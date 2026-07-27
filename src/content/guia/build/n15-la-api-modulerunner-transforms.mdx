@@ -1,0 +1,151 @@
+---
+title: "La API: environments configurables, ModuleRunner y transforms por entorno"
+description: "El corazón técnico de la Environment API: el DevEnvironment que transforma sin ejecutar, el ModuleRunner de vite/module-runner que ejecuta el código de servidor en su propio runtime a través de un transport, y los transforms y hooks por entorno con this.environment y applyToEnvironment."
+subject: build
+level: 15
+order: 3
+icon: "15.3"
+duracion: "18 min"
+---
+
+<Lead>
+Aquí abrimos la caja. La Environment API se sostiene sobre una separación limpia entre dos responsabilidades que Vite 5 mezclaba: transformar código y ejecutarlo. El `DevEnvironment` transforma —resuelve, aplica plugins, cachea en su grafo— pero no ejecuta. El `ModuleRunner` ejecuta —evalúa el código transformado en un runtime concreto— pero no transforma. Entre ambos, un transport. Esa frontera es lo que permite que el código de servidor corra donde debe correr, incluso en otro proceso o en otro runtime, y es la pieza que reemplaza para siempre a `ssrLoadModule`.
+</Lead>
+
+<Objetivos>
+
+- Separar las dos responsabilidades: el `DevEnvironment` transforma, el `ModuleRunner` ejecuta.
+- Entender el `ModuleRunner` de `vite/module-runner` y el transport que lo conecta al servidor.
+- Usar `RunnableDevEnvironment` para ejecutar en el mismo proceso y saber cuándo no vale.
+- Escribir transforms y hooks por entorno con `this.environment` y `applyToEnvironment`.
+
+</Objetivos>
+
+## El DevEnvironment transforma, no ejecuta
+
+Un `DevEnvironment` es la mitad del sistema que vive dentro del proceso de Vite. Su trabajo es tomar una URL de módulo, resolverla con las condiciones del entorno, pasarla por los plugins de ese entorno y devolver código transformado, dejándolo cacheado en su `EnvironmentModuleGraph`. Lo que no hace es evaluarlo: el `DevEnvironment` no sabe ejecutar tu servidor, solo sabe prepararlo.
+
+```ts
+const server = await createServer()
+const env = server.environments.ssr        // un DevEnvironment
+const result = await env.transformRequest('/src/entry-server.ts')
+// result.code es codigo listo para evaluar, PERO nadie lo ha ejecutado aun
+```
+
+Esta parcialidad es deliberada. Al no ejecutar, el `DevEnvironment` no impone dónde se ejecuta: no obliga a Node, no obliga al mismo proceso, no obliga a nada. Deja esa decisión para la otra mitad, y en esa libertad está toda la potencia de la API.
+
+## El ModuleRunner ejecuta el código de servidor
+
+El `ModuleRunner`, importado de `vite/module-runner`, es la mitad que ejecuta. Vive en el runtime de destino —Node, un Worker, un thread aparte— y pide módulos al `DevEnvironment` a través de un transport. Cuando le pides importar una URL, el runner la solicita, el entorno la transforma y la devuelve, y un evaluator ejecuta ese código en el runtime donde el runner vive.
+
+```ts
+import { ModuleRunner, ESModulesEvaluator } from 'vite/module-runner'
+
+const runner = new ModuleRunner(
+  {
+    transport,               // el canal hacia el DevEnvironment que transforma
+  },
+  new ESModulesEvaluator(),  // como se evalua el codigo EN ESTE runtime
+)
+
+// el runner pide, el entorno transforma, el evaluator ejecuta aqui mismo
+const mod = await runner.import('/src/entry-server.ts')
+mod.render()
+```
+
+La clave está en que `vite/module-runner` es un paquete minúsculo y sin dependencias de Node: puede correr dentro de `workerd`, de Deno o de un Web Worker. El transport es una interfaz de mensajería abstracta —puede ser una llamada de función en el mismo proceso, un `MessagePort` entre threads o un socket entre procesos—. Esa abstracción es la que despega la ejecución del servidor de Vite: el código se transforma en un sitio y se ejecuta en otro, y entre medias solo viajan mensajes.
+
+<Mermaid code={`flowchart LR
+  R[ModuleRunner en el runtime destino] -- pide url --> T[transport]
+  T --> D[DevEnvironment en el proceso de Vite]
+  D -- transforma con plugins y condiciones --> T
+  T -- codigo transformado --> R
+  R -- evaluator ejecuta --> X[modulo vivo en el runtime real]
+  style R fill:#89b4fa,color:#11111b
+  style D fill:#cba6f7,color:#11111b
+  style X fill:#a6e3a1,color:#11111b`} />
+
+Cuando el runtime de destino es el mismo proceso de Node donde corre Vite —el caso más simple—, no necesitas cablear el transport a mano. Vite ofrece un `RunnableDevEnvironment`: un `DevEnvironment` que ya trae un `ModuleRunner` incorporado y conectado, con un método `runner.import`.
+
+```ts
+import { createServer, isRunnableDevEnvironment } from 'vite'
+
+const server = await createServer()
+const env = server.environments.ssr
+if (isRunnableDevEnvironment(env)) {
+  const mod = await env.runner.import('/src/entry-server.ts')
+  mod.render()   // ejecutado en este mismo proceso Node
+}
+```
+
+<Callout type="tip" title="RunnableDevEnvironment es la comodidad, no la regla">
+El `RunnableDevEnvironment` resuelve el caso más común —SSR en Node, en el mismo proceso— con una línea. Pero es un caso particular, no el corazón de la API. En cuanto tu runtime de destino no es este proceso —un Worker de `workerd`, un thread aislado—, dejas de tener un runner incorporado y vuelves al modelo general: un `ModuleRunner` que vive allí y un transport que lo conecta aquí. Interiorizar que lo runnable es el atajo, y no la esencia, evita el error de creer que la ejecución siempre ocurre donde transformas.
+</Callout>
+
+## El transport: la interfaz que lo hace portable
+
+Si el `ModuleRunner` puede vivir en Node, en `workerd` o en un thread, es porque no habla directamente con el `DevEnvironment`, sino con un transport: una interfaz de mensajería mínima que abstrae *cómo* viajan las peticiones y las respuestas. El runner pide un módulo; el transport lleva esa petición al entorno y trae de vuelta el código transformado. Ni el runner sabe dónde está el entorno, ni el entorno sabe dónde está el runner.
+
+```ts
+// La forma esencial de un transport: enviar peticiones y recibir respuestas
+interface Transport {
+  // el runner pide; la implementacion decide COMO cruza la frontera
+  fetchModule(id: string, importer?: string): Promise<FetchResult>
+  // canal opcional para HMR y mensajes del entorno hacia el runner
+  connect?(handlers: TransportHandlers): void
+}
+```
+
+Que sea una interfaz y no una implementación concreta es justo lo que la vuelve portable. En el mismo proceso, el transport es una llamada de función directa. Entre threads, se apoya en un `MessagePort`. Entre procesos, o hacia un runtime remoto, en un socket o en el protocolo que ese runtime exponga. La forma del contrato no cambia; solo cambia el mensajero, y por eso una misma pieza de ejecución sirve para escenarios que antes exigían máquinas distintas.
+
+Aquí se cierra la idea de la lección. El `DevEnvironment` transforma sin saber quién ejecutará; el `ModuleRunner` ejecuta sin saber quién transformó; el transport los une sin acoplarlos. Tres piezas con fronteras nítidas, cada una ignorante de las otras dos salvo por su contrato, que es la definición misma de un sistema desacoplado y la razón de que la API escale a runtimes que sus autores ni siquiera anticiparon.
+
+<Callout type="info" title="El transport es la costura, y una costura bien definida es una extensión">
+La tentación es ver el transport como fontanería interna que no te incumbe. Pero es precisamente el punto de extensión de la API: soportar un runtime nuevo —uno que hoy no existe— se reduce, en lo esencial, a implementar un transport que sepa hablar con él. No hay que tocar el transformador ni el evaluador; basta con enseñar a los mensajes a cruzar una frontera nueva. Cuando el punto de variación de un sistema está aislado tras una interfaz pequeña, añadir capacidades deja de ser cirugía y se vuelve implementar un contrato.
+</Callout>
+
+## Transforms y hooks por entorno
+
+La tercera pieza es que los plugins ahora saben en qué entorno operan. Dentro de cualquier hook, `this.environment` es la instancia del entorno actual, con su `name` y su config. Eso convierte cada plugin en algo consciente del destino sin duplicar plugins.
+
+```ts
+function miPlugin(): Plugin {
+  return {
+    name: 'mi-plugin',
+    // se aplica solo a los entornos que quieras
+    applyToEnvironment(env) {
+      return env.name === 'workerd'
+    },
+    transform(code, id) {
+      // this.environment dice DONDE se esta transformando
+      if (this.environment.name === 'ssr') {
+        return inyectarSoloEnServidor(code)
+      }
+      return null
+    },
+    // HMR por entorno: sustituye al viejo handleHotUpdate global
+    hotUpdate(ctx) {
+      // ctx.environment identifica el entorno; ctx.modules son SUS modulos
+      if (ctx.environment.name === 'client') {
+        // invalidar solo el grafo del cliente
+      }
+    },
+  }
+}
+```
+
+Tres hooks marcan el cambio de era. `applyToEnvironment` decide si un plugin se activa en un entorno dado, permitiendo pipelines distintos por destino. `transform` —y `resolveId`, y `load`— reciben `this.environment`, así que un mismo plugin puede comportarse distinto en cliente y en servidor sin bifurcarse en dos. Y `hotUpdate`, que reemplaza al antiguo `handleHotUpdate`, opera por entorno: recibe los módulos del grafo de ese entorno concreto, de modo que un cambio en un archivo invalida solo los grafos que de verdad lo contienen.
+
+La consecuencia práctica es que desaparece un patrón feo y frágil: el de consultar variables globales o inspeccionar el `id` con expresiones regulares para adivinar "¿esto es servidor o cliente?". Esa pregunta ahora tiene una respuesta autoritativa y local, `this.environment`, disponible en el sitio exacto donde la necesitas. Un plugin bien escrito contra la Environment API no *deduce* su contexto: lo *lee*, y esa diferencia entre adivinar y saber es lo que vuelve robusto el código de plugins que antes vivía de heurísticas.
+
+<Callout type="dios" title="Transformar y ejecutar son ejes ortogonales, y separarlos es lo que libera el runtime">
+El salto conceptual de la API entera cabe en una frase: transformar código y ejecutar código son responsabilidades ortogonales, y Vite 5 las tenía soldadas en `ssrLoadModule`. Aquella función hacía las dos cosas —transformaba con el pipeline de SSR y evaluaba con el sistema de módulos de Node— y por eso arrastraba a Node consigo: no podías quedarte con la transformación y llevarte la ejecución a otra parte, porque venían pegadas. La Environment API corta esa soldadura. El `DevEnvironment` se queda con la transformación, que es lo que necesitan el grafo, los plugins y las condiciones. El `ModuleRunner` se queda con la ejecución, que es lo que necesita un runtime concreto —y por eso es un paquete minúsculo, portable, sin atarse a Node—. Entre ambos, un transport que solo mueve mensajes. Una vez separados los dos ejes, el runtime de ejecución se vuelve un parámetro: si quieres ejecutar en este proceso, usas un `RunnableDevEnvironment`; si en `workerd`, pones un `ModuleRunner` dentro de Miniflare y lo conectas por un transport; si en un thread para aislar, igual, con un `MessagePort`. La transformación no cambia en ninguno de los tres casos; solo cambia dónde vive el runner. Esta es la clase de diseño que multiplica capacidades sin multiplicar código: no se añadió "soporte para edge" ni "soporte para threads" como funciones nuevas, se eliminó la suposición que los impedía. Separar lo que estaba junto —cuando de verdad eran cosas distintas— es, una y otra vez, el movimiento que convierte una herramienta rígida en una plataforma.
+</Callout>
+
+<Reto title="Separa transformar de ejecutar">
+1. Con un `RunnableDevEnvironment`, importa y ejecuta un módulo de servidor en el mismo proceso y observa que no tocaste ningún transport.
+2. Lee la superficie de `vite/module-runner` y enumera por qué puede correr fuera de Node.
+3. Escribe un plugin con `applyToEnvironment` que solo se active en `workerd` y compruébalo con un log.
+4. En un hook `transform`, ramifica el comportamiento según `this.environment.name` y verifica la diferencia entre cliente y ssr.
+5. Explica con tus palabras por qué separar transformación y ejecución es lo que permite ejecutar en el edge sin cambiar el pipeline.
+</Reto>

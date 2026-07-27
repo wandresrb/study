@@ -1,0 +1,146 @@
+---
+title: "El problema de las suscripciones manuales: la gestión de memoria vuelve"
+description: "Cada suscripción es un recurso que reservas y que alguien debe liberar. Cuando esa liberación queda en manos del programador aparecen las fugas de memoria del lapsed listener, los bugs de orden de limpieza y una carga de contabilidad que no escala. Esta lección diagnostica el dolor y presenta las herramientas de 2026 —AbortController, using y Symbol.dispose— que lo alivian sin eliminarlo."
+subject: estado
+level: 3
+order: 3
+icon: "3.3"
+duracion: "17 min"
+---
+
+<Lead>
+Suscribirse es fácil; darse de baja, no tanto. Cada `subscribe` abre un recurso que el sujeto retiene, y ese recurso hay que cerrarlo o se convierte en una fuga. La gestión manual de suscripciones es, literalmente, la gestión manual de memoria disfrazada: el mismo dolor que el `malloc`/`free` de C, ahora entre componentes y stores. Entender por qué no escala a mano es entender por qué la reactividad automática tuvo que existir.
+</Lead>
+
+<Objetivos>
+
+- Ver por qué cada `subscribe` exige un `unsubscribe` emparejado y quién lo olvida.
+- Diagnosticar el lapsed listener y las fugas de memoria que provoca.
+- Entender por qué el orden de limpieza importa y cómo se rompe en silencio.
+- Conocer las herramientas de 2026: `AbortController`, `using` y `Symbol.dispose`.
+
+</Objetivos>
+
+## Suscribirse es reservar un recurso
+
+Piensa en el paralelismo que gobierna toda la lección: `subscribe` y `unsubscribe` son a las suscripciones lo que `malloc` y `free` a la memoria, o lo que `open` y `close` a los ficheros. Cada alta reserva un recurso del que te vuelves responsable, y cada recurso reservado hay que liberarlo exactamente una vez.
+
+El compilador no te recordará la baja; el tipo de retorno de `subscribe` no te obliga a nada. Es un contrato que existe solo en tu cabeza y en la disciplina con que lo cumplas, y esa es precisamente la clase de contrato que los humanos incumplimos en cuanto el sistema crece.
+
+Ese es el pecado original: la corrección depende de que un humano recuerde emparejar dos llamadas que suelen vivir muy lejos la una de la otra —el alta al montar un componente, la baja al desmontarlo, con toda la lógica de la aplicación en medio—.
+
+Y como todo problema de emparejamiento manual, falla en las dos direcciones: puedes olvidar suscribirte a una dependencia nueva (y quedarte con datos obsoletos) o puedes olvidar darte de baja (y filtrar memoria). La segunda es la más insidiosa, porque no rompe nada de inmediato: la aplicación funciona en la demo, pasa las pruebas y solo delata la fuga tras horas de uso real.
+
+## El lapsed listener: la fuga que no se ve
+
+El patrón tóxico canónico es un sujeto de vida larga —un store global, un bus de eventos, un servicio— al que se suscriben observadores de vida corta —componentes que se montan y desmontan—. El sujeto guarda una referencia **fuerte** a cada escucha, así que mientras el store viva, cada componente que se suscribió y no se dio de baja seguirá vivo en memoria aunque la interfaz ya lo haya descartado.
+
+```ts
+const store = new EventTarget(); // vive durante toda la aplicación
+
+function montarWidget() {
+  const nodo = document.createElement("div");
+  // FUGA: el store retendrá esta función (y el nodo que captura) para siempre
+  store.addEventListener("cambio", () => {
+    nodo.textContent = "actualizado"; // el nodo ya no está en el documento
+  });
+  return nodo;
+}
+// cada llamada deja una escucha viva aunque su nodo se haya descartado
+```
+
+Esto se llama *lapsed listener* y tiene un segundo filo peor que la memoria: la escucha muerta **sigue reaccionando**. Cada emisión del store ejecuta el callback de cada widget difunto, que intenta tocar un nodo ya desconectado del documento, malgasta CPU y a veces provoca errores o dobles renders. Una fuga de suscripciones no solo consume memoria: ejecuta trabajo fantasma.
+
+### Dónde muerde en los frameworks
+
+Cada framework tiene su ritual para emparejar el alta con la baja, y todos delegan en ti el no olvidarlo. En React, el `useEffect` debe devolver una función de limpieza que corre al desmontar, y omitirla es la fuga clásica de los tutoriales. En Vue está `onUnmounted`, en Svelte el retorno de `onMount`, en Angular el `ngOnDestroy` o el operador `takeUntilDestroyed`. Todos son la misma idea con distinto nombre: un gancho de desmontaje donde tienes que acordarte de cerrar lo que abriste. El framework te ofrece el lugar; la disciplina de usarlo sigue siendo enteramente tuya.
+
+<Mermaid code={`flowchart TD
+  A[El componente se monta] --> B[subscribe al store de larga vida]
+  B --> C[El store guarda una referencia fuerte al componente]
+  C --> D{El componente se desmonta}
+  D -->|con unsubscribe| E[Referencia liberada y el GC recupera la memoria]
+  D -->|sin unsubscribe| F[Referencia viva lapsed listener y fuga]
+  F --> G[La escucha muerta sigue reaccionando a cada emision]
+  style E fill:#a6e3a1,color:#11111b
+  style F fill:#f38ba8,color:#11111b
+  style G fill:#f38ba8,color:#11111b`} />
+
+El diagrama deja clara la asimetría: la rama feliz —dar de baja— es una sola línea de código fácil de olvidar, mientras que la rama del olvido no falla ruidosamente, solo acumula. Por eso las fugas de suscripciones sobreviven tanto tiempo en producción: nada las delata hasta que el consumo de memoria o el trabajo fantasma se vuelven imposibles de ignorar, y para entonces la causa está enterrada bajo meses de commits.
+
+## El orden de limpieza y por qué no escala
+
+Cuando las suscripciones se anidan o dependen entre sí, el **orden** de la baja importa. Si un observador derivado depende de otro y liberas primero al del que depende, el derivado puede recibir una última notificación contra un estado a medio desmontar. La disciplina segura es liberar en orden inverso al de creación —LIFO, lo último que abriste es lo primero que cierras—, exactamente como se desenrolla una pila, como corren los destructores o como se ejecuta un `defer`. Hecho a mano, ese orden lo tienes que llevar tú.
+
+Un caso concreto lo hace palpable: un panel se suscribe a un store de sesión y, con ese dato, abre una conexión que a su vez emite eventos a los que también te suscribes. Al cerrar el panel debes dar de baja primero la conexión y luego la sesión; si lo haces al revés, la sesión cae, la conexión intenta reaccionar a su desaparición y acabas operando sobre un objeto a medio morir. Nadie te avisa del orden correcto: se deduce del grafo de dependencias que solo vive en tu cabeza.
+
+Y ahí está la raíz de por qué no escala: la contabilidad es lineal y frágil. Un componente con cinco suscripciones necesita cinco bajas correctas; multiplícalo por cientos de componentes y por la composición entre ellos, y basta un solo emparejamiento olvidado para tener una fuga que no aparece en las pruebas y solo se manifiesta como memoria que sube sin parar en producción.
+
+El ser humano es malísimo en contabilidad silenciosa de recursos de larga distancia. La historia de la programación es, en buena medida, la de delegar esa contabilidad a la máquina —y las suscripciones son el siguiente recurso en esa lista de cosas que dejamos de gestionar a mano.
+
+## Las herramientas de 2026
+
+El ecosistema moderno no elimina el problema, pero lo hace mucho más difícil de arruinar, convirtiendo la baja en algo declarativo o automático en vez de manual y disperso.
+
+<Cards>
+  <Card icon="🎯" title="AbortController">
+    Un solo `AbortSignal` agrupa muchas escuchas; un único `abort` las desmonta todas a la vez. Se compone con `AbortSignal.any` para combinar varias causas de cancelación en una.
+  </Card>
+  <Card icon="🧹" title="using y Symbol.dispose">
+    La gestión explícita de recursos de TC39, ya estándar: `using recurso = ...` invoca `Symbol.dispose` al salir del bloque, en orden LIFO. El lenguaje empareja el alta con la baja por ti.
+  </Card>
+  <Card icon="🗑️" title="DisposableStack">
+    Un saco de recursos: agrega varias bajas y ejecútalas juntas al cerrarlo. La versión estándar del Subscription bag que popularizó RxJS con su `add`.
+  </Card>
+  <Card icon="🔗" title="WeakRef y FinalizationRegistry">
+    Dejan que el GC recolecte lo que nadie más referencia, pero de forma no determinista. Son una red de seguridad, jamás un sustituto de la baja explícita.
+  </Card>
+</Cards>
+
+Compara primero cómo se ve la baja hecha del todo a mano, con su fragilidad a la vista:
+
+```ts
+function trabajoManual(store: EventTarget) {
+  const manejar = () => actualizar();
+  store.addEventListener("cambio", manejar);
+  try {
+    // ...usa la suscripción durante este bloque...
+  } finally {
+    store.removeEventListener("cambio", manejar); // hay que recordar ESTO, siempre
+  }
+}
+```
+
+Hay que guardar la referencia exacta a `manejar`, envolver todo en `try`/`finally` y no equivocarse en el nombre del evento. La combinación idiomática de 2026 une `AbortController` con la gestión explícita de recursos para que el propio bloque garantice la baja sin ese ceremonial:
+
+```ts
+function suscribir(store: EventTarget): Disposable {
+  const ac = new AbortController();
+  store.addEventListener("cambio", () => actualizar(), { signal: ac.signal });
+  return { [Symbol.dispose]: () => ac.abort() }; // la baja, empaquetada
+}
+
+function trabajo(store: EventTarget) {
+  using sub = suscribir(store); // se dará de baja sola al terminar
+  // ...trabaja con la suscripción activa durante todo este bloque...
+} // aquí corre sub[Symbol.dispose]() de forma automática y en orden LIFO
+```
+
+La palabra clave `using` es la pieza nueva: declara un recurso cuya baja el propio lenguaje garantiza al cerrarse el bloque, pase lo que pase —incluso si se lanza una excepción—, y en orden inverso al de creación. Si necesitas agrupar varias bajas de vidas ligadas, `DisposableStack` hace de saco: registras cada recurso con `use` y un solo cierre los libera todos. Es la versión estándar y sin dependencias del viejo Subscription bag que RxJS popularizó con su `add`.
+
+### Por qué WeakRef no es la solución
+
+Es tentador pensar que `WeakRef` y `FinalizationRegistry` resuelven el lapsed listener de raíz: si el sujeto guardara referencias débiles, el GC podría recolectar a los observadores muertos por su cuenta. En la práctica no sirven como mecanismo primario por dos razones. La primera es que la finalización es **no determinista**: no sabes cuándo, ni siquiera si, correrá, de modo que el trabajo fantasma puede seguir ejecutándose mucho después de que el observador debiera haber desaparecido. La segunda es que las propias callbacks suelen capturar el objeto que querrías dejar morir, manteniéndolo vivo por accidente. Son una red de seguridad, no un plan de limpieza.
+
+Con todo, ninguna de estas herramientas borra la raíz del problema: sigues siendo tú quien decide dónde nace y dónde muere cada suscripción. El `using` garantiza la baja, pero tú escribes el `using`; el `AbortController` agrupa, pero tú creas el controlador y lo pasas. El salto que de verdad elimina el trabajo llega cuando el sistema deduce las dependencias solo, sin que declares ni ates nada, y ese es el territorio de la última lección del nivel.
+
+<Callout type="dios" title="Automatizar la baja es la misma batalla que ganó el recolector de basura">
+Retrocede y observa el patrón histórico. La gestión manual de memoria —reservar y liberar a mano— fue durante décadas la fuente número uno de bugs graves, hasta que el recolector de basura automatizó la liberación y borró de un plumazo familias enteras de errores. La gestión manual de otros recursos —ficheros, sockets, locks— fue domada por RAII en C++, por `try-with-resources` en Java, por `defer` en Go y ahora por `using` y `Symbol.dispose` en JavaScript. Las suscripciones son exactamente el mismo problema con otro nombre: un recurso que se reserva y debe liberarse, cuya baja manual no escala porque depende de que un humano recuerde emparejar, en el orden correcto, dos llamadas separadas por toda la lógica de la aplicación. Las herramientas de 2026 —el `AbortSignal` que desmonta un grupo entero, el `using` que garantiza la baja al cerrar el bloque— son enormes mejoras, pero fíjate en lo que siguen exigiendo: que tú declares el recurso, que tú lo ates a un ámbito, que tú decidas dónde vive su vida. Aún cableas. La pregunta que abre la última lección del nivel es la natural: ¿y si el sistema dedujera solo qué depende de qué, se suscribiera solo al leer y se diera de baja solo al dejar de leer? Eso es precisamente lo que hacen los signals, y por eso su invención se siente menos como una librería nueva y más como el recolector de basura de la reactividad: el fin de una clase entera de contabilidad manual.
+</Callout>
+
+<Reto title="Fuga, diagnostica y sella">
+1. Reproduce una fuga: suscribe cien callbacks a un `EventTarget` de larga vida sin darlos de baja y observa cómo crece la memoria retenida entre emisiones.
+2. Añade una baja atada a un `AbortController` y demuestra que un solo `abort` cancela todas las escuchas del grupo.
+3. Reescribe la suscripción con `using` y `Symbol.dispose` y verifica que la baja corre sola al salir del bloque.
+4. Crea dos suscripciones dependientes y comprueba, invirtiendo el orden de baja, que liberar en el orden equivocado provoca una notificación contra un estado a medio desmontar.
+</Reto>

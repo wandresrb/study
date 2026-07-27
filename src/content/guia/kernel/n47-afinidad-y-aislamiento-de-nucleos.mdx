@@ -1,0 +1,131 @@
+---
+title: "Afinidad de CPU y aislamiento de núcleos: latencia predecible por diseño"
+description: "Cómo se clava una tarea a un subconjunto de CPUs con sched_setaffinity y cpumask, por qué eso solo controla dónde puede correr pero no impide que otros la molesten, y cómo isolcpus, nohz_full y rcu_nocbs construyen un núcleo casi de metal desnudo donde una tarea de HPC o de tiempo real corre sin tick, sin migraciones y sin vecinos que le roben caché."
+subject: kernel
+level: 47
+order: 2
+icon: "47.2"
+duracion: "17 min"
+---
+
+<Lead>
+El balanceador del nivel anterior es una bendición para el rendimiento medio y una maldición para la latencia predecible. Una tarea de HPC que llena la caché de un núcleo no quiere que la migren; un lazo de control de tiempo real no quiere que el tick del planificador le robe microsegundos cada milisegundo. Aquí aprendes a decirle al kernel "esta tarea vive **aquí** y nadie más la toca". Primero la afinidad, que fija *dónde puede* correr; luego el aislamiento, que expulsa a todos los demás de ese núcleo para que el *dónde puede* se convierta en *dónde corre a solas*.
+</Lead>
+
+<Objetivos>
+
+- Fijar la afinidad de una tarea con `sched_setaffinity` y manipular un `cpu_set_t`.
+- Entender el `cpumask` como la representación de conjuntos de CPUs en el kernel.
+- Sacar núcleos del balanceo global con `isolcpus` y del tick con `nohz_full`.
+- Comprender por qué la baja latencia exige combinar afinidad, aislamiento y descarga de RCU.
+
+</Objetivos>
+
+## sched_setaffinity: clavar una tarea a un conjunto de CPUs
+
+La afinidad restringe el conjunto de núcleos donde el planificador puede colocar una tarea. Desde espacio de usuario se maneja con `cpu_set_t` y sus macros:
+
+```c
+#define _GNU_SOURCE
+#include <sched.h>
+
+/* clavar el hilo actual a los nucleos 2 y 3 */
+cpu_set_t mask;
+CPU_ZERO(&mask);
+CPU_SET(2, &mask);
+CPU_SET(3, &mask);
+
+if (sched_setaffinity(0 /* pid 0 = yo mismo */, sizeof(mask), &mask) != 0)
+	perror("sched_setaffinity");
+```
+
+`taskset -c 2,3 ./mi_hpc` hace lo mismo sin recompilar, y `taskset -p PID` consulta la máscara de un proceso vivo. Dentro del kernel, esa máscara es un `cpumask` —un `bitmap` de `NR_CPUS` bits— y la llamada acaba en `set_cpus_allowed_ptr`, que guarda el conjunto en `p->cpus_ptr` y, si la tarea está corriendo en un núcleo que ya no le pertenece, la migra en el acto:
+
+```c
+/* kernel/sched/core.c, esquema */
+int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+{
+	/* p->cpus_ptr apunta a la mascara de CPUs permitidas */
+	if (cpumask_test_cpu(task_cpu(p), new_mask))
+		return 0;                         /* ya esta donde debe */
+	/* si no, empujarla a un CPU de new_mask (stop_sched_class migra) */
+	return __set_cpus_allowed_ptr(p, new_mask, 0);
+}
+```
+
+<Callout type="info" title="El cpumask es el lenguaje de las CPUs en el kernel">
+Casi toda API que hable de conjuntos de núcleos usa `struct cpumask`: `cpumask_set_cpu`, `cpumask_test_cpu`, `cpumask_and`, `for_each_cpu`. Existen máscaras globales con significado: `cpu_online_mask` (núcleos vivos ahora), `cpu_possible_mask` (los que podrían existir), `cpu_active_mask` (los que aceptan tareas). Fijar afinidad no es más que intersectar la máscara de una tarea con esas realidades. La IRQ también tiene afinidad, en `/proc/irq/N/smp_affinity`: si no la mueves, las interrupciones seguirán cayendo en tu núcleo aislado y arruinarán su silencio.
+</Callout>
+
+## Afinidad no es aislamiento
+
+Aquí está el malentendido que arruina proyectos de tiempo real. Clavar tu tarea al núcleo 3 le dice al planificador *dónde puede correr la tuya*, pero **no** le prohíbe correr **otras** tareas ahí. El balanceador seguirá colocando procesos ajenos en el núcleo 3, el tick del planificador seguirá interrumpiéndolo cada milisegundo, `kworker` y los hilos de RCU seguirán despertando en él. Afinidad y aislamiento son cosas distintas:
+
+```bash
+# afinidad: MI tarea solo aqui... pero el nucleo 3 sigue siendo publico
+taskset -c 3 ./control_rt          # no garantiza exclusividad
+
+# aislamiento: sacar los nucleos 2-5 del reparto general desde el arranque
+# (linea de kernel en el gestor de arranque)
+isolcpus=domain,managed_irq,2-5 nohz_full=2-5 rcu_nocbs=2-5 irqaffinity=0,1
+```
+
+`isolcpus=domain,2-5` retira esos núcleos de los **dominios de scheduling**: el balanceador deja de mirarlos, así que ninguna tarea llega ahí *por su cuenta*; solo las que tú claves explícitamente con afinidad. La variante `managed_irq` además mantiene lejos las interrupciones gestionadas de esos núcleos. El resultado es un núcleo reservado: público para nadie, privado para quien tú decidas.
+
+## nohz_full y rcu_nocbs: hacia el metal desnudo
+
+Aislar del balanceo no basta para la latencia extrema, porque queda el **tick**. Por defecto, cada núcleo recibe una interrupción de temporizador periódica (`HZ` veces por segundo) para contabilidad, preferencia y RCU. En un lazo de control eso es jitter inaceptable. `nohz_full=2-5` activa el modo *full dynticks*: **si en ese núcleo solo hay una tarea ejecutable**, el kernel apaga el tick por completo y la tarea corre sin que nadie la interrumpa hasta que ella misma cede.
+
+```bash
+# confirmar el resultado tras arrancar con esos parametros
+cat /sys/devices/system/cpu/isolated      #  2-5
+cat /sys/devices/system/cpu/nohz_full      #  2-5
+cat /proc/cmdline                          #  ...isolcpus=... nohz_full=...
+```
+
+Pero el tick hacía un trabajo que no desaparece: procesar los *callbacks* de RCU (nivel 17). Por eso `nohz_full` **exige** `rcu_nocbs=2-5`, que descarga ese procesamiento a hilos `rcuop` alojados en los núcleos domésticos (0 y 1). El patrón completo dedica unos pocos **núcleos domésticos** (*housekeeping*) a absorber todo el ruido —ticks, RCU, workqueues no atadas, IRQs— para que los núcleos aislados queden lo más cerca posible del metal desnudo.
+
+<Mermaid code={`flowchart LR
+  subgraph Domesticos[Nucleos domesticos 0 y 1]
+    K[tick, kworker, rcuop, IRQs]
+  end
+  subgraph Aislados[Nucleos aislados 2 a 5]
+    A[Una sola tarea RT o HPC]
+    A2[Sin tick con nohz_full]
+    A3[Sin migracion con isolcpus]
+    A4[Sin callbacks con rcu_nocbs]
+  end
+  K -. absorbe el ruido de .-> Aislados
+  style Aislados fill:#a6e3a1,color:#11111b
+  style Domesticos fill:#89b4fa,color:#11111b`} />
+
+<Cards>
+  <Card icon="📌" title="sched_setaffinity">
+    Restringe el conjunto de CPUs de una tarea. Controla *dónde puede* correr, no la exclusividad. `taskset` es su envoltorio de línea de comandos.
+  </Card>
+  <Card icon="🚧" title="isolcpus=domain">
+    Saca núcleos de los dominios de scheduling: el balanceador ya no coloca nada ahí salvo lo que claves a mano.
+  </Card>
+  <Card icon="🤫" title="nohz_full">
+    Apaga el tick del planificador en un núcleo cuando solo hay una tarea lista. Elimina el jitter periódico del temporizador.
+  </Card>
+  <Card icon="📤" title="rcu_nocbs">
+    Descarga los callbacks de RCU a hilos en los núcleos domésticos. Es el complemento obligado de `nohz_full`.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="isolcpus es un martillo estático; cpuset es un bisturí vivo">
+`isolcpus` se fija en el arranque y no se puede cambiar sin reiniciar, y la documentación del kernel lo considera una interfaz heredada. La forma moderna y dinámica de particionar es el **controlador cpuset de cgroup v2** (nivel 47.4): con `cpuset.cpus` y el flag `cpuset.cpus.partition` creas dominios aislados en caliente, los rediseñas sin reiniciar y los integras con systemd y los orquestadores. Para un banco de pruebas rápido, `isolcpus` en la línea de kernel es cómodo; para producción seria, particiona con `cpuset`.
+</Callout>
+
+<Callout type="dios" title="La latencia predecible se compra echando a todos los demás">
+Detente en el cambio de objetivo, porque reordena tu manera de pensar el rendimiento. Durante casi todo el arco anterior optimizabas el **rendimiento medio**: más operaciones por segundo, mejor aprovechamiento, colas equilibradas. El balanceador, el tick, la migración oportunista, la caché compartida: toda esa maquinaria existe para exprimir el promedio. Aquí persigues algo distinto y a menudo opuesto: el **peor caso acotado**. A un lazo de control de un reactor, a un trader de baja latencia, a un nodo de HPC en una barrera de sincronización global, no le importa hacer un millón de iteraciones por segundo de media si una de ellas, impredeciblemente, tarda cien veces más porque el tick saltó, porque la migraron, porque un `kworker` le robó la L2. La cola larga de la distribución de latencias es su enemigo, no la media. Y la lección profunda es que esa predictibilidad no se consigue haciendo tu tarea más rápida, sino haciendo que **todo lo demás desaparezca** de su núcleo. Afinidad, `isolcpus`, `nohz_full`, `rcu_nocbs`, afinidad de IRQ: ninguno acelera tu código ni un ciclo; todos eliminan interferencia. Estás comprando silencio, no velocidad. Y el silencio tiene un coste real que debes aceptar con los ojos abiertos: cuatro núcleos dedicados a una tarea que quizá esté ociosa la mitad del tiempo es capacidad de cómputo que sacrificas a cambio de que el peor caso sea acotado. Cuando comprendes que optimizar la media y acotar el peor caso son dos disciplinas con herramientas y sacrificios opuestos, dejas de preguntar "¿cómo hago esto más rápido?" y empiezas a preguntar "¿qué tengo que apagar para que esto sea predecible?".
+</Callout>
+
+<Reto title="Construye un núcleo silencioso">
+1. Escribe un programa que se clave al núcleo 3 con `sched_setaffinity` y verifique con `sched_getaffinity` que la máscara quedó como pedías.
+2. Arranca el kernel con `isolcpus=domain,2-5 nohz_full=2-5 rcu_nocbs=2-5` y comprueba los tres archivos de `/sys/devices/system/cpu/` que reflejan el resultado.
+3. Con `taskset` lanza una tarea calienta-CPU sin aislar y otra en un núcleo aislado; mide con `perf stat` las migraciones (`cpu-migrations`) de cada una y explica la diferencia.
+4. Explica por qué `nohz_full` sin `rcu_nocbs` deja la puerta abierta a que el procesamiento de RCU siga despertando tu núcleo.
+5. Mueve las interrupciones fuera de tus núcleos aislados vía `/proc/irq/*/smp_affinity` y razona por qué sin ese paso el aislamiento queda incompleto.
+</Reto>

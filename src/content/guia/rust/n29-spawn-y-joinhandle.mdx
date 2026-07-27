@@ -1,0 +1,147 @@
+---
+title: "thread::spawn y JoinHandle: lanzar un hilo y cosechar su valor"
+description: "Un hilo del sistema operativo es una clausura que corre a la vez que main, con su propia pila. thread::spawn la lanza y entrega un JoinHandle, un recibo tipado con el que join bloquea hasta el final y devuelve el valor de la clausura o la carga de su panic. Modelo 1:1, hilos desatendidos y Builder para nombre y pila."
+subject: rust
+level: 29
+order: 1
+icon: "29.1"
+duracion: "18 min"
+---
+
+<Lead>
+Hasta ahora cada programa ha sido una sola línea de ejecución: una pila, un flujo de control que desciende por `main` instrucción tras instrucción. Un **hilo** rompe esa unicidad. `thread::spawn` toma una clausura y le concede una pila propia y un flujo de control propio que el sistema operativo planifica *a la vez* que el resto del programa. Lo que recibes a cambio no es el resultado —el hilo puede no haber terminado todavía— sino un `JoinHandle<T>`, un recibo tipado. Con él, y solo con él, te reúnes con el hilo mediante `join`: bloqueas hasta que acabe y cosechas lo que devolvió. Todo el nivel gira sobre esa pareja —lanzar y reunir— y sobre las garantías que el compilador exige para que lanzar no signifique corromper.
+</Lead>
+
+<Objetivos>
+
+- Lanzar un hilo nativo del sistema operativo con `thread::spawn` y una clausura `FnOnce`.
+- Recuperar su valor de retorno esperándolo con `JoinHandle::join`, que bloquea hasta el final.
+- Leer el `Result` de `join`, cuyo `Err` transporta la carga del `panic!` de un hilo.
+- Dar nombre y tamaño de pila a un hilo con `thread::Builder` y su `spawn` falible.
+
+</Objetivos>
+
+## Un hilo es una clausura con pila propia
+
+Lanzar un hilo es entregar una clausura a `thread::spawn`. La llamada retorna al instante, sin esperar a que el trabajo termine:
+
+```rust
+use std::thread;
+
+fn main() {
+    let hijo = thread::spawn(|| {
+        for i in 1..=3 {
+            println!("hilo hijo: {i}");
+        }
+    });
+
+    for i in 1..=3 {
+        println!("hilo principal: {i}");
+    }
+
+    hijo.join().unwrap();   // sin esto, main podria acabar antes que el hijo
+}
+```
+
+Desde la llamada a `spawn` hay **dos** hilos vivos, cada uno con su propia pila y planificado de forma independiente por el núcleo. El orden en que se intercalan sus `println!` no está determinado: puede cambiar entre ejecuciones. Rust adopta un modelo de hilos **1:1**: cada `thread::spawn` crea un hilo *nativo* del sistema operativo —un `pthread` en Unix, un hilo del núcleo en Windows—, no un hilo verde de un planificador propio. Rust tuvo hilos verdes M:N antes de la 1.0 y los retiró: un lenguaje de sistemas no debe imponer un runtime pesado, y el modelo 1:1 deja el coste y el control del planificador en manos del sistema operativo.
+
+La firma condensa el nivel entero:
+
+```rust
+pub fn spawn<F, T>(f: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+```
+
+La clausura es `FnOnce` porque el hilo la invoca **una sola vez**. Ha de ser `Send + 'static` —transportable a otro hilo y sin referencias prestadas de duración limitada—, exigencias que desmenuzan las lecciones dos y tres. Y `T`, lo que la clausura devuelve, viaja de vuelta al hilo que haga `join`; por eso también es `Send`.
+
+## join: bloquear y cosechar el valor
+
+El `JoinHandle<T>` no es decoración: es el único canal por el que recuperas el valor de retorno del hilo. `join` toma `self` **por valor** —consume el manejador, así que solo puedes reunirte con un hilo una vez— y **bloquea** al llamante hasta que el hijo termina:
+
+```rust
+use std::thread;
+
+fn main() {
+    let handle = thread::spawn(|| {
+        let mut suma = 0u64;
+        for i in 1..=1_000 { suma += i; }
+        suma                         // este valor viajara al que haga join
+    });
+
+    let total: u64 = handle.join().unwrap();
+    println!("el hilo calculo {total}");
+}
+```
+
+`join` devuelve `thread::Result<T>`, que es `Result<T, Box<dyn Any + Send + 'static>>`. El caso `Ok` lleva el valor que la clausura devolvió. El caso `Err` aparece cuando el hilo **entró en pánico**, y su `Box<dyn Any>` transporta la carga del `panic!` —el `&str` o `String` del mensaje—, recuperable con `downcast_ref`:
+
+```rust
+let handle = thread::spawn(|| panic!("algo se rompio dentro"));
+
+match handle.join() {
+    Ok(()) => println!("termino sin incidentes"),
+    Err(carga) => {
+        if let Some(msg) = carga.downcast_ref::<&str>() {
+            println!("el hilo entro en panico: {msg}");
+        }
+    }
+}
+```
+
+Un pánico en un hilo secundario **no derriba el proceso**: desenrolla solo la pila de ese hilo y se convierte en el `Err` de su `join`. Ese aislamiento —un fallo local que no se vuelve global— es una de las razones por las que los hilos son fronteras naturales de contención, como viste con `catch_unwind`. En cambio, un pánico en el hilo *principal* termina el proceso.
+
+<Callout type="warn" title="Un hilo sin join queda desatendido, y main que retorna lo mata">
+Si sueltas el `JoinHandle` sin llamar a `join`, el hilo no muere: queda **desatendido** (*detached*) y sigue por su cuenta. Pero cuando `main` retorna, el proceso entero termina, y con él **todos los hilos que aún vivan**, de golpe y sin ejecutar los destructores de sus pilas. Un hilo que imprime cada segundo y al que nadie espera puede no imprimir jamás si `main` acaba antes. Si quieres que su trabajo se complete, has de hacerle `join`.
+</Callout>
+
+## Builder: nombre, pila y creación falible
+
+`thread::spawn` es azúcar de `Builder::new().spawn(...).unwrap()`. Si el sistema operativo no puede crear el hilo —agotó memoria o el límite de hilos—, ese `unwrap` interno entra en pánico. `thread::Builder` expone la operación **falible** y dos atributos que `spawn` fija por defecto:
+
+```rust
+use std::thread;
+
+let builder = thread::Builder::new()
+    .name("trabajador-io".to_string())   // aparece en panicos y depuradores
+    .stack_size(4 * 1024 * 1024);        // 4 MiB en vez del defecto (~2 MiB)
+
+let handle = builder
+    .spawn(|| {
+        let actual = thread::current();
+        println!("soy {}", actual.name().unwrap_or("anonimo"));
+    })
+    .expect("el SO no pudo crear el hilo");   // spawn devuelve io::Result
+
+handle.join().unwrap();
+```
+
+El `spawn` de `Builder` devuelve `io::Result<JoinHandle<T>>`, para que decidas tú qué hacer ante el fallo en lugar de entrar en pánico. El **nombre** viaja a los mensajes de diagnóstico; el **tamaño de pila** importa cuando un hilo hace recursión profunda o reserva buffers grandes en la pila, y el defecto de unos 2 MiB se queda corto. `thread::current()` devuelve un manejador al hilo en curso, con el que consultar su nombre o su identificador (`ThreadId`).
+
+<Mermaid code={`flowchart TD
+  S[thread spawn recibe una clausura FnOnce] --> J[Devuelve un JoinHandle de tipo T]
+  S --> R[El hilo hijo corre a la vez con su propia pila]
+  J -->|join toma self y bloquea| W[Espera a que el hijo termine]
+  W --> OK[Ok con el valor que devolvio la clausura]
+  W --> ER[Err con la carga del panic del hilo]
+  style S fill:#89b4fa,color:#11111b
+  style J fill:#cba6f7,color:#11111b
+  style OK fill:#a6e3a1,color:#11111b
+  style ER fill:#f38ba8,color:#11111b`} />
+
+<Callout type="dios" title="El JoinHandle es la costura que devuelve dos flujos temporales a uno">
+Un hilo es, en esencia, una bifurcación del tiempo del programa: donde había una única secuencia de instantes hay ahora dos, avanzando en paralelo sin un orden garantizado entre ellas. Esa bifurcación plantea de inmediato dos problemas que el resto del nivel no hará sino refinar. El primero es de *sincronización*: si dos flujos avanzan a la vez, ¿cómo sabe uno que el otro ya terminó, y cómo recibe su resultado sin adivinar? El segundo es de *pertenencia*: si ambos flujos tocan los mismos datos, ¿quién manda? `JoinHandle` y `join` son la respuesta de Rust al primero, y la respuesta es elegante porque es *tipada*. `join` no es una simple barrera que dice "espera aquí"; es una barrera que **transporta un valor** de tipo `T` de vuelta al llamante, cerrando la costura temporal exactamente donde se abrió y devolviendo los dos flujos a uno solo con un dato en la mano. Que ese `T` esté en la firma —`JoinHandle<T>`, no `JoinHandle` a secas— significa que el compilador conoce el tipo del fruto del hilo y lo verifica en la reunión, igual que verificaría el retorno de una función. Y que el `Err` de `join` lleve la carga de un pánico convierte la muerte de un hilo en un *valor* que el padre puede inspeccionar, no en una señal que se pierde: el aislamiento del fallo, que en la lección del `panic!` era una propiedad del desenrollado, aquí se vuelve un `Result` que el sistema de tipos te obliga a mirar. La lección de fondo es que Rust trata la concurrencia con las mismas armas que trata todo lo demás —tipos, posesión, valores que viajan por firmas— en lugar de con un mecanismo aparte. Un hilo no es una excepción al modelo del lenguaje: es el modelo del lenguaje aplicado al tiempo. Lanzar es mover una clausura a un flujo nuevo; reunir es mover un valor de vuelta. Interioriza que `join` mueve un `T` a través de la frontera temporal, y las lecciones sobre `move`, `Send` y `scope` serán variaciones de esa única idea.
+</Callout>
+
+<Callout type="note" title="Lo esencial de spawn y join">
+`thread::spawn(clausura)` crea un hilo nativo (modelo 1:1) con pila propia que corre a la vez, y devuelve un `JoinHandle<T>`. La clausura es `FnOnce + Send + 'static` y su retorno `T` también es `Send`. `join` toma `self`, bloquea hasta que el hilo acaba y devuelve `thread::Result<T>` = `Result<T, Box<dyn Any + Send>>`: `Ok` con el valor, `Err` con la carga del `panic!` del hilo. Un hilo sin `join` queda desatendido y muere si `main` retorna antes. `thread::Builder` da nombre, tamaño de pila y un `spawn` falible que devuelve `io::Result`.
+</Callout>
+
+<Reto title="Lanza, reúne y cosecha">
+1. Lanza tres hilos que impriman su índice y observa entre varias ejecuciones que el orden de salida no es determinista; luego hazles `join` en orden y comprueba que el programa siempre termina limpio.
+2. Escribe una clausura que sume un rango grande y devuelva el total; recógelo con `join().unwrap()` y anota el tipo `T` que atraviesa la frontera.
+3. Provoca un `panic!` dentro de un hilo y captura la carga con `match` sobre `join()`, usando `downcast_ref::<&str>()` para imprimir el mensaje; confirma que el proceso no muere.
+4. Lanza un hilo que imprima cada 200 ms y **no** le hagas `join`; haz que `main` retorne enseguida y explica por qué el hilo apenas imprime.
+5. Sustituye un `thread::spawn` por `thread::Builder` con nombre y `stack_size`, maneja el `io::Result` de su `spawn` y recupera el nombre desde dentro con `thread::current().name()`.
+</Reto>

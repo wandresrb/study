@@ -1,0 +1,125 @@
+---
+title: "tokio-console: ver en vivo la población de tareas del runtime"
+description: "Si el depurador no puede listar las tareas dormidas, hace falta una herramienta que interrogue al propio runtime. tokio-console instrumenta el scheduler y expone, en una interfaz viva, cada tarea con su tiempo ocupada, su número de sondeos, sus poll times y sus wakeups, además de los recursos que retiene. Es el top de las tareas async: revela de un vistazo la que nunca cede el hilo, la que se auto-despierta en bucle y la que se durmió y no volvió."
+subject: rust
+level: 36
+order: 3
+icon: "36.3"
+duracion: "18 min"
+---
+
+<Lead>
+La primera lección dejó una carencia concreta: un depurador de pila no puede *listar* las diez mil tareas dormidas de un servidor, ni decirte cuánto tarda cada sondeo, ni cuál se auto-despierta en bucle quemando un hilo. Si la información no está en la pila sino en el runtime, la herramienta tiene que **interrogar al runtime**. Eso es `tokio-console`: un instrumento que se conecta al scheduler de Tokio y muestra, en una interfaz de terminal viva y refrescándose, la población completa de tareas —cada una con su estado, su tiempo total ocupada, su número de `poll`, su *poll time* máximo y sus wakeups— junto con los recursos que retienen, como mutexes y semáforos. Es, casi literalmente, el `top` de las tareas async: donde `top` te enseña los procesos que compiten por la CPU, `tokio-console` te enseña las tareas que compiten por tus hilos trabajadores. Y con esa vista, patologías que eran invisibles se vuelven obvias de un vistazo: la tarea que nunca cede, la que se despierta a sí misma sin avanzar, la que se durmió y jamás volvió.
+</Lead>
+
+<Objetivos>
+
+- Instrumentar una aplicación Tokio para `tokio-console` con `console-subscriber` y el flag `--cfg tokio_unstable`.
+- Leer las métricas por tarea: tiempo ocupada (*busy*), número de sondeos, *poll time* y wakeups.
+- Detectar la tarea que **nunca cede** el hilo y la que se **auto-despierta** en bucle, dos patologías de cooperación.
+- Observar los recursos (mutexes, semáforos) y sus tiempos de espera para localizar contención.
+
+</Objetivos>
+
+## Conectar la consola al runtime
+
+`tokio-console` tiene dos mitades: una *subscriber* que vive dentro de tu proceso y publica métricas por gRPC, y un cliente TUI aparte que se conecta y las dibuja. La instrumentación se apoya en el mismo `tracing` de la lección anterior, más contadores internos que Tokio solo expone bajo una bandera de compilación *inestable*:
+
+```toml
+[dependencies]
+console-subscriber = "0.4"
+tokio = { version = "1", features = ["full", "tracing"] }
+```
+
+```rust
+#[tokio::main]
+async fn main() {
+    console_subscriber::init(); // publica en el puerto 6669 por defecto
+    // ... tu aplicacion ...
+}
+```
+
+La pieza que se olvida siempre es el flag: Tokio solo emite la instrumentación de tareas si compilas con `tokio_unstable` activo. Sin él, la consola arranca pero no ve ninguna tarea.
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" cargo run
+# en otra terminal:
+tokio-console            # se conecta a http://127.0.0.1:6669
+```
+
+<Callout type="warn" title="tokio_unstable es una ABI inestable, no para producción a ciegas">
+El flag `--cfg tokio_unstable` habilita API cuya compatibilidad Tokio **no** garantiza entre versiones menores: puede cambiar o romperse sin aviso. Además, instrumentar cada tarea tiene un coste —memoria por tarea y trabajo por sondeo— que no quieres pagar por defecto en un servicio de alta carga. La práctica sana es dejarlo tras una *feature* de Cargo que actives solo al diagnosticar, o en compilaciones de desarrollo y *staging*. `tokio-console` es un instrumento de laboratorio potentísimo, no un agente que dejas corriendo en toda tu flota.
+</Callout>
+
+## Las métricas por tarea, y qué cuenta cada una
+
+La vista principal es una tabla con una fila por tarea. Cada columna responde a una pregunta que el depurador no podía:
+
+<Cards>
+  <Card icon="⏱️" title="Busy y Idle">
+    *Busy* es el tiempo total que la tarea pasó **ejecutándose** dentro de un `poll`; *idle*, el que pasó dormida esperando. Una tarea de E/S sana es casi todo idle. Mucho busy en algo que debería esperar delata cómputo escondido.
+  </Card>
+  <Card icon="🔁" title="Polls">
+    Cuántas veces se sondeó la tarea. Un número que crece a velocidad vertiginosa sin que la tarea termine es la firma de un bucle de auto-despertar: se reprograma una y otra vez sin progresar.
+  </Card>
+  <Card icon="📊" title="Poll time">
+    Cuánto dura *un solo* `poll`, en promedio y en el máximo. Es la métrica reina: un `poll` debe durar microsegundos y ceder. Un *poll time* de milisegundos significa que la tarea retuvo el hilo trabajador ese tiempo sin dejar avanzar a nadie.
+  </Card>
+  <Card icon="⏰" title="Wakes y self-wakes">
+    Cuántas veces la despertó un `waker`. Los *self-wakes* —que se despierte a sí misma— en volumen alto revelan una tarea que gira en vacío en vez de dormir de verdad hasta que haya trabajo.
+  </Card>
+</Cards>
+
+La consola también resalta con avisos las tareas cuyo comportamiento es sospechoso: marca las que han tenido *polls* anormalmente largos ("this task has lost its waker" o avisos de *poll time* elevado) y las que acumulan *self-wakes*. No tienes que calcular nada: la herramienta subraya la anomalía y tú vas a mirar esa fila.
+
+## Cazar la tarea que no coopera
+
+El modelo async es un pacto de cooperación: cada tarea debe *ceder* con frecuencia en un `.await` para que las demás avancen. `tokio-console` es el instrumento que audita ese pacto y señala a quien lo rompe. Dos delitos son los más comunes.
+
+El primero es **no ceder nunca**: una tarea que ejecuta un bucle de CPU largo o llama a una API bloqueante dentro de un `poll`. No hay `.await` que la suspenda, así que retiene el hilo trabajador de principio a fin. En la consola aparece con un *poll time* máximo enorme —el `poll` que nunca termina— y con el *busy* disparado. Todas las tareas que compartían ese hilo se ven hambrientas, sin culpa propia.
+
+```rust
+// Delito: un poll que no cede. Su poll time maximo sera enorme en la consola.
+async fn agregar(datos: &[u64]) -> u64 {
+    let mut acc = 0;
+    for &x in datos {          // millones de iteraciones sin un solo await
+        acc = acc.wrapping_add(fib(x)); // CPU pura: nunca cede el hilo
+    }
+    acc
+}
+```
+
+El segundo es **auto-despertarse en bucle**: una tarea, a menudo un `Future` escrito a mano, que devuelve `Poll::Ready` de un `waker` sin haber progresado, o que se reprograma cada vez que la sondean. En la consola se delata por un número de `polls` que sube como la espuma y una cifra alta de *self-wakes*, mientras el trabajo real no avanza. Consume CPU fingiendo estar ocupada.
+
+<Mermaid code={`flowchart LR
+  APP[Tu app con console-subscriber] -->|metricas por gRPC| SRV[Puerto 6669]
+  SRV --> TUI[tokio-console TUI]
+  TUI --> T1[Tarea sana casi todo idle]
+  TUI --> T2[Tarea con poll time enorme no cede]
+  TUI --> T3[Tarea con self-wakes en bucle]
+  style APP fill:#89b4fa,color:#11111b
+  style T1 fill:#a6e3a1,color:#11111b
+  style T2 fill:#f38ba8,color:#11111b
+  style T3 fill:#fab387,color:#11111b`} />
+
+Más allá de las tareas, la consola tiene una vista de **recursos**: cada `Mutex`, `RwLock` o `Semaphore` de Tokio aparece con cuántas tareas esperan por él y cuánto llevan esperando. Si una operación va lenta y sospechas de contención, aquí ves de un vistazo qué candado tiene cola y qué tareas están detenidas en ella. Es la antesala del profiling de la lección cinco: la consola no solo te dice *que* algo va mal, sino *dónde* se están acumulando las tareas.
+
+<Callout type="info" title="La consola trae lints que nombran la patología">
+`tokio-console` no solo muestra números: incorpora *warnings* que los interpretan por ti. Marca la tarea que lleva demasiado tiempo *busy* sin ceder, la que acumula *self-wakes* sospechosos y la que parece haber **perdido su waker** —dormida sin nadie que la despierte, la firma del `.await` que nunca vuelve de la próxima lección—. Cada aviso es un puntero a la fila que debes mirar, traduciendo la métrica cruda a un diagnóstico con nombre. Empieza por la pestaña de warnings antes de bucear en las columnas.
+</Callout>
+
+<Callout type="dios" title="tokio-console observa la dimensión que el depurador no tiene: la población y el tiempo compartido">
+Un depurador clásico es un instrumento de *profundidad*: toma un hilo y te deja bajar por su pila hasta el fondo, congelando un instante. Es perfecto cuando el problema es "¿cómo llegó este hilo hasta aquí?", porque la pila contiene esa respuesta. Pero la primera lección demostró que en async las preguntas importantes son de otra naturaleza: no "¿qué hay bajo este marco?", sino "¿cuántas tareas hay, cuánto tiempo de hilo consume cada una, cuál rompe la cooperación?". Esas son preguntas de *anchura* y de *tiempo*, no de profundidad, y ninguna pila puede contestarlas porque ninguna pila contiene a las diez mil tareas dormidas ni el histórico de cómo se repartieron los hilos. `tokio-console` es el instrumento de esa otra dimensión. Al pedirle al scheduler que confiese sus propias métricas —cada `poll`, cada *wake*, cada milisegundo de *busy*—, hace visible el reparto cooperativo del tiempo que es la esencia misma de async y que, por construcción, vive en el runtime y no en ningún hilo. Y hay una elegancia en que la patología se lea directamente en la métrica: la lección 32 definió el pecado capital de async como "bloquear el hilo del executor", y ese pecado *es* un `poll time` alto; definió la promesa como "millones de tareas que ceden", y esa promesa *es* un mar de tareas con mucho idle y poco busy. La consola no interpreta ni adivina: expone los números que ese modelo produce, y en ellos la virtud y el vicio tienen firmas inconfundibles. Por eso cambia el propio acto de depurar. Dejas de preguntarte "¿qué hace este hilo?" y empiezas a preguntar, como quien mira un `top`, "¿quién se está comiendo mis hilos y por qué no los suelta?". La respuesta ya no se lee hacia abajo en una pila; se lee a lo ancho en una tabla de tareas, que es donde async, de verdad, vive.
+</Callout>
+
+<Callout type="note" title="Lo esencial de tokio-console">
+`tokio-console` interroga al scheduler de Tokio y muestra en vivo cada tarea. Requiere `console-subscriber`, la feature `tracing` de Tokio y compilar con `RUSTFLAGS="--cfg tokio_unstable"`; el flag es una ABI inestable y con coste, reservada al diagnóstico, no a producción a ciegas. Cada tarea trae *busy* frente a *idle*, número de `polls`, *poll time* (promedio y máximo) y *wakes*/self-wakes. Un *poll time* alto delata la tarea que no cede el hilo —un bucle de CPU o una llamada bloqueante—; un torrente de *polls* y *self-wakes* delata la que gira en vacío. La vista de recursos revela qué `Mutex` o `Semaphore` tiene cola. Es el `top` de las tareas: observa la anchura y el tiempo que ninguna pila contiene.
+</Callout>
+
+<Reto title="Pon el runtime bajo el microscopio">
+1. Instrumenta una app Tokio con `console_subscriber::init()`, compílala con `--cfg tokio_unstable` y conéctate con `tokio-console`. Identifica las columnas *busy*, *polls*, *poll time* y *wakes*.
+2. Introduce una tarea con un bucle de CPU sin `.await` y localízala en la consola por su *poll time* máximo. Explica por qué las demás tareas del mismo hilo se ralentizan.
+3. Escribe un `Future` a mano que llame a `wake()` cada vez que lo sondean sin progresar, y obsérvalo en la consola por su explosión de `polls` y *self-wakes*.
+4. Añade un `tokio::sync::Mutex` compartido por varias tareas que compiten, ve a la vista de recursos y observa cuántas tareas esperan por él y cuánto.
+5. Argumenta por qué ninguna de las cuatro observaciones anteriores podría obtenerse con un depurador de pila, conectándolo con la primera lección del nivel.
+</Reto>

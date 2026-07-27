@@ -1,0 +1,150 @@
+---
+title: "Tu propia caché de objetos: kmem_cache_create"
+description: "Cuando asignas millones de objetos del mismo tipo, declárale ese tipo al asignador: kmem_cache_create, kmem_cache_alloc, kmem_cache_free y kmem_cache_destroy. La semántica exacta del constructor, el macro KMEM_CACHE, la fusión de caches, y las flags que importan: SLAB_HWCACHE_ALIGN, SLAB_ACCOUNT y SLAB_TYPESAFE_BY_RCU."
+subject: kernel
+level: 21
+order: 4
+icon: "21.4"
+duracion: "16 min"
+---
+
+<Lead>
+`kmalloc` sirve bytes anónimos; una caché propia sirve objetos de un *tipo*. Cuando tu subsistema crea y destruye millones de estructuras idénticas, declararle ese tipo al asignador con `kmem_cache_create` le da la información para optimizar alineación, contabilidad, depuración y —vía el constructor— el estado invariante. Esta es la interfaz que usan `dentry`, `inode`, `task_struct` y casi todo lo caliente del kernel.
+</Lead>
+
+<Objetivos>
+
+- Crear y destruir una caché con `kmem_cache_create` y `kmem_cache_destroy`.
+- Asignar y liberar con `kmem_cache_alloc` y `kmem_cache_free`.
+- Entender qué hace, y qué no, un constructor de caché.
+- Elegir flags: alineación, `SLAB_ACCOUNT` y `SLAB_TYPESAFE_BY_RCU`.
+
+</Objetivos>
+
+## Crear la caché
+
+La firma es estable desde hace más de una década: nombre, tamaño del objeto, alineación deseada, banderas y un constructor opcional.
+
+```c
+#include <linux/slab.h>
+
+struct conexion {
+	spinlock_t        lock;
+	struct list_head  nodo;
+	u64               id;
+	unsigned char     estado;
+};
+
+static struct kmem_cache *conn_cache;
+
+static int __init conn_init(void)
+{
+	conn_cache = kmem_cache_create("conexion",
+				       sizeof(struct conexion),
+				       0,                    /* alineacion: 0 = la natural */
+				       SLAB_HWCACHE_ALIGN,   /* alinea a linea de cache */
+				       NULL);                /* sin constructor */
+	if (!conn_cache)
+		return -ENOMEM;
+	return 0;
+}
+```
+
+El nombre aparecerá en `/proc/slabinfo` y en `/sys/kernel/slab`, así que hazlo descriptivo. Para el caso trivial —nombre igual al de la estructura, alineación natural, sin constructor— existe un macro que ahorra la ceremonia:
+
+```c
+/* equivalente compacto: usa sizeof y __alignof__ de la estructura */
+conn_cache = KMEM_CACHE(conexion, SLAB_HWCACHE_ALIGN);
+```
+
+## alloc, free y destroy
+
+El ciclo de vida es simétrico y estricto. Asignas de la caché, la usas, la liberas *a la misma caché*, y al descargar el módulo la destruyes.
+
+```c
+struct conexion *c = kmem_cache_alloc(conn_cache, GFP_KERNEL);
+if (!c)
+	return -ENOMEM;
+
+/* ... usar c ... */
+
+kmem_cache_free(conn_cache, c);      /* devuelve a SU caché, no a otra */
+
+/* al descargar el modulo, cuando ya NO queda ningun objeto vivo */
+kmem_cache_destroy(conn_cache);
+```
+
+Hay una variante `kmem_cache_zalloc` que pone el objeto a cero, y `kmem_cache_alloc_node` para forzar un nodo NUMA. Para ráfagas, `kmem_cache_alloc_bulk` y `kmem_cache_free_bulk` mueven muchos objetos por llamada, amortizando el coste del camino lento.
+
+<Callout type="danger" title="Destruir una caché con objetos vivos es un bug">
+`kmem_cache_destroy` exige que **todos** los objetos estén liberados. Si queda uno vivo, el kernel emite un aviso, la caché no se libera y tienes una fuga garantizada al recargar el módulo. El orden de desmontaje importa: primero drena tus estructuras y libera cada objeto con `kmem_cache_free`, y solo entonces destruye la caché. Un `rmmod` que se salte ese orden deja basura en `/proc/slabinfo` hasta el próximo reinicio.
+</Callout>
+
+## El constructor: estado invariante, no inicialización por uso
+
+Aquí está la sutileza que separa a quien entiende el slab de quien lo usa a ciegas. El constructor **no se ejecuta en cada `kmem_cache_alloc`**. Se ejecuta una sola vez por objeto, en el momento en que una slab nueva se puebla desde el buddy. Su cometido es llevar el objeto a un **estado base invariante** que se *preserva* a lo largo de los ciclos de asignación y liberación.
+
+```c
+static void conn_ctor(void *p)
+{
+	struct conexion *c = p;
+
+	spin_lock_init(&c->lock);      /* invariante: siempre un lock listo */
+	INIT_LIST_HEAD(&c->nodo);      /* invariante: siempre una lista vacia */
+}
+
+/* crear con el constructor */
+conn_cache = kmem_cache_create("conexion", sizeof(struct conexion),
+			       0, SLAB_HWCACHE_ALIGN, conn_ctor);
+```
+
+<Mermaid code={`flowchart LR
+  NEW[slab nueva del buddy] -->|ctor una vez por objeto| BASE[estado base invariante]
+  BASE --> ALLOC[kmem_cache_alloc]
+  ALLOC --> USE[uso con campos propios]
+  USE -->|el usuario restaura el estado base| FREE[kmem_cache_free]
+  FREE --> BASE
+  style BASE fill:#a6e3a1,color:#11111b
+  style USE fill:#f9e2af,color:#11111b`} />
+
+El contrato es un pacto entre las dos partes: el asignador te entrega el objeto *ya construido* —el `spinlock` inicializado, la `list_head` vacía— y tú, antes de liberarlo, debes **devolverlo a ese mismo estado base** (lista vacía, lock desbloqueado). Así el constructor solo corre una vez por objeto físico, no una vez por préstamo, y su coste se amortiza sobre miles de ciclos. Los campos que siempre se inicializan igual —locks, listas embebidas— van al constructor; los datos que cambian en cada uso los fijas tú tras el `alloc`.
+
+<Callout type="warn" title="Constructor y kmem_cache_zalloc se excluyen">
+Si tu caché tiene constructor, **no** uses `kmem_cache_zalloc`: poner el objeto a cero arrasaría el estado que el constructor dejó montado —un `spinlock` a cero no es un `spinlock` inicializado—. Las dos estrategias son mutuamente excluyentes: o construyes una vez y preservas el estado base, o pones a cero en cada asignación y reconstruyes lo que necesites. Mezclarlas corrompe el siguiente préstamo del objeto de forma silenciosa.
+</Callout>
+
+## Cuándo merece la pena, y flags que importan
+
+¿Por qué crear una caché en vez de usar `kmalloc`? Por control sobre el tipo: alineación garantizada, un constructor que amortiza inicialización, contabilidad por cgroup, aislamiento para depurar, y semánticas especiales de liberación. Las banderas que gobiernan todo eso:
+
+<Cards>
+  <Card icon="📐" title="SLAB_HWCACHE_ALIGN">
+    Alinea cada objeto a una línea de caché. Evita el false sharing entre objetos vecinos; cuesta algo de memoria.
+  </Card>
+  <Card icon="🧾" title="SLAB_ACCOUNT">
+    Contabiliza los objetos al cgroup de memoria del proceso. Obligatorio para asignaciones que un usuario puede disparar a voluntad.
+  </Card>
+  <Card icon="♻️" title="SLAB_TYPESAFE_BY_RCU">
+    Al liberar, el objeto puede reutilizarse, pero su slab no vuelve al buddy hasta un grace period. Habilita búsquedas lockless.
+  </Card>
+</Cards>
+
+`SLAB_TYPESAFE_BY_RCU` (antes `SLAB_DESTROY_BY_RCU`) merece una frase propia. Garantiza *seguridad de tipo*, no de identidad: un lector RCU que capturó un puntero verá siempre un objeto válido **del tipo correcto**, aunque quizá ya reutilizado por otro; la memoria no se recicla al buddy bajo sus pies durante el grace period. Es el cimiento de patrones de búsqueda sin lock donde revalidas la identidad tras adquirir el objeto. Añade también `SLAB_RECLAIM_ACCOUNT` para objetos que el kernel puede reclamar bajo presión (estilo `dentry`), y `kmem_cache_create_usercopy` cuando una región del objeto se copia a espacio de usuario y quieres el *hardened usercopy* limitado a esa ventana.
+
+Un detalle de rendimiento que suele pasarse por alto: para caminos que asignan o liberan muchos objetos de golpe —una cola de red que se drena, un `readahead` que prepara descriptores— existen `kmem_cache_alloc_bulk` y `kmem_cache_free_bulk`. En lugar de recorrer la ruta por-CPU una vez por objeto, toman y sueltan el estado local una sola vez para todo el lote y arrastran una ristra entera de la freelist de una tacada. Es la diferencia entre N transacciones y una sola, y en las rutas calientes de la pila de red se nota en el perfil.
+
+<Callout type="info" title="La fusión de caches y cómo desactivarla">
+SLUB **fusiona** cachés compatibles: si tu estructura tiene el mismo tamaño, alineación y flags que otra y no lleva constructor, sus objetos pueden compartir slabs con, digamos, kmalloc-64. Es un ahorro de memoria real, pero borra la frontera entre tipos y estorba al depurar. Un constructor, una bandera distintiva, `SLAB_NO_MERGE`, o activar `slub_debug` para esa caché la mantienen separada e identificable en `/proc/slabinfo`.
+</Callout>
+
+<Callout type="dios" title="Declarar un tipo al asignador es cambiar de contrato">
+La diferencia entre `kmalloc` y una caché propia no es de rendimiento, es de *contrato de información*. Con `kmalloc` le dices al kernel "dame N bytes anónimos" y él no sabe nada más: cada préstamo llega en blanco, sin estructura ni historia. Con `kmem_cache_create` le dices "voy a gestionar el ciclo de vida de millones de objetos de este tipo exacto", y esa declaración desbloquea toda una batería de optimizaciones imposibles sin ella: talla las slabs a la medida sin desperdicio, alinea a la línea de caché, ejecuta el constructor una sola vez y preserva el estado invariante entre préstamos, contabiliza al cgroup correcto, aísla el tipo para que el depurador lo distinga, y ofrece semánticas de liberación tan finas como la seguridad de tipo bajo RCU. Es la misma idea que en el nivel 21.1 elevaba el slab por encima del buddy, ahora en manos del programador: pasar de pedir memoria a *modelar un tipo con su ciclo de vida*. Cuando internalizas esto, dejas de ver `kmem_cache_create` como una optimización opcional y empiezas a verlo como lo que es: la forma en que el kernel razona sobre sus propios objetos. Por eso las estructuras más importantes del núcleo —`task_struct`, `inode`, `dentry`, `sk_buff`— tienen todas su caché dedicada.
+</Callout>
+
+<Reto title="Modela un tipo con su caché">
+1. Crea una caché para una estructura tuya con `kmem_cache_create` y su gemelo `KMEM_CACHE`, y compáralos.
+2. Escribe un constructor que inicialice un `spinlock` y una `list_head`, y explica por qué corre una sola vez por objeto.
+3. Justifica por qué usar `kmem_cache_zalloc` sobre una caché con constructor es un error.
+4. Elige, con argumentos, las flags para una caché de objetos que un `syscall` de usuario puede crear en masa.
+5. Explica qué garantiza y qué no `SLAB_TYPESAFE_BY_RCU`, y en qué patrón de búsqueda lockless se apoya.
+</Reto>

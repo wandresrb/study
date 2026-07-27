@@ -1,0 +1,136 @@
+---
+title: "hrtimers: temporizadores de alta resolución"
+description: "Los timers con precisión de nanosegundos desligados de jiffies: struct hrtimer, la nueva API hrtimer_setup, arrancar con hrtimer_start sobre un ktime_t en modo relativo o absoluto, el callback que devuelve HRTIMER_RESTART y se rearma con hrtimer_forward_now, y por qué el audio, la red y el tiempo real los exigen."
+subject: kernel
+level: 45
+order: 4
+icon: "45.4"
+duracion: "16 min"
+---
+
+<Lead>
+Hay dominios donde redondear al siguiente tick es inaceptable. Un buffer de audio que debe rellenarse cada 5,3 ms, un shaper de tráfico que espacia paquetes al microsegundo, un hilo de tiempo real con un plazo duro: ninguno tolera la granularidad grosera de `jiffies`. Para ellos existe el hrtimer, el temporizador de alta resolución, que abandona el contador de ticks y se apoya directamente en el `clock_event_device` en modo oneshot para prometer un disparo con precisión de nanosegundos. Es la otra mitad del universo de timers del kernel, y la que hace posible el sonido, la red moderna y el tiempo real.
+</Lead>
+
+<Objetivos>
+
+- Distinguir el hrtimer del timer clásico y saber cuándo la precisión justifica su coste.
+- Armar un hrtimer con la API moderna `hrtimer_setup` sobre un reloj y un modo.
+- Arrancarlo con `hrtimer_start` usando un `ktime_t` relativo o absoluto.
+- Escribir un callback periódico que devuelva `HRTIMER_RESTART` y se rearme con `hrtimer_forward_now`.
+
+</Objetivos>
+
+## Otra base de tiempo: ktime_t y el oneshot
+
+El hrtimer no cuenta en `jiffies`: cuenta en nanosegundos, con el tipo `ktime_t` (un `s64` de nanosegundos). Y no espera al tick para disparar: programa el `clock_event_device` en modo oneshot (nivel 45.2) para pedir una interrupción en el instante exacto. Por eso su resolución no depende de `HZ` sino de la calidad del hardware de eventos, que en 2026 baja cómodamente al microsegundo o menos.
+
+La estructura vive en `include/linux/hrtimer.h` y se ancla a un reloj concreto —`CLOCK_MONOTONIC` para intervalos, `CLOCK_REALTIME` para plazos de pared—:
+
+```c
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
+
+struct generador_audio {
+	struct hrtimer	timer;
+	ktime_t		periodo;      /* p. ej. 5,33 ms por buffer */
+	void		*ring;
+};
+```
+
+Un `ktime_t` se construye con ayudantes claros, sin aritmética cruda de nanosegundos regada por el código:
+
+```c
+ktime_t p = ktime_set(0, 5333000);     /* 0 s y 5 333 000 ns */
+ktime_t q = ms_to_ktime(5);            /* 5 ms exactos       */
+ktime_t r = us_to_ktime(125);          /* 125 us             */
+```
+
+## Armar y arrancar: hrtimer_setup y hrtimer_start
+
+La API moderna arma el timer con `hrtimer_setup`, que en una sola llamada fija la función de callback, el reloj y el modo. Sustituye al antiguo par de `hrtimer_init` seguido de asignar `.function` a mano, un patrón que dejaba una ventana peligrosa entre inicializar y fijar el callback:
+
+```c
+static enum hrtimer_restart audio_tick(struct hrtimer *t);
+
+static void audio_init(struct generador_audio *g)
+{
+	g->periodo = ms_to_ktime(5);
+	hrtimer_setup(&g->timer, audio_tick,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+}
+```
+
+Armado no es andando. Se arranca con `hrtimer_start`, dándole el instante y el modo. El modo decide cómo se interpreta el `ktime_t`:
+
+- **`HRTIMER_MODE_REL`** — relativo: "dispara dentro de este tiempo a partir de ahora". Lo habitual para periodos e intervalos.
+- **`HRTIMER_MODE_ABS`** — absoluto: "dispara en este instante exacto del reloj". Para plazos de pared o sincronización con una base común.
+- Los sufijos **`_HARD`** y **`_SOFT`** eligen si el callback corre en contexto de interrupción dura o en el softirq de hrtimers.
+
+```c
+/* arranca: primer disparo dentro de un periodo */
+hrtimer_start(&g->timer, g->periodo, HRTIMER_MODE_REL);
+```
+
+## El callback periódico: HRTIMER_RESTART y forward
+
+Aquí está la diferencia estructural más visible con el timer clásico. El callback de un hrtimer **devuelve** un `enum hrtimer_restart`: si devuelve `HRTIMER_NORESTART`, el timer muere tras disparar; si devuelve `HRTIMER_RESTART`, el core lo vuelve a encolar automáticamente con el `->expires` que hayas avanzado. Ese mecanismo integrado hace trivial un periódico exacto y sin deriva:
+
+```c
+static enum hrtimer_restart audio_tick(struct hrtimer *t)
+{
+	struct generador_audio *g = container_of(t, struct generador_audio, timer);
+
+	rellenar_buffer(g->ring);        /* trabajo breve, sin dormir */
+
+	/* avanza el vencimiento un periodo desde ahora, absorbiendo el retraso,
+	   y devuelve RESTART para que el core lo re-encole sin deriva */
+	hrtimer_forward_now(t, g->periodo);
+	return HRTIMER_RESTART;
+}
+```
+
+`hrtimer_forward_now` es la pieza clave del periódico exacto: avanza `->expires` en múltiplos del periodo hasta rebasar el instante actual, de modo que aunque un disparo llegue tarde, el siguiente se calcula sobre la rejilla teórica y no se acumula deriva. Un bucle de `hrtimer_start` relativos dentro del callback derivaría; `hrtimer_forward_now` no.
+
+El callback de un hrtimer corre por defecto en contexto de interrupción dura (desde `hrtimer_interrupt`), así que la prohibición de dormir es aún más estricta que en el softirq del timer clásico. Debe ser cortísimo. Si necesitas dormir o hacer trabajo pesado, usa un modo `_SOFT` o despierta un hilo, pero jamás bloquees dentro del callback.
+
+## Cancelar y el coste real
+
+Cancelar un hrtimer sigue el mismo patrón síncrono que el timer clásico: `hrtimer_cancel` borra y espera a que el callback en vuelo termine, mientras que `hrtimer_try_to_cancel` no espera y puede fallar si el callback está corriendo.
+
+```c
+static void audio_teardown(struct generador_audio *g)
+{
+	hrtimer_cancel(&g->timer);   /* espera al callback; seguro para liberar */
+}
+```
+
+El coste que pagas es real: cada hrtimer reprograma el `clock_event_device`, y un hrtimer que dispara a 10 kHz son 10 000 reprogramaciones e interrupciones por segundo. Por eso no se usan para timeouts perezosos —ahí el timer clásico gana por goleada— sino donde la precisión es innegociable. El kernel mantiene los hrtimers en un árbol rojo-negro por CPU ordenado por vencimiento, así que hallar el próximo a disparar es O(1) y reprogramar el hardware, O(log n).
+
+<Mermaid code={`sequenceDiagram
+  participant CE as clock_event_device oneshot
+  participant HI as hrtimer_interrupt
+  participant CB as Callback
+  participant T as Arbol rb por CPU
+  CE->>HI: interrupcion en el instante programado
+  HI->>T: extrae los hrtimers vencidos
+  HI->>CB: ejecuta el callback en hardirq
+  CB->>CB: hrtimer_forward_now avanza un periodo
+  CB->>HI: devuelve HRTIMER_RESTART
+  HI->>CE: reprograma el proximo evento`} />
+
+<Callout type="info" title="hrtimer_setup reemplazó a hrtimer_init">
+Si lees código anterior a los kernels recientes verás `hrtimer_init(&t, CLOCK_MONOTONIC, HRTIMER_MODE_REL)` seguido de `t.function = cb`. Esa secuencia en dos pasos dejaba el callback sin fijar entre ambas líneas y era una fuente de errores sutiles. La API actual lo unifica en `hrtimer_setup(&t, cb, CLOCK_MONOTONIC, HRTIMER_MODE_REL)`, y existe `hrtimer_setup_on_stack` para timers de vida corta en la pila. Prefiere siempre la forma unificada en código nuevo.
+</Callout>
+
+<Callout type="dios" title="El hrtimer es el kernel pagando por abandonar su propia rejilla">
+Detente en lo que el hrtimer confiesa sobre el resto del nivel. Durante tres lecciones el tiempo del kernel fue cómodo porque era discreto: `jiffies` daba una rejilla gratis y todo se redondeaba a ella. El hrtimer es el momento en que esa comodidad ya no basta y el kernel decide *pagar* por salir de la rejilla. Y el precio revela la estructura profunda del subsistema. Para prometer un disparo en un nanosegundo arbitrario hay que abandonar el contador de ticks y hablar directamente con el hardware de eventos en su modo pleno, el oneshot; hay que mantener una estructura ordenada por vencimiento porque ya no hay cubos que agrupen; hay que reprogramar el hardware tras cada disparo porque ya no hay latido fijo que reutilizar. Cada una de esas cargas es la contracara exacta de una comodidad que el timer clásico disfrutaba gratis. Interioriza entonces que hrtimer y `timer_list` no son dos herramientas rivales sino los dos extremos de un único eje: precisión contra coste. En un extremo, un millón de timeouts baratos y borrosos sobre la rejilla del tick; en el otro, un puñado de disparos carísimos y exactos que reprograman el hierro. Y comprende, sobre todo, que este es el mismo movimiento que hará posible el tickless: una vez que el tick se convirtió en *un hrtimer más* en modo oneshot, el latido periódico dejó de ser una ley del sistema para volverse una opción que se puede apagar. El hrtimer no es solo el timer de audio y red; es la pieza que, al desligar el tiempo de `jiffies`, permitió al kernel silenciar su propio corazón cuando nadie lo escucha.
+</Callout>
+
+<Reto title="Un generador periódico sin deriva">
+1. Escribe un módulo con un `struct hrtimer` armado con `hrtimer_setup` sobre `CLOCK_MONOTONIC` y `HRTIMER_MODE_REL`.
+2. Arranca con `hrtimer_start` a un periodo de 5 ms y en el callback registra la marca de `ktime_get` antes de rearmar.
+3. Devuelve `HRTIMER_RESTART` tras `hrtimer_forward_now` y comprueba, sobre cientos de disparos, que el intervalo medio no deriva.
+4. Sustituye `hrtimer_forward_now` por un `hrtimer_start` relativo dentro del callback y demuestra cómo aparece la deriva acumulada.
+5. Cancela con `hrtimer_cancel` en la descarga y explica por qué esperar al callback en vuelo evita liberar memoria que el hardware aún podría hacer disparar.
+</Reto>

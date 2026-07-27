@@ -1,0 +1,142 @@
+---
+title: "Qué es un spinlock y por qué existe"
+description: "La espera activa como primitiva de sincronización: cuándo tiene sentido girar en vez de dormir, spinlock_t con spin_lock y spin_unlock, y la mitad invisible del truco: deshabilitar la preempción."
+subject: kernel
+level: 15
+order: 1
+icon: "15.1"
+duracion: "12 min"
+---
+
+<Lead>
+El kernel es masivamente concurrente: el mismo dato puede tocarlo tu código en un núcleo mientras otro núcleo lo pisa a la vez. Necesitas exclusión mutua, y el spinlock es la primitiva más básica y brutal para lograrla: en vez de dormir esperando su turno, el hilo gira quemando CPU hasta que el lock queda libre. Entender cuándo esa espera activa es la decisión correcta es el primer paso de toda la concurrencia del kernel.
+</Lead>
+
+<Objetivos>
+
+- Entender la espera activa (busy-wait) y su modelo de coste.
+- Declarar y usar un `spinlock_t` con `spin_lock`/`spin_unlock`.
+- Ver qué hace `spin_lock` por dentro: `preempt_disable` y el arch layer.
+- Decidir cuándo girar en vez de dormir.
+
+</Objetivos>
+
+## La espera activa: girar en vez de dormir
+
+Hay dos grandes familias de locks. Los **locks que duermen** (mutex, semáforo; nivel 16) ponen al que espera a dormir y ceden la CPU a otro; cuando el lock se libera, el planificador despierta al durmiente. Los **locks que giran** hacen justo lo contrario: no ceden nada, se quedan en un bucle comprobando el lock una y otra vez —esperan *activamente*— hasta que pueden entrar.
+
+La idea, en pseudocódigo (no es el código real del kernel, que es mucho más fino):
+
+```c
+/* la esencia conceptual de un spinlock */
+while (test_and_set(&lock->val) == YA_COGIDO)
+	cpu_relax();      /* PAUSE en x86: no martillees el bus mientras giras */
+/* aquí dentro: exclusión mutua conseguida */
+```
+
+`cpu_relax()` emite una instrucción de pausa (`PAUSE` en x86, `YIELD` en ARM) que le dice al núcleo "estoy en un spin, no satures la tubería ni al hermano SMT". No hay `schedule()`, no hay cambio de contexto: solo giras.
+
+## Anatomía: declarar y usar
+
+El tipo es `spinlock_t`, de `#include <linux/spinlock.h>`. Se puede declarar estático ya inicializado o embeberlo en un struct e inicializarlo en runtime:
+
+```c
+#include <linux/spinlock.h>
+
+/* estático, inicializado en tiempo de compilación */
+static DEFINE_SPINLOCK(mi_lock);
+
+/* o embebido en tus datos, inicializado en runtime */
+struct mi_dispositivo {
+	spinlock_t       lock;
+	u32              contador;
+	struct list_head cola;
+};
+
+static void dev_setup(struct mi_dispositivo *dev)
+{
+	spin_lock_init(&dev->lock);
+}
+```
+
+Y el uso es un par simétrico que envuelve la sección crítica:
+
+```c
+spin_lock(&dev->lock);
+/* sección crítica: exclusión total, en este núcleo y en todos los demás */
+dev->contador++;
+list_add(&nodo->cola, &dev->cola);
+spin_unlock(&dev->lock);
+```
+
+Un detalle que importará luego: `spinlock_t` no es el lock crudo de la arquitectura. Envuelve a `raw_spinlock_t`, que a su vez envuelve al `arch_spinlock_t` específico de la CPU. Esa indirección es la que permite que, bajo PREEMPT_RT, un `spinlock_t` cambie de comportamiento sin tocar tu código.
+
+## Qué hace spin_lock por dentro
+
+Aquí está la mitad que nadie ve. `spin_lock` no es solo el bucle de espera; simplificando la ruta real del kernel:
+
+```c
+/* include/linux/spinlock_api_smp.h, simplificado */
+static inline void __raw_spin_lock(raw_spinlock_t *lock)
+{
+	preempt_disable();                              /* 1 */
+	spin_acquire(&lock->dep_map, 0, 0, _RET_IP_);   /* 2 */
+	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock); /* 3 */
+}
+```
+
+1. **`preempt_disable()`** — la clave. Mientras tienes el spinlock, el planificador no puede expulsarte de este núcleo. Eso acota el tiempo que retienes el lock y es la razón profunda de por qué no puedes dormir con él cogido (nivel 15.2).
+2. **Hooks de lockdep** — el validador de locks anota la adquisición para detectar deadlocks (nivel 26).
+3. **El giro real**, delegado en el arch layer. En x86 SMP moderno es el *queued spinlock* (`qspinlock`), un lock basado en MCS que evita el rebote de cache (nivel 15.4).
+
+Revelación incómoda: en un kernel uniprocesador sin preempción, `spin_lock` se compila casi a nada —no hay nadie contra quien girar—. Todo su valor de corrección se reduce entonces al `preempt_disable()`. Es decir, el trabajo esencial de un spinlock es tanto **deshabilitar preempción e interrupciones** como el spin en sí.
+
+<Mermaid code={`flowchart TD
+  A[Necesito exclusion mutua sobre un dato] --> B[La seccion critica es muy corta]
+  B -->|si y estoy en contexto atomico| E[Spinlock: espera activa]
+  B -->|si pero podria dormir| F[Spinlock si la contencion es baja]
+  B -->|no, puede tardar| M[Mutex o semaforo: dormir]
+  E --> Z[Regla: nunca dormir con el lock cogido]
+  F --> Z
+  style E fill:#a6e3a1,color:#11111b
+  style M fill:#89b4fa,color:#11111b`} />
+
+## Cuándo girar tiene sentido
+
+El cálculo es de coste. Dormir y despertar cuesta del orden de microsegundos —miles de ciclos—: guardar y restaurar registros, efectos en TLB y caches, trabajo del planificador. Girar solo cuesta los ciclos que de verdad esperas.
+
+- **Sección cortísima y contención baja** → girar gana: esperar unas decenas de ciclos es ridículamente más barato que un cambio de contexto completo.
+- **Sección larga o espera potencialmente larga** → dormir gana: mientras uno duerme, la CPU hace trabajo útil de otro.
+- **Contexto atómico** (manejador de interrupción, softirq, o ya tienes otro spinlock) → no puedes dormir. Ahí el spinlock no es una optimización: es la única opción legal.
+
+Esa tercera línea es la que de verdad manda. Muchas veces no eliges spinlock por rendimiento, sino porque estás en un sitio donde `schedule()` está prohibido.
+
+## spinlock_t frente a raw_spinlock_t
+
+Ya viste que `spinlock_t` envuelve a `raw_spinlock_t`. La diferencia parece cosmética hasta que entra PREEMPT_RT. En un kernel normal, ambos giran igual; bajo PREEMPT_RT se separan:
+
+- `spinlock_t` se convierte en un lock que **duerme** (un `rt_mutex` con herencia de prioridad), para que el kernel de tiempo real pueda expropiar secciones críticas largas y acotar la latencia.
+- `raw_spinlock_t` sigue siendo un spin *de verdad*, que deshabilita preempción e IRQ pase lo que pase. Se reserva para el código más bajo y sensible: el planificador, la gestión de IRQ, los sitios donde ni siquiera el tiempo real puede dormir.
+
+```c
+/* solo para código de muy bajo nivel; casi nunca en un driver */
+static DEFINE_RAW_SPINLOCK(sched_lock);
+
+raw_spin_lock(&sched_lock);
+/* aquí no se duerme jamás, ni siquiera bajo PREEMPT_RT */
+raw_spin_unlock(&sched_lock);
+```
+
+Regla práctica: en tu driver usa `spinlock_t`. Deja `raw_spinlock_t` para el núcleo profundo del kernel; si crees que lo necesitas, casi seguro no.
+
+<Callout type="dios" title="El spin es negociable; el contrato atómico, no">
+Piensa en un spinlock no como "un lock que gira", sino como "una región donde este núcleo no cede el control". Lo que tu código depende de verdad no es del giro, sino de dos garantías: exclusión mutua y no ser expulsado (preempción/IRQ deshabilitadas). La prueba está en PREEMPT_RT, el kernel de tiempo real ya en mainline en 2026: ahí `spin_lock` deja de girar y pasa a ser un lock que *duerme* (un `rt_mutex` con herencia de prioridad), mientras que solo `raw_spinlock_t` sigue girando de verdad. Que la implementación pueda cambiar de "girar" a "dormir" sin romper el kernel demuestra dónde está el contrato: no en el mecanismo, sino en la semántica de sección atómica corta. Por eso dominar spinlocks no es aprender un bucle, es interiorizar una disciplina —secciones diminutas, sin dormir, sin sorpresas— que se paga en corrección a escala de miles de núcleos.
+</Callout>
+
+<Reto title="Tu primer spinlock">
+1. Añade un `spinlock_t` a un struct de tu driver y llámalo con `spin_lock_init` en la inicialización.
+2. Protege un contador compartido: incrementa dentro de `spin_lock`/`spin_unlock`.
+3. Prueba también la forma estática con `DEFINE_SPINLOCK` para un dato global.
+4. Razona en un comentario por qué elegiste spinlock y no mutex para esa sección.
+5. Investiga: busca `arch_spinlock_t` en las fuentes y descubre si tu arquitectura usa `qspinlock`.
+</Reto>

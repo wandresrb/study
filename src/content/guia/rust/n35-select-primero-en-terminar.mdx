@@ -1,0 +1,164 @@
+---
+title: "select!: reaccionar al primero que termine"
+description: "Donde join! espera a todos, select! espera al PRIMERO: sondea varias ramas y ejecuta el handler de la que gana, dropeando las demas. Es la herramienta de los timeouts, la cancelacion y la multiplexacion. Y trae el gotcha mas afilado de async: al perder, un future se cancela a media operacion, y si no era cancel-safe, pierde datos."
+subject: rust
+level: 35
+order: 2
+icon: "35.2"
+duracion: "18 min"
+---
+
+<Lead>
+`join!` respondía a la pregunta "¿cómo espero a que terminen *todos*?". `select!` responde a la contraria y, a menudo, más urgente: "¿cómo reacciono al *primero* que termine e ignoro el resto?". Sondea varias ramas a la vez y, en cuanto una está lista, ejecuta su bloque asociado y **abandona las demás**. Esa forma —una carrera con un único ganador— es la base de tres patrones omnipresentes: ponerle un límite de tiempo a una operación, cancelar trabajo cuando llega una señal de apagado, y multiplexar varias fuentes de eventos en un solo bucle. Pero el abandono de las ramas perdedoras no es gratis ni inocente: esos futures se **dropean a mitad de camino**, y ahí vive el error más sutil de todo el async de Rust, el que se conoce como *cancellation safety*.
+</Lead>
+
+<Objetivos>
+
+- Escribir un `select!` con varias ramas y entender que ejecuta solo el handler de la que gana.
+- Aplicarlo a los tres patrones canónicos: timeout, cancelación y multiplexación.
+- Reconocer el peligro de *cancellation safety*: la rama perdedora se dropea a media operación.
+- Controlar el orden de sondeo con `biased` y reutilizar un future en un bucle con `pin`.
+
+</Objetivos>
+
+## La forma de select!: gana el primero
+
+`tokio::select!` recibe una lista de ramas. Cada rama tiene un patrón, un future, una flecha y un bloque. La macro sondea todos los futures; en cuanto uno produce su valor, liga ese valor al patrón, ejecuta el bloque de esa rama y **descarta los futures de las demás**:
+
+```rust
+tokio::select! {
+    valor = fuente_a() => {
+        // fuente_a gano; fuente_b fue dropeada sin terminar
+        procesar(valor);
+    }
+    valor = fuente_b() => {
+        // fuente_b gano; fuente_a fue dropeada sin terminar
+        procesar(valor);
+    }
+}
+```
+
+La diferencia con `join!` es total: `join!` conduce todos hasta el final y devuelve la tupla de *todos* los resultados; `select!` conduce todos pero se queda con *uno* y tira el resto. Donde `join!` es conjunción —"y esto, y aquello"—, `select!` es una disyunción con desempate temporal —"lo que ocurra antes"—.
+
+## Los tres usos: timeout, cancelación, multiplexar
+
+El primer patrón es el **timeout**: corre tu trabajo contra un temporizador y quédate con quien llegue antes.
+
+```rust
+use tokio::time::{sleep, Duration};
+
+tokio::select! {
+    res = trabajo() => manejar(res),
+    _ = sleep(Duration::from_secs(5)) => {
+        // el temporizador gano: trabajo() se dropeo, se cancelo
+        eprintln!("agotado el tiempo");
+    }
+}
+```
+
+Es tan común que Tokio lo empaqueta en `tokio::time::timeout(dur, fut)`, que devuelve `Err` si vence el plazo; por dentro es este mismo `select!`. El segundo patrón es la **cancelación** cooperativa: corre el trabajo contra una señal de apagado.
+
+```rust
+loop {
+    tokio::select! {
+        msg = canal.recv() => match msg {
+            Some(m) => procesar(m),
+            None => break, // el canal se cerro
+        },
+        _ = &mut apagado => break, // llego la senal: sal del bucle
+    }
+}
+```
+
+El tercero es la **multiplexación**: un solo bucle que atiende varias fuentes —dos canales, un socket y un temporizador, eventos de teclado y de red— reaccionando a la que primero hable. `select!` es, en el fondo, el `match` del tiempo: elige rama según *qué* ocurre antes.
+
+## El gotcha: cancellation safety
+
+Aquí está el filo. Cuando una rama gana, las demás se **dropean en el punto exacto donde estaban esperando**. Si una de esas ramas había hecho un trabajo parcial que vivía *dentro* del future —había leído medio mensaje de un socket a un buffer interno, había sacado un elemento de una cola sin confirmarlo—, ese progreso **se pierde** al dropearse. Un future es *cancel-safe* si dropearlo a media espera no pierde datos ni corrompe estado; es *no* cancel-safe si sí.
+
+```rust
+// PELIGRO si read_exact NO es cancel-safe: en cada vuelta del bucle,
+// si el timer gana, los bytes ya leidos por read_exact se PIERDEN,
+// porque vivian en el estado del future que acabamos de dropear.
+loop {
+    tokio::select! {
+        r = socket.read_exact(&mut buf) => usar(&buf, r),
+        _ = tick.tick() => registrar_latido(),
+    }
+}
+```
+
+La regla práctica: en un `select!` dentro de un bucle, cada rama debe usar operaciones **cancel-safe**, porque se dropearán y recrearán una y otra vez. La documentación de Tokio marca método a método su seguridad ante cancelación: `mpsc::Receiver::recv` es cancel-safe —si se cancela, ningún mensaje se pierde—; en cambio operaciones que **acumulan estado parcial** dentro del future, como `read_exact` o un decodificador que buffea, no lo son. Cuando necesites una operación no cancel-safe dentro de un `select!`, la salida es sacarla del future y darle un sitio estable donde su progreso sobreviva entre vueltas —por ejemplo, un buffer o un future *pineado* fuera del bucle— en lugar de recrearla cada iteración.
+
+<Callout type="warn" title="Un select! en bucle recrea sus ramas en cada vuelta">
+El error clásico: `tokio::select! { x = stream.next() => ..., _ = shutdown => ... }` dentro de un `loop`. Si `stream.next()` no es cancel-safe, cada vez que la otra rama gana pierdes lo que ese future llevaba acumulado, y vuelves a empezar. Antes de poner una operación en una rama de `select!`, pregúntate: si esta rama pierde la carrera y se dropea *ahora mismo*, ¿pierdo datos? Si la respuesta es sí, no la pongas cruda ahí.
+</Callout>
+
+## biased, guardas y reutilizar un future
+
+Por defecto, `select!` sondea sus ramas en orden **aleatorio** en cada evaluación. Es deliberado: evita que una rama siempre lista *hambree* a las demás. Cuando de verdad necesitas un orden fijo —dar prioridad a la señal de apagado, por ejemplo— pon `biased;` como primera línea y las ramas se sondearán en el orden escrito:
+
+```rust
+tokio::select! {
+    biased; // sondea de arriba abajo; la primera lista gana
+    _ = &mut apagado => cerrar(),      // maxima prioridad
+    msg = canal.recv() => atender(msg),
+}
+```
+
+Cada rama admite además una **guarda** `if condicion`, que la desactiva cuando la condición es falsa —útil para no leer de una fuente ya agotada—, y una rama `else` que corre si *todas* las ramas están desactivadas. Hay un detalle mecánico frecuente: para reutilizar el *mismo* future a lo largo de varias vueltas del bucle (y no recrearlo, justo por la cancel-safety), debes pineárlo y pasarlo por referencia mutable con `tokio::pin!`:
+
+```rust
+let dormir = sleep(Duration::from_secs(30));
+tokio::pin!(dormir); // ahora es Unpin-por-referencia y reutilizable
+loop {
+    tokio::select! {
+        msg = canal.recv() => { reiniciar_o_procesar(msg); }
+        _ = &mut dormir => { cerrar_por_inactividad(); break; }
+    }
+}
+```
+
+<Cards>
+  <Card icon="🏁" title="Gana el primero">
+    Sondea todas las ramas, ejecuta el handler de la que se completa antes y dropea las demás. Es el `match` del tiempo.
+  </Card>
+  <Card icon="⏱️" title="Timeout y cancelacion">
+    Corre trabajo contra `sleep` o una señal de apagado. `tokio::time::timeout` empaqueta el patrón del temporizador.
+  </Card>
+  <Card icon="⚠️" title="Cancel-safety">
+    La rama perdedora se dropea a media operación. Si no es cancel-safe, pierde su progreso parcial. Vital dentro de un bucle.
+  </Card>
+  <Card icon="🎚️" title="biased y pin">
+    `biased` fija el orden de sondeo; una guarda `if` desactiva ramas; `pin!` reutiliza un future entre vueltas sin recrearlo.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TB
+  S[select! con varias ramas] --> P[Sondea todas las ramas]
+  P --> W{Alguna lista}
+  W -->|no| P
+  W -->|si| G[Ejecuta el handler de la ganadora]
+  G --> D[Las demas ramas se DROPEAN se cancelan]
+  D --> R{Eran cancel-safe}
+  R -->|si| OK[No se pierde nada]
+  R -->|no| BAD[Se pierde el progreso parcial]
+  style G fill:#a6e3a1,color:#11111b
+  style D fill:#fab387,color:#11111b
+  style BAD fill:#f38ba8,color:#11111b`} />
+
+<Callout type="dios" title="select! es una carrera cuyo premio es correr y cuyo castigo es la cancelacion">
+`select!` parece un simple "espera a lo primero que pase", pero encierra una tensión que define el carácter de la concurrencia en Rust. Para poder elegir a la que llega antes, `select!` tiene que estar avanzando a *todas* a la vez —sondearlas en cada evaluación—, y en el instante en que una gana, las demás dejan de importarle: las suelta. Ese soltar no es una operación aparte que la macro invoque; es, literalmente, dropear los futures perdedores, y por tanto es la cancelación del nivel de futures en estado puro. Aquí es donde la elegancia del modelo perezoso enseña su reverso: como cancelar es dropear, y dropear es barato y ocurre en cualquier `.await`, `select!` puede componer carreras sin maquinaria especial —ni banderas, ni hilos que matar, ni señales que propagar—. Pero esa misma facilidad esconde el precio: un future que se dropea a mitad de una lectura no ejecuta el código que venía después de su `.await`, y si ese código era el que iba a *confirmar* o *guardar* el trabajo parcial, ese trabajo se evapora. La cancel-safety no es una propiedad exótica de librería, es la pregunta ineludible que plantea cualquier concurrencia por carrera: ¿qué le pasa a lo que quedó a medias cuando decidimos que ya no nos interesa? En un lenguaje con hilos preventivos ni siquiera puedes hacerte la pregunta con precisión, porque no controlas dónde se interrumpe un hilo; en Rust, la interrupción solo ocurre en los `.await`, que son visibles en el código, y por eso *puedes* razonar exactamente sobre qué se pierde y protegerte. La disciplina que exige `select!` —usar operaciones cancel-safe en las ramas, o dar al progreso parcial un hogar que sobreviva al drop— no es burocracia: es el reconocimiento honesto de que reaccionar a lo primero significa renunciar a lo demás, y renunciar bien es tan importante como esperar bien.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+`select!` sondea varias ramas y ejecuta el handler de la primera que se completa, dropeando las demás. Habilita timeouts (corre contra `sleep`; `tokio::time::timeout` lo empaqueta), cancelación (corre contra una señal de apagado) y multiplexación (un bucle sobre varias fuentes). El peligro es la *cancellation safety*: la rama perdedora se cancela a media operación y, si no es cancel-safe, pierde su progreso parcial —crítico dentro de bucles—. `biased` fija el orden de sondeo, una guarda `if` desactiva ramas, y `pin!` permite reutilizar un future entre vueltas.
+</Callout>
+
+<Reto title="Corre carreras y sobrevive a la cancelacion">
+1. Escribe un `select!` entre una tarea que duerme 100 ms y otra que duerme 300 ms; comprueba que solo corre el handler de la primera y razona qué le pasó al future perdedor.
+2. Implementa un timeout con `select!` y luego reescríbelo con `tokio::time::timeout`; verifica que se comportan igual.
+3. Monta un bucle que multiplexe dos canales `mpsc` con `select!`; confirma que `recv` es cancel-safe observando que ningún mensaje se pierde entre vueltas.
+4. Provoca el bug de cancel-safety: pon una lectura que acumule estado parcial en una rama y una señal frecuente en la otra, dentro de un bucle, y observa cómo se pierde el progreso; luego arréglalo sacando el future del bucle con `pin!`.
+5. Añade `biased;` a un `select!` con una señal de apagado y explica por qué, sin él, el orden aleatorio de sondeo podría retrasar el cierre.
+</Reto>

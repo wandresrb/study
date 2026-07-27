@@ -1,0 +1,121 @@
+---
+title: "regmap: un único acceso a registros sobre I2C, SPI o MMIO"
+description: "La abstracción que separa qué registro tocar de cómo llegan los bytes hasta él. Describir el mapa con struct regmap_config, inicializar un regmap sobre I2C, SPI o MMIO cambiando una sola línea, y usar regmap_read, regmap_write y regmap_update_bits para eliminar la duplicación de código por transporte."
+subject: kernel
+level: 32
+order: 4
+icon: "32.4"
+duracion: "15 min"
+---
+
+<Lead>
+Muchísimos chips se venden en dos sabores: una variante I2C y una variante SPI, con un mapa de registros idéntico. Sin ayuda, escribirías la lógica del dispositivo dos veces, una por bus, y la mantendrías por duplicado para siempre. regmap es la abstracción que separa *qué registro tocar* de *cómo llegan los bytes hasta él*. Escribes `regmap_read` y `regmap_write` una sola vez, contra una interfaz de registros abstracta, y eliges el transporte con una única línea en el `probe`. La misma lógica sirve al chip por I2C, por SPI o mapeado en memoria, sin cambiar nada más.
+</Lead>
+
+<Objetivos>
+
+- Describir un mapa de registros con `struct regmap_config`.
+- Inicializar un `regmap` sobre I2C, SPI o MMIO cambiando solo una línea.
+- Leer, escribir y modificar bits con `regmap_read`, `regmap_write` y `regmap_update_bits`.
+- Entender por qué regmap elimina la duplicación de código por transporte.
+
+</Objetivos>
+
+## El problema: el mismo chip por dos buses
+
+Un IMU o un códec de audio típico existe como pieza I2C y como pieza SPI con los mismos registros y la misma semántica. Antes de regmap, un driver que quisiera servir a ambos arrastraba punteros a función `read_reg`/`write_reg`, una implementación por bus, y toda la lógica de dispositivo llena de indirecciones. Peor: cada driver reinventaba su propio esquema, y el árbol acumulaba decenas de variantes del mismo patrón. regmap, introducido por Mark Brown, factorizó ese patrón en una biblioteca central: el driver deja de saber por qué bus habla.
+
+## regmap_config y la inicialización por bus
+
+Todo empieza describiendo la geometría del mapa: cuántos bits ocupa la dirección de registro, cuántos el valor, y cuál es el último registro válido.
+
+```c
+#include <linux/regmap.h>
+
+static const struct regmap_config sensor_regmap_config = {
+	.reg_bits = 8,           /* la direccion de registro ocupa 8 bits */
+	.val_bits = 8,           /* cada registro son 8 bits */
+	.max_register = 0x7f,    /* ultimo registro valido */
+};
+```
+
+Con esa misma config, la elección del transporte es **una sola línea** en el `probe`. Todo lo que viene después —la lógica del dispositivo— es idéntico:
+
+```c
+/* variante I2C */
+map = devm_regmap_init_i2c(client, &sensor_regmap_config);
+
+/* variante SPI: misma config, misma logica despues */
+map = devm_regmap_init_spi(spi, &sensor_regmap_config);
+
+/* variante mapeada en memoria, un IP dentro del SoC */
+map = devm_regmap_init_mmio(dev, base, &sensor_regmap_config);
+
+if (IS_ERR(map))
+	return PTR_ERR(map);
+```
+
+Cada inicializador sabe cómo enmarcar un acceso en su bus: por I2C, escribe el registro y lee con start repetido; por SPI, suele marcar lectura o escritura en el bit alto del byte de dirección; por MMIO, traduce a `readl`/`writel` sobre `base` más el desplazamiento. Ese detalle de transporte se declara, cuando hace falta, en la propia config:
+
+```c
+static const struct regmap_config sensor_spi_config = {
+	.reg_bits = 8,
+	.val_bits = 8,
+	.max_register = 0x7f,
+	.read_flag_mask = 0x80,  /* el bit alto del byte de registro marca lectura */
+};
+```
+
+## regmap_read, regmap_write, regmap_update_bits
+
+El núcleo del API es agnóstico del bus. El valor sale por puntero y el retorno es limpio —cero o `-errno`—, sin la ambigüedad de SMBus, que multiplexaba dato y error en un mismo `s32`:
+
+```c
+unsigned int val;
+int ret;
+
+ret = regmap_read(map, SENSOR_REG_WHOAMI, &val);
+if (ret)
+	return ret;
+
+ret = regmap_write(map, SENSOR_REG_CTRL, 0x01);
+
+/* lee-modifica-escribe bajo el candado interno del regmap */
+ret = regmap_update_bits(map, SENSOR_REG_CTRL,
+			 SENSOR_MODE_MASK, SENSOR_MODE_CONT);
+
+/* rafaga contigua en una sola operacion de bus */
+u8 raw[6];
+ret = regmap_bulk_read(map, SENSOR_REG_DATA, raw, sizeof(raw));
+```
+
+`regmap_update_bits` merece atención: hace un lee-modifica-escribe serializado por el candado interno del regmap, así que dos hilos que toquen bits distintos del mismo registro no se pisan. Antes, ese patrón era una carrera clásica que cada driver resolvía —o no— por su cuenta.
+
+## Por qué regmap borra el transporte
+
+La lógica del driver depende ahora de un `struct regmap *`, una interfaz de registros abstracta, y del bus concreto solo se decide una vez, en el `probe`. Las mismas quinientas líneas de lógica de dispositivo sirven a la variante I2C y a la SPI. El transporte pasa de ser una decisión que impregna todo el código a ser un plugin elegido en el borde:
+
+<Mermaid code={`flowchart TB
+  LOGIC[Logica del driver regmap_read y regmap_write] --> RM[regmap nucleo]
+  RM --> I2C[regmap-i2c]
+  RM --> SPI[regmap-spi]
+  RM --> MMIO[regmap-mmio]
+  I2C --> B1[Tramas I2C]
+  SPI --> B2[Tramas SPI]
+  MMIO --> B3[readl y writel]`} />
+
+<Callout type="tip" title="Un regmap es también la puerta a más maquinaria">
+Reducir todo acceso a un único punto de estrangulamiento no solo elimina duplicación: habilita capas que se cuelgan de ese punto sin tocar la lógica. La caché de registros, los campos de bits con nombre y la ventana de depuración por debugfs —todo el nivel 32.5— existen porque cada lectura y cada escritura pasan por el mismo sitio. Elegir regmap desde el primer día es barato; reconvertir un driver maduro a regmap, mucho más caro. Cuando escribas un driver nuevo de un chip con registros, empieza por regmap aunque solo tenga una variante de bus.
+</Callout>
+
+<Callout type="dios" title="regmap es la inversión de dependencias hecha subsistema">
+Reconoce el patrón, porque no es exclusivo de los registros: es la idea que estructura medio kernel. Tu driver ya no depende de un bus; depende de una interfaz abstracta —el `regmap`— y el bus depende de esa misma interfaz para enchufarse por debajo. Eso es inversión de dependencias: ambos lados apuntan al centro, y el centro no conoce a ninguno en concreto. Un acceso a registro se convierte en una operación *semántica* —pon el bit 3 de CTRL, lee el estado— cuya realización física es un detalle intercambiable resuelto en el borde. Has visto esta misma forma antes y la volverás a ver: el VFS hace que un fichero se lea igual sobre ext4, sobre NFS o sobre un socket, y el sistema de ficheros concreto es el plugin; la capa de bloques hace que un `bio` viaje igual hacia un NVMe o un disco rotatorio; la pila de red hace que un socket hable igual sobre Ethernet o sobre WiFi. Todos comparten la misma arquitectura de cintura estrecha: un puñado de operaciones abstractas en el centro, la variación empujada a los extremos, y una explosión de implementaciones arriba y abajo que jamás se conocen entre sí. regmap es esa filosofía aplicada al humilde acceso a un registro, y su lección trasciende el hardware. Cuando internalizas que el valor no está en `regmap_read` sino en haber convertido el transporte en un enchufe, empiezas a diseñar todo tu software preguntando dónde poner la cintura: qué puñado de operaciones son la esencia semántica, y qué es mero detalle de implementación que merece exiliarse al borde para no contaminar el centro. Esa pregunta, repetida en cada capa, es la que mantiene un kernel de decenas de millones de líneas comprensible en vez de convertido en un caos de casos particulares.
+</Callout>
+
+<Reto title="Un driver, dos transportes">
+1. Escribe una `regmap_config` para un chip con dirección de registro de 8 bits y valores de 8 bits, con `max_register` en `0x7f`.
+2. Muestra las dos líneas de `probe` que lo inicializan por I2C y por SPI, y señala qué cambia y qué no.
+3. Sustituye una secuencia lee-modifica-escribe manual por una sola `regmap_update_bits` y explica qué carrera elimina.
+4. Añade `read_flag_mask` a la variante SPI y explica qué codifica el bit alto del byte de dirección.
+5. Busca en el árbol un driver de `sound/soc/codecs/` que use `devm_regmap_init_i2c` y `devm_regmap_init_spi` con la misma config, y verifica que la lógica no se duplica.
+</Reto>

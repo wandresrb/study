@@ -1,0 +1,150 @@
+---
+title: "Un misc device en Rust: registrar y operar con seguridad"
+description: "Registrar un misc device con las abstracciones del crate kernel, implementar las operaciones de archivo con un vtable seguro, y copiar hacia y desde el espacio de usuario con UserSlice sin arriesgar un -EFAULT. El char device del nivel 37, ahora con las manos atadas por los tipos."
+subject: kernel
+level: 55
+order: 2
+icon: "55.2"
+duracion: "17 min"
+---
+
+<Lead>
+Un módulo que solo imprime en `dmesg` no habla con nadie. El puente clásico hacia el espacio de usuario es un dispositivo de caracteres: un archivo en `/dev` con sus operaciones `open`, `read`, `write`, `release`. En el nivel 37 lo montaste en C con un `struct file_operations` lleno de punteros a función y `copy_to_user` a pelo. Rust for Linux ofrece la abstracción `miscdevice`, que registra el dispositivo y te obliga a implementar esas operaciones dentro de un contrato que el compilador verifica.
+</Lead>
+
+<Objetivos>
+
+- Registrar un misc device con `MiscDeviceRegistration` y `MiscDeviceOptions`.
+- Implementar el trait `MiscDevice` con `#[vtable]` como las operaciones de archivo.
+- Copiar a y desde userspace con `UserSlice` sin manipular punteros crudos.
+- Ver cómo el estado por apertura vive en un objeto con `Drop`.
+
+</Objetivos>
+
+## Registrar el dispositivo
+
+Un misc device es la vía más corta a `/dev`: el kernel le asigna el major 10 y tú solo pones el nombre. La abstracción de Rust envuelve el registro en un objeto, `MiscDeviceRegistration`, cuya sola existencia mantiene vivo el dispositivo; cuando ese objeto muere, el dispositivo se desregistra:
+
+```rust
+// SPDX-License-Identifier: GPL-2.0
+use kernel::{
+    c_str,
+    fs::File,
+    ioctl::{_IOC_SIZE, _IOR, _IOW},
+    miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
+    new_mutex,
+    prelude::*,
+    sync::Mutex,
+    uaccess::{UserSlice, UserSliceReader, UserSliceWriter},
+};
+
+module! {
+    type: ModuloMisc,
+    name: "rust_misc_device",
+    author: "William",
+    description: "Un misc device de ejemplo en Rust",
+    license: "GPL",
+}
+
+struct ModuloMisc {
+    _reg: Pin<KBox<MiscDeviceRegistration<Dispositivo>>>,
+}
+
+impl kernel::Module for ModuloMisc {
+    fn init(_module: &'static ThisModule) -> Result<Self> {
+        let opciones = MiscDeviceOptions {
+            name: c_str!("rust-misc-device"),
+        };
+        Ok(Self {
+            _reg: KBox::pin_init(
+                MiscDeviceRegistration::register(opciones),
+                GFP_KERNEL,
+            )?,
+        })
+    }
+}
+```
+
+El registro vive en un campo `_reg` del módulo. Por lo que aprendiste en el nivel 55.1, eso basta para la limpieza: cuando el módulo se descarga, su `Drop` destruye el `MiscDeviceRegistration`, que a su vez desregistra el dispositivo. No hay un `misc_deregister` que puedas olvidar.
+
+## Las operaciones de archivo: un `vtable` seguro
+
+El `struct file_operations` de C es una tabla de punteros a función que el kernel invoca cuando un proceso hace `open`, `read` o `ioctl` sobre tu `/dev`. Nada garantiza que rellenes bien esos punteros ni que respetes las convenciones de cada uno. En Rust esa tabla es un trait, `MiscDevice`, y el atributo `#[vtable]` la construye a partir de tu `impl`:
+
+```rust
+#[pin_data]
+struct Dispositivo {
+    #[pin]
+    interno: Mutex<Estado>,
+}
+
+struct Estado {
+    valor: i32,
+}
+
+#[vtable]
+impl MiscDevice for Dispositivo {
+    type Ptr = Pin<KBox<Self>>;
+
+    fn open(_file: &File, _misc: &MiscDeviceRegistration<Self>) -> Result<Pin<KBox<Self>>> {
+        KBox::pin_init(
+            pin_init!(Dispositivo {
+                interno <- new_mutex!(Estado { valor: 0 }),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    fn release(_dispositivo: Pin<KBox<Self>>, _file: &File) {
+        pr_info!("rust-misc-device: cerrado\n");
+    }
+
+    fn ioctl(me: Pin<&Dispositivo>, _file: &File, cmd: u32, arg: usize) -> Result<isize> {
+        let tam = _IOC_SIZE(cmd);
+        match cmd {
+            FIJAR_VALOR => {
+                let mut lector = UserSlice::new(arg, tam).reader();
+                let nuevo = lector.read::<i32>()?;   // copia comprobada desde userspace
+                me.interno.lock().valor = nuevo;
+            }
+            LEER_VALOR => {
+                let valor = me.interno.lock().valor;  // el guard se suelta al final
+                let mut escritor = UserSlice::new(arg, tam).writer();
+                escritor.write::<i32>(&valor)?;       // copia comprobada hacia userspace
+            }
+            _ => return Err(ENOTTY),
+        }
+        Ok(0)
+    }
+}
+```
+
+`open` devuelve un `Pin<KBox<Self>>`: un objeto nuevo por cada apertura del archivo, que el kernel asocia a ese `struct file`. Ese objeto es el estado por apertura, y su `release` —el equivalente al `.release` de C— lo recibe por valor y lo destruye. El `Mutex` que envuelve el estado interno lo verás a fondo en el nivel 55.4; por ahora basta saber que `me.interno.lock()` serializa el acceso.
+
+## Copiar a userspace sin `-EFAULT`
+
+La operación más peligrosa de un driver de caracteres es cruzar la frontera con el espacio de usuario (nivel 12). Un puntero que viene de userspace no es de fiar: puede apuntar a memoria no mapeada, o a memoria de otro proceso. En C llamas a `copy_to_user` o `copy_from_user` y, si te descuidas y desreferencias el puntero directamente, abres un agujero de seguridad o te ganas un `-EFAULT`. Rust encierra esa frontera en el tipo `UserSlice`:
+
+```rust
+// definidos con los ayudantes de kernel::ioctl, como el _IOR/_IOW de C
+const FIJAR_VALOR: u32 = _IOW::<i32>('|' as u32, 0x80);
+const LEER_VALOR: u32 = _IOR::<i32>('|' as u32, 0x81);
+```
+
+`UserSlice::new(arg, tam)` no te da un puntero: te da un objeto que solo sabe hacer dos cosas, entregarte un `reader` o un `writer`. `lector.read::<i32>()?` copia de forma comprobada desde el espacio de usuario y devuelve un `Result` —si la dirección es inválida, obtienes un `Err(EFAULT)` limpio en vez de corromper el kernel—. `escritor.write::<i32>(&valor)?` hace lo simétrico hacia fuera. Nunca tienes en la mano un puntero de usuario crudo que puedas desreferenciar por error: el tipo te lo impide.
+
+<Callout type="info" title="ioctl frente a read y write">
+Este ejemplo usa `ioctl` para mover un entero en ambos sentidos porque es el patrón del sample oficial `rust_misc_device` y muestra `UserSlice` en sus dos direcciones. Las operaciones `read` y `write` clásicas del nivel 37 existen igual en las abstracciones de Rust y reciben también un `UserSliceWriter` o un `UserSliceReader`; la mecánica de la copia segura es idéntica. Lo esencial no es qué operación implementas, sino que toda ella pasa por el mismo tipo que valida la frontera.
+</Callout>
+
+<Callout type="dios" title="El vtable tipado convierte el contrato del driver en algo que el compilador revisa">
+Un `struct file_operations` en C es una promesa sin fiador. Prometes que tu `.read` respeta la firma, que copias con `copy_to_user` y no con un `memcpy` crudo, que devuelves el número de bytes o un `-errno`, que no duermes donde no debes. El kernel confía y llama a tu puntero; si mentiste, el fallo aparece en tiempo de ejecución, quizá como una fuga de memoria del kernel hacia un proceso, quizá como un `-EFAULT` bajo carga. El `#[vtable]` de Rust toma esa misma tabla de operaciones y la vuelve un trait: ahora las firmas están fijadas por el tipo, el estado por apertura es un objeto con dueño y `Drop`, y el único modo de tocar la memoria del usuario es a través de `UserSlice`, que no te deja desreferenciar nada. La lista de invariantes que en C sostenías de memoria —copiar por la vía segura, emparejar `open` con `release`, no filtrar el búfer, propagar el `-errno`— aquí son consecuencias del sistema de tipos. El driver sigue siendo el mismo puente entre `/dev` y tu código; lo que cambia es que el puente ya no se puede cruzar mal sin que el compilador lo diga antes de arrancar la máquina.
+</Callout>
+
+<Reto title="Un dispositivo que habla con userspace">
+1. Compila el misc device y confirma que aparece en `/dev/rust-misc-device` tras `insmod`.
+2. Escribe un programa de usuario que abra el dispositivo y use tu `ioctl` `FIJAR_VALOR` y `LEER_VALOR` para escribir y leer el entero.
+3. Pásale a `ioctl` una dirección inválida a propósito y comprueba que obtienes `EFAULT` sin que el kernel se corrompa.
+4. Añade un segundo campo al `Estado` y una operación que lo devuelva; observa que el `Mutex` protege ambos campos a la vez.
+5. Compara la firma de tu `ioctl` con el `.unlocked_ioctl` del `struct file_operations` en C y localiza qué comprobaciones te ahorra `UserSlice`.
+</Reto>

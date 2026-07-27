@@ -1,0 +1,170 @@
+---
+title: "liburing: la librería que hace io_uring usable"
+description: "La interfaz cruda de io_uring exige mmap manuales, aritmética de índices y barreras de memoria explícitas. liburing encapsula toda esa ceremonia detrás de una API limpia: io_uring_queue_init, io_uring_get_sqe, io_uring_prep_read, io_uring_submit y io_uring_wait_cqe. Un programa completo que lee un archivo, compilable con -luring."
+subject: kernel
+level: 40
+order: 5
+icon: "40.5"
+duracion: "18 min"
+---
+
+<Lead>
+Los cuatro capítulos anteriores te han hecho tocar io_uring en carne viva: `mmap` con offsets mágicos, aritmética de índices con máscaras, barreras *release* y *acquire* colocadas a mano. Todo eso es correcto y todo eso es exactamente lo que *no* quieres escribir en cada programa, porque un solo `smp_store_release` olvidado es una condición de carrera con el kernel imposible de depurar. liburing, escrita por el propio autor de io_uring, encapsula esa ceremonia: hace el `io_uring_setup` y los tres `mmap` por ti, coloca las barreras correctas en cada envío y cada recogida, y te deja una API tan limpia como la de las syscalls clásicas pero asíncrona. Es a io_uring lo que la libc es a la tabla de syscalls: la capa ergonómica sobre una ABI cruda y estable.
+</Lead>
+
+<Objetivos>
+
+- Inicializar y destruir un anillo con `io_uring_queue_init` y `io_uring_queue_exit`.
+- Preparar operaciones con `io_uring_get_sqe` y los ayudantes `io_uring_prep_*`.
+- Enviar con `io_uring_submit` y esperar finalizaciones con `io_uring_wait_cqe`.
+- Escribir y compilar un lector de archivos completo, enlazado con `-luring`.
+
+</Objetivos>
+
+## Del anillo crudo a la API de liburing
+
+Compara. Todo el ritual del nivel 40.2 —parámetros, tres `mmap`, punteros a los índices— se reduce a una llamada. Y todo el baile de barreras del nivel 40.3 —publicar con *release*, cosechar con *acquire*— queda dentro de `io_uring_submit` y de `io_uring_cqe_seen`. Las funciones esenciales son media docena:
+
+```c
+struct io_uring ring;
+io_uring_queue_init(256, &ring, 0);        /* setup + los tres mmap, en una linea */
+
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);  /* toma una ranura libre */
+io_uring_prep_read(sqe, fd, buf, len, off);          /* rellena el SQE por ti  */
+io_uring_sqe_set_data(sqe, ctx);                     /* user_data como puntero  */
+
+io_uring_submit(&ring);                    /* publica con la barrera correcta */
+
+struct io_uring_cqe *cqe;
+io_uring_wait_cqe(&ring, &cqe);            /* bloquea hasta una finalizacion  */
+/* ... usar cqe->res y io_uring_cqe_get_data(cqe) ... */
+io_uring_cqe_seen(&ring, cqe);             /* marca visto y avanza la cabeza   */
+
+io_uring_queue_exit(&ring);                /* desmonta todo */
+```
+
+Ninguna de estas llamadas te obliga a pensar en offsets, ni en máscaras, ni en `smp_store_release`. liburing hace lo correcto por debajo, y lo hace igual de rápido: los ayudantes `io_uring_prep_*` son funciones `static inline` que se compilan a las mismas escrituras que harías a mano.
+
+## Un programa completo: leer un archivo
+
+Aquí está, entero y compilable, el "hola mundo" de la E/S asíncrona: abre el archivo que le pasas, lee sus primeros bytes con io_uring y los vuelca por salida estándar. Cada paso numerado corresponde a una fase del ciclo de vida que ya conoces:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <string.h>
+#include <liburing.h>
+
+#define TAM 4096
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2) {
+        fprintf(stderr, "uso: %s ARCHIVO\n", argv[0]);
+        return 1;
+    }
+
+    int fd = open(argv[1], O_RDONLY);
+    if (fd < 0) { perror("open"); return 1; }
+
+    struct io_uring ring;
+    /* 1. crea el anillo: io_uring_setup + los tres mmap en una sola llamada */
+    if (io_uring_queue_init(8, &ring, 0) < 0) {
+        perror("io_uring_queue_init");
+        return 1;
+    }
+
+    char buf[TAM];
+
+    /* 2. toma un SQE libre de la Submission Queue */
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+
+    /* 3. describelo: leer hasta TAM bytes de fd desde el offset 0 */
+    io_uring_prep_read(sqe, fd, buf, TAM, 0);
+    io_uring_sqe_set_data64(sqe, 42);       /* etiqueta opcional */
+
+    /* 4. publica el SQE: una unica io_uring_enter por debajo */
+    io_uring_submit(&ring);
+
+    /* 5. bloquea hasta que llegue la finalizacion */
+    struct io_uring_cqe *cqe;
+    int ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+        fprintf(stderr, "io_uring_wait_cqe: %s\n", strerror(-ret));
+        return 1;
+    }
+
+    /* 6. cqe->res es lo que devolveria read(2): bytes, o -errno si fallo */
+    if (cqe->res < 0)
+        fprintf(stderr, "lectura asincrona fallo: %s\n", strerror(-cqe->res));
+    else
+        fwrite(buf, 1, cqe->res, stdout);
+
+    /* 7. marca el CQE como visto: avanza la cabeza de la Completion Queue */
+    io_uring_cqe_seen(&ring, cqe);
+
+    /* 8. desmonta el anillo y cierra */
+    io_uring_queue_exit(&ring);
+    close(fd);
+    return 0;
+}
+```
+
+Se compila enlazando con la librería, y se ejecuta como cualquier programa:
+
+```bash
+cc lee.c -o lee -luring     # en Debian/Ubuntu: apt install liburing-dev
+./lee /etc/hostname
+```
+
+Fíjate en lo que *no* aparece: ni un `mmap`, ni un índice, ni una barrera. El programa se lee como uno síncrono, pero por debajo la lectura viajó por la cola compartida y volvió como un CQE.
+
+## Cosechar en lote: el bucle de eventos real
+
+Un servidor no espera un CQE cada vez: publica muchas operaciones y cosecha todas las finalizaciones disponibles de golpe. liburing ofrece justo eso con `io_uring_for_each_cqe`, que recorre cuantos CQEs haya sin una syscall por pieza, y `io_uring_cq_advance`, que devuelve todas las ranuras al kernel de una sola vez:
+
+```c
+/* patron de bucle de eventos: cosechar en lote lo que haya listo */
+struct io_uring_cqe *cqe;
+unsigned head, contados = 0;
+
+io_uring_submit_and_wait(&ring, 1);        /* envia lo pendiente y espera al menos 1 */
+
+io_uring_for_each_cqe(&ring, head, cqe) {
+    struct conexion *c = io_uring_cqe_get_data(cqe);  /* recupera tu contexto */
+    atender(c, cqe->res);
+    contados++;
+}
+io_uring_cq_advance(&ring, contados);      /* avanza la cabeza de golpe */
+```
+
+Este es el esqueleto de todo servidor moderno sobre io_uring: un `submit_and_wait`, un barrido de CQEs recuperando el contexto de cada uno con `io_uring_cqe_get_data`, y un solo `cq_advance` al final. Sobre ese armazón se montan las piezas avanzadas del nivel 41 —búferes y descriptores registrados, buffers en anillo, multishot, copia cero—, pero la forma del bucle no cambia.
+
+<Cards>
+  <Card icon="🔧" title="queue_init / queue_exit">
+    Montan y desmontan el anillo: hacen el `io_uring_setup` y los `mmap`, y los liberan. El principio y el final de todo programa.
+  </Card>
+  <Card icon="📝" title="get_sqe / prep_*">
+    Toman una ranura libre y la rellenan para una operación concreta (`prep_read`, `prep_recv`, `prep_accept`...), sin tocar campos a mano.
+  </Card>
+  <Card icon="📬" title="submit / wait_cqe / cqe_seen">
+    Publican los SQEs pendientes, esperan finalizaciones y marcan cada CQE como consumido, con las barreras correctas por dentro.
+  </Card>
+</Cards>
+
+<Callout type="tip" title="io_uring_cqe_seen es un cq_advance de uno">
+`io_uring_cqe_seen(&ring, cqe)` no es más que `io_uring_cq_advance(&ring, 1)`: marca un único CQE como consumido. Cuando cosechas en lote con `io_uring_for_each_cqe`, no llames a `cqe_seen` dentro del bucle; cuenta y llama a `io_uring_cq_advance` una sola vez al final. Avanzar la cabeza es liberar ranuras para el kernel, y hacerlo de golpe es más barato.
+</Callout>
+
+<Callout type="dios" title="liburing prueba que las barreras del nivel 18 no eran teoría">
+Cierra el nivel volviendo la vista al 18, donde estudiaste el modelo de memoria del kernel —*acquire*, *release*, `smp_store_release`, `smp_load_acquire`— y quizá pensaste que era la parte más abstracta y académica de todo el temario, un rigor para especialistas en arquitecturas débiles. liburing es la refutación de esa sospecha. Debajo de `io_uring_submit` y de `io_uring_cqe_seen` no hay magia: hay exactamente esas barreras, colocadas con precisión quirúrgica, porque la Submission Queue y la Completion Queue son estructuras de datos concurrentes *sin candado* compartidas nada menos que con el kernel. Cuando publicas un SQE, la escritura *release* del índice de cola garantiza que el kernel, corriendo tal vez en otro núcleo y en modo privilegiado, jamás vea el nuevo índice antes que el contenido del SQE; cuando el kernel deposita un CQE, tu lectura *acquire* del índice garantiza que no leas basura de una ranura a medio escribir. Es el problema productor-consumidor sin bloqueo de los manuales, salvo que aquí el otro hilo es el sistema operativo entero y el error no es un test que falla una vez de cada mil, sino una corrupción silenciosa en la frontera más crítica de la máquina. Que liburing exista y esconda todo esto no significa que puedas ignorarlo: significa que alguien tuvo que entenderlo a la perfección para que tú no tuvieras que rehacerlo en cada programa. La lección más profunda de io_uring, y del track entero, es esta: las abstracciones bellas del kernel —el page cache, el planificador, los anillos— no son atajos que te evitan la teoría, sino teoría condensada hasta volverse invisible. El día que una de esas abstracciones se rompa bajo tus pies, y en el kernel siempre acaba pasando, la única red de seguridad será haber comprendido lo que la abstracción encapsula. liburing es cómoda; el modelo de memoria que hay debajo es la verdad. Domina la comodidad, pero respeta la verdad.
+</Callout>
+
+<Reto title="Escribe y extiende tu primer programa io_uring">
+1. Compila el lector de arriba con `cc lee.c -o lee -luring` y confirma que vuelca el contenido de `/etc/hostname`.
+2. Comprueba con `strace` que una lectura completa se resuelve con un solo `io_uring_enter`, sin ningún `read`.
+3. Extiéndelo para leer un archivo entero en varias lecturas de 4 KiB, avanzando el offset y usando `user_data` para llevar la cuenta de cada trozo.
+4. Convierte la espera en un bucle con `io_uring_for_each_cqe` y `io_uring_cq_advance`, cosechando en lote en lugar de una a una.
+5. Fuerza un error (un archivo inexistente) y verifica que lo detectas por `cqe->res` negativo, y no por el valor de retorno de `io_uring_submit`.
+</Reto>

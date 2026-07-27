@@ -1,0 +1,134 @@
+---
+title: "KCSAN y KMSAN: carreras y memoria no inicializada"
+description: "Más allá de KASAN, el kernel trae dos sanitizers dinámicos: KCSAN caza data races con watchpoints software y completa a lockdep, y KMSAN detecta el uso de memoria no inicializada con shadow de bits y rastreo de orígenes. Qué caza cada uno, su coste y su relación con la concurrencia del nivel 19."
+subject: kernel
+level: 51
+order: 2
+icon: "51.2"
+duracion: "16 min"
+---
+
+<Lead>
+KASAN responde a "¿es legítima esta dirección?". Pero hay dos formas de romper la memoria que la addressability no ve: leer un valor que nadie escribió, y dejar que dos hilos toquen el mismo dato sin sincronizar. El kernel tiene un sanitizer para cada una. KMSAN persigue la memoria no inicializada; KCSAN, los data races. Ambos son instrumentación del compilador, y juntos con KASAN cierran el triángulo de la corrección de memoria.
+</Lead>
+
+<Objetivos>
+
+- Entender qué caza KMSAN: la memoria no inicializada y las fugas de información.
+- Ver cómo KMSAN usa shadow de bits y rastreo de orígenes.
+- Repasar KCSAN y su papel frente a lockdep en la concurrencia (nivel 19).
+- Situar los tres sanitizers como una familia con costes y objetivos distintos.
+
+</Objetivos>
+
+## KMSAN: cazar la memoria no inicializada
+
+Una variable local sin inicializar, un campo de `struct` que se copia entero a userspace con dos bytes de relleno sin poner: son bugs silenciosos y, a menudo, fugas de información del kernel. `CONFIG_KMSAN` (el Kernel Memory Sanitizer, solo con Clang) los caza siguiendo la *initializedness* de cada bit de memoria. Por cada bit real mantiene un bit de sombra: `1` significa envenenado —no inicializado—, `0` significa limpio. La memoria recién asignada nace envenenada; escribir en ella la limpia; leerla y *usarla* de forma observable dispara el informe.
+
+Lo que hace útil a KMSAN es el segundo nivel de metadato: el **rastreo de orígenes**. Además de la sombra, guarda por cada cuatro bytes un identificador de origen que encadena hasta el punto donde nació ese valor sucio. Así el informe no dice solo "usaste algo sin inicializar", sino *dónde se creó*:
+
+```c
+static int __init kmsan_demo_init(void)
+{
+	int v;                  /* nace envenenado: sombra a unos */
+	int w = v + 1;          /* w hereda el veneno por propagacion */
+
+	if (w > 0)              /* USO observable de un valor sucio */
+		pr_info("rama sucia\n");
+	return 0;
+}
+```
+
+El informe nombra el uso y el origen, las dos mitades del diagnóstico:
+
+```text
+=====================================================
+BUG: KMSAN: uninit-value in kmsan_demo_init+0x3a/0x120 [kmsan_demo]
+ kmsan_demo_init+0x3a/0x120 [kmsan_demo]
+ do_one_initcall+0x8e/0x3f0
+ do_init_module+0x8c/0x2d0
+
+Uninit was created at:
+ __kmsan_slab_alloc+0x0/0x40      <- o kmsan_stack, segun el origen
+ kmsan_demo_init+0x12/0x120 [kmsan_demo]
+=====================================================
+```
+
+KMSAN propaga el veneno a través de la aritmética y las copias —por eso `w` hereda el estado de `v`—, pero solo *dispara* ante un uso observable: una rama condicional, un índice de array, un argumento de syscall o un `copy_to_user`. Ese último caso es el más valioso: KMSAN es la herramienta que caza los infoleaks, memoria del kernel con basura que se filtra a espacio de usuario. Su coste es brutal —duplica o triplica la memoria entre sombra y orígenes, y solo compila con Clang— así que es un kernel de laboratorio y de fuzzing, nunca de producción.
+
+La frontera con el espacio de usuario tiene una regla especial: los datos que entran por `copy_from_user()` se dan por inicializados —no son basura del kernel—, mientras que un `copy_to_user()` de memoria envenenada es justo el infoleak que se persigue. Para el ruido inevitable hay anotaciones, hermanas de las de los otros sanitizers:
+
+```c
+/* excluir una funcion entera de la comprobacion */
+__no_kmsan_checks void ruta_sensible(void) { ... }
+
+/* comprobar a mano que un buffer esta inicializado antes de usarlo */
+kmsan_check_memory(ptr, size);
+
+/* declarar inicializada memoria que KMSAN no puede seguir, con cuidado */
+kmsan_unpoison_memory(ptr, size);
+```
+
+## KCSAN: los data races y lockdep
+
+KCSAN, el Kernel Concurrency Sanitizer, ya lo conoces del nivel 19: caza *data races*, accesos concurrentes en conflicto donde al menos uno escribe y al menos uno es un acceso plano sin marcar. No usa shadow memory como KASAN o KMSAN, sino **watchpoints software**: para una fracción de los accesos instrumentados coloca un vigía sobre la dirección, retarda un instante la ejecución para ampliar la ventana de colisión, y si otro hilo toca esa dirección durante el retardo, ha visto una carrera en directo.
+
+La relación con la concurrencia es de complementariedad estricta con lockdep (nivel 19), y conviene tenerla nítida:
+
+<Mermaid code={`flowchart LR
+  BUG[Fallo de concurrencia] --> D[Bloqueo de mas o en mal orden]
+  BUG --> R[Bloqueo de menos]
+  D --> LD[lockdep prueba ausencia de deadlock]
+  R --> KC[KCSAN caza el data race]
+  LD --> OK[Concurrencia correcta]
+  KC --> OK
+  style D fill:#f9e2af,color:#11111b
+  style R fill:#f38ba8,color:#11111b
+  style OK fill:#a6e3a1,color:#11111b`} />
+
+lockdep demuestra que tus locks no pueden trabarse en círculo, pero no que hayas protegido de verdad el dato; KCSAN demuestra que ningún dato queda a la intemperie, pero no ordena tus locks. Un código puede pasar lockdep sin un solo deadlock y aun así corromper memoria por accesos sin proteger. La respuesta a un informe de KCSAN es siempre una de tres: poner un lock, marcar el acceso con `READ_ONCE`/`WRITE_ONCE`, o documentar una carrera benigna con `data_race()`. El muestreo lo hace incompleto —puede perder carreras raras— pero a cambio no da falsos positivos. Con `CONFIG_KCSAN_WEAK_MEMORY=y` va más lejos y modela barreras ausentes, cazando un `smp_mb()` o un `smp_store_release()` que faltan (nivel 18); con `CONFIG_KCSAN_STRICT=y` sigue el modelo de memoria del kernel al pie de la letra y reporta hasta las carreras que las reglas permisivas por defecto perdonan.
+
+## Una familia de tres, un mismo método
+
+Los tres comparten el ADN —instrumentación del compilador más metadato consultado en tiempo de ejecución— pero atacan ejes ortogonales de la corrección de memoria:
+
+<Cards>
+  <Card icon="🎯" title="KASAN — addressability">
+    ¿Es legítima esta dirección? Shadow de un byte por cada ocho. Caza out-of-bounds y use-after-free. GCC o Clang.
+  </Card>
+  <Card icon="🌫️" title="KMSAN — initializedness">
+    ¿Alguien escribió este valor? Shadow de bits más orígenes. Caza uso de memoria sin inicializar e infoleaks. Solo Clang.
+  </Card>
+  <Card icon="🏁" title="KCSAN — concurrencia">
+    ¿Se accede sin sincronizar? Watchpoints software y retardo. Caza data races. Complementa a lockdep.
+  </Card>
+</Cards>
+
+```bash
+# activarlos (por separado: son incompatibles entre si en un mismo kernel)
+CONFIG_KASAN=y            # generic, out-of-bounds y use-after-free
+CONFIG_KMSAN=y            # memoria no inicializada (requiere Clang)
+CONFIG_KCSAN=y            # data races
+
+# excluir un fichero problematico del sanitizer, por Makefile
+KMSAN_SANITIZE_ruido.o := n
+KCSAN_SANITIZE_ruido.o := n
+KASAN_SANITIZE_ruido.o := n
+```
+
+No se combinan en un mismo binario: cada uno reescribe los accesos a su manera y su instrumentación choca. La estrategia real es tener tres imágenes distintas y pasar la misma carga —o el mismo fuzzer— por las tres, que es justo lo que hace syzbot para cada objetivo.
+
+<Callout type="info" title="UBSAN y KFENCE: los otros miembros del zoo">
+La familia no acaba en tres. `CONFIG_UBSAN`, el Undefined Behavior Sanitizer, caza desbordamientos aritméticos, desplazamientos fuera de rango y desreferencias desalineadas: no memoria mal usada, sino operaciones cuyo resultado el estándar de C deja indefinido. Y KFENCE (nivel 21) es el detector de corrupción por muestreo, tan barato que corre en producción interceptando una de cada muchas asignaciones. KASAN, KMSAN y KCSAN son las tres redes finas de laboratorio; UBSAN cubre el flanco aritmético; KFENCE es la red de malla ancha que vigila el campo. Entre todos, casi no queda forma de romper la memoria o el lenguaje que pase inadvertida.
+</Callout>
+
+<Callout type="dios" title="Tres preguntas ortogonales sobre cada byte">
+La lección que corona estos sanitizers es que la corrección de memoria no es una propiedad, sino tres, y son independientes. Por cada acceso que tu código hace a un byte, hay tres preguntas que C no puede responder por sí solo y que en tiempo de ejecución quedan borradas: ¿esta dirección me pertenece —KASAN—, este valor fue escrito por alguien —KMSAN—, y estoy accediendo sin que otro hilo lo haga a la vez —KCSAN—? Las tres pueden fallar por separado y de forma invisible. Un buffer puede estar perfectamente dentro de rango y aun así contener basura sin inicializar; un valor puede estar bien inicializado y aun así corromperse por una carrera; una estructura puede leerse sin carreras y aun así apuntar fuera de sus límites. Ningún sanitizer sustituye a otro porque ninguna de las tres propiedades implica a las demás. Y la técnica que las hace decidibles es siempre la misma: el compilador, que en tiempo de compilación conoce el tipo, la vida y la sincronización de cada acceso y los iba a descartar, en su lugar emite código que consulta un metadato lateral —una sombra de bytes, una sombra de bits con orígenes, una tabla de watchpoints— antes de actuar. Convertir un invariante implícito e indecidible en una comprobación explícita y barata: ese es el patrón que unifica toda la depuración de sistemas madura, y aquí lo ves aplicado tres veces al mismo byte desde tres ángulos que no se solapan.
+</Callout>
+
+<Reto title="Recorre los tres ejes">
+1. Compila un kernel Clang con `CONFIG_KMSAN` y escribe un módulo que use una variable local sin inicializar en una rama; captura las secciones uninit-value y Uninit was created at.
+2. Provoca un infoleak con `copy_to_user` de una `struct` con relleno sin poner y confirma que KMSAN lo detecta.
+3. Reproduce el data race del nivel 19 bajo `CONFIG_KCSAN` y arréglalo con `READ_ONCE`/`WRITE_ONCE`.
+4. Razona por qué los tres sanitizers necesitan imágenes de kernel separadas y no una sola.
+</Reto>

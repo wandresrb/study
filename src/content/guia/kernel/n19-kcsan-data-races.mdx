@@ -1,0 +1,142 @@
+---
+title: "KCSAN: cazar data races reales"
+description: "lockdep prueba que no puedes hacer deadlock, pero no que hayas protegido los datos. KCSAN detecta data races: accesos concurrentes sin sincronización. Cómo funciona con watchpoints, cómo marcar accesos con READ_ONCE y data_race, y cómo diseñar jerarquías de lock que contenten a lockdep y a KCSAN a la vez."
+subject: kernel
+level: 19
+order: 5
+icon: "19.5"
+duracion: "16 min"
+---
+
+<Lead>
+lockdep responde a "¿pueden mis locks bloquearse en círculo?". No responde a "¿protegí de verdad este dato?". Un campo compartido leído sin lock, un contador incrementado desde dos hilos: eso es un data race, y para lockdep es invisible. El Kernel Concurrency Sanitizer, KCSAN, es la otra mitad de la historia.
+</Lead>
+
+<Objetivos>
+
+- Definir un data race con precisión, según el LKMM.
+- Entender cómo KCSAN caza carreras con watchpoints y retardo.
+- Marcar accesos con `READ_ONCE`, `WRITE_ONCE` y `data_race()`.
+- Diseñar una jerarquía de locks que satisfaga a lockdep y a KCSAN a la vez.
+
+</Objetivos>
+
+## Data race: la definición precisa
+
+No es lo mismo un *data race* que una *race condition*. Una race condition es un fallo de lógica; un data race está definido a nivel del lenguaje C. Según el modelo de memoria del kernel (LKMM), dos accesos forman un data race si **entran en conflicto** (misma dirección, al menos uno escribe), ocurren **concurrentemente** en hilos distintos, y al menos uno es un **acceso plano** (una lectura o escritura normal, sin marcar). El data race es comportamiento indefinido: el compilador puede partir la escritura, recargar el valor o inventarse accesos.
+
+```c
+static int contador;              /* compartido, sin proteger */
+
+void hilo_a(void) { contador++; }         /* escritura plana */
+void hilo_b(void) { usar(contador); }     /* lectura plana  -> DATA RACE */
+```
+
+## Cómo caza KCSAN
+
+KCSAN es un detector dinámico basado en instrumentación en tiempo de compilación y muestreo con *watchpoints* software. Para cada acceso plano instrumentado hace tres cosas:
+
+1. Comprueba si ya existe un watchpoint para esa dirección; si existe y al menos uno de los dos accesos escribe, acaba de observar una carrera.
+2. De vez en cuando, si no hay watchpoint, coloca uno y detiene la ejecución un instante con un retardo aleatorio, ampliando la ventana en la que otro hilo puede chocar.
+3. Fotografía el valor antes y después del retardo; si cambió, infiere una carrera de origen desconocido (instrumentación ausente en el otro hilo, o un acceso por DMA).
+
+La clave del diseño: los accesos **marcados** (`READ_ONCE`, `WRITE_ONCE`, los `atomic_*`) solo *comprueban* watchpoints, nunca los *colocan*. Si todos los accesos a una variable están correctamente marcados, KCSAN jamás dispara sobre ella. El informe es directo:
+
+```text
+BUG: KCSAN: data-race in hilo_b / hilo_a
+
+write to 0xffffffffc009a628 of 4 bytes by task 487 on cpu 0:
+ hilo_a+0x1d/0x30
+
+read to 0xffffffffc009a628 of 4 bytes by task 488 on cpu 6:
+ hilo_b+0x10/0x20
+
+value changed: 0x00000009 -> 0x0000000a
+```
+
+## Marcar los accesos
+
+Ante un data race hay tres respuestas legítimas, según la intención:
+
+```c
+/* 1. El dato tiene dueno: protegelo con un lock */
+spin_lock(&lock);
+contador++;
+spin_unlock(&lock);
+
+/* 2. Estado compartido de una sola palabra, sin lock pero marcado */
+WRITE_ONCE(bandera, 1);
+if (READ_ONCE(bandera))
+	reaccionar();
+
+/* 3. Carrera intencionada y benigna, documentada para KCSAN */
+if (data_race(cache_quiza_sucia))
+	revalidar();
+```
+
+Para invariantes que no son data races pero sí propiedades de concurrencia —"solo hay un escritor"— existen aserciones que KCSAN vigila activamente:
+
+```c
+void actualizar(void)
+{
+	spin_lock(&foo_lock);
+	ASSERT_EXCLUSIVE_WRITER(shared_foo);   /* nadie mas debe escribir aqui */
+	WRITE_ONCE(shared_foo, nuevo);
+	spin_unlock(&foo_lock);
+}
+```
+
+Se activa con `CONFIG_KCSAN=y` (GCC o Clang 11 o superior) y se gobierna en caliente por `/sys/kernel/debug/kcsan`. Con `CONFIG_KCSAN_WEAK_MEMORY=y` llega a modelar barreras ausentes, detectando un `smp_mb()` o un `smp_store_release()` que faltan.
+
+## Leer y afinar KCSAN
+
+El informe tiene dos formas. La habitual nombra los dos accesos en conflicto —"data-race in hilo_b / hilo_a"— con sus dos pilas y la línea "value changed" con el valor antes y después. La otra, la carrera de **origen desconocido**, aparece cuando KCSAN infiere la carrera solo porque el valor bajo su watchpoint cambió durante el retardo, sin ver al otro accedente: suele significar instrumentación ausente en el otro lado, o un acceso por DMA desde un dispositivo.
+
+No todo informe es un bug que quieras ver ahora. KCSAN se afina con precisión quirúrgica:
+
+```c
+/* excluir una funcion entera */
+__no_kcsan void ruta_caliente(void) { ... }
+
+/* documentar que un campo corre a proposito */
+struct foo { int __data_racy stats; };
+```
+
+```bash
+# excluir un fichero, o un Makefile entero
+KCSAN_SANITIZE_archivo.o := n
+KCSAN_SANITIZE := n
+
+# en caliente: silenciar por funcion, o pausar del todo
+echo '!funcion_ruidosa' > /sys/kernel/debug/kcsan
+echo off > /sys/kernel/debug/kcsan
+```
+
+Y al revés: `CONFIG_KCSAN_STRICT=y` sigue el modelo de memoria del kernel lo más de cerca posible, reportando incluso las carreras que las reglas permisivas por defecto perdonan. El muestreo hace a KCSAN *incompleto* —puede perder carreras raras— pero a cambio no da falsos positivos: si informa, hay una carrera de verdad.
+
+## Diseñar la jerarquía de locks
+
+lockdep y KCSAN atacan los dos fallos opuestos de la concurrencia, y una buena jerarquía de locks los contenta a ambos. Las reglas de diseño:
+
+- **Un orden total, documentado.** Enumera tus locks del más externo al más interno y adquiérelos siempre en ese orden. Es lo que impide los ciclos que persigue lockdep.
+- **Cada dato, un dueño.** Todo campo compartido debe tener un lock que lo proteja, elegido con un grano bastante grueso para que "qué lock protege qué" sea obvio. Es lo que elimina los data races que persigue KCSAN.
+- **Afirma en la frontera.** Empieza las funciones que asumen un lock tomado con `lockdep_assert_held(&lock)`: documenta y verifica a la vez.
+
+```c
+void consumir(struct cola *q)
+{
+	lockdep_assert_held(&q->lock);   /* contrato verificado en runtime */
+	q->cabeza = q->cabeza->siguiente;
+}
+```
+
+<Callout type="dios" title="Dos sanitizers, dos mitades de la corrección concurrente">
+Detente en la simetría, porque es la lección que corona el nivel. La concurrencia se rompe de exactamente dos maneras opuestas. Si bloqueas de más o en mal orden, obtienes un **deadlock**: la máquina se para. Si bloqueas de menos, obtienes un **data race**: los datos se corrompen en silencio. lockdep demuestra la ausencia de la primera familia; KCSAN caza la segunda. Ninguno de los dos sustituye al otro: puedes tener un código sin un solo deadlock que corrompa memoria por accesos sin proteger, y un código sin una sola carrera que se cuelgue por un ABBA. Solo juntos cubren el espacio del error. Y la pieza que los une no es una herramienta, sino un acto de diseño: una jerarquía de locks explícita, con un orden total y un dueño por dato. Sobre esa jerarquía, lockdep verifica que el orden nunca se viola y KCSAN verifica que ningún dato queda a la intemperie. Recorre cada camino de tu código una vez bajo ambos y tendrás algo rarísimo en programación de sistemas: evidencia empírica fuerte de que tu concurrencia es correcta, no la esperanza de que lo sea. Ese es el estándar del kernel, y a partir de este nivel es también el tuyo.
+</Callout>
+
+<Reto title="Cierra el círculo: sin deadlock y sin carrera">
+1. Escribe un contador compartido con acceso plano desde dos `kthread` y captura el informe de KCSAN.
+2. Arréglalo de las tres formas —lock, `READ_ONCE`/`WRITE_ONCE`, y `data_race()`— y razona cuándo es correcta cada una.
+3. Añade `lockdep_assert_held()` a una función que asuma un lock y provoca el WARN quitando el lock.
+4. Documenta el orden total de los locks de tu módulo y verifica que ni lockdep ni KCSAN protestan.
+</Reto>

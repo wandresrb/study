@@ -1,0 +1,137 @@
+---
+title: "El ciclo de vida de una operación: del SQE al CQE"
+description: "Una operación de io_uring nace como un descriptor de sumisión (SQE) que describe qué hacer, se publica avanzando la cola y se entrega al kernel con io_uring_enter, y muere como un descriptor de finalización (CQE) que trae el resultado y la etiqueta que la identifica. El viaje completo, campo a campo y barrera a barrera."
+subject: kernel
+level: 40
+order: 3
+icon: "40.3"
+duracion: "18 min"
+---
+
+<Lead>
+Ya tienes las dos colas mapeadas; ahora sigamos a una sola operación de principio a fin. Su vida tiene tres actos: nace cuando rellenas un *Submission Queue Entry* (`struct io_uring_sqe`) que describe qué hacer y sobre qué descriptor; madura cuando lo publicas en la cola y tocas el timbre con `io_uring_enter`; y muere cuando el kernel deposita un *Completion Queue Entry* (`struct io_uring_cqe`) con el resultado. Entre el nacimiento y la muerte, la operación viaja fuera de tu control y puede completarse en cualquier orden respecto a sus hermanas, así que cada resultado ha de traer una etiqueta que diga a cuál pertenece. Ese viaje —y la disciplina de barreras que lo hace honesto— es la mecánica esencial de io_uring.
+</Lead>
+
+<Objetivos>
+
+- Rellenar un `struct io_uring_sqe`: opcode, descriptor, búfer, longitud y offset.
+- Publicar el SQE en la cola con una barrera de *release* y entregarlo con `io_uring_enter`.
+- Recoger el `struct io_uring_cqe` e interpretar `res` como valor de retorno o `-errno`.
+- Usar `user_data` para correlacionar cada finalización con la operación que la originó.
+
+</Objetivos>
+
+## Acto I: anatomía de un SQE
+
+El SQE es una estructura de 64 bytes que describe una operación como lo haría una syscall, pero de forma diferida y por escrito. Sus campos esenciales son el opcode, el descriptor, la dirección del búfer, la longitud y el offset:
+
+```c
+struct io_uring_sqe {
+    __u8  opcode;      /* IORING_OP_READ, _WRITE, _RECV, _ACCEPT... */
+    __u8  flags;       /* IOSQE_IO_LINK, IOSQE_FIXED_FILE...        */
+    __u16 ioprio;
+    __s32 fd;          /* el descriptor sobre el que operar         */
+    __u64 off;         /* offset (o addr2, segun el opcode)         */
+    __u64 addr;        /* direccion del buffer de usuario           */
+    __u32 len;         /* cuantos bytes                             */
+    /* ... union de flags especificos del opcode ...                */
+    __u64 user_data;   /* TU etiqueta: vuelve intacta en el CQE     */
+    /* ... buf_index, personality, padding hasta 64 bytes ...       */
+};
+```
+
+Rellenarlo a mano es tan sencillo como describir la lectura que quieres. Tomas la ranura que corresponde a la cola actual y la rellenas:
+
+```c
+unsigned tail  = *sq_tail;
+unsigned index = tail & *sq_mask;         /* mascara, no modulo */
+struct io_uring_sqe *sqe = &sqes[index];
+
+memset(sqe, 0, sizeof *sqe);
+sqe->opcode    = IORING_OP_READ;
+sqe->fd        = fd;
+sqe->addr      = (unsigned long) buf;     /* a donde leer */
+sqe->len       = 4096;                    /* cuanto        */
+sqe->off       = 0;                       /* desde donde   */
+sqe->user_data = 0xC0FFEE;                /* etiqueta de correlacion */
+```
+
+## Acto II: publicar y tocar el timbre
+
+Rellenar el SQE no basta: el kernel no lo verá hasta que lo *publiques*, y publicar tiene dos pasos con un orden sagrado. Primero enlazas el índice en el array de indirección; después avanzas la cola `sq_tail`. Y ese avance debe ser una escritura *release*, para garantizar que el kernel nunca vea la cola nueva antes que el SQE ya completo:
+
+```c
+sq_arr[index] = index;
+
+/* barrera release: publica el SQE ANTES de que el kernel vea el nuevo tail.
+   En espacio de usuario es un atomic_store con memory_order_release (C11). */
+smp_store_release(sq_tail, tail + 1);
+```
+
+Con el SQE publicado, tocas el timbre. `io_uring_enter(fd, to_submit, min_complete, flags, ...)` le dice al kernel cuántas sumisiones consumir y, si pides `IORING_ENTER_GETEVENTS`, cuántas finalizaciones esperar antes de devolver el control:
+
+```c
+/* una sola syscall: entrega 1 sumision y espera a que 1 finalice */
+syscall(__NR_io_uring_enter, ring_fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+```
+
+Una sola llamada hace las dos cosas: envía y espera. Y nada te obliga a que sea una: podrías haber publicado veinte SQEs y pasar `to_submit = 20`, entregándolos todos con la misma syscall. Ese es el germen del batching del nivel 40.4.
+
+## Acto III: cosechar el CQE
+
+El kernel ejecuta la operación cuando puede y deposita un CQE en la Completion Queue. El CQE es minúsculo —dieciséis bytes— y solo dice tres cosas: de quién es, cómo fue y con qué banderas:
+
+```c
+struct io_uring_cqe {
+    __u64 user_data;   /* la MISMA etiqueta que pusiste en el SQE       */
+    __s32 res;         /* resultado: >= 0 exito (bytes), < 0 es -errno  */
+    __u32 flags;       /* IORING_CQE_F_MORE, IORING_CQE_F_BUFFER...     */
+};
+```
+
+El campo `res` es el valor que habría devuelto la syscall equivalente: para una lectura, el número de bytes leídos; si algo falló, un valor negativo que es `-errno`. Recoger el CQE exige la barrera simétrica a la de publicación: lees `cq_tail` con semántica *acquire* para no adelantar la lectura de los CQEs, procesas, y avanzas `cq_head` con *release* para devolverle el hueco al kernel.
+
+```c
+unsigned head = *cq_head;
+/* acquire: no leer ningun CQE antes de haber leido el tail del kernel */
+if (head != smp_load_acquire(cq_tail)) {
+    struct io_uring_cqe *cqe = &cqes[head & *cq_mask];
+
+    if (cqe->res < 0)
+        fprintf(stderr, "fallo: %s\n", strerror(-cqe->res));
+    else
+        printf("lei %d bytes; etiqueta = 0x%llx\n", cqe->res, cqe->user_data);
+
+    /* release: libera la ranura solo cuando ya lei el CQE entero */
+    smp_store_release(cq_head, head + 1);
+}
+```
+
+Aquí `user_data` cumple su razón de ser: como las operaciones se completan fuera de orden, `0xC0FFEE` regresa intacto en el CQE y te dice, sin ambigüedad, cuál de tus muchas lecturas en vuelo acaba de terminar.
+
+<Mermaid code={`sequenceDiagram
+  participant U as Usuario
+  participant SQ as Submission Queue
+  participant K as Kernel
+  participant CQ as Completion Queue
+  U->>SQ: rellena SQE y avanza tail con release
+  U->>K: io_uring_enter envia y espera
+  K->>K: ejecuta la operacion pedida
+  K->>CQ: deposita CQE y avanza tail
+  U->>CQ: lee CQE con acquire y avanza head`} />
+
+<Callout type="warn" title="No toques un búfer en vuelo">
+Entre que publicas el SQE y cosechas su CQE, el búfer y las estructuras que apuntó el SQE pertenecen al kernel. Reutilizar ese `buf`, liberarlo o cambiar el `iovec` antes de ver la finalización corrompe la operación en curso. La regla del modelo de completion es implacable: lo que describiste queda inmovilizado hasta que su resultado vuelve.
+</Callout>
+
+<Callout type="dios" title="user_data es la dirección de retorno de la asincronía">
+Detente en `user_data`, ese campo humilde que copias del SQE al CQE, porque en él se cifra toda la diferencia entre lo síncrono y lo asíncrono. En una llamada síncrona nunca necesitaste identificar el resultado: preguntabas `read()` y la respuesta volvía *en el mismo sitio*, por el valor de retorno, en el mismo hilo, en el acto. La identidad de la operación estaba implícita en el flujo de control: sabías qué habías pedido porque estabas parado justo ahí, esperándolo. El modelo de completion rompe esa unidad de tiempo y lugar. Publicas mil lecturas, sigues trabajando, y los resultados vuelven cuando quieren y en el orden que quieren —la lectura de un NVMe rápido adelanta a la de un disco lento aunque la pidieras después—. En ese desorden, el valor de retorno ya no basta para saber *de qué* es el resultado, porque no hay un "aquí" donde esperarlo. `user_data` es la respuesta a esa pérdida: una etiqueta que tú eliges, que viaja pegada a la operación y regresa intacta, y que en la práctica suele ser un puntero a tu propia estructura de estado —la conexión, la petición, la continuación—. Es, con toda exactitud, el equivalente asíncrono de una dirección de retorno: así como la pila guarda a dónde volver cuando una función termina, `user_data` guarda a qué contexto pertenece cuando una E/S termina. Los grandes servidores construidos sobre io_uring no son más que máquinas de estados donde cada CQE, a través de su `user_data`, reanuda la continuación correcta. Comprender esto es comprender por qué la programación asíncrona de verdad es programación con continuaciones explícitas: cuando renuncias a esperar parado, la identidad de lo que esperabas deja de ser gratis y hay que llevarla escrita. `user_data` es el precio, mínimo y exacto, de no bloquearse.
+</Callout>
+
+<Reto title="Sigue una operación de SQE a CQE">
+1. Rellena a mano un SQE de `IORING_OP_READ`, publícalo con la barrera de *release* y entrégalo con `io_uring_enter`.
+2. Cosecha el CQE y comprueba que `res` coincide con los bytes que devolvería un `read()` equivalente.
+3. Provoca un error a propósito —un `fd` ya cerrado— y verifica que `cqe->res` trae el `-errno` correspondiente (`-EBADF`).
+4. Lanza tres lecturas con `user_data` distintos sin esperar entre ellas y observa en qué orden regresan los CQEs.
+5. Explica qué escritura corrompe la operación si tocas el búfer antes de recibir su finalización, y por qué las barreras *release*/*acquire* son imprescindibles aquí.
+</Reto>

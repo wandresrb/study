@@ -1,0 +1,164 @@
+---
+title: "Escribir un driver PCI: struct pci_driver y el probe"
+description: "El esqueleto de un driver PCI: la tabla pci_device_id con MODULE_DEVICE_TABLE que declara qué dispositivos reconoce, struct pci_driver, y el .probe con su ritual de adquisición: pci_enable_device, pci_request_regions y pci_iomap del BAR. La simetría en .remove y la variante gestionada con pcim/devm."
+subject: kernel
+level: 30
+order: 3
+icon: "30.3"
+duracion: "17 min"
+---
+
+<Lead>
+Con la topología (30.1) y los BARs (30.2) entendidos, toca lo que llevas todo el nivel esperando: escribir el driver. Un driver PCI no arranca por sí mismo. Declara qué identidades reconoce, se registra ante el subsistema, y espera a que el núcleo le entregue un dispositivo que encaje llamando a su `.probe`. Dentro del probe se ejecuta un ritual preciso de adquisición —encender, reservar, mapear— cuyo orden importa y cuyo deshacer debe ser exactamente simétrico.
+</Lead>
+
+<Objetivos>
+
+- Declarar qué dispositivos reconoce un driver con `pci_device_id` y `MODULE_DEVICE_TABLE`.
+- Registrar un `struct pci_driver` y entender el modelo de emparejamiento por identidad.
+- Ejecutar el ritual del `.probe`: `pci_enable_device`, `pci_request_regions`, `pci_iomap`.
+- Deshacer con simetría en `.remove` y conocer la variante gestionada `pcim`/`devm`.
+
+</Objetivos>
+
+## La tabla de identidades
+
+Un driver PCI empieza declarando **a qué responde**. La `struct pci_device_id[]` lista pares `Vendor`/`Device ID`; la macro `PCI_DEVICE(v, d)` rellena una entrada dejando el subsistema como comodín. `MODULE_DEVICE_TABLE(pci, ...)` exporta esa tabla a los metadatos del módulo para que `udev` y el *hotplug* sepan cargar este driver cuando aparezca una tarjeta que encaje —sin él, tu driver no se autocargaría al enchufar el hardware.
+
+```c
+#include <linux/module.h>
+#include <linux/pci.h>
+
+#define DRV_NAME "midev"
+
+static const struct pci_device_id midev_ids[] = {
+	{ PCI_DEVICE(0x1af4, 0x1041) },                 /* virtio-net moderno */
+	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x10d3) },    /* e1000e 82574L */
+	{ 0, }                                          /* centinela: fin de tabla */
+};
+MODULE_DEVICE_TABLE(pci, midev_ids);
+```
+
+## struct pci_driver y el registro
+
+El `struct pci_driver` amarra el nombre, la tabla y los callbacks del ciclo de vida. `module_pci_driver` genera el `init`/`exit` que registran y desregistran el driver; bajo el capó son `pci_register_driver` y `pci_unregister_driver`. Al registrarse, el núcleo recorre los dispositivos ya enumerados y, por cada uno que encaje con la tabla, llama a `.probe`.
+
+```c
+static struct pci_driver midev_driver = {
+	.name     = DRV_NAME,
+	.id_table = midev_ids,
+	.probe    = midev_probe,
+	.remove   = midev_remove,
+};
+module_pci_driver(midev_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Driver PCI minimo de ejemplo");
+```
+
+El emparejamiento es **por identidad, no por posición**: da igual en qué `BDF` esté la tarjeta. Ese desacople es lo que permite que el mismo binario sirva a mil máquinas distintas.
+
+## El ritual del probe: encender, reservar, mapear
+
+`.probe` recibe el `struct pci_dev` y la entrada de la tabla que casó. Dentro se ejecutan tres adquisiciones en orden, cada una un apretón de manos con un subsistema distinto: **energía y decodificación** (`pci_enable_device`), **arbitraje de recursos** (`pci_request_regions`) y **memoria virtual** (`pci_iomap`).
+
+```c
+struct midev {
+	void __iomem *regs;
+};
+
+static int midev_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	struct midev *dev;
+	int ret;
+
+	ret = pci_enable_device(pdev);        /* despierta y activa decodificacion */
+	if (ret)
+		return ret;
+
+	ret = pci_request_regions(pdev, DRV_NAME);  /* reclama los BARs en el arbol de recursos */
+	if (ret)
+		goto disable;
+
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev) {
+		ret = -ENOMEM;
+		goto release;
+	}
+
+	dev->regs = pci_iomap(pdev, 0, 0);    /* BAR 0, longitud completa -> void __iomem * */
+	if (!dev->regs) {
+		ret = -ENOMEM;
+		goto free;
+	}
+
+	pci_set_drvdata(pdev, dev);           /* recuperable luego con pci_get_drvdata */
+	dev_info(&pdev->dev, "listo, BAR0 en %pR\n", &pdev->resource[0]);
+	return 0;
+
+free:
+	kfree(dev);
+release:
+	pci_release_regions(pdev);
+disable:
+	pci_disable_device(pdev);
+	return ret;
+}
+```
+
+`pci_enable_device` enciende el dispositivo y activa los bits de decodificación de memoria/E/S en el registro de comando; sin él, los accesos al BAR se pierden. `pci_request_regions` **marca** los BARs como ocupados en el árbol global de recursos, de modo que ningún otro driver reclame el mismo MMIO —es arbitraje, no mapeo—. Y `pci_iomap` construye las tablas de página del kernel que convierten la dirección física del BAR en un `void __iomem *` desreferenciable con `readl`/`writel`.
+
+<Callout type="warn" title="La escalera de goto es el reverso exacto de las adquisiciones">
+Fíjate en el orden: cada etiqueta deshace **una** adquisición, en orden inverso al que se hizo. Si `pci_iomap` falla, hay que liberar regiones y deshabilitar; si falla `kzalloc`, solo liberar regiones y deshabilitar. Ese patrón no es estilo: es la única forma de no dejar un dispositivo medio encendido o un recurso reclamado para siempre. Cada `enable` exige su `disable`; cada `request` su `release`; cada `iomap` su `iounmap`.
+</Callout>
+
+## Simetría en remove y la variante gestionada
+
+El `.remove` deshace, en orden inverso, todo lo que hizo el probe:
+
+```c
+static void midev_remove(struct pci_dev *pdev)
+{
+	struct midev *dev = pci_get_drvdata(pdev);
+
+	pci_iounmap(pdev, dev->regs);
+	kfree(dev);
+	pci_release_regions(pdev);
+	pci_disable_device(pdev);
+}
+```
+
+Esa contabilidad manual es propensa a fugas. La API **gestionada** (`pcim`/`devm`) ata cada recurso al ciclo de vida del dispositivo y lo libera automáticamente al desligarse, colapsando el probe y eliminando el `.remove` casi por completo:
+
+```c
+static int midev_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	struct midev *dev;
+
+	if (pcim_enable_device(pdev))          /* disable automatico al desligar */
+		return -ENODEV;
+
+	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	dev->regs = pcim_iomap_region(pdev, 0, DRV_NAME);  /* request + iomap gestionados */
+	if (IS_ERR(dev->regs))
+		return PTR_ERR(dev->regs);
+
+	pci_set_drvdata(pdev, dev);
+	return 0;    /* sin .remove para estos recursos: el nucleo los libera */
+}
+```
+
+<Callout type="dios" title="El probe no inicializa un dispositivo: negocia su lugar en tres reinos compartidos">
+La lectura ingenua de `.probe` es "aquí pongo en marcha mi hardware". La lectura correcta reordena todo el nivel: `.probe` es el momento en que un dispositivo **reclama su plaza en tres reinos que no le pertenecen en exclusiva**. `pci_enable_device` negocia con el subsistema de energía y decodificación —enciende el chip y le da permiso para responder en el bus—. `pci_request_regions` negocia con el árbol global de recursos —clava una bandera sobre un rango de direcciones físicas para que dos drivers no se peleen por el mismo MMIO, exactamente el mismo problema de exclusión que resolvías con locks, pero sobre el mapa de direcciones—. Y `pci_iomap` negocia con la memoria virtual del kernel —fabrica las tablas de página que hacen del BAR un puntero que puedes desreferenciar—. Tres apretones de manos con tres subsistemas independientes, y por eso el fallo de cualquiera obliga a deshacer solo los anteriores. Cuando ves la escalera de `goto` no como *boilerplate* feo sino como la pila de adquisiciones desmontándose en orden inverso —un `defer` manual, un destructor escrito a mano—, dejas de copiarla mecánicamente y empiezas a razonarla. Y entiendes por qué la API gestionada es tan liberadora: `devm` convierte esa pila explícita en el mismo RAII que el nivel de Rust te dio gratis, atando la vida de cada recurso a la del dispositivo para que el desmontaje sea automático y correcto por construcción. El emparejamiento por identidad cierra el cuadro: el driver nunca supo ni le importó *dónde* estaba su dispositivo, solo *qué* era —la posición es del kernel, la identidad es del driver, y esa división del trabajo es lo que hace que este código funcione en un portátil y en un servidor de 128 núcleos sin cambiar una línea.
+</Callout>
+
+<Reto title="Vincula un driver a un dispositivo real en QEMU">
+1. Escribe el esqueleto completo con la tabla, `struct pci_driver` y `module_pci_driver`, apuntando al `Vendor`/`Device ID` de la NIC virtio o e1000 de tu QEMU (nivel 12).
+2. Cárgalo y comprueba en `/sys/bus/pci/drivers/midev/` qué `BDF` quedó vinculado.
+3. Desvincula y revincula a mano escribiendo el `BDF` en `unbind` y `bind` de ese directorio; observa cuándo se dispara `.probe` y `.remove`.
+4. Migra el probe a la variante `pcim`/`devm` y borra el `.remove`; verifica con `dev_info` que la liberación sigue ocurriendo al descargar el módulo.
+5. Añade un fallo forzado tras `pci_iomap` y confirma con trazas que la escalera de `goto` deshace exactamente las adquisiciones previas.
+</Reto>

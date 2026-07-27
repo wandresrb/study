@@ -1,0 +1,146 @@
+---
+title: "Las cuatro tablas: qué implementa un sistema de archivos"
+description: "Escribir un sistema de archivos no es reescribir el VFS: es rellenar cuatro juegos de operaciones que el núcleo invoca por indirección. `super_operations` gobierna el volumen, `inode_operations` el espacio de nombres, `file_operations` los archivos abiertos y `address_space_operations` el page cache. Este es el mapa y el mínimo viable."
+subject: kernel
+level: 38
+order: 1
+icon: "38.1"
+duracion: "17 min"
+---
+
+<Lead>
+El VFS define cuatro objetos abstractos —superbloque, inodo, dentry y archivo abierto— y una operación no toca ninguno directamente: pasa siempre por una tabla de punteros a función que cuelga del objeto. Escribir un sistema de archivos, por tanto, no es implementar el VFS, sino **rellenar cuatro vtables**. El núcleo aporta el algoritmo genérico —el recorrido de rutas, el control de permisos, el page cache, el dcache, el `mmap`, el `splice`— y tu código aporta únicamente los verbos concretos que saben hablar con un formato de almacenamiento. Este primer nivel es el plano de esas cuatro tablas.
+</Lead>
+
+<Objetivos>
+
+- Distinguir los cuatro objetos del VFS y la tabla de operaciones que cada uno posee.
+- Ubicar qué verbo vive en `super_operations`, `inode_operations`, `file_operations` y `address_space_operations`.
+- Reconocer qué campos son obligatorios y cuáles pueden quedar en `NULL` delegando en el comportamiento genérico.
+- Identificar el mínimo viable para un sistema de archivos en memoria.
+
+</Objetivos>
+
+## Cuatro objetos, cuatro vtables
+
+El VFS modela cualquier sistema de archivos con cuatro estructuras en memoria. El `struct super_block` representa un volumen montado; el `struct inode` representa un objeto del sistema de archivos —un archivo, un directorio, un enlace— con sus metadatos; el `struct dentry` es el nodo del árbol de nombres que ata un nombre a un inodo; y el `struct file` es una instancia abierta de un inodo, con su `offset` y su modo. Cada uno lleva empotrado un puntero a su tabla de operaciones, y ahí es donde tu código se engancha:
+
+```c
+struct super_block {
+	/* ... */
+	const struct super_operations	*s_op;
+};
+
+struct inode {
+	/* ... */
+	const struct inode_operations	*i_op;    /* verbos de espacio de nombres */
+	const struct file_operations	*i_fop;   /* file_ops por defecto al abrir */
+	struct address_space		*i_mapping;   /* apunta a a_ops (page cache) */
+};
+
+struct file {
+	/* ... */
+	const struct file_operations	*f_op;    /* copiado de i_fop en open() */
+};
+```
+
+Hay una quinta tabla, las `dentry_operations` (`d_op`), pero para la inmensa mayoría de sistemas de archivos el comportamiento genérico del dcache basta y se deja en `NULL`. Las cuatro que importan al escribir un sistema de archivos son las que la consigna nombra.
+
+## super_operations: el volumen y el ciclo de vida del inodo
+
+Esta tabla gobierna el volumen entero y el nacimiento y la muerte de los inodos en memoria. El núcleo la invoca cuando necesita fabricar un inodo, escribirlo a disco, expulsarlo del cache o responder a `df`:
+
+```c
+struct super_operations {
+	struct inode *(*alloc_inode)(struct super_block *sb);
+	void (*free_inode)(struct inode *);          /* liberacion diferida por RCU */
+	void (*destroy_inode)(struct inode *);
+	int  (*write_inode)(struct inode *, struct writeback_control *);
+	void (*evict_inode)(struct inode *);         /* soltar bloques en disco */
+	void (*put_super)(struct super_block *);
+	int  (*sync_fs)(struct super_block *, int wait);
+	int  (*statfs)(struct dentry *, struct kstatfs *);   /* responde a df */
+	int  (*drop_inode)(struct inode *);
+	int  (*show_options)(struct seq_file *, struct dentry *);
+};
+```
+
+`alloc_inode` y `free_inode` existen para que tu sistema de archivos embeba su propio estado alrededor del `struct inode` genérico —el truco de `container_of` que verás en el nivel 38.4—. `evict_inode` es donde un sistema de archivos en disco libera los bloques cuando el último enlace desaparece. Y `drop_inode` decide qué hacer con un inodo que cae a cero referencias: un sistema en disco lo conserva en cache por si vuelve a hacer falta, pero uno **en memoria** usa `generic_delete_inode` para borrarlo de inmediato, porque conservarlo sería fugar RAM sin ningún beneficio.
+
+## inode_operations: el espacio de nombres
+
+Aquí viven los verbos que crean, borran y renombran entradas dentro de un directorio, más la metadata de cualquier inodo. El corazón es `lookup`: dado el inodo de un directorio y un dentry con un nombre, encuentra o instancia el inodo hijo. Fíjate en dos rasgos del kernel moderno:
+
+```c
+struct inode_operations {
+	struct dentry *(*lookup)(struct inode *, struct dentry *, unsigned int);
+	int (*create)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t, bool);
+	int (*link)(struct dentry *, struct inode *, struct dentry *);
+	int (*unlink)(struct inode *, struct dentry *);
+	int (*symlink)(struct mnt_idmap *, struct inode *, struct dentry *, const char *);
+	struct dentry *(*mkdir)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t);
+	int (*rmdir)(struct inode *, struct dentry *);
+	int (*mknod)(struct mnt_idmap *, struct inode *, struct dentry *, umode_t, dev_t);
+	int (*rename)(struct mnt_idmap *, struct inode *, struct dentry *,
+		      struct inode *, struct dentry *, unsigned int);
+	int (*getattr)(struct mnt_idmap *, const struct path *, struct kstat *, u32, unsigned int);
+	int (*setattr)(struct mnt_idmap *, struct dentry *, struct iattr *);
+	int (*permission)(struct mnt_idmap *, struct inode *, int);
+};
+```
+
+<Callout type="note" title="Dos firmas que delatan la edad del kernel">
+El primer parámetro `struct mnt_idmap *` aparece desde 6.3: es el mapeo de identidades del montaje, y traducir con él los `uid`/`gid` es obligatorio para soportar montajes idmapped. Y desde 6.15, `mkdir` **devuelve `struct dentry *`** en lugar de `int`, porque el core necesitaba que el sistema de archivos pudiera devolver un dentry ya instanciado. Si copias un `inode_operations` de un tutorial viejo, el compilador de 7.x te rechazará ambas cosas.
+</Callout>
+
+## file_operations y address_space_operations
+
+Las `file_operations` operan sobre el archivo ya abierto. La misma estructura sirve para archivos y para directorios, pero cada inodo apunta a una **instancia distinta**: un directorio deja `read_iter` en `NULL` y rellena `iterate_shared`; un archivo hace lo contrario.
+
+```c
+struct file_operations {
+	loff_t  (*llseek)(struct file *, loff_t, int);
+	ssize_t (*read_iter)(struct kiocb *, struct iov_iter *);    /* lectura moderna */
+	ssize_t (*write_iter)(struct kiocb *, struct iov_iter *);
+	int     (*iterate_shared)(struct file *, struct dir_context *);  /* readdir */
+	int     (*mmap)(struct file *, struct vm_area_struct *);
+	int     (*open)(struct inode *, struct file *);
+	int     (*release)(struct inode *, struct file *);
+	int     (*fsync)(struct file *, loff_t, loff_t, int datasync);
+	ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *,
+			       size_t, unsigned int);
+};
+```
+
+Los antiguos `read` y `write` de búfer fijo son legado: el camino moderno es `read_iter`/`write_iter` sobre `iov_iter`, que unifica lectura sincrónica, `readv`, `aio` y `io_uring`. Y `iterate_shared` es el `readdir` de hoy; el viejo `.iterate` no compartido se retiró hacia 6.5.
+
+La cuarta tabla, `address_space_operations`, es la costura con el page cache y la estudiaste en el nivel 24.2: `read_folio`, `write_begin`, `write_end`, `writepages`, `dirty_folio`. Un sistema de archivos en memoria no necesita escribirlas a mano: reutiliza el `ram_aops` de ramfs, hecho de helpers de libfs.
+
+<Cards>
+  <Card icon="🗂️" title="super_operations">
+    El volumen y el ciclo de vida del inodo: `alloc_inode`, `evict_inode`, `statfs`, `drop_inode`. Obligatorio de facto: `statfs`.
+  </Card>
+  <Card icon="🌳" title="inode_operations">
+    El espacio de nombres: `lookup`, `create`, `mkdir`, `unlink`, `rename`. Obligatorio en un directorio: `lookup`.
+  </Card>
+  <Card icon="📄" title="file_operations">
+    El archivo abierto: `read_iter`, `write_iter`, `iterate_shared`, `mmap`, `fsync`. Todo delegable en genéricos.
+  </Card>
+  <Card icon="🧠" title="address_space_operations">
+    El page cache por inodo: `read_folio`, `write_begin`, `write_end`, `dirty_folio`. Reutilizable vía `ram_aops`.
+  </Card>
+</Cards>
+
+El **mínimo viable** de un sistema de archivos en memoria es asombrosamente pequeño. Basta con un `super_operations` que aporte `statfs` y un `drop_inode` igual a `generic_delete_inode`; un inodo raíz cableado como directorio con `inode_operations` compuestas casi enteramente de helpers `simple_*` y con `simple_dir_operations` como `file_operations`; y, para los archivos regulares, `ram_aops`. Todo lo demás puede quedar en `NULL`: el VFS detecta el hueco y o bien aplica su comportamiento genérico, o bien devuelve `-EPERM` o `-EINVAL`. Esa es la promesa que libfs (nivel 38.3) convierte en código, y el ejemplo completo llega en el 38.4.
+
+<Callout type="dios" title="El VFS es una clase abstracta y tu sistema de archivos es una subclase concreta">
+Aquí está la idea que ordena todo el subsistema. El VFS no es un sistema de archivos: es una **clase base abstracta** escrita en C, con cuatro objetos y cuatro tablas de métodos virtuales, y tu sistema de archivos es una subclase que sobreescribe los verbos que le distinguen y hereda todo lo demás. Piensa en lo que el núcleo genérico ya resuelve por ti: el recorrido de una ruta componente a componente, con su cache de dentries y su bloqueo fino; la verificación de permisos y de capabilities; la traducción de `read` y `write` a operaciones sobre folios del page cache; el `mmap` que proyecta esos mismos folios en el espacio de un proceso; el `splice` que los mueve sin copiarlos; el writeback que los baja a disco; el `fsync` que espera a que lo hagan. Nada de eso es tuyo. Tu sistema de archivos es la fina capa de adaptación entre esa maquinaria universal y un formato de almacenamiento concreto, y por eso su superficie se reduce a cuatro vtables. Cuando comprendes que `lookup` es el único método que de verdad define qué es un directorio, que `read_folio` es el único que define de dónde sale un byte, y que absolutamente todo el resto del camino de E/S es código compartido por los noventa sistemas de archivos del árbol, dejas de ver un laberinto y empiezas a ver un patrón: el mismo polimorfismo del `address_space` del nivel 24, ahora multiplicado por cuatro. Escribir un sistema de archivos es, literalmente, rellenar las casillas que el VFS dejó en blanco a propósito.
+</Callout>
+
+<Reto title="Levanta el plano de las cuatro tablas">
+1. Enumera los cuatro objetos del VFS y el nombre exacto del campo que en cada `struct` apunta a su tabla de operaciones.
+2. Para cada una de las cuatro tablas, nombra un verbo que un sistema de archivos en memoria deba aportar sí o sí y otro que pueda quedar en `NULL`.
+3. Explica por qué la misma `struct file_operations` sirve para archivos y para directorios y, sin embargo, cada inodo apunta a una instancia distinta.
+4. Traza qué tabla toca cada una de estas llamadas: `open("/x")`, `mkdir("/d")`, `read(fd, ...)` y `statfs("/")`.
+5. Argumenta por qué `address_space_operations` es una tabla separada y no un puñado de campos más dentro de `file_operations`.
+</Reto>

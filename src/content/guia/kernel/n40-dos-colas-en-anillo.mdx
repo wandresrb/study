@@ -1,0 +1,127 @@
+---
+title: "Las dos colas en anillo: memoria compartida entre kernel y usuario"
+description: "El corazón de io_uring son dos ring buffers mapeados con mmap y compartidos entre kernel y espacio de usuario: la Submission Queue por donde entregas trabajo y la Completion Queue por donde recoges resultados. Al vivir la cola en memoria que ambos ven, desaparece el coste de copiar argumentos y de gastar una syscall por operación."
+subject: kernel
+level: 40
+order: 2
+icon: "40.2"
+duracion: "17 min"
+---
+
+<Lead>
+Si el modelo de completion es la idea, los dos anillos son la máquina que la encarna. io_uring no te da una syscall por operación: te da dos colas circulares —dos *ring buffers*— que el kernel y tu proceso comparten físicamente en la misma memoria, mapeadas con `mmap`. Por una, la *Submission Queue* (SQ), empujas descripciones de trabajo; por la otra, la *Completion Queue* (CQ), recoges resultados. La clave no está en que sean anillos, sino en que son anillos *compartidos*: la estructura donde escribes el trabajo es exactamente la que el kernel lee, sin copia y sin cruzar la frontera. La syscall deja de ser el vehículo de cada operación para volverse, como mucho, un timbre que avisa de que hay trabajo nuevo.
+</Lead>
+
+<Objetivos>
+
+- Crear un anillo con `io_uring_setup` e interpretar el `struct io_uring_params` que devuelve.
+- Mapear con `mmap` las regiones de la SQ, la CQ y el array de SQEs.
+- Entender las colas como estructuras productor-consumidor de un solo emisor y un solo receptor.
+- Explicar por qué la memoria compartida elimina las copias y las syscalls por operación.
+
+</Objetivos>
+
+## io_uring_setup: un descriptor y tres regiones
+
+Todo empieza con `io_uring_setup(entries, params)`. El kernel reserva las dos colas dimensionadas para al menos `entries` sumisiones y te devuelve un descriptor de archivo que representa el anillo. En el `struct io_uring_params` te rellena, de vuelta, los desplazamientos exactos de cada campo dentro de las regiones que vas a mapear:
+
+```c
+struct io_uring_params p;
+memset(&p, 0, sizeof p);
+
+int ring_fd = syscall(__NR_io_uring_setup, 256, &p);   /* 256 entradas */
+if (ring_fd < 0) { perror("io_uring_setup"); exit(1); }
+
+/* p.sq_off y p.cq_off traen los offsets de head, tail, ring_mask, array... */
+/* p.features indica capacidades como IORING_FEAT_SINGLE_MMAP                */
+```
+
+No hay envoltorio de glibc para estas syscalls: se invocan por número (`__NR_io_uring_setup` es la 425; `io_uring_enter`, la 426). Ese detalle deja claro lo bajo que estamos, y es justo lo que liburing (nivel 40.5) vendrá a tapar.
+
+## Los tres mmap: proyectar las colas en tu espacio
+
+El descriptor no se lee ni se escribe con `read`/`write`: se *mapea*. A partir de él proyectas en tu espacio de direcciones la región de la SQ, la de la CQ y el array de SQEs, usando tres desplazamientos mágicos como `offset` de `mmap`:
+
+```c
+size_t sq_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+size_t cq_sz = p.cq_off.cqes  + p.cq_entries * sizeof(struct io_uring_cqe);
+
+/* en kernels modernos IORING_FEAT_SINGLE_MMAP fusiona ambos anillos en un mapeo */
+void *sq_ring = mmap(NULL, sq_sz, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_POPULATE, ring_fd, IORING_OFF_SQ_RING);
+void *cq_ring = mmap(NULL, cq_sz, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_POPULATE, ring_fd, IORING_OFF_CQ_RING);
+
+/* el array de SQEs se proyecta aparte, en su propia region */
+struct io_uring_sqe *sqes = mmap(NULL, p.sq_entries * sizeof(struct io_uring_sqe),
+                     PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+                     ring_fd, IORING_OFF_SQES);
+```
+
+`MAP_SHARED` es la palabra decisiva: estas páginas no son tuyas en exclusiva, son la mesa común donde kernel y usuario dejan sus notas. La SQ contiene dos cosas: los índices de cabeza y cola del anillo, y un *array de indirección* que apunta al array real de SQEs; esa indirección permite publicar sumisiones en cualquier orden y reutilizar ranuras sin moverlas.
+
+## Dos anillos, dos sentidos: quién produce y quién consume
+
+Cada anillo es una cola circular de *un solo productor y un solo consumidor* (SPSC), y ahí está su elegancia: al haber un único escritor y un único lector en cada cola, no hace falta un candado, solo barreras de memoria (nivel 18) que ordenen las escrituras. Los papeles se invierten entre las dos colas:
+
+```c
+/* punteros a los indices compartidos, calculados con los offsets que dio el kernel */
+unsigned *sq_head = sq_ring + p.sq_off.head;      /* lo mueve el KERNEL (consumidor) */
+unsigned *sq_tail = sq_ring + p.sq_off.tail;      /* lo mueves TU (productor)         */
+unsigned *sq_mask = sq_ring + p.sq_off.ring_mask;
+unsigned *sq_arr  = sq_ring + p.sq_off.array;
+
+unsigned *cq_head = cq_ring + p.cq_off.head;      /* lo mueves TU (consumidor)        */
+unsigned *cq_tail = cq_ring + p.cq_off.tail;      /* lo mueve el KERNEL (productor)   */
+unsigned *cq_mask = cq_ring + p.cq_off.ring_mask;
+struct io_uring_cqe *cqes = cq_ring + p.cq_off.cqes;
+```
+
+En la SQ tú eres el productor: avanzas `tail` al publicar trabajo, y el kernel avanza `head` al consumirlo. En la CQ es al revés: el kernel avanza `tail` al depositar un resultado, y tú avanzas `head` al recogerlo. El número de entradas es siempre potencia de dos, de modo que el índice real se obtiene con una máscara (`indice & *sq_mask`) en vez de un módulo: una operación de un solo ciclo en el camino caliente.
+
+<Mermaid code={`flowchart LR
+  subgraph Usuario
+    U1[produce SQE y avanza sq_tail]
+    U2[consume CQE y avanza cq_head]
+  end
+  subgraph Kernel
+    K1[consume SQE y avanza sq_head]
+    K2[produce CQE y avanza cq_tail]
+  end
+  U1 -->|Submission Queue| K1
+  K2 -->|Completion Queue| U2`} />
+
+## Por qué la memoria compartida lo cambia todo
+
+Compara con la AIO nativa: cada `io_submit()` copiaba los bloques de control al kernel, cruzando la frontera y pagando la copia en cada envío. Con io_uring el SQE que rellenas *ya está* en la memoria que el kernel lee; no hay nada que copiar y nada que trasladar. Publicar trabajo es escribir en RAM y mover un índice.
+
+```c
+/* AIO nativa: cada envio COPIA los iocb al kernel y cruza la frontera, siempre */
+io_submit(ctx, n, iocbs);                 /* n estructuras copiadas, 1 syscall */
+
+/* io_uring: el SQE ya vive donde el kernel lee; publicar = escribir + indice */
+for (int i = 0; i < n; i++) {
+    struct io_uring_sqe *sqe = &sqes[(*sq_tail + i) & *sq_mask];
+    /* ...rellenar sqe en la memoria COMPARTIDA: cero copias al kernel... */
+}
+smp_store_release(sq_tail, *sq_tail + n);   /* publica el lote entero de golpe */
+syscall(__NR_io_uring_enter, ring_fd, n, 0, 0, NULL, 0); /* 1 syscall para n; o 0 con SQPOLL */
+```
+
+Y como el kernel puede mirar la cola cuando le convenga, una sola llamada a `io_uring_enter` da de comer decenas de sumisiones a la vez —o, con un hilo de sondeo del kernel, ninguna llamada en absoluto—. Este patrón no es nuevo: es exactamente cómo una tarjeta de red moderna habla con el kernel, mediante anillos de descriptores en memoria compartida por DMA (nivel 27). io_uring toma esa misma idea —la que el hardware usa para hablar con el software— y la aplica a la frontera entre el software de usuario y el kernel.
+
+<Callout type="tip" title="MAP_POPULATE evita el fallo de página en el camino caliente">
+Pedir `MAP_POPULATE` fuerza a poblar las tablas de páginas del anillo en el momento del `mmap`, no de forma perezosa al primer acceso. Así, la primera sumisión no paga un fallo de página en mitad de la ruta crítica de E/S. Es un detalle menor que delata la obsesión de io_uring por eliminar todo coste no esencial del camino caliente.
+</Callout>
+
+<Callout type="dios" title="La cola compartida disuelve la frontera como muro">
+Piensa en lo que la memoria compartida le hace a la frontera usuario/kernel, porque es el núcleo conceptual de todo el nivel. Durante toda la historia de Unix, esa frontera fue un *muro*: para pedirle algo al kernel cruzabas con una syscall, y cruzar significaba copiar tus argumentos al otro lado, cambiar de modo de privilegio y esperar. Cada operación de E/S era un viaje de ida y vuelta a través del muro, y el muro cobraba peaje en cada viaje. Los dos anillos compartidos no *aceleran* ese viaje: lo *abolen* para el caso común. La SQ y la CQ convierten el muro en una mesa que ambos lados pueden mirar y anotar a la vez; el trabajo ya no se *entrega* cruzando, sino que se *deja escrito* donde el otro lo verá. La syscall no desaparece del todo —sigue haciendo falta un timbre para avisar de que hay trabajo, y hasta ese timbre se puede silenciar con un hilo de sondeo—, pero deja de ser el vehículo de cada operación para volverse un evento ocasional. Y de esta única inversión —de muro que se cruza a mesa que se comparte— brota todo lo demás: el batching es posible porque puedes dejar muchas notas antes de tocar el timbre; la ausencia de copias es consecuencia de que la nota ya está donde el kernel lee; el sondeo sin syscalls es el límite natural de una mesa que el kernel vigila por su cuenta. Entender io_uring no es memorizar tres `mmap`, sino captar que su verdadera invención es tratar la comunicación con el kernel como un problema de estructuras de datos concurrentes en memoria compartida, y no como una secuencia de llamadas. La E/S del futuro no cruza fronteras: comparte memoria.
+</Callout>
+
+<Reto title="Mapea los anillos con tus propias manos">
+1. Llama a `io_uring_setup` con 256 entradas y vuelca por pantalla `p.sq_entries`, `p.cq_entries` y las banderas de `p.features`; comprueba si tu kernel ofrece `IORING_FEAT_SINGLE_MMAP`.
+2. Realiza los tres `mmap` y verifica que ninguno devuelve `MAP_FAILED`.
+3. Imprime los offsets de `p.sq_off` y `p.cq_off` y dibuja, sobre papel, dónde cae cada índice dentro de cada región.
+4. Razona por qué basta una máscara y no un módulo para envolver el índice, y qué exige eso del número de entradas.
+5. Explica, con la AIO nativa como contraste, qué copia concreta desaparece al vivir el SQE en memoria compartida.
+</Reto>

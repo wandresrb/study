@@ -1,0 +1,164 @@
+---
+title: "El modelo mental: una async fn es una máquina de estados"
+description: "Un .await no llama a una primitiva del sistema para dormir el hilo: es un punto de suspensión en una máquina que el compilador construyó por ti. Una async fn se compila a un tipo anónimo que implementa Future, con un estado por cada .await, y el runtime lo hace avanzar llamando a poll. Una introducción al mecanismo que el nivel 33 abre en canal."
+subject: rust
+level: 32
+order: 4
+icon: "32.4"
+duracion: "18 min"
+---
+
+<Lead>
+Ya sabes que `.await` cede el control cuando algo no está listo. Pero, ¿cómo *reanuda* la función justo donde la dejó, si el hilo se marchó a hacer otra cosa? La respuesta es la idea más bella del modelo async de Rust: el compilador toma tu `async fn` —código lineal, de arriba abajo— y lo transforma en un tipo anónimo que implementa `Future`, una **máquina de estados** con un estado por cada `.await`. Cada punto de suspensión es un estado; entre ellos, el código corre de un tirón. El runtime la hace avanzar llamando a `poll`, y cada llamada ejecuta desde el último punto de suspensión hasta el siguiente. Esto es una introducción; el nivel 33 abre la máquina en canal, con `poll`, `Waker` y `Pin` al detalle.
+</Lead>
+
+<Objetivos>
+
+- Ver que el compilador transforma una `async fn` en un tipo anónimo que implementa `Future`.
+- Entender que cada `.await` es un estado y un punto de suspensión de esa máquina.
+- Seguir el ciclo de `poll` con `Poll::Pending` y `Poll::Ready` que conduce el runtime.
+- Comprender el papel del `Waker`: avisar cuándo vale la pena volver a hacer `poll`.
+
+</Objetivos>
+
+## De función a máquina de estados
+
+Toma una `async fn` con dos puntos de espera:
+
+```rust
+async fn saludar(id: u64) -> String {
+    let nombre = leer_nombre(id).await;   // punto de suspension 1
+    let saludo = componer(&nombre).await; // punto de suspension 2
+    saludo
+}
+```
+
+El compilador no genera una función que "se duerme": genera un **tipo** que recuerda en qué punto va. Conceptualmente, algo como un `enum` con un estado por cada tramo entre `.await`:
+
+```rust
+// Aproximacion conceptual de lo que fabrica el compilador:
+enum SaludarSM {
+    Inicio { id: u64 },
+    EsperandoNombre { fut: LeerNombreFut },
+    EsperandoSaludo { fut: ComponerFut, nombre: String },
+    Terminado,
+}
+```
+
+La clave está en qué guarda cada estado: **exactamente las variables locales que deben sobrevivir a ese punto de suspensión**. Si `nombre` se usa después del primer `.await`, viaja dentro del estado que cruza esa espera. Entre dos `.await`, el código se ejecuta seguido. Y todo el conjunto es una sola estructura de tamaño conocido en tiempo de compilación: no hay una asignación por cada espera.
+
+## poll: el motor del avance
+
+El runtime conduce la máquina llamando a `poll`, que devuelve uno de dos veredictos:
+
+- `Poll::Ready(v)`: terminé, aquí está el valor.
+- `Poll::Pending`: aún no; ya me las he arreglado para que me despierten, no me consultes en bucle.
+
+```rust
+fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<String> {
+    // Segun el estado actual, intenta avanzar:
+    //  - hace poll del sub-future que esta esperando
+    //  - si ese devuelve Pending, este future devuelve Pending
+    //  - si devuelve Ready, guarda el valor y pasa al siguiente estado
+    //  - cuando no quedan estados, devuelve Ready(saludo)
+}
+```
+
+El ciclo es este: el runtime hace `poll`; si obtiene `Pending`, **aparca** la tarea y dedica el hilo a otras; cuando algo hace posible el avance, vuelve a hacer `poll`; la máquina salta al estado correcto y sigue desde ahí. Lo esencial es que `poll` es una **llamada a función normal** —despacho estático, sin asignación, baratísima—. Componer futures es anidar máquinas de estados: el future de `saludar` contiene al de `leer_nombre`, y el todo colapsa en una sola máquina plana.
+
+Dibujado en pseudocódigo, el `poll` de nuestra máquina es un bucle con un `match` sobre el estado, donde cada `Pending` *sale cediendo* y cada `Ready` *avanza de estado*:
+
+```rust
+// Version conceptual (no compila tal cual): revela el salto entre estados.
+fn poll(&mut self, cx: &mut Context<'_>) -> Poll<String> {
+    loop {
+        match &mut self.estado {
+            Estado::Inicio { id } => {
+                self.estado = Estado::EsperandoNombre(leer_nombre(*id));
+            }
+            Estado::EsperandoNombre(fut) => match fut.poll(cx) {
+                Poll::Pending => return Poll::Pending,        // cede el control
+                Poll::Ready(nombre) => {                      // avanza al siguiente
+                    self.estado = Estado::EsperandoSaludo(componer(nombre));
+                }
+            },
+            Estado::EsperandoSaludo(fut) => match fut.poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(saludo) => return Poll::Ready(saludo),
+            },
+        }
+    }
+}
+```
+
+Ahí está toda la magia desmitificada: no hay hilos que dormir ni pilas que salvar, solo un `match` que recuerda por dónde iba y un `return Poll::Pending` que es, literalmente, ceder.
+
+## El waker: avísame cuando pueda avanzar
+
+Falta una pieza para que el ciclo no sea un desperdicio. Cuando un future *hoja* —una lectura de socket, digamos— devuelve `Pending`, no se limita a decir "aún no": guarda el `Waker` que viaja dentro del `Context` y se lo entrega al reactor, diciendo "despierta esta tarea cuando este descriptor sea legible". El reactor —`epoll`, `kqueue`— vigila miles de descriptores a la vez; en cuanto uno está listo, invoca `wake()`, que le pide al executor que vuelva a poner esa tarea en la cola para otro `poll`.
+
+```rust
+// El waker es el puente entre "no estoy listo" y "vuelve a intentarlo":
+//   future hoja  --Pending-->  registra el waker en el reactor
+//   reactor ve el fd listo  -->  waker.wake()  -->  el executor re-encola la tarea
+```
+
+Sin `Waker`, el executor tendría que sondear en bucle —*busy-poll*— preguntando "¿ya? ¿ya?" y quemando CPU. Con `Waker`, el executor **duerme** hasta que hay algo real que hacer. Por eso `Poll::Pending` no significa "vuelve enseguida", sino "no vuelvas hasta que te avise".
+
+<Callout type="info" title="poll no es una espera activa">
+Es tentador imaginar que el runtime pregunta a cada future en un bucle cerrado hasta que uno dice `Ready`. No es así, y sería ruinoso. Gracias al `Waker`, una tarea que devuelve `Pending` solo se vuelve a consultar cuando su fuente de datos avisa de que hay progreso posible. El executor pasa el tiempo ocioso *dormido*, no girando. `poll` se llama pocas veces y con propósito, no en una rueda de hámster.
+</Callout>
+
+<Mermaid code={`flowchart TD
+  S0[Estado inicial guarda los locales] --> P1[El runtime llama a poll]
+  P1 --> A1{El await actual esta listo}
+  A1 -->|no| PEND[Devuelve Pending y registra el waker]
+  PEND -->|el waker despierta la tarea| P1
+  A1 -->|si| S1[Guarda el valor y avanza al siguiente estado]
+  S1 --> A2{Quedan mas awaits}
+  A2 -->|si| P1
+  A2 -->|no| DONE[Devuelve Ready con el valor final]
+  style S0 fill:#89b4fa,color:#11111b
+  style PEND fill:#fab387,color:#11111b
+  style DONE fill:#a6e3a1,color:#11111b`} />
+
+## Stackless: por qué importa
+
+El async de Rust es **sin pila** (*stackless*). Lo que debe sobrevivir a un `.await` no es una pila de llamadas real sostenida por un hilo del sistema, sino los campos de esa estructura-máquina, dimensionada en compilación y almacenada allí donde viva el future —a menudo una única asignación en el heap cuando se hace `spawn`—. Compáralo con las corrutinas *con pila* o los hilos verdes de Go, que mantienen una pila real y crecible por tarea.
+
+<Cards>
+  <Card icon="🧩" title="Un estado por await">
+    La máquina guarda solo los locales que cruzan cada suspensión. El tamaño total se conoce en compilación.
+  </Card>
+  <Card icon="🔁" title="Pending / Ready">
+    `poll` avanza hasta el próximo await o hasta el final. `Pending` aparca la tarea; `Ready` entrega el valor.
+  </Card>
+  <Card icon="🔔" title="Waker">
+    El aviso "ya puedes avanzar" que evita el sondeo en bucle. Lo cablea el reactor a cada fuente de datos.
+  </Card>
+  <Card icon="📏" title="Sin pila">
+    Componer futures anida máquinas en una sola estructura plana. Cero asignaciones por await, coste cero.
+  </Card>
+</Cards>
+
+Las consecuencias son grandes. La composición es de **coste cero**: hacer `.await` de otro future solo incrusta su máquina como un campo; todo el árbol de llamadas async es una estructura y, al hacer `spawn`, una asignación. El tamaño es **conocido** en compilación —puede ser grande, el famoso problema de los "futures gordos", pero es predecible—. Y hay una consecuencia que el nivel 33 desarrollará: como la máquina puede guardar una referencia *a sí misma* —un local prestado a través de un `.await`—, no debe moverse una vez que empezó a avanzar. Por eso `poll` recibe `Pin<&mut Self>`: para prometerle al future que su dirección no cambiará.
+
+<Callout type="note" title="Esto es el modelo mental; el nivel 33 abre la máquina">
+Aquí has visto la *forma* de la transformación: función lineal a máquina de estados, `poll`, `Pending`/`Ready`, `Waker`, sin pila. En el nivel 33 se profundiza en el trait `Future` completo, la firma exacta de `poll`, el ciclo `poll`/`wake` en detalle y por qué `Pin` es imprescindible. Quédate con la intuición: un `.await` no duerme un hilo, marca un estado.
+</Callout>
+
+<Callout type="dios" title="await es una transformación del compilador, no una llamada a dormir">
+La palabra `.await` engaña con su aire de operación en tiempo de ejecución, como si invocara al sistema para suspender la ejecución. No lo hace: `.await` es, ante todo, una *instrucción para el compilador*, una directiva que dispara una transformación de programa. El compilador toma tu función escrita en el estilo natural y directo —haz esto, luego espera aquello, luego lo otro— y la reescribe mecánicamente a un objeto reanudable: una máquina de estados donde cada `.await` se ha vuelto una etiqueta, un punto al que se puede saltar de vuelta, y donde las variables que cruzan esa etiqueta se han mudado de la pila a los campos de una estructura. Es la misma idea que a mano se llama *continuation-passing* o *lowering* de corrutinas, pero automatizada y verificada por el compilador con todo el rigor del sistema de tipos. De esa transformación cuelga todo lo demás. El coste de la concurrencia deja de ser una pila entera por tarea y pasa a ser, exactamente, las variables que sobreviven a una suspensión: ni un byte más, ni uno menos, y calculado en compilación. La planificación de esa tarea deja de ser un cambio de contexto del kernel y pasa a ser una llamada a `poll`, una función corriente que el runtime invoca cuando el `Waker` avisa. Y como la máquina es un valor de tamaño fijo y sin pila propia, el mismo mecanismo cabe en el heap de un servidor gigante o en los pocos kilobytes de RAM de un microcontrolador: no hay pila crecible que gestionar, solo una estructura que se mueve, se aparca y se reanuda. Aquí es donde se cierra el círculo del nivel: la pereza de la lección dos existía para que el compilador pudiera ver *todos* los puntos de suspensión antes de ejecutar nada y así construir esta máquina; la ausencia de runtime de la lección tres tiene sentido porque lo único que el lenguaje necesita definir es la *forma* de la máquina —el trait `Future`— y dejar que el motor que la hace girar sea una biblioteca. Cuando dejas de ver `.await` como magia que duerme hilos y empiezas a verlo como azúcar sobre una máquina de estados que puedes casi dibujar a mano, la programación async de Rust se vuelve razonable, depurable y, sobre todo, tuya.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+El compilador transforma una `async fn` en un tipo anónimo que implementa `Future`: una máquina de estados con un estado por cada `.await`, que guarda solo los locales que cruzan esa suspensión. El runtime la conduce con `poll`, que devuelve `Poll::Ready(v)` al terminar o `Poll::Pending` al ceder; el `Waker` del `Context` avisa cuándo vale la pena volver a hacer `poll`, evitando la espera activa. Es un modelo *sin pila*: componer futures anida máquinas en una estructura plana de coste cero, y como puede guardar referencias a sí misma, `poll` recibe `Pin<&mut Self>`. El nivel 33 abre esta maquinaria en canal.
+</Callout>
+
+<Reto title="Dibuja la máquina de estados">
+1. Toma una `async fn` con dos `.await` y dibuja a mano el `enum` de estados que el compilador generaría, marcando qué locales guarda cada estado.
+2. Explica por qué la variable que se usa *después* de un `.await` debe almacenarse en el estado y la que solo se usa antes no.
+3. Describe el ciclo completo `poll` → `Pending` → `wake` → `poll` para una tarea que lee de un socket vacío que luego recibe datos.
+4. Argumenta por qué un executor que hiciera `poll` en bucle sin `Waker` sería una espera activa ruinosa, y qué ahorra concretamente el `Waker`.
+5. Relaciona el carácter *sin pila* de la máquina con dos cosas: por qué la composición de futures es de coste cero y por qué `poll` recibe `Pin<&mut Self>`.
+</Reto>

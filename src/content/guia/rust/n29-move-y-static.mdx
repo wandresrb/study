@@ -1,0 +1,136 @@
+---
+title: "move y 'static: por qué el hilo debe poseer lo que toca"
+description: "El hilo hijo puede seguir vivo cuando la pila del padre ya murio, asi que no puede prestar nada de ella. Ese es el sentido del bound Send + 'static que exige thread::spawn. Aqui se disecciona qué significa 'static como cota de un tipo (no eternidad, sino ausencia de prestamos que caduquen) y por qué move es la unica forma de cumplirlo con datos locales."
+subject: rust
+level: 29
+order: 2
+icon: "29.2"
+duracion: "18 min"
+---
+
+<Lead>
+`thread::spawn` pide que su clausura sea `Send + 'static`, y ese `'static` es la barrera con la que más pelea quien empieza con hilos. La tentación es leerlo como "vive para siempre" y concluir que los hilos solo aceptan datos eternos, lo cual sería absurdo. El significado real es más sutil y más profundo: un hilo hijo puede seguir corriendo cuando la función que lo lanzó ya retornó y liberó su pila, de modo que cualquier cosa que la clausura *preste* de esa pila se convertiría en un puntero a memoria muerta. `'static` no exige que los datos vivan siempre; exige que **no dependan de un préstamo que pueda caducar**. Y la única forma de cumplir eso con variables locales es que el hilo las **posea**. Esa es la razón última de `move`.
+</Lead>
+
+<Objetivos>
+
+- Ver por qué el hilo hijo puede sobrevivir a la pila del padre y qué desastre evita `'static`.
+- Distinguir `'static` como *cota de tipo* (`T: 'static`) de la referencia `&'static T`.
+- Entender que `T: 'static` significa "no contiene préstamos más cortos que el programa", no "eterno".
+- Usar `move` para convertir préstamos locales en posesión y satisfacer así el bound de `spawn`.
+
+</Objetivos>
+
+## El hilo puede sobrevivir a su cuna
+
+Sin `move`, una clausura que solo lee captura por referencia. Dentro de un mismo ámbito eso es óptimo; a través de la frontera de un hilo es una catástrofe latente que el compilador ataja de raíz:
+
+```rust
+use std::thread;
+
+fn main() {
+    let datos = vec![10, 20, 30];
+
+    let handle = thread::spawn(|| {
+        println!("{datos:?}");   // ERROR: presta &datos, que no es 'static
+    });
+
+    handle.join().unwrap();
+}
+```
+
+El compilador rechaza esto: *"closure may outlive the current function, but it borrows `datos`"*. El razonamiento es implacable. La clausura presta `&datos`, una referencia atada a la pila de `main`. Pero `thread::spawn` no promete que el hilo termine antes de que `main` retorne —de hecho, sin `join` podría seguir vivo indefinidamente—. Si `main` liberase `datos` mientras el hilo aún lo lee, tendríamos un uso tras liberación *entre hilos*: exactamente la clase de corrupción que Rust existe para impedir. El `'static` del bound es lo que hace imposible ese escenario en tiempo de compilación.
+
+## Qué significa 'static de verdad
+
+Aquí conviven dos usos de `'static` que es vital no confundir:
+
+- **`&'static T`** es una *referencia* cuyo destino vive durante todo el programa: un literal de cadena `&'static str`, o algo filtrado con `Box::leak`. La referencia en sí es eterna.
+- **`T: 'static`** es una *cota sobre un tipo*: dice que `T` **no contiene ninguna referencia con vida más corta que el programa**. No dice que un valor de tipo `T` viva para siempre; dice que *podría* hacerlo sin volverse inválido, porque no arrastra ningún préstamo que caduque antes.
+
+Esta segunda lectura es la que aparece en `spawn`, y es contraintuitiva: un `String` que creas y destruyes en la línea siguiente cumple `String: 'static`, porque **posee** sus bytes y no presta nada de nadie. En cambio `&'a str` para un `'a` local **no** es `'static`, porque su validez depende de un dueño que puede morir.
+
+```rust
+fn exige_static<T: 'static>(_x: T) {}
+
+fn demo() {
+    let s = String::from("efimero");
+    exige_static(s);              // OK: String posee sus datos, es 'static
+
+    let local = 42;
+    let r: &i32 = &local;
+    // exige_static(r);           // ERROR: &'a i32 depende de local, no es 'static
+
+    let lit: &'static str = "vivo todo el programa";
+    exige_static(lit);            // OK: la referencia ya es 'static
+}
+```
+
+La regla mental: **poseer un valor lo hace `'static`; prestarlo de algo local, no.** Por eso `T: 'static` no es una restricción sobre *cuánto vive* el valor, sino sobre *de qué depende para seguir siendo válido*. Un dato autónomo —que no toma prestado nada efímero— cumple la cota aunque su vida real dure un microsegundo.
+
+<Callout type="info" title="Por qué spawn pide el máximo y no un lifetime concreto">
+Una función normal puede aceptar `&'a T` y prometer devolver antes de que `'a` expire; sus lifetimes se relacionan con los del llamante. Pero `thread::spawn` no puede prometer nada sobre *cuándo* terminará el hilo respecto al ámbito que lo lanzó: el hilo es un flujo independiente. Ante esa incertidumbre total, la firma pide la cota máxima —`'static`, "válido tanto como haga falta, incluso para siempre"— porque es la única que ningún desenlace temporal puede violar. La lección cuatro mostrará que, cuando *sí* se puede garantizar el fin del hilo (`thread::scope`), esta exigencia se relaja con precisión quirúrgica.
+</Callout>
+
+## move: convertir préstamos en posesión
+
+`move` es la palabra que transforma cada captura por referencia en captura por valor. Aplicada a la clausura de un hilo, sustituye los préstamos de la pila del padre por posesiones que viajan con el hilo, y con ello la clausura pasa a cumplir `'static`:
+
+```rust
+use std::thread;
+
+fn main() {
+    let datos = vec![10, 20, 30];
+
+    let handle = thread::spawn(move || {
+        // El hilo POSEE datos; no hay referencia a la pila de main.
+        let suma: i32 = datos.iter().sum();
+        println!("suma en el hilo: {suma}");
+        suma
+    });
+
+    // datos ya no es accesible aqui: se movio al hilo.
+    let total = handle.join().unwrap();
+    println!("total recibido: {total}");
+}
+```
+
+Al poseer `datos`, el hilo no depende del marco de `main`: cuando el hilo termine, liberará `datos` él mismo, sin importar qué haya sido de la pila del padre. La cota `'static` queda satisfecha porque la clausura ya no presta nada efímero. Si necesitas conservar el original, el patrón es clonar antes de mover:
+
+```rust
+let datos = vec![10, 20, 30];
+let copia = datos.clone();
+
+let handle = thread::spawn(move || copia.iter().sum::<i32>());
+println!("el padre aun ve {datos:?}");   // datos sigue vivo; se movio copia
+let _ = handle.join();
+```
+
+Y el matiz que cierra el círculo: `move` **no** es un conjuro que borre referencias, solo cambia *cómo se captura*. Si mueves al hilo una referencia `&'a T` con `'a` no estático, sigues incumpliendo `'static`, porque lo que se movió es la referencia efímera misma. `move` satisface la cota únicamente cuando lo que captura son **valores propios** (o referencias que ya eran `&'static`). Poseer es la condición; `move` es solo el mecanismo que la activa.
+
+<Mermaid code={`flowchart TD
+  P[Hilo padre con datos en su pila] -->|spawn sin move presta la referencia| B[La clausura guarda un prestamo de la pila del padre]
+  B --> X[El padre retorna y libera datos]
+  X --> D[La referencia apuntaria a memoria muerta]
+  P -->|spawn con move mueve el valor| O[La clausura posee datos y viaja con el hilo]
+  O --> S[Cumple static porque no presta nada efimero]
+  style B fill:#f38ba8,color:#11111b
+  style D fill:#f38ba8,color:#11111b
+  style O fill:#a6e3a1,color:#11111b
+  style S fill:#89b4fa,color:#11111b`} />
+
+<Callout type="dios" title="Un lifetime bound es una cota inferior sobre cuánto debe poder durar la validez">
+Para entender por qué `'static` es *exactamente* la frontera correcta, hay que dejar de leer los lifetimes como duraciones concretas y leerlos como lo que son: cotas. Cuando escribes `T: 'a`, no afirmas que los valores de `T` vivan `'a`; afirmas que **son válidos durante al menos `'a`**, es decir, que cualquier referencia oculta dentro de `T` dura como poco tanto como `'a`. Es una cota inferior sobre la validez, no una medida de la vida. Con esa lente, `T: 'static` deja de significar "eterno" y pasa a significar "válido durante al menos todo el programa", que es la cota más fuerte posible: solo la cumplen los tipos cuya validez no descansa sobre ningún préstamo que pueda caducar antes —los que poseen todo lo suyo, o los que solo prestan cosas ya eternas—. Ahora la pregunta de `spawn` se responde sola. Un hilo es un flujo temporal que la función lanzadora no controla: puede terminar en un nanosegundo o no terminar nunca, puede sobrevivir a diez marcos de pila que lo lancen y retornen. Frente a un consumidor cuya duración es *desconocida y potencialmente ilimitada*, la única cota de validez que garantiza que nada se rompa jamás es la máxima, `'static`: si lo que el hilo sostiene es válido durante al menos todo el programa, entonces es válido durante toda la vida del hilo, dure lo que dure. Pedir menos —`'a` para algún `'a` concreto— sería apostar a que el hilo termina antes de que `'a` expire, y `spawn` no puede hacer esa apuesta porque no conoce el desenlace. De ahí la elegancia del diseño: la misma maquinaria de lifetimes que impide una referencia colgante *dentro* de un hilo —el borrow checker que ya dominabas— impide, subida a su cota máxima, una referencia colgante *entre* hilos. No hay un sistema nuevo para la concurrencia; hay el sistema de siempre exigiendo su límite superior. Y `move` es el gesto con el que un valor renuncia a depender de un contexto para volverse autónomo, capaz de prometer la cota máxima porque ya no le debe su validez a nadie. Concurrencia segura, vista así, no es más que gestión de lifetimes cuando el consumidor vive un tiempo que no puedes acotar.
+</Callout>
+
+<Callout type="note" title="Lo esencial de move y 'static">
+`thread::spawn` exige `F: Send + 'static` porque el hilo hijo puede sobrevivir al ámbito que lo lanzó; prestar de la pila del padre daría una referencia colgante entre hilos. `T: 'static` es una **cota de tipo**: significa "no contiene préstamos más cortos que el programa", no "eterno". Un `String` local cumple `'static` (posee sus datos); un `&'a T` local, no. `move` convierte capturas por referencia en capturas por valor, y así la clausura satisface `'static` cuando posee sus datos. `move` no borra referencias: mover un `&'a T` efímero sigue fallando. Clona antes de mover si necesitas conservar el original.
+</Callout>
+
+<Reto title="Doma la cota 'static">
+1. Lanza un hilo que capture un `Vec` local sin `move`, lee el mensaje "may outlive the current function" y arréglalo con `move`; explica qué referencia habría quedado colgante.
+2. Escribe `fn exige_static<T: 'static>(_: T) {}` y pásale, por turnos, un `String`, un `&i32` a un local y un `&'static str`; predice cuáles compilan y por qué antes de probarlo.
+3. Argumenta por qué un `String` que destruyes en la línea siguiente cumple `T: 'static` pese a durar un instante.
+4. Intenta mover al hilo una referencia `&'a Vec<i32>` (no estática) con `move` y comprueba que sigue fallando; relaciónalo con "mover no vuelve estático lo prestado".
+5. Convierte un dato local en `&'static` con `Box::leak` y pásalo a un hilo sin `move` del valor; discute el coste (memoria nunca liberada) frente a simplemente poseer con `move`.
+</Reto>

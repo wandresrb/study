@@ -1,0 +1,184 @@
+---
+title: "Un driver I2C: de la cadena compatible a la trama en el bus"
+description: "Construir un struct i2c_driver con probe, remove, id_table y of_match_table, leer y escribir registros con la familia portable i2c_smbus_*, componer tramas arbitrarias con i2c_transfer y struct i2c_msg, y entender el emparejamiento por device tree y la inversión de control del modelo de dispositivos."
+subject: kernel
+level: 32
+order: 2
+icon: "32.2"
+duracion: "16 min"
+---
+
+<Lead>
+Un driver I2C es, en esencia, un traductor: convierte una cadena `compatible` del device tree en una secuencia de transacciones sobre el bus. Nunca toca un cable ni genera un pulso de reloj; solo describe qué bytes deben cruzar y en qué orden, y delega la electricidad al controlador del bus. El modelo de dispositivos de Linux invierte el control: no eres tú quien busca el hardware, es el núcleo quien llama a tu `probe` cuando aparece un dispositivo que encaja con tu tabla. Ese desacoplamiento entre protocolo y transporte es lo que hace que el mismo driver funcione idéntico en una Raspberry Pi, un portátil x86 y un teléfono.
+</Lead>
+
+<Objetivos>
+
+- Construir un `struct i2c_driver` con `probe`, `remove`, `id_table` y `of_match_table`.
+- Leer y escribir registros con la familia portable `i2c_smbus_*`.
+- Componer tramas arbitrarias con `i2c_transfer` y `struct i2c_msg`.
+- Entender el emparejamiento por device tree y la inversión de control del bus.
+
+</Objetivos>
+
+## El esqueleto: struct i2c_driver
+
+Todo driver I2C es la misma plantilla: una función `probe`, una tabla de dispositivos del device tree y el registro con `module_i2c_driver`. Desde Linux 6.3 la firma de `probe` recibe un solo argumento —el `i2c_client`—, y desde 6.1 `remove` devuelve `void`. Tomemos el sensor de temperatura TMP117:
+
+```c
+#include <linux/i2c.h>
+#include <linux/mod_devicetable.h>
+#include <linux/module.h>
+
+#define TMP117_REG_TEMP     0x00
+#define TMP117_REG_CONFIG   0x01
+#define TMP117_REG_WHOAMI   0x0f
+#define TMP117_DEVICE_ID    0x0117
+
+struct tmp117 {
+	struct i2c_client *client;
+};
+
+static int tmp117_probe(struct i2c_client *client)
+{
+	struct tmp117 *st;
+	s32 id;
+
+	st = devm_kzalloc(&client->dev, sizeof(*st), GFP_KERNEL);
+	if (!st)
+		return -ENOMEM;
+	st->client = client;
+	i2c_set_clientdata(client, st);
+
+	/* el WHO_AM_I confirma que hay de verdad un TMP117 en esta direccion */
+	id = i2c_smbus_read_word_swapped(client, TMP117_REG_WHOAMI);
+	if (id < 0)
+		return dev_err_probe(&client->dev, id, "no responde el WHO_AM_I\n");
+	if (id != TMP117_DEVICE_ID)
+		return dev_err_probe(&client->dev, -ENODEV,
+				     "id inesperado 0x%04x\n", id);
+
+	dev_info(&client->dev, "TMP117 en 0x%02x\n", client->addr);
+	return 0;
+}
+
+static void tmp117_remove(struct i2c_client *client)
+{
+	/* devm_ libera lo asignado; aqui solo iria el apagado activo del chip */
+}
+```
+
+El registro del driver enlaza las dos vías de emparejamiento —device tree y tabla de identificadores— con `module_i2c_driver`, que genera el `module_init`/`module_exit` por ti:
+
+```c
+static const struct i2c_device_id tmp117_id[] = {
+	{ "tmp117" },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, tmp117_id);
+
+static const struct of_device_id tmp117_of_match[] = {
+	{ .compatible = "ti,tmp117" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, tmp117_of_match);
+
+static struct i2c_driver tmp117_driver = {
+	.driver = {
+		.name = "tmp117",
+		.of_match_table = tmp117_of_match,
+	},
+	.probe    = tmp117_probe,
+	.remove   = tmp117_remove,
+	.id_table = tmp117_id,
+};
+module_i2c_driver(tmp117_driver);
+
+MODULE_DESCRIPTION("Driver minimo del sensor TMP117 por I2C");
+MODULE_LICENSE("GPL");
+```
+
+El uso de `devm_kzalloc` y `dev_err_probe` no es adorno: el primero ata la memoria al ciclo de vida del dispositivo y la libera sola al desconectar; el segundo registra el error con formato uniforme y, si el código es `-EPROBE_DEFER`, calla en vez de ensuciar `dmesg` mientras el núcleo reintenta más tarde.
+
+## SMBus: el vocabulario de alto nivel
+
+La familia `i2c_smbus_*` cubre el 90 % de los sensores sin que armes una sola trama. Cada función devuelve un `s32`: negativo es un `-errno`; cero o positivo, el dato. Ojo con el endianismo: `i2c_smbus_read_word_data` asume el byte bajo primero, pero muchísimos sensores envían el alto primero, y para ellos existe la variante `_swapped`:
+
+```c
+/* leer y escribir un registro de 8 bits */
+s32 cfg = i2c_smbus_read_byte_data(client, TMP117_REG_CONFIG);
+int ret = i2c_smbus_write_byte_data(client, TMP117_REG_CONFIG, 0x02);
+
+/* leer 16 bits big-endian: el sensor manda el MSB primero */
+s32 raw = i2c_smbus_read_word_swapped(client, TMP117_REG_TEMP);
+
+/* leer un bloque contiguo de golpe */
+u8 buf[6];
+int n = i2c_smbus_read_i2c_block_data(client, 0x08, sizeof(buf), buf);
+```
+
+Antes de confiar en SMBus conviene comprobar que el controlador lo soporta, porque no todos los adaptadores implementan todas las transacciones:
+
+```c
+if (!i2c_check_functionality(client->adapter,
+			     I2C_FUNC_SMBUS_WORD_DATA))
+	return -EOPNOTSUPP;
+```
+
+## i2c_transfer: control total sobre las tramas
+
+Cuando SMBus no basta —un dispositivo con un puntero de registro de dos bytes, o un marco no estándar— se baja un nivel a `i2c_transfer`, que ejecuta un array de `struct i2c_msg` como **una sola transacción de bus**. La lectura de un registro es el patrón canónico: un mensaje de escritura con el número de registro, seguido, sin condición de parada intermedia sino con un start repetido, de un mensaje de lectura:
+
+```c
+static int tmp117_read_reg(struct i2c_client *client, u8 reg, u16 *val)
+{
+	u8 rx[2];
+	struct i2c_msg msgs[] = {
+		{
+			.addr  = client->addr,
+			.flags = 0,           /* escritura: el puntero de registro */
+			.len   = 1,
+			.buf   = &reg,
+		}, {
+			.addr  = client->addr,
+			.flags = I2C_M_RD,    /* lectura con start repetido implicito */
+			.len   = 2,
+			.buf   = rx,
+		},
+	};
+	int ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret != ARRAY_SIZE(msgs))
+		return ret < 0 ? ret : -EIO;
+
+	*val = (rx[0] << 8) | rx[1];  /* big-endian, MSB primero */
+	return 0;
+}
+```
+
+`i2c_transfer` devuelve el número de mensajes transferidos, no cero: por eso se compara con `ARRAY_SIZE`. La bandera `0` marca escritura y `I2C_M_RD` lectura; al no emitirse parada entre ambos mensajes, el bus mantiene el start repetido que los chips con puntero de registro exigen para no perder la dirección entre la escritura y la lectura.
+
+## Emparejamiento por device tree
+
+Aquí está la inversión de control. Al arrancar, el núcleo de OF recorre el device tree; por cada nodo hijo de un controlador I2C crea un `i2c_client` con su dirección y su cadena `compatible`. El núcleo del bus compara esa cadena contra el `of_match_table` de cada driver registrado y, al primer acierto, llama a tu `probe` con ese cliente. Tú no escaneas el bus ni sondeas direcciones: describes qué compatibles sabes manejar y esperas. La macro `MODULE_DEVICE_TABLE(of, ...)` incrusta esos compatibles como metadatos, para que `udev` cargue tu módulo automáticamente cuando aparezca el hardware.
+
+<Mermaid code={`flowchart LR
+  DT[Nodo del device tree compatible ti tmp117] --> CORE[Nucleo I2C crea un i2c_client]
+  CORE --> MATCH[Compara compatible con of_match_table de cada driver]
+  MATCH --> PROBE[Encaja y llama a tu probe con el client]
+  PROBE --> DRV[El driver habla el bus con smbus o i2c_transfer]`} />
+
+<Callout type="warn" title="No confundas presencia con funcionamiento">
+Que exista un nodo en el device tree solo garantiza que se llamará a tu `probe`, no que haya silicio vivo detrás. Un `probe` robusto **verifica** el hardware —el WHO_AM_I del ejemplo— y devuelve `-ENODEV` si la identidad no cuadra, en vez de dar por hecho que el dispositivo responde. Y jamás cachees el resultado de `i2c_smbus_read_*` sin mirar el signo: un `s32` negativo es un error de bus, no un valor de registro plausible.
+</Callout>
+
+<Callout type="dios" title="El driver es una función pura de protocolo a transacciones">
+Alza la vista sobre las tres APIs que acabas de ver y fíjate en lo que tienen en común, porque ahí vive la filosofía entera del modelo de dispositivos de Linux. Tu driver no sabe nada de voltajes, de resistencias de pull-up, de pulsos de reloj ni de en qué placa corre. Sabe una única cosa: qué significan los registros del TMP117 y en qué orden tocarlos. Esa es su competencia —el protocolo— y termina justo donde empieza el cable. El controlador del bus sabe la otra mitad —el transporte— y no tiene ni idea de qué es un TMP117; solo mueve bytes entre una dirección y la memoria. Entre ambos media un contrato de una sola frase, la cadena `compatible`, que el device tree usa como llave para casar a un desconocido de hardware con el desconocido de software que sabe hablarle. La consecuencia es profunda: tu driver se vuelve una función casi pura, que dado un registro devuelve una secuencia de transacciones, y esa pureza es lo que lo hace portable sin cambiar una línea a través de arquitecturas, placas y décadas. El poder no está en `i2c_transfer`; está en que el núcleo, no tú, decide cuándo naces y a qué hardware sirves. Cuando internalizas que un driver es la mitad de protocolo de una conversación cuya mitad de transporte no le pertenece, dejas de escribir código que busca hardware y empiezas a escribir código que espera, declarado y descubrible, a ser invocado. Esa espera —la inversión de control— es la diferencia entre un script y un driver.
+</Callout>
+
+<Reto title="Escribe el traductor mínimo">
+1. Esboza un `i2c_driver` completo para un sensor imaginario con `compatible = acme,foo`, con `probe`, `remove` y las dos tablas de emparejamiento.
+2. Lee su registro de identidad con `i2c_smbus_read_byte_data` y rechaza el `probe` con `-ENODEV` si no cuadra.
+3. Reescribe esa lectura con `i2c_transfer` y dos `i2c_msg`, y explica por qué el start repetido es imprescindible.
+4. Justifica por qué se compara el retorno de `i2c_transfer` con el número de mensajes y no con cero.
+5. Busca en el árbol un driver real de `drivers/iio/` que use `i2c_smbus_read_word_swapped` y explica qué endianismo tiene su sensor.
+</Reto>

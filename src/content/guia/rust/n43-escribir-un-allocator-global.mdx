@@ -1,0 +1,153 @@
+---
+title: "Escribir un allocator global que instrumenta y cuenta asignaciones"
+description: "El allocator global es un trait, así que puedes escribir el tuyo. El caso más útil no es reinventar `malloc`, sino envolverlo: delegar en `System` y añadir contabilidad —bytes vivos, pico, número de asignaciones— con contadores atómicos. Por el camino aparecen dos trampas de nivel PhD: la reentrancia y la seguridad entre hilos."
+subject: rust
+level: 43
+order: 2
+icon: "43.2"
+duracion: "18 min"
+---
+
+<Lead>
+Como el allocator global es solo un trait, nada te impide escribir el tuyo. Pero rara vez querrás reimplementar `malloc` desde cero: el patrón valioso es **envolver** el allocator del sistema para observarlo. Un allocator que delega cada reserva en `System` y, de paso, suma bytes en un contador te da algo que ninguna librería externa puede darte con tanta precisión: la contabilidad exacta de toda la memoria que tu programa —y sus dependencias— pide al heap. Cuántos bytes hay vivos ahora, cuál fue el pico, cuántas asignaciones se han hecho. Escribirlo son veinte líneas; hacerlo **correcto** exige entender dos peligros que solo aparecen en este territorio: la reentrancia, porque tu código corre *dentro* del allocator, y las carreras de datos, porque corre en todos los hilos a la vez.
+</Lead>
+
+<Objetivos>
+
+- Implementar `GlobalAlloc` para un tipo propio que delega en `System` y cuenta bytes.
+- Usar contadores `AtomicUsize` con `Ordering::Relaxed` y entender por qué basta ese orden.
+- Reconocer y evitar la **reentrancia**: por qué no puedes asignar memoria dentro de `alloc`.
+- Respetar el requisito de edición 2024 de envolver cada operación insegura en un bloque `unsafe`.
+
+</Objetivos>
+
+## Envolver System y contar bytes
+
+La idea es un tipo sin estado propio que reenvía todo a `System` y actualiza contadores globales antes o después de delegar:
+
+```rust
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct Contador;
+
+static VIVOS: AtomicUsize = AtomicUsize::new(0);      // bytes asignados ahora mismo
+static PICO: AtomicUsize = AtomicUsize::new(0);       // maximo historico
+static ASIGNACIONES: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Contador {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(layout) };      // delega en el sistema
+        if !p.is_null() {
+            let previo = VIVOS.fetch_add(layout.size(), Ordering::Relaxed);
+            ASIGNACIONES.fetch_add(1, Ordering::Relaxed);
+            PICO.fetch_max(previo + layout.size(), Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        VIVOS.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Contador = Contador;
+```
+
+`System` es un tipo sin campos que ya implementa `GlobalAlloc`, así que `System.alloc(layout)` reenvía la petición al `malloc` de la plataforma. Nuestro papel se reduce a interponer los contadores. Fíjate en que solo sumamos si el puntero **no es nulo**: si el sistema no pudo asignar, no hay bytes que contabilizar.
+
+<Callout type="info" title="Tu allocator vive antes de main y después">
+El allocator es un `static` con constructor `const` por una razón física: tiene que existir **antes** de que corra la primera línea de Rust. Los inicializadores de estáticos, el arranque del runtime y las estructuras internas de la biblioteca ya asignan memoria antes de que tu `main` empiece, y los destructores globales y las rutinas de salida asignan y liberan después de que termine. Tu allocator instrumentado lo ve todo: por eso `VIVOS` nunca marca exactamente cero al principio ni al final. No es un bug de tu contador, es la prueba de que ocupas la capa más profunda —la que despierta primero y se acuesta la última—.
+</Callout>
+
+<Callout type="tip" title="Edicion 2024: unsafe dentro de unsafe fn es explicito">
+En la edición 2024 el lint `unsafe_op_in_unsafe_fn` está activo por defecto, así que el cuerpo de una `unsafe fn` **no** es un bloque inseguro implícito: cada operación peligrosa —aquí, llamar a `System.alloc`— debe ir envuelta en su propio `unsafe { }`. Es más verboso, pero deliberado: obliga a marcar con precisión *qué* línea ejerce el poder, en lugar de teñir toda la función. Verás ese `unsafe { System.alloc(layout) }` anidado dentro de la `unsafe fn alloc`, y no es redundancia: es la regla nueva.
+</Callout>
+
+## La trampa de la reentrancia
+
+Aquí está el error que casi todo el mundo comete la primera vez. Es tentador imprimir desde dentro del allocator para depurar:
+
+```rust
+unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+    println!("pido {} bytes", layout.size()); // PELIGRO: println puede asignar
+    unsafe { System.alloc(layout) }
+}
+```
+
+El problema es que `println!` formatea en un buffer que **puede pedir memoria al heap**, es decir, puede volver a llamar a tu `alloc`, que vuelve a `println!`, que vuelve a asignar… Es reentrancia: tu allocator se invoca a sí mismo, y en el mejor caso desbordas la pila; en el peor, corrompes tu propia contabilidad a mitad de una actualización. La regla de oro es tajante: **dentro de `alloc` y `dealloc` no puedes hacer nada que asigne memoria**. Nada de `println!`, nada de `format!`, nada de un `Vec` temporal. Solo aritmética, contadores atómicos y la delegación. Si necesitas emitir un diagnóstico, escribe a un buffer de tamaño fijo en la pila con `write!` sobre un `[u8; N]`, o difiere el trabajo fuera del allocator.
+
+<Callout type="warn" title="No uses un Mutex ingenuo dentro del allocator">
+Proteger los contadores con un `Mutex<Estadisticas>` parece razonable, pero envenena el allocator: si el `Mutex` estuviera envenenado tras un pánico, o si su implementación tocara el heap, reintroduces reentrancia y bloqueos. Peor aún, un `lock` puede dormir el hilo *dentro* de una asignación, algo intolerable en código sensible a latencia. Usa siempre tipos atómicos —`AtomicUsize` y compañía— que no asignan, no duermen y no se envenenan. La contabilidad de un allocator es justo el caso de uso para el que los átomos existen.
+</Callout>
+
+## realloc: la asignación que se contabiliza sola
+
+Falta un cabo suelto. Un `Vec` que crece no llama a `alloc`, sino a `realloc`, y nosotros no la hemos implementado. ¿Se nos escapa de la cuenta? No, y la razón es sutil y elegante. Como **no** redefinimos `realloc`, entra en juego su implementación por defecto del trait, que está escrita en términos de `self.alloc` y `self.dealloc` —es decir, de *nuestros* métodos instrumentados—. Cada crecimiento de un `Vec` pasa así por nuestro `alloc` (suma la capacidad nueva) y nuestro `dealloc` (resta la vieja), y la contabilidad cuadra sin que escribamos una línea más.
+
+<Callout type="warn" title="Delegar realloc en System rompería la cuenta en silencio">
+La trampa acecha en la "optimización" evidente. Si por rendimiento redefinieras `realloc` para delegar en `System.realloc`, ganarías el crecimiento en el sitio del sistema pero **saltarías tus dos contadores**: ni la reserva nueva ni la liberación vieja pasarían por tu código, y tu memoria contabilizada divergiría de la real sin ningún error visible. Es el clásico dilema de la instrumentación: la ruta rápida y la ruta observada son la misma, y acelerarla la vuelve invisible. Si de verdad necesitas delegar `realloc`, tienes que replicar dentro el ajuste de contadores, restando `layout.size()` y sumando `nuevo`.
+</Callout>
+
+## Por qué basta Ordering::Relaxed
+
+Los contadores usan `Ordering::Relaxed`, el orden de memoria más débil, y es la elección correcta. `Relaxed` garantiza que cada `fetch_add` es **atómico** —ningún incremento se pierde aunque mil hilos asignen a la vez— pero no impone ninguna relación de *ordenación* con otras variables. Y no la necesitamos: no estamos usando el contador como señal para sincronizar el acceso a otro dato, solo acumulamos una suma. Pedir `SeqCst` aquí sería pagar barreras de memoria caras en la ruta más caliente del programa —cada asignación— sin obtener nada a cambio. La lección general: elige el orden por lo que el contador *significa*, no por miedo; un acumulador estadístico es el ejemplo canónico de `Relaxed` legítimo.
+
+<Mermaid code={`flowchart TD
+  A[Vec pide memoria] --> B[Contador alloc]
+  B --> C[System alloc delega en malloc]
+  C --> D{puntero no nulo}
+  D -->|si| E[fetch_add en VIVOS y ASIGNACIONES]
+  E --> F[fetch_max actualiza PICO]
+  D -->|no| G[devuelve nulo sin contar]
+  F --> H[devuelve el puntero]
+  style B fill:#cba6f7,color:#11111b
+  style E fill:#89b4fa,color:#11111b
+  style H fill:#a6e3a1,color:#11111b`} />
+
+De las tres cifras, la más valiosa suele ser el **pico**, no los bytes vivos. Los bytes vivos fluctúan a cada instante y dicen poco por sí solos; el pico histórico, en cambio, es el que dimensiona tu heap: en un embebido te dice cuánta RAM debes reservar para que el programa nunca se quede sin memoria, y en un servidor revela el peor momento de presión aunque haya durado un milisegundo. Por eso lo actualizamos con `fetch_max` en cada `alloc`, capturando el máximo sin necesidad de muestrear. Esta métrica es justamente la que necesitarás en la última lección, cuando seas tú quien fije el tamaño del heap sobre metal desnudo.
+
+Para leer las estadísticas desde el resto del programa basta una función que consulte los átomos, y esta sí puede asignar y formatear porque corre fuera del allocator:
+
+```rust
+fn estadisticas() -> (usize, usize, usize) {
+    (
+        VIVOS.load(Ordering::Relaxed),
+        PICO.load(Ordering::Relaxed),
+        ASIGNACIONES.load(Ordering::Relaxed),
+    )
+}
+```
+
+<Cards>
+  <Card icon="🚫" title="No asignes">
+    Nada de `println!`, `format!` ni `Vec` dentro de `alloc`/`dealloc`: asignar te reinvoca a ti mismo (reentrancia) y desborda la pila.
+  </Card>
+  <Card icon="⏱️" title="No bloquees">
+    Nada de `Mutex` que pueda dormir el hilo o envenenarse tras un pánico. Solo tipos atómicos, que no asignan ni suspenden.
+  </Card>
+  <Card icon="🧮" title="Cuenta con átomos">
+    `AtomicUsize` con `Ordering::Relaxed`: atómico basta para acumular, sin pagar barreras que no necesitas.
+  </Card>
+  <Card icon="✅" title="Contabiliza si no es nulo">
+    Suma en `alloc` solo si el puntero es válido; no redefinas `realloc` sin replicar el ajuste de los contadores.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="El allocator instrumentado es un observador total, y por eso su disciplina es total">
+Un allocator global que envuelve a `System` ocupa una posición única en el programa: **todo** pasa por él. Cada `Vec` que crece, cada `String` que se clona, cada `HashMap` de una dependencia que jamás leerás, deja su huella en tus contadores. Ninguna herramienta de perfilado externa tiene esa cobertura sin instrumentar el binario, porque tú *eres* el punto por el que fluye la memoria. Ese poder de observación total es exactamente lo que impone la disciplina total. Estás escribiendo código que corre dentro del mecanismo del que depende todo lo demás para funcionar, incluido tú mismo: si asignas, te llamas; si bloqueas, congelas el heap entero; si te envenenas tras un pánico, matas al programa por la vía de su recurso más básico. Por eso las dos reglas —no asignes, no bloquees— no son consejos de estilo sino condiciones de existencia, y por eso los átomos con `Relaxed` no son una micro-optimización sino la única primitiva admisible: son lo único que cuenta sin asignar, coordina sin dormir y sobrevive a un pánico. La enseñanza que trasciende el allocator es una idea de sistemas: cuando escribes la capa de la que todo depende, no puedes usar las abstracciones que esa capa habilita. El allocator no puede usar el heap; el planificador no puede dormir; el manejador de fallos de página no puede fallar de página. Programar bajo nivel es, en el fondo, aprender qué comodidades debes renunciar a usar por ser tú quien las provee.
+</Callout>
+
+<Callout type="note" title="Lo esencial de un allocator instrumentado">
+Envolver `System` con un tipo que implementa `GlobalAlloc` te da contabilidad exacta de toda la memoria del programa. Delega en `System.alloc`/`dealloc` y actualiza contadores `AtomicUsize` con `Ordering::Relaxed`, que basta porque solo acumulas, no sincronizas. Dos reglas innegociables: nunca asignes dentro de `alloc`/`dealloc` (reentrancia: `println!` puede recursar hasta desbordar la pila) y nunca uses un `Mutex` que pueda dormir o envenenarse (usa átomos). En edición 2024, cada operación insegura del cuerpo va en su propio bloque `unsafe`. Cuentas si el puntero no es nulo; lees las estadísticas desde fuera del allocator.
+</Callout>
+
+<Reto title="Construye y prueba tu contador de memoria">
+1. Implementa el allocator `Contador` que delega en `System` y mantiene `VIVOS`, `PICO` y `ASIGNACIONES`. Regístralo con `#[global_allocator]`.
+2. En `main`, crea y destruye varios `Vec` y `String`, imprime las estadísticas y explica por qué `VIVOS` no vuelve exactamente a cero.
+3. Añade un `println!` dentro de `alloc`, observa el fallo (desbordamiento de pila o cuelgue) y explica la reentrancia que lo causa.
+4. Cambia `Relaxed` por `SeqCst` y argumenta qué cambia en la corrección y qué en el coste. ¿Se justifica aquí?
+5. Escribe la función `estadisticas` fuera del allocator y explica por qué esta sí puede formatear e imprimir sin peligro.
+</Reto>

@@ -1,0 +1,166 @@
+---
+title: "Qué es eBPF: una máquina virtual dentro del kernel"
+description: "Cómo Linux dejó de ser un kernel que solo se configura para convertirse en uno que se programa: una máquina virtual de registros que ejecuta programas cargados desde el espacio de usuario, enganchados a eventos y demostrados seguros antes de correr en anillo 0."
+subject: kernel
+level: 50
+order: 1
+icon: "50.1"
+duracion: "15 min"
+---
+
+<Lead>
+Durante cuarenta y nueve niveles has extendido el kernel de la única forma clásica: escribir un módulo, compilarlo contra sus cabeceras, insertarlo y confiar en que un puntero suelto no derribe la máquina entera. eBPF rompe ese contrato. Te ofrece cargar código en el corazón del kernel, engancharlo a casi cualquier evento y ejecutarlo en anillo 0 con la garantía matemática de que no puede colgar el sistema ni leer memoria ajena. No es un módulo ni una llamada al sistema nueva: es una máquina virtual dentro del kernel, y probablemente la transformación más profunda de Linux en dos décadas.
+</Lead>
+
+<Objetivos>
+
+- Entender eBPF como una máquina virtual de registros embebida en el kernel.
+- Recorrer el ciclo completo: compilar a bytecode, cargar con `bpf()`, verificar, compilar con JIT y enganchar.
+- Conocer el modelo de ejecución dirigido por eventos y su aislamiento.
+- Situar por qué eBPF convierte al kernel en una plataforma programable.
+
+</Objetivos>
+
+## De filtro de paquetes a máquina universal
+
+El origen es humilde. En 1992, Steven McCanne y Van Jacobson diseñaron el *Berkeley Packet Filter*: una minúscula máquina virtual que ejecutaba en el kernel las expresiones de `tcpdump` para decidir, sin cruzar a espacio de usuario, qué paquetes copiar. Ese BPF clásico —hoy llamado cBPF— tenía dos registros de 32 bits y un puñado de instrucciones.
+
+En 2014, Alexei Starovoitov lo reescribió por completo para Linux 3.18. El nuevo eBPF amplió los registros a 64 bits, los llevó a diez, añadió estructuras de datos persistentes (los mapas), llamadas a funciones auxiliares del kernel y un compilador JIT. De pronto la maquinita de filtrar paquetes era una máquina de propósito general capaz de instrumentar cualquier rincón del núcleo. El nombre quedó, pero el proyecto se independizó tanto que oficialmente eBPF ya no es un acrónimo de nada: es, sin más, la tecnología.
+
+## El formato de la máquina: registros e instrucciones
+
+eBPF es una arquitectura RISC deliberadamente sencilla. Tiene once registros de 64 bits —`r0` a `r10`— y alrededor de cien instrucciones de ancho fijo: cargas y almacenamientos, aritmética, saltos, una instrucción de llamada y una de salida. Cada instrucción cabe en ocho bytes:
+
+```c
+/* include/uapi/linux/bpf.h: la instrucción de la máquina virtual */
+struct bpf_insn {
+	__u8	code;		/* operación: clase, tamaño, modo */
+	__u8	dst_reg:4;	/* registro destino */
+	__u8	src_reg:4;	/* registro fuente */
+	__s16	off;		/* desplazamiento con signo */
+	__s32	imm;		/* constante inmediata con signo */
+};
+```
+
+La convención de registros no es arbitraria: imita la ABI de las arquitecturas reales para que el JIT sea casi una traducción uno a uno. `r0` guarda el valor de retorno del programa y el resultado de cada auxiliar; `r1` a `r5` pasan argumentos a los auxiliares; `r6` a `r9` los preserva el llamado; y `r10` es el puntero de marco de pila, de solo lectura. Un programa no puede fabricar punteros con aritmética libre: el kernel sabe en todo momento qué contiene cada registro.
+
+La pila es diminuta y fija: 512 bytes por programa, apuntados por `r10`, que solo se lee. No hay `malloc`, no hay memoria dinámica clásica; el estado que exceda la pila vive en los mapas. Esta parquedad no es un defecto sino una condición de la demostración de seguridad: cuanto más acotado es el modelo de ejecución, más fácil le resulta al verificador probar que ninguna ejecución se sale de madre.
+
+El repertorio de instrucciones se organiza en clases codificadas en el campo `code`: `BPF_LD` y `BPF_LDX` para cargas, `BPF_ST` y `BPF_STX` para almacenamientos, `BPF_ALU` y `BPF_ALU64` para aritmética y lógica de 32 y 64 bits, `BPF_JMP` para saltos condicionales y la llamada a auxiliar, y `BPF_JMP32` para comparaciones de 32 bits. No hay instrucción de salto indirecto arbitrario ni de retorno a una dirección calculada: el flujo de control es siempre estructurado y analizable, otra elección deliberada al servicio de la demostrabilidad.
+
+## El ciclo de vida: de C a anillo 0
+
+Nadie escribe bytecode a mano. Escribes C restringido, lo compilas con Clang apuntando al backend `bpf`, y obtienes un objeto ELF con las instrucciones y metadatos. Un tracer mínimo que cuenta ejecuciones de `execve`:
+
+```c
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+SEC("tp/syscalls/sys_enter_execve")
+int cuenta_exec(void *ctx)
+{
+	bpf_printk("execve invocado\n");
+	return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+```bash
+clang -O2 -g -target bpf -c exec.c -o exec.o   # C restringido -> bytecode ELF
+```
+
+El espacio de usuario habla con el subsistema por una **única** llamada al sistema, `bpf()`, que actúa como multiplexor: el primer argumento elige el comando y el segundo lleva una unión con sus parámetros.
+
+```c
+/* una sola syscall, decenas de comandos */
+int bpf(int cmd, union bpf_attr *attr, unsigned int size);
+
+enum bpf_cmd {
+	BPF_MAP_CREATE,       /* crear un mapa */
+	BPF_MAP_UPDATE_ELEM,  /* escribir en un mapa */
+	BPF_PROG_LOAD,        /* verificar y cargar un programa */
+	BPF_PROG_ATTACH,      /* enganchar a un gancho */
+	BPF_BTF_LOAD,         /* cargar información de tipos */
+	/* ... y muchos más ... */
+};
+```
+
+Para cargar el tracer, el usuario invoca `bpf(BPF_PROG_LOAD, ...)` con el bytecode. El kernel lo verifica (nivel 50.2), lo compila a código nativo con el JIT y devuelve un descriptor de fichero que representa el programa cargado. Casi nunca llamarás a `bpf()` a mano —`libbpf` la envuelve—, pero cada creación de mapa, cada carga y cada enganche cruza ese portal. Puedes inspeccionar la forma final de la máquina virtual con `bpftool`:
+
+```bash
+$ bpftool prog dump xlated id 138
+0: (b7) r0 = 0        ; carga inmediata: r0 = 0
+1: (95) exit          ; devuelve r0
+```
+
+Dos instrucciones: cargar cero y salir. Esa es la desnudez de la máquina. Todo programa eBPF, por sofisticado que sea, termina siendo una secuencia de estas operaciones que el JIT convierte en instrucciones x86-64 o arm64 reales, sin intérprete de por medio en producción.
+
+Una vez cargado, el programa existe como un objeto del kernel con su propio identificador, contabilizado y visible para quien lo consulte:
+
+```bash
+$ bpftool prog show id 138
+138: tracepoint  name cuenta_exec  tag a4f3c2b1e9d70a55  gpl
+	loaded_at 2026-07-20T10:14:02+0000  uid 0
+	xlated 16B  jited 43B  memlock 4096B
+```
+
+<Mermaid code={`flowchart LR
+  C[fuente C restringida] --> K[clang target bpf]
+  K --> O[bytecode en ELF]
+  O --> S[syscall bpf BPF_PROG_LOAD]
+  S --> V[verifier demuestra seguridad]
+  V --> J[JIT a codigo nativo]
+  J --> H[enganchado a un evento]`} />
+
+## El JIT: del bytecode al metal
+
+Verificado el programa, todavía es bytecode. Antes de dejarlo correr, el kernel lo pasa por su compilador *just-in-time*, que traduce cada instrucción de la máquina virtual a instrucciones nativas del anfitrión. Como la convención de registros de eBPF se diseñó imitando la ABI real, la traducción es casi uno a uno y el resultado corre a velocidad prácticamente nativa, sin intérprete en el camino caliente:
+
+```bash
+$ bpftool prog dump jited id 138
+   0: push   %rbp
+   1: mov    %rsp,%rbp
+   4: xor    %eax,%eax      ; r0 = 0
+   6: leave
+   7: ret                   ; return r0
+```
+
+Sobrevive un intérprete de bytecode como reserva para arquitecturas sin JIT, pero en cualquier servidor moderno el JIT está activo por defecto. Y para cerrar la superficie de ataque, el kernel lo endurece: protege las páginas del código emitido como solo lectura y ejecutable una vez emitido, y ofusca las constantes para dificultar los ataques especulativos contra el código generado.
+
+## Dirigido por eventos, aislado por diseño
+
+Un programa eBPF no se ejecuta solo: duerme hasta que su evento ocurre. Una llamada al sistema, la llegada de un paquete, la entrada a una función del kernel, un `perf event` periódico. Cuando el gancho dispara, la máquina corre, produce su resultado y calla hasta la próxima vez. El estado que debe sobrevivir entre disparos vive en los mapas (nivel 50.4), la única memoria persistente que el programa conoce.
+
+Ese aislamiento es la clave de todo. Un módulo del kernel es *confiable*: puede hacer cualquier cosa, y un solo error tuyo cuelga la máquina. Un programa eBPF es *no confiable pero demostrado seguro*: no puede llamar a funciones arbitrarias del kernel —solo a auxiliares con contrato explícito—, no puede desreferenciar un puntero sin que el verificador haya probado sus límites, y no puede ejecutar un bucle sin fin. Corre en anillo 0 con los privilegios del kernel, pero dentro de una jaula que el propio kernel construyó.
+
+De esa combinación —seguridad demostrada, carga en caliente y ganchos por todo el núcleo— nace su carácter transformador. Google, Meta, Netflix y Cloudflare lo ejecutan a escala planetaria; la red de Kubernetes, la seguridad de contenedores y la observabilidad moderna se reescribieron sobre él. Ninguna otra tecnología reciente reorganizó tan a fondo lo que significa extender un sistema operativo: por primera vez se puede injertar comportamiento nuevo en el kernel de producción sin recompilarlo, sin reiniciarlo y sin arriesgarse a derribarlo.
+
+<Cards>
+  <Card icon="🧱" title="Módulo del kernel">
+    Código confiable con acceso total. Máxima potencia, cero red de seguridad: un puntero inválido provoca un `kernel panic`. Requiere compilar contra el kernel exacto y reinsertar.
+  </Card>
+  <Card icon="🛡️" title="Programa eBPF">
+    Código no confiable pero verificado. Corre en anillo 0 sin poder colgar la máquina ni leer memoria ajena. Se carga y descarga en caliente, sin reiniciar ni recompilar el kernel.
+  </Card>
+</Cards>
+
+<Callout type="info" title="No confundas eBPF con un lenguaje">
+eBPF no es un lenguaje de programación, sino un *entorno de ejecución*: una arquitectura de máquina virtual, un verificador, un JIT y un modelo de ganchos. Escribes C, Rust o incluso Python que se compila a su bytecode. La analogía correcta es la JVM: igual que Java corre sobre la máquina virtual de Java, tu observabilidad corre sobre la máquina virtual del kernel.
+</Callout>
+
+<Callout type="warn" title="Cargar eBPF es una operación privilegiada">
+Que el código sea seguro no significa que cualquiera pueda inyectarlo. Cargar programas exige la capacidad `CAP_BPF` —y `CAP_PERFMON`, `CAP_NET_ADMIN` o `CAP_SYS_ADMIN` según el tipo—, y la carga de eBPF *no privilegiado* está deshabilitada por defecto en los kernels modernos con `kernel.unprivileged_bpf_disabled`. El verificador defiende al kernel de errores; el modelo de capacidades defiende de quién tiene siquiera derecho a intentarlo.
+</Callout>
+
+<Callout type="dios" title="El kernel dejó de ser una fortaleza para volverse una plataforma">
+Detente aquí, porque lo que acabas de cruzar reordena la relación entera entre tu código y el sistema operativo. Durante toda la historia de Unix el kernel fue una fortaleza cerrada: para cambiar su comportamiento tenías dos caminos, ambos brutales. O modificabas su fuente y recompilabas el mundo, o inyectabas un módulo con acceso total y aceptabas que un error de programación tuyo derribara la máquina de todos. No existía término medio entre no tocar nada y arriesgarlo todo, porque el kernel no tenía forma de razonar sobre código que no fuera suyo. eBPF inventa ese término medio y, al hacerlo, cambia la naturaleza del kernel. La idea decisiva no es la máquina virtual —hay máquinas virtuales por todas partes— sino que el kernel puede *demostrar*, antes de ejecutar una sola instrucción, que un programa extraño es incapaz de dañarlo. Esa demostración transforma la confianza en verificación: ya no necesitas confiar en quien escribió el programa, porque el kernel comprobó por ti que termina, que no toca lo que no debe y que respeta cada contrato. Y una vez que el kernel puede aceptar código de terceros sin riesgo, deja de ser una fortaleza y se vuelve una plataforma: un sustrato programable donde la observabilidad, la red, la seguridad y el rendimiento se escriben desde fuera, en caliente, sin tocar la fuente sagrada. Todo el resto del nivel —el verificador, los ganchos, los mapas, el ecosistema— no son cinco temas sueltos, sino las cuatro consecuencias de esta única inversión: el día en que el kernel aprendió a razonar sobre el código ajeno en lugar de tener que confiar en él.
+</Callout>
+
+<Reto title="Carga tu primer programa en la máquina virtual">
+1. Escribe el tracer de `execve` de arriba, compílalo con `clang -target bpf` y cárgalo con `bpftool prog load` o con `bpftrace -e 'tracepoint:syscalls:sys_enter_execve { printf("exec\n"); }'`.
+2. Vuelca su forma verificada con `bpftool prog dump xlated` y cuenta cuántas instrucciones de la máquina virtual generó tu `bpf_printk`.
+3. Explica en tres líneas por qué `r10` es de solo lectura y qué desastre permitiría un programa que pudiera fabricar punteros de pila a voluntad.
+4. Argumenta la diferencia esencial entre insertar un módulo con `insmod` y cargar un programa con `bpf()`: ¿en qué momento exacto deja de existir la posibilidad de un `kernel panic` provocado por tu código?
+5. Vuelca la forma nativa con `bpftool prog dump jited` y compara el número de instrucciones nativas con el de la forma `xlated`: ¿qué te dice esa relación sobre lo cerca que está eBPF del metal?
+</Reto>

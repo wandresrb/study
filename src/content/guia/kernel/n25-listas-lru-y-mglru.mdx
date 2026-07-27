@@ -1,0 +1,143 @@
+---
+title: "Las listas LRU y MGLRU: elegir a quién expulsar"
+description: "El reclaim necesita un oráculo que no puede permitirse: LRU exacto. El kernel lo aproxima con cinco listas por lruvec, el bit de referencia y el algoritmo de segunda oportunidad. MGLRU (Multi-Gen LRU) sustituye las dos listas por un eje de generaciones recorrido mediante page table walking."
+subject: kernel
+level: 25
+order: 2
+icon: "25.2"
+duracion: "18 min"
+---
+
+<Lead>
+Reclamar es elegir víctimas, y elegir mal es catastrófico: expulsar la página que se usará dentro de un microsegundo condena al sistema a releerla de disco. La política ideal —desalojar la que tardará más en volver a usarse— exige ver el futuro. El kernel no puede, así que aproxima el pasado: LRU. Toda la historia del reemplazo de páginas es una sucesión de aproximaciones cada vez más baratas a ese oráculo imposible, y su capítulo actual se llama MGLRU.
+</Lead>
+
+<Objetivos>
+
+- Conocer las cinco listas LRU por `lruvec` y por qué anónima y archivo van separadas.
+- Entender el bit de referencia y el algoritmo de segunda oportunidad.
+- Ver cómo se promociona y degrada entre la lista activa y la inactiva.
+- Comprender MGLRU: generaciones, aging, eviction y por qué escala mejor.
+
+</Objetivos>
+
+## Cinco listas, no una
+
+El LRU exacto exigiría reordenar una lista global en cada acceso a memoria: impensable a la escala de millones de accesos por segundo. El kernel lo aproxima con un puñado de listas por `struct lruvec` —una por cada combinación de nodo NUMA y cgroup— y mueve las páginas entre ellas de forma perezosa. Son cinco:
+
+```c
+/* include/linux/mmzone.h */
+enum lru_list {
+	LRU_INACTIVE_ANON = LRU_BASE,
+	LRU_ACTIVE_ANON   = LRU_BASE + LRU_ACTIVE,
+	LRU_INACTIVE_FILE = LRU_BASE + LRU_FILE,
+	LRU_ACTIVE_FILE   = LRU_BASE + LRU_FILE + LRU_ACTIVE,
+	LRU_UNEVICTABLE,
+	NR_LRU_LISTS
+};
+```
+
+Dos ejes las organizan. El primero, **activa frente a inactiva**, implementa un reloj de dos manecillas: la lista activa guarda el conjunto de trabajo caliente, protegido; la inactiva es la sala de espera de la expulsión, y la cola de la inactiva es lo primero en caer. El segundo eje, **anónima frente a archivo**, separa las dos familias del nivel 25.1 porque su coste de reclamo es abismalmente distinto —descartar archivo limpio es gratis; expulsar anónima cuesta una escritura a swap— y el reparto entre ambas lo gobierna `swappiness` (nivel 25.4). Fuera de todo el juego queda `LRU_UNEVICTABLE`: páginas `mlock` o no expulsables que se apartan para no malgastar escaneos en ellas.
+
+## Segunda oportunidad: el reloj aproximado
+
+¿Cómo sabe el kernel si una página de la inactiva sigue en uso sin rastrear cada acceso? Con dos bits baratos. La MMU pone el **bit de accessed** en el PTE cada vez que se toca la página; el kernel mantiene además el flag `PG_referenced` en el propio folio. Con ellos implementa el clásico **algoritmo de segunda oportunidad**: una página que se referencia estando en la inactiva no se expulsa de inmediato, se le concede una tregua.
+
+```c
+/* mm/vmscan.c — el corazón de la segunda oportunidad */
+static enum folio_references folio_check_references(struct folio *folio,
+						    struct scan_control *sc)
+{
+	unsigned long vm_flags;
+	int referenced_ptes, referenced_folio;
+
+	/* ¿algún PTE joven (bit accessed) apunta al folio? */
+	referenced_ptes = folio_referenced(folio, 1,
+					   sc->target_mem_cgroup, &vm_flags);
+	referenced_folio = folio_test_clear_referenced(folio);
+
+	if (referenced_ptes) {
+		/* muy referenciada o ejecutable: promover a la activa */
+		if (referenced_folio || (vm_flags & VM_EXEC))
+			return FOLIOREF_ACTIVATE;
+
+		folio_set_referenced(folio);   /* primera tregua: conservar */
+		return FOLIOREF_KEEP;
+	}
+	return FOLIOREF_RECLAIM;            /* sin referencias: expulsable */
+}
+```
+
+La lógica es un termostato de temperatura de página. Sin referencias, `FOLIOREF_RECLAIM`: fría, se va. Con referencias pero primera vez, `FOLIOREF_KEEP`: se le marca `PG_referenced` y sobrevive una ronda. Con referencias **y** ya marcada, o si es código ejecutable, `FOLIOREF_ACTIVATE`: caliente, asciende a la lista activa. Las páginas de la activa se degradan a la inactiva cuando esta se queda escuálida, cerrando el ciclo del reloj.
+
+## Balance activa/inactiva y los refaults
+
+El equilibrio entre ambas manecillas importa. Si la activa engorda demasiado, la inactiva se queda sin candidatos y el reclaim escanea en vano; si la inactiva es enorme, se expulsan páginas que aún hacían falta. El kernel vigila que la inactiva no caiga por debajo de cierta proporción de la activa y degrada páginas cuando conviene.
+
+La pieza más elegante es la **detección de refault**. Cuando se expulsa una página de archivo, su hueco en el árbol de páginas del inode no queda vacío: guarda una *shadow entry*, una marca con la "edad" del LRU en el momento del desalojo. Si esa página vuelve a pedirse poco después, el kernel compara esa edad con la actual y sabe si el desalojo fue un error —un refault que indica que el conjunto de trabajo no cabía—. Esa señal, el `workingset`, alimenta las variables `anon_cost` y `file_cost` de `scan_control` y hace que el reclaim aprenda de sus propios errores. El mismo mecanismo detecta el thrashing y alimenta la PSI (nivel 25.4).
+
+## MGLRU: de dos listas a un eje de generaciones
+
+El esquema de dos listas tiene un talón de Aquiles: para saber qué páginas anónimas están calientes, el reclaim recorre el `rmap` —de página a los PTEs que la mapean—, un barrido inverso caro y de mala localidad bajo presión. **MGLRU** (Multi-Generational LRU, activo por defecto en Linux 7.x) le da la vuelta: en lugar de dos listas por tipo, mantiene un abanico de **generaciones**, y en lugar de escanear el rmap, recorre las tablas de páginas hacia delante para muestrear el bit de accessed con localidad excelente.
+
+```c
+/* include/linux/mmzone.h — el corazón de MGLRU */
+struct lru_gen_folio {
+	/* el aging incrementa la generación más joven */
+	unsigned long max_seq;
+	/* la eviction incrementa las generaciones más viejas */
+	unsigned long min_seq[ANON_AND_FILE];
+	unsigned long timestamps[MAX_NR_GENS];
+	/* listas multi-generacionales por tipo y por zona */
+	struct list_head folios[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+};
+/* MIN_NR_GENS = 2, MAX_NR_GENS = 4, MAX_NR_TIERS = 4 */
+```
+
+Dos operaciones mueven el mecanismo. El **aging** recorre las tablas de páginas buscando páginas jóvenes y las promueve a la generación más nueva, incrementando `max_seq`; crea así el extremo caliente del abanico. La **eviction** expulsa desde la generación más vieja (`min_seq`) e incrementa ese contador al vaciarla. Entre ambos extremos, las páginas envejecen por el mero paso del tiempo sin que nadie las toque. Dentro de cada generación, los **tiers** clasifican por frecuencia de acceso usando el conteo de referencias, y la protección basada en refaults decide qué tiers merecen sobrevivir a una ronda.
+
+```bash
+# ¿está MGLRU compilado y activo?
+cat /sys/kernel/mm/lru_gen/enabled     # bitmask, 0x0007 = todo activado
+echo y > /sys/kernel/mm/lru_gen/enabled
+# estado por nodo y por memcg, con histograma de generaciones
+cat /sys/kernel/debug/lru_gen
+```
+
+<Mermaid code={`flowchart LR
+  AG[Aging recorre tablas de paginas incrementa max_seq] --> Y[Generacion mas joven]
+  Y --> M1[Generacion intermedia]
+  M1 --> M2[Generacion mas vieja min_seq]
+  M2 --> EV[Eviction expulsa la cola e incrementa min_seq]
+  AC[Acceso detectado bit accessed] --> Y`} />
+
+MGLRU aporta tres ventajas medibles. El recorrido de tablas de páginas tiene localidad muy superior al barrido de rmap, así que estima el conjunto de trabajo más deprisa y con menos CPU bajo presión. Las generaciones dan un eje temporal explícito que hace la política más predecible y ajustable. Y su telemetría en `debugfs` permite ver, generación a generación, dónde vive el conjunto de trabajo. Por eso se adoptó primero en Android y ChromeOS —donde la latencia bajo presión es crítica— y hoy es el reclaim por defecto en la nube.
+
+<Cards>
+  <Card icon="🌱" title="Aging">
+    Recorre las tablas de páginas, detecta páginas jóvenes por el bit de accessed y las promueve a la generación más nueva, incrementando `max_seq`. Crea el extremo caliente.
+  </Card>
+  <Card icon="🍂" title="Eviction">
+    Expulsa desde la generación más vieja e incrementa `min_seq`. Es el extremo frío del abanico, la sala de espera del desalojo que antes ocupaba la cola de la inactiva.
+  </Card>
+  <Card icon="🎚️" title="Tiers">
+    Dentro de cada generación clasifican por frecuencia de acceso; la protección basada en refaults decide qué tiers merecen sobrevivir a una ronda de reclaim.
+  </Card>
+</Cards>
+
+<Callout type="info" title="Optimización de mirar alrededor">
+Cuando MGLRU encuentra una página joven durante el aging, aplica `lru_gen_look_around()`: examina las páginas vecinas en la misma tabla, porque la localidad espacial hace probable que también estén calientes. Filtros de Bloom recuerdan qué regiones de VMA merecieron ser recorridas, evitando re-escanear zonas frías. Son las heurísticas que convierten el muestreo del bit de accessed en una estimación barata y sorprendentemente fiel del conjunto de trabajo.
+</Callout>
+
+<Callout type="dios" title="Todo el reemplazo de páginas es predecir el futuro con el pasado">
+Belady demostró en 1966 que la política óptima de reemplazo —expulsar la página cuyo próximo uso está más lejano en el tiempo— es inalcanzable, porque exige conocer el futuro. Desde entonces, cada algoritmo de paginación es un intento de **inferir ese futuro a partir del pasado observable**, y la única variable de diseño real es cuánta información recolectas y a qué precio. El LRU exacto querría el orden total de accesos: demasiado caro. Las dos listas con bit de referencia se conforman con una foto binaria —caliente o frío— actualizada de forma perezosa: barato pero grueso. MGLRU añade una dimensión que faltaba, el **tiempo cuantizado en generaciones**, y con ella distingue no solo si una página se usó, sino *hace cuánto*, que es justo lo que Belady necesitaba y no podía tener. El salto conceptual es dejar de preguntar "¿esta página está en uso?" para preguntar "¿en qué punto de una línea temporal de envejecimiento cae?". Ninguna de estas políticas ve el futuro; todas apuestan a que el pasado reciente lo predice. La historia del reclaim es la historia de hacer esa apuesta más fina sin hacerla más cara, y MGLRU es el estado del arte de un problema que nació con la memoria virtual y no se cerrará nunca.
+</Callout>
+
+<Reto title="Observa el envejecimiento en vivo">
+1. Enumera las cinco listas de `enum lru_list` y explica qué eje separa cada par.
+2. Traza los tres retornos de `folio_check_references` y di qué le pasa a la página en cada uno.
+3. Explica qué es una shadow entry y cómo un refault delata que el conjunto de trabajo no cabe.
+4. Lee `/sys/kernel/mm/lru_gen/enabled` y `/sys/kernel/debug/lru_gen`; identifica `min_seq` y `max_seq` de tu nodo.
+5. Argumenta por qué recorrer las tablas de páginas escala mejor que el barrido de rmap bajo presión de memoria.
+</Reto>

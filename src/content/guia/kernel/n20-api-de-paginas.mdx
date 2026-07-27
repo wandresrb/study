@@ -1,0 +1,132 @@
+---
+title: "La API de páginas: alloc_pages y sus hermanas"
+description: "Las funciones con las que se pide y se devuelve memoria física al buddy: alloc_pages y alloc_page, __get_free_pages y get_zeroed_page, free_pages y __free_pages. Qué devuelve cada una, el papel del parámetro order y por qué hay que emparejar reserva y liberación."
+subject: kernel
+level: 20
+order: 3
+icon: "20.3"
+duracion: "14 min"
+---
+
+<Lead>
+Ya sabes cómo piensa el buddy; toca hablarle. Su interfaz es un puñado de funciones que giran todas alrededor de un mismo parámetro, el `order`, y de una decisión: querer un `struct page` o querer directamente una dirección virtual utilizable. Elegir bien —y liberar con la función gemela de la que reservó— es la diferencia entre código correcto y un leak silencioso.
+</Lead>
+
+<Objetivos>
+
+- Distinguir qué devuelve `alloc_pages` frente a `__get_free_pages`.
+- Usar `alloc_page`, `get_zeroed_page` y los atajos de orden 0.
+- Emparejar cada reserva con su liberación correcta.
+- Entender por qué el `order` obliga a pensar en potencias de dos contiguas.
+
+</Objetivos>
+
+## Dos familias: página o dirección
+
+Toda reserva al buddy nace de una de dos funciones, y la elección es qué te devuelven. `alloc_pages()` devuelve un puntero al `struct page` del primer marco del bloque; `__get_free_pages()` devuelve la **dirección virtual** ya mapeada del bloque, lista para escribir:
+
+```c
+/* include/linux/gfp.h */
+struct page *alloc_pages(gfp_t gfp, unsigned int order);
+unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order);
+unsigned long get_zeroed_page(gfp_t gfp_mask);
+
+#define alloc_page(gfp_mask)      alloc_pages(gfp_mask, 0)
+#define __get_free_page(gfp_mask) __get_free_pages((gfp_mask), 0)
+```
+
+`alloc_pages` es la forma primaria: te da la ficha, y desde ella obtienes la dirección con `page_address()` cuando la necesitas. Es obligatoria cuando vas a manejar la página como objeto —ponerla en una lista, mapearla a usuario, entregarla a un DMA—. `__get_free_pages` es el atajo cómodo cuando solo quieres memoria para usar aquí y ahora: te ahorra el `page_address()`, pero por eso mismo **no puede** devolver memoria alta no mapeada, cosa irrelevante en 64 bits pero central en la historia del kernel.
+
+```c
+/* Quiero el descriptor: 4 paginas contiguas (2 elevado a 2) */
+struct page *pg = alloc_pages(GFP_KERNEL, 2);
+if (!pg)
+	return -ENOMEM;
+void *buf = page_address(pg);       /* direccion virtual del bloque */
+/* ... usar buf ... */
+__free_pages(pg, 2);
+
+/* Quiero directamente memoria para usar: 4 paginas */
+unsigned long addr = __get_free_pages(GFP_KERNEL, 2);
+if (!addr)
+	return -ENOMEM;
+memset((void *)addr, 0, 4 * PAGE_SIZE);
+/* ... usar addr ... */
+free_pages(addr, 2);
+```
+
+## El order: potencias de dos, siempre contiguas
+
+El `order` es el mismo del buddy: pides 2^order páginas **físicamente contiguas**. Orden 0 es una página, orden 1 son dos, orden 2 son cuatro. No existe pedir tres páginas: se redondea al alza a un bloque de orden 2 y se desperdicia una. Esto tiene dos consecuencias que marcan todo el diseño de un driver:
+
+- **Cuanto mayor el orden, más probable el fallo.** Un bloque de orden 0 casi siempre está disponible; uno de orden 8 (1 MiB contiguo) exige que el buddy tenga compañeros alineados sin fragmentar, y puede fallar aunque sobre RAM. Pedir órdenes altos es pedir suerte.
+- **El máximo es `MAX_PAGE_ORDER`, 10 por defecto.** Pedir por encima de ese orden falla siempre y suelta un aviso. Si necesitas más y no exiges contigüidad física, la respuesta es `vmalloc()`, que cose páginas dispersas en un rango virtual continuo.
+
+Traducido a tamaños con páginas de 4 KiB: orden 0 son 4 KiB, orden 2 son 16 KiB, orden 4 son 64 KiB, orden 8 es 1 MiB y orden 10 —el máximo— son 4 MiB. Cada escalón dobla el anterior y estrecha el margen de maniobra del buddy.
+
+Por eso la regla de oro del asignador de páginas: **pide el orden más bajo que resuelva tu problema.** Si te basta con memoria virtualmente contigua, no reclames contigüidad física.
+
+<Callout type="info" title="Variantes NUMA por debajo de alloc_pages">
+`alloc_pages()` respeta la política NUMA de la tarea que llama. Cuando quieres forzar el nodo —por localidad de un DMA, por ejemplo— existe `alloc_pages_node(nid, gfp, order)`, y el núcleo real bajo todas ellas es `__alloc_pages(gfp, order, preferred_nid, nodemask)`. En un servidor con varios sockets, reservar en el nodo equivocado cuesta latencia en cada acceso posterior a esa memoria.
+</Callout>
+
+## Liberar con la función gemela
+
+El buddy no recuerda con qué orden reservaste: se lo tienes que decir al liberar. Y cada familia de reserva tiene su familia de liberación; cruzarlas es corrupción de memoria:
+
+```c
+/* include/linux/gfp.h */
+void __free_pages(struct page *page, unsigned int order);
+void free_pages(unsigned long addr, unsigned int order);
+
+#define __free_page(page) __free_pages((page), 0)
+#define free_page(addr)   free_pages((addr), 0)
+```
+
+La correspondencia es estricta y merece grabarse:
+
+<Cards>
+  <Card icon="🧩" title="alloc_pages / alloc_page">
+    Devuelve `struct page *`. Se libera con `__free_pages(page, order)` o `__free_page(page)`. La familia de la ficha.
+  </Card>
+  <Card icon="📬" title="__get_free_pages / get_zeroed_page">
+    Devuelve `unsigned long`, una dirección virtual. Se libera con `free_pages(addr, order)` o `free_page(addr)`. La familia de la dirección.
+  </Card>
+</Cards>
+
+Dos errores clásicos y fatales: liberar con un `order` distinto del reservado (el buddy fusiona bloques que no existen y corrompe las listas libres), y pasar una dirección virtual a `__free_pages` o un `struct page` a `free_pages` (mezclar familias). Ninguno da un fallo inmediato: envenenan el asignador y estallan minutos después, lejos del culpable.
+
+Bajo el capó, liberar decrementa el `_refcount` del bloque y solo cuando llega a cero devuelve las páginas a las listas del buddy. Por eso el doble free es tan corrosivo: el segundo `__free_pages` mete en una lista libre un bloque que quizá ya fue reasignado, y a partir de ahí dos dueños creen poseer la misma memoria. Opciones como `CONFIG_DEBUG_VM` y el page poisoning existen precisamente para atrapar estos cruces antes de que corrompan datos ajenos.
+
+`get_zeroed_page()` merece mención aparte: equivale a `__get_free_pages(gfp | __GFP_ZERO, 0)`, una página recién puesta a cero, imprescindible cuando la vas a exponer a usuario para no filtrar datos ajenos. No hay una variante de varios órdenes con nombre propio: se consigue añadiendo `__GFP_ZERO` a la máscara, el modificador que verás en la próxima lección.
+
+<Mermaid code={`flowchart TD
+  Q[Que necesito del buddy] -->|el struct page como objeto| AP[alloc_pages gfp order]
+  Q -->|solo memoria usable| GF[__get_free_pages gfp order]
+  AP --> PA[page_address da la direccion]
+  AP -.libera con.-> FP1[__free_pages page order]
+  GF -.libera con.-> FP2[free_pages addr order]`} />
+
+## En Linux 7.x: el giro a folios
+
+Durante años el kernel usó `struct page` para todo, mezclando en un mismo tipo las páginas sueltas y las cabezas de bloques compuestos, con reglas sutiles sobre cuál era cuál. Linux 7.x consolida una abstracción más limpia sobre el buddy: el **folio**. Un `struct folio` es, por construcción, la primera página de un bloque —nunca una página de cola—, lo que elimina toda una clase de errores de refcounting:
+
+```c
+/* include/linux/gfp.h */
+struct folio *folio_alloc(gfp_t gfp, unsigned int order);
+void folio_put(struct folio *folio);   /* baja el refcount; libera al llegar a 0 */
+```
+
+La API de páginas cruda que acabas de aprender no desaparece: es el cimiento sobre el que se construyen `folio_alloc` y el asignador de slab, y sigue siendo la interfaz correcta para la memoria que el kernel gestiona como marcos físicos —DMA, tablas de páginas, buffers de driver—. Los folios se imponen donde la memoria es paginable y se cuenta por referencias: el page cache y la memoria anónima. Distinguir cuándo manejas un marco físico y cuándo un folio es parte de leer el `mm/` moderno.
+
+<Callout type="dios" title="La contigüidad física es un lujo; pídela solo si la necesitas">
+Hay una jerarquía moral escondida en estas funciones que separa al programador de kernel novato del experto. El novato reserva con holgura, pide órdenes altos por comodidad y trata la memoria contigua como gratis. El experto sabe que cada orden que sube multiplica por dos la probabilidad de que el buddy no pueda servirle bajo presión, y que un driver que exige un bloque de orden 5 en el camino de una interrupción es una bomba de relojería: funcionará en el laboratorio y fallará el día de más carga. La contigüidad física es un recurso escaso y no renovable a corto plazo: solo el hardware que hace DMA sin IOMMU la necesita de verdad. Para todo lo demás existe `vmalloc`, que finge contigüidad con tablas de páginas, y existe el diseño que evita necesitar bloques grandes. Interioriza la pregunta que todo parche debe responder antes de llamar a `alloc_pages`: ¿de verdad necesito estas páginas pegadas en la RAM física, o solo necesito que mi puntero recorra un rango continuo? La respuesta honesta, casi siempre, baja el orden que pides —y con él, la fragilidad de tu código bajo estrés—. Esa disciplina es lo que hace que el kernel siga en pie tras años de uptime.
+</Callout>
+
+<Reto title="Empareja reservas y liberaciones">
+1. Reserva 8 páginas con `alloc_pages(GFP_KERNEL, 3)`, obtén su dirección con `page_address` y escríbelas enteras con `memset`; libéralas con `__free_pages(pg, 3)`.
+2. Repite con `__get_free_pages(GFP_KERNEL, 3)` y `free_pages(addr, 3)`; observa que te ahorras el `page_address`.
+3. Sustituye una reserva por `get_zeroed_page` y verifica con `memchr_inv` que la página llega a cero.
+4. En una VM desechable, libera a propósito con el `order` equivocado y observa el estropicio que reporta el kernel bajo `CONFIG_DEBUG_VM`.
+5. Intenta `alloc_pages(GFP_KERNEL, 11)` y captura el aviso por superar `MAX_PAGE_ORDER`.
+</Reto>

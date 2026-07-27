@@ -1,0 +1,161 @@
+---
+title: "Prioridades y clases: nice, pesos y sched_class"
+description: "Cómo nice se traduce en peso mediante la tabla sched_prio_to_weight, los cuatro campos de prioridad de task_struct (prio, static_prio, normal_prio, rt_priority), y las clases de scheduling ordenadas en jerarquía estricta: stop, deadline, rt, fair, ext e idle. Cómo pick_next_task recorre las clases de mayor a menor prioridad y por qué el tiempo real puede matar de hambre al resto."
+subject: kernel
+level: 46
+order: 4
+icon: "46.4"
+duracion: "17 min"
+---
+
+<Lead>
+No todas las tareas merecen lo mismo, y Linux expresa ese "merecer" en dos registros distintos que conviene no confundir. Dentro de la clase fair, la importancia es un continuo: `nice` gradúa cuánta CPU te toca frente a tus iguales. Entre clases, la importancia es una jerarquía tajante: una tarea de tiempo real gana siempre a una normal, pase lo que pase. Comprender el planificador es comprender estas dos escalas —el peso continuo y la clase discreta— y cómo la segunda domina a la primera.
+</Lead>
+
+<Objetivos>
+
+- Traducir `nice` a peso con la tabla `sched_prio_to_weight` y su factor 1.25.
+- Distinguir los cuatro campos de prioridad de `task_struct`.
+- Enumerar las clases de scheduling y el estado que cada una gobierna.
+- Ver cómo `pick_next_task` recorre las clases en orden estricto de prioridad.
+
+</Objetivos>
+
+## nice y peso: la aritmética de la equidad
+
+El valor `nice` va de `-20` (más ávido de CPU) a `+19` (más cortés), con `0` por defecto. Pero el planificador no razona en `nice`, sino en **peso**: cada nivel de `nice` se traduce a un peso mediante una tabla fija, y el reparto de CPU entre tareas listas es proporcional a sus pesos.
+
+```c
+/* kernel/sched/core.c: nice -> peso */
+const int sched_prio_to_weight[40] = {
+ /* -20 */  88761, 71755, 56483, 46273, 36291,
+ /* -15 */  29154, 23254, 18705, 14949, 11916,
+ /* -10 */   9548,  7620,  6100,  4904,  3906,
+ /*  -5 */   3121,  2501,  1991,  1586,  1277,
+ /*   0 */   1024,   820,   655,   526,   423,
+ /*   5 */    335,   272,   215,   172,   137,
+ /*  10 */    110,    87,    70,    56,    45,
+ /*  15 */     36,    29,    23,    18,    15,
+};
+```
+
+El peso a `nice 0` es `1024`, que el kernel llama `NICE_0_LOAD`. La tabla está calibrada para que cada nivel de `nice` cambie la cuota de CPU en un factor de aproximadamente **1.25**: subir diez niveles multiplica o divide la CPU recibida por unas diez veces. Si una tarea a `nice 0` (peso 1024) compite con una a `nice 5` (peso 335), la primera recibe `1024 / (1024 + 335)`, cerca del 75 por ciento. Este mismo peso es el que escala el `vruntime` en EEVDF: pesar más es ver correr el tiempo virtual más despacio y, por tanto, correr más.
+
+## De nice a prioridad: los cuatro campos
+
+`task_struct` guarda cuatro campos de prioridad porque hay que reconciliar dos mundos numéricos —el de tiempo real y el normal— en una sola escala interna:
+
+```c
+#define MAX_RT_PRIO      100                              /* 0..99: banda RT */
+#define MAX_PRIO         (MAX_RT_PRIO + NICE_WIDTH)       /* 140 */
+#define DEFAULT_PRIO     (MAX_RT_PRIO + NICE_WIDTH / 2)   /* 120 = nice 0 */
+#define NICE_TO_PRIO(n)  ((n) + DEFAULT_PRIO)             /* nice -> 100..139 */
+```
+
+En la escala interna, **menor número es mayor prioridad**. Los valores `0..99` forman la banda de tiempo real; `100..139` corresponde a las tareas normales (`nice -20..+19`). Los cuatro campos:
+
+- `static_prio`: la prioridad base de una tarea normal, `120 + nice`, en el rango `100..139`.
+- `rt_priority`: la prioridad de tiempo real, `1..99`, que fija `sched_setscheduler` para `SCHED_FIFO` y `SCHED_RR`.
+- `normal_prio`: la prioridad derivada de la política. Para tiempo real es `MAX_RT_PRIO - 1 - rt_priority`; para normal es `static_prio`; para deadline queda por debajo de todo.
+- `prio`: la prioridad **efectiva**, la que el planificador usa de verdad. Normalmente coincide con `normal_prio`, pero puede elevarse temporalmente por herencia de prioridad cuando la tarea posee un `rt_mutex` que bloquea a otra más prioritaria.
+
+Esa distinción entre `normal_prio` (lo que la tarea es) y `prio` (lo que es *ahora*, quizá impulsada) es la que hace posible la herencia de prioridad y, con ella, la evitación de la inversión de prioridad.
+
+## Las clases de scheduling: sched_class
+
+Por encima de todos estos números vive una abstracción más fuerte: la **clase de scheduling**, `struct sched_class`. Cada clase es una tabla de operaciones que sabe encolar, desencolar, elegir la siguiente y contabilizar el tic para su propio conjunto de tareas, con su propia estructura de datos:
+
+```c
+struct sched_class {
+	void (*enqueue_task)(struct rq *rq, struct task_struct *p, int flags);
+	void (*dequeue_task)(struct rq *rq, struct task_struct *p, int flags);
+	void (*yield_task)(struct rq *rq);
+	void (*wakeup_preempt)(struct rq *rq, struct task_struct *p, int flags);
+	struct task_struct *(*pick_next_task)(struct rq *rq);
+	void (*put_prev_task)(struct rq *rq, struct task_struct *p, ...);
+	void (*set_next_task)(struct rq *rq, struct task_struct *p, bool first);
+	void (*task_tick)(struct rq *rq, struct task_struct *p, int queued);
+	/* ... */
+};
+```
+
+Las clases forman una jerarquía **estricta**, de mayor a menor prioridad. Las políticas POSIX que fija el usuario se reparten entre ellas:
+
+<Cards>
+  <Card icon="🛑" title="stop_sched_class">
+    La cúspide absoluta: el hilo de parada y migración de cada CPU. No es programable por el usuario; sirve para expropiar un núcleo de inmediato.
+  </Card>
+  <Card icon="⏱️" title="dl_sched_class">
+    `SCHED_DEADLINE`: EDF más servidor de ancho de banda constante. Cada tarea declara runtime, plazo y periodo; gana a todo tiempo real clásico.
+  </Card>
+  <Card icon="🚑" title="rt_sched_class">
+    `SCHED_FIFO` y `SCHED_RR`: tiempo real POSIX, prioridades `1..99`. La de mayor prioridad corre hasta que se bloquea o cede.
+  </Card>
+  <Card icon="⚖️" title="fair_sched_class">
+    `SCHED_NORMAL`, `SCHED_BATCH`, `SCHED_IDLE`: la inmensa mayoría de las tareas, planificadas por EEVDF según su peso.
+  </Card>
+  <Card icon="🧩" title="ext_sched_class">
+    `sched_ext`: planificadores escritos en BPF, cargables desde espacio de usuario. Mainline desde Linux 6.12 (2024). Se sitúa bajo fair.
+  </Card>
+  <Card icon="😴" title="idle_sched_class">
+    La tarea idle de cada núcleo. Corre solo cuando ninguna otra clase tiene nada listo; nunca falla al ser consultada.
+  </Card>
+</Cards>
+
+## El orden de prioridad: for_each_class
+
+Las clases se declaran en un orden fijo y el enlazador las coloca en una sección contigua, de modo que recorrerlas de mayor a menor prioridad es recorrer un array:
+
+```c
+/* kernel/sched/sched.h: orden de declaracion = orden de prioridad */
+extern const struct sched_class stop_sched_class;
+extern const struct sched_class dl_sched_class;
+extern const struct sched_class rt_sched_class;
+extern const struct sched_class fair_sched_class;
+extern const struct sched_class ext_sched_class;
+extern const struct sched_class idle_sched_class;
+
+#define for_each_class(class) \
+	for_class_range(class, __sched_class_highest, __sched_class_lowest)
+```
+
+El corazón de la elección, `pick_next_task`, pregunta a cada clase por orden y se queda con la primera que ofrezca una tarea:
+
+```c
+static inline struct task_struct *
+__pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+{
+	const struct sched_class *class;
+	struct task_struct *p;
+
+	/* De la clase mas prioritaria a la menos: la primera con tarea gana.
+	 * idle siempre tiene una, asi que el bucle nunca sale por abajo. */
+	for_each_class(class) {
+		p = class->pick_next_task(rq);
+		if (p)
+			return p;
+	}
+	BUG();   /* idle_sched_class jamas devuelve NULL */
+}
+```
+
+La consecuencia es dura y deliberada: **una sola** tarea de tiempo real lista mata de hambre a todas las fair, y una `SCHED_DEADLINE` gana incluso a las de tiempo real. Ese es el contrato del tiempo real —si lo pides, lo tienes—, pero también un riesgo: un bucle infinito en `SCHED_FIFO` congelaría la máquina. Por eso existe el *throttling* de tiempo real (`sched_rt_runtime_us`, por defecto 950000 de cada 1000000): reserva un 5 por ciento del tiempo para las clases inferiores y evita el cuelgue total.
+
+<Mermaid code={`flowchart TD
+  S[stop_sched_class: migracion y stop machine] --> D[dl_sched_class: SCHED_DEADLINE]
+  D --> R[rt_sched_class: SCHED_FIFO y SCHED_RR]
+  R --> F[fair_sched_class: NORMAL BATCH IDLE via EEVDF]
+  F --> E[ext_sched_class: sched_ext programable por BPF]
+  E --> I[idle_sched_class: la tarea idle]`} />
+
+<Callout type="dios" title="Dos formas de merecer: la cuota y la urgencia">
+Detente en la doble naturaleza de la importancia, porque revela una decisión de valores incrustada en el código. El planificador no tiene un único eje de prioridad, sino dos irreconciliables que trata por separado. Dentro de la clase fair, la importancia es una **cuota**: `nice` no dice quién corre primero, sino qué fracción del tiempo total te corresponde a la larga; es una escala continua, negociable, donde nadie queda excluido y todos avanzan, solo que a ritmos distintos. Es la ética del reparto. Entre clases, la importancia es **urgencia**: una tarea de tiempo real no pide una fracción mayor, pide correr *ahora*, y el kernel se lo concede aunque eso signifique que ninguna tarea normal toque la CPU durante segundos. Es la ética de la corrección, donde llegar tarde equivale a fallar. La jerarquía de clases codifica cuál de las dos éticas domina cuando chocan: primero se satisface a quien no puede esperar —deadline, tiempo real—, y solo con lo que sobra se reparte con justicia entre los demás. Y en el sótano, la tarea idle, que no merece nada y por eso corre solo cuando no queda nadie más. Cuando internalizas que `pick_next_task` es un bucle que baja por esta escala moral —de lo imprescindible a lo prescindible, de la urgencia a la cuota, del audio en directo al recolector de basura de segundo plano—, dejas de ver la prioridad como un número y empiezas a verla como lo que es: la respuesta del sistema a la pregunta de para qué existe la máquina en este instante, y a quién está dispuesta a sacrificar para servirlo.
+</Callout>
+
+<Reto title="Recorre las dos escalas de importancia">
+1. Con `chrt` lanza una tarea `SCHED_FIFO` de prioridad 50 y observa en `/proc/PID/sched` cómo desplaza a las tareas normales; luego mide el efecto del *throttling* de tiempo real.
+2. Comprueba en la tabla `sched_prio_to_weight` que la razón entre `nice 0` y `nice 5` es cercana a 3 a 1 y contrástalo con el reparto real de CPU medido.
+3. Explica la diferencia entre `normal_prio` y `prio`, y construye un caso de herencia de prioridad donde diverjan.
+4. Fija una tarea a `SCHED_DEADLINE` con `sched_setattr` (runtime, deadline, period) y argumenta por qué gana a una `SCHED_FIFO`.
+5. Investiga `sched_ext` en el árbol: dónde se inserta `ext_sched_class` en el orden y qué permite hacer que las clases empotradas no permiten.
+</Reto>

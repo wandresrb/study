@@ -1,0 +1,158 @@
+---
+title: "mmap en un driver: exponer memoria sin copiar"
+description: "Un driver puede mapear su buffer del kernel o su memoria de dispositivo directamente en el espacio de un proceso, para que el usuario lea y escriba sin un solo copy_to_user. Las tres vías: remap_pfn_range para regiones físicamente contiguas, dma_mmap_coherent para un buffer DMA compartido con el hardware, y un vm_operations_struct.fault para poblar página a página. Coherencia de caché, vm_flags correctos y el driver como servidor de fallos de página."
+subject: kernel
+level: 42
+order: 2
+icon: "42.2"
+duracion: "18 min"
+---
+
+<Lead>
+La forma más pura de zero-copy en un driver es no mover nada: hacer que el proceso de usuario y el kernel toquen exactamente los mismos marcos físicos. Cuando implementas `file_operations.mmap`, dejas de servir bytes con `read` y `write` y empiezas a **compartir memoria**. El usuario mapea una vez y, a partir de ahí, cada acceso es un desreferenciado de puntero que llega directo al buffer del driver o al registro del hardware. Aquí está la técnica, sus tres variantes, y la trampa de coherencia que todas comparten.
+</Lead>
+
+<Objetivos>
+
+- Implementar `file_operations.mmap` para compartir memoria en vez de copiarla.
+- Elegir entre `remap_pfn_range`, `dma_mmap_coherent` y un `.fault` según cómo sea la memoria.
+- Fijar los `vm_flags` correctos con las macros modernas de escritura protegida.
+- Garantizar la coherencia de caché cuando el buffer lo comparten CPU, DMA y usuario a la vez.
+
+</Objetivos>
+
+## El gancho: file_operations.mmap
+
+Cuando un proceso llama a `mmap` sobre el fichero de dispositivo, el camino `do_mmap` a `call_mmap` (nivel 23) desemboca en tu método. Recibes la VMA ya construida y tu trabajo es poblar la tabla de páginas del rango `[vma->vm_start, vma->vm_end)` con tus marcos físicos, o instalar un `vm_ops` que los provea bajo demanda.
+
+```c
+static int mydev_mmap(struct file *filp, struct vm_area_struct *vma);
+
+static const struct file_operations mydev_fops = {
+	.owner = THIS_MODULE,
+	.open  = mydev_open,
+	.mmap  = mydev_mmap,       /* lo invoca el kernel en mmap(2) */
+};
+```
+
+## dma_mmap_coherent: el buffer que comparten hardware y usuario
+
+El caso estrella del nivel 42 es un buffer DMA que llena el dispositivo y consume el proceso sin intermediarios. No uses `remap_pfn_range` a pelo sobre memoria DMA: la API de DMA (nivel 27) tiene su propio ayudante de mapeo que respeta la coherencia y la IOMMU.
+
+```c
+/* En probe: reservar un buffer coherente que el dispositivo llenara por DMA */
+dev->vaddr = dma_alloc_coherent(&pdev->dev, dev->size,
+                                &dev->dma_handle, GFP_KERNEL);
+/* dev->vaddr : direccion virtual del kernel
+   dev->dma_handle : direccion que el motor DMA del dispositivo entiende */
+
+static int mydev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct mydev *dev = filp->private_data;
+	unsigned long size = vma->vm_end - vma->vm_start;
+
+	if (size > dev->size)
+		return -EINVAL;
+
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+
+	/* Mapea el MISMO buffer DMA al usuario, con los atributos de cache
+	   correctos para la plataforma. Sin copia: el proceso ve lo que el
+	   hardware escribe. */
+	return dma_mmap_coherent(&dev->pdev->dev, vma, dev->vaddr,
+	                         dev->dma_handle, size);
+}
+```
+
+Ahora el flujo es de copia cero de extremo a extremo: el dispositivo escribe por DMA en el buffer coherente, y el proceso lo lee desde su propio espacio de direcciones sin que la CPU toque un solo byte de tránsito. Es el patrón de las cámaras, las capturadoras y los aceleradores que vuelcan datos a un anillo compartido con el software.
+
+## remap_pfn_range: cablear una región contigua de golpe
+
+Si expones registros MMIO o un buffer físicamente contiguo reservado, `remap_pfn_range` instala de una vez las traducciones de todo el rango. Trabaja en *page frame numbers*: la dirección física desplazada `PAGE_SHIFT` bits.
+
+```c
+static int mydev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct mydev *dev = filp->private_data;
+	unsigned long size = vma->vm_end - vma->vm_start;
+	unsigned long pfn  = dev->phys_base >> PAGE_SHIFT;   /* marco fisico base */
+
+	if (size > dev->len)
+		return -EINVAL;
+
+	/* Memoria de dispositivo: sin struct page, no cacheable, no volcar */
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+	return remap_pfn_range(vma, vma->vm_start,
+	                       pfn + vma->vm_pgoff,   /* respeta el offset de mmap */
+	                       size, vma->vm_page_prot);
+}
+```
+
+`VM_IO` marca espacio de E/S; `VM_PFNMAP` declara que detrás de estas PFN **no hay** un `struct page` gestionado; `VM_DONTEXPAND` frena un `mremap` que la agrande; `VM_DONTDUMP` la excluye del core. Para MMIO real, `io_remap_pfn_range` ajusta atributos de bus en algunas arquitecturas.
+
+<Callout type="warn" title="vm_flags ya no se asigna directamente">
+Desde Linux 6.3 el campo `vm_flags` es de **solo lectura** fuera del core de memoria: no puedes hacer `vma->vm_flags |= VM_IO`. Debes usar `vm_flags_set`, `vm_flags_clear` y `vm_flags_mod`. El cambio fuerza que toda modificación pase por un punto controlado, necesario para los locks por-VMA. Código antiguo que asigne `vm_flags` a pelo no compila en Linux 7.x.
+</Callout>
+
+## .fault: poblar página a página un buffer disperso
+
+`remap_pfn_range` exige contigüidad física. Un buffer de `vmalloc` es contiguo en el espacio virtual del kernel pero disperso en el físico, así que hay que mapearlo perezosamente: instalas un `vm_operations_struct` con `.fault` y el kernel te llama una vez por cada página que el usuario toque.
+
+```c
+static vm_fault_t mydev_fault(struct vm_fault *vmf)
+{
+	struct mydev *dev = vmf->vma->vm_private_data;
+	unsigned long offset = vmf->pgoff << PAGE_SHIFT;   /* byte dentro del buffer */
+	struct page *page;
+
+	if (offset >= dev->len)
+		return VM_FAULT_SIGBUS;            /* fuera de rango: senal al proceso */
+
+	page = vmalloc_to_page(dev->buf + offset);
+	get_page(page);                            /* referencia que sostiene el mapeo */
+	vmf->page = page;                          /* el core instala la PTE */
+	return 0;
+}
+
+static const struct vm_operations_struct mydev_vm_ops = {
+	.fault = mydev_fault,
+};
+
+static int mydev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	vma->vm_ops = &mydev_vm_ops;
+	vma->vm_private_data = filp->private_data;
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+	return 0;                              /* nada mapeado aun: sera perezoso */
+}
+```
+
+<Cards>
+  <Card icon="🤝" title="dma_mmap_coherent">
+    Para un buffer DMA compartido con el hardware. Respeta coherencia e IOMMU por ti. La vía correcta del zero-copy dispositivo↔usuario. No la reimplementes a mano.
+  </Card>
+  <Card icon="🧱" title="remap_pfn_range">
+    Ansioso, de un tirón. Para MMIO o memoria físicamente contigua reservada. Marca `VM_PFNMAP | VM_IO`; sin `struct page` detrás.
+  </Card>
+  <Card icon="🎯" title="vm_ops .fault">
+    Perezoso, página a página. Para buffers no contiguos (`vmalloc`) o mapeos enormes y dispersos. Devuelve `vmf->page` con `get_page`.
+  </Card>
+</Cards>
+
+<Callout type="danger" title="Coherencia: el enemigo silencioso del buffer compartido">
+Cuando CPU, DMA y usuario comparten el mismo buffer, la caché puede mentir. Si mapeas memoria DMA como cacheable normal, el proceso puede leer datos rancios de su caché mientras el dispositivo ya escribió los nuevos por DMA, o viceversa. `dma_mmap_coherent` resuelve esto por ti: en cada plataforma aplica los atributos correctos —no cacheable, o *write-combining*, o coherente por hardware— según lo que garantice la arquitectura. Por eso no debes mapear un buffer DMA con `remap_pfn_range` y `pgprot_noncached` a mano salvo que sepas exactamente qué modelo de coherencia tiene tu SoC: usar el ayudante de la DMA API es la única vía portable y correcta.
+</Callout>
+
+<Callout type="dios" title="El driver deja de servir datos y empieza a compartir realidad">
+Mira lo que has construido y verás el salto conceptual completo. Con `read` y `write`, tu driver era un mostrador: el usuario pedía bytes, tú se los copiabas, cada petición pagaba su `copy_to_user`. Con `mmap`, el mostrador desaparece. Ya no entregas copias del dato: entregas el **dato mismo**, la propia región de memoria física, proyectada simultáneamente en el espacio del kernel, en el del hardware por DMA y en el del proceso. Los tres no ven tres versiones sincronizadas de un buffer; ven un único conjunto de marcos, la misma electricidad en las mismas celdas de DRAM, a través de tres tablas de traducción distintas. Ese es el sentido profundo del zero-copy por mapeo: no aceleras la copia, la aboles, porque descubres que nunca había dos cosas que copiar, solo una mirada desde tres ángulos. Y con `.fault` das el último paso: tu driver se convierte en un servidor de fallos de página, la MMU dispara y tú decides qué marco físico aparece bajo cada dirección virtual que el usuario toca. Estás programando la unidad de gestión de memoria del procesador desde un módulo. La abstracción que el kernel usa para mentirle a los procesos sobre la RAM —prometer regiones, entregar páginas al fallar— queda en tus manos, y detrás de una dirección de usuario puedes poner un registro de hardware, un anillo de DMA de una cámara o un buffer que otro dispositivo llenará. El zero-copy más elegante no es mover rápido: es hacer que el dato exista en un solo lugar y enseñárselo a todos.
+</Callout>
+
+<Reto title="Comparte un buffer sin copiar un byte">
+1. Escribe un driver que reserve memoria con `dma_alloc_coherent` e implemente `.mmap` con `dma_mmap_coherent`; desde userspace mapéalo con `MAP_SHARED` y comprueba que ves un patrón escrito desde el módulo.
+2. Reescríbelo con un buffer `vmalloc` y un `vm_ops.fault` página a página; razona por qué aquí no puedes usar `remap_pfn_range`.
+3. Haz una tercera versión con `remap_pfn_range` sobre memoria contigua y explica cuándo es aplicable cada una de las tres vías.
+4. Fuerza un problema de coherencia: mapea un buffer DMA como cacheable a mano y observa datos rancios; luego arréglalo con `dma_mmap_coherent` y explica qué cambió.
+5. Justifica por qué necesitas `vm_flags_set` en lugar de asignar `vm_flags`, y qué significan `VM_IO`, `VM_PFNMAP` y `VM_DONTEXPAND`.
+</Reto>

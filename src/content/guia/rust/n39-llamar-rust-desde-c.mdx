@@ -1,0 +1,137 @@
+---
+title: "Llamar a Rust desde C: exportar con no_mangle y extern C"
+description: "La dirección inversa de la FFI. Tienes código Rust rápido y seguro, y quieres que C (o Python por ctypes, o cualquier lenguaje que hable la ABI de C) lo llame. Dos obstáculos: Rust decora los nombres de los símbolos, y su convención de llamada por defecto es inestable. Se resuelven con extern C para fijar la ABI, #[unsafe(no_mangle)] para preservar el nombre, un crate-type cdylib o staticlib, y blindando la frontera contra el panic."
+subject: rust
+level: 39
+order: 3
+icon: "39.3"
+duracion: "18 min"
+---
+
+<Lead>
+Hasta ahora Rust era el llamador. Demos la vuelta: tienes una función en Rust —rápida, verificada, sin fugas— y quieres que la invoque C, o Python vía `ctypes`, o Ruby, o cualquier lenguaje que sepa hablar la ABI de C, que es el esperanto de los binarios. Dos obstáculos se interponen. El primero: Rust **decora** los nombres de los símbolos (*name mangling*), así que tu función `sumar` acaba llamándose algo como `_ZN9mi_crate5sumarE17h...` en el binario, un nombre que ningún `#include` de C podría predecir. El segundo: la convención de llamada por defecto de Rust no está estabilizada, puede cambiar entre versiones. Se resuelven con dos anotaciones quirúrgicas —`extern "C"` fija la ABI, `#[unsafe(no_mangle)]` preserva el nombre— más la decisión de compilar el crate como una biblioteca que C pueda enlazar.
+</Lead>
+
+<Objetivos>
+
+- Exportar una función con `extern "C"` para fijar la ABI de C.
+- Preservar el nombre del símbolo con `#[unsafe(no_mangle)]` en la edición 2024.
+- Configurar el crate como `cdylib` o `staticlib` en `Cargo.toml`.
+- Blindar la frontera contra `panic!`, que nunca debe cruzar hacia C.
+
+</Objetivos>
+
+## Exportar una función: extern C y no_mangle
+
+La receta mínima combina tres piezas sobre una función pública:
+
+```rust
+use core::ffi::c_int;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sumar(a: c_int, b: c_int) -> c_int {
+    a + b
+}
+```
+
+- `pub` la hace visible fuera del crate.
+- `extern "C"` cambia la convención de llamada a la de C, para que el llamador sepa cómo pasar los argumentos y recoger el resultado.
+- `#[unsafe(no_mangle)]` desactiva la decoración: el símbolo se llamará literalmente `sumar`, que es el nombre que C escribirá en su prototipo.
+
+Sin `no_mangle`, el enlazador de C jamás encontraría el símbolo. En la edición 2024 el atributo se escribe envuelto en `unsafe(...)` porque aplicarlo es peligroso: puedes colisionar con un símbolo de `libc` —definir tu propio `malloc`, por ejemplo— y corromper el enlazado de todo el programa. La forma antigua `#[no_mangle]` a secas sigue valiendo en ediciones anteriores.
+
+## El crate como biblioteca: cdylib y staticlib
+
+Un binario normal no expone símbolos para que otros los llamen. Hay que pedirle a Cargo que produzca una **biblioteca** con el tipo adecuado:
+
+```toml
+[lib]
+crate-type = ["cdylib", "staticlib"]
+```
+
+- `cdylib` genera una biblioteca dinámica (`.so`, `.dylib`, `.dll`), la que carga Python con `ctypes` o un programa con `dlopen`.
+- `staticlib` genera un archivo estático (`.a`) para incrustar dentro de un ejecutable de C en tiempo de enlazado.
+
+El lado C necesita una cabecera que declare el prototipo —la que en la próxima lección generará `cbindgen`—:
+
+```c
+int sumar(int a, int b);
+```
+
+Y se compila enlazando contra la biblioteca de Rust:
+
+```bash
+cargo build --release
+cc main.c -L target/release -lmi_crate -o programa
+```
+
+<Mermaid code={`flowchart LR
+  A[Funcion Rust con extern C y unsafe no_mangle] --> B[Cargo compila un cdylib o staticlib]
+  B --> C[Simbolo sumar sin decorar en la biblioteca]
+  D[Cabecera C con el prototipo] --> E[El enlazador de C resuelve el simbolo]
+  C --> E
+  E --> F[Programa en C que llama a sumar]
+  style A fill:#89b4fa,color:#11111b
+  style C fill:#cba6f7,color:#11111b
+  style D fill:#fab387,color:#11111b
+  style F fill:#a6e3a1,color:#11111b`} />
+
+## El panic no debe cruzar la frontera
+
+Aquí acecha un fallo sutil. Si dentro de tu función exportada ocurre un `panic!`, su *unwinding* intentaría propagarse hacia el marco de pila de C, que no sabe nada de él. Desde Rust 1.81, un `panic` que alcanza una frontera `extern "C"` **aborta el proceso** por defecto en lugar de provocar UB; pero abortar tampoco es lo que quiere el llamador de C. La disciplina es **atrapar el panic en la frontera** y convertirlo en un valor de retorno que C entienda:
+
+```rust
+use core::ffi::c_int;
+use std::panic::catch_unwind;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dividir(a: c_int, b: c_int) -> c_int {
+    let resultado = catch_unwind(|| {
+        if b == 0 { panic!("division por cero"); }
+        a / b
+    });
+    resultado.unwrap_or(-1)   // convierte el panic en un codigo de error
+}
+```
+
+`catch_unwind` detiene el *unwinding* dentro de Rust y te devuelve un `Result`; lo traduces a un código de error o a un valor centinela. Si de verdad necesitas que el *unwinding* cruce —porque el otro lado es C++ preparado para recibirlo— existe la ABI explícita `extern "C-unwind"`, pero es la excepción, no la norma.
+
+<Callout type="danger" title="no_mangle y panic: dos formas de tumbar el proceso ajeno">
+`#[unsafe(no_mangle)]` publica un nombre global sin espacio de nombres: si exportas `init` o `read` puedes ensombrecer un símbolo del sistema y desviar llamadas que no eran para ti, un fallo diabólico de depurar. Y un `panic` que escapa hacia C, aunque hoy aborte limpiamente, mata el proceso del que llama sin que este pueda reaccionar. Ambos convierten un descuido de Rust en una catástrofe **del lado ajeno**. Nombra los símbolos exportados con un prefijo propio y envuelve todo cuerpo exportable no trivial en `catch_unwind`.
+</Callout>
+
+## Callbacks: entregar una función de Rust a C
+
+Muchas APIs de C piden un **puntero a función** para llamarte de vuelta: `qsort` recibe el comparador, un bucle de eventos recibe el manejador. Rust entrega una función `extern "C"` como ese puntero, porque un `extern "C" fn` es representable como el puntero a función que C espera:
+
+```rust
+use core::ffi::{c_int, c_void};
+
+extern "C" fn comparar(a: *const c_void, b: *const c_void) -> c_int {
+    let (x, y) = unsafe { (*(a as *const c_int), *(b as *const c_int)) };
+    ((x > y) as c_int) - ((x < y) as c_int)   // comparador sin desbordamiento
+}
+
+unsafe extern "C" {
+    fn qsort(base: *mut c_void, n: usize, tam: usize,
+             cmp: extern "C" fn(*const c_void, *const c_void) -> c_int);
+}
+```
+
+Dos reglas gobiernan el *callback*: debe ser `extern "C"` para que la ABI encaje, y **no debe dejar escapar un panic** hacia el código de C que lo invoca, por lo mismo que cualquier función exportada. Un *closure* que capture entorno no sirve como puntero de función de C; por eso las APIs bien diseñadas aceptan además un `*mut c_void` de "datos de usuario" que te devuelven en cada llamada para reconstruir el contexto.
+
+<Callout type="dios" title="Exportar es invertir la relación de confianza: ahora el garante eres tú">
+Cuando *llamas* a C desde Rust asumes un contrato ajeno: confías en que `strlen` hace lo que promete. Cuando *exportas* Rust hacia C, la relación se invierte por completo, y esa inversión lo cambia todo. Ya no eres el consumidor cauto de una API; eres el **proveedor** de una, y del otro lado hay un llamador que no conoces, que quizá programe en C, en Python o en un lenguaje que aún no existe, y que va a construir sobre tu símbolo dando por buenas tus promesas. Tu función deja de ser código interno que el borrow checker vigila de cerca y se convierte en una **superficie pública congelada**: su nombre sin decorar, su ABI, el significado exacto de cada argumento y de cada valor de retorno pasan a ser un contrato que otros graban en piedra en sus propios binarios. Y aquí está lo profundo: todas las garantías que Rust te daba hacia dentro —que un valor no se usa tras liberarse, que un `panic` se propaga ordenadamente, que los tipos casan— **no viajan con el símbolo**. El llamador de C recibe una dirección de memoria y una convención de llamada, nada más; no hereda tu seguridad, hereda tu palabra. Por eso exportar exige una mentalidad distinta a escribir Rust normal: cada función `#[unsafe(no_mangle)] pub extern "C"` es un punto de la frontera donde tú te vuelves el garante que antes era el compilador. Debes documentar precondiciones que Rust normalmente infiere, atrapar panics que Rust normalmente deja fluir, elegir nombres que no colisionen en un espacio global que Rust normalmente te oculta. La asimetría es la lección: importar una función es aceptar un riesgo acotado a tu propio proceso; exportarla es asumir la responsabilidad de la corrección en procesos que nunca verás. Escribir la firma es fácil; estar a la altura del contrato que implica es la verdadera ingeniería.
+</Callout>
+
+<Callout type="note" title="Lo esencial de exportar hacia C">
+Exportar una función de Rust exige `pub extern "C"` para fijar la ABI y `#[unsafe(no_mangle)]` (edición 2024) para que el símbolo conserve su nombre sin decorar. El crate se compila como `cdylib` (biblioteca dinámica, para `dlopen` o `ctypes`) o `staticlib` (archivo estático, para incrustar en C), declarado en `crate-type`. El lado C necesita un prototipo en una cabecera. Un `panic` nunca debe escapar: desde 1.81 aborta, pero lo correcto es atraparlo con `catch_unwind` y devolver un código de error. Cuida los nombres globales: `no_mangle` puede colisionar con símbolos del sistema.
+</Callout>
+
+<Reto title="Publica una API para C">
+1. Exporta `sumar(a, b)` con `#[unsafe(no_mangle)] pub extern "C"`. Inspecciona el binario con `nm` y confirma que el símbolo aparece sin decorar; quita `no_mangle` y compara.
+2. Configura `crate-type = ["cdylib", "staticlib"]`, compila y escribe un `main.c` que enlace y llame a `sumar`. Documenta el comando de `cc`.
+3. Explica por qué `extern "C"` y `#[unsafe(no_mangle)]` resuelven **problemas distintos**: la ABI y el nombre. Comprueba qué pasa si pones uno sin el otro.
+4. Escribe `dividir` que haga `panic!` ante `b == 0` y envuélvela en `catch_unwind` devolviendo `-1`. Razona qué ocurriría sin el `catch_unwind` desde Rust 1.81.
+5. Argumenta por qué exportar un símbolo llamado `read` o `write` es peligroso y qué convención de nombres lo evita.
+</Reto>

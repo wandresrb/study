@@ -1,0 +1,123 @@
+---
+title: "El coste de copiar: por qué cada byte importa"
+description: "En E/S de alto rendimiento —red, multimedia, almacenamiento— mover un dato con la CPU cuesta ancho de banda de memoria, ciclos y caché contaminada. El camino clásico read+write hacia un socket paga cuatro copias y cuatro cambios de contexto por bloque. Anatomía de ese impuesto invisible, distinción entre copias por DMA y copias por CPU, y qué promete de verdad la palabra zero-copy."
+subject: kernel
+level: 42
+order: 1
+icon: "42.1"
+duracion: "16 min"
+---
+
+<Lead>
+El código más inocente del mundo —leer de un fichero y escribir a un socket— esconde uno de los mayores desperdicios de la programación de sistemas. Cada iteración de ese bucle mueve los mismos bytes cuatro veces por la memoria, dos de ellas quemando la CPU en un `memcpy` glorificado que no calcula nada. En un servidor a 40 Gbit/s o en una tubería de vídeo 8K, esa copia deja de ser un detalle y se convierte en el cuello de botella. Este nivel entero es aprender a verla y a borrarla.
+</Lead>
+
+<Objetivos>
+
+- Trazar las cuatro copias y los cambios de contexto de un `read` seguido de `write` a un socket.
+- Cuantificar el coste real: ancho de banda de memoria, ciclos de CPU y contaminación de caché.
+- Distinguir las copias por DMA —la E/S física inevitable— de las copias por CPU, el objetivo a eliminar.
+- Definir con precisión qué elimina, y qué no, la etiqueta zero-copy.
+
+</Objetivos>
+
+## El camino clásico: cuatro copias por bloque
+
+La versión que todos escribimos primero para servir un fichero por la red parece gratuita. No lo es.
+
+```c
+/* Servir un fichero por un socket: la version ingenua */
+char buf[65536];
+ssize_t n;
+
+while ((n = read(file_fd, buf, sizeof buf)) > 0) {   /* page cache -> buf usuario */
+    char *p = buf;
+    while (n > 0) {
+        ssize_t m = write(sock_fd, p, n);            /* buf usuario -> buf socket */
+        if (m < 0)
+            return -1;
+        p += m;
+        n -= m;
+    }
+}
+```
+
+Sigue el viaje de un bloque de 64 KiB. Son cuatro traslados de memoria:
+
+1. **DMA disco → page cache.** El controlador de almacenamiento deposita los datos en el page cache del kernel (nivel 24). El motor DMA trabaja solo; la CPU ni se entera.
+2. **CPU page cache → buffer de usuario.** El `read` invoca `copy_to_user`: la CPU lee del page cache y escribe en `buf`. Puro trasiego.
+3. **CPU buffer de usuario → buffer del socket.** El `write` invoca `copy_from_user`: la CPU lee de `buf` y escribe en el `sk_buff` del socket, otra vez dentro del kernel.
+4. **DMA buffer del socket → NIC.** La tarjeta de red lee su buffer por DMA y pone los bytes en el cable. La CPU, de nuevo, ausente.
+
+A eso súmale cuatro cambios de contexto: cada llamada al sistema cruza usuario→kernel→usuario. Pero lo escandaloso son los pasos **2 y 3**: los datos ya vivían en memoria del kernel (el page cache), suben a userspace y bajan de inmediato al kernel otra vez. **Nunca necesitaron visitar el espacio de usuario.** Ese viaje de ida y vuelta es trabajo inventado.
+
+<Callout type="info" title="DMA es física; la copia por CPU es desperdicio">
+Las copias 1 y 4 son la E/S de verdad: hardware moviendo datos hacia y desde dispositivos. Son irreducibles. Las copias 2 y 3 las hace la CPU con `copy_to_user` y `copy_from_user`, y no producen ningún valor: reubican bytes que ya estaban donde debían. Toda la disciplina zero-copy consiste en eliminar esas dos, jamás las de DMA.
+</Callout>
+
+## Anatomía del impuesto: ancho de banda, ciclos y caché
+
+`copy_to_user` y `copy_from_user` son las primitivas del kernel para cruzar la frontera de la frontera usuario↔kernel (nivel 12): validan el puntero con `access_ok`, toleran fallos de página y, por debajo, son un `memcpy` optimizado.
+
+```c
+/* En el lado del kernel, la ruta de 'read' termina copiando al usuario */
+if (copy_to_user(ubuf, kaddr, len))   /* CPU: page cache -> espacio de usuario */
+    return -EFAULT;
+```
+
+El coste tiene tres caras:
+
+- **Ancho de banda de memoria.** Cada copia por CPU lee `N` bytes y escribe `N` bytes: consume `2N` de tráfico en el bus de memoria. A velocidad de línea de 40 Gbit/s, las dos copias suman decenas de gigabytes por segundo de tráfico dedicado únicamente a reubicar datos. Ese ancho de banda no lo tiene ya el resto del sistema.
+- **Ciclos de CPU.** Mientras la CPU copia, no calcula. Un servidor de ficheros o un transcodificador debería estar sirviendo peticiones o transformando fotogramas, no actuando de motor `memmove`. La copia convierte un núcleo caro en una bomba de bytes tonta.
+- **Contaminación de caché.** Empujar 64 KiB por la CPU desaloja de L1 y L2 el conjunto de trabajo útil. Y lo irónico: esos datos suelen usarse una sola vez —se transmiten y se olvidan—, así que ensucian la caché sin beneficiarse jamás de ella.
+
+<Callout type="warn" title="El copy_to_user también puede dormir">
+La copia no solo cuesta banda: puede bloquear. Si la página de usuario está paginada a swap, `copy_to_user` provoca un fallo de página que duerme el hilo. Por eso vive en contexto de proceso y nunca bajo un spinlock (nivel 15). El zero-copy, al no tocar páginas de usuario con la CPU, esquiva también esta clase de latencia impredecible.
+</Callout>
+
+## Dónde más se esconde la copia
+
+El camino de envío no es el único culpable, y verlo entero desarma la ilusión de que la copia es un problema aislado:
+
+- **El lado de recepción es el mismo mal en espejo.** Un `recv` sobre un socket copia del `sk_buff` del kernel al buffer del proceso (`copy_to_user`); si luego ese dato pasa a otro subsistema, se vuelve a copiar. La NIC deposita por DMA, y a partir de ahí la CPU vuelve a hacer de mula.
+- **Los protocolos apilan copias.** Cifrar con TLS, serializar un mensaje, reensamblar fragmentos: cada capa que reescribe el dato en un buffer nuevo suma una copia que el perfil no atribuye a la E/S, pero que compite por el mismo ancho de banda de memoria.
+- **El doble buffer del propio programa.** Es habitual leer a un buffer de aplicación y luego copiarlo a otro «de trabajo». Dos copias más, invisibles en el código, evidentes en `perf`.
+
+La conclusión incómoda: en una ruta de datos real, las cuatro copias del ejemplo son un suelo, no un techo. Contar copias de punta a punta —incluidas las que añaden tus propias capas— es el primer acto de diseño de cualquier sistema que aspire a saturar la red o el disco.
+
+## Qué promete zero-copy, y qué no
+
+Zero-copy **no** significa cero transferencias: significa cero copias intermedias hechas por la CPU. Las transferencias DMA siguen ahí, porque son la E/S real. Lo que desaparece es el trasiego de bytes por el procesador. Hay dos grandes familias de técnicas, y son el mapa de este nivel:
+
+<Cards>
+  <Card icon="🗺️" title="Mapear en vez de copiar">
+    Exponer el mismo marco físico al proceso y al kernel con `mmap`, para que ambos toquen los mismos bytes. Se comparte la tabla de páginas, no se duplica el dato. Es la vía de los drivers (nivel 42.2).
+  </Card>
+  <Card icon="🔗" title="Empalmar dentro del kernel">
+    Mover referencias a páginas entre descriptores sin subir a userspace: `sendfile` y `splice` (42.3), compartir buffers entre dispositivos con `dma_buf` (42.4), o fijar páginas de usuario para que el DMA las lea directo con `MSG_ZEROCOPY` e io_uring (42.5).
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart LR
+  D[Disco] -->|DMA 1| PC[Page cache del kernel]
+  PC -->|copy_to_user por CPU| UB[Buffer de usuario]
+  UB -->|copy_from_user por CPU| SB[Buffer del socket]
+  SB -->|DMA 2| NIC[Tarjeta de red]
+  style PC fill:#89b4fa,color:#11111b
+  style UB fill:#f38ba8,color:#11111b
+  style SB fill:#f38ba8,color:#11111b
+  style NIC fill:#a6e3a1,color:#11111b`} />
+
+Las dos cajas rojas son el enemigo. Mapear las funde en una sola región compartida; empalmar las salta pasando referencias de página de un fd al otro. Pero atención a la letra pequeña que este nivel resolverá: el zero-copy no es gratis, cambia copias por complejidad —fijar páginas, rastrear cuándo el hardware terminó, mantener la coherencia de caché— y solo compensa por encima de cierto tamaño de bloque. Regalar la copia pequeña puede salir más caro que hacerla.
+
+<Callout type="dios" title="La copia es el impuesto que no aparece en la factura">
+Da un paso atrás y observa la asimetría más honda de la ingeniería de sistemas. En el código fuente, `read(fd, buf, n)` y `write(fd, buf, n)` parecen operaciones elementales y gratuitas: una línea, un verbo, sin coste visible. Pero en el perfil de rendimiento, esas dos líneas dominan: son el grueso del tiempo, del ancho de banda y de la energía. Esta es la sombra del cuello de botella de von Neumann llevada al kernel: en la mayoría de los sistemas reales, el trabajo no es calcular sobre los datos, es **moverlos**, y mover un byte de un sitio a otro de la RAM cuesta casi lo mismo que la operación útil que querías hacer con él. El programador novato optimiza los algoritmos —reduce comparaciones, afina bucles— mientras el 80% del tiempo se va en copias que su fuente no menciona siquiera. Aprender zero-copy es, antes que una colección de APIs, un cambio de mirada: entrenar el ojo para ver el trasiego de datos que el lenguaje esconde, para preguntar de cada byte no solo qué operación sufre, sino cuántas veces cruza la memoria antes de llegar a su destino. Cuando esa pregunta se te vuelva instintiva ante cualquier ruta de E/S —cuántas copias, cuáles son físicas, cuáles son puro impuesto— habrás dejado de escribir E/S para empezar a diseñarla. El resto del nivel son las herramientas; esta es la revelación que las hace necesarias.
+</Callout>
+
+<Reto title="Mide el impuesto antes de borrarlo">
+1. Escribe el servidor ingenuo `read`+`write` de arriba y sírvele un fichero grande a un cliente por `localhost`; mide el throughput y el uso de CPU con `pidstat` o `perf stat`.
+2. Con `perf record` identifica dónde se va el tiempo: verás `copy_user_enhanced_fast_string` o similar dominando el perfil. Esa es la copia por CPU en carne y hueso.
+3. Dibuja, para tu caso, las cuatro transferencias y etiqueta cada una como DMA o CPU. Justifica por qué exactamente dos son eliminables.
+4. Estima el tráfico de memoria: a `X` GB/s de throughput, ¿cuántos GB/s de ancho de banda consumen las dos copias por CPU juntas?
+5. Predice qué técnica del nivel (mapear o empalmar) atacará mejor tu escenario y por qué, y guárdalo para contrastarlo al final del nivel.
+</Reto>

@@ -1,0 +1,137 @@
+---
+title: "Tiempo real: SCHED_FIFO, SCHED_RR y SCHED_DEADLINE"
+description: "Las políticas de prioridad fija SCHED_FIFO y SCHED_RR que pisan siempre a las tareas normales, la política SCHED_DEADLINE que planifica por plazos con EDF y un servidor de ancho de banda constante que garantiza tiempo sin monopolizar, y el peligro central del tiempo real: una tarea RT en bucle puede congelar la máquina si el kernel no reserva una válvula de escape."
+subject: kernel
+level: 47
+order: 3
+icon: "47.3"
+duracion: "19 min"
+---
+
+<Lead>
+Hasta ahora todas las tareas eran iguales ante la ley: la clase *fair* reparte la CPU con justicia y nadie se queda sin su porción. El tiempo real rompe ese contrato a propósito. Una tarea `SCHED_FIFO` de prioridad 80 no comparte: corre hasta que ella quiera, pisando a todo lo que tenga menos prioridad, incluidos hilos del kernel. Es justo lo que necesita un lazo de control que no puede llegar tarde, y justo lo que puede colgar tu máquina si la escribes mal. En este nivel manejas las tres políticas de tiempo real de Linux y, sobre todo, entiendes el filo del cuchillo: garantizar plazos y monopolizar la CPU son la misma capacidad vista desde dos lados.
+</Lead>
+
+<Objetivos>
+
+- Aplicar `SCHED_FIFO` y `SCHED_RR` con prioridades estáticas vía `sched_setscheduler`.
+- Usar `SCHED_DEADLINE` con `sched_setattr` y entender EDF más el servidor CBS.
+- Reconocer el peligro de que una tarea RT monopolice la CPU y mate el sistema.
+- Conocer la válvula del *RT throttling* y por qué el control de admisión protege los plazos.
+
+</Objetivos>
+
+## SCHED_FIFO y SCHED_RR: prioridad fija que lo pisa todo
+
+Las dos políticas clásicas de tiempo real usan una **prioridad estática** entre 1 y 99. Cualquier tarea RT, aun la de prioridad 1, corre siempre antes que cualquier tarea `SCHED_NORMAL`. Se activan con `sched_setscheduler` y un `struct sched_param`:
+
+```c
+#include <sched.h>
+
+struct sched_param sp = { .sched_priority = 80 };
+
+/* FIFO: corre hasta bloquearse, ceder (sched_yield) o ser expulsada por
+ * otra RT de MAYOR prioridad. Entre iguales, no rota: el primero manda. */
+if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0)
+	perror("sched_setscheduler");
+
+/* RR: igual que FIFO pero entre tareas de la MISMA prioridad reparte
+ * por turnos de sched_rr_timeslice_ms. Evita que dos iguales se congelen. */
+sched_setscheduler(0, SCHED_RR, &sp);
+```
+
+La diferencia entre ambas es sutil pero decisiva. `SCHED_FIFO` no tiene rodaja de tiempo: una tarea corre hasta que se bloquea, cede voluntariamente o aparece otra RT de mayor prioridad. `SCHED_RR` añade un *quantum* (`/proc/sys/kernel/sched_rr_timeslice_ms`) para que varias tareas de **igual** prioridad se turnen. En ambas, una tarea de mayor prioridad **siempre** desaloja a una de menor: la política es de preferencia estricta, sin envejecimiento ni justicia. `chrt -f 80 ./control` y `chrt -r 50 ./tarea` hacen lo mismo desde la shell.
+
+<Callout type="warn" title="El orden de prioridad RT es al revés que el nice">
+Cuidado con la intuición. En `SCHED_NORMAL` el `nice` va de -20 (más favor) a 19 (menos), y número **bajo** significa más CPU. En las clases RT es al contrario: `sched_priority` **alto** es más urgente, 99 pisa a 1. Y ese número no tiene nada que ver con el `nice`: son escalas de mundos distintos. Una tarea RT de prioridad 1 ya domina a una `SCHED_NORMAL` con `nice -20`, porque la clase RT entera está por encima de la clase *fair* en la cadena de `sched_class` del nivel 47.1.
+</Callout>
+
+## SCHED_DEADLINE: planificar por plazos, no por prioridades
+
+La prioridad fija tiene un defecto teórico: no expresa *cuándo* necesitas la CPU, solo *cuánto* importas. `SCHED_DEADLINE` cambia el modelo. Cada tarea declara tres números —cuánto cómputo necesita, cada cuánto lo necesita y para cuándo debe estar hecho— y el kernel planifica por **EDF** (*Earliest Deadline First*): corre siempre la tarea cuyo plazo absoluto está más cerca. Se configura con `sched_setattr`, que glibc aún no envuelve, así que se llama por número de syscall:
+
+```c
+#include <linux/sched.h>
+#include <linux/sched/types.h>     /* struct sched_attr */
+#include <sys/syscall.h>
+#include <unistd.h>
+
+struct sched_attr attr = {
+	.size          = sizeof(attr),
+	.sched_policy  = SCHED_DEADLINE,
+	.sched_runtime =  2 * 1000 * 1000,   /* 2 ms de computo... */
+	.sched_period  = 10 * 1000 * 1000,   /* ...cada 10 ms...    */
+	.sched_deadline= 10 * 1000 * 1000,   /* ...entregado en 10 ms */
+};
+
+/* runtime <= deadline <= period, todo en nanosegundos */
+if (syscall(__NR_sched_setattr, 0, &attr, 0) != 0)
+	perror("sched_setattr");             /* EBUSY = admision denegada */
+```
+
+La magia no es solo EDF, sino el **CBS** (*Constant Bandwidth Server*) que lo envuelve. El kernel lleva la cuenta del `runtime` consumido: cuando una tarea agota sus 2 ms dentro del periodo, se la **frena** hasta el siguiente, aunque siga teniendo trabajo. Esto convierte una promesa en una garantía bilateral: el kernel te asegura tus 2 ms cada 10 ms, y a cambio tú no puedes robar más. Por eso `SCHED_DEADLINE` tiene **control de admisión**: si la suma de anchos de banda `runtime/period` de todas las tareas deadline superara la capacidad disponible, `sched_setattr` falla con `EBUSY` antes de aceptar una tarea que rompería los plazos de las demás. En la cadena de clases, `dl_sched_class` está por encima de `rt`, así que una tarea deadline pisa incluso a una `SCHED_FIFO` de prioridad 99.
+
+<Mermaid code={`flowchart TD
+  Q[Tarea quiere tiempo real] --> D{Plazos concretos y periodicos}
+  D -->|Si, garantia dura| DL[SCHED_DEADLINE: EDF mas CBS]
+  D -->|No, solo urgencia relativa| P{Varias de igual prioridad}
+  P -->|Si, deben turnarse| RR[SCHED_RR con quantum]
+  P -->|No, una manda| FF[SCHED_FIFO sin quantum]
+  DL --> A[Control de admision protege los plazos]
+  FF --> T[RT throttling evita el cuelgue]
+  RR --> T
+  style DL fill:#a6e3a1,color:#11111b
+  style T fill:#f38ba8,color:#11111b`} />
+
+## El peligro: una tarea RT puede congelar la máquina
+
+Aquí está el filo. Una tarea `SCHED_FIFO` que entra en un bucle sin bloquearse **nunca cede la CPU** a nada de menor prioridad. Y "menor prioridad" incluye casi todo el kernel: el hilo que procesa RCU, los `kworker`, tu propia shell. Un simple error convierte tu lazo de control en un cerrojo que congela un núcleo, y si es un sistema uniprocesador, la máquina entera:
+
+```c
+/* BOMBA: FIFO en bucle cerrado. Sin RT throttling, cuelga el nucleo. */
+struct sched_param sp = { .sched_priority = 99 };
+sched_setscheduler(0, SCHED_FIFO, &sp);
+while (1)
+	;   /* no se bloquea, no cede: nada de menor prioridad correra jamas */
+```
+
+La red de seguridad se llama **RT throttling**. Por defecto el kernel reserva una fracción de cada periodo para las tareas no-RT:
+
+```bash
+# de cada 1_000_000 us, 950_000 us como maximo para SCHED_FIFO/RR
+cat /proc/sys/kernel/sched_rt_period_us     # 1000000
+cat /proc/sys/kernel/sched_rt_runtime_us    #  950000  (95%)
+```
+
+Ese 5% reservado es lo que te permite recuperar la shell y matar la tarea desbocada en lugar de pulsar el botón de reinicio. Es una válvula deliberadamente tosca: no arregla tu código, solo evita que un `SCHED_FIFO` mal escrito se lleve el sistema por delante. `SCHED_DEADLINE` no la necesita porque su CBS ya frena a cada tarea en su presupuesto; el *throttling* es el parche para las políticas de prioridad fija, que carecen de esa contabilidad.
+
+<Cards>
+  <Card icon="🥇" title="SCHED_FIFO">
+    Prioridad fija 1 a 99, sin rodaja: corre hasta bloquearse o ceder. La de mayor prioridad pisa a la de menor sin excepción. Ideal y peligrosa a partes iguales.
+  </Card>
+  <Card icon="🔄" title="SCHED_RR">
+    Como FIFO pero con quantum: entre iguales reparte por turnos. Evita que dos tareas de la misma prioridad se congelen mutuamente.
+  </Card>
+  <Card icon="⏱️" title="SCHED_DEADLINE">
+    Declaras runtime, deadline y period; el kernel planifica por EDF y con control de admisión. El poder acotado por diseño, no por confianza.
+  </Card>
+  <Card icon="🚨" title="RT throttling">
+    Reserva un 5% de cada periodo para lo no-RT. La red que te deja recuperar la máquina cuando una tarea de prioridad fija se desboca.
+  </Card>
+</Cards>
+
+<Callout type="info" title="Inversión de prioridad: el clásico que hundió a la Mars Pathfinder">
+El tiempo real trae un peligro sutil más allá del monopolio: la **inversión de prioridad**. Una tarea RT de alta prioridad se bloquea esperando un lock que tiene una de baja prioridad, y una tarea intermedia —que ni siquiera toca el lock— desaloja a la de baja, que nunca lo suelta: la de alta queda atascada por debajo de la intermedia. La cura es la **herencia de prioridad** (`rt_mutex`): quien tiene el lock hereda temporalmente la prioridad del que espera, para que lo suelte cuanto antes. Con `PREEMPT_RT` —hoy en mainline— casi todos los locks del kernel se vuelven `rt_mutex` con herencia, y por eso el kernel entero se hace apropiable. Es la misma familia de peligros del nivel 19, ahora con plazos en juego.
+</Callout>
+
+<Callout type="dios" title="Garantizar un plazo y secuestrar la CPU son el mismo poder">
+Detente en la simetría, porque es la esencia moral del tiempo real y la razón de que sea tan difícil. Cuando concedes a una tarea prioridad `SCHED_FIFO` 99, le estás diciendo al kernel: *pase lo que pase, cuando esta tarea quiera correr, córrela*. Eso es exactamente lo que un lazo de control de un airbag, de un brazo robótico o de una barrera de sonido necesita: la certeza absoluta de que llegará a tiempo. Pero mira la frase otra vez, porque es palabra por palabra la definición de una tarea que puede secuestrar la máquina. No hay dos capacidades distintas, una buena —garantizar— y otra mala —monopolizar—; hay **una sola** capacidad, el derecho a pisar incondicionalmente a todo lo demás, y su bondad o maldad depende por completo de si la tarea cede la CPU cuando ha terminado su trabajo. La garantía de plazo y el riesgo de cuelgue son la misma moneda: no puedes tener la primera sin exponerte al segundo. Ahí radica la superioridad conceptual de `SCHED_DEADLINE` sobre la prioridad fija. En lugar de conceder un poder ilimitado y confiar en la buena conducta de la tarea, `SCHED_DEADLINE` acota el poder desde el diseño: te doy tus 2 ms cada 10, ni uno más, y con control de admisión garantizo que la suma de todas las promesas cabe en la CPU real. El CBS transforma "confío en que te portes bien" en "el sistema hace imposible que te portes mal". Cuando internalizas que en tiempo real toda garantía es un privilegio y todo privilegio es un peligro, dejas de repartir prioridades altas como si fueran gratis y empiezas a preguntarte, ante cada tarea RT: ¿qué exactamente le estoy permitiendo secuestrar, y qué le impide no devolverlo?
+</Callout>
+
+<Reto title="Prueba el filo con cuidado">
+1. Escribe una tarea `SCHED_RR` de prioridad 50 con `chrt` y otra `SCHED_FIFO` de prioridad 60; observa con `chrt -p` cuál desaloja a cuál y por qué.
+2. En una máquina virtual desechable, baja `sched_rt_runtime_us` a `950000`, lanza la bomba `SCHED_FIFO` en bucle y comprueba que aún puedes recuperar la shell gracias al 5% reservado.
+3. Programa una tarea `SCHED_DEADLINE` con `sched_setattr`; luego intenta admitir una segunda cuyo `runtime/period` no quepa y captura el `EBUSY` del control de admisión.
+4. Explica por qué `SCHED_DEADLINE` no necesita RT throttling mientras que `SCHED_FIFO` sí, apoyándote en el CBS.
+5. Razona cómo la herencia de prioridad de `rt_mutex` evita la inversión de prioridad, y qué cambia cuando el kernel corre con `PREEMPT_RT`.
+</Reto>

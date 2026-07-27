@@ -1,0 +1,149 @@
+---
+title: "regmap avanzado: caché, campos de bits y depuración por debugfs"
+description: "Cuando todo acceso pasa por un solo punto puedes colgar de él maquinaria poderosa: una caché que refleja el dispositivo en RAM y permite replicar su estado en suspensión y reanudación, campos de bits con nombre mediante regmap_field, la distinción entre registros volátiles y cacheables, y una ventana a los registros desde debugfs."
+subject: kernel
+level: 32
+order: 5
+icon: "32.5"
+duracion: "17 min"
+---
+
+<Lead>
+Una vez que cada acceso a registro pasa por el mismo punto de estrangulamiento, puedes atornillarle maquinaria potente casi gratis: una caché que refleja el dispositivo en RAM y evita ir al bus por lo que no ha cambiado, campos de bits con nombre que se leen como miembros de una estructura, y una ventana desde debugfs para hurgar los registros desde la consola. Aquí regmap deja de ser un mero eliminador de duplicación y se convierte en un **modelo** del dispositivo: su estado se vuelve dato que puedes inspeccionar, diferenciar y reconstruir. Es el salto de mandar a ciegas al silicio a razonar sobre una copia fiel de lo que contiene.
+</Lead>
+
+<Objetivos>
+
+- Activar y gobernar la caché de registros con `cache_type` y `REGCACHE_MAPLE`.
+- Describir qué registros son volátiles, escribibles o preciosos con callbacks.
+- Nombrar campos de bits con `regmap_field` y `REG_FIELD`.
+- Depurar por debugfs y sincronizar el estado en suspensión y reanudación.
+
+</Objetivos>
+
+## La caché de registros
+
+Una caché guarda en RAM el último valor conocido de cada registro, para que una lectura de algo que no ha cambiado no toque el bus y las escrituras puedan diferirse o agruparse. regmap ofrece varios tipos: `REGCACHE_NONE` (por defecto, sin caché), `REGCACHE_FLAT` (un array, rapidísimo pero glotón de RAM), `REGCACHE_RBTREE` (el clásico para mapas dispersos) y `REGCACHE_MAPLE`, basado en el maple tree y hoy el recomendado para mapas dispersos por su mejor comportamiento en memoria y concurrencia. Se elige en la config:
+
+```c
+static const struct regmap_config cfg = {
+	.reg_bits = 8,
+	.val_bits = 8,
+	.max_register = 0x7f,
+	.cache_type = REGCACHE_MAPLE,    /* cache dispersa moderna, maple tree */
+};
+```
+
+Pero una caché es una mentira útil solo si le dices qué registros **no** debe creerse: aquellos que el propio hardware cambia por su cuenta.
+
+## Volátiles, escribibles, preciosos
+
+La corrección de la caché descansa en describir la semántica del mapa con callbacks. Un registro **volátil** lo cambia el hardware —estado, datos, bits que se autolimpian—, así que su lectura siempre debe ir al bus y jamás cachearse. Los límites **escribible** y **legible** los respeta regmap y también debugfs:
+
+```c
+static bool sensor_volatile_reg(struct device *dev, unsigned int reg)
+{
+	switch (reg) {
+	case SENSOR_REG_STATUS:      /* lo mueve el hardware: nunca cachear */
+	case SENSOR_REG_DATA:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool sensor_writeable_reg(struct device *dev, unsigned int reg)
+{
+	return reg <= SENSOR_REG_CTRL;   /* mas alla es de solo lectura */
+}
+
+static const struct regmap_config cfg = {
+	.reg_bits = 8,
+	.val_bits = 8,
+	.max_register = 0x7f,
+	.cache_type    = REGCACHE_MAPLE,
+	.volatile_reg  = sensor_volatile_reg,
+	.writeable_reg = sensor_writeable_reg,
+};
+```
+
+Falta una tercera categoría: los registros **preciosos** (`precious_reg`), aquellos cuya simple lectura tiene efectos —un estado de interrupción que se limpia al leerse—. regmap se abstiene de tocarlos en un volcado de debugfs, para que inspeccionar el dispositivo no altere su estado.
+
+<Callout type="warn" title="Olvidar marcar un registro como volátil es el bug clásico">
+Si un registro de estado o de datos no se declara volátil, regmap devolverá para siempre el primer valor que cacheó, y tu driver verá el dispositivo congelado: el sensor parece no actualizarse, la interrupción nunca se despeja, la lectura no avanza. No es un fallo del hardware sino de la descripción del mapa. Ante un dispositivo que se comporta como si estuviera clavado en un valor, sospecha primero de un `volatile_reg` incompleto.
+</Callout>
+
+## regmap_field: bits con nombre
+
+En vez de repartir desplazamientos y máscaras por todo el código, ata un campo de bits a un nombre con `REG_FIELD` —registro, bit inicial, bit final— y opera sobre él como una entidad:
+
+```c
+/* campo: bits 3 a 5 del registro CTRL */
+static const struct reg_field sensor_gain = REG_FIELD(SENSOR_REG_CTRL, 3, 5);
+
+struct regmap_field *gain;
+unsigned int g;
+
+gain = devm_regmap_field_alloc(dev, map, sensor_gain);
+if (IS_ERR(gain))
+	return PTR_ERR(gain);
+
+regmap_field_write(gain, 0x2);       /* toca solo los bits 3 a 5, el resto intacto */
+regmap_field_read(gain, &g);
+```
+
+`regmap_field_write` hace por dentro el desplazamiento, la máscara y el lee-modifica-escribe atómico; tú piensas en "la ganancia", no en "los bits 3 a 5 de CTRL". Para muchos campos de golpe existe `devm_regmap_field_bulk_alloc`. Es más limpio y menos propenso a errores que el manoseo manual de bits, que tarde o temprano equivoca una máscara.
+
+## Depuración por debugfs y sincronización de energía
+
+Con `CONFIG_REGMAP_DEBUGFS`, cada regmap aparece bajo `/sys/kernel/debug/regmap/` en una subcarpeta por dispositivo, con ficheros para volcar registros, ver rangos y consultar accesos —respetando siempre lo escribible, lo legible y lo precioso—:
+
+```bash
+# volcar todos los registros legibles del dispositivo
+cat /sys/kernel/debug/regmap/1-0048/registers
+
+# consultar y forzar el modo solo-cache
+cat /sys/kernel/debug/regmap/1-0048/cache_only
+```
+
+Y la caché habilita una suspensión y reanudación limpias. Al suspender, se pasa a modo solo-caché y se marca todo como sucio; al reanudar, `regcache_sync` reescribe al chip únicamente lo que difiere de sus valores de reset:
+
+```c
+static int sensor_suspend(struct device *dev)
+{
+	struct regmap *map = dev_get_regmap(dev, NULL);
+
+	regcache_cache_only(map, true);   /* desde aqui, ni una lectura al bus */
+	regcache_mark_dirty(map);         /* al reanudar habra que reescribir */
+	/* ...cortar la alimentacion del chip... */
+	return 0;
+}
+
+static int sensor_resume(struct device *dev)
+{
+	struct regmap *map = dev_get_regmap(dev, NULL);
+
+	/* ...restaurar la alimentacion; el chip vuelve a valores de reset... */
+	regcache_cache_only(map, false);
+	return regcache_sync(map);        /* reescribe solo lo que cambio */
+}
+```
+
+<Mermaid code={`flowchart LR
+  RD[regmap_read] --> DEC[Es un registro volatil]
+  DEC -->|si| BUS[Va al bus fisico]
+  DEC -->|no| CH[Devuelve el valor cacheado en RAM]
+  WR[regmap_write] --> UPD[Actualiza la cache]
+  UPD --> BUS`} />
+
+<Callout type="dios" title="La caché convierte el estado del hardware en dato">
+Mira lo que acaba de ocurrir con la naturaleza misma del dispositivo. Mientras el driver mandaba pokes imperativos al silicio, el hardware era una cosa opaca a la que ordenabas a ciegas y de la que solo sabías lo último que te contó. En cuanto su mapa de registros vive como un maple tree en la RAM, el dispositivo se vuelve un modelo: una estructura de datos que puedes serializar, diferenciar, replicar e inspeccionar. La suspensión y reanudación se revelan entonces como lo que de verdad son —un viaje en el tiempo—: congelas el modelo, cortas la corriente, devuelves el chip a su estado de reset y reproduces la diferencia para restaurarlo exactamente donde estaba, sin re-derivar una sola línea de configuración. Y la frontera entre volátil y cacheable, que parecía un tecnicismo de rendimiento, es en realidad una línea ontológica precisa: marca qué estado pertenece al *dispositivo* —el estado que él genera, las muestras, los bits que se limpian solos— y qué estado pertenece al *driver* —la configuración que él impuso y por tanto puede recordar—. Cachear lo del driver es legítimo porque es suyo; cachear lo del dispositivo es mentir. Debugfs cierra el círculo volviendo el modelo observable desde la consola, de modo que el estado del hardware deja de ser un secreto encerrado en el chip para ser un dato que lees con `cat`. Ahí está la marca de la ingeniería de sistemas madura: dejar de tratar el hardware como una caja negra que se comanda y empezar a tratar su estado como información que se posee, sobre la que se razona y que se reconstruye a voluntad. regmap es ese cambio hecho concreto —de un torrente de órdenes ciegas a un modelo declarado, cacheado e inspeccionable del silicio—, y la disciplina que enseña, la de convertir el estado en dato, es la que separa un driver que funciona de uno que sobrevive a que le corten la luz.
+</Callout>
+
+<Reto title="Modela el dispositivo, no solo lo comandes">
+1. Activa `REGCACHE_MAPLE` en una `regmap_config` y añade un `volatile_reg` que marque el registro de estado y el de datos.
+2. Explica qué le pasa a un driver que olvida marcar como volátil su registro de datos, y cómo se manifiesta el bug.
+3. Define un `reg_field` para un campo de tres bits con `REG_FIELD`, reserva el `regmap_field` y escribe y lee ese campo.
+4. Escribe los callbacks de `suspend` y `resume` con `regcache_cache_only`, `regcache_mark_dirty` y `regcache_sync`, y explica por qué `sync` solo reescribe lo que cambió.
+5. Con un dispositivo real, vuelca `/sys/kernel/debug/regmap/` de su regmap y razona por qué los registros preciosos no aparecen en el volcado.
+</Reto>

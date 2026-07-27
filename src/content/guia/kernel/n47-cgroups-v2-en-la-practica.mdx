@@ -1,0 +1,142 @@
+---
+title: "cgroups v2 en la práctica: cpu.max, memory.max e io.max"
+description: "Cómo se limita CPU con cpu.max y se reparte por peso con cpu.weight, cómo memory.max, memory.high y memory.low separan el techo duro de la presión suave y la protección, cómo io.max acota ancho de banda por dispositivo, y por qué estas cuatro perillas son literalmente la base sobre la que runc, Docker, Kubernetes y systemd construyen todo el aislamiento de la nube."
+subject: kernel
+level: 47
+order: 5
+icon: "47.5"
+duracion: "18 min"
+---
+
+<Lead>
+Ya sabes qué es la jerarquía; ahora giras las perillas. Este nivel es deliberadamente concreto: los archivos exactos que escribes para decir "este grupo usa como mucho dos CPUs, medio giga de RAM y cien megabytes por segundo de disco". Y al final entiendes la revelación práctica de todo el capítulo: cuando `docker run --memory=512m --cpus=2` limita un contenedor, o cuando Kubernetes hace cumplir el `limits` de un pod, no hay ninguna magia nueva —hay exactamente estos archivos, escritos por ti a mano ahora y por `runc` en producción después.
+</Lead>
+
+<Objetivos>
+
+- Limitar y repartir CPU con `cpu.max` (cuota) y `cpu.weight` (proporción).
+- Distinguir `memory.max`, `memory.high` y `memory.low` como techo, freno y protección.
+- Acotar E/S por dispositivo con `io.max` y repartir con `io.weight`.
+- Ver cómo Docker, Kubernetes y systemd traducen sus opciones a estos archivos.
+
+</Objetivos>
+
+## Limitar CPU: cuota dura y peso proporcional
+
+El controlador `cpu` ofrece dos modelos que conviven. `cpu.max` fija un **techo absoluto**: dos números, cuánto tiempo de CPU en microsegundos por cada periodo. `cpu.weight` fija una **proporción relativa** que solo importa cuando hay contención:
+
+```bash
+mkdir /sys/fs/cgroup/clienteA
+echo "+cpu" > /sys/fs/cgroup/cgroup.subtree_control
+
+# TECHO: 200000 us de computo por cada 100000 us de periodo = 2 CPUs enteras
+echo "200000 100000" > /sys/fs/cgroup/clienteA/cpu.max
+
+# sin techo (por defecto): la palabra 'max' como cuota
+echo "max 100000" > /sys/fs/cgroup/clienteA/cpu.max
+
+# PESO: reparto proporcional cuando hay pugna (1..10000, defecto 100)
+echo 200 > /sys/fs/cgroup/clienteA/cpu.weight   # el doble de cuota que un peso 100
+```
+
+La diferencia es de naturaleza. `cpu.max` es un **límite**: aunque el resto de la máquina esté ociosa, `clienteA` no pasará de sus dos CPUs —es reparto por cuota, predecible y a veces desperdiciador—. `cpu.weight` es una **garantía relativa**: si dos grupos con pesos 200 y 100 pelean por un núcleo saturado, se lo reparten dos a uno, pero si uno duerme, el otro usa todo lo disponible. Producción seria suele combinar ambos: peso para el reparto justo bajo carga, cuota para que nadie exceda lo contratado. El *throttling* consumido se audita en `cpu.stat` (`nr_throttled`, `throttled_usec`).
+
+<Callout type="warn" title="La cuota de CPU estrangula, y eso puede doler en las colas de latencia">
+`cpu.max` no ralentiza suavemente: cuando un grupo agota su cuota dentro del periodo, el kernel lo **congela** hasta el siguiente, aunque haya núcleos ociosos al lado. En una aplicación con hilos, eso produce pausas bruscas de hasta un periodo entero justo cuando más trabajo hay, y dispara la cola de latencias p99. Es el famoso dolor del *CFS throttling* en Kubernetes: pods con `limits` de CPU agresivos que sufren pausas periódicas. La cura no es subir la cuota a ciegas sino entender que un límite de CPU compra predictibilidad de consumo al precio de predictibilidad de latencia, y a veces conviene poner `weight` sin `max`.
+</Callout>
+
+## Limitar memoria: techo, freno y protección
+
+La memoria tiene tres perillas con roles distintos, y confundirlas es el error clásico. `memory.max` es el **techo duro**: superarlo dispara el OOM killer *dentro del grupo* (nivel 25). `memory.high` es un **freno suave**: no mata, pero al rebasarlo el kernel mete al grupo bajo fuerte presión de reclaim, ralentizándolo. `memory.low` es **protección**: la memoria por debajo de ese valor se defiende del reclaim mientras haya otra recuperable en otro sitio.
+
+```bash
+echo "+memory" > /sys/fs/cgroup/cgroup.subtree_control
+
+echo 536870912  > /sys/fs/cgroup/clienteA/memory.max   # 512 MiB: techo duro, OOM si se pasa
+echo 450M       > /sys/fs/cgroup/clienteA/memory.high  # 450 MiB: freno por reclaim, no mata
+echo 128M       > /sys/fs/cgroup/clienteA/memory.low   # 128 MiB: protegidos del reclaim ajeno
+
+cat /sys/fs/cgroup/clienteA/memory.current             # uso actual en bytes
+cat /sys/fs/cgroup/clienteA/memory.events              # low high max oom oom_kill: contadores
+```
+
+La combinación inteligente usa `memory.high` como amortiguador y `memory.max` como red de último recurso: el grupo se frena mucho antes de llegar al techo letal, dándote margen para reaccionar. `memory.events` es la caja negra: cada vez que el grupo toca `high`, `max` o sufre un `oom_kill`, un contador sube, y ahí lees si tu límite está bien calibrado o asfixiando la carga. Existe también `memory.swap.max` para acotar el intercambio por separado.
+
+<Cards>
+  <Card icon="🧱" title="memory.max">
+    Techo duro. Rebasarlo invoca al OOM killer confinado al grupo. La última línea, no la primera.
+  </Card>
+  <Card icon="🐢" title="memory.high">
+    Freno suave. Por encima, reclaim agresivo ralentiza el grupo sin matarlo. El amortiguador que da tiempo a reaccionar.
+  </Card>
+  <Card icon="🛡️" title="memory.low">
+    Protección. La memoria bajo este valor resiste el reclaim mientras haya otra recuperable. Garantiza un mínimo de trabajo.
+  </Card>
+  <Card icon="📊" title="memory.events">
+    La telemetría. Contadores de cuántas veces se tocó `high`, `max` u ocurrió un `oom_kill`. El termómetro del límite.
+  </Card>
+</Cards>
+
+## Limitar E/S y contar procesos
+
+El controlador `io` acota el acceso al almacenamiento **por dispositivo**, identificado por su par `major:minor`. `io.max` pone topes absolutos de ancho de banda (`rbps`, `wbps`) e IOPS (`riops`, `wiops`); `io.weight` reparte proporcionalmente bajo contención cuando el planificador de bloque lo soporta:
+
+```bash
+echo "+io +pids" > /sys/fs/cgroup/cgroup.subtree_control
+
+# averiguar major:minor del disco
+lsblk -o NAME,MAJ:MIN            # p.ej. nvme0n1  259:0
+
+# techo: 100 MB/s de lectura y 2000 IOPS de escritura en ese dispositivo
+echo "259:0 rbps=104857600 wiops=2000" > /sys/fs/cgroup/clienteA/io.max
+
+# reparto proporcional de E/S (1..10000)
+echo "default 200" > /sys/fs/cgroup/clienteA/io.weight
+
+# techo de procesos: la defensa barata contra un fork bomb
+echo 512 > /sys/fs/cgroup/clienteA/pids.max
+cat /sys/fs/cgroup/clienteA/pids.current
+```
+
+## Docker, Kubernetes y systemd son escritores de estos archivos
+
+Aquí cierra el círculo. Cuando ejecutas `docker run --cpus=2 --memory=512m`, el runtime `runc` **crea un cgroup y escribe exactamente lo que acabas de escribir tú**: `cpu.max` con cuota `200000 100000` y `memory.max` con `536870912`. Kubernetes traduce el manifiesto de un pod a estos mismos archivos vía la interfaz de contenedores:
+
+```yaml
+# manifiesto de Kubernetes...
+resources:
+  requests: { cpu: "500m", memory: "256Mi" }   # -> cpu.weight y memory.low
+  limits:   { cpu: "2",    memory: "512Mi" }    # -> cpu.max y memory.max
+```
+
+```bash
+# ...y systemd, que hace lo mismo con una sola orden
+systemd-run --scope -p CPUQuota=200% -p MemoryMax=512M -p IOWeight=200 \
+	./mi_carga
+# CPUQuota=200% se convierte en cpu.max "200000 100000"; MemoryMax en memory.max
+```
+
+Los `requests` de Kubernetes se convierten en `cpu.weight` y protección de memoria; los `limits`, en `cpu.max` y `memory.max`. Una unidad de systemd con `MemoryMax=512M` acaba en `memory.max`; `CPUWeight=` en `cpu.weight`. No hay una capa oculta: hay estos archivos, y por encima capas de comodidad que los escriben por ti.
+
+<Mermaid code={`flowchart TD
+  K[kubectl apply pod con limits] --> KL[kubelet y CRI]
+  D[docker run cpus memory] --> RC[runc]
+  S[systemd-run MemoryMax] --> SD[systemd]
+  KL --> F[Escribir cpu.max memory.max io.max en cgroupfs]
+  RC --> F
+  SD --> F
+  F --> KE[El kernel hace cumplir el limite]
+  style F fill:#f9e2af,color:#11111b
+  style KE fill:#a6e3a1,color:#11111b`} />
+
+<Callout type="dios" title="La nube entera se apoya en cuatro archivos de texto">
+Detente en la desmitificación que acabas de vivir, porque cambia tu relación con toda la infraestructura moderna. Palabras como Docker, Kubernetes, contenedor, orquestación, nube evocan una torre de tecnología insondable, capas sobre capas de abstracción que parecen requerir un saber esotérico. Y sin embargo, cuando bajas hasta el fondo —hasta donde el hardware se reparte de verdad— no encuentras un mecanismo arcano: encuentras un directorio en `/sys/fs/cgroup` y un puñado de archivos de texto que se escriben con `echo`. `docker run --memory=512m` no ejerce ningún poder que tú no tengas ahora mismo desde una shell: escribe `536870912` en `memory.max`, ni más ni menos. Kubernetes, con toda su maquinaria de planificadores, controladores y reconciliación, cuando de verdad hace cumplir el `limits` de un pod, termina en un `kubelet` que llama a un runtime que escribe `cpu.max`. La lección profunda no es que estas herramientas sean simples —orquestar diez mil contenedores en mil máquinas es un problema genuinamente difícil— sino **dónde** está la dificultad: no en el mecanismo de aislamiento, que es esta media docena de perillas del kernel, sino en decidir *qué* escribir, *dónde* y *cuándo* a escala planetaria. El kernel provee el mecanismo; los orquestadores proveen la política. Y esa separación —mecanismo abajo, política arriba— es uno de los principios de diseño más profundos de todo Unix, repetido aquí a la escala de un centro de datos. Cuando internalizas que la nube no flota sobre magia sino sobre `cgroupfs`, dos cosas te pasan a la vez: pierdes el miedo reverencial a la infraestructura, porque ya has tocado su fondo con las manos, y ganas el poder real de depurarla, porque cuando un contenedor se estrangula sin razón aparente sabes exactamente qué archivo leer. Has recorrido el camino entero, de la teoría del planificador al `echo` que gobierna un centro de datos, y ya no hay caja negra entre ambos.
+</Callout>
+
+<Reto title="Reproduce a mano lo que hace Docker">
+1. Crea un cgroup, ponle `cpu.max` de "una sola CPU" y lanza dentro un bucle que queme CPU; con `top` confirma que se queda clavado en el 100% de un núcleo y no más.
+2. Fija `memory.max` a 64 MiB, corre dentro un programa que reserve 128 MiB y observa el `oom_kill` en `memory.events` y en `dmesg`.
+3. Limita la escritura de un disco con `io.max` (`wbps=`) y compara la velocidad de un `dd` dentro y fuera del grupo.
+4. Ejecuta `systemd-run --scope -p MemoryMax=128M -p CPUQuota=50% sleep 999` y localiza en `/sys/fs/cgroup` el `.scope` creado; verifica que `memory.max` y `cpu.max` valen lo que pediste.
+5. Lanza un contenedor con `docker run --memory=256m --cpus=1`, encuentra su cgroup bajo `machine.slice` o `system.slice` y comprueba que sus archivos coinciden con lo que escribirías tú.
+</Reto>

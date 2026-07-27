@@ -1,0 +1,150 @@
+---
+title: "Escribir un platform driver: probe, remove y recursos"
+description: "La anatomía de un platform_driver real de Linux 7.x: el struct con probe y remove (que ahora devuelve void), cómo probe reclama los registros con platform_get_resource y devm_ioremap_resource, engancha la interrupción con platform_get_irq, y por qué devm convierte remove en casi nada."
+subject: kernel
+level: 29
+order: 2
+icon: "29.2"
+duracion: "16 min"
+---
+
+<Lead>
+Un platform driver es la contraparte del dispositivo mudo del nivel anterior: la pieza de código que, cuando el kernel le entrega un dispositivo sin metadatos propios, sabe leer los recursos que otro declaró y ponerlo en marcha. Su forma es sorprendentemente estable —un `struct platform_driver`, una función `probe` y una función `remove`— pero en cada línea hay decisiones de diseño del kernel moderno: gestión de recursos con `devm`, propagación de errores con `dev_err_probe`, y un `remove` que en los kernels de 2026 ya ni siquiera devuelve un valor.
+</Lead>
+
+<Objetivos>
+
+- Escribir un `struct platform_driver` completo con `.probe`, `.remove` y `.driver`.
+- Reclamar registros con `platform_get_resource` y `devm_ioremap_resource` dentro de `probe`.
+- Obtener la interrupción con `platform_get_irq` y engancharla con `devm_request_irq`.
+- Entender por qué `devm` vacía a `remove` y por qué `.remove` hoy devuelve `void`.
+
+</Objetivos>
+
+## El struct platform_driver
+
+Todo empieza por la estructura que registra el driver ante el platform bus. Contiene los punteros a las funciones del ciclo de vida y un `struct device_driver` embebido cuyo `of_match_table` decide de qué nodos se hace cargo (nivel 29.4). El macro `module_platform_driver` genera el `module_init` y el `module_exit` que registran y retiran el driver, evitando el código repetitivo.
+
+```c
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/mod_devicetable.h>
+
+static const struct of_device_id acme_of_match[] = {
+	{ .compatible = "acme,uart-9000" },
+	{ /* centinela */ }
+};
+MODULE_DEVICE_TABLE(of, acme_of_match);
+
+static struct platform_driver acme_driver = {
+	.probe  = acme_probe,
+	.remove = acme_remove,           /* en 7.x devuelve void, no int */
+	.driver = {
+		.name           = "acme-uart",
+		.of_match_table = acme_of_match,
+	},
+};
+module_platform_driver(acme_driver);
+
+MODULE_LICENSE("GPL");
+```
+
+## probe: donde nace el dispositivo
+
+`probe` se invoca **una vez** por cada dispositivo que casa con el driver. Recibe el `struct platform_device` y tiene un solo trabajo: reservar su estado, reclamar sus recursos y dejar el hardware operativo. Si algo falla, debe devolver un errno negativo y no dejar nada a medias. Este es el esqueleto canónico de un driver de 2026:
+
+```c
+struct acme_priv {
+	void __iomem	*base;    /* registros ya mapeados */
+	int		irq;
+};
+
+static irqreturn_t acme_isr(int irq, void *data)
+{
+	struct acme_priv *priv = data;
+	u32 st = readl(priv->base + ACME_STATUS);
+
+	writel(st, priv->base + ACME_STATUS);   /* limpiar la fuente */
+	return IRQ_HANDLED;
+}
+
+static int acme_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct acme_priv *priv;
+	struct resource *res;
+	int ret;
+
+	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	/* 1. los registros: el recurso MEM numero 0 declarado para este device */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	priv->base = devm_ioremap_resource(dev, res);
+	if (IS_ERR(priv->base))
+		return PTR_ERR(priv->base);   /* ioremap valida el res nulo */
+
+	/* 2. la interrupcion: platform_get_irq ya imprime el error si falla */
+	priv->irq = platform_get_irq(pdev, 0);
+	if (priv->irq < 0)
+		return priv->irq;
+
+	ret = devm_request_irq(dev, priv->irq, acme_isr, 0,
+			       dev_name(dev), priv);
+	if (ret)
+		return dev_err_probe(dev, ret, "no pude solicitar la IRQ\n");
+
+	platform_set_drvdata(pdev, priv);   /* guardar el estado para remove */
+	dev_info(dev, "dispositivo acme inicializado\n");
+	return 0;
+}
+```
+
+Fíjate en tres detalles. `platform_get_resource(pdev, IORESOURCE_MEM, 0)` pide el primer rango de registros que se declaró para este dispositivo, sin importar de dónde salió esa declaración (board file o device tree). `devm_ioremap_resource` mapea ese rango a una dirección virtual del kernel y, de paso, reclama la región y valida que `res` no sea nulo. Y `platform_get_irq` traduce la interrupción declarada a un número Linux `virq` listo para `request_irq`; devuelve un errno negativo si no la hay, y en los kernels modernos imprime el mensaje de error por ti.
+
+<Mermaid code={`flowchart LR
+  MATCH[Match por compatible] --> PROBE[probe]
+  PROBE -->|devm_kzalloc| MEM[Reserva el estado]
+  PROBE -->|platform_get_resource + devm_ioremap_resource| IO[Mapea los registros]
+  PROBE -->|platform_get_irq + devm_request_irq| INT[Engancha la interrupcion]
+  PROBE --> LISTO[Dispositivo activo]
+  LISTO -->|rmmod o unbind| REMOVE[remove]`} />
+
+## dev_err_probe y el aplazamiento
+
+`dev_err_probe` no es azúcar sintáctico. Un platform driver a menudo depende de recursos que aún no existen: un GPIO cuyo controlador todavía no cargó, un reloj pendiente. En ese caso las funciones devuelven `-EPROBE_DEFER`, y el kernel **reintentará** el `probe` más tarde. `dev_err_probe` distingue ese caso: registra el error normal como error, pero el aplazamiento lo baja a mensaje de depuración para no inundar el log con reintentos, y devuelve el mismo errno para encadenarlo en el `return`. Es el idioma estándar de manejo de errores en `probe` desde hace años.
+
+## remove y el ciclo devm
+
+Aquí está la elegancia del modelo. Cada función `devm_*` registra su liberación en una lista atada al `struct device`. Cuando el dispositivo se desliga —por `rmmod`, por `unbind` o por un fallo posterior en el propio `probe`— el kernel recorre esa lista **en orden inverso** y deshace todo: libera la memoria, desmapea los registros, suelta la IRQ. El driver no tiene que acordarse de nada. Por eso `remove` queda casi vacío: solo se ocupa de lo que `devm` no puede saber, típicamente **apagar el hardware**.
+
+```c
+static void acme_remove(struct platform_device *pdev)
+{
+	struct acme_priv *priv = platform_get_drvdata(pdev);
+
+	writel(0, priv->base + ACME_CTRL);   /* silenciar el hardware */
+	/* no hay free, no hay iounmap, no hay free_irq: devm lo hace solo */
+}
+```
+
+<Callout type="warn" title="En los kernels de 2026, remove devuelve void">
+Durante décadas `.remove` devolvía `int`, pero ese valor era una mentira: el core ignoraba el resultado porque un dispositivo se **va** a desligar quieras o no, y devolver un error no lo impedía. Tras la transición vía el efímero `.remove_new`, los kernels actuales convirtieron `.remove` en `void (*remove)(struct platform_device *)`. Si portas un driver antiguo que hacía `return 0` al final de `remove`, el compilador ahora te lo rechazará. La lección de diseño: no devuelvas un error que nadie puede atender.
+</Callout>
+
+<Callout type="info" title="devm_platform_ioremap_resource: los dos pasos en uno">
+El patrón `platform_get_resource` seguido de `devm_ioremap_resource` es tan común que existe el atajo `devm_platform_ioremap_resource(pdev, 0)`, que hace ambas cosas y devuelve directamente el `void __iomem *` mapeado. Lo usaremos en el nivel 29.5. Aquí mostramos los dos pasos por separado para que veas qué ocurre por dentro: primero se localiza el recurso declarado, luego se mapea.
+</Callout>
+
+<Callout type="dios" title="probe y remove son el contrato universal, y devm invierte la responsabilidad de limpiar">
+Levanta la vista por encima de este driver concreto, porque acabas de aprender la forma de **todos** los drivers del kernel, no solo los de platform. PCI, USB, I2C, SPI: todos giran alrededor del mismo par, un `probe` que da vida a una instancia y un `remove` que la retira, porque el modelo de dispositivos de Linux es en el fondo una máquina que empareja dispositivos con drivers y les notifica la aparición y la desaparición. Lo que cambia entre buses es únicamente de dónde salen los recursos que `probe` reclama; el contrato es invariante. Y dentro de ese contrato vive una de las mejores ideas del kernel: `devm`. La limpieza de recursos es la fuente clásica de fugas y de errores en la ruta de fallo, porque obliga a cada `goto err_*` a deshacer exactamente lo hecho hasta ese punto, en orden inverso, sin olvidar ni repetir nada. `devm` convierte esa disciplina frágil en una propiedad estructural: atas cada adquisición a la vida del `struct device`, y la liberación deja de ser tu responsabilidad para convertirse en una consecuencia automática de que el dispositivo desaparezca. El resultado es que `probe` puede fallar en cualquier línea con un simple `return err` y todo lo reservado hasta ahí se deshace solo, y que `remove` adelgaza hasta contener nada más que lo que el hardware necesita para apagarse con dignidad. Cuando internalizas que el ciclo de vida de un recurso puede acoplarse al ciclo de vida de un objeto en lugar de gestionarse a mano, entiendes que `devm` no es una comodidad sino una forma de RAII incrustada en C, y que el kernel moderno prefiere las invariantes que se cumplen solas a la vigilancia que hay que recordar.
+</Callout>
+
+<Reto title="Construye y disecciona un platform driver">
+1. Escribe un `probe` mínimo que solo haga `devm_kzalloc` y `platform_get_irq`, y explica qué pasa si el dispositivo no declara ninguna interrupción.
+2. Sustituye el par `platform_get_resource` más `devm_ioremap_resource` por `devm_platform_ioremap_resource` y razona qué comprobación de error puedes eliminar.
+3. Introduce a propósito un `return -EPROBE_DEFER` en mitad de `probe` y describe qué hace el core del kernel con ese valor y cuándo reintenta.
+4. Convierte un `remove` antiguo que terminaba en `return 0` al prototipo `void` de 7.x y argumenta por qué el core nunca podía usar aquel valor de retorno.
+5. Elimina un `devm_` para volverlo manual y enumera todos los `goto` de limpieza que reaparecen en la ruta de error: ese es el coste que `devm` te ahorra.
+</Reto>

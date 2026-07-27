@@ -1,0 +1,150 @@
+---
+title: "El problema que resuelve RCU"
+description: "Por qué las estructuras read-mostly del kernel necesitan lecturas que escalen a miles de núcleos, y por qué los locks de lectura (rwlock, rwsem) colapsan por cache bouncing al crecer el número de núcleos."
+subject: kernel
+level: 17
+order: 1
+icon: "17.1"
+duracion: "14 min"
+---
+
+<Lead>
+El kernel lee mucho más de lo que escribe. Un lock de lectura parece barato, pero bajo el microscopio cada lector escribe en la misma palabra de memoria, y esa palabra se convierte en un cuello de botella que empeora con cada núcleo que añades. RCU es la respuesta; para apreciarla, primero hay que sentir el dolor que elimina.
+</Lead>
+
+<Objetivos>
+
+- Reconocer las cargas read-mostly omnipresentes en el kernel.
+- Entender el cache bouncing de una línea compartida bajo MESI.
+- Ver por qué `rwlock_t` y `rw_semaphore` no escalan.
+- Formular la asimetría lector/escritor que RCU explota.
+
+</Objetivos>
+
+## Cargas read-mostly: lo normal en el kernel
+
+Un patrón domina el kernel: estructuras que se **leen** millones de veces por segundo y se **modifican** rara vez. En Linux 7.x lo ves en la tabla de rutas IPv4/IPv6, el `dentry cache`, la lista de módulos cargados, las reglas de netfilter, la política de SELinux o la lista de CPUs online. Las lecturas superan a las escrituras por varios órdenes de magnitud.
+
+Pon un ejemplo concreto: una tabla de rutas se **consulta** una vez por cada paquete que enruta la máquina —cientos de miles o millones de veces por segundo en un router serio— y se **modifica** solo cuando cambia la topología de la red, quizá unas pocas veces por minuto. Proteger algo así con un candado que serialice cada consulta es tirar el rendimiento de la máquina a la basura.
+
+El caso extremo es el `dentry cache`: cada `open`, cada `stat`, cada resolución de una ruta lo consulta, y solo se actualiza al crear o borrar ficheros; la proporción lecturas/escrituras puede superar el millón a uno.
+
+La intuición dice: "si casi nadie escribe, un lock de lectura compartido bastará; muchos lectores pueden entrar a la vez". El código clásico es este:
+
+```c
+#include <linux/rwlock.h>
+
+struct config {
+	int valor;
+	/* ... */
+};
+
+static struct config *cfg;
+static DEFINE_RWLOCK(cfg_lock);
+
+static int leer_valor(void)
+{
+	int v;
+
+	read_lock(&cfg_lock);      /* escribe en la palabra del lock */
+	v = cfg->valor;            /* la seccion critica real */
+	read_unlock(&cfg_lock);    /* vuelve a escribir en ella */
+	return v;
+}
+```
+
+El problema no está en `cfg->valor`: está en `read_lock`. Adquirir el lock de lectura **escribe** en `cfg_lock`.
+
+## El coste oculto: cache bouncing
+
+`read_lock` incrementa de forma atómica un contador dentro de `rwlock_t`. Una operación atómica de lectura-modificación-escritura (el prefijo `LOCK` en x86, un par `ldaxr`/`stlxr` en ARM64) exige que el núcleo posea la línea de caché en estado **Exclusive** o **Modified** del protocolo MESI. Para conseguirlo, debe **invalidar** la copia de esa línea en todos los demás núcleos.
+
+Cuando N núcleos martillean la misma palabra del lock, la línea rebota entre ellos: cada adquisición es una transferencia de caché entre núcleos —o peor, entre sockets— de cientos de ciclos.
+
+<Mermaid code={`flowchart TD
+  L[Linea de cache de cfg_lock]
+  C0[Nucleo 0 read_lock] --> L
+  C1[Nucleo 1 read_lock] --> L
+  C2[Nucleo 2 read_lock] --> L
+  C3[Nucleo 3 read_lock] --> L
+  L --> B[La linea rebota: cientos de ciclos por adquisicion]
+  style L fill:#f38ba8,color:#11111b
+  style B fill:#f9e2af,color:#11111b`} />
+
+Aquí está la ironía. El dato leído, `cfg->valor`, es de solo lectura: puede vivir replicado en estado **Shared** en la caché de cada núcleo, y leerlo es prácticamente gratis. Lo que no escala es la **contabilidad** para entrar en la sección crítica, porque esa contabilidad es una escritura a memoria compartida. La coordinación domina; el trabajo útil, no.
+
+Pon números al desastre: leer una línea que ya tienes en tu L1 en estado Shared cuesta unos pocos ciclos; adquirirla en Exclusive cuando otro socket la posee cuesta de cien a varios cientos de ciclos por el tráfico de coherencia. Con decenas de núcleos compitiendo por la palabra del lock, el throughput agregado de `read_lock` deja de crecer con los núcleos y se **desploma**: cada adquisición espera su turno sobre la misma línea. Es contención sobre los metadatos del lock, no sobre los datos que proteges.
+
+Y en máquinas NUMA el castigo se multiplica: si la palabra del lock vive en la memoria de otro nodo, cada rebote cruza la interconexión entre sockets, el tramo más lento de toda la jerarquía de memoria. Lo que en un portátil de ocho núcleos ni se nota, en un servidor de ciento veintiocho es el factor que limita el sistema entero.
+
+<Callout type="info" title="La serialización es física, no lógica">
+Dos lectores son lógicamente independientes: leen, no se pisan. Pero al escribir ambos en la palabra del lock, el hardware de coherencia los serializa **físicamente**. Cuantos más núcleos, más larga la cola por esa línea. Lecturas que deberían ir en paralelo perfecto acaban ejecutándose casi en serie: es la ley de Amdahl escrita en silicio.
+</Callout>
+
+<Callout type="danger" title="El anti-patrón del 'solo añade un lock'">
+La reacción instintiva ante una estructura compartida es "protégela con un lock". Para datos read-mostly en un sistema de muchos núcleos, ese instinto es una trampa: el lock que parece resolver la corrección introduce un cuello de botella invisible que no aparece en pruebas pequeñas pero estrangula la producción. Medir el **escalado**, no solo la corrección, es parte inseparable del trabajo de sistemas.
+</Callout>
+
+## Ni rwsem ni los locks por-CPU salvan
+
+¿Y un `rw_semaphore`, que permite dormir en secciones largas? Tampoco. Mantiene un `atomic_long_t count` y un dueño; cada lector hace un `cmpxchg` sobre ese contador para anunciarse. Misma línea compartida, mismo rebote, y encima puede encolar y dormir a los lectores si hay un escritor esperando. `rwlock` gira; `rwsem` duerme; ambos **escriben** estado compartido para entrar.
+
+Y el escritor es aún más brutal: `write_lock` excluye a **todos** los lectores a la vez. En una carga read-mostly la escritura es rara, pero cuando llega congela por completo el camino caliente:
+
+```c
+write_lock(&cfg_lock);     /* excluye a TODOS los lectores y escritores */
+cfg->valor = nuevo;        /* modificacion in situ */
+write_unlock(&cfg_lock);
+```
+
+Un intento más fino es dar a cada CPU su propio contador: el histórico *big reader lock* o el `percpu_rw_semaphore` de hoy. El lector solo toca su línea por-CPU y el rebote desaparece... pero el coste se traslada al escritor, que ahora debe excluir las N variables por-CPU: se vuelve O(N) y caro. De hecho, el `percpu_rw_semaphore` usa RCU por debajo para su lado escritor. Es la filosofía correcta a medias: abaratar al lector a costa del escritor.
+
+<Cards>
+  <Card icon="🔒" title="rwlock_t">
+    Gira en espera. Cada `read_lock` es un RMW atómico sobre la palabra del lock: rebote garantizado bajo contención.
+  </Card>
+  <Card icon="😴" title="rw_semaphore">
+    Puede dormir en secciones largas, pero mantiene un contador atómico compartido y una cola de espera. Mismo rebote, más latencia.
+  </Card>
+  <Card icon="⚡" title="RCU">
+    El lector no escribe nada compartido. Cero rebote, escalado lineal. El precio lo paga el escritor, no el lector.
+  </Card>
+</Cards>
+
+<Callout type="note" title="¿Y un seqlock?">
+El `seqlock` es otra arma read-mostly: el lector no toma candado, lee un contador de secuencia antes y después, y **reintenta** si un escritor pasó en medio. Escala mejor que un rwlock, pero tiene dos límites que RCU no tiene. Uno: el lector puede ver un estado a medias, así que debe poder **releer** barato y no sirve para seguir punteros hacia estructuras que quizá ya no existen. Dos: el escritor sí serializa a los lectores durante su escritura. RCU ni obliga a reintentar ni expone estados intermedios; por eso es la elección por defecto para punteros y colecciones enlazadas.
+</Callout>
+
+## La asimetría que lo cambia todo
+
+La observación decisiva: si el lector no escribiera **nada** compartido, escalaría de forma perfecta, lineal, sin límite práctico de núcleos. ¿Y por qué escribe? Solo para anunciarse: "estoy aquí, no liberes esto bajo mis pies". RCU elimina ese anuncio del lado lector y traslada toda la carga al escritor, que ahora debe **esperar** hasta que sea demostrablemente seguro liberar la versión antigua.
+
+El coste se mueve del camino caliente y frecuente (las lecturas) al camino frío y raro (las escrituras). Con RCU cada núcleo lee su copia local sin tocar una sola línea compartida en escritura, así que las lecturas no se estorban entre sí:
+
+<Mermaid code={`flowchart TD
+  R0[Nucleo 0 rcu_read_lock] --> D0[Lee sin tocar estado compartido]
+  R1[Nucleo 1 rcu_read_lock] --> D1[Lee sin tocar estado compartido]
+  R2[Nucleo 2 rcu_read_lock] --> D2[Lee sin tocar estado compartido]
+  R3[Nucleo 3 rcu_read_lock] --> D3[Lee sin tocar estado compartido]
+  style D0 fill:#a6e3a1,color:#11111b
+  style D1 fill:#a6e3a1,color:#11111b
+  style D2 fill:#a6e3a1,color:#11111b
+  style D3 fill:#a6e3a1,color:#11111b`} />
+
+Pon el compromiso en la balanza: el escritor paga una copia y un grace period —quizá milisegundos— por cada actualización; el lector deja de pagar toda coordinación en cada una de sus millones de invocaciones. Si hay mil millones de lecturas por cada escritura, mover el coste a la escritura divide el trabajo total del sistema por un factor enorme. Esa reasignación es la idea central de todo lo que viene en este nivel.
+
+<Callout type="tip" title="La pregunta que debes hacerte">
+Antes de elegir mecanismo de sincronización, mide la proporción lecturas/escrituras. Cercana a 1: un spinlock. Lecturas ganando por poco: un `rwlock` o `seqlock`. Lecturas ganando por órdenes de magnitud: RCU. Elegir el candado sin conocer esa proporción es programar a ciegas.
+</Callout>
+
+<Callout type="dios" title="Lecturas libres de coordinación">
+La lección profunda de RCU no es una API, es una reorientación económica de la concurrencia. Todo mecanismo clásico —spinlock, mutex, rwlock, rwsem, incluso atomics— hace que el lector **escriba** para coordinarse, y toda escritura a memoria compartida es un punto de serialización que la coherencia de caché convierte en un cuello de botella creciente con el número de núcleos. RCU rompe esa premisa: en su forma clásica, un lector no ejecuta ni una sola operación atómica ni toca una línea compartida en modo escritura; es, literalmente, casi tan barato como no tener sincronización. Esto solo es posible porque RCU acepta una asimetría brutal: hace que los escritores trabajen mucho más (copiar, publicar y esperar un grace period) a cambio de que los lectores no trabajen casi nada. En una carga donde las lecturas superan a las escrituras por órdenes de magnitud, cambiar coste raro por velocidad frecuente es el mejor negocio de la ingeniería de sistemas. Por eso RCU está en el corazón de las rutas más calientes de Linux, y por eso escala a miles de núcleos donde un rwlock se ahoga con una docena.
+</Callout>
+
+<Reto title="Mide el dolor antes de la cura">
+1. Explica con MESI por qué `read_lock` de un `rwlock_t` compartido no escala aunque nadie escriba el dato protegido.
+2. Distingue el coste de leer `cfg->valor` (estado Shared) del de `read_lock` (escritura, estado Exclusive).
+3. Enumera tres estructuras read-mostly de Linux 7.x y estima su relación lecturas/escrituras.
+4. Argumenta por qué ni `rw_semaphore` ni un `percpu_rw_semaphore` eliminan del todo el coste que RCU sí elimina.
+5. Formula, en una frase, la asimetría que RCU explota, y compárala con un `seqlock`.
+</Reto>

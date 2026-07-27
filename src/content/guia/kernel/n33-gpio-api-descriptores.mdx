@@ -1,0 +1,126 @@
+---
+title: "GPIO con descriptores: controlar un pin sin números mágicos"
+description: "La API moderna de GPIO basada en descriptores (gpiod_get, gpiod_direction_output, gpiod_set_value) de linux/gpio/consumer.h, el modelo consumidor/proveedor, y por qué reemplazó a la vieja API numérica global que hardcodeaba números de pin y era ciega a la polaridad."
+subject: kernel
+level: 33
+order: 1
+icon: "33.1"
+duracion: "15 min"
+---
+
+<Lead>
+Un GPIO —General Purpose Input/Output— es la unidad más humilde del hardware: un solo pin que el software puede leer como entrada o forzar como salida a nivel alto o bajo. Enciende un LED, muestrea un botón, resetea un chip, selecciona un dispositivo en un bus. Durante veinte años el kernel controló esos pines con números enteros globales; hoy los controla con `descriptores` opacos que esconden el número, la polaridad y la propiedad del recurso. Ese cambio no es cosmético: es la diferencia entre un driver atado a una placa concreta y un driver portable que solo expresa su intención.
+</Lead>
+
+<Objetivos>
+
+- Entender qué es un GPIO y el modelo consumidor/proveedor que lo abstrae.
+- Dominar la API de descriptores de `<linux/gpio/consumer.h>`: `gpiod_get`, `gpiod_direction_output`, `gpiod_set_value`.
+- Comprender por qué la vieja API numérica de `<linux/gpio.h>` quedó obsoleta y en retirada.
+- Ver cómo el descriptor encapsula la polaridad active-low y la gestión de recursos con `devm_`.
+
+</Objetivos>
+
+## Un pin y dos actores
+
+Un GPIO físico lo genera un **proveedor**: el controlador de GPIO del SoC, o un expansor externo colgado de I2C o SPI. Ese proveedor registra un `struct gpio_chip` y ofrece un banco de líneas numeradas *dentro de él*. El **consumidor** es tu driver, que necesita una línea concreta para una función concreta —la de reset, la de habilitación, la del LED de estado— sin saber ni querer saber en qué chip ni en qué número vive.
+
+El puente entre ambos lo tiende el firmware: el device tree o las tablas ACPI declaran, para cada dispositivo, qué línea de qué controlador cumple cada función y con qué polaridad. El consumidor pide la línea *por su nombre lógico* y recibe un `struct gpio_desc *`: un descriptor opaco que ya lleva dentro toda esa información.
+
+<Mermaid code={`flowchart LR
+  DT[Device tree o ACPI] -->|describe la conexion| Core[Núcleo gpiolib]
+  Driver[Driver consumidor] -->|gpiod_get por nombre| Core
+  Core -->|devuelve| Desc[struct gpio_desc]
+  Core -->|resuelve a linea fisica| Chip[gpio_chip proveedor]
+  Chip --> Pin[Pin fisico del SoC]`} />
+
+## La vieja API numérica y sus pecados
+
+La interfaz clásica de `<linux/gpio.h>` giraba en torno a un entero global. Cada pin del sistema entero recibía un número único dentro de un espacio acotado por `ARCH_NR_GPIOS`, y el driver operaba sobre ese entero:
+
+```c
+/* API antigua basada en enteros: DEPRECADA y en proceso de retirada */
+#define LED_GPIO 42        /* numero magico, global, atado a este SoC */
+
+if (gpio_request(LED_GPIO, "status-led"))
+        return -EBUSY;
+gpio_direction_output(LED_GPIO, 0);
+gpio_set_value(LED_GPIO, 1);   /* escribe el nivel CRUDO: ignora la polaridad */
+/* ...y no olvidar nunca: */
+gpio_free(LED_GPIO);
+```
+
+Cuatro defectos la condenaron. **Uno**: el número 42 es un dato de la placa incrustado en el driver, que deja de compilar sin cambios en otra máquina donde el mismo LED cuelga del pin 17. **Dos**: `gpio_set_value` escribe el nivel eléctrico literal; si el LED es active-low —enciende con 0 voltios— el driver tiene que saberlo y negar a mano, dispersando conocimiento de hardware por todo el código. **Tres**: el espacio global de enteros no escala a expansores dinámicos que aparecen y desaparecen. **Cuatro**: la gestión de recursos es manual —`gpio_request` y `gpio_free` emparejados a mano— y cualquier camino de error que los desequilibre fuga la línea.
+
+## La API de descriptores
+
+La interfaz moderna vive en `<linux/gpio/consumer.h>` y sustituye el entero por un descriptor. El consumidor pide la línea por su nombre de función y el núcleo `gpiolib` resuelve el resto:
+
+```c
+#include <linux/gpio/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/property.h>
+
+struct led_priv {
+        struct gpio_desc *status;
+};
+
+static int led_probe(struct platform_device *pdev)
+{
+        struct device *dev = &pdev->dev;
+        struct led_priv *priv;
+
+        priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+        if (!priv)
+                return -ENOMEM;
+
+        /* "status-gpios" en el device tree se resuelve al con_id "status" */
+        priv->status = devm_gpiod_get(dev, "status", GPIOD_OUT_LOW);
+        if (IS_ERR(priv->status))
+                return dev_err_probe(dev, PTR_ERR(priv->status),
+                                     "no se pudo reservar el GPIO status\n");
+
+        gpiod_set_value(priv->status, 1);   /* enciende, respetando la polaridad */
+        platform_set_drvdata(pdev, priv);
+        return 0;
+}
+```
+
+Cada pieza corrige un pecado de la vieja API. `devm_gpiod_get` reserva la línea y la **libera automáticamente** cuando el driver se desvincula: no hay `gpiod_put` que olvidar. El segundo argumento, `"status"`, es un nombre lógico que el firmware traduce a una línea concreta —el driver ignora el número físico—. El tercer argumento es una bandera de `enum gpiod_flags` que fija *dirección y estado inicial de una vez*: `GPIOD_OUT_LOW` configura la línea como salida a nivel lógico bajo, `GPIOD_OUT_HIGH` como salida alta, `GPIOD_IN` como entrada y `GPIOD_ASIS` la deja como esté. Y `dev_err_probe` registra el fallo y propaga el código, silenciando el ruido cuando el error es `-EPROBE_DEFER` porque el proveedor aún no ha cargado.
+
+Una vez tienes el descriptor, la dirección se puede reconfigurar en caliente y el valor leerse o escribirse en términos **lógicos**:
+
+```c
+gpiod_direction_output(priv->status, 1);   /* pasa a salida, valor logico 1 */
+gpiod_direction_input(priv->reset);        /* pasa a entrada */
+int nivel = gpiod_get_value(priv->reset);  /* 1 = activo, no "5 voltios" */
+```
+
+## El descriptor esconde la polaridad
+
+Aquí está la ganancia conceptual. `gpiod_set_value(desc, 1)` no significa "pon el pin a nivel eléctrico alto": significa "**activa** la función". Si el device tree declaró la línea como `GPIO_ACTIVE_LOW`, el núcleo invierte el nivel eléctrico por ti, y tu driver jamás menciona voltajes. El conocimiento de la polaridad vive donde debe —en la descripción de la placa—, no diseminado por la lógica del driver.
+
+```dts
+/* fragmento del device tree que describe la conexion fisica */
+status-led {
+        compatible = "myvendor,status-led";
+        status-gpios = <&gpio1 7 GPIO_ACTIVE_LOW>;   /* linea 7 del gpio1, activa a 0 V */
+};
+```
+
+Cuando de verdad necesites el nivel eléctrico crudo —depurar hardware, hablar con un protocolo por bit-banging— existen las variantes explícitas `gpiod_set_raw_value` y `gpiod_get_raw_value`, que saltan la inversión. Que sean casos raros y con nombre feo es intencional: lo normal es pensar en términos lógicos.
+
+<Callout type="warn" title="cansleep: no todo GPIO es instantáneo">
+Un pin del SoC se conmuta con una escritura a un registro y no bloquea. Pero un expansor colgado de I2C exige una transacción de bus que **puede dormir**. Por eso `gpiod_set_value` avisa con un WARN si lo llamas sobre una línea que puede dormir; en contexto de proceso usa las variantes `gpiod_set_value_cansleep` y `gpiod_get_value_cansleep`. La regla espeja la del resto del kernel: si algo puede dormir, no lo toques desde contexto atómico.
+</Callout>
+
+<Callout type="dios" title="El número de pin no es asunto del driver">
+Detente en la inversión que acabas de cruzar, porque es el patrón que gobierna todo el modelo de dispositivos moderno. El driver dejó de decir *qué* pin y *a qué* voltaje, y pasó a decir solo *qué función* quiere: "dame la línea de estado y actívala". El número físico, la polaridad, el controlador concreto y hasta si el chip duerme son datos de la *placa*, no del *driver*, y viven en el firmware que describe el hardware. El descriptor es la materialización de esa frontera: un asa opaca que representa una capacidad ya resuelta. Este no es un truco de GPIO, es la misma forma con que el kernel entrega relojes con `clk_get`, reguladores con `regulator_get`, resets con `reset_control_get` y canales de DMA. La vieja API numérica tuvo que morir no porque fuera fea, sino porque violaba esta separación: incrustaba conocimiento de la placa dentro de la lógica del driver, lo hacía imposible de reutilizar entre máquinas y era ciega a la polaridad y a la propiedad del recurso. Cuando interiorizas que un driver bien escrito *expresa intención y recibe capacidades resueltas*, dejas de ver GPIO, clocks y regulators como APIs sueltas y empiezas a ver una única arquitectura: el hardware se describe una vez, en el firmware, y los drivers lo consumen sin saber en qué placa corren.
+</Callout>
+
+<Reto title="De número a descriptor">
+1. Localiza en `drivers/leds/leds-gpio.c` la llamada a `devm_gpiod_get` (o `gpiod_get_index`) y sigue de dónde saca el nombre de la función.
+2. Explica, sobre el ejemplo del LED, qué pasaría si la línea fuera `GPIO_ACTIVE_LOW` y usaras `gpiod_set_raw_value(desc, 1)` en vez de `gpiod_set_value`.
+3. Enumera los cuatro pecados de la API numérica y empareja cada uno con la pieza de la API de descriptores que lo corrige.
+4. Justifica por qué `devm_gpiod_get` hace innecesario un `gpiod_put` explícito y qué fuga evita en los caminos de error del `probe`.
+</Reto>

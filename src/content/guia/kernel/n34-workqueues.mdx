@@ -1,0 +1,142 @@
+---
+title: "Workqueues: diferir a contexto de proceso"
+description: "Cómo diferir trabajo a un kworker que puede dormir con INIT_WORK, schedule_work y queue_work, cómo el planificador de concurrencia CMWQ escala los hilos sin que un trabajo dormido atasque la cola, cuándo crear una cola dedicada con alloc_workqueue y sus banderas WQ_UNBOUND y WQ_MEM_RECLAIM, y el criterio definitivo para elegir entre workqueue, threaded IRQ y softirq."
+subject: kernel
+level: 34
+order: 5
+icon: "34.5"
+duracion: "17 min"
+---
+
+<Lead>
+Al final del camino que empezó en la costura atómica de la interrupción está la libertad total: un contexto de proceso corriente, con planificador, que puede dormir cuanto quiera, esperar por un bus, tomar mutex, asignar memoria con `GFP_KERNEL` y bloquearse sin dañar a nadie. Ese es el reino de las workqueues. No están atadas a ninguna interrupción concreta, admiten retardo y prioridad propia, y son la herramienta cuando el trabajo diferido ya no va uno a uno con un disparo de hardware. Cierran el nivel porque son el punto más alejado de la costura, y el que exige elegir con más criterio.
+</Lead>
+
+<Objetivos>
+
+- Diferir trabajo a contexto de proceso con `INIT_WORK`, `schedule_work` y `queue_work`.
+- Entender el pool de kworkers y el planificador de concurrencia CMWQ.
+- Crear una cola dedicada con `alloc_workqueue` y sus banderas clave.
+- Elegir con criterio entre workqueue, threaded IRQ y softirq.
+
+</Objetivos>
+
+## work_struct: una función que correrá en un kworker
+
+Una `work_struct` asocia una función a un trabajo diferido. La atas con `INIT_WORK`, la encolas con `schedule_work`, y un hilo del kernel llamado *kworker* la ejecuta más tarde en contexto de proceso, donde **sí puede dormir**.
+
+```c
+struct mi_dispositivo {
+	struct work_struct trabajo;
+	struct regmap     *regmap;
+	struct mutex       lock;
+};
+
+static void mi_trabajo(struct work_struct *w)
+{
+	struct mi_dispositivo *dev = container_of(w, struct mi_dispositivo, trabajo);
+
+	mutex_lock(&dev->lock);                  /* permitido: contexto de proceso */
+	regmap_write(dev->regmap, REG_CFG, VAL); /* puede dormir por I2C o SPI */
+	mutex_unlock(&dev->lock);
+}
+
+/* en probe: */   INIT_WORK(&dev->trabajo, mi_trabajo);
+
+/* desde la mitad superior de la IRQ: */
+static irqreturn_t mi_handler(int irq, void *dev_id)
+{
+	struct mi_dispositivo *dev = dev_id;
+
+	schedule_work(&dev->trabajo);   /* difiere a un kworker y sale al instante */
+	return IRQ_HANDLED;
+}
+```
+
+`schedule_work` encola en `system_wq`, la cola compartida por defecto. Para trabajo con retardo existe `struct delayed_work` con `schedule_delayed_work`, que espera un número de jiffies antes de correr y puede reencolarse a sí misma para formar un temporizador que sí puede dormir:
+
+```c
+/* delayed_work reintento; como campo de struct mi_dispositivo */
+static void reintentar(struct work_struct *w)
+{
+	struct mi_dispositivo *dev = container_of(to_delayed_work(w),
+						  struct mi_dispositivo, reintento);
+
+	if (reconfig_hw(dev))            /* puede dormir por I2C o SPI */
+		schedule_delayed_work(&dev->reintento, msecs_to_jiffies(500));
+}
+
+/* en probe: */   INIT_DELAYED_WORK(&dev->reintento, reintentar);
+/* al fallar:  */ schedule_delayed_work(&dev->reintento, msecs_to_jiffies(500));
+```
+
+Y hay una obligación de higiene ineludible: en la descarga del driver debes llamar a `cancel_work_sync` (o `cancel_delayed_work_sync`, o `flush_work`) antes de liberar la estructura, porque el trabajo encolado guarda un puntero a tus datos y correr sobre memoria ya liberada es un *use-after-free*.
+
+## kworkers y el CMWQ: concurrencia gestionada
+
+Detrás de `schedule_work` vive el **Concurrency Managed Workqueue** (CMWQ). Los trabajos no tienen un hilo cada uno: corren sobre un pool compartido de kworkers por CPU, y el núcleo ajusta la concurrencia de forma dinámica. La propiedad decisiva es esta: **si un trabajo se duerme, el pool arranca otro kworker** para que la cola siga avanzando, de modo que un trabajo bloqueado no atasca a los demás. Cuando el trabajo despierta y termina, el excedente de kworkers se retira.
+
+```bash
+ps -eo pid,comm | grep kworker    # kworker/0:1, kworker/u16:2 (unbound)...
+```
+
+Una garantía que conviene fijar: una misma `work_struct` nunca corre en dos CPUs a la vez —no se solapa consigo misma—, pero dos trabajos distintos de la misma cola sí pueden correr en paralelo. Si necesitas orden estricto o serialización entre varios trabajos, no lo asumas: pídelo con una cola ordenada. Además de `system_wq`, el kernel ofrece `system_highpri_wq`, `system_long_wq` y `system_unbound_wq` para perfiles distintos de latencia y duración.
+
+## Colas dedicadas: alloc_workqueue y sus banderas
+
+Cuando la cola compartida no basta —porque tu trabajo es largo, sensible a la latencia, o corre en una ruta de reclaim de memoria— creas la tuya con `alloc_workqueue`.
+
+```c
+dev->wq = alloc_workqueue("mi-dev", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+if (!dev->wq)
+	return -ENOMEM;
+
+queue_work(dev->wq, &dev->trabajo);   /* encola en TU cola, no en la del sistema */
+```
+
+Las banderas cambian la naturaleza de la cola. `WQ_UNBOUND` la desliga de una CPU concreta: el planificador coloca sus kworkers donde quiera, lo ideal para trabajo largo o intensivo en CPU que no debe fijar un núcleo. `WQ_MEM_RECLAIM` reserva un hilo de rescate para que la cola avance incluso bajo presión de memoria; es **obligatorio, no una optimización**, si la cola participa en un camino que libera memoria (escritura diferida, capa de bloque), porque sin él un `kmalloc` que espera reclaim podría depender de un trabajo que a su vez espera memoria: un abrazo mortal. `WQ_HIGHPRI` y `WQ_FREEZABLE` afinan prioridad y comportamiento ante la suspensión, y `alloc_ordered_workqueue` da una cola FIFO estricta de uno en uno.
+
+## Elegir: workqueue, threaded IRQ o softirq
+
+Este es el vértice del nivel. Las tres opciones vivas —el tasklet queda descartado por obsoleto— se ordenan con dos preguntas: **¿necesita dormir?** y **¿va uno a uno con una interrupción?**
+
+<Cards>
+  <Card icon="⚡" title="softirq">
+    Solo para los caminos ultracalientes que ya son dueños de un vector: red y bloque. Atómico, no duerme, latencia mínima. Un driver normal no lo usa.
+  </Card>
+  <Card icon="🧵" title="threaded IRQ">
+    Necesita dormir y va atado uno a uno a una interrupción. Traspaso integrado con `IRQ_WAKE_THREAD`, enmascarado `ONESHOT` y prioridad RT. El defecto para mitades inferiores.
+  </Card>
+  <Card icon="🗓️" title="workqueue">
+    Necesita dormir pero está desacoplada de la IRQ: es periódica, admite retardo, la disparan varios sitios o exige cola con garantías de reclaim y orden propias.
+  </Card>
+</Cards>
+
+La regla práctica se dice en una frase. Si no necesita dormir y es un camino calentísimo de un subsistema del núcleo, softirq. Si necesita dormir y es exactamente "atiende esta interrupción con derecho a dormir", threaded IRQ. Si necesita dormir pero se dispara desde muchos sitios, con retardo, o pide su propia cola con `WQ_MEM_RECLAIM` u orden estricto, workqueue. Un patrón frecuente combina las dos últimas: un threaded IRQ atiende lo inmediato y, para una subtarea aún más lenta o que debe agruparse, encola un trabajo en una workqueue dedicada, empujándolo un peldaño más lejos de la costura.
+
+<Mermaid code={`flowchart TD
+  A[El trabajo diferido necesita dormir] -->|No| B[Camino ultracaliente de red o bloque]
+  B --> C[softirq del subsistema]
+  A -->|Si| D[Esta atado uno a uno a una interrupcion]
+  D -->|Si| E[Threaded IRQ con request_threaded_irq]
+  D -->|No| F[Periodico, con retardo o desde varios sitios]
+  F --> G[Workqueue con queue_work]
+  style C fill:#89b4fa,color:#11111b
+  style E fill:#a6e3a1,color:#11111b
+  style G fill:#f9e2af,color:#11111b`} />
+
+<Callout type="tip" title="Cancela siempre antes de liberar">
+Un trabajo encolado sobrevive a la estructura que lo referencia si no lo detienes. En la ruta de descarga, `cancel_work_sync(&dev->trabajo)` espera a que termine o lo cancela antes de que corra, y `destroy_workqueue(dev->wq)` vacía y libera tu cola dedicada. Omitirlo es un *use-after-free* clásico que el `KASAN` del nivel 19 detecta al instante.
+</Callout>
+
+<Callout type="dios" title="El nivel entero es una escalera de contextos, y aquí está el último peldaño">
+Recorre mentalmente los cinco niveles como una sola escalera y verás que no eran cinco temas sino cinco alturas de una misma ascensión. En el escalón más bajo estaba la mitad superior: contexto de interrupción dura, sin proceso, sin planificador, sin derecho a dormir, la costura atómica pura. Cada peldaño siguiente compró de vuelta una libertad perdida a cambio de un poco de latencia. El softirq reabrió las interrupciones de hardware pero siguió siendo atómico. El threaded IRQ recuperó el proceso y el derecho a dormir, y con ellos la prioridad planificable. La workqueue llega a la cima: contexto de proceso pleno, desacoplado incluso de la interrupción que lo originó, con retardo, con colas dedicadas, con garantías de reclaim, indistinguible de cualquier hilo del kernel. Lo que estás eligiendo cada vez que decides entre softirq, threaded IRQ y workqueue no es una API sino una **altura en esa escalera**: cuánta libertad necesita tu trabajo y cuánta latencia estás dispuesto a pagar por ella. Y la geometría de la escalera explica el criterio: bajas todo lo que puedas hacia lo atómico solo cuando el rendimiento bruto lo exige, porque abajo se es rápido pero se es esclavo; subes hacia el contexto de proceso en cuanto necesitas dormir, porque arriba se es libre pero se paga el cambio de contexto. Dominar las interrupciones no es memorizar `request_irq`, `napi_schedule` o `queue_work`: es haber interiorizado que todos son la misma pregunta —¿a qué altura de la escalera de contextos debe vivir este trabajo?— y saber leer, en la física de cada dispositivo, la respuesta. Cuando esa pregunta se te vuelva automática ante cualquier driver, habrás dejado de aprender interrupciones para empezar a pensarlas.
+</Callout>
+
+<Reto title="Sitúa cada trabajo en su peldaño">
+1. Escribe un driver que en la mitad superior encole una `work_struct` con `schedule_work`, y en el trabajo tome un mutex y llame a una función que duerme.
+2. Convierte la cola por defecto en una dedicada con `alloc_workqueue` y `WQ_UNBOUND | WQ_MEM_RECLAIM`; justifica cada bandera.
+3. Añade la cancelación correcta en la descarga y explica el *use-after-free* que evitas.
+4. Para tres escenarios —recepción de red masiva, lectura de un sensor I2C por interrupción, y un reintento periódico cada segundo— elige softirq, threaded IRQ o workqueue y defiende cada elección.
+5. Diseña el patrón combinado: un threaded IRQ que difiere una subtarea lenta a una workqueue dedicada, y razona qué gana frente a hacerlo todo en el `thread_fn`.
+</Reto>

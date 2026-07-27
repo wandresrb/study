@@ -1,0 +1,133 @@
+---
+title: "Los flags GFP a fondo: dormir o no dormir"
+description: "La máscara gfp_t que acompaña a cada reserva es a la vez un deseo y un permiso. GFP_KERNEL puede dormir y espera memoria; GFP_ATOMIC no duerme y tira de reservas de emergencia; GFP_NOWAIT ni una cosa ni la otra. Y los modificadores como __GFP_ZERO y __GFP_NOFAIL."
+subject: kernel
+level: 20
+order: 4
+icon: "20.4"
+duracion: "16 min"
+---
+
+<Lead>
+Cada llamada al asignador lleva un segundo argumento tan importante como el tamaño: la máscara `gfp_t`. No es una opción decorativa; codifica en qué contexto se ejecuta tu código y cuánto esfuerzo autoriza al kernel para conseguir la memoria. Confundir `GFP_KERNEL` con `GFP_ATOMIC` no es un matiz de estilo: es la frontera entre un sistema estable y un "sleeping while atomic" que cuelga la máquina.
+</Lead>
+
+<Objetivos>
+
+- Descomponer `GFP_KERNEL`, `GFP_ATOMIC` y `GFP_NOWAIT` en sus bits.
+- Saber cuál usar según el contexto (proceso, IRQ, spinlock tomado).
+- Entender por qué `GFP_KERNEL` puede dormir y por qué eso es a veces prohibido.
+- Aplicar los modificadores `__GFP_ZERO`, `__GFP_NOFAIL` y `__GFP_HIGH`.
+
+</Objetivos>
+
+## Anatomía de una máscara
+
+```c
+/* include/linux/gfp_types.h (extracto) */
+#define __GFP_RECLAIM	(__GFP_DIRECT_RECLAIM | __GFP_KSWAPD_RECLAIM)
+
+#define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
+#define GFP_ATOMIC	(__GFP_HIGH | __GFP_KSWAPD_RECLAIM)
+#define GFP_NOWAIT	(__GFP_KSWAPD_RECLAIM | __GFP_NOWARN)
+#define GFP_NOIO	(__GFP_RECLAIM)
+#define GFP_NOFS	(__GFP_RECLAIM | __GFP_IO)
+```
+
+Una máscara `gfp_t` no es un número mágico: es la suma de banderas ortogonales, y el vocabulario se reduce a unas pocas:
+
+- `__GFP_DIRECT_RECLAIM` — el que llama **puede bloquearse** y ponerse él mismo a reclamar memoria. Es el bit que autoriza a dormir.
+- `__GFP_KSWAPD_RECLAIM` — despierta al hilo `kswapd` para que reclame en segundo plano, sin bloquear a nadie.
+- `__GFP_IO` y `__GFP_FS` — permiten que el reclaim arranque E/S y entre en el sistema de ficheros. Se apagan (`GFP_NOIO`, `GFP_NOFS`) justo en las rutas de E/S y de FS, para no reentrar y colgarse.
+- `__GFP_HIGH` — autoriza a morder las **reservas de emergencia** por debajo de las marcas de agua bajas, para asignaciones urgentes que no pueden esperar.
+
+Con ese alfabeto, las tres máscaras canónicas se leen solas: `GFP_KERNEL` lleva `__GFP_DIRECT_RECLAIM`, luego **puede dormir**; `GFP_ATOMIC` no lo lleva —no duerme— pero añade `__GFP_HIGH` para tirar de reservas; `GFP_NOWAIT` no lleva ni lo uno ni lo otro: ni duerme ni toca reservas, solo cosquillea a `kswapd` y se rinde pronto.
+
+<Callout type="note" title="GFP_NOIO y GFP_NOFS: romper la recursión del reclaim">
+`GFP_NOIO` y `GFP_NOFS` existen para un peligro sutil: si estás en mitad de una operación de E/S o del sistema de ficheros y asignas con `GFP_KERNEL`, el reclaim que dispares puede reentrar en esa misma capa —escribir una página sucia que necesita el lock que tú ya retienes— y bloquearse contra sí mismo. Apagando `__GFP_FS` o `__GFP_IO` le prohíbes al reclaim recorrer ese camino. En el kernel moderno se prefiere marcar un **ámbito** con `memalloc_nofs_save()` o `memalloc_noio_save()`, que aplica la restricción a todas las asignaciones de la sección sin cablear la máscara en cada llamada.
+</Callout>
+
+## Dormir o no dormir: el contexto decide
+
+<Cards>
+  <Card icon="🛌" title="GFP_KERNEL">
+    Puede dormir: si no hay memoria, el que llama entra en reclaim directo y se bloquea hasta lograrla. Solo en contexto de proceso. La opción por defecto.
+  </Card>
+  <Card icon="⚡" title="GFP_ATOMIC">
+    No duerme. Tira de reservas de emergencia (`__GFP_HIGH`) para subir la probabilidad de éxito, pero puede devolver `NULL`. Para IRQ, softirq o con un spinlock tomado.
+  </Card>
+  <Card icon="🚪" title="GFP_NOWAIT">
+    Ni duerme ni usa reservas. La de mayor tasa de fallo. Cuando no puedes bloquear y tampoco quieres agotar las reservas críticas del sistema.
+  </Card>
+</Cards>
+
+La regla es tajante: en contexto de interrupción, en un softirq o con un `spinlock` tomado, **no puedes dormir**, así que jamás uses `GFP_KERNEL` ahí. Dormir en esos contextos no ralentiza: cuelga la CPU o corrompe el planificador. El kernel lo vigila —con `CONFIG_DEBUG_ATOMIC_SLEEP` verás el clásico "BUG: sleeping function called from invalid context"— porque la ruta de reclaim de `GFP_KERNEL` invoca `might_sleep()`.
+
+```c
+static irqreturn_t dev_isr(int irq, void *data)
+{
+	/* contexto de interrupcion: dormir aqui cuelga la CPU */
+	struct evento *ev = kmalloc(sizeof(*ev), GFP_ATOMIC);
+	if (!ev)
+		return IRQ_NONE;    /* fallar es preferible a dormir en IRQ */
+	/* ... */
+	return IRQ_HANDLED;
+}
+```
+
+Cuando una función auxiliar recibe la máscara por parámetro, puede preguntar si tiene permiso para bloquear antes de intentar algo costoso:
+
+```c
+gfp_t gfp = puede_bloquear ? GFP_KERNEL : GFP_ATOMIC;
+
+if (gfpflags_allow_blocking(gfp))
+	might_sleep();      /* documenta y verifica el contrato en runtime */
+```
+
+<Mermaid code={`flowchart TD
+  C[En que contexto asigno] -->|proceso puedo bloquear| K[GFP_KERNEL]
+  C -->|IRQ softirq o spinlock| U[No puedo dormir]
+  U -->|urgente uso reservas| AT[GFP_ATOMIC]
+  U -->|benigno sin reservas| NW[GFP_NOWAIT]`} />
+
+## Modificadores: afinar el deseo
+
+Sobre las máscaras base se suman modificadores `__GFP_*` que ajustan el comportamiento sin cambiar el contexto. Los que más verás:
+
+- `__GFP_ZERO` — devuelve la memoria puesta a cero. Obligatorio si la vas a exponer a usuario.
+- `__GFP_NOWARN` — silencia el aviso por fallo de asignación; para intentos oportunistas con plan B.
+- `__GFP_NORETRY` — intenta con poco esfuerzo y se rinde pronto en vez de forzar reclaim pesado u OOM.
+- `__GFP_RETRY_MAYFAIL` — se esfuerza a fondo (reclaim, compactación) pero aún puede fallar sin invocar al OOM killer.
+- `__GFP_NOFAIL` — el asignador reintenta en bucle hasta lograrlo; nunca devuelve `NULL`. Solo para órdenes pequeños.
+- `__GFP_HIGH` — acceso a las reservas de emergencia, como en `GFP_ATOMIC`.
+- `__GFP_COMP` — reserva el bloque como página compuesta, tratable como un objeto único.
+- `__GFP_ACCOUNT` — imputa la memoria al cgroup de memoria del proceso.
+
+```c
+/* pagina puesta a cero, lista para exponer a usuario */
+struct page *z = alloc_pages(GFP_KERNEL | __GFP_ZERO, 0);
+
+/* intento oportunista: si no hay bloque grande, seguimos sin ruido */
+struct page *big = alloc_pages(GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN, 4);
+if (!big)
+	big = plan_b_por_paginas_sueltas();
+
+/* reserva que el codigo no sabe manejar fallando: el asignador insiste */
+void *ancla = kmalloc(sizeof(struct raiz), GFP_KERNEL | __GFP_NOFAIL);
+```
+
+<Callout type="warn" title="__GFP_NOFAIL no es una varita mágica">
+`__GFP_NOFAIL` no invoca memoria de la nada: obliga al asignador a **reintentar en bucle** en vez de devolver `NULL`. Si lo usas en un contexto que no puede bloquear, o para un orden grande que el buddy no puede servir, ese bucle se convierte en un cuelgue. El kernel solo lo admite para asignaciones pequeñas (orden 0 o 1) y prohíbe combinarlo con `__GFP_NORETRY`. Úsalo únicamente cuando de verdad no exista un camino de error razonable; casi siempre, la respuesta correcta es escribir ese camino de error.
+</Callout>
+
+<Callout type="dios" title="La máscara gfp es un contrato firmado con el kernel">
+Aquí está la idea que eleva todo lo anterior de trivia a arquitectura. La máscara `gfp_t` es el mecanismo por el que una función hoja, tres llamadas por debajo de la que empezó, sabe si tiene permiso para dormir. No hay una variable global que diga "estamos en una interrupción"; sería frágil e incorrecta con la preempción. En su lugar, el kernel **enhebra el contexto como dato**: quien está en contexto atómico pasa `GFP_ATOMIC` hacia abajo, y esa máscara viaja por la pila de llamadas hasta el asignador, que la lee y decide si puede bloquear. Por eso miles de funciones del kernel llevan un `gfp_t` en su firma y lo propagan sin tocarlo: no es burocracia, es la forma de mantener respondible, a cualquier profundidad, la pregunta más importante de la programación de sistemas —¿puedo dormir aquí?—. La disciplina que se deriva es clara y define al buen código de kernel: una función que podría asignar memoria recibe la máscara por parámetro y la pasa hacia abajo; nunca cablea `GFP_KERNEL`, porque no sabe desde qué contexto la llamarán. Cuando interiorices esto, dejarás de ver los flags GFP como una lista que memorizar y empezarás a verlos como lo que son: el sistema de tipos con el que Linux razona sobre el contexto de ejecución.
+</Callout>
+
+<Reto title="Siente el contexto en la máscara">
+1. Escribe una función que reserve con una `gfp_t` recibida por parámetro y llámala desde contexto de proceso con `GFP_KERNEL` y desde un tasklet con `GFP_ATOMIC`.
+2. Con `CONFIG_DEBUG_ATOMIC_SLEEP`, provoca a propósito una reserva `GFP_KERNEL` con un `spinlock` tomado y captura el "BUG: sleeping function called from invalid context".
+3. Reserva con `__GFP_ZERO` y verifica el cero; quítalo y observa la basura.
+4. Compara la tasa de éxito de `GFP_ATOMIC` frente a `GFP_NOWAIT` bajo presión de memoria, con un proceso que devore RAM en paralelo.
+5. Razona por qué un driver de red usa `GFP_ATOMIC` en su ruta de recepción por interrupción.
+</Reto>

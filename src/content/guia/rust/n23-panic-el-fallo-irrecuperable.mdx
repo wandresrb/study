@@ -1,0 +1,124 @@
+---
+title: "panic!: el fallo irrecuperable y su maquinaria"
+description: "panic! no es la contraparte de las excepciones: es una parada controlada reservada a los bugs y las invariantes rotas. Qué hace por dentro (desenrollado frente a aborto), qué destructores ejecuta, cómo se atrapa en un límite de hilo con catch_unwind, y por qué nunca debe usarse para errores esperables."
+subject: rust
+level: 23
+order: 1
+icon: "23.1"
+duracion: "18 min"
+---
+
+<Lead>
+Rust parte los fallos en dos mundos irreconciliables. Uno es el de los errores *esperables* —el fichero que no está, la red que se cae— y se modela con `Result`, un valor que viaja por la firma. El otro es el de los fallos *que no deberían poder ocurrir jamás*: un índice fuera de rango, una invariante que tu propia lógica juró mantener y rompió. Para ese segundo mundo existe `panic!`. No es un `throw` disfrazado ni un mecanismo de control de flujo: es la declaración de que el programa ha alcanzado un estado imposible y que continuar sería peor que detenerse. Entender su maquinaria —qué desenrolla, qué destruye, qué se puede atrapar y qué no— es entender la frontera exacta entre un bug y una condición.
+</Lead>
+
+<Objetivos>
+
+- Distinguir el fallo irrecuperable (un bug) del error recuperable (una condición del mundo).
+- Comprender las dos estrategias de `panic!`: desenrollado (`unwind`) y aborto (`abort`).
+- Conocer la maquinaria: destructores, `catch_unwind`, hooks, `#[track_caller]` y `#[panic_handler]`.
+- Razonar por qué `panic!` nunca es la herramienta para errores que quien te llama podría manejar.
+
+</Objetivos>
+
+## Qué es un panic, y qué no es
+
+Un `panic!` señala un **error de programación**, no una condición del entorno. La regla de las directrices de la API oficial es tajante: usa `Result` cuando el fallo forma parte del contrato razonable de la función, y `panic!` cuando el fallo significa que una precondición se ha violado y no hay contrato que respetar. `panic!`, `assert!`, indexar un `Vec` fuera de rango, un desbordamiento aritmético en `debug`, o un `unwrap` sobre `None`: todos convergen en el mismo mecanismo.
+
+```rust
+fn media(datos: &[f64]) -> f64 {
+    assert!(!datos.is_empty(), "media de un slice vacio: invariante rota");
+    datos.iter().sum::<f64>() / datos.len() as f64
+}
+```
+
+El `assert!` no valida entrada del usuario; valida una **invariante interna** que el resto del código promete mantener. Si se dispara, no hay recuperación sensata: el programa ya está en un estado que su autor consideró imposible. Compáralo con parsear un número que teclea el usuario, que es un `Result`, porque teclear basura es un evento perfectamente normal.
+
+<Cards>
+  <Card icon="🐛" title="Bugs">
+    Un estado que tu lógica garantizaba y no cumplió: índice negativo calculado, un `match` que creías exhaustivo. `panic!` lo hace visible de inmediato en vez de propagar corrupción.
+  </Card>
+  <Card icon="⛓️" title="Invariantes rotas">
+    Precondiciones que documentaste con `assert!` o `debug_assert!`. Si se violan, seguir ejecutando produciría resultados sin sentido o inseguros a nivel lógico.
+  </Card>
+  <Card icon="🧪" title="Prototipos y esqueletos">
+    `todo!`, `unimplemented!` y `unwrap` rápidos mientras exploras. Marcan "aún no" de forma ruidosa, no silenciosa.
+  </Card>
+  <Card icon="⚠️" title="Nunca: errores esperables">
+    Fichero ausente, entrada mal formada, timeout de red. Eso es `Result`. Convertirlo en `panic!` roba a quien te llama la posibilidad de reaccionar.
+  </Card>
+</Cards>
+
+## Desenrollado frente a aborto: las dos estrategias
+
+Cuando un `panic!` ocurre, Rust puede reaccionar de dos maneras, y la elección es del perfil de compilación, no del código.
+
+Con **desenrollado** (`unwind`, el modo por defecto en `std`), el hilo que entró en pánico recorre su pila hacia arriba **ejecutando todos los destructores** (`Drop`) de los valores vivos en cada marco, liberando recursos con orden, hasta llegar a la raíz del hilo. Si es el hilo principal, el proceso termina; si es un hilo secundario, solo muere ese hilo y el resto del programa sigue. Ese recorrido ordenado tiene un coste: el compilador debe emitir *tablas de desenrollado* (las secciones tipo `.eh_frame`) y puntos de aterrizaje que engordan el binario y atan levemente las manos al optimizador.
+
+Con **aborto** (`abort`), no hay recorrido: el proceso muere en el acto con una señal (`SIGABRT`), **sin ejecutar un solo destructor**. Se activa así:
+
+```toml
+# Cargo.toml
+[profile.release]
+panic = "abort"
+```
+
+El aborto produce binarios más pequeños y sin tablas de desenrollado, razón por la que es el modo natural en embebido, `no_std`, núcleos y contextos donde el desenrollado es un lujo inaceptable. El precio es que pierdes la limpieza ordenada y la capacidad de atrapar el pánico.
+
+<Callout type="warn" title="Un pánico durante el desenrollado aborta siempre">
+Si un destructor (`Drop`) entra en pánico *mientras* la pila ya se está desenrollando por un pánico anterior, Rust no puede seguir: se encuentra con dos fallos simultáneos y no hay forma coherente de continuar. La respuesta es un **doble pánico** que aborta el proceso incondicionalmente, ignorando el modo `unwind`. Moraleja de diseño: un `Drop` jamás debería entrar en pánico.
+</Callout>
+
+Hay una frontera más, crítica desde Rust 1.81: si el desenrollado alcanza un límite `extern "C"`, el proceso **aborta**, porque desenrollar a través de una ABI que no lo contempla sería comportamiento indefinido. Para permitir el desenrollado a través de la frontera —interoperar con C++ que sí desenrolla— existe la ABI explícita `extern "C-unwind"`.
+
+<Mermaid code={`flowchart TD
+  P[panic invocado] --> U[Estrategia unwind]
+  P --> A[Estrategia abort]
+  U --> D[Ejecuta destructores subiendo por la pila]
+  D --> C[catch_unwind puede atrapar en un limite de hilo]
+  A --> K[Aborta de inmediato sin destructores]
+  K --> S[Binario menor sin tablas de desenrollado]
+  style P fill:#f38ba8,color:#11111b
+  style U fill:#89b4fa,color:#11111b
+  style A fill:#cba6f7,color:#11111b
+  style C fill:#a6e3a1,color:#11111b`} />
+
+## La maquinaria: hooks, catch_unwind y track_caller
+
+Antes de desenrollar, Rust invoca el **hook de pánico**. El por defecto imprime en `stderr` el mensaje, la ubicación del `panic!` y —si `RUST_BACKTRACE=1`— la traza de pila. Puedes reemplazarlo con `std::panic::set_hook`, cuyo cierre recibe un `&PanicHookInfo` (nombre que en `std` sustituyó al antiguo `PanicInfo` a partir de Rust 1.81, para separarlo del `core::panic::PanicInfo` que usa `#[panic_handler]`).
+
+```rust
+std::panic::set_hook(Box::new(|info| {
+    eprintln!("fallo fatal registrado: {info}");
+}));
+```
+
+Sobre el desenrollado se construye `catch_unwind`, que ejecuta un cierre y atrapa un pánico convirtiéndolo en un `Result`:
+
+```rust
+use std::panic;
+
+let resultado = panic::catch_unwind(|| {
+    procesar_peticion()   // si entra en panico, no derriba el proceso
+});
+match resultado {
+    Ok(v) => v,
+    Err(_causa) => registrar_y_seguir(),   // el hilo sobrevive
+}
+```
+
+No es un `try/catch`: su propósito legítimo es aislar fallos en fronteras —un servidor que no quiere que un pánico en una petición tumbe a las demás, o exponer una API a C sin dejar escapar el desenrollado—. Exige que lo capturado sea `UnwindSafe` (o que lo afirmes con `AssertUnwindSafe`), una salvaguarda contra observar estados a medio romper. Y bajo `panic = "abort"` no atrapa nada, porque no hay desenrollado que interceptar. Para relanzar el pánico intacto, `panic::resume_unwind`.
+
+Un último detalle de ergonomía: `#[track_caller]`. Funciones como `unwrap` lo llevan para que, al entrar en pánico, la ubicación reportada sea la de **quien las llamó**, no la de la línea interna de la biblioteca. `std::panic::Location::caller()` expone esa información. En `no_std`, por último, no hay hook por defecto: tú provees el comportamiento con una función `#[panic_handler]` que recibe `&PanicInfo` y no retorna nunca (`-> !`).
+
+<Callout type="dios" title="panic! es una afirmación sobre la corrección, no una herramienta de control de flujo">
+La tentación, viniendo de otros lenguajes, es leer `panic!` como el `throw` de Rust y `catch_unwind` como su `catch`. Es un error conceptual que envenena el diseño. Una excepción es un canal de control de flujo: la lanzas *esperando* que alguien la capture y decida. Un `panic!` es lo contrario: es la afirmación de que has alcanzado un estado que declaraste imposible, y por tanto **no hay decisión sensata que tomar salvo detenerse**. Por eso `catch_unwind` no es para lógica de negocio, sino para fronteras de aislamiento donde un fallo local no debe volverse global: un hilo trabajador, una petición HTTP, una llamada desde C. La distinción se refleja en toda la maquinaria. El desenrollado ejecuta destructores no para "manejar el error", sino para no dejar recursos a medias mientras el programa se apaga con dignidad; el aborto renuncia incluso a eso cuando la limpieza es un lujo. Que un doble pánico aborte siempre, que cruzar `extern "C"` aborte, que `Result` sea `#[must_use]` y `panic!` no necesite serlo: todo apunta a la misma filosofía. Los errores esperables son valores que el compilador te obliga a mirar; los bugs son fallos que el runtime te obliga a no ignorar, deteniendo el mundo antes de que el estado corrupto se propague. Confundir los dos —usar `panic!` para un fichero ausente, o `Result` para una invariante rota— es traicionar la línea sobre la que descansa toda la fiabilidad de Rust. La primera pregunta ante cualquier fallo no es "¿cómo lo manejo?", sino "¿es esto una condición del mundo o un bug en mi código?". La respuesta elige la herramienta, y elegir mal no es un detalle de estilo: es diseñar mal.
+</Callout>
+
+<Reto title="Traza la frontera del pánico">
+1. Escribe `fn tercero(v: &[i32]) -> i32` con un `assert!` que documente la precondición de longitud, y provoca el pánico con un slice corto; observa el mensaje y la ubicación.
+2. Añade `panic = "abort"` a un perfil y compara: ¿se ejecuta un destructor con `Drop` que imprima algo? Explica por qué desaparece.
+3. Envuelve una llamada que entra en pánico con `catch_unwind` y demuestra que el hilo sobrevive; luego relánzalo con `resume_unwind`.
+4. Instala un hook con `set_hook` que registre el pánico con un prefijo propio; verifica que se dispara antes del desenrollado.
+5. Para cada caso decide `panic!` o `Result` y justifícalo: desbordamiento de un contador que tu lógica juró acotado; un JSON de entrada mal formado; un `Drop` que detecta doble liberación lógica.
+</Reto>

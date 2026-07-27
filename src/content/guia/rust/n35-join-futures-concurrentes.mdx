@@ -1,0 +1,160 @@
+---
+title: "join! y try_join!: avanzar varios futures a la vez"
+description: "Dos esperas independientes encadenadas con .await suman sus latencias sin motivo. La macro join! avanza varios futures solapados en una sola tarea y devuelve la tupla de todos sus resultados; try_join! hace lo mismo pero cortocircuita al primer Err. Y una distincion que decide el rendimiento: esto es concurrencia sin paralelismo."
+subject: rust
+level: 35
+order: 1
+icon: "35.1"
+duracion: "17 min"
+---
+
+<Lead>
+En el nivel anterior aprendiste que los `.await` son secuenciales por defecto: `let a = f().await; let b = g().await;` no arranca `g` hasta que `f` terminó. Cuando `f` y `g` dependen una de otra, eso es correcto. Cuando son **independientes** —dos consultas a servicios distintos, dos lecturas de dos ficheros— encadenarlas es regalar latencia: pagas la suma de dos esperas donde podrías pagar solo la mayor. La macro `join!` corrige exactamente esto. Toma varios futures, los avanza *solapados* dentro de una misma tarea y no vuelve hasta que **todos** terminan, devolviendo sus resultados en una tupla. Su prima `try_join!` añade una regla de fallo rápido. Y ambas encierran la lección conceptual del nivel: solapar esperas es concurrencia, y la concurrencia no es lo mismo que el paralelismo.
+</Lead>
+
+<Objetivos>
+
+- Solapar esperas independientes con `join!` en lugar de sumarlas con `.await` secuencial.
+- Leer la tupla de resultados que devuelve `join!` y entender que espera a que *todos* terminen.
+- Usar `try_join!` para cortocircuitar en cuanto un future devuelve `Err`.
+- Distinguir la concurrencia de `join!` del paralelismo de `spawn`, y saber cuándo hace falta cada uno.
+
+</Objetivos>
+
+## El desperdicio del await secuencial
+
+Imagina que la ficha de un producto necesita dos datos que viven en servicios distintos: su precio y su stock. Consultarlos uno tras otro con `.await` los pone en fila:
+
+```rust
+async fn precio(sku: &str) -> u32 { /* 10 ms de red */ 0 }
+async fn stock(sku: &str) -> u32 { /* 10 ms de red */ 0 }
+
+async fn ficha_lenta(sku: &str) -> (u32, u32) {
+    let p = precio(sku).await; // cede 10 ms; nadie mas de ESTA tarea avanza
+    let s = stock(sku).await;  // solo EMPIEZA cuando precio ya volvio
+    (p, s) // coste total: 10 + 10 = 20 ms
+}
+```
+
+El segundo `.await` no tiene ninguna razón para esperar al primero: ni `stock` usa el precio ni comparten recurso. Pero la sintaxis secuencial encadena sus esperas, y la latencia total es la **suma**. Con dos llamadas se nota poco; con cinco servicios detrás de una petición, ese error de forma multiplica la latencia percibida por el usuario.
+
+## join!: avanzar varios futures a la vez
+
+`join!` toma dos o más futures y los conduce **a la vez** en la misma tarea. Cuando uno cede en un `.await`, el otro avanza; la macro no retorna hasta que todos han producido su valor, y entrega una tupla con todos ellos en orden:
+
+```rust
+async fn ficha(sku: &str) -> (u32, u32) {
+    // Ambos futures avanzan solapados. La espera total es el MAXIMO
+    // de las dos latencias, no la suma: ~10 ms en vez de ~20 ms.
+    let (p, s) = tokio::join!(precio(sku), stock(sku));
+    (p, s)
+}
+```
+
+Hay un detalle que la distingue de lanzar tareas: `join!` no exige `Send` ni `'static`. Como todo ocurre dentro de una sola tarea, los futures pueden **tomar prestado** dato local —fíjate en que ambos comparten el préstamo de `sku` sin problema—. Eso la hace la herramienta natural cuando el trabajo concurrente necesita referencias al ámbito que lo lanzó.
+
+```rust
+async fn tablero(cfg: &Config) -> (Metricas, Alertas, Registro) {
+    // Tres esperas independientes en paralelo logico; el tablero
+    // tarda lo que la mas lenta, no lo que las tres sumadas.
+    tokio::join!(cargar_metricas(cfg), cargar_alertas(cfg), cargar_registro(cfg))
+}
+```
+
+<Callout type="warn" title="join! no protege contra un future que no cede">
+`join!` reparte los `.await`, no los núcleos. Si uno de los futures entra en un bucle de CPU largo o hace una llamada bloqueante, no cede el control y los demás quedan **congelados** hasta que termine: siguen sin avanzar aunque su E/S ya esté lista. La regla del nivel sigue en pie: dentro de async, todo debe ceder con frecuencia. Para cómputo pesado, `spawn_blocking`; nunca lo metas crudo dentro de un `join!`.
+</Callout>
+
+## try_join!: cortocircuito al primer error
+
+Cuando los futures devuelven `Result`, `join!` esperaría a todos aunque uno ya hubiera fallado —te daría una tupla de `Result` y tú decidirías después—. A menudo eso no es lo que quieres: si una consulta falla, la ficha entera es inservible y seguir esperando a las otras es desperdicio. `try_join!` implementa esa política de fallo rápido:
+
+```rust
+async fn precio(sku: &str) -> Result<u32, Error> { Ok(0) }
+async fn stock(sku: &str) -> Result<u32, Error> { Ok(0) }
+
+async fn ficha(sku: &str) -> Result<(u32, u32), Error> {
+    // Avanza ambos. Si UNO devuelve Err, try_join! retorna ese Err
+    // de inmediato y deja de conducir el otro (que se dropea, se cancela).
+    let (p, s) = tokio::try_join!(precio(sku), stock(sku))?;
+    Ok((p, s))
+}
+```
+
+La semántica es la de un `?` repartido entre varias ramas: en cuanto cualquiera produce `Err`, `try_join!` abandona el resto y propaga ese error. Todos los futures deben compartir un tipo de error común, y el resultado es un único `Result` con la tupla de éxitos o el primer fallo. Es la diferencia entre "quiero todos los resultados, éxitos y fracasos" —`join!`— y "quiero todos o me rindo al primer fallo" —`try_join!`—.
+
+Un matiz de cancelación asoma aquí, y enlaza con las lecciones que siguen: cuando un future falla, los demás que `try_join!` estaba conduciendo se **dropean** a mitad de camino. Ese abandono es la cancelación por *drop* que estudiarás en detalle; por ahora basta con retenerlo: el fallo rápido no solo devuelve antes, también *cancela* el trabajo restante, con todo lo que eso implica para operaciones que dejaban algo a medias.
+
+<Callout type="info" title="Colecciones dinamicas: join_all y try_join_all">
+`join!` y `try_join!` son macros para un número *fijo* de futures escritos a mano. Cuando tienes un número variable —un `Vec` de futures, uno por cada elemento de una lista— usa `futures::future::join_all` o `try_join_all`, que reciben un iterador de futures y devuelven un `Vec` de resultados. Ojo: `join_all` avanza *todos* a la vez; si son cientos de peticiones de red, quizá satures el servicio. Para limitar cuántas corren simultáneamente, un `Stream` con `buffer_unordered(n)` (lección 3) da control de concurrencia con un techo.
+</Callout>
+
+## Concurrencia sin paralelismo
+
+Aquí está la idea que separa a quien usa `join!` de memoria de quien lo entiende. `join!` produce **concurrencia**: varios futures progresan intercalados. Pero no produce **paralelismo**: todo sucede en una sola tarea, que el runtime ejecuta en un solo hilo a la vez. La macro, al ser sondeada, sondea a cada sub-future por turno; nunca corren dos *literalmente al mismo instante* en dos núcleos.
+
+El orden importa menos de lo que parece: aunque `join!` sondea los sub-futures en el orden en que los escribiste, la tupla que devuelve respeta *posiciones*, no *tiempos de finalización* —el primer hueco es siempre el primer future, termine antes o después—. Y el intercalado real lo dictan los `.await`: cada future avanza hasta que cede, momento en que la macro pasa al siguiente que pueda progresar. Por eso dos esperas se solapan sin esfuerzo, pero dos cálculos sin `.await` intermedio no: sin puntos de cesión, no hay dónde intercalar.
+
+```rust
+// join! solapa ESPERAS, no calculos. Si precio y stock fueran
+// cargas de CPU, join! NO usaria dos nucleos: los intercalaria
+// en el mismo hilo, y el total volveria a ser la suma.
+let (p, s) = tokio::join!(precio(sku), stock(sku));
+```
+
+Para E/S esto es justo lo que quieres: las dos esperas se solapan porque, mientras una tarea aguarda a la red, la otra rama avanza; no necesitas dos hilos para eso. Para **paralelismo real** —repartir cómputo entre núcleos— necesitas tareas separadas que el runtime pueda distribuir entre sus hilos trabajadores, y eso es `tokio::spawn`:
+
+```rust
+// spawn crea tareas independientes que un runtime multihilo PUEDE
+// correr en paralelo. Exige 'static y Send, y no toma prestado local.
+let h1 = tokio::spawn(async move { precio_owned(sku1).await });
+let h2 = tokio::spawn(async move { stock_owned(sku2).await });
+let (p, s) = (h1.await.unwrap(), h2.await.unwrap());
+```
+
+La regla para decidir entre ambos es limpia. Si tu trabajo **espera** —red, disco, bases de datos— y solo quieres solapar esas esperas, `join!` es la herramienta exacta: sin `spawn`, sin `Send`, sin `'static`, y con préstamos del ámbito. Si tu trabajo **calcula** y quieres exprimir varios núcleos, necesitas `spawn` sobre un runtime multihilo, que reparte tareas entre hilos de verdad. Y si además quieres **reaccionar a cada resultado en cuanto llega** en lugar de esperar a que todos terminen, ni `join!` ni `join_all` sirven —ambos entregan de golpe—; ahí entra `FuturesUnordered`, una colección de futures que emite cada salida en el orden en que se completa, no en el que la insertaste.
+
+<Callout type="tip" title="join! espera a todos a la vez; FuturesUnordered entrega uno a uno">
+`join!` y `join_all` son "todo o nada temporal": no devuelven hasta que el último future termina, así que su latencia la marca el más lento. Cuando quieres consumir resultados *a medida que van llegando* —mostrar cada respuesta apenas está, o alimentar una tubería—, usa `futures::stream::FuturesUnordered`: le empujas futures y la recorres como un `Stream`, recibiendo cada valor en cuanto su future se completa. Es la diferencia entre "avísame cuando estén todos" y "avísame cada vez que llegue uno".
+</Callout>
+
+<Cards>
+  <Card icon="🔗" title="join!: concurrencia">
+    Varios futures solapados en una tarea. Sin `Send` ni `'static`: pueden tomar prestado local. Espera a todos. Ideal para solapar esperas de E/S.
+  </Card>
+  <Card icon="⛔" title="try_join!: fallo rapido">
+    Como `join!`, pero corta al primer `Err` y lo propaga, dropeando el resto. Un `?` repartido entre ramas con un tipo de error común.
+  </Card>
+  <Card icon="🚀" title="spawn: paralelismo">
+    Tareas independientes que el runtime reparte entre hilos. Exige `Send + 'static`. Para cómputo real en varios núcleos, no para solapar esperas.
+  </Card>
+  <Card icon="🌊" title="join_all: dinamico">
+    Un iterador de futures a la vez. Para números variables. Con techo de concurrencia, prefiere un `Stream` con `buffer_unordered`.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart LR
+  S[Dos esperas independientes] --> A[await secuencial]
+  S --> B[join! concurrente]
+  A --> A2[Una espera tras otra la SUMA de latencias]
+  B --> B2[Solapadas en una tarea el MAXIMO de las dos]
+  B --> B3[Concurrencia no paralelismo un hilo a la vez]
+  style A2 fill:#f38ba8,color:#11111b
+  style B2 fill:#a6e3a1,color:#11111b
+  style B3 fill:#fab387,color:#11111b`} />
+
+<Callout type="dios" title="join! es composicion de futures, y por eso no necesita hilos">
+La pregunta ingenua ante `join!` es "¿cómo consigue correr dos cosas a la vez sin lanzar un hilo?", y la respuesta desmonta un malentendido que arrastramos de los lenguajes con hilos como única herramienta de concurrencia. `join!` no *lanza* nada: **compone**. Toma dos futures —dos descripciones de trabajo perezoso, dos máquinas de estados— y fabrica una tercera máquina de estados que los contiene a ambos y que, cada vez que se la sondea, sondea a los dos y devuelve control en cuanto ninguno puede avanzar más por ahora. La concurrencia no nace de multiplicar hilos, sino de que un future es un valor de primera clase que puedes meter dentro de otro. Por eso `join!` no cuesta una pila nueva ni un cambio de contexto del kernel: cuesta unos bytes más en la máquina de estados de la tarea que ya tenías. Y por eso, simétricamente, no te regala paralelismo: al ser un único valor sondeado por una única tarea, corre en un hilo a la vez, intercalando en los `.await` pero nunca ejecutando dos cálculos en el mismo instante. Aquí se ve con toda nitidez la distinción que el nivel de fundamentos sembró: la concurrencia es *estructura* —cómo organizas trabajo que se solapa—, el paralelismo es *ejecución* —cuántos núcleos arden a la vez—. `join!` te da la primera casi gratis, porque solapar esperas solo requiere recordar dónde se quedó cada una, no correrlas simultáneamente. El paralelismo, que sí requiere repartir cómputo entre hilos, lo pides aparte con `spawn`, y pagas su precio: `Send`, `'static`, y datos que la tarea debe poseer. La decisión de diseño, leída al derecho, es que Rust te deja elegir la concurrencia sin obligarte a comprar el paralelismo, porque para el océano de esperas que es la E/S masiva, solapar basta y sobra. Confundir ambas —esperar `join!` que use dos núcleos, o pagar `spawn` donde bastaba solapar— no es un matiz: es no haber entendido que un future es una descripción componible, no un hilo disfrazado.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+`join!` avanza varios futures solapados en una sola tarea y no vuelve hasta que *todos* terminan, devolviendo su tupla de resultados; la latencia es el máximo de las esperas, no la suma. No exige `Send` ni `'static`, así que sus futures pueden tomar prestado dato local. `try_join!` hace lo mismo pero cortocircuita al primer `Err`, dropeando el resto. Para números variables, `join_all` / `try_join_all`. Y la clave conceptual: `join!` da **concurrencia** —esperas solapadas en un hilo a la vez—, no **paralelismo**; para repartir cómputo entre núcleos, `spawn`.
+</Callout>
+
+<Reto title="Solapa esperas y mide la diferencia">
+1. Escribe dos `async fn` que duerman 200 ms con `tokio::time::sleep` y devuelvan un número; combínalas primero con `.await` secuencial y luego con `join!`, cronometrando cada versión.
+2. Convierte esas funciones para que devuelvan `Result`, haz que una falle, y compara el comportamiento de `join!` (te da ambos `Result`) con el de `try_join!` (corta al primer `Err`).
+3. Con `futures::future::join_all`, lanza diez futures generados desde un `Vec` y recoge sus resultados; razona qué pasaría si fueran diez mil peticiones de red a la vez.
+4. Demuestra con un bucle de CPU dentro de un future por qué `join!` no da paralelismo: el total vuelve a ser la suma. Luego mueve ese cómputo a `spawn` y observa el cambio en un runtime multihilo.
+5. Explica por qué `join!` puede tomar prestado `sku` mientras que `spawn` exige `move` y `'static`; relaciónalo con que uno compone en la misma tarea y el otro crea una tarea nueva.
+</Reto>

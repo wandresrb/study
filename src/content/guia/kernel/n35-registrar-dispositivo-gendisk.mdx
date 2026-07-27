@@ -1,0 +1,147 @@
+---
+title: "Registrar un dispositivo de bloques: gendisk y add_disk"
+description: "Cómo un driver publica un disco: describir las colas con blk_mq_alloc_tag_set, crear a la vez la request_queue y el gendisk con blk_mq_alloc_disk pasando sus queue_limits, rellenar major, first_minor, fops, disk_name y set_capacity, publicarlo con add_disk para que se escanee la tabla de particiones y se emita el uevent que hace a udev crear el nodo en /dev, y desmontar en orden con del_gendisk, blk_mq_free_tag_set y put_disk."
+subject: kernel
+level: 35
+order: 5
+icon: "35.5"
+duracion: "16 min"
+---
+
+<Lead>
+Hemos recorrido la `bio`, la arquitectura de dos capas y el viaje de una petición; queda la pregunta del ingeniero que va a escribir un driver de bloques de verdad: ¿cómo hago que aparezca `/dev/mibloque0` y que el kernel lo trate como un disco de pleno derecho, con sus particiones y su cola? La respuesta es una ceremonia corta pero exacta de cuatro pasos —describir las colas, crear el disco, vestirlo y publicarlo— que conecta todo lo anterior con el modelo de dispositivos (nivel 28) y con `/dev`. Dominarla es cerrar el nivel, porque es donde el block layer deja de ser teoría y se vuelve un dispositivo que puedes formatear y montar.
+</Lead>
+
+<Objetivos>
+
+- Describir las colas del dispositivo con `blk_mq_alloc_tag_set`.
+- Crear la `request_queue` y el `gendisk` juntos con `blk_mq_alloc_disk` y sus `queue_limits`.
+- Rellenar `major`, `fops`, `disk_name` y la capacidad con `set_capacity`.
+- Publicar con `add_disk` y entender su relación con `/dev` y las particiones.
+
+</Objetivos>
+
+## Paso uno: describir las colas con el tag_set
+
+Todo empieza declarando cómo son las colas del dispositivo, en un `struct blk_mq_tag_set` que ya conoces del nivel 35.3. Aquí se fija el número de colas hardware, la profundidad, el tamaño de los datos privados por petición y —lo esencial— el `blk_mq_ops` con el `queue_rq` que el block layer llamará para entregarte cada `request`.
+
+```c
+static const struct blk_mq_ops mi_mq_ops = {
+	.queue_rq = mi_queue_rq,     /* el driver recibe aqui cada peticion */
+	.complete = mi_complete,     /* epilogo del completado */
+};
+
+static int mi_init_colas(struct mi_dev *d)
+{
+	memset(&d->tag_set, 0, sizeof(d->tag_set));
+	d->tag_set.ops          = &mi_mq_ops;
+	d->tag_set.nr_hw_queues = 1;               /* un disco simple: una cola */
+	d->tag_set.queue_depth  = 128;
+	d->tag_set.numa_node    = NUMA_NO_NODE;
+	d->tag_set.cmd_size     = sizeof(struct mi_cmd);
+	d->tag_set.flags        = BLK_MQ_F_SHOULD_MERGE;
+	return blk_mq_alloc_tag_set(&d->tag_set);   /* reserva los tags del sbitmap */
+}
+```
+
+`blk_mq_alloc_tag_set` reserva el `sbitmap` de tags y toda la maquinaria de colas hardware. A partir de aquí, el `tag_set` describe la capacidad de despacho del dispositivo, y puede compartirse entre varios discos del mismo controlador.
+
+## Paso dos: crear y vestir el gendisk
+
+En el Linux de 2026, una sola llamada crea a la vez la `request_queue` —cableada a ese `tag_set`— y el `struct gendisk`, y recibe los `queue_limits` del dispositivo en el momento de la creación, de forma atómica:
+
+```c
+struct queue_limits lim = {
+	.logical_block_size = 512,
+	.max_hw_sectors     = 1024,        /* 512 KiB por peticion */
+	.io_min             = 512,
+	.io_opt             = 0,
+};
+
+d->disk = blk_mq_alloc_disk(&d->tag_set, &lim, d);   /* queue + gendisk + limits */
+if (IS_ERR(d->disk)) {
+	blk_mq_free_tag_set(&d->tag_set);
+	return PTR_ERR(d->disk);
+}
+```
+
+El tercer argumento, `d`, es el `queuedata`: tu contexto privado, que recuperarás en `queue_rq` para saber a qué dispositivo pertenece la petición. El `gendisk` que devuelve es el objeto central que representa un disco lógico entero —con sus particiones—, el equivalente en el mundo de bloques al `cdev` del mundo de carácter.
+
+Pero ese `gendisk` recién creado está desnudo. Antes de publicarlo hay que darle su identidad de números mayor y menor, su tabla de operaciones, su nombre visible y su capacidad:
+
+```c
+static const struct block_device_operations mi_fops = {
+	.owner = THIS_MODULE,
+	.open  = mi_open,
+	.release = mi_release,
+	.ioctl = mi_ioctl,
+};
+
+d->disk->major        = mi_major;          /* de register_blkdev, o dinamico */
+d->disk->first_minor  = 0;
+d->disk->minors       = 16;                /* 15 particiones + el disco entero */
+d->disk->fops         = &mi_fops;
+d->disk->private_data = d;
+snprintf(d->disk->disk_name, DISK_NAME_LEN, "mibloque0");
+
+set_capacity(d->disk, d->tam_bytes >> SECTOR_SHIFT);  /* en sectores de 512 B */
+```
+
+Tres detalles cargan el peso. El par `major:minor` es la identidad numérica del dispositivo, la misma que verás en `ls -l /dev/mibloque0`; `major` se reserva con `register_blkdev` (o se toma dinámico). El campo `minors` declara **cuántas particiones** admite: reservar 16 menores significa que caben quince particiones más el disco completo, porque cada partición consume un menor consecutivo. Y `set_capacity` fija el tamaño en sectores de 512 bytes (nivel 35.1), no en bytes: de ahí el desplazamiento `SECTOR_SHIFT`.
+
+## Paso tres: publicar con add_disk
+
+Hasta aquí el disco existe en memoria pero es invisible. `add_disk` lo hace real: lo registra en el modelo de dispositivos, **escanea su tabla de particiones** creando un `gendisk` de bloque por cada partición encontrada, crea las entradas en `sysfs` bajo `/sys/block/` y **emite el uevent** que el espacio de usuario espera.
+
+```c
+int ret = add_disk(d->disk);   /* __must_check: puede fallar, comprobalo */
+if (ret) {
+	put_disk(d->disk);
+	blk_mq_free_tag_set(&d->tag_set);
+	return ret;
+}
+/* a partir de aqui existe /dev/mibloque0 y sus particiones /dev/mibloque0p1... */
+```
+
+Aquí se cierra el puente con el nivel 28: `add_disk` no crea el nodo de `/dev` por sí mismo. Emite un uevent de tipo `add` que `udev` recibe; `udev` lee el `major:minor` del `sysfs` y crea el nodo `/dev/mibloque0` con `mknod`. El kernel expone la identidad; el espacio de usuario materializa el archivo. Por eso `add_disk` debe ser el **último** paso del `probe`: en cuanto retorna, el disco es accesible y un `open()` puede llegar antes de que la siguiente línea de tu código corra.
+
+<Mermaid code={`flowchart TD
+  A[blk_mq_alloc_tag_set describe ops y colas] --> B[blk_mq_alloc_disk crea queue y gendisk]
+  B --> C[Rellenar major fops disk_name y set_capacity]
+  C --> D[add_disk publica el disco]
+  D --> E[Escaneo de la tabla de particiones]
+  D --> F[uevent add al espacio de usuario]
+  F --> G[udev crea el nodo en dev]
+  E --> H[Un minor consecutivo por cada particion]
+  style A fill:#89b4fa,color:#11111b
+  style D fill:#f9e2af,color:#11111b
+  style G fill:#a6e3a1,color:#11111b`} />
+
+## La ruta de descarga: deshacer en orden inverso
+
+Registrar bien obliga a desregistrar bien, y el orden importa porque `add_disk` publicó el disco al mundo. Primero se retira de la vista con `del_gendisk` —que espera a que no queden aperturas y borra las particiones—, luego se sueltan los tags, y por fin se libera el `gendisk` con `put_disk`, que respeta su cuenta de referencias por si alguien aún lo sostiene.
+
+```c
+static void mi_remove(struct mi_dev *d)
+{
+	del_gendisk(d->disk);            /* despublica; espera cierres pendientes */
+	blk_mq_free_tag_set(&d->tag_set);/* libera el sbitmap y las colas hardware */
+	put_disk(d->disk);               /* suelta la referencia; libera si es la ultima */
+}
+```
+
+<Callout type="tip" title="add_disk es __must_check y debe ir el último">
+Desde la versión 5.15 `add_disk` devuelve un `int` que **debes** comprobar: puede fallar al crear entradas de `sysfs` o al escanear particiones, y un disco a medio publicar es una fuga. Colócalo como último paso del `probe`, con todo lo demás ya en su sitio, porque su retorno abre la puerta a `open()` desde el espacio de usuario; y en el fallo, deshaz en orden inverso lo que ya construiste. La simetría entre `add_disk` y `del_gendisk`, y entre `alloc` y `put`, es la misma disciplina de limpieza en cascada que el patrón `goto` del nivel de errores del kernel.
+</Callout>
+
+<Callout type="dios" title="Un gendisk es un contrato entre dos mundos que no se conocen">
+Detente en lo que `add_disk` logra de verdad, porque es el resumen físico de todo el nivel. Un `gendisk` no es un trozo de hardware ni un archivo: es un **contrato** colocado en la frontera entre dos mundos que jamás se hablan directamente. Por debajo tiene un `tag_set` y un `queue_rq` que solo entienden de tags, sectores y descriptores de DMA —el mundo del hardware, atómico, sin nombres, medido en microsegundos—. Por encima tiene un `disk_name`, un `major:minor` y una tabla de particiones —el mundo de `/dev`, de los usuarios, de `mkfs` y `mount`, medido en rutas de archivo—. El `gendisk` es la pieza que traduce entre ambos, y `add_disk` es el instante en que ese contrato entra en vigor: antes de esa llamada, el driver es código privado que nadie puede tocar; después, es un dispositivo con nombre que cualquier proceso puede abrir, particionar y formatear. Fíjate en que ni el hardware sabe que se llama `mibloque0` ni el usuario sabe que hay tags y colas hardware debajo: el `gendisk` sostiene la ficción, para arriba, de que hay un array de bloques direccionable con un nombre en `/dev`, y la ficción, para abajo, de que hay un flujo ordenado de `request` que atender. Y observa cómo esta última pieza recoge todas las anteriores: el `set_capacity` habla en los sectores de 512 del nivel 35.1; el `tag_set` es la arquitectura de dos capas del 35.3; el `queue_rq` es la estación del camino del 35.4; y las `bio` del 35.2 son lo que fluye por dentro cuando el disco ya vive. Registrar un dispositivo de bloques no es rellenar una estructura: es firmar el contrato que hace que cinco niveles de mecanismo se conviertan, ante los ojos de un usuario que escribe `mount /dev/mibloque0p1 /mnt`, en algo tan simple como un disco. Esa distancia entre la simplicidad de la interfaz y la profundidad del mecanismo es, exactamente, lo que significa entender un subsistema del kernel.
+</Callout>
+
+<Reto title="Publica tu propio disco">
+1. Escribe la secuencia de `probe` de un ramdisk: `blk_mq_alloc_tag_set`, `blk_mq_alloc_disk` con sus `queue_limits`, rellenar el `gendisk` y `add_disk`; comprueba cada retorno.
+2. Explica por qué `disk->minors = 16` permite quince particiones más el disco entero, y qué relación tiene un menor con cada `/dev/mibloque0pN`.
+3. Traza qué ocurre entre `add_disk` y la aparición de `/dev/mibloque0`: qué hace el kernel, qué hace `udev`, y por qué el nodo lo crea el espacio de usuario.
+4. Argumenta por qué `add_disk` debe ser el último paso del `probe` y qué carrera evitas al colocarlo ahí.
+5. Escribe la ruta de descarga simétrica con `del_gendisk`, `blk_mq_free_tag_set` y `put_disk`, y justifica el orden inverso frente al del registro.
+</Reto>

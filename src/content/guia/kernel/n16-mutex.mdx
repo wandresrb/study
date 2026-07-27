@@ -1,0 +1,159 @@
+---
+title: "El mutex: el lock por defecto que duerme"
+description: "struct mutex, mutex_lock y mutex_unlock, la variante interruptible, la propiedad (owner) y el optimistic spinning. Por qué el mutex es el lock por defecto para secciones que pueden dormir."
+subject: kernel
+level: 16
+order: 2
+icon: "16.2"
+duracion: "14 min"
+---
+
+<Lead>
+Si puedes dormir y necesitas exclusión mutua, la respuesta correcta casi siempre tiene cuatro letras: mutex. Es el spinlock de los que duermen, pero más listo: sabe quién lo tiene, gira cuando conviene y duerme cuando toca. Entender por qué es el lock por defecto es entender el diseño de la concurrencia moderna del kernel.
+</Lead>
+
+<Objetivos>
+
+- Declarar, inicializar y usar un `struct mutex`.
+- Coger y soltar con `mutex_lock`, `mutex_unlock` y `mutex_lock_interruptible`.
+- Entender la propiedad (owner) y sus tres consecuencias.
+- Saber por qué el mutex desplazó al semáforo como lock durmiente por defecto.
+
+</Objetivos>
+
+## Anatomía y uso básico
+
+Un `struct mutex` es un lock durmiente con un único dueño. Vive en `#include <linux/mutex.h>` y su estructura, en un kernel 7.x, es más rica de lo que aparenta:
+
+```c
+struct mutex {
+	atomic_long_t			owner;		/* task_struct del dueño + flags en bits bajos */
+	raw_spinlock_t			wait_lock;	/* protege wait_list */
+	struct optimistic_spin_queue	osq;		/* cola MCS de los que giran */
+	struct list_head		wait_list;	/* los que duermen esperando */
+};
+```
+
+Lo declaras estático con `DEFINE_MUTEX` o lo inicializas en tiempo de ejecución con `mutex_init`. Después, el patrón es siempre el mismo: coger, sección crítica, soltar.
+
+```c
+#include <linux/mutex.h>
+
+struct dispositivo {
+	struct mutex	lock;
+	unsigned char	buffer[256];
+	size_t		len;
+};
+
+static struct dispositivo dev;
+
+static int __init dev_init(void)
+{
+	mutex_init(&dev.lock);		/* dinámico; para estáticos: DEFINE_MUTEX(dev_lock) */
+	return 0;
+}
+
+static ssize_t dev_write(struct file *f, const char __user *ubuf,
+			 size_t n, loff_t *off)
+{
+	if (n > sizeof(dev.buffer))
+		return -EINVAL;
+
+	/* interruptible: si llega una señal mientras dormimos esperando el
+	 * lock, abortamos limpiamente en vez de quedar colgados sin matar. */
+	if (mutex_lock_interruptible(&dev.lock))
+		return -ERESTARTSYS;
+
+	/* sección crítica: PUEDE dormir. copy_from_user (nivel 12) puede
+	 * provocar un fallo de página y bloquear; con un mutex es legal. */
+	if (copy_from_user(dev.buffer, ubuf, n)) {
+		mutex_unlock(&dev.lock);
+		return -EFAULT;
+	}
+	dev.len = n;
+
+	mutex_unlock(&dev.lock);
+	return n;
+}
+```
+
+Tienes cuatro formas de coger el lock, según qué quieras hacer mientras esperas:
+
+<Cards>
+  <Card icon="😴" title="mutex_lock">
+    Duerme hasta cogerlo, ignorando señales. Úsalo cuando la sección es corta y no hay riesgo de espera larga.
+  </Card>
+  <Card icon="✉️" title="mutex_lock_interruptible">
+    Duerme, pero si llega una señal aborta y devuelve `-EINTR`. La opción por defecto en rutas de syscall.
+  </Card>
+  <Card icon="💀" title="mutex_lock_killable">
+    Solo cede ante señales fatales como SIGKILL. Ni interrumpible frívolamente, ni completamente incancelable.
+  </Card>
+  <Card icon="🎲" title="mutex_trylock">
+    No duerme: devuelve 1 si lo coge y 0 si estaba ocupado. Para cuando tienes un plan B.
+  </Card>
+</Cards>
+
+## La propiedad: un solo dueño
+
+La regla de oro del mutex: **el que lo coge es el que lo suelta**. El campo `owner` guarda la `task_struct` del dueño actual, y de esa única idea cuelgan tres consecuencias enormes:
+
+- **No es recursivo.** Si la misma tarea intenta cogerlo dos veces, se autobloquea. El kernel no lleva un contador de anidamiento como un lock recursivo; un mutex es de un solo nivel, a propósito.
+- **Se puede depurar.** Con `CONFIG_DEBUG_MUTEXES` y lockdep, el kernel detecta que sueltas un mutex que no cogiste, o que sales de una función teniéndolo cogido. El dueño conocido convierte errores silenciosos en warnings.
+- **Habilita el spinning y la herencia de prioridad.** Saber quién es el dueño permite optimizaciones que un lock anónimo no puede hacer, y una de ellas —el optimistic spinning— es la que lo hace rápido.
+
+<Callout type="warn" title="Las reglas que no puedes romper">
+Un mutex jamás se coge en contexto atómico (por definición duerme, nivel 16.1). No se coge dos veces desde la misma tarea. No se suelta desde otra tarea. Y una tarea no puede terminar teniéndolo cogido. Romper cualquiera de estas es un bug que lockdep suele cazar, pero que conviene no cometer.
+</Callout>
+
+## Optimistic spinning: por qué es casi tan rápido como un spinlock
+
+Aquí está la joya. Cuando intentas coger un mutex ocupado, el kernel no te duerme de inmediato. Primero mira el `owner`: ¿está el dueño **corriendo ahora mismo en otra CPU**? Si es así, probablemente soltará el lock en microsegundos, y dormirte —con su cambio de contexto de ida y vuelta— costaría más que esperar girando. Así que giras, encolado ordenadamente en la `osq`, una cola MCS que evita el rebote de líneas de caché. Solo si el dueño está él mismo dormido te duermes tú.
+
+<Mermaid code={`flowchart TD
+  A[mutex_lock] --> B{Esta libre}
+  B -->|Si| C[Lo cojo: owner es current]
+  B -->|No| D{El owner corre en otra CPU}
+  D -->|Si| E[Optimistic spinning: giro en la cola MCS]
+  D -->|No, el owner duerme| F[Me duermo en wait_list]
+  E --> B
+  F --> G[El owner suelta y me despierta]
+  G --> C
+  style C fill:#a6e3a1,color:#11111b
+  style E fill:#f9e2af,color:#11111b
+  style F fill:#89b4fa,color:#11111b`} />
+
+El resultado: un mutex sin contención o con contención breve es casi tan barato como un spinlock, pero bajo contención real duerme y libera la CPU en vez de quemarla girando. Lo mejor de los dos mundos, y la razón por la que un buen mutex rara vez es el cuello de botella.
+
+## Liberación automática: guard
+
+Olvidar un `mutex_unlock` en un camino de error es uno de los bugs más comunes del kernel. Los kernels modernos ofrecen una red de seguridad con `#include <linux/cleanup.h>`: la macro `guard` suelta el lock automáticamente al salir del ámbito, pase lo que pase.
+
+```c
+#include <linux/cleanup.h>
+
+static ssize_t dev_write(struct file *f, const char __user *ubuf,
+			 size_t n, loff_t *off)
+{
+	guard(mutex)(&dev.lock);	/* se suelta solo al volver, en cualquier return */
+
+	if (copy_from_user(dev.buffer, ubuf, n))
+		return -EFAULT;		/* aquí el mutex ya se libera solo */
+	dev.len = n;
+	return n;			/* y aquí también */
+}
+```
+
+Bajo el capó, `guard` usa el atributo `__cleanup` del compilador para invocar `mutex_unlock` al cerrar el bloque. Elimina de un plumazo toda una clase de fugas de lock. Cuando necesitas soltar antes del final del ámbito, `scoped_guard(mutex, &dev.lock)` acota la región exacta.
+
+<Callout type="dios" title="Por qué el mutex es el lock por defecto">
+Durante años, el lock durmiente de Linux fue el semáforo binario. En 2006 Ingo Molnar introdujo `struct mutex` como tipo propio, y una conversión masiva barrió el árbol. ¿Por qué ganó? Porque codifica un invariante en su propio tipo: "esto tiene un solo dueño". Esa restricción, que parece una limitación, es su superpoder. Le permite depurarse (sabe quién debe soltarlo), acelerar (puede girar mientras el dueño corre) y heredar prioridad (sabe a quién impulsar). Un semáforo, al no tener dueño, no puede hacer nada de esto. La lección trasciende el mutex: en el kernel, la herramienta más específica suele ser la más segura y la más rápida, porque su tipo captura una verdad sobre cómo se usa. Cuando dudes entre un lock general y uno especializado que encaja en tu caso, elige el especializado: el compilador y el depurador trabajarán a tu favor. Por eso la regla es simple: si puedes dormir y quieres exclusión mutua, usa un mutex, y solo desvíate con una razón que sepas explicar.
+</Callout>
+
+<Reto title="Domina el mutex de punta a punta">
+1. Añade un `struct mutex` a la estructura de tu char device (nivel 13) e inicialízalo con `mutex_init`.
+2. Protege `read` y `write` con `mutex_lock_interruptible`, devolviendo `-ERESTARTSYS` si falla.
+3. Comprueba que sueltas el lock en **todos** los caminos de retorno, incluidos los de error.
+4. Provoca un autobloqueo: coge el mutex dos veces seguidas en la misma función y observa el cuelgue (con lockdep, el aviso).
+5. Compila con `CONFIG_DEBUG_MUTEXES=y` y suelta el mutex desde una función distinta a la que lo cogió; lee el warning que salta.
+</Reto>

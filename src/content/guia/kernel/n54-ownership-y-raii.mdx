@@ -1,0 +1,138 @@
+---
+title: "Ownership y RAII en el kernel: la muerte del goto de limpieza"
+description: "El sistema de tipos de Rust garantiza que cada recurso se libera exactamente una vez mediante Drop, eliminando de raíz las fugas y el doble free. Esta lección enfrenta la escalera de goto del manejo de errores en C del nivel 11 con el patrón RAII de Rust, muestra cómo el operador ? deshace las adquisiciones en orden inverso sin una sola etiqueta de limpieza, y explica por qué el doble free es un error que ni siquiera se puede escribir."
+subject: kernel
+level: 54
+order: 4
+icon: "54.4"
+duracion: "18 min"
+---
+
+<Lead>
+En el nivel 11 aprendiste el idioma del manejo de errores en C del kernel: la escalera de `goto`, con sus etiquetas `err_algo` que deshacen, en orden inverso y exactamente hasta el punto correcto, todo lo que se había adquirido. Es disciplina pura, y es frágil: basta saltar a la etiqueta equivocada, olvidar una liberación o añadir un recurso sin actualizar la escalera para tener una fuga o un doble free. Rust no mejora esa disciplina; la vuelve innecesaria. El mismo trabajo lo hace el sistema de tipos, de forma automática y demostrada en compilación, mediante dos ideas acopladas: la propiedad y `Drop`.
+</Lead>
+
+<Objetivos>
+
+- Recordar la escalera de `goto` del nivel 11 y sus modos de fallo: fuga y doble free.
+- Entender `Drop` como el RAII del kernel: liberar al salir de ámbito, exactamente una vez.
+- Ver cómo el operador `?` deshace las adquisiciones en orden inverso sin etiquetas.
+- Comprender por qué las semánticas de movimiento hacen el doble free inexpresable.
+
+</Objetivos>
+
+## La escalera de goto, y por qué falla
+
+Recordemos el patrón canónico del nivel 11. Un `probe` que adquiere tres recursos debe, si el tercero falla, liberar los dos primeros en orden inverso y solo esos:
+
+```c
+static int probe(struct platform_device *pdev)
+{
+	struct estado *e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return -ENOMEM;
+
+	e->regs = ioremap(base, len);
+	if (!e->regs)
+		goto err_regs;
+
+	e->irq = pedir_irq(pdev, e);
+	if (e->irq < 0)
+		goto err_irq;
+
+	return 0;
+
+err_irq:
+	iounmap(e->regs);      /* deshacer el ioremap */
+err_regs:
+	kfree(e);              /* deshacer el kzalloc */
+	return -EIO;
+}
+```
+
+Funciona, pero cada recurso nuevo obliga a insertar una etiqueta en el lugar exacto y a encadenarla bien. Los fallos son célebres: saltar a `err_regs` en vez de `err_irq` **filtra** la IRQ; escribir `iounmap` en dos etiquetas la libera **dos veces**; añadir un recurso y olvidar su etiqueta filtra memoria en la ruta de error. Son precisamente los bugs de los que hablaba la lección 54.1, y aquí nacen de tener que reproducir a mano la simetría entre adquirir y liberar.
+
+## Drop: RAII incrustado en el tipo
+
+Rust ata la liberación al tipo, no a la ruta de código. Un tipo que posee un recurso implementa el trait `Drop`, cuyo método `drop` el compilador **inserta automáticamente** en el punto exacto donde el valor sale de ámbito. Esto es RAII —*Resource Acquisition Is Initialization*—, la misma idea que ya viste como `devm` en el nivel 29, pero ahora garantizada por el lenguaje para cualquier recurso, no solo para los atados a un `struct device`.
+
+```rust
+struct Registros {
+    base: *mut u8,
+}
+
+impl Registros {
+    fn new(fis: usize, len: usize) -> Result<Self> {
+        // SAFETY: fis/len describen una region MMIO valida del dispositivo.
+        let base = unsafe { bindings::ioremap(fis as _, len) };
+        if base.is_null() {
+            return Err(ENOMEM);
+        }
+        Ok(Registros { base: base.cast() })
+    }
+}
+
+impl Drop for Registros {
+    fn drop(&mut self) {
+        // SAFETY: base proviene de un ioremap con exito en new.
+        unsafe { bindings::iounmap(self.base.cast()) };
+    }
+}
+```
+
+La adquisición vive en `new`; la liberación, en `drop`. No hay una tercera parte del programa que tenga que acordarse de emparejarlas: quien crea un `Registros` obtiene la liberación garantizada por el mero hecho de que el valor, tarde o temprano, sale de ámbito.
+
+## El operador ? deshace en orden inverso, sin etiquetas
+
+Ahora el `probe` de C traducido. Cada recurso es un tipo con `Drop`; el operador `?` propaga el error, y al hacerlo desencadena la liberación automática de todo lo adquirido antes, en orden inverso de creación:
+
+```rust
+fn probe(pdev: &mut PlatformDevice) -> Result {
+    let e = KBox::new(Estado::vacio(), GFP_KERNEL)?;  // 1.o creado
+    let regs = Registros::new(base, len)?;            // si falla, e se libera
+    let irq = Irq::pedir(pdev)?;                       // si falla, regs y e
+
+    guardar(pdev, e, regs, irq);
+    Ok(())
+}   // al salir por Ok o por ?, se destruyen irq, luego regs, luego e
+```
+
+Compáralo con la escalera de C. No hay etiquetas, no hay `goto`, no hay que decidir a qué punto saltar: si `Registros::new` falla, el `?` retorna y el compilador destruye lo único vivo hasta ahí, que es `e`. Si falla `Irq::pedir`, se destruyen `regs` y luego `e`. El **orden inverso** es la regla del lenguaje —el último en construirse es el primero en destruirse— y coincide exactamente con lo que la escalera de `goto` intentaba lograr a mano. Añadir un recurso nuevo es añadir una línea; la limpieza se ajusta sola.
+
+<Mermaid code={`flowchart TD
+  E[Crea e primero] --> R[Crea regs]
+  R --> I[Crea irq]
+  I --> OK[Devuelve Ok y sale de ambito]
+  R -. si falla el ? .-> D1[Destruye e]
+  I -. si falla el ? .-> D2[Destruye regs y luego e]
+  OK -. orden inverso .-> D3[Destruye irq regs y e]`} />
+
+Fíjate en que la simetría es perfecta y automática: el punto de fallo determina exactamente qué se ha construido, y el compilador destruye ese conjunto y solo ese, en el orden opuesto al de creación. Ni un recurso de más, que sería un doble free, ni uno de menos, que sería una fuga. La escalera de `goto` perseguía esta misma propiedad obligando al programador a colocar cada etiqueta en su sitio; aquí la propiedad es una consecuencia inevitable de las reglas de ámbito, imposible de romper por descuido.
+
+<Callout type="warn" title="El doble free no es difícil de evitar: es imposible de escribir">
+La razón última es la semántica de movimiento. Cuando un valor se mueve —al pasarlo por valor a una función, por ejemplo— su antiguo nombre queda **invalidado**, y usarlo es un error de compilación. Liberar dos veces exigiría destruir el valor dos veces, pero tras la primera el nombre ya no designa nada.
+
+```rust
+let r = Registros::new(base, len)?;
+liberar(r);   // r se MUEVE hacia liberar, que lo destruye al terminar
+liberar(r);   // error[E0382]: use of moved value: `r`
+```
+
+El `double free`, una de las corrupciones más explotables del kernel, deja de ser un bug que hay que tener cuidado de no cometer y pasa a ser una construcción que el lenguaje rechaza.
+</Callout>
+
+## El límite honesto: fugas seguras
+
+Rust elimina el doble free y hace muy difícil la fuga, pero no promete cero fugas, y conviene saber por qué. Una fuga de memoria no es *inseguridad*: memoria que no se libera no corrompe nada, solo se desperdicia. Por eso el lenguaje permite fugas deliberadas —`core::mem::forget`, o un ciclo de referencias entre dos `Arc`— sin marcarlas `unsafe`. La garantía fuerte de Rust es sobre la seguridad de memoria; las fugas quedan como un problema de corrección que el diseño de tipos desalienta pero no prohíbe en términos absolutos.
+
+<Callout type="dios" title="El ciclo de vida del recurso deja de ser un camino y pasa a ser un tipo">
+Levanta la vista sobre la mecánica y mira el cambio de naturaleza que encierra. En C, la vida de un recurso es una propiedad del **flujo de control**: existe entre la línea que lo adquiere y la línea que lo libera, y garantizar que esas dos líneas se emparejan en todos los caminos posibles —el camino feliz, cada ruta de error, cada `return` temprano, cada `goto`— es una obligación que recae sobre el programador y que crece de forma combinatoria con el número de recursos y de puntos de salida. La escalera de `goto` es el mejor intento de C por domar esa explosión, y aun así falla, porque sigue siendo el humano quien debe mantener la simetría. Rust hace algo distinto de mejorar el intento: cambia dónde vive la información. La vida del recurso deja de ser una propiedad del camino y pasa a ser una propiedad del **tipo** — el recurso lo posee un valor, y la existencia de ese valor, gobernada por reglas de ámbito que el compilador conoce con total precisión, determina cuándo se libera. Como el compilador sabe exactamente cuándo cada valor deja de ser accesible en cada camino, puede insertar la liberación en el punto correcto de todos ellos a la vez, sin que nadie se lo pida y sin posibilidad de olvido. La simetría entre adquirir y liberar deja de ser una disciplina que hay que sostener y se convierte en un teorema que el sistema de tipos demuestra. Y cuando la propiedad de un recurso es única y transferible por movimiento, la liberación doble se vuelve tan imposible como usar un nombre que ya no designa nada. Cuando internalizas que RAII no es una convención de estilo sino la decisión de codificar el ciclo de vida en el sistema de tipos, entiendes por qué el mismo insight aparece en `devm`, en `Drop` y en el `Guard` del mutex: son tres formas de la misma verdad — atar la liberación a la muerte de un objeto es más seguro que atarla a la ejecución de una línea, porque los objetos mueren solos y las líneas hay que acordarse de escribirlas.
+</Callout>
+
+<Reto title="Convierte una escalera de goto en RAII">
+1. Toma el `probe` en C de la lección y añádele un cuarto recurso; enumera cada etiqueta `goto` que tienes que insertar y dónde, y señala el punto más fácil de equivocar.
+2. Traduce ese `probe` a Rust con un tipo `Drop` por recurso y muestra que añadir el cuarto recurso es añadir una sola línea.
+3. Explica, para el `?` que falla en el tercer recurso, qué destructores se ejecutan y en qué orden, y por qué ese orden es correcto.
+4. Escribe en Rust un intento de doble free y transcribe el error de `rustc`; explica qué regla de propiedad lo detiene.
+5. Da un ejemplo de fuga **segura** en Rust y argumenta por qué el lenguaje la permite sin marcarla `unsafe`, distinguiendo fuga de corrupción.
+</Reto>

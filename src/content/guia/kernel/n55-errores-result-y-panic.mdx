@@ -1,0 +1,142 @@
+---
+title: "Manejo de errores en el kernel: Result, el operador ? y por qué no hay panic"
+description: "Los errores como valores tipados con Result y el operador ? en lugar del -errno y el goto en cascada de C, la asignación fallible que nunca devuelve un puntero nulo en silencio, y por qué un panic! en el kernel es tan grave que Rust for Linux lo proscribe."
+subject: kernel
+level: 55
+order: 3
+icon: "55.3"
+duracion: "16 min"
+---
+
+<Lead>
+En el nivel 11 aprendiste el vocabulario de errores del kernel —`-EINVAL`, `-ENOMEM`, `-EFAULT`— y la disciplina de propagarlos sin perder información, con el idioma del `goto err` en cascada. Rust for Linux conserva ese mismo vocabulario de errno, pero lo envuelve en un tipo, `Result`, y sustituye el `goto` por un operador de una sola letra, `?`. Y añade una regla nueva que en C no existía: en el kernel, entrar en pánico está prohibido.
+</Lead>
+
+<Objetivos>
+
+- Devolver y propagar errores con `Result` y el operador `?`.
+- Ver cómo `?` reemplaza al `goto err` en cascada del nivel 11.
+- Entender la asignación fallible: no hay `kmalloc` que devuelva un puntero nulo en silencio.
+- Razonar por qué `panic!`, `unwrap` y `expect` están proscritos en el kernel.
+
+</Objetivos>
+
+## `Result` y el operador `?`
+
+En el kernel de Rust, `Result` es el alias de un resultado cuyo error es `kernel::error::Error`: un envoltorio de un `-errno` no nulo. Los mismos códigos del nivel 11 están ahí, ahora como valores tipados en `kernel::error::code`:
+
+```rust
+use kernel::prelude::*;
+use kernel::error::code::*;
+
+fn validar(tam: usize) -> Result<usize> {
+    if tam == 0 {
+        return Err(EINVAL);   // el -EINVAL del nivel 11, ahora un valor
+    }
+    if tam > MAX_TAM {
+        return Err(EMSGSIZE);
+    }
+    Ok(tam)
+}
+```
+
+`Result<usize>` significa "o un `usize` válido, o un `Error`". Quien llama no puede ignorar la posibilidad de fallo: el tipo lo obliga a decidir qué hacer con ambos casos. Y para el caso común —"si falla, propaga el error hacia arriba"— está el operador `?`:
+
+```rust
+fn preparar(tam: usize) -> Result<KVec<u8>> {
+    let tam = validar(tam)?;                     // si Err, retorna aqui con ese error
+    let mut buf = KVec::with_capacity(tam, GFP_KERNEL)?;   // ENOMEM se propaga solo
+    buf.resize(tam, 0, GFP_KERNEL)?;
+    Ok(buf)
+}
+```
+
+Cada `?` dice: si esto es `Ok`, saca el valor y sigue; si es `Err`, devuélvelo tal cual desde esta función. Es exactamente la disciplina del nivel 11 —"propaga el error original, no lo aplastes con un `-EINVAL` genérico"— pero convertida en un operador. El error de un `kmalloc` profundo llega intacto hasta arriba sin que escribas una sola línea de reenvío.
+
+## Del `goto err` al `?`
+
+Compara la ruta de error de C con la de Rust. En C, cada recurso que reservas añade una etiqueta de limpieza, y cada fallo salta a la etiqueta correcta para deshacer en orden inverso:
+
+```c
+int preparar(size_t tam, u8 **out) {
+    int ret;
+    u8 *buf;
+    if (tam == 0)            { ret = -EINVAL; goto err; }
+    buf = kmalloc(tam, GFP_KERNEL);
+    if (!buf)                { ret = -ENOMEM; goto err; }
+    /* ... mas pasos, mas etiquetas ... */
+    *out = buf;
+    return 0;
+err:
+    return ret;
+}
+```
+
+La versión Rust de arriba hace lo mismo sin una sola etiqueta: el `?` propaga el error, y la liberación de lo ya reservado la ejecuta el `Drop` de cada objeto al salir de la función. La escalera de `goto` del nivel 11, fuente clásica de fugas cuando una etiqueta libera de más o de menos, desaparece porque el desenrollado lo hacen los tipos.
+
+<Mermaid code={`flowchart TB
+  A[validar tam] -->|Ok| B[reservar buffer]
+  A -->|Err| X[return del error tal cual]
+  B -->|Ok| C[redimensionar]
+  B -->|Err| X
+  C -->|Ok| D[Ok con el buffer]
+  C -->|Err| X
+  style X fill:#f38ba8,color:#11111b
+  style D fill:#a6e3a1,color:#11111b`} />
+
+El `?` no solo propaga: también convierte. Cuando el error que sale de una operación no es un `Error` del kernel sino otro tipo, el operador aplica la conversión `From` correspondiente antes de devolverlo. El crate `kernel` implementa esas conversiones para los errores estándar más comunes, de modo que cada uno cae en el `-errno` que le corresponde:
+
+```rust
+fn a_indice(valor: u64) -> Result<u32> {
+    let i: u32 = valor.try_into()?;   // TryFromIntError -> EINVAL, via From
+    Ok(i)
+}
+```
+
+Aquí `try_into()` puede fallar con un `TryFromIntError` —el valor no cabe en `u32`—, y el `?` lo transforma en `Err(EINVAL)` sin que escribas la conversión. Lo mismo ocurre con el error de una asignación fallida, que se convierte en `ENOMEM`. Y puedes definir tu propio `impl From<MiError> for Error` para que tus tipos de error internos se propaguen con el `?` hasta convertirse en el errno que el usuario verá. La disciplina del nivel 11 de "elegir el errno correcto" se vuelve, en Rust, una decisión que se toma una vez en la conversión y se aplica sola en cada `?`.
+
+## Asignación fallible: no hay puntero nulo en silencio
+
+En el espacio de usuario, `Vec::push` de Rust asigna memoria y, si no hay, entra en pánico. En el kernel eso sería inaceptable, así que Rust for Linux redefine la asignación como una operación explícitamente fallible:
+
+```rust
+let mut v = KVec::new();
+v.push(dato, GFP_KERNEL)?;              // recibe el flag GFP, devuelve Result
+let caja = KBox::new(Estado::new(), GFP_KERNEL)?;   // no hay Box::new infalible
+```
+
+Toda reserva recibe un flag GFP del nivel 20 y devuelve un `Result`. No existe la variante que entra en pánico. Esto traslada al tipo la comprobación que en C hacías a mano tras cada `kmalloc` —comprobar si el puntero es nulo y devolver `-ENOMEM`— con la diferencia de que aquí olvidarla es imposible: sin el `?`, el `Result` sin usar es un aviso del compilador.
+
+Tres ideas, entonces, gobiernan el error en el kernel de Rust, y conviene tenerlas juntas:
+
+<Cards>
+  <Card icon="🎯" title="Result y ?">
+    Los errores son valores tipados; el `?` los propaga intactos y sustituye al `goto err` en cascada del nivel 11.
+  </Card>
+  <Card icon="🧱" title="Asignación fallible">
+    Toda reserva recibe un flag GFP y devuelve `Result`. No hay `NULL` silencioso ni variante que entre en pánico.
+  </Card>
+  <Card icon="💣" title="Nada de panic">
+    `unwrap`, `expect` y `panic!` son un `BUG()` en potencia: con `panic=abort`, un pánico se lleva la máquina.
+  </Card>
+</Cards>
+
+## Por qué el kernel de Rust no entra en pánico
+
+En C, cualquier función puede matar la máquina con un puntero suelto, pero no existe una construcción cuyo *propósito* sea abortar. En Rust sí la hay —`panic!`— y precisamente por eso hay que entender por qué en el kernel está vetada.
+
+<Callout type="dios" title="Los errores son valores, y el kernel no puede permitirse un unwinding">
+Dos peligros ambientales del C del kernel desaparecen aquí a la vez, y por el mismo motivo de fondo. El primero es el errno ignorado: en C nada te obliga a mirar el valor que devuelve una función, y un error que no compruebas se convierte en un bug silencioso que aflora tres capas más arriba. En Rust, `Result` lleva `#[must_use]`: ignorarlo es un aviso, y el `?` hace que atenderlo cueste un carácter, de modo que el camino fácil y el camino correcto son el mismo. El segundo peligro es el pánico. En el espacio de usuario, un `unwrap` sobre un `Err`, un índice fuera de rango o un desbordamiento aritmético terminan el proceso y no pasa nada más. En el kernel no existe "el proceso": el pánico corre en anillo 0, y Rust for Linux se compila con `panic=abort`, sin desenrollado, así que un `panic!` se convierte en un `BUG()` que, según dónde ocurra, se lleva por delante la máquina entera. Por eso la cultura del kernel proscribe `unwrap`, `expect`, `panic!`, `todo!` y cualquier construcción que pueda entrar en pánico ante datos de ejecución: no son atajos, son minas. La consecuencia es una inversión de la carga que define el estilo: en C, no fallar catastróficamente depende de que recuerdes comprobar cada retorno y no desreferenciar cada puntero dudoso; en el Rust del kernel, el modo por defecto es devolver `Err` con el `?`, y entrar en pánico es la construcción rara que revisas con lupa en cada revisión de código. El vocabulario de errno del nivel 11 no cambia; cambia que ahora es imposible tirarlo a la basura sin querer, e imposible confundir un error recuperable con el derecho a tumbar el kernel.
+</Callout>
+
+<Callout type="warn" title="unwrap no es tu amigo aquí">
+El `.unwrap()` y el `.expect()` que en un ejemplo de userspace son inofensivos, en el kernel son un `BUG()` en potencia. Cuando de verdad sabes que un valor no puede ser `Err`, prefiere reestructurar el código para que el tipo lo demuestre, o documenta la invariante; recurrir a `unwrap` "porque aquí no puede fallar" es justo la clase de suposición que un kernel bajo carga y datos hostiles convierte en pánico. La regla práctica: si escribes `unwrap` en un `.rs` del kernel, que sea sobre algo comprobado en compilación, nunca sobre datos de ejecución.
+</Callout>
+
+<Reto title="Errores como valores">
+1. Escribe una función que devuelva `Result` y encadene tres operaciones fallibles con `?`; provoca un fallo en la segunda y confirma que la tercera no corre.
+2. Traduce a Rust una función C del nivel 11 con `goto err` en cascada y cuenta cuántas etiquetas te ahorra el `?`.
+3. Reserva un `KVec` grande a propósito hasta agotar la memoria y comprueba que obtienes `Err(ENOMEM)` en vez de un pánico.
+4. Sustituye un `?` por un `.unwrap()` y razona qué pasaría si ese `Result` fuera `Err` en un kernel real.
+5. Busca en `kernel::error::code` cinco de los errno que ya conocías del nivel 11 y comprueba que son los mismos.
+</Reto>

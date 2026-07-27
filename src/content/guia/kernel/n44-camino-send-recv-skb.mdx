@@ -1,0 +1,129 @@
+---
+title: "El camino de send y recv: del socket al cable y de vuelta"
+description: "Cómo send baja los datos de la app al socket por sock_sendmsg, inet_sendmsg y tcp_sendmsg, los copia y segmenta en sk_buffs de la cola de escritura, y los empuja por ip_queue_xmit y dev_queue_xmit hasta el driver; cómo recv los recoge de sk_receive_queue y despierta al durmiente con sk_data_ready; y el sk_buff con sus punteros head, data, tail y end."
+subject: kernel
+level: 44
+order: 3
+icon: "44.3"
+duracion: "18 min"
+---
+
+<Lead>
+Escribir `send(fd, buf, n, 0)` parece atómico, pero desata una cascada. El byte que copias de tu buffer cruza tres capas de despacho, se parte en segmentos del tamaño que la conexión permite, se envuelve en cabeceras que no son sino punteros que retroceden sobre el mismo buffer, y sale por un anillo de DMA que ya conoces (nivel 27). En el otro extremo, `recv` recorre el camino inverso: recoge de una cola, copia a tu buffer y, si no hay nada, duerme hasta que un softirq lo despierte. Este es el viaje de un dato, y su vehículo es una estructura que verás en cada rincón de la pila: el `sk_buff`.
+</Lead>
+
+<Objetivos>
+
+- Seguir `send()` por `sock_sendmsg`, `inet_sendmsg` y `tcp_sendmsg` hasta el driver.
+- Entender la segmentación en `sk_buff` de la cola de escritura y el límite `sk_sndbuf`.
+- Ver `recv()` recoger de `sk_receive_queue` y despertar con `sk_data_ready`.
+- Dominar el `sk_buff` y sus punteros `head`, `data`, `tail` y `end`.
+
+</Objetivos>
+
+## send(): de la app a la cola de escritura
+
+`send` entra por `__sys_sendto`, que arma un `struct msghdr` y llama a `sock_sendmsg`. De ahí sale el doble despacho del nivel anterior: `sock->ops->sendmsg` es `inet_sendmsg`, que reenvía a `sk->sk_prot->sendmsg`, es decir `tcp_sendmsg`. Su trabajo es copiar los bytes del usuario a `sk_buff`s encolados en `sk->sk_write_queue`, cada uno acotado al MSS, contabilizando contra `sk_sndbuf`.
+
+```c
+/* net/ipv4/tcp.c, esqueleto de tcp_sendmsg_locked */
+while (msg_data_left(msg)) {
+	struct sk_buff *skb = tcp_write_queue_tail(sk);
+	int copy;
+
+	if (!skb || !tcp_skb_can_collapse_to(skb))
+		skb = tcp_stream_alloc_skb(sk, sk->sk_allocation, false);  /* nuevo segmento */
+
+	copy = min_t(int, msg_data_left(msg), mss_now - skb->len);
+	if (skb_availroom(skb) <= 0 || sk_wmem_schedule(sk, copy) == 0) {
+		tcp_push(sk, flags, mss_now, ...);         /* sin hueco: empuja */
+		sk_stream_wait_memory(sk, &timeo);         /* y si toca, duerme */
+		continue;
+	}
+	skb_add_data_nocache(sk, skb, &msg->msg_iter, copy);  /* copia del usuario */
+	copied += copy;
+}
+__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
+```
+
+Cuando la cola llena `sk_sndbuf` y el socket es bloqueante, `sk_stream_wait_memory` duerme al proceso hasta que las confirmaciones (ACK) liberen espacio: eso es control de flujo, y es literalmente el tamaño de una cola más un durmiente. Un socket no bloqueante devolvería `-EAGAIN` en ese punto.
+
+## El sk_buff: el contenedor universal del paquete
+
+Todo paquete, en cualquier capa, es un `sk_buff`. Su astucia está en cuatro punteros sobre un buffer lineal: `head` y `end` marcan el buffer físico; `data` y `tail` marcan los **datos vivos** dentro de él. Añadir una cabecera no copia nada: mueve `data` hacia atrás.
+
+```c
+struct sk_buff {
+	unsigned char	*head;     /* inicio del buffer fisico */
+	unsigned char	*data;     /* inicio de los datos vivos (cabecera actual) */
+	unsigned int	 len;      /* longitud total: lineal + fragmentos */
+	unsigned int	 data_len; /* solo la parte en fragmentos paginados */
+	sk_buff_data_t	 tail;     /* fin de los datos vivos */
+	sk_buff_data_t	 end;      /* fin del buffer, antes de skb_shared_info */
+};
+```
+
+Las operaciones son aritmética de punteros, no `memcpy`:
+
+```c
+skb = alloc_skb(size, GFP_ATOMIC);      /* reserva head..end */
+skb_reserve(skb, MAX_HEADER);           /* headroom para cabeceras futuras */
+carga = skb_put(skb, payload_len);      /* extiende tail: zona de payload */
+th = skb_push(skb, sizeof(struct tcphdr));  /* antepone cabecera: data retrocede */
+skb_pull(skb, sizeof(struct tcphdr));   /* consume cabecera: data avanza (en RX) */
+```
+
+Al **bajar**, cada capa antepone su cabecera con `skb_push` —TCP, luego IP, luego Ethernet—; al **subir**, cada capa la consume con `skb_pull`. El `headroom` que `skb_reserve` aparta al principio garantiza que cada nivel tenga sitio para su cabecera sin reasignar. Y cuando el payload no cabe o no conviene en la parte lineal, vive en fragmentos paginados dentro de `skb_shared_info`: el `sk_buff` no lineal es la base del zero-copy y de GSO/GRO (nivel 42).
+
+## Bajar por la pila: IP, qdisc y el driver
+
+Una vez el segmento está listo y la ventana de congestión lo permite, `tcp_write_xmit` lo saca. `tcp_transmit_skb` construye la cabecera TCP con `skb_push`, calcula el checksum y lo entrega a `ip_queue_xmit`, que antepone la cabecera IP y resuelve la ruta. De ahí a `dev_queue_xmit`, que lo encola en la disciplina de tráfico (qdisc) del dispositivo, y finalmente al `ndo_start_xmit` del driver, que programa el descriptor de DMA y toca el timbre de la NIC.
+
+<Mermaid code={`flowchart TD
+  App[send desde la app] --> TS[tcp_sendmsg copia y segmenta]
+  TS --> WQ[cola sk_write_queue de sk_buffs]
+  WQ --> TX[tcp_transmit_skb antepone cabecera TCP]
+  TX --> IP[ip_queue_xmit antepone cabecera IP]
+  IP --> DQ[dev_queue_xmit encola en la qdisc]
+  DQ --> DRV[ndo_start_xmit del driver programa el DMA]
+  DRV --> NIC[la NIC pone los bytes en el cable]`} />
+
+## recv(): recoger de la cola y despertar al durmiente
+
+En recepción, el softirq de NAPI (nivel 44.1) sube el paquete por `tcp_v4_rcv` hasta `tcp_data_queue`, que lo encola en `sk->sk_receive_queue` y llama a `sk->sk_data_ready(sk)` —por defecto `sock_def_readable`—, que despierta a quien duerma en la cola de espera del socket y notifica a `poll`/`epoll`. El lector, por su parte, entra por `tcp_recvmsg`:
+
+```c
+/* net/ipv4/tcp.c, esqueleto de tcp_recvmsg */
+do {
+	skb = skb_peek(&sk->sk_receive_queue);
+	if (!skb) {
+		if (sk->sk_state != TCP_ESTABLISHED || !timeo)
+			break;                       /* nada mas que esperar */
+		sk_wait_data(sk, &timeo, NULL);      /* duerme hasta sk_data_ready */
+		continue;
+	}
+	used = min(skb->len - offset, len - copied);
+	skb_copy_datagram_msg(skb, offset, msg, used);  /* copia al usuario: copy_to_user */
+	copied += used;
+	if (consumido_entero)
+		sk_eat_skb(sk, skb);             /* libera el skb y ajusta la ventana */
+} while (copied < len);
+```
+
+`skb_copy_datagram_msg` es donde el dato cruza al espacio de usuario con `copy_to_user`. Ese `sk_wait_data` seguido del despertar por `sk_data_ready` es exactamente el mecanismo que hace que `epoll` sepa que un socket se volvió legible sin sondear: la llegada del paquete empuja el evento, no lo consulta el lector.
+
+<Callout type="warn" title="El tamaño del buffer no es el tamaño de la ventana">
+`sk_rcvbuf` limita cuánta memoria de socket puede acumular el receptor; la ventana anunciada a TCP se deriva de ese límite, pero no son lo mismo. Sube `SO_RCVBUF` (o deja que el autotuning de `tcp_rmem` lo haga) y la ventana crecerá, permitiendo más datos en vuelo en enlaces de alta latencia. Confundir ambos lleva a diagnósticos erróneos de throughput.
+</Callout>
+
+<Callout type="dios" title="Un paquete no se copia entre capas: se reanota">
+Detente en la mentira piadosa que te contaron sobre el modelo de capas. Los libros lo dibujan como muñecas rusas: cada nivel mete el paquete del nivel superior dentro de un sobre nuevo, y así se apilan las cabeceras. Físicamente eso es falso, y la falsedad importa. En el kernel hay **un** buffer y un cursor: los bytes están quietos mientras `data` se desliza sobre ellos, y una cabecera se "añade" moviendo el puntero hacia atrás y se "quita" moviéndolo hacia adelante. La encapsulación no es copia, es aritmética de punteros. De esa sola verdad brotan las dos caras del `sk_buff`: es rápido porque envolver un paquete cuesta un puntero, no un `memcpy`; y es difícil porque todas las capas comparten un mismo objeto mutable y deben respetar invariantes sobre quién posee el headroom, quién puede escribir y quién sostiene la última referencia. Y hay una segunda revelación cosida a la primera: el control de flujo, esa disciplina temible de no ahogar a un extremo lento, se reduce a dos enteros y una cola de espera. `sk_sndbuf` bloquea al escritor cuando la cola de salida se llena; `sk_rcvbuf` frena al emisor cerrando la ventana cuando la de entrada se acumula. La contrapresión de toda la red —el arte de acompasar productor y consumidor a través de un cable con latencia— no es un algoritmo elaborado sino el tamaño de estas colas y la contabilidad que duerme y despierta procesos contra ellas. Cuando ves el `sk_buff` como bytes quietos bajo un cursor que baja y sube, y los buffers de socket como las dos represas que regulan el caudal, la pila de red deja de ser un misterio de siete capas y se vuelve un mecanismo de una sola pieza que puedes razonar entero.
+</Callout>
+
+<Reto title="Sigue el byte">
+1. Dibuja los punteros `head`, `data`, `tail` y `end` de un `sk_buff` antes y después de un `skb_push` de la cabecera TCP; marca el headroom y el tailroom.
+2. En `tcp_sendmsg` localiza dónde ocurre la copia desde el usuario y dónde el socket se bloquea al llenarse `sk_sndbuf`.
+3. Con `ss -tmi` en tu máquina inspecciona los tamaños de buffer de un socket vivo y relaciónalos con `sk_sndbuf` y `sk_rcvbuf`.
+4. Explica por qué un `sk_buff` no lineal (fragmentos paginados) es el requisito previo del `sendfile` zero-copy (nivel 42.3).
+5. A partir de `sk_data_ready`, argumenta cómo `epoll` se entera de que un socket se volvió legible sin sondearlo en un bucle.
+</Reto>

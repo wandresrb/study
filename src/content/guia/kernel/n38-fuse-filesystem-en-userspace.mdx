@@ -1,0 +1,177 @@
+---
+title: "FUSE: un sistema de archivos en el espacio de usuario"
+description: "FUSE mueve la lógica del sistema de archivos a un daemon sin privilegios en userspace: el módulo `fuse` del kernel traduce cada operación del VFS en un mensaje que viaja por `/dev/fuse` hasta un proceso construido con libfuse, que responde y despierta a la tarea bloqueada. Vemos el puente, un ejemplo con libfuse y cuándo conviene FUSE frente a un sistema de archivos en el kernel."
+subject: kernel
+level: 38
+order: 5
+icon: "38.5"
+duracion: "17 min"
+---
+
+<Lead>
+Los cuatro niveles anteriores escribían el sistema de archivos **dentro** del kernel, donde un puntero mal calculado es un pánico y donde todo el código debe ser C bajo la licencia GPL. FUSE ofrece el camino opuesto: escribir la lógica en un programa de usuario corriente, en cualquier lenguaje, sin privilegios, que puede fallar sin llevarse el sistema por delante. El truco es un módulo genérico del kernel, `fuse`, que no implementa ningún sistema de archivos concreto: implementa un **puente**. Cada operación del VFS sobre un montaje FUSE se convierte en un mensaje que cruza a userspace, se resuelve allí y regresa. Este último nivel del track diseca ese puente, lo pone en marcha con libfuse y establece cuándo vale la pena cruzar la frontera.
+</Lead>
+
+<Objetivos>
+
+- Entender el puente kernel-usuario: el módulo `fuse`, `/dev/fuse` y el protocolo de peticiones.
+- Reconocer la API de libfuse y escribir un sistema de archivos FUSE mínimo.
+- Trazar el camino completo de una lectura desde el proceso hasta el daemon y de vuelta.
+- Decidir con criterio entre FUSE y un sistema de archivos en el kernel.
+
+</Objetivos>
+
+## El puente kernel-usuario
+
+Del lado del kernel, FUSE es un sistema de archivos como cualquiera de los que escribimos: registra un `file_system_type`, rellena las cuatro tablas. La diferencia es que sus operaciones no resuelven nada por sí mismas. Cuando el VFS invoca, digamos, el `read_folio` de un inodo FUSE, el módulo empaqueta la petición en un mensaje con una cabecera fija, le asigna un identificador único y lo encola en el dispositivo de carácter `/dev/fuse`. Al otro lado, un daemon de usuario lee ese mensaje, lo resuelve y escribe la respuesta con el mismo identificador; el módulo la casa con la petición y despierta a la tarea que dormía. El protocolo es una estructura de la ABI del kernel:
+
+```c
+/* include/uapi/linux/fuse.h (recortado) */
+struct fuse_in_header {
+	uint32_t	len;
+	uint32_t	opcode;   /* FUSE_LOOKUP, FUSE_GETATTR, FUSE_READ, FUSE_WRITE... */
+	uint64_t	unique;   /* casa la respuesta con esta peticion */
+	uint64_t	nodeid;   /* el inodo destino, referido por un numero opaco */
+	uint32_t	uid;
+	uint32_t	gid;
+	uint32_t	pid;
+	/* ... */
+};
+
+struct fuse_out_header {
+	uint32_t	len;
+	int32_t		error;    /* 0 en exito, o -errno */
+	uint64_t	unique;   /* el mismo unique de la peticion */
+};
+```
+
+El primer mensaje que cruza siempre es `FUSE_INIT`, que negocia la versión del protocolo y las capacidades. A partir de ahí, cada `open`, `lookup`, `read` o `write` del proceso se traduce en su opcode y viaja por el mismo canal.
+
+<Mermaid code={`flowchart TD
+  APP[Proceso lee un archivo FUSE] --> VFS[Capa VFS]
+  VFS --> KMOD[Modulo fuse del kernel]
+  KMOD -->|encola FUSE_READ con unique| DEV[Cola en dev fuse]
+  DEV --> D[Daemon libfuse en userspace]
+  D --> LOGIC[Ejecuta el callback read]
+  LOGIC -->|escribe fuse_out_header| DEV
+  DEV --> KMOD
+  KMOD -->|despierta la tarea bloqueada| VFS
+  VFS --> APP`} />
+
+## Un sistema de archivos FUSE mínimo
+
+Nadie escribe ese protocolo a mano: libfuse lo encapsula. Su **API de alto nivel** te deja pensar en rutas y devolver estructuras `stat`, ocultando por completo los inodos y los mensajes. Un sistema de archivos que expone un único archivo de solo lectura cabe en una pantalla:
+
+```c
+#define FUSE_USE_VERSION 314
+#include <fuse.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+
+static const char *hello_path = "/hola";
+static const char *hello_str  = "hola desde userspace\n";
+
+static int hello_getattr(const char *path, struct stat *st,
+			 struct fuse_file_info *fi)
+{
+	memset(st, 0, sizeof(*st));
+	if (strcmp(path, "/") == 0) {
+		st->st_mode = S_IFDIR | 0755;
+		st->st_nlink = 2;
+	} else if (strcmp(path, hello_path) == 0) {
+		st->st_mode = S_IFREG | 0444;
+		st->st_nlink = 1;
+		st->st_size = strlen(hello_str);
+	} else {
+		return -ENOENT;
+	}
+	return 0;
+}
+
+static int hello_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+			 off_t off, struct fuse_file_info *fi,
+			 enum fuse_readdir_flags flags)
+{
+	if (strcmp(path, "/") != 0)
+		return -ENOENT;
+	filler(buf, ".",  NULL, 0, 0);
+	filler(buf, "..", NULL, 0, 0);
+	filler(buf, hello_path + 1, NULL, 0, 0);   /* nombre sin la barra */
+	return 0;
+}
+
+static int hello_read(const char *path, char *buf, size_t size, off_t off,
+		      struct fuse_file_info *fi)
+{
+	size_t len = strlen(hello_str);
+
+	if (off >= len)
+		return 0;
+	if (off + size > len)
+		size = len - off;
+	memcpy(buf, hello_str + off, size);
+	return size;
+}
+
+static const struct fuse_operations hello_ops = {
+	.getattr = hello_getattr,
+	.readdir = hello_readdir,
+	.read    = hello_read,
+};
+
+int main(int argc, char *argv[])
+{
+	return fuse_main(argc, argv, &hello_ops, NULL);   /* monta y sirve peticiones */
+}
+```
+
+`fuse_main` abre `/dev/fuse`, monta el sistema y entra en el bucle que lee peticiones y las despacha a tus callbacks. Compilar y montar no requiere ser root:
+
+```bash
+cc hello.c -o hello $(pkg-config fuse3 --cflags --libs)
+
+mkdir -p /tmp/pt
+./hello /tmp/pt            # lanza el daemon y monta en /tmp/pt
+
+cat /tmp/pt/hola          # -> hola desde userspace
+ls  /tmp/pt               # -> hola
+
+fusermount3 -u /tmp/pt    # desmonta sin privilegios de root
+```
+
+<Callout type="info" title="Alto nivel frente a bajo nivel">
+libfuse ofrece dos API. La de **alto nivel** que ves aquí, basada en rutas, es cómoda pero obliga a la biblioteca a resolver cada ruta en cada operación. La de **bajo nivel** (`struct fuse_lowlevel_ops`) trabaja con `nodeid` de inodos y `FUSE_LOOKUP` explícitos, exactamente como el protocolo del kernel; es más verbosa pero permite cachés de inodos y el máximo rendimiento. sshfs y los sistemas serios usan la de bajo nivel.
+</Callout>
+
+## Cuándo FUSE y cuándo el kernel
+
+La decisión gira en torno a una sola frontera: cada operación FUSE cruza del kernel a userspace y vuelve, con su cambio de contexto y su copia de datos. Ese peaje es la desventaja histórica de FUSE en rendimiento, y la ventaja en todo lo demás.
+
+<Cards>
+  <Card icon="🛡️" title="FUSE conviene cuando">
+    Un fallo no debe tumbar el kernel, quieres desarrollar rápido en cualquier lenguaje, o el backend es una red o una base de datos: sshfs, rclone sobre S3, gocryptfs, prototipos y montajes por usuario.
+  </Card>
+  <Card icon="⚙️" title="El kernel conviene cuando">
+    El rendimiento y la latencia mandan y el formato es estable: ext4, xfs, btrfs, f2fs. Un bug es un pánico o un exploit, y el coste de desarrollo y auditoría es alto, pero no hay peaje de frontera.
+  </Card>
+  <Card icon="🚀" title="El peaje, en 2026">
+    `passthrough` (6.9) delega `read` y `write` directo a un archivo de respaldo sin pasar por el daemon; FUSE sobre `io_uring` (6.14) sustituye el sondeo de `/dev/fuse` por un anillo compartido y recorta drásticamente el coste por petición.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="El daemon es una dependencia del sistema montado">
+Si el proceso libfuse muere o se cuelga, el montaje queda inservible: todo acceso se bloquea o devuelve errores hasta que alguien lo desmonta. Un sistema de archivos en el kernel no tiene ese punto único de fallo en userspace, pero a cambio un error suyo no se contiene: se propaga al kernel entero. Es exactamente el intercambio entre aislamiento y acoplamiento.
+</Callout>
+
+<Callout type="dios" title="FUSE invierte la frontera de confianza: el sistema de archivos deja de ser el kernel y pasa a ser un servidor al que el kernel llama">
+Levanta la vista sobre FUSE y verás que no es un truco de conveniencia, sino una idea arquitectónica profunda injertada en un kernel monolítico. Durante todo este track, el sistema de archivos **era** el kernel: código privilegiado, en el mismo espacio de direcciones que el planificador y la gestión de memoria, capaz de corromper cualquier cosa y obligado a no equivocarse jamás. FUSE invierte esa relación. El sistema de archivos se convierte en un **servidor** —un proceso de usuario, sin privilegios, aislado— y el kernel se convierte en su **cliente**: cuando necesita leer un byte, no lo calcula, lo *pide*, cruzando la frontera de protección que separa los dos dominios. Esta es, literalmente, la tesis del microkernel —la de Mach y HURD, la de convertir cada servicio del sistema operativo en un proceso que se comunica por mensajes— realizada dentro de Linux, que es el monolito por antonomasia. Y como toda encarnación de esa tesis, FUSE hereda su dilema fundamental, que no es un detalle de implementación sino una ley: cruzar una frontera de protección cuesta. Cuesta un cambio de contexto, cuesta una copia, cuesta latencia, y ningún ingenio elimina ese coste, solo lo amortiza. Por eso el debate FUSE contra kernel no es un debate de gustos ni de madurez de la tecnología: es la frontera usuario-kernel hecha decisión de diseño. Pones la lógica del sistema de archivos del lado seguro y flexible de la frontera y pagas el peaje de cruzarla en cada operación; o la pones del lado rápido y peligroso y no pagas peaje pero arriesgas el sistema entero. Lo fascinante de 2026 es que el kernel intenta tener las dos cosas a la vez: `passthrough` deja que los datos masivos salten la frontera una sola vez y fluyan directos a un archivo de respaldo, y FUSE sobre `io_uring` reemplaza el goteo de mensajes por un anillo de memoria compartida que amortiza el cruce sobre miles de peticiones. Son intentos de acercar el rendimiento de userspace al del kernel sin renunciar al aislamiento, y son la frontera de investigación del subsistema. Pero el dilema de fondo permanece intacto, porque es el mismo dilema que define a los sistemas operativos desde que existen: dónde trazas la línea entre lo que confías y lo que aíslas, y cuánto estás dispuesto a pagar por cruzarla.
+</Callout>
+
+<Reto title="Cruza la frontera con FUSE">
+1. Compila y monta el ejemplo `hello`, y con `strace -f` sobre el daemon observa las lecturas y escrituras sobre `/dev/fuse` que corresponden a un solo `cat`.
+2. Añade un callback `.write` y un `.mkdir` a `hello_ops` y describe qué opcode del protocolo dispara cada uno.
+3. Traza, con la ayuda del diagrama, el camino completo de un `cat` desde el proceso hasta el daemon y de vuelta, nombrando la estructura que viaja en cada sentido.
+4. Enumera tres sistemas de archivos FUSE reales y justifica en cada uno por qué userspace fue la elección correcta frente al kernel.
+5. Explica qué problema de rendimiento resuelven `passthrough` y FUSE sobre `io_uring`, y por qué ninguno de los dos elimina del todo el coste de la frontera.
+</Reto>

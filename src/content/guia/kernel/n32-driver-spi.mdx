@@ -1,0 +1,186 @@
+---
+title: "Un driver SPI: spi_message, spi_sync y los modos de reloj"
+description: "Construir un struct spi_driver y configurar el dispositivo con spi_setup, componer transferencias con struct spi_transfer y struct spi_message, distinguir spi_sync de spi_async y los ayudantes spi_write_then_read, y entender los cuatro modos SPI donde CPOL y CPHA fijan la polaridad y la fase del reloj."
+subject: kernel
+level: 32
+order: 3
+icon: "32.3"
+duracion: "16 min"
+---
+
+<Lead>
+Un driver SPI comparte el esqueleto del driver I2C —`probe`, tablas de emparejamiento, `module_spi_driver`—, pero la unidad de transferencia cambia de raíz. En SPI no hay direcciones ni tramas estándar: compones una `spi_message` con una o varias `spi_transfer`, y el controlador la ejecuta como un intercambio full-duplex atómico, con el chip select mantenido de principio a fin. Y antes de la primera palabra debes pactar con el chip la polaridad y la fase del reloj —los cuatro modos SPI—, porque un desacuerdo de una sola de esas dos elecciones desalinea cada bit y solo lees basura.
+</Lead>
+
+<Objetivos>
+
+- Construir un `struct spi_driver` y configurar el dispositivo con `spi_setup`.
+- Componer transferencias con `struct spi_transfer` y `struct spi_message`.
+- Distinguir `spi_sync` de `spi_async` y usar los ayudantes `spi_write_then_read`.
+- Entender los modos SPI y cómo `CPOL` y `CPHA` fijan el muestreo del reloj.
+
+</Objetivos>
+
+## El esqueleto: struct spi_driver y spi_setup
+
+La plantilla es gemela de la de I2C, con `probe` recibiendo un `spi_device`. La diferencia es que aquí sueles fijar los parámetros eléctricos —modo, anchura de palabra, frecuencia máxima— y llamar a `spi_setup`, que los negocia con el controlador y configura el chip select:
+
+```c
+#include <linux/spi/spi.h>
+#include <linux/mod_devicetable.h>
+#include <linux/module.h>
+
+#define AD7292_RD  0x80              /* bit alto del byte de comando: lectura */
+
+struct ad7292 {
+	struct spi_device *spi;
+};
+
+static int ad7292_probe(struct spi_device *spi)
+{
+	struct ad7292 *st;
+	int ret;
+
+	st = devm_kzalloc(&spi->dev, sizeof(*st), GFP_KERNEL);
+	if (!st)
+		return -ENOMEM;
+	st->spi = spi;
+	spi_set_drvdata(spi, st);
+
+	spi->mode = SPI_MODE_0;          /* CPOL=0, CPHA=0 */
+	spi->bits_per_word = 8;
+	spi->max_speed_hz = 20 * 1000 * 1000;
+	ret = spi_setup(spi);            /* valida contra las capacidades del controlador */
+	if (ret)
+		return dev_err_probe(&spi->dev, ret, "spi_setup fallo\n");
+
+	return 0;
+}
+```
+
+El registro del driver es idéntico en forma al de I2C, con `module_spi_driver`:
+
+```c
+static const struct spi_device_id ad7292_id[] = {
+	{ "ad7292" },
+	{ }
+};
+MODULE_DEVICE_TABLE(spi, ad7292_id);
+
+static const struct of_device_id ad7292_of_match[] = {
+	{ .compatible = "adi,ad7292" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, ad7292_of_match);
+
+static struct spi_driver ad7292_driver = {
+	.driver = {
+		.name = "ad7292",
+		.of_match_table = ad7292_of_match,
+	},
+	.probe    = ad7292_probe,
+	.id_table = ad7292_id,
+};
+module_spi_driver(ad7292_driver);
+
+MODULE_DESCRIPTION("Driver minimo del ADC AD7292 por SPI");
+MODULE_LICENSE("GPL");
+```
+
+`spi_setup` comprueba que el modo y la velocidad que pides caben en lo que el controlador (`spi->controller`, antes llamado *master*) puede dar; si el chip requiere un modo imposible en esa placa, falla aquí y no misteriosamente en la primera lectura.
+
+## spi_message y spi_transfer: la unidad de transferencia
+
+Una `spi_transfer` describe un segmento: un `tx_buf`, un `rx_buf` y una longitud común. Ambos búferes son opcionales, pero la clave del bus asoma aquí: si pones los dos, el segmento es full-duplex —salen los bytes de `tx` mientras entran los de `rx` en los mismos pulsos de reloj—. Una `spi_message` encadena una o más transferencias y se ejecuta como **un solo intercambio atómico**, con el `CS` bajado durante toda ella. La lectura de un registro suele ser un único segmento full-duplex: envías el comando y, en los pulsos siguientes, recoges la respuesta que el chip va desplazando:
+
+```c
+static int ad7292_read_reg(struct ad7292 *st, u8 reg, u16 *val)
+{
+	u8 tx[3] = { AD7292_RD | reg, 0, 0 };
+	u8 rx[3];
+	struct spi_transfer xfer = {
+		.tx_buf = tx,
+		.rx_buf = rx,
+		.len    = sizeof(tx),    /* full-duplex: sale tx, entra rx a la vez */
+	};
+	struct spi_message msg;
+	int ret;
+
+	spi_message_init(&msg);
+	spi_message_add_tail(&xfer, &msg);
+	ret = spi_sync(st->spi, &msg);   /* baja CS, transfiere, sube CS */
+	if (ret)
+		return ret;
+
+	*val = (rx[1] << 8) | rx[2];     /* el dato llega tras el byte de comando */
+	return 0;
+}
+```
+
+Fíjate en el desfase: la respuesta aparece en `rx[1]` y `rx[2]`, no en `rx[0]`, porque en los primeros ocho pulsos —mientras sale el comando— el chip aún no tiene nada que decir y desplaza ceros. El anillo de registros de desplazamiento explica por qué la lectura llega retrasada por la longitud del comando.
+
+## spi_sync frente a spi_async y los ayudantes
+
+`spi_sync` bloquea hasta terminar: duerme, así que solo vale en contexto de proceso. `spi_async` encola la mensaje y vuelve enseguida, invocando un callback de finalización, apto para caminos donde no puedes dormir. Para el patrón half-duplex habitual —escribir un comando y leer la respuesta— hay envoltorios que ahorran la ceremonia:
+
+```c
+/* escribir n bytes y leer n bytes, por separado */
+ret = spi_write(spi, tx, n);
+ret = spi_read(spi, rx, n);
+
+/* escribir y LUEGO leer, con CS mantenido: el patron de registro */
+u8 cmd = AD7292_RD | reg;
+u8 rx[2];
+ret = spi_write_then_read(spi, &cmd, 1, rx, sizeof(rx));
+
+/* atajos de una linea para registros pequenos */
+u8  v8  = spi_w8r8(spi, cmd);        /* escribe 8 bits, lee 8 */
+u16 v16 = spi_w8r16be(spi, cmd);     /* escribe 8, lee 16 big-endian */
+```
+
+`spi_write_then_read` usa un búfer interno rebote de tamaño acotado, pero mantiene el `CS` bajado entre la escritura y la lectura, que es justo el análogo del start repetido de I2C: sin soltar al chip entre el comando y su respuesta.
+
+<Callout type="warn" title="spi_sync duerme: nunca desde contexto atómico">
+`spi_sync`, `spi_write`, `spi_read` y `spi_write_then_read` pueden dormir esperando a que el controlador termine la transferencia. Llamarlos desde un manejador de interrupción de línea dura, bajo un spinlock o en cualquier contexto atómico es un error que `might_sleep` cazará con las comprobaciones de depuración activas. Si necesitas SPI desde un contexto que no puede dormir, usa `spi_async` con su callback, o difiere el trabajo a un hilo con un `threaded IRQ` o una workqueue.
+</Callout>
+
+## Modos SPI: CPOL y CPHA
+
+Un bit en un cable no significa nada sin un acuerdo sobre cuándo mirarlo. SPI codifica ese acuerdo en dos elecciones. `CPOL` (polaridad) fija el nivel del reloj en reposo: 0 es reposo bajo, 1 es reposo alto. `CPHA` (fase) fija en qué flanco se muestrea el dato: 0 es el primer flanco de cada ciclo, 1 es el segundo. Sus cuatro combinaciones son los modos 0 a 3, y ambos extremos deben coincidir o cada bit se lee en el instante equivocado:
+
+<Cards>
+  <Card icon="🕛" title="Modo 0 — CPOL 0, CPHA 0">
+    Reloj en reposo bajo; el dato se muestrea en el primer flanco (subida). El modo más común, el de la mayoría de sensores y ADC.
+  </Card>
+  <Card icon="🕐" title="Modo 1 — CPOL 0, CPHA 1">
+    Reposo bajo; muestreo en el segundo flanco (bajada). El dato se coloca en subida y se lee en bajada.
+  </Card>
+  <Card icon="🕕" title="Modo 2 — CPOL 1, CPHA 0">
+    Reloj en reposo alto; muestreo en el primer flanco (bajada). El espejo del modo 0 con el reloj invertido.
+  </Card>
+  <Card icon="🕖" title="Modo 3 — CPOL 1, CPHA 1">
+    Reposo alto; muestreo en el segundo flanco (subida). Frecuente en flash y en muchas pantallas.
+  </Card>
+</Cards>
+
+Junto a `SPI_MODE_0` hasta `SPI_MODE_3`, el campo `spi->mode` admite banderas para casos menos ortodoxos: `SPI_CS_HIGH` si el chip select es activo a uno, `SPI_LSB_FIRST` si el bit menos significativo va primero, `SPI_3WIRE` para un solo hilo de datos bidireccional, o `SPI_TX_QUAD` para las flash de cuatro líneas.
+
+<Mermaid code={`flowchart LR
+  subgraph RING [Anillo full-duplex un bit por pulso]
+    CTRL[Registro de desplazamiento del controlador] -->|MOSI| PERI[Registro del periferico]
+    PERI -->|MISO| CTRL
+  end
+  SCLK[SCLK marca cada pulso de reloj] --> RING
+  CS[CS abre y cierra la transaccion] --> RING`} />
+
+<Callout type="dios" title="En SPI no hay lectura ni escritura: solo intercambio">
+Detente en la verdad física que el API se esfuerza por ocultarte. En SPI no existe la operación de leer ni la de escribir; existe una sola: el intercambio. Cada pulso de reloj empuja un bit fuera por `MOSI` y, en el mismo instante, arrastra otro dentro por `MISO`. No son dos operaciones que ocurren a la vez: son la misma operación vista desde los dos extremos del anillo de registros de desplazamiento. Cuando llamas a `spi_read`, el hardware sigue desplazando bytes hacia afuera —basura que el chip ignora— porque no sabe leer sin escribir; y cuando llamas a `spi_write`, entra por `MISO` un eco que tú descartas. El half-duplex cómodo de `spi_write` y `spi_read` es una ficción amable construida sobre un bus que solo sabe intercambiar. De esa misma raíz brotan las dos disciplinas del nivel. Los modos revelan que un bit no tiene significado propio: un uno en `MISO` no es nada hasta que un acuerdo sobre `CPOL` y `CPHA` decide en qué flanco mirarlo; el dato no vive en el cable, vive en la convención compartida de cuándo muestrearlo. Y el chip select revela que SPI, que carece de tramas en hardware, reimpone el marco en software: la `spi_message` con su `CS` mantenido es la transacción atómica que el bus no te da y que el driver reconstruye. Interioriza que programas un anillo, no un canal de ida y otro de vuelta, y que cada bit es a la vez pregunta y respuesta, y el desfase de la respuesta en `rx`, el retraso del dato tras el comando y la obsesión con el modo dejarán de ser detalles caprichosos para convertirse en la geometría inevitable de un intercambio simultáneo.
+</Callout>
+
+<Reto title="Construye y depura un intercambio">
+1. Esboza un `spi_driver` con `probe` que fije `SPI_MODE_0`, 8 bits por palabra y 10 MHz, y llame a `spi_setup`.
+2. Escribe una lectura de registro con una `spi_transfer` full-duplex y explica en qué índice de `rx` aparece el dato y por qué.
+3. Reescribe esa lectura con `spi_write_then_read` y razona qué papel cumple el `CS` mantenido entre las dos fases.
+4. Dibuja los cuatro modos indicando, para cada uno, nivel de reposo y flanco de muestreo, y di cuál usa una flash típica.
+5. Explica por qué llamar a `spi_sync` desde un manejador de IRQ de línea dura es un error y cómo lo resolverías.
+</Reto>

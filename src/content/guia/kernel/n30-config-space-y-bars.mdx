@@ -1,0 +1,120 @@
+---
+title: "El espacio de configuración y los BARs"
+description: "Los 256 bytes del espacio de configuración PCI (y los 4 KiB extendidos de PCIe) por los que el kernel descubre un dispositivo. La cabecera estándar, el registro de comando, y los Base Address Registers: cómo un BAR declara su tamaño con el truco de escribir unos, y cómo el kernel expone el recurso con pci_resource_start/len/flags."
+subject: kernel
+level: 30
+order: 2
+icon: "30.2"
+duracion: "16 min"
+---
+
+<Lead>
+Antes de que un dispositivo PCI pueda hacer nada útil, el kernel necesita saber qué es y qué recursos reclama. Toda esa información vive en el **espacio de configuración**: una ventana estándar, pequeña y siempre en el mismo sitio, que el software lee para arrancar el descubrimiento de todo lo demás. Y dentro de esa ventana están los BARs, los registros por los que un dispositivo anuncia cuánta memoria del mapa físico necesita para exponer sus registros. El BAR es la negociación entre hardware y software por el mapa de direcciones.
+</Lead>
+
+<Objetivos>
+
+- Situar el espacio de configuración como el punto de entrada estándar para descubrir un dispositivo.
+- Leer campos de la cabecera con `pci_read_config_word`/`dword` y el registro `PCI_COMMAND`.
+- Entender qué codifica un BAR: memoria frente a E/S, 32 frente a 64 bits, prefetchable.
+- Descubrir el tamaño de un BAR con el truco de escribir unos, y usar `pci_resource_*`.
+
+</Objetivos>
+
+## El espacio de configuración: la ventana de arranque
+
+Cada función PCI expone **256 bytes** de espacio de configuración; PCIe lo extiende a **4096**, con capacidades avanzadas (AER, control de energía, MSI-X) más allá del desplazamiento `0x100`. Los primeros 64 bytes son la **cabecera estándar**, con un formato fijo: `Vendor ID`, `Device ID`, los registros de `command` y `status`, el `class code`, el `header type` y —crucialmente— los BARs.
+
+Históricamente se accedía por dos puertos de E/S (`0xCF8`/`0xCFC`); hoy PCIe lo mapea en memoria (ECAM/MMCONFIG). El kernel abstrae ambos caminos tras una API portable que nunca falla por el mecanismo subyacente:
+
+```c
+u16 vendor, cmd, status;
+u8  htype;
+
+pci_read_config_word(pdev, PCI_VENDOR_ID, &vendor);   /* desplazamiento 0x00 */
+pci_read_config_word(pdev, PCI_COMMAND,   &cmd);      /* 0x04 */
+pci_read_config_word(pdev, PCI_STATUS,    &status);   /* 0x06 */
+pci_read_config_byte(pdev, PCI_HEADER_TYPE, &htype);  /* 0x0e */
+```
+
+El **registro de comando** es el interruptor maestro del dispositivo. Sus bits habilitan la decodificación de espacio de E/S (`PCI_COMMAND_IO`), de memoria (`PCI_COMMAND_MEMORY`) y el bus mastering (`PCI_COMMAND_MASTER`, que verás en 30.5). Mientras `PCI_COMMAND_MEMORY` esté a cero, los accesos a los BARs de memoria del dispositivo no llegan: por eso `pci_enable_device` es obligatorio antes de tocar nada.
+
+<Callout type="warn" title="No escribas la cabecera a mano">
+Leer el espacio de configuración desde un driver está bien para diagnóstico. Escribirlo directamente casi nunca: el kernel ya programó los BARs, los números de bus y el registro de comando durante la enumeración. Toca `PCI_COMMAND` a través de `pci_enable_device`/`pci_set_master`, no con `pci_write_config_word` a pelo, o pelearás con el núcleo por el mismo registro.
+</Callout>
+
+## Los BARs: la ventana del dispositivo en el mapa físico
+
+Un dispositivo tiene registros —de control, de estado, colas— que la CPU necesita alcanzar con simples `load` y `store`. Para eso, esos registros se **mapean** en el espacio de direcciones físico de la CPU: un acceso a esa dirección se convierte en una transacción PCIe hacia el dispositivo. Eso es **MMIO**. Los **Base Address Registers** son los seis registros (en una cabecera de tipo 0) por los que el dispositivo declara *cuánto* espacio necesita y por los que el software le dice *dónde* vivirá.
+
+<Mermaid code={`flowchart LR
+  CPU[CPU ejecuta load y store] -->|direccion del BAR0| W0[Ventana MMIO en el espacio fisico]
+  W0 -->|transaccion PCIe| DEV[Registros del dispositivo]
+  RAM[RAM del sistema del mismo espacio fisico] --- CPU`} />
+
+Los bits bajos de un BAR no forman parte de la dirección: son un descriptor de tipo. El bit 0 distingue un BAR de **memoria** (0) de uno de **E/S** (1). En un BAR de memoria, los bits 1 y 2 dicen la anchura: `00` es de 32 bits, `10` es de 64 bits —y entonces consume **dos** registros consecutivos, uno con la parte baja y otro con la alta—. El bit 3 marca si la región es *prefetchable*, es decir, si la CPU puede leer por adelantado sin efectos secundarios.
+
+## El truco del sizing: cómo un BAR declara su tamaño
+
+Un BAR no tiene un campo "tamaño". El tamaño se **deduce**: los bits de dirección que el dispositivo realmente decodifica son escribibles; los de más abajo están cableados a cero. Así que para medir un BAR se escriben todos unos y se lee cuánto "pegó". Los bits que quedaron a cero marcan el tamaño, que siempre es potencia de dos. El kernel hace esto durante la enumeración; reproducirlo ilustra la mecánica:
+
+```c
+u32 orig, probe;
+
+pci_read_config_dword(pdev, PCI_BASE_ADDRESS_0, &orig);
+pci_write_config_dword(pdev, PCI_BASE_ADDRESS_0, 0xffffffff);
+pci_read_config_dword(pdev, PCI_BASE_ADDRESS_0, &probe);
+pci_write_config_dword(pdev, PCI_BASE_ADDRESS_0, orig);   /* restaurar SIEMPRE */
+
+probe &= PCI_BASE_ADDRESS_MEM_MASK;   /* descartar los 4 bits bajos de tipo */
+pr_info("tamano del BAR0 = %u bytes\n", ~probe + 1);  /* complemento a dos */
+```
+
+Como el kernel ya midió y programó cada BAR con una dirección física real, **un driver jamás repite este ritual**. Lo que consume es el resultado ya cocinado, a través de tres macros que leen los recursos del `struct pci_dev`:
+
+```c
+resource_size_t base  = pci_resource_start(pdev, 0);  /* direccion fisica del BAR0 */
+resource_size_t len   = pci_resource_len(pdev, 0);    /* tamano decodificado */
+unsigned long   flags = pci_resource_flags(pdev, 0);
+
+if (flags & IORESOURCE_MEM)
+	dev_info(&pdev->dev, "BAR0 MMIO en %pa, %llu bytes\n",
+		 &base, (unsigned long long)len);
+else if (flags & IORESOURCE_IO)
+	dev_info(&pdev->dev, "BAR0 es espacio de E/S\n");
+```
+
+<Cards>
+  <Card icon="🗺️" title="BAR de memoria (MMIO)">
+    El caso moderno. Los registros del dispositivo viven en el espacio físico y se acceden con `readl`/`writel`. Puede ser de 64 bits y prefetchable. Es lo que mapearás con `pci_iomap` en 30.3.
+  </Card>
+  <Card icon="🚪" title="BAR de E/S (I/O port)">
+    El caso legacy. Un rango del viejo espacio de puertos de E/S, accedido con `inb`/`outb`. Limitado y en desuso; casi ningún dispositivo PCIe nuevo lo usa salvo por compatibilidad.
+  </Card>
+</Cards>
+
+## Las capacidades: la lista enlazada del config space
+
+Más allá de la cabecera fija, el espacio de configuración guarda una **lista enlazada de capacidades**: bloques opcionales que declaran funciones avanzadas —gestión de energía, `MSI`, `MSI-X`, PCIe nativo, reporte de errores—. Cada bloque lleva un identificador y un puntero al siguiente, y el kernel la recorre por ti. Para localizar una capacidad estándar usas `pci_find_capability`; para las extendidas de PCIe, más allá del desplazamiento `0x100`, `pci_find_ext_capability`:
+
+```c
+int msix = pci_find_capability(pdev, PCI_CAP_ID_MSIX);
+if (msix)
+	dev_info(&pdev->dev, "soporta MSI-X, capacidad en offset 0x%x\n", msix);
+
+/* capacidad extendida de PCIe: reporte avanzado de errores */
+int aer = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_ERR);
+```
+
+Esa lista es la razón por la que la lección 30.4 podrá preguntarle al dispositivo "¿hablas MSI-X?" sin adivinar: la respuesta está grabada en una capacidad del config space, y `pci_alloc_irq_vectors` la consulta por debajo antes de elegir el mecanismo de interrupción. El config space no es solo una cabecera estática, sino un directorio extensible por el que el hardware sigue declarando lo que sabe hacer.
+
+<Callout type="dios" title="El config space es el bootstrap: una dirección conocida para hallar todas las desconocidas">
+Aquí se esconde un problema de arranque tan viejo como elegante, el mismo que resuelve un gestor de arranque o la tabla de vectores de una CPU: para hablar con un dispositivo necesitas saber en qué direcciones viven sus registros, pero esas direcciones las anuncia el propio dispositivo... en una de sus direcciones. Es una recursión que hay que romper con un punto fijo. PCI la rompe con el **espacio de configuración**: una ventana en una posición estándar, de tamaño fijo y mecanismo de acceso universal, que no hay que descubrir porque se conoce de antemano. A través de ese único agujero conocido, el software lee los BARs y averigua dónde están *todos los demás* agujeros —las ventanas MMIO reales, que sí varían de dispositivo a dispositivo y de arranque a arranque. Y el BAR mismo encierra otra inversión preciosa: no es el hardware quien decide dónde vive en el mapa físico, sino el software quien se lo asigna, tras preguntarle cuánto espacio necesita mediante el truco de escribir unos. El dispositivo declara un *apetito* —"quiero 16 KiB alineados"— y el sistema operativo, que tiene la vista global del mapa de direcciones, le concede una *dirección*. Config space y BARs son, juntos, el protocolo por el que dos partes que no se conocen —un chip fabricado años antes y un kernel compilado ayer— negocian desde cero un espacio de direcciones compartido. Cuando ves MMIO no como "registros en memoria" sino como el resultado de esa negociación, entiendes por qué `pci_resource_start` te devuelve una dirección que nadie hardcodeó: la pactaron el silicio y el núcleo en el instante del arranque.
+</Callout>
+
+<Reto title="Diseca los BARs de un dispositivo real">
+1. Ejecuta `lspci -v` sobre tu NVMe y anota sus regiones: cuáles son *Memory*, cuáles de 64 bits, cuáles prefetchable.
+2. Abre `/sys/bus/pci/devices/<BDF>/resource` y descifra las líneas: dirección de inicio, fin y flags de cada BAR.
+3. Toma el tamaño de un BAR y verifica a mano que es potencia de dos; explica por qué el truco de escribir unos garantiza que siempre lo sea.
+4. Encuentra un BAR de 64 bits y razona por qué ocupa dos entradas de BAR consecutivas y qué pasaría si el dispositivo solo tuviera BARs de 32 bits en una máquina con la RAM por encima de los 4 GiB.
+</Reto>

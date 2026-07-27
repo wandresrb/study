@@ -1,0 +1,123 @@
+---
+title: "SIMD: autovectorización, std::simd portable y cuándo bajar a los intrinsics"
+description: "Una instrucción que opera sobre varios datos a la vez. Tres modos de acceder a SIMD en Rust: la autovectorización gratuita del compilador y sus fragilidades, std::simd (portable_simd) con carriles explícitos y portables, y los intrinsics de std::arch para el control absoluto. Por qué la reducción de floats no se autovectoriza, cómo target-cpu native abre instrucciones anchas, y cuándo vale la pena escribir SIMD a mano."
+subject: rust
+level: 49
+order: 3
+icon: "49.3"
+duracion: "19 min"
+---
+
+<Lead>
+Un procesador moderno esconde un paralelismo que casi nadie usa: sus registros vectoriales pueden aplicar **una sola instrucción a varios datos a la vez** —sumar ocho `f32` de un golpe, comparar dieciséis `u8` en un ciclo—. Es SIMD (*single instruction, multiple data*), y en cargas numéricas —gráficos, audio, álgebra, parsing— multiplica el rendimiento por el número de carriles. Rust ofrece tres maneras de aprovecharlo, en escalera de esfuerzo y control: dejar que el compilador **autovectorice** tus bucles gratis, escribir SIMD **portable** con `std::simd`, o bajar a los **intrinsics** específicos de la arquitectura. La destreza no está en saber escribir intrinsics, sino en saber en qué peldaño quedarte —y casi siempre el peldaño correcto es más bajo de lo que crees.
+</Lead>
+
+<Objetivos>
+
+- Explicar qué es SIMD y los tres modos de acceso, del más automático al más manual.
+- Provocar y verificar la autovectorización, y reconocer qué la rompe.
+- Escribir un núcleo con `std::simd` (portable_simd) manejando los carriles y la cola.
+- Decidir con criterio —y tras medir— cuándo bajar a los intrinsics de `std::arch`.
+
+</Objetivos>
+
+## SIMD y la autovectorización gratuita
+
+El primer peldaño no cuesta nada: el compilador, vía LLVM, **autovectoriza** los bucles sencillos a partir de `opt-level` 2. Un bucle que suma dos slices elemento a elemento puede compilarse a instrucciones que procesan varios elementos por iteración, sin que tú escribas nada especial. El problema es que la autovectorización es **frágil**: depende de que el optimizador *demuestre* que la transformación es segura y equivalente, y cualquier obstáculo la desactiva en silencio. Una rama dentro del bucle, un posible solapamiento de punteros, una llamada que no puede inlinear, o una dependencia entre iteraciones bastan para que renuncie.
+
+El caso más instructivo es la **reducción de flotantes**. Sumar un `&[f32]` en un acumulador no se autovectoriza por defecto, y la razón es matemática, no técnica: la suma en coma flotante **no es asociativa** —reordenarla cambia el redondeo—, así que sumar en paralelo por carriles daría un resultado numéricamente distinto, y el compilador se niega a alterar tus resultados sin permiso. Con enteros, donde la suma sí es asociativa, la reducción se vectoriza sin drama.
+
+```bash
+# La linea base es conservadora; target-cpu=native abre AVX2 o AVX-512 de tu maquina.
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+Por defecto Rust compila para una línea base antigua de la arquitectura, sin instrucciones vectoriales anchas, por portabilidad. `target-cpu=native` le dice que use todo lo que tu CPU ofrece; en un binario que distribuyes, se prefiere habilitar familias concretas (`target-feature=+avx2`) y detectar en ejecución. Y como aprendiste en la lección 1, la única forma de *saber* si un bucle se vectorizó es abrir el ensamblador con `cargo asm` y buscar los registros vectoriales.
+
+## std::simd: carriles portables y explícitos
+
+Cuando la autovectorización falla o no puedes confiar en ella, el segundo peldaño es escribir SIMD **explícito pero portable** con `std::simd` —la biblioteca *portable_simd*, aún en el canal *nightly* tras `#![feature(portable_simd)]` en 2026—. Su tipo central es `Simd<T, N>`, un vector de `N` carriles con alias cómodos (`f32x8`, `u8x16`, `i32x4`). Operas sobre él con los operadores normales, que actúan carril a carril, y lo mejor: el mismo código compila a AVX en x86, a NEON en ARM, y a instrucciones escalares donde no haya SIMD. Escribes la intención una vez; el compilador la traduce a cada arquitectura.
+
+```rust
+#![feature(portable_simd)]
+use std::simd::f32x8;
+use std::simd::num::SimdFloat;
+
+// Producto punto vectorizado: procesa 8 carriles por vuelta.
+fn producto_punto(a: &[f32], b: &[f32]) -> f32 {
+    let mut acum = f32x8::splat(0.0);
+    let (a8, cola_a) = a.as_chunks::<8>();     // bloques de 8 y el resto
+    let (b8, cola_b) = b.as_chunks::<8>();
+
+    for (x, y) in a8.iter().zip(b8) {
+        acum += f32x8::from_array(*x) * f32x8::from_array(*y);
+    }
+    // reduce_sum colapsa los 8 carriles a un escalar.
+    let mut total = acum.reduce_sum();
+
+    // La cola: los elementos que no llenan un bloque de 8.
+    for (x, y) in cola_a.iter().zip(cola_b) {
+        total += x * y;
+    }
+    total
+}
+```
+
+Dos ideas viven en ese fragmento y valen para todo SIMD manual. La primera es el **manejo de la cola**: los datos rara vez son múltiplo exacto del ancho de carril, así que procesas los bloques completos vectorizados y barres el resto de forma escalar. La segunda es la **reducción horizontal** (`reduce_sum`), que colapsa los carriles a un escalar —y observa que al escribirla tú *das permiso* explícito para la suma por carriles que el compilador no se atrevía a hacer solo—. `std::simd` ofrece además máscaras (`Mask`) para ramas sin saltos, `simd_swizzle!` para permutar carriles, y comparaciones que devuelven máscaras en vez de booleanos.
+
+<Callout type="info" title="El layout de datos decide si puedes vectorizar">
+SIMD y el *layout* del nivel 19 son inseparables. Para llenar un registro vectorial con ocho posiciones necesitas ocho posiciones *contiguas* en memoria, y ahí gana la **estructura de arrays** (un `Vec` por campo) frente al **array de estructuras** (un `Vec<Particula>` con posición, velocidad y color entrelazados). Con el array de estructuras, cargar ocho posiciones exige recogerlas salteadas entre otros campos —un *gather* lento o directamente un muro para el vectorizador—. Con la estructura de arrays, las ocho posiciones ya están pegadas y entran en un registro de una carga. No hay SIMD eficiente sobre un layout hostil: primero ordena los datos, luego vectoriza.
+</Callout>
+
+## Cuándo bajar a los intrinsics
+
+El tercer peldaño, el más bajo, son los **intrinsics** de `std::arch`: funciones que mapean una a una a instrucciones concretas de la máquina (`_mm256_add_ps` para AVX). Dan control absoluto y acceso a operaciones exóticas que `std::simd` no expone todavía, pero el precio es alto: son **específicos de la arquitectura** (rompes la portabilidad), son `unsafe`, exigen `#[target_feature]` y te obligan a **detectar en ejecución** si la CPU los soporta para no ejecutar una instrucción ilegal.
+
+```rust
+#[cfg(target_arch = "x86_64")]
+fn suma_slices(a: &[f32], b: &[f32], out: &mut [f32]) {
+    if is_x86_feature_detected!("avx2") {
+        // SEGURO: solo llegamos aqui si la CPU tiene AVX2.
+        unsafe { suma_avx2(a, b, out) }
+    } else {
+        // Camino de respaldo escalar (o portable_simd) para el resto.
+        for ((x, y), o) in a.iter().zip(b).zip(out) { *o = x + y; }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn suma_avx2(a: &[f32], b: &[f32], out: &mut [f32]) {
+    // ... intrinsics de core::arch::x86_64: control total, cero portabilidad
+}
+```
+
+La regla es una escalera descendente disciplinada, y casi nunca hay que llegar al fondo. Empieza confiando en la **autovectorización** y verifícala en el asm; si falla donde importa, sube a **`std::simd`**, que da control sin sacrificar portabilidad; y baja a los **intrinsics** solo cuando hayas *medido* (lección 2) que ese núcleo domina el perfil y que ni la autovectorización ni `std::simd` extraen el rendimiento que la instrucción exótica sí daría. Escribir intrinsics "por si acaso" es la microoptimización prematura en su forma más cara: código no portable, `unsafe` y difícil de mantener, para acelerar algo que quizá no era el cuello de botella.
+
+<Mermaid code={`flowchart TB
+  L[Bucle numerico sobre slices] --> AV[Autovectorizacion del compilador gratis]
+  AV --> OK[Funciona portable pero fragil]
+  AV --> FAIL[Falla ante ramas solapamiento o reduccion de floats]
+  FAIL --> PS[std simd portable_simd carriles explicitos y portables]
+  PS --> INTR[Intrinsics de std arch solo si el perfil lo exige]
+  OK --> V[Verifica en el asm que se vectorizo]
+  style AV fill:#89b4fa,color:#11111b
+  style PS fill:#cba6f7,color:#11111b
+  style INTR fill:#f38ba8,color:#11111b
+  style V fill:#a6e3a1,color:#11111b`} />
+
+<Callout type="dios" title="SIMD premia al que ordena los datos, no al que escribe instrucciones exóticas">
+Hay una tentación casi irresistible al descubrir SIMD, y es creer que el rendimiento vive en las instrucciones —en conocer el intrinsic recóndito, en teclear `_mm256_fmadd_ps` con la soltura de un iniciado—. Es una ilusión, y la escalera de tres peldaños de Rust está diseñada para desengañarte de ella empezando por arriba. El primer peldaño, la autovectorización, revela que el compilador ya sabe generar SIMD excelente **si le dejas**, y que tu trabajo no es escribir vectores sino no *estorbarle*: quitar la rama que rompe el bucle, romper la dependencia entre iteraciones, dar permiso para reasociar la suma. El segundo, `std::simd`, revela que puedes ser explícito **sin** casarte con una arquitectura, escribiendo la intención de "ocho a la vez" una sola vez para que compile a NEON, a AVX o a lo que haya. Y el tercero, los intrinsics, queda como lo que debe ser: un recurso de último grado, caro y no portable, para el puñado de núcleos donde el perfil demostró que cada ciclo cuenta. Pero la lección más honda atraviesa los tres peldaños y conecta con el nivel 19: **SIMD no es un problema de instrucciones, es un problema de layout**. Un registro vectorial es un cubo que quieres llenar de datos útiles y contiguos, y si tu memoria está organizada como un array de estructuras —con lo que te importa entrelazado con lo que no—, ninguna instrucción exótica te salvará, porque el cuello de botella no es calcular sino *recoger* los datos dispersos para poder calcular. Por eso los reinos donde SIMD brilla —simulación de partículas, procesamiento de imagen, motores de consulta— son precisamente los que adoptan la programación orientada a datos, la estructura de arrays, el pensar primero en cómo se disponen los bytes. El que empieza escribiendo intrinsics sobre un layout hostil optimiza el peldaño equivocado; el que primero ordena los datos descubre a menudo que la humilde autovectorización, sobre memoria bien dispuesta, ya vuela. La instrucción es el final del camino, no el principio.
+</Callout>
+
+<Callout type="note" title="Lo esencial de SIMD">
+SIMD aplica una instrucción a varios datos a la vez, y multiplica el rendimiento numérico por el número de carriles. Tres modos, en escalera: la **autovectorización** es gratis desde `opt-level` 2 pero frágil —una rama, un solapamiento o la no asociatividad de la suma de floats la desactivan—, y `target-cpu=native` le abre las instrucciones anchas de tu CPU. **`std::simd`** (portable_simd, aún *nightly* en 2026) da carriles explícitos y **portables** con `Simd<T, N>`, exigiéndote manejar la cola y las reducciones horizontales. Los **intrinsics** de `std::arch` dan control total pero son `unsafe`, no portables y requieren detección en ejecución; se reservan para lo que el perfil señale. Y todo depende del *layout* (nivel 19): sin estructura de arrays contigua, no hay SIMD eficiente.
+</Callout>
+
+<Reto title="Baja la escalera solo lo justo">
+1. Escribe un bucle que sume dos `&[i32]` y otro que reduzca un `&[f32]`; compila con `cargo asm` y explica por qué el de enteros se vectoriza y el de flotantes no.
+2. Recompila con `RUSTFLAGS="-C target-cpu=native"` y compara el asm: identifica las instrucciones vectoriales anchas que antes no aparecían.
+3. Implementa `producto_punto` con `std::simd` manejando explícitamente la cola; razona qué pasaría si olvidaras los elementos que no llenan un bloque de carriles.
+4. Toma un `Vec<Particula>` (array de estructuras) y reescríbelo como estructura de arrays; explica por qué la segunda forma permite vectorizar el bucle que solo toca una posición.
+5. Argumenta, citando la lección 2, qué debes haber medido antes de escribir un solo intrinsic de `std::arch`, y qué dos costes asumes al hacerlo.
+</Reto>

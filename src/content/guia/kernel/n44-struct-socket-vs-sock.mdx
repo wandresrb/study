@@ -1,0 +1,130 @@
+---
+title: "Sockets por dentro: struct socket contra struct sock"
+description: "La cara VFS del socket (struct socket, un objeto por descriptor) frente a la cara del protocolo (struct sock, el estado de la conexión), cómo un socket() de espacio de usuario se traduce por sock_create e inet_create hasta un struct sock, y el doble despacho entre proto_ops de familia y struct proto de protocolo sobre el pseudo-sistema de ficheros sockfs."
+subject: kernel
+level: 44
+order: 2
+icon: "44.2"
+duracion: "16 min"
+---
+
+<Lead>
+Un socket es dos objetos que fingen ser uno. Desde el espacio de usuario ves un simple descriptor de fichero, y por eso `read`, `write` y `close` funcionan sobre él como sobre cualquier archivo. Pero detrás de ese descriptor el kernel mantiene dos estructuras cosidas por un puntero: una habla el idioma del VFS —es genérica, la comparten TCP, UDP, un socket UNIX o un `AF_XDP`— y la otra guarda el alma del protocolo: colas, ventanas, temporizadores, estado de la conexión. Entender por qué son dos y no una es entender toda la arquitectura de red de Linux.
+</Lead>
+
+<Objetivos>
+
+- Distinguir `struct socket` (la cara VFS) de `struct sock` (el estado del protocolo).
+- Seguir un `socket()` de usuario hasta `sock_create` e `inet_create`.
+- Entender el doble despacho `proto_ops` de familia frente a `struct proto` de protocolo.
+- Ver cómo el socket vive sobre `sockfs` y se ata a un `struct file` y a un `fd`.
+
+</Objetivos>
+
+## struct socket: la cara VFS
+
+`struct socket` vive en `<linux/net.h>` y es diminuta a propósito. Es el objeto que el VFS conoce: uno por cada descriptor de socket, con el tipo, el estado, un puntero al `struct file` que lo representa como fichero, la tabla de operaciones de la familia y —la pieza clave— un puntero `sk` al estado del protocolo.
+
+```c
+struct socket {
+	socket_state		state;   /* SS_UNCONNECTED, SS_CONNECTED... */
+	short			type;    /* SOCK_STREAM, SOCK_DGRAM... */
+	unsigned long		flags;
+	struct file		*file;   /* el fichero VFS asociado */
+	struct sock		*sk;     /* el estado del protocolo */
+	const struct proto_ops	*ops;    /* operaciones de la familia */
+	struct socket_wq	wq;      /* cola de espera para poll/epoll */
+};
+```
+
+Es deliberadamente pobre en campos: todo lo que sea específico de TCP o de UDP no está aquí. `struct socket` solo sabe que es un socket, no de qué protocolo. Su trabajo es ser el asa que el VFS agarra y el punto donde la API BSD de sockets aterriza antes de delegar.
+
+## struct sock: el estado del protocolo
+
+`struct sock` vive en `<net/sock.h>` y es todo lo contrario: enorme, con cientos de campos. Es el estado real de la comunicación —las colas de recepción y envío, los límites de buffer, el estado de la conexión, los punteros a callbacks y a la tabla de operaciones del protocolo—.
+
+```c
+struct sock {
+	struct sock_common	__sk_common;      /* familia, estado, hashes */
+	struct sk_buff_head	sk_receive_queue; /* paquetes recibidos */
+	struct sk_buff_head	sk_write_queue;   /* pendientes de enviar */
+	int			sk_rcvbuf;        /* limite del buffer de RX */
+	int			sk_sndbuf;        /* limite del buffer de TX */
+	struct proto		*sk_prot;         /* tcp_prot, udp_prot... */
+	void			(*sk_data_ready)(struct sock *sk);  /* hay datos */
+	void			(*sk_write_space)(struct sock *sk); /* hay hueco */
+	/* ...cientos de campos mas... */
+};
+```
+
+Los dos objetos se apuntan mutuamente: `socket->sk` es este `struct sock`, y `sock->sk_socket` vuelve al `struct socket`. Esa dualidad no es accidental: refleja dos ejes de cambio distintos. La API de sockets es fija —`bind`, `listen`, `accept`, `send`, `recv`—, mientras que los protocolos proliferan. Una cara estable, muchos fondos intercambiables.
+
+<Cards>
+  <Card icon="🚪" title="proto_ops · la familia">
+    Un `const struct proto_ops` como `inet_stream_ops`. Traduce la API BSD a la familia de direcciones: qué significa `bind` o `connect` en `AF_INET`. Es la cara del socket.
+  </Card>
+  <Card icon="⚙️" title="struct proto · el protocolo">
+    Un `struct proto` como `tcp_prot` o `udp_prot`. Implementa el transporte de verdad: colas, ventanas, temporizadores, control de congestión. Es la cara del `sock`.
+  </Card>
+</Cards>
+
+## De socket() a sock_create a inet_create
+
+Cuando el usuario llama a `socket(AF_INET, SOCK_STREAM, 0)`, la llamada al sistema `__sys_socket` orquesta dos actos: crear el par de estructuras y atarlo a un descriptor.
+
+```c
+/* net/socket.c, simplificado */
+int __sys_socket(int family, int type, int protocol)
+{
+	struct socket *sock;
+	int retval = sock_create(family, type & SOCK_TYPE_MASK, protocol, &sock);
+
+	if (retval < 0)
+		return retval;
+	return sock_map_fd(sock, /* flags */ 0);  /* crea struct file y devuelve el fd */
+}
+```
+
+`sock_create` desemboca en `__sock_create`, que busca en `net_families[family]` —una tabla que cada familia rellena con `sock_register` al arrancar— la operación `create` y la invoca. Para `AF_INET` esa función es `inet_create`, y es donde nace el `struct sock`:
+
+```c
+/* net/ipv4/af_inet.c, esqueleto de inet_create */
+static int inet_create(struct net *net, struct socket *sock, int protocol, int kern)
+{
+	struct inet_protosw *answer;  /* elegido por type+protocol: TCP, UDP, RAW */
+	struct sock *sk;
+
+	sock->ops = answer->ops;      /* p.ej. inet_stream_ops (proto_ops) */
+	sk = sk_alloc(net, PF_INET, GFP_KERNEL, answer->prot, kern);  /* answer->prot = tcp_prot */
+	sock_init_data(sock, sk);     /* enlaza sock<->sk y fija valores por defecto */
+	if (sk->sk_prot->init)
+		sk->sk_prot->init(sk);        /* tcp_v4_init_sock */
+	return 0;
+}
+```
+
+Al salir, `sock->ops` apunta a `inet_stream_ops` y `sk->sk_prot` a `tcp_prot`. Luego `sock_map_fd` reserva un descriptor y un `struct file` con `socket_file_ops`, que enlaza el mundo VFS con el `struct socket`. El socket vive sobre `sockfs`, un pseudo-sistema de ficheros sin backing en disco: cada socket tiene un `SOCK_INODE` oculto que le da identidad de fichero sin ocupar el árbol de nombres.
+
+<Mermaid code={`flowchart LR
+  FD[Descriptor fd en la tabla del proceso] --> File[struct file con socket_file_ops]
+  File --> Sock[struct socket ops proto_ops]
+  Sock -->|puntero sk| SK[struct sock sk_prot proto]
+  SK --> Proto[tcp_prot implementa el transporte]`} />
+
+El doble despacho es la consecuencia elegante de todo esto. Cuando llega un `send`, la capa de familia `inet_sendmsg` no contiene lógica de TCP: se limita a llamar a `sk->sk_prot->sendmsg`, que resuelve a `tcp_sendmsg`. La familia enruta; el protocolo trabaja. Dos indirecciones, dos responsabilidades separadas.
+
+<Callout type="info" title="El mismo sk vale para IPv4 y IPv6">
+`struct sock` no es específico de TCP ni de una versión de IP. La parte común vive en `sock_common`, y protocolos y familias lo especializan con estructuras que lo embeben —`inet_sock`, luego `tcp_sock`— usando el clásico truco de C de poner el genérico como primer campo. Por eso `tcp_sk(sk)` es solo un `container_of` disfrazado: el mismo objeto visto con más resolución según quién lo mire.
+</Callout>
+
+<Callout type="dios" title="El socket es la filosofía del VFS llevada a la red">
+Da un paso atrás y verás que esta división no es una peculiaridad de la red, sino la misma idea que gobierna todo el kernel repetida una vez más. `struct socket` es a `struct sock` lo que `struct file` es al dato privado del inodo: el asa genérica que ve el VFS frente al objeto específico del subsistema que hace el trabajo. La célebre consigna de Unix, "todo es un fichero", es solo media verdad; la verdad más honda es "todo es un fichero más un objeto privado al que el fichero apunta". El puntero `->sk` es exactamente la costura donde "todo es un fichero" cede el paso a "y este fichero en concreto es una conexión TCP". Y la razón de que sean dos estructuras y no una es un principio de diseño que ya viste en los `file_operations` y volverás a ver en los `net_device_ops`: cuando una interfaz es estable pero sus implementaciones proliferan, separas la interfaz —una estructura de punteros a funciones— del estado que esas funciones manipulan. La API de sockets no ha cambiado en cuarenta años, pero debajo han desfilado TCP, UDP, SCTP, MPTCP, QUIC en kernel y `AF_XDP`, cada uno con su `struct proto` distinto y el mismo `struct socket` delante. Cuando interiorizas que casi todo subsistema del kernel es una estructura-interfaz con punteros a operaciones y una estructura-estado detrás que esas operaciones tocan, dejas de memorizar APIs sueltas y empiezas a leer el kernel como una sola gramática: el mismo esqueleto, `ops` más estado, encarnado en mil objetos.
+</Callout>
+
+<Reto title="Dos estructuras, un descriptor">
+1. Abre `<linux/net.h>` y `<net/sock.h>`; lista tres campos de cada estructura y clasifícalos como propios de la cara VFS o de la cara del protocolo.
+2. Sigue `inet_create` en `net/ipv4/af_inet.c` y localiza dónde se fijan `sock->ops` y `sk->sk_prot`; nombra las estructuras concretas para un socket TCP.
+3. Explica el doble despacho: qué hace exactamente `inet_sendmsg` y por qué no contiene él mismo la lógica de TCP.
+4. Argumenta por qué los sockets necesitan un pseudo-sistema de ficheros (`sockfs`) y qué aporta el `SOCK_INODE` oculto.
+5. Ante un protocolo nuevo como MPTCP o `AF_XDP`, razona cuál de las dos estructuras cambia más y por qué esa separación abarata añadir protocolos.
+</Reto>

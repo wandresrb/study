@@ -1,0 +1,236 @@
+---
+title: "Un sistema de archivos mínimo en memoria, de cabo a rabo"
+description: "Ensamblamos los tres niveles anteriores en un módulo compilable: una fábrica de inodos con `myfs_get_inode`, operaciones de directorio construidas sobre un `mknod` compartido y helpers de libfs, un `fill_super` que crea la raíz con `d_make_root`, y el registro con `mount_nodev`. Al montarlo, `mkdir`, `echo` y `cat` funcionan sin una sola línea de E/S propia."
+subject: kernel
+level: 38
+order: 4
+icon: "38.4"
+duracion: "18 min"
+---
+
+<Lead>
+Ha llegado el momento de juntar las piezas. Con las cuatro tablas del nivel 38.1, el registro del 38.2 y los helpers de libfs del 38.3 tenemos todo lo necesario para escribir un sistema de archivos en memoria **completo y funcional** en unas sesenta líneas de pegamento. Este nivel es ese módulo, comentado de arriba abajo: una fábrica de inodos, las operaciones de directorio, el superbloque y el registro. Cuando lo cargues y lo montes, podrás crear directorios, escribir archivos y leerlos, y ni una sola de esas operaciones de E/S será código tuyo: todo lo hace el núcleo por ti.
+</Lead>
+
+<Objetivos>
+
+- Escribir la fábrica `myfs_get_inode` que cablea cada inodo según sea archivo o directorio.
+- Implementar `create`, `mkdir` y `mknod` sobre un helper común y delegar el resto en libfs.
+- Montar el sistema con `mount_nodev`, `fill_super` y `d_make_root`.
+- Comprobar que escribir y leer archivos funciona apoyándose solo en el page cache.
+
+</Objetivos>
+
+## La fábrica de inodos
+
+El núcleo del módulo es la función que fabrica un inodo y lo cablea a la tabla correcta según su tipo. Un directorio recibe operaciones de espacio de nombres y `simple_dir_operations`; un archivo regular recibe operaciones de archivo y su `address_space` apunta a los helpers de page cache de libfs. Primero, las tablas de operaciones constantes:
+
+```c
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/pagemap.h>
+#include <linux/mount.h>
+
+#define MYFS_MAGIC 0x6d796673   /* 'myfs' en ASCII */
+
+static const struct address_space_operations myfs_aops = {
+	.read_folio	= simple_read_folio,
+	.write_begin	= simple_write_begin,
+	.write_end	= simple_write_end,
+	.dirty_folio	= noop_dirty_folio,
+};
+
+static const struct file_operations myfs_file_ops = {
+	.read_iter	= generic_file_read_iter,   /* lee desde el page cache */
+	.write_iter	= generic_file_write_iter,  /* escribe al page cache */
+	.mmap		= generic_file_mmap,
+	.fsync		= noop_fsync,               /* en RAM no hay nada que sincronizar */
+	.splice_read	= filemap_splice_read,
+	.splice_write	= iter_file_splice_write,
+	.llseek		= generic_file_llseek,
+};
+
+static const struct inode_operations myfs_file_iops = {
+	.setattr	= simple_setattr,
+	.getattr	= simple_getattr,
+};
+
+static const struct inode_operations myfs_dir_iops;   /* definida mas abajo */
+
+static struct inode *myfs_get_inode(struct super_block *sb,
+				    const struct inode *dir, umode_t mode)
+{
+	struct inode *inode = new_inode(sb);
+
+	if (!inode)
+		return NULL;
+
+	inode->i_ino = get_next_ino();                      /* numero de inodo unico */
+	inode_init_owner(&nop_mnt_idmap, inode, dir, mode); /* uid, gid y modo */
+	inode->i_mapping->a_ops = &myfs_aops;               /* page cache del inodo */
+	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
+	simple_inode_init_ts(inode);                        /* atime = mtime = ctime = ahora */
+
+	switch (mode & S_IFMT) {
+	case S_IFREG:                                       /* archivo regular */
+		inode->i_op  = &myfs_file_iops;
+		inode->i_fop = &myfs_file_ops;
+		break;
+	case S_IFDIR:                                       /* directorio */
+		inode->i_op  = &myfs_dir_iops;
+		inode->i_fop = &simple_dir_operations;      /* readdir vía dcache */
+		inc_nlink(inode);                           /* la entrada '.' apunta a si mismo */
+		break;
+	default:                                            /* dispositivos, fifos, sockets */
+		init_special_inode(inode, mode, 0);
+		break;
+	}
+	return inode;
+}
+```
+
+`inode_init_owner` toma el `nop_mnt_idmap` porque un sistema en RAM no participa en remapeos de identidad; en un sistema real recibirías el `idmap` del montaje. Y `simple_inode_init_ts` es el idioma moderno para fijar las tres marcas de tiempo, tras la llegada de las marcas de tiempo multigrano.
+
+## Las operaciones de directorio
+
+Crear un archivo, un directorio o un nodo especial es siempre lo mismo: fabricar el inodo e instanciarlo en su dentry. Por eso `create` y `mkdir` se reducen a llamar a un `mknod` compartido con el bit de tipo adecuado. El resto de verbos —búsqueda, borrado, renombrado— son helpers de libfs sin una línea propia:
+
+```c
+static int myfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+		      struct dentry *dentry, umode_t mode, dev_t dev)
+{
+	struct inode *inode = myfs_get_inode(dir->i_sb, dir, mode);
+
+	if (!inode)
+		return -ENOSPC;
+
+	d_instantiate(dentry, inode);   /* ata el inodo nuevo a su dentry */
+	dget(dentry);                   /* el dcache retiene el archivo vivo */
+	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	return 0;
+}
+
+static int myfs_create(struct mnt_idmap *idmap, struct inode *dir,
+		       struct dentry *dentry, umode_t mode, bool excl)
+{
+	return myfs_mknod(idmap, dir, dentry, mode | S_IFREG, 0);
+}
+
+static struct dentry *myfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				 struct dentry *dentry, umode_t mode)
+{
+	int ret = myfs_mknod(idmap, dir, dentry, mode | S_IFDIR, 0);
+
+	if (ret)
+		return ERR_PTR(ret);
+	inc_nlink(dir);   /* el '..' del hijo suma un enlace al padre */
+	return NULL;      /* en 7.x mkdir devuelve dentry: NULL = usa el que se paso */
+}
+
+static const struct inode_operations myfs_dir_iops = {
+	.create	= myfs_create,
+	.lookup	= simple_lookup,   /* todo lo que existe esta en el dcache */
+	.link	= simple_link,
+	.unlink	= simple_unlink,
+	.mkdir	= myfs_mkdir,
+	.rmdir	= simple_rmdir,
+	.mknod	= myfs_mknod,
+	.rename	= simple_rename,
+};
+```
+
+## El superbloque y el registro
+
+Queda el pegamento de montaje: un `super_operations` mínimo, el `fill_super` que crea la raíz, y el `file_system_type` registrado en el `module_init`:
+
+```c
+static const struct super_operations myfs_super_ops = {
+	.statfs		= simple_statfs,
+	.drop_inode	= generic_delete_inode,   /* inodo sin enlaces = borrar ya */
+};
+
+static int myfs_fill_super(struct super_block *sb, void *data, int silent)
+{
+	struct inode *root;
+
+	sb->s_maxbytes		= MAX_LFS_FILESIZE;
+	sb->s_blocksize		= PAGE_SIZE;
+	sb->s_blocksize_bits	= PAGE_SHIFT;
+	sb->s_magic		= MYFS_MAGIC;
+	sb->s_op		= &myfs_super_ops;
+	sb->s_time_gran		= 1;
+
+	root = myfs_get_inode(sb, NULL, S_IFDIR | 0755);
+	sb->s_root = d_make_root(root);   /* envuelve la raiz; hace iput si falla */
+	if (!sb->s_root)
+		return -ENOMEM;
+	return 0;
+}
+
+static struct dentry *myfs_mount(struct file_system_type *fs_type,
+				 int flags, const char *dev_name, void *data)
+{
+	return mount_nodev(fs_type, flags, data, myfs_fill_super);
+}
+
+static struct file_system_type myfs_type = {
+	.owner		= THIS_MODULE,
+	.name		= "myfs",
+	.mount		= myfs_mount,
+	.kill_sb	= kill_litter_super,   /* libera tambien el arbol de dentries */
+	.fs_flags	= FS_USERNS_MOUNT,
+};
+MODULE_ALIAS_FS("myfs");
+
+static int __init myfs_init(void) { return register_filesystem(&myfs_type); }
+static void __exit myfs_exit(void) { unregister_filesystem(&myfs_type); }
+module_init(myfs_init);
+module_exit(myfs_exit);
+MODULE_DESCRIPTION("Sistema de archivos minimo en memoria");
+MODULE_LICENSE("GPL");
+```
+
+Cargado y montado, se comporta como cualquier sistema POSIX, y todo el camino de lectura y escritura lo aporta el núcleo:
+
+```bash
+sudo insmod myfs.ko
+sudo mkdir -p /mnt/myfs
+sudo mount -t myfs none /mnt/myfs
+
+cd /mnt/myfs
+sudo mkdir hola
+echo "hola kernel" | sudo tee hola/saludo.txt   # write_iter -> page cache
+cat hola/saludo.txt                              # read_iter  <- page cache
+ls -la hola                                      # iterate_shared <- dcache
+
+sudo umount /mnt/myfs      # kill_litter_super libera dentries e inodos
+sudo rmmod myfs
+```
+
+<Mermaid code={`flowchart TD
+  SB[super_block magic MYFS_MAGIC] -->|s_op| SOP[myfs_super_ops]
+  SB -->|s_root| DR[dentry raiz]
+  DR -->|d_inode| RI[inode raiz S_IFDIR]
+  RI -->|i_op| DIOPS[myfs_dir_iops]
+  RI -->|i_fop| SDO[simple_dir_operations]
+  RI -->|hijo en dcache| DF[dentry saludo.txt]
+  DF -->|d_inode| FI[inode S_IFREG]
+  FI -->|i_fop| FOPS[myfs_file_ops]
+  FI -->|i_mapping a_ops| AOPS[myfs_aops sobre page cache]`} />
+
+<Callout type="info" title="El siguiente paso: estado privado por inodo">
+Este módulo no guarda datos propios en cada inodo. Para hacerlo —el truco `container_of` que anticipó el nivel 38.1— defines un `struct myfs_inode_info` que embebe un `struct inode`, y añades `.alloc_inode` y `.free_inode` a `super_operations` para asignarlo desde un `kmem_cache` propio. Así es como shmem guarda por inodo su política de swap. Sin eso, el inodo genérico basta, y por eso aquí lo omitimos.
+</Callout>
+
+<Callout type="dios" title="Sesenta líneas de pegamento y el núcleo escribe el sistema de archivos entero">
+Mira lo que acabas de construir y, sobre todo, lo que **no** has tenido que construir. No escribiste el recorrido de la ruta `hola/saludo.txt`: lo hizo el walker del VFS, componente a componente, consultando tu `lookup` —que es `simple_lookup`— en cada paso. No escribiste el `write` que puso `hola kernel` en el archivo: `generic_file_write_iter` asignó un folio en el page cache, copió los bytes desde el espacio de usuario con `simple_write_begin` y `simple_write_end`, y lo marcó. No escribiste el `read` que lo devolvió: `generic_file_read_iter` encontró ese mismo folio en el cache y lo copió de vuelta. No escribiste el `readdir` de `ls`: `dcache_readdir` enumeró los hijos que viven en el dcache. No escribiste la comprobación de permisos, ni el bloqueo del directorio durante la creación, ni la contabilidad de referencias que mantiene vivos los inodos. Tu contribución fueron tres cosas y solo tres: **decir de qué tipo es cada inodo** cableándolo a una tabla u otra, **decir cómo nace un archivo** instanciándolo en su dentry, y **decir dónde vive el contenido** apuntando el `a_ops` al page cache. Todo lo demás es el núcleo, porque todo lo demás es genérico. Y aquí está la revelación final del track: la distancia entre este juguete de sesenta líneas y ext4 no es una distancia de arquitectura, sino de una sola pregunta. ext4 rellena exactamente las mismas cuatro tablas; la única diferencia es que su `read_folio` va a buscar el dato a un dispositivo de bloques en vez de encontrarlo ya en RAM, y que su `evict_inode` libera bloques en un disco en vez de dejar morir un inodo en memoria. Cambia dónde está el almacenamiento y este módulo se convierte en un sistema de archivos real. Esa es la lección: el VFS no te pide que escribas un sistema de archivos, te pide que le digas dónde están los bytes.
+</Callout>
+
+<Reto title="Construye, monta y extiende tu sistema de archivos">
+1. Compila el módulo con un `Makefile` de kbuild, cárgalo, móntalo y reproduce la sesión de `bash`; confirma con `stat` que los tiempos y el modo del directorio raíz son los esperados.
+2. Explica, sin mirar tu código, por qué `echo ... > archivo` funciona pese a que no escribiste ninguna función de escritura.
+3. Añade `struct myfs_inode_info` con un campo entero propio y las operaciones `.alloc_inode` y `.free_inode` con un `kmem_cache`, y recupéralo desde un inodo con `container_of`.
+4. Sigue qué libera exactamente `kill_litter_super` al desmontar y por qué `kill_anon_super` dejaría fugas aquí.
+5. Convierte el registro a la API de `fs_context`: sustituye `.mount` por `.init_fs_context` y `mount_nodev` por `get_tree_nodev`, conservando el mismo `myfs_fill_super`.
+</Reto>

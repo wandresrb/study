@@ -1,0 +1,155 @@
+---
+title: "La máquina de estados: async fn compilada a un enum que hace poll"
+description: "El compilador toma una async fn con varios await y la reescribe como un tipo anónimo que implementa Future: un enum con un estado por cada await, cuyos campos son exactamente los locales que sobreviven a cada suspensión, y cuyo poll es un match que reanuda por donde iba. Abrimos esa transformación en detalle, incluida la autorreferencia que fuerza a Pin."
+subject: rust
+level: 33
+order: 4
+icon: "33.4"
+duracion: "19 min"
+---
+
+<Lead>
+Ya tienes las piezas sueltas: el trait `Future`, el `poll` con sus dos veredictos, el `Waker` que despierta. Falta ver cómo el compilador las **ensambla solo** a partir de una `async fn` que escribes en estilo lineal, de arriba abajo, como si fuera síncrona. La respuesta es una de las transformaciones de programa más bonitas de cualquier lenguaje: tu función se reescribe en un tipo anónimo —un `enum` máquina de estados— con un estado por cada `.await`, cuyos campos son precisamente las variables que deben sobrevivir a cada suspensión, y cuyo `poll` es un `match` que salta al estado guardado y sigue desde ahí. El nivel 32 te enseñó la *forma* de esta idea; aquí la abrimos en canal, hasta la autorreferencia que obliga a `poll` a recibir `Pin<&mut Self>`.
+</Lead>
+
+<Objetivos>
+
+- Ver cómo una `async fn` se reescribe en un `enum` con un estado por cada `.await`.
+- Determinar qué locales guarda cada estado según el análisis de "vivo a través de la suspensión".
+- Leer el `poll` generado como un `match` sobre el discriminante que reanuda el cálculo.
+- Explicar por qué la máquina puede ser autorreferencial y cómo eso fuerza el uso de `Pin`.
+
+</Objetivos>
+
+## De código lineal a estados reanudables
+
+Parte de una `async fn` con dos puntos de espera y un local que cruza el primero:
+
+```rust
+async fn saludar(id: u64) -> String {
+    let nombre = leer_nombre(id).await;    // suspension 1
+    let saludo = componer(&nombre).await;  // suspension 2: usa nombre
+    saludo
+}
+```
+
+El problema que el compilador debe resolver es concreto: cuando `leer_nombre(id).await` no está listo, la función tiene que **ceder el hilo** y, más tarde, **reanudarse justo en esa línea** con `nombre` intacto. Una función síncrona no puede hacer eso —su estado vive en la pila, que se desmonta al retornar—. La solución es no usar la pila: **materializar el estado en un valor** que persista entre sondeos. Ese valor es un `enum` con una variante por cada tramo entre suspensiones:
+
+```rust
+// Aproximacion conceptual de lo que fabrica el compilador:
+enum SaludarSM {
+    Inicio { id: u64 },
+    TrasLeer { fut1: LeerNombreFut },
+    TrasComponer { fut2: ComponerFut, nombre: String },
+    Terminado,
+}
+```
+
+Cada variante es un **punto de reanudación** con nombre. `Inicio` guarda lo que hay antes de tocar nada; `TrasLeer` representa "estoy suspendido en el primer `.await`" y guarda el sub-future que estoy sondeando; `TrasComponer` representa el segundo `.await` y guarda tanto su sub-future como `nombre`, que hará falta después. `Terminado` es el estado absorbente tras devolver `Ready`.
+
+## Qué guarda cada estado: vivo a través de la suspensión
+
+La pregunta central del compilador para cada variable local es: **¿se usa después de algún `.await`?** Si la respuesta es sí, la variable debe **vivir a través de esa suspensión** y, por tanto, almacenarse en el estado que cruza ese punto. Si solo se usa dentro de un tramo, entre dos suspensiones, no necesita guardarse: nace y muere sin cruzar ninguna frontera, como un local de pila corriente.
+
+En `saludar`, `nombre` se produce en el primer `.await` y se consume en el segundo: **cruza** la segunda suspensión, así que viaja dentro de `TrasComponer`. En cambio `id` solo se usa al principio, para arrancar `leer_nombre`; una vez lanzado ese sub-future, `id` ya no hace falta y no aparece en los estados posteriores.
+
+Esto explica una propiedad clave: **el tamaño del future es exactamente la mayor combinación de locales viva simultáneamente**, calculada en compilación. No hay asignación por `.await`; hay una sola estructura cuyo tamaño es el del estado más gordo. De ahí el fenómeno de los *futures gordos*: un `.await` en medio de muchos locales vivos, o un future recursivo, inflan esa estructura, y por eso a veces se mete un future en un `Box` para moverlo al heap y aligerar la máquina que lo contiene.
+
+```rust
+// Un future recursivo se inflaria sin fin; el Box corta la recursion de tamano:
+fn factorial(n: u64) -> Pin<Box<dyn Future<Output = u64>>> {
+    Box::pin(async move {
+        if n <= 1 { 1 } else { n * factorial(n - 1).await }
+    })
+}
+```
+
+<Callout type="info" title="Los tramos entre await corren de un tirón">
+Dentro de una misma variante, entre dos `.await`, el código se ejecuta **seguido y sin ceder**: sumas, llamadas síncronas, ramas, bucles cortos. La máquina de estados no fragmenta el trabajo en trocitos arbitrarios; solo introduce fronteras donde tú escribiste un `.await`. Por eso un cálculo pesado *sin* `.await` en medio de una tarea async bloquea al executor —no hay punto de suspensión donde ceder— y hay que trocearlo con `yield` explícito o delegarlo a `spawn_blocking`. Los estados no son rebanadas de tiempo: son los puntos exactos donde tú permitiste ceder.
+</Callout>
+
+## El poll generado: un match que reanuda
+
+El `poll` que el compilador sintetiza es un bucle con un `match` sobre el estado actual. Cada iteración intenta avanzar; cada `Pending` de un sub-future *sale cediendo*; cada `Ready` *transita* al estado siguiente:
+
+```rust
+// Version conceptual del poll generado (no compila tal cual):
+fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<String> {
+    loop {
+        match self.estado() {
+            Inicio { id } => {
+                // arranca el primer sub-future y transita
+                let fut1 = leer_nombre(*id);
+                self.pasar_a(TrasLeer { fut1 });
+            }
+            TrasLeer { fut1 } => match fut1.poll(cx) {
+                Poll::Pending => return Poll::Pending,   // cede: nada que hacer aun
+                Poll::Ready(nombre) => {
+                    let fut2 = componer(&nombre);
+                    self.pasar_a(TrasComponer { fut2, nombre });
+                }
+            },
+            TrasComponer { fut2, .. } => match fut2.poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(saludo) => {
+                    self.pasar_a(Terminado);
+                    return Poll::Ready(saludo);          // termino
+                }
+            },
+            Terminado => panic!("future sondeado tras completarse"),
+        }
+    }
+}
+```
+
+Léelo despacio y verás desmitificado todo el nivel. `.await` **es** este patrón: sondear el sub-future, y si da `Pending`, propagar `Pending` hacia arriba; si da `Ready`, quedarse con el valor y transitar. El `Waker` de la lección anterior viaja transparente en `cx`, que se pasa hacia abajo a cada sub-`poll`: cuando el future hoja del fondo lo registra, queda cableado a la tarea entera. Y no hay pila que salvar: reanudar es leer el discriminante del `enum` y saltar a la rama correcta. La reentrada al `poll` continúa exactamente donde el `Pending` la cortó.
+
+## Autorreferencia: por qué la máquina no puede moverse
+
+Queda el detalle que ata este nivel con el 28. Observa `TrasComponer { fut2, nombre }`: ahí conviven el sub-future `fut2` y `nombre`. Pero `fut2` se creó con `componer(&nombre)` —tomó una **referencia a `nombre`**—, y `nombre` vive *en la misma variante del `enum`*. La máquina de estados guarda, entonces, un campo que apunta a otro campo de sí misma: es **autorreferencial**.
+
+Y ahí está el peligro. Si esa estructura se **moviera** en memoria después de crear esa referencia interna, `fut2` seguiría apuntando a la dirección *vieja* de `nombre`, ahora basura: un puntero colgante, justo el fallo que Rust existe para prohibir. La solución no es prohibir la autorreferencia —es inevitable en cualquier `.await` que preste un local—, sino **prohibir el movimiento** una vez que la máquina empezó a avanzar. Ese es todo el propósito de `Pin<&mut Self>` en la firma de `poll`: es la promesa, verificada por el sistema de tipos, de que la dirección del future **no cambiará** mientras se le hace `poll`. `Pin` no mueve nada ni copia nada; solo retira del alcance las operaciones que moverían el valor, garantizando que las referencias internas sigan siendo válidas sondeo tras sondeo.
+
+<Cards>
+  <Card icon="🔢" title="Un estado por await">
+    El `enum` tiene una variante por cada `.await`, más el inicial y el final. Cada una es un punto de reanudación con nombre.
+  </Card>
+  <Card icon="📦" title="Solo los locales vivos">
+    Cada estado guarda las variables que se usan *tras* su suspensión. El tamaño total es el del estado más gordo, fijado en compilación.
+  </Card>
+  <Card icon="🔀" title="poll es un match">
+    Reanudar es leer el discriminante y saltar a su rama. `Pending` propaga hacia arriba; `Ready` transita al estado siguiente.
+  </Card>
+  <Card icon="📌" title="Autorreferencia y Pin">
+    Prestar un local a un sub-future hace la máquina autorreferencial; por eso no debe moverse y `poll` recibe `Pin<&mut Self>`.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TD
+  A[async fn en estilo lineal] --> B[El compilador analiza los locales vivos por await]
+  B --> C[Genera un enum con un estado por await]
+  C --> D[Cada estado guarda los locales que cruzan la suspension]
+  D --> E[Genera poll como un match que reanuda]
+  E --> F{Un estado presta un local a su sub future}
+  F -->|si| G[La maquina es autorreferencial exige Pin]
+  F -->|no| H[La maquina es Unpin se mueve libre]
+  style A fill:#cba6f7,color:#11111b
+  style C fill:#89b4fa,color:#11111b
+  style G fill:#f38ba8,color:#11111b
+  style H fill:#a6e3a1,color:#11111b`} />
+
+<Callout type="dios" title="El compilador como transformador de corrutinas: bajar continuaciones a un enum">
+Lo que ocurre bajo `async` es una de esas transformaciones donde un compilador convierte una comodidad de sintaxis en una estructura de datos, y merece verse como lo que es: un *lowering* de corrutinas, la mecanización de una técnica que los lenguajes sin ella obligan a hacer a mano y mal. El estilo que tú escribes —haz esto, espera aquello, luego lo otro— es *directo*: presupone una pila que recuerda dónde estás. El estilo al que el compilador lo traduce es de *continuaciones reificadas*: cada `.await` se vuelve una etiqueta a la que se puede volver, y el "resto del cálculo por hacer" deja de ser una posición implícita en una pila para convertirse en un discriminante explícito de un `enum` más los campos que ese resto necesitará. Es exactamente lo que, en lenguajes sin `async`, se programa a pulso con máquinas de estados escritas a mano en C —esos `switch (estado)` gigantes de las bibliotecas de red—, con *callbacks* anidados que despedazan la lógica en fragmentos inconexos, o con *continuation-passing style* que invierte el flujo hasta hacerlo ilegible. La aportación de Rust es que esa transformación tediosa y propensa a errores la hace el compilador, con todo el rigor del sistema de tipos, y te devuelve la legibilidad del estilo directo sin renunciar a la eficiencia del estilo de estados. Y lo hace calculando el coste al byte: el tamaño del future es la fotografía del máximo de variables vivas a la vez, ni una más, conocido en compilación, sin pila crecible ni asignación por suspensión. De esa misma transformación brota, inevitable, la autorreferencia —un `.await` que presta un local produce una máquina que se apunta a sí misma— y con ella la necesidad de `Pin`, que no es un parche sino la consecuencia honesta de haber materializado la pila en un valor movible: si el estado que antes vivía en una pila fija ahora vive en una estructura que se puede mover, hay que reintroducir la fijeza justo donde importa. Comprender que `.await` no *llama* a nada sino que *marca un estado*, y que el compilador ensambla con esos estados una máquina que tú podrías dibujar a mano, es el momento en que la asincronía de Rust deja de ser un dialecto mágico y se revela como lo que es: azúcar sintáctica sobre un `enum` y un `match`, verificado hasta el último puntero.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+El compilador reescribe una `async fn` como un tipo anónimo que implementa `Future`: un `enum` con un estado por cada `.await`. Cada estado guarda **solo los locales que sobreviven a esa suspensión** —los que se usan después del `.await`—, y por eso el tamaño del future, conocido en compilación, es el del estado más gordo. El `poll` generado es un `match` sobre el discriminante que reanuda por donde iba: sondea el sub-future, propaga `Pending` o transita con `Ready`, pasando `cx` hacia abajo. Como un estado puede prestar un local a su sub-future, la máquina es autorreferencial, y por eso no debe moverse tras arrancar: de ahí `Pin<&mut Self>` en `poll`.
+</Callout>
+
+<Reto title="Desensambla la máquina">
+1. Toma una `async fn` con tres `.await` y dibuja el `enum` de estados, anotando en cada variante qué locales guarda y cuáles no, según se usen o no tras cada suspensión.
+2. Justifica por qué `id` no aparece en los estados posteriores de `saludar` pero `nombre` sí. Da la regla general en una frase.
+3. Escribe a mano el `poll` conceptual de tu ejemplo de tres `.await`, marcando dónde se propaga `Pending` y dónde se transita de estado.
+4. Explica por qué un cálculo pesado sin `.await` en medio de una tarea bloquea al executor, conectándolo con la idea de que los estados solo nacen donde tú escribiste una suspensión.
+5. Construye el caso autorreferencial: un `.await` cuyo sub-future toma prestado un local que vive en el mismo estado. Explica qué se rompería si la máquina se moviera y cómo `Pin` lo impide, enlazando con el nivel 28.
+</Reto>

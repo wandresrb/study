@@ -1,0 +1,154 @@
+---
+title: "Preempción: voluntaria, total, PREEMPT_RT y la perezosa"
+description: "Qué es la preempción y cuándo el kernel puede arrebatar la CPU a una tarea. Los modelos none, voluntary y full seleccionables en caliente con PREEMPT_DYNAMIC, la mecánica de preempt_count y TIF_NEED_RESCHED, los puntos de preempción, PREEMPT_RT (el kernel de tiempo real ya mainline desde 6.12) que convierte los spinlocks en locks que duermen, y la preempción perezosa que unifica los modelos."
+subject: kernel
+level: 46
+order: 5
+icon: "46.5"
+duracion: "18 min"
+---
+
+<Lead>
+Hasta ahora el planificador elegía a quién correr en los momentos que la propia tarea le cedía la CPU: al dormirse, al bloquearse, al volver de una llamada al sistema. La preempción es lo contrario: el kernel **arrebatando** la CPU a una tarea que no ha pedido soltarla, porque otra la merece más. Cuánto se atreve el kernel a interrumpirse a sí mismo —a preemptar código que corre en modo núcleo— es una perilla que define el carácter del sistema: máxima productividad si nunca lo hace, mínima latencia si lo hace en todas partes. Y esa perilla, que fue durante veinte años una elección de compilación, hoy se gira en caliente.
+</Lead>
+
+<Objetivos>
+
+- Distinguir preempción de espacio de usuario de preempción del kernel.
+- Comparar los modelos `none`, `voluntary` y `full`, y `PREEMPT_DYNAMIC`.
+- Entender la mecánica de `preempt_count` y `TIF_NEED_RESCHED`.
+- Situar `PREEMPT_RT` y la preempción perezosa en el kernel de 2026.
+
+</Objetivos>
+
+## Qué es la preempción y dónde puede ocurrir
+
+Preemptar es interrumpir a una tarea en ejecución para dar la CPU a otra sin que la primera coopere. Preemptar código de **usuario** siempre ha sido posible: cada vez que la CPU vuelve a espacio de usuario tras una interrupción o una syscall, el kernel comprueba si debe reprogramar. Lo que los modelos de preempción controlan es lo difícil: preemptar código del **propio kernel**, una tarea que corre en modo núcleo a media llamada al sistema.
+
+El disparador siempre es el mismo: alguien marca que la tarea actual debe ceder la CPU, poniendo el flag `TIF_NEED_RESCHED`. Lo hace `resched_curr` cuando el tic decide que la rodaja se agotó, cuando despierta una tarea más prioritaria, o cuando el balanceador reordena la carga. Pero marcar no es preemptar: la preempción solo se materializa al llegar a un **punto de preempción** donde sea seguro hacerlo.
+
+## Los modelos: none, voluntary y full
+
+Históricamente había tres modelos, hoy además seleccionables en tiempo de arranque o ejecución con `CONFIG_PREEMPT_DYNAMIC`:
+
+```bash
+# Elegir el modelo sin recompilar (PREEMPT_DYNAMIC)
+cat /sys/kernel/debug/sched/preempt        # none (voluntary) full
+echo full > /sys/kernel/debug/sched/preempt
+# o al arrancar:  preempt=none | voluntary | full
+```
+
+- **`PREEMPT_NONE`**: el kernel nunca se preempta a sí mismo. Una syscall corre hasta completarse o hasta que se duerma voluntariamente. Solo se reprograma al volver a usuario y en `cond_resched` explícitos. Máxima productividad, peor latencia; servidores y cómputo por lotes.
+- **`PREEMPT_VOLUNTARY`**: añade puntos de preempción explícitos —`might_sleep`, `cond_resched`— sembrados en los bucles largos del kernel. Mejora la latencia a bajo coste, sin ser preemptible en secciones críticas.
+- **`PREEMPT` (full)**: el kernel es preemptible en casi todas partes, salvo donde se desactiva a propósito (spinlocks, regiones con IRQ inhibidas). Baja latencia para escritorio e interactividad.
+
+Que `PREEMPT_DYNAMIC` los intercambie en caliente es posible gracias a las *static calls*: los puntos de preempción y `cond_resched` se parchean a `nop` o a código real según el modelo activo, sin penalización cuando están apagados. Cada modelo es un punto distinto en el compromiso entre productividad y latencia:
+
+<Cards>
+  <Card icon="🏭" title="none">
+    Cero preempción de kernel. Máximo rendimiento por trabajo terminado sin interrupciones, peor latencia de cola. Servidores, cómputo por lotes, HPC.
+  </Card>
+  <Card icon="🌱" title="voluntary">
+    Reprograma en puntos explícitos sembrados en bucles largos. Latencia media a coste casi nulo. El histórico compromiso de escritorio de propósito general.
+  </Card>
+  <Card icon="🖥️" title="full">
+    Preemptible salvo en secciones críticas marcadas. Baja latencia para interactividad, audio y vídeo, a cambio de más cambios de contexto.
+  </Card>
+  <Card icon="🎛️" title="rt">
+    Casi todo preemptible: spinlocks que duermen, IRQ en hilos. Latencia acotada para tiempo real duro. Control industrial, audio profesional, robótica.
+  </Card>
+</Cards>
+
+## preempt_count y need_resched: la mecánica
+
+El kernel sabe si es seguro preemptarse mirando un único contador por tarea, `preempt_count`, que empaqueta varios recuentos. Si es distinto de cero, la preempción está prohibida:
+
+```c
+/* Campos empaquetados en preempt_count (un unico word por tarea) */
+/* PREEMPT | SOFTIRQ | HARDIRQ | NMI | PREEMPT_NEED_RESCHED (bit alto) */
+
+#define preempt_disable() \
+do { \
+	preempt_count_inc(); \
+	barrier(); \
+} while (0)
+
+#define preempt_enable() \
+do { \
+	barrier(); \
+	if (unlikely(preempt_count_dec_and_test())) \
+		__preempt_schedule();   /* si llego a 0 y hay need_resched */
+} while (0)
+```
+
+Cada `spin_lock` hace `preempt_disable`, cada contexto de interrupción suma en su campo, y mientras cualquiera de esos recuentos sea no nulo la tarea es intocable. El truco de rendimiento es que `TIF_NEED_RESCHED` se refleja además en el bit alto de `preempt_count` (`PREEMPT_NEED_RESCHED`, invertido), de modo que la pregunta "¿puedo y debo reprogramar?" se responde con **una sola** comparación del word contra cero. Cuando `preempt_enable` baja el contador a cero y el bit de resched está puesto, llama al planificador ahí mismo.
+
+Los puntos donde la marca se hace efectiva son cuatro:
+
+```c
+/* Retorno de una IRQ a codigo de kernel preemptible:
+ * se planifica aqui, en medio de la tarea interrumpida */
+asmlinkage __visible void __sched preempt_schedule_irq(void)
+{
+	do {
+		preempt_disable();
+		local_irq_enable();
+		__schedule(SM_PREEMPT);
+		local_irq_disable();
+		sched_preempt_enable_no_resched();
+	} while (need_resched());
+}
+```
+
+Los otros tres: `preempt_enable` cuando el contador cae a cero, el retorno a espacio de usuario (`exit_to_user_mode_loop`), y las llamadas explícitas a `cond_resched` o `schedule`. Fuera de esos puntos, y con `preempt_count` no nulo, la tarea corre sin que nada pueda arrebatarle la CPU.
+
+Bajo los modelos `none` y `voluntary`, un bucle largo en modo núcleo debe ceder la CPU a mano, o monopolizará el núcleo hasta terminar. De ahí el sembrado de `cond_resched` que salpica el árbol:
+
+```c
+/* Un recorrido largo que colaboraria con el planificador */
+for (i = 0; i < nr_enorme; i++) {
+	procesar(&datos[i]);
+	if (need_resched())     /* implicito dentro de cond_resched */
+		cond_resched();     /* cede solo si hay algo mas prioritario */
+}
+```
+
+`cond_resched` es un `nop` bajo `PREEMPT` (full) y `PREEMPT_RT`, porque ahí el kernel ya preempta por su cuenta y no hace falta pedir permiso. Precisamente eliminar estas miles de llamadas manuales —reliquia de los modelos no preemptibles— es una de las metas de la preempción perezosa.
+
+<Callout type="warn" title="Preempción no es interrupción">
+Una interrupción siempre puede llegar (salvo con IRQ inhibidas) y se atiende sin cambiar de tarea: el manejador corre y devuelve el control a la misma tarea. La preempción es la decisión, tomada normalmente **al volver** de esa interrupción, de no devolver el control a la tarea original sino a otra distinta. Por eso `preempt_count` cuenta por separado el contexto de interrupción: puedes estar atendiendo una IRQ (intocable) y aun así tener `need_resched` marcado, que se hará efectivo al retornar.
+</Callout>
+
+## PREEMPT_RT y la preempción perezosa
+
+Durante casi veinte años existió fuera del árbol un cuarto modelo, `PREEMPT_RT`, y desde **Linux 6.12 (2024)** está por fin en mainline. Su meta es hacer preemptible casi todo el kernel para acotar la latencia máxima —el tiempo real duro—, y para lograrlo transforma los cimientos de la concurrencia:
+
+- Los `spinlock_t` dejan de inhibir la preempción y se convierten en `rt_mutex` que **pueden dormir**, con herencia de prioridad para evitar la inversión.
+- Solo los `raw_spinlock_t` y las regiones con IRQ inhibidas siguen siendo verdaderamente atómicas e impreemptibles: el núcleo mínimo irreductible.
+- Los manejadores de interrupción se ejecutan en hilos (*threaded IRQs*) por defecto, así que también son preemptibles y planificables.
+
+Esta es la razón de fondo de todas las advertencias de niveles anteriores: bajo `PREEMPT_RT`, código que en un kernel normal jamás dormía —el que está bajo un `spin_lock`— sí puede dormir, y por eso las reglas de contexto se vuelven más estrictas. La última pieza, la **preempción perezosa** (`PREEMPT_LAZY`, en mainline desde 2025), busca unificar los modelos: añade un segundo bit, `TIF_NEED_RESCHED_LAZY`, que para tareas `SCHED_NORMAL` marca la reprogramación como diferible —se aplicará en el próximo punto natural, preservando la productividad—, mientras que las de tiempo real siguen preemptando de inmediato con el bit eager. El objetivo a largo plazo es que un solo modelo, afinando la avidez por clase, reemplace a `none`, `voluntary` y `full`, y que los miles de `cond_resched` dispersos por el árbol puedan por fin borrarse.
+
+<Mermaid code={`flowchart TD
+  A[resched_curr marca need_resched] --> B[La tarea sigue corriendo]
+  B --> C[Se alcanza un punto de preempcion]
+  C --> D[Retorno de IRQ a kernel preemptible]
+  C --> E[preempt_enable baja el contador a cero]
+  C --> F[Retorno a espacio de usuario]
+  C --> G[cond_resched o schedule explicito]
+  D --> H[__schedule elige la siguiente tarea]
+  E --> H
+  F --> H
+  G --> H`} />
+
+<Callout type="dios" title="La preempción es la promesa que el kernel se obliga a cumplir">
+Detente en la tensión que la preempción encarna, porque atraviesa todo el diseño del kernel. Un sistema operativo quiere dos cosas que se contradicen: terminar el trabajo cuanto antes —que cada tarea corra sin interrupciones hasta acabar, aprovechando cachés calientes y sin pagar cambios de contexto— y responder al instante —que ninguna tarea, por importante que sea la que corre, tenga que esperar demasiado su turno—. Productividad contra latencia, y no hay un punto óptimo universal: depende de si la máquina es un servidor que muele datos o un sintetizador que no puede perder una muestra de audio. La preempción es el mecanismo con el que el kernel elige, y `PREEMPT_RT` lleva la elección al extremo de someterse a sus propias reglas: para poder interrumpirse en casi cualquier punto, el kernel tuvo que volverse tan reentrante y tan escrupuloso con sus locks como le exige a cualquier driver. Ahí está la revelación que cierra el nivel y el arco entero de concurrencia: cada spinlock, cada barrera, cada sección crítica que estudiaste no eran ceremonias burocráticas, sino el precio de esta promesa. Un kernel preemptible es un kernel que puede arrebatarse la CPU a sí mismo a media faena, y eso solo es seguro si cada estructura de datos está protegida como si un segundo hilo pudiera aparecer en cualquier instante sobre ella —porque, con la preempción, puede—. La preempción no es una función más del planificador: es el contrato que convierte la corrección concurrente de una buena práctica en una condición de supervivencia. Cuando lo entiendes, el planificador deja de ser el último tema del kernel y se revela como el primero: el que impone el orden temporal del que todo lo demás depende.
+</Callout>
+
+<Reto title="Gira la perilla y observa la latencia">
+1. Lee `/sys/kernel/debug/sched/preempt`, cambia entre `none`, `voluntary` y `full` en caliente y mide la latencia con `cyclictest` bajo carga.
+2. Escribe un módulo con una sección bajo `preempt_disable`/`preempt_enable` y comprueba con `CONFIG_DEBUG_PREEMPT` que dormir dentro dispara un aviso.
+3. Explica por qué `TIF_NEED_RESCHED` se refleja en `preempt_count` y qué comparación única habilita eso en el camino caliente.
+4. Enumera los cuatro puntos de preempción y razona por qué ninguno actúa mientras `preempt_count` es distinto de cero.
+5. Describe qué le pasa a un `spin_lock` bajo `PREEMPT_RT` y por qué eso obliga a repensar qué código puede dormir.
+</Reto>

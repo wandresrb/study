@@ -1,0 +1,145 @@
+---
+title: "Contadores de referencia: refcount_t y kref"
+description: "Gestionar la vida de objetos compartidos entre contextos sin carreras ni use-after-free. refcount_t y su blindaje contra desbordamientos, kref con su callback de liberación, y la frontera exacta entre cuándo bastan los atomics y cuándo necesitas un lock."
+subject: kernel
+level: 14
+order: 5
+icon: "14.5"
+duracion: "16 min"
+---
+
+<Lead>
+Un objeto del kernel —un socket, un archivo, un dispositivo— lo comparten a la vez varios contextos. ¿Quién lo libera, y cuándo, sin que otro lo siga usando? La respuesta es el contador de referencia: el último en soltarlo apaga la luz. Es la aplicación estrella de los atomics, pero también donde aprendes su límite: por qué a veces un átomo basta y por qué a veces, irremediablemente, necesitas un lock.
+</Lead>
+
+<Objetivos>
+
+- `refcount_t` y su blindaje contra overflow y use-after-free.
+- `kref`: contador más callback de liberación.
+- El patrón `container_of` en la función de release.
+- Cuándo bastan los atomics y cuándo necesitas un lock.
+
+</Objetivos>
+
+## El problema: ¿quién libera el objeto?
+
+Imagina una estructura compartida por varios contextos. Cada uno que la usa toma una "referencia"; al terminar, la suelta. Cuando la última se suelta, el objeto se libera. Históricamente esto se hacía con un `atomic_t` a pelo, y funcionaba... hasta que no. Un `atomic_t` que se desborda al incrementar, o que baja de cero por un decremento de más, provoca que el objeto se libere mientras alguien lo usa: un `use-after-free`, la clase de bug más explotada del kernel. El CVE-2016-0728 del subsistema de keyrings fue exactamente eso: un overflow de refcount escalable a root.
+
+Por eso Linux introdujo `refcount_t`, un contador de referencia *blindado*: satura en lugar de desbordar, y avisa (`WARN`) ante un decremento a cero indebido o un incremento desde cero. Cambia la semántica de "cuenta rápido" por "cuenta seguro":
+
+```c
+#include <linux/refcount.h>
+
+struct recurso {
+	refcount_t ref;
+	/* ...datos... */
+};
+
+refcount_set(&r->ref, 1);              /* al crear: 1 referencia */
+refcount_inc(&r->ref);                 /* +1 (aborta con WARN si ya era 0) */
+
+if (refcount_dec_and_test(&r->ref)) {  /* -1; true SOLO si llego a 0 */
+	/* Somos el ultimo. Nadie mas tiene el objeto. Liberamos. */
+	kfree(r);
+}
+```
+
+La operación clave es `refcount_dec_and_test`: decrementa y devuelve verdadero *solo* al hilo que llevó la cuenta a cero. Como en `atomic_dec_and_test` (nivel 14.3), esa exclusividad es lo que hace correcta la liberación sin lock. Para el patrón "búscalo y quédate una referencia si aún vive" está `refcount_inc_not_zero`, que devuelve falso si el objeto ya estaba muriendo.
+
+## kref: el patrón envuelto
+
+Repetir "decrementa, comprueba, libera" en cada objeto invita a errores. El kernel lo empaqueta en `kref`: un `refcount_t` más una función de liberación que se invoca sola al llegar a cero.
+
+```c
+#include <linux/kref.h>
+
+struct recurso {
+	struct kref refcount;
+	char nombre[32];
+};
+
+/* Se llama automaticamente cuando la cuenta llega a 0 */
+static void recurso_release(struct kref *ref)
+{
+	struct recurso *r = container_of(ref, struct recurso, refcount);
+	pr_info("liberando %s\n", r->nombre);
+	kfree(r);
+}
+
+static void ejemplo(void)
+{
+	struct recurso *r = kmalloc(sizeof(*r), GFP_KERNEL);
+
+	kref_init(&r->refcount);                 /* cuenta = 1 */
+	kref_get(&r->refcount);                  /* +1: otro contexto la toma */
+	kref_put(&r->refcount, recurso_release); /* -1 */
+	kref_put(&r->refcount, recurso_release); /* -1: llega a 0, llama release */
+}
+```
+
+Reaparece el `container_of` del nivel 2.2: el callback recibe un puntero al campo `kref`, y desde él recupera el `struct recurso` completo. Es el mismo diseño intrusivo de las listas del nivel 10, y no por casualidad: es *el* idioma del kernel para componer objetos. Estructuras centrales como `struct kobject` —y por tanto todo el device model— usan `kref` por dentro para gestionar su vida.
+
+Hay un matiz vital al *buscar* un objeto en una estructura compartida: entre que encuentras el puntero y haces `kref_get`, otro contexto puede haber llevado la cuenta a cero y estar ya liberándolo. Tomar una referencia entonces sería un `use-after-free`. Para eso está `kref_get_unless_zero`, que incrementa *solo si* la cuenta no era cero y devuelve falso en caso contrario:
+
+```c
+struct recurso *r = buscar_en_tabla(clave);   /* puede estar muriendo */
+
+if (r && kref_get_unless_zero(&r->refcount)) {
+	/* referencia tomada con exito: el objeto sigue vivo, es nuestro */
+} else {
+	/* ya estaba en camino de liberarse: tratalo como no encontrado */
+}
+```
+
+Es el `refcount_inc_not_zero` envuelto en `kref`, y la base de las búsquedas seguras combinadas con RCU (un nivel más adelante).
+
+<Mermaid code={`flowchart TD
+  I[kref_init cuenta 1] --> G[kref_get cuenta sube]
+  G --> U[Varios contextos usan el objeto]
+  U --> P[kref_put cuenta baja]
+  P --> Q{La cuenta llego a cero}
+  Q -->|no, aun hay usuarios| U
+  Q -->|si, ultimo en salir| REL[recurso_release libera]
+  style REL fill:#f38ba8,color:#11111b
+  style Q fill:#f9e2af,color:#11111b`} />
+
+## La frontera: átomo frente a lock
+
+Aquí llega la lección más importante de todo el nivel. Un `refcount_t` protege *un solo dato* con *una sola operación indivisible*. Perfecto para contar referencias. Pero la mayoría de los problemas reales necesitan más, y hay que ver *por qué* con precisión.
+
+Los atomics bastan cuando tu invariante cabe en una operación: un contador, un flag, una referencia. `refcount_dec_and_test` toma la decisión de liberar en un único punto indivisible, así que es correcto sin lock.
+
+Necesitas un lock en cuanto tu invariante abarca *varios* pasos o *varios* datos. El caso clásico: "si el refcount es el último, quítalo de la lista global y libéralo". Eso son dos acciones —decrementar y desenlazar— que deben ocurrir como una sola frente a otros contextos. Un hilo podría encontrar el objeto en la lista *justo entre* tu decremento a cero y tu `list_del`, y quedarse con un puntero a memoria que estás liberando. Ninguna secuencia de atomics arregla esto, porque el problema no es cada paso, sino la *frontera* entre ellos.
+
+El kernel ofrece un puente preciso para este caso exacto, `refcount_dec_and_lock`, que decrementa y, *solo si* llega a cero, adquiere el lock y devuelve verdadero de forma atómica:
+
+```c
+/* Decrementa; si llega a 0, coge 'lock' y devuelve true, todo atomico */
+if (refcount_dec_and_lock(&r->ref, &lista_lock)) {
+	list_del(&r->nodo);            /* protegido por el lock */
+	spin_unlock(&lista_lock);
+	kfree(r);
+}
+```
+
+Une los dos mundos: el átomo decide, el lock protege la acción compuesta que sigue.
+
+<Callout type="dios" title="Los atomics no se componen: la regla que gobierna toda la concurrencia">
+Grábate esta frase, porque es la ley que separa a quien *usa* primitivas de quien las *entiende*: una operación atómica es una roca, pero una secuencia de operaciones atómicas es arena. Cada `atomic_inc`, cada `cmpxchg`, cada `refcount_dec_and_test` es individualmente indivisible; pero en cuanto encadenas dos, el hueco entre ellas vuelve a ser una sección crítica abierta por la que otro contexto se cuela. La atomicidad *no es transitiva*: no se propaga de las partes al todo. De aquí se deduce, con la fuerza de un teorema, toda la disciplina de la sincronización. Cuándo elegir un atómico frente a un lock no es cuestión de gusto ni de rendimiento: es una pregunta sobre el *tamaño de tu invariante*. Si lo que debe mantenerse verdadero cabe en una sola operación de hardware, un átomo basta y es óptimo. Si abarca dos datos, o un "lee, decide y actúa", ninguna cantidad de atomics lo salvará y necesitas un lock que abrace toda la sección. Todo el resto de este track de concurrencia —spinlocks, mutexes, RCU— existe para proteger invariantes demasiado grandes para un solo átomo. Entiende esta frontera y tendrás el mapa entero.
+</Callout>
+
+<Callout type="note" title="get y put deben cuadrar como débitos y créditos">
+La disciplina del refcount es contabilidad pura: cada `get` (y el `set` inicial a 1) es un crédito, cada `put` un débito, y al final de la vida del objeto deben cuadrar exactamente en cero. Un `get` de menos libera el objeto bajo los pies de quien aún lo usa; uno de más lo fuga para siempre. La regla práctica: documenta en cada función si *toma* una referencia que el llamador tendrá que soltar, o si opera sobre una prestada que no debe soltar. Una fracción enorme de los bugs de gestión de vida del kernel es, al final, un `get` y un `put` que no cuadran.
+</Callout>
+
+<Callout type="tip" title="Por defecto, refcount_t antes que atomic_t">
+Si estás implementando un contador de *referencias*, usa `refcount_t` o `kref`, nunca un `atomic_t` a pelo. La protección contra overflow y underflow no cuesta casi nada y cierra una familia entera de CVE. Reserva `atomic_t` para contadores y estadísticas donde el desbordamiento no implique liberar memoria viva.
+</Callout>
+
+<Reto title="Gestiona la vida de un objeto">
+1. Define un `struct` con un `struct kref` embebido y una función `_release` que use `container_of` para recuperarlo y hacer `kfree`.
+2. Simula dos contextos (dos kthreads) que hacen `kref_get` al empezar y `kref_put` al acabar. Comprueba con un `pr_info` que `release` se llama una sola vez, tras el último `put`.
+3. Provoca a propósito un `put` de más y observa el `WARN` de `refcount_t`. Compara con lo que haría un `atomic_t` a pelo: un `use-after-free` silencioso.
+4. Reescribe la liberación para que, además de liberar, quite el objeto de una lista global. Razona por qué ahora necesitas `refcount_dec_and_lock` y no basta `kref_put`.
+5. En una frase por invariante, clasifica tres datos compartidos de un driver tuyo según si les basta un átomo o exigen un lock.
+</Reto>

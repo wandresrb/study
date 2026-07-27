@@ -1,0 +1,127 @@
+---
+title: "Deadlocks y stalls async: cuando el await no vuelve"
+description: "El nivel 31 mostró que Rust no previene interbloqueos entre hilos; async añade formas nuevas de la misma enfermedad de viveza. Un candado async sostenido a través de un await, dos tareas esperándose por un canal lleno, un waker perdido que deja un future dormido para siempre, o una llamada bloqueante que congela al executor: todos son programas seguros que nunca progresan. Cómo reconocer cada patrón y cómo cazarlos con timeout y tokio-console."
+subject: rust
+level: 36
+order: 4
+icon: "36.4"
+duracion: "18 min"
+---
+
+<Lead>
+El nivel 31 trazó una frontera incómoda: Rust demuestra la ausencia de carreras de datos, pero **no** la de interbloqueos, porque el progreso es una propiedad de *viveza* y refutarla equivale al problema de la parada. Async no mueve esa frontera; le añade territorio. A las formas clásicas —dos hilos con candados en orden opuesto— se suman patologías nuevas que solo existen porque el flujo de control es ahora un dato que se suspende: un candado async retenido a través de un `.await`, dos tareas que se esperan mutuamente por un canal lleno, un `waker` que se pierde y deja un `Future` dormido para siempre, o —el pecado más propio de async— una llamada bloqueante que congela al executor y hambrea a todas las tareas vecinas. Todos comparten la firma que el nivel 31 describió: son programas **seguros** —sin `unsafe`, sin corrupción— que simplemente *nunca vuelven de un `.await`*. Y como no hay pánico, `RUST_BACKTRACE` calla; la detección exige las herramientas de este nivel. Aprender a reconocer cada patrón es aprender a leer el silencio.
+</Lead>
+
+<Objetivos>
+
+- Reconocer el interbloqueo async por sostener un candado (`tokio::sync::Mutex`) a través de un `.await`.
+- Identificar la espera circular entre tareas a través de canales acotados llenos.
+- Diagnosticar el `.await` que nunca resuelve: `waker` perdido, emisor caído o notificación jamás enviada.
+- Entender por qué **bloquear el executor** es el stall más traicionero, y cómo cazar todo esto con `timeout` y `tokio-console`.
+
+</Objetivos>
+
+## El candado retenido a través del await
+
+El nivel 31 te advirtió: nunca sostengas un guard mientras llamas a código que no controlas. En async esa regla se vuelve más aguda, porque un `.await` *es* ceder el control a código que no controlas —el resto de tus tareas—. Sostener un `tokio::sync::Mutex` a través de un `.await` es la receta canónica del interbloqueo async:
+
+```rust
+use tokio::sync::Mutex;
+use std::sync::Arc;
+
+async fn transferir(estado: Arc<Mutex<Cuenta>>) {
+    let mut guard = estado.lock().await;
+    guard.saldo -= 10;
+    confirmar_en_red(&guard).await; // MAL: el guard sigue vivo cruzando el await
+    guard.saldo += 0;
+}
+```
+
+Mientras la tarea está suspendida en `confirmar_en_red`, retiene el candado. Si otra tarea —o esta misma en otra invocación— necesita `lock()` para avanzar, y de su avance depende que `confirmar_en_red` termine, se cierra el ciclo: cada una espera a la otra, ninguna suelta. La cura es la misma disciplina del nivel 31 llevada a async: **encoge la sección crítica para que no cruce ningún `.await`**. Copia lo que necesites, suelta el guard con `drop`, y solo entonces suspende.
+
+```rust
+async fn transferir(estado: Arc<Mutex<Cuenta>>) {
+    let snapshot = {
+        let mut guard = estado.lock().await;
+        guard.saldo -= 10;
+        guard.clone()          // copio lo necesario
+    };                         // el guard muere aqui, ANTES del await
+    confirmar_en_red(&snapshot).await;
+}
+```
+
+<Callout type="tip" title="std::sync::Mutex a través de un await ni siquiera compila (y menos mal)">
+Si en vez del `Mutex` de Tokio usas el `std::sync::Mutex`, su guard es `!Send`, y sostenerlo a través de un `.await` en una tarea que debe ser `Send` produce un **error de compilación**. Es una de las pocas veces que el sistema de tipos te salva de un interbloqueo: te obliga a soltar el candado síncrono antes de suspender. La regla práctica que se deriva: usa `std::sync::Mutex` para secciones críticas cortísimas y puramente síncronas, y reserva `tokio::sync::Mutex` para cuando *de verdad* necesites mantener el lock a través de un `.await` —sabiendo que asumes tú la disciplina que el compilador ya no vigila—.
+</Callout>
+
+## Esperas circulares y awaits que no resuelven
+
+La segunda familia son tareas que se esperan entre sí sin ningún candado a la vista. El vehículo típico es un **canal acotado lleno**: la tarea A no puede enviar a B porque el buffer de B está lleno, y B no puede vaciarlo porque está bloqueada enviando a A, cuyo buffer también está lleno. Es la espera circular del nivel 31, pero tejida con `send().await` en vez de `lock()`.
+
+```rust
+// A espera hueco en el canal hacia B; B espera hueco en el canal hacia A.
+tx_a_b.send(msg).await.unwrap(); // se bloquea si el buffer de B esta lleno
+// ... y simetricamente en la otra tarea. Ciclo cerrado, nadie drena.
+```
+
+Un pariente más solitario es el `.await` que **nunca** resuelve, sin que haya ciclo alguno. Ocurre cuando el `Future` que esperas jamás recibirá la señal que lo completa:
+
+- **El emisor se cayó**: esperas un `oneshot::Receiver` cuyo `Sender` se soltó sin enviar. Aquí Tokio es amable y el `await` resuelve con `Err(RecvError)` en vez de colgarse —siempre que no *ignores* ese `Result`—.
+- **La notificación nunca llega**: esperas un `Notify::notified()` y ninguna tarea llama a `notify_one()`, o esperas datos en un canal cuyo productor terminó sin cerrar bien.
+- **El `waker` se perdió**: en un `Future` escrito a mano, guardaste mal el `Waker` —o no lo guardaste— y devolviste `Poll::Pending`. Nadie volverá a sondear la tarea: se durmió y no hay quien la despierte. Es el interbloqueo de una sola tarea consigo misma, y `tokio-console` lo marca literalmente como "lost waker".
+
+## Bloquear el executor: el stall más traicionero
+
+El stall más propio de async no es un ciclo: es un solo egoísta. Si una tarea llama a una operación **bloqueante** —`std::thread::sleep`, E/S síncrona, un `Mutex` de `std` que se queda esperando, o un bucle de CPU largo— no cede el hilo trabajador en un `.await`, sino que lo **congela**. En un runtime `current_thread`, con un solo hilo, eso detiene el mundo entero: ninguna otra tarea avanza. En un runtime multihilo, hambrea a un trabajador; y si suficientes tareas bloquean suficientes trabajadores a la vez, el runtime se para en seco aunque no haya ningún ciclo lógico.
+
+```rust
+async fn manejar() {
+    std::thread::sleep(Duration::from_secs(2)); // congela el hilo trabajador
+    // Debia ser: tokio::time::sleep(Duration::from_secs(2)).await;
+}
+```
+
+<Mermaid code={`flowchart TD
+  P[La tarea no vuelve del await] --> Q1[Retiene un candado cruzando el await]
+  P --> Q2[Espera circular por canal lleno]
+  P --> Q3[Waker perdido o emisor caido]
+  P --> Q4[Llamada bloqueante congela el executor]
+  Q1 --> D[tokio-console tarea idle para siempre]
+  Q2 --> D
+  Q3 --> D
+  Q4 --> E[tokio-console poll time enorme]
+  style P fill:#f38ba8,color:#11111b
+  style Q4 fill:#fab387,color:#11111b
+  style D fill:#89b4fa,color:#11111b
+  style E fill:#89b4fa,color:#11111b`} />
+
+La diferencia diagnóstica importa: un interbloqueo o un `waker` perdido dejan a la tarea **idle** —dormida, con `poll time` bajo, sin progresar—, mientras que bloquear el executor deja un **`poll` que no termina** —`poll time` altísimo—. `tokio-console` distingue los dos casos de un vistazo, exactamente por las métricas de la lección anterior. Y la primera herramienta defensiva, antes de abrir la consola, es envolver toda espera sospechosa en un límite temporal, que convierte un cuelgue silencioso en un error visible:
+
+```rust
+use tokio::time::{timeout, Duration};
+
+match timeout(Duration::from_secs(5), operacion()).await {
+    Ok(v) => v,
+    Err(_) => tracing::error!("operacion colgada: posible deadlock o waker perdido"),
+}
+```
+
+<Callout type="tip" title="Los volcados de tareas de Tokio: un backtrace async al fin">
+Bajo `--cfg tokio_unstable`, Tokio ofrece `Handle::dump()`, que captura un **volcado de tareas**: el árbol de `.await` de cada tarea viva, mostrando en qué punto de suspensión se quedó parada cada una. Es lo más parecido a un backtrace que async permite —no la pila del hilo, que la primera lección desahució, sino la pila *lógica* de futures anidados— y es la herramienta directa para "¿en qué `.await` se colgó esta tarea?". Combinado con `timeout` para disparar el volcado cuando algo tarda de más, convierte un cuelgue mudo en un informe que señala la suspensión culpable. Es reciente, inestable y con coste, pero cierra justo el hueco que dejaba la ausencia de backtraces async.
+</Callout>
+
+<Callout type="dios" title="Async no crea una nueva clase de fallo, pero sí un nuevo eje: la cooperación que se puede traicionar">
+La tentación es catalogar estos cuatro patrones como "bugs nuevos de async", pero la verdad es más precisa y más útil. Tres de ellos —candado retenido, espera circular, señal que no llega— son la **misma** enfermedad de viveza que el nivel 31 diagnosticó para hilos: propiedades de progreso que ningún sistema de tipos puede garantizar, porque decidirlas es indecidible. Async no inventó el interbloqueo; solo le dio vehículos nuevos —el `.await` en lugar del `lock()`, el canal lleno en lugar del candado en orden opuesto—. Lo que sí es genuinamente nuevo, lo que no tiene análogo exacto en el mundo de los hilos, es el cuarto: bloquear el executor. Y merece pensarse, porque revela la naturaleza profunda del modelo. Un hilo del sistema opera bajo planificación *preventiva*: el kernel se lo quita por la fuerza cada pocos milisegundos, así que un hilo egoísta que no cede solo se perjudica a sí mismo. Una tarea async opera bajo planificación *cooperativa*: nadie se la quita del hilo trabajador; ella debe *elegir* ceder en un `.await`. Esa elección es la fuente de toda la eficiencia del modelo —sin cambios de contexto forzosos, sin pilas de megabytes— y es, simétricamente, su punto único de fallo. Una tarea que no coopera no se perjudica solo a sí misma: **secuestra el hilo y con él a todas las tareas que dependían de que lo soltara**. El bloqueo del executor es, por tanto, un interbloqueo de un género nuevo: no un ciclo de espera entre iguales, sino la traición del pacto sobre el que se sostiene la concurrencia entera. Por eso la disciplina de async es más exigente que la de los hilos, no menos: el compilador te salva de las carreras de datos y, con el `Mutex` de `std`, hasta de algún candado cruzando un `.await`; pero la viveza —que las tareas cedan, que las señales lleguen, que ningún candado sobreviva a una suspensión— queda enteramente en tus manos. Programar async bien es honrar un contrato que ninguna máquina puede verificar por ti, y depurarlo es, casi siempre, encontrar dónde ese contrato se rompió en silencio.
+</Callout>
+
+<Callout type="note" title="Lo esencial de los stalls async">
+Async hereda la viveza indecidible del nivel 31 y le suma vehículos propios. Un `tokio::sync::Mutex` retenido a través de un `.await` interbloquea: encoge la sección crítica para que el guard muera antes de suspender (el `Mutex` de `std` ni compila, y eso te protege). Dos tareas que se esperan por canales acotados llenos cierran una espera circular. Un `.await` que no resuelve nace de un `waker` perdido, un emisor caído o una notificación jamás enviada. Y bloquear el executor —`sleep` síncrono, E/S bloqueante, CPU larga— congela el hilo y hambrea a las vecinas: el fallo único de la planificación cooperativa. Diagnóstico: `timeout` convierte el cuelgue en error; `tokio-console` distingue la tarea *idle* para siempre del `poll` que nunca termina.
+</Callout>
+
+<Reto title="Provoca el silencio, luego rómpelo">
+1. Sostén un `tokio::sync::Mutex` a través de un `.await` en dos tareas que compiten y reproduce el interbloqueo; corrígelo soltando el guard antes de suspender y explica qué condición de Coffman negaste.
+2. Cambia ese `Mutex` por `std::sync::Mutex` y observa el error de compilación; razona por qué `!Send` en el guard equivale aquí a una red de seguridad.
+3. Monta dos tareas que se envíen por canales `mpsc` acotados de capacidad 1 hasta llenarlos y provoca la espera circular; rómpela aumentando la capacidad o drenando en otra tarea.
+4. Escribe un `Future` a mano que devuelva `Poll::Pending` sin registrar el `Waker` y confírmalo con `tokio-console` como tarea *idle* con "lost waker"; arréglalo guardando y llamando al `waker`.
+5. Mete un `std::thread::sleep` en una tarea sobre un runtime `current_thread`, observa que todo se para, y cúralo con `tokio::time::sleep` o `spawn_blocking`. Envuelve además la operación en `timeout` y compara la experiencia de depuración.
+</Reto>

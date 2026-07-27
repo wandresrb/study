@@ -1,0 +1,144 @@
+---
+title: "seccomp: filtrar las syscalls de un proceso"
+description: "Cada llamada al sistema es una puerta al anillo 0; seccomp cierra las que un proceso no necesita. El modo estricto, seccomp-bpf con su programa de filtrado sobre struct seccomp_data, el requisito de no_new_privs, las acciones de retorno del filtro y el modo de notificacion a un supervisor, y como Chrome, systemd y los runtimes de contenedores lo usan para reducir la superficie de ataque del kernel."
+subject: kernel
+level: 52
+order: 3
+icon: "52.3"
+duracion: "16 min"
+---
+
+<Lead>
+El kernel expone alrededor de cuatrocientas syscalls, y cada una es una puerta abierta hacia el anillo 0. Un editor de texto no necesita `mount`, un servidor web no necesita `ptrace`, un decodificador de vídeo no necesita `bpf`, y sin embargo todos ellos, por defecto, pueden invocarlas: la puerta está abierta aunque nadie la cruce. Si un atacante logra ejecutar código dentro de ese proceso, hereda el llavero completo y puede empujar cualquier puerta buscando una con la cerradura rota —un fallo del kernel tras una syscall oscura—. `seccomp` es el mecanismo con el que un proceso renuncia voluntariamente y de forma irrevocable a las puertas que no va a usar, encogiendo la superficie de ataque del kernel a la mínima que su trabajo exige.
+</Lead>
+
+<Objetivos>
+
+- Distinguir el modo estricto del modo filtro (`seccomp-bpf`).
+- Escribir un filtro BPF que inspecciona `struct seccomp_data` y decide por syscall.
+- Entender por qué `no_new_privs` es requisito y qué garantiza.
+- Conocer las acciones de retorno y el modo `USER_NOTIF` de delegación a un supervisor.
+
+</Objetivos>
+
+## Del modo estricto al filtro programable
+
+`seccomp` nació en 2005 con un único modo, hoy llamado *estricto*: un proceso que lo activa solo puede invocar `read`, `write`, `_exit` y `sigreturn`; cualquier otra syscall lo mata al instante. Servía para ejecutar código no confiable que solo operaba sobre descriptores ya abiertos, pero era demasiado rígido para software real.
+
+La revolución llegó en 2012 con `seccomp-bpf`, el modo *filtro*. En lugar de una lista fija, el proceso adjunta un programa BPF clásico (cBPF, el ancestro de dos registros del eBPF del nivel 50) que el kernel ejecuta *antes* de cada syscall. El programa recibe una descripción de la llamada y devuelve un veredicto. Es una decisión programable, evaluada en el kernel, sin salir a espacio de usuario.
+
+```c
+/* include/uapi/linux/seccomp.h: lo que ve el filtro en cada syscall */
+struct seccomp_data {
+	int   nr;                    /* numero de syscall */
+	__u32 arch;                  /* AUDIT_ARCH_X86_64, AUDIT_ARCH_AARCH64... */
+	__u64 instruction_pointer;   /* desde donde se invoco */
+	__u64 args[6];               /* los seis argumentos */
+};
+```
+
+## Un filtro de lista blanca
+
+El filtro es un vector de instrucciones `sock_filter`. Comprueba primero la arquitectura —olvidarlo es un agujero clásico, porque en x86-64 se pueden invocar syscalls de 32 bits con otra numeración— y luego decide por número de syscall. Este permite un puñado y devuelve `EPERM` para el resto:
+
+```c
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <errno.h>
+
+static struct sock_filter filtro[] = {
+	/* rechazar cualquier arquitectura que no sea x86-64 */
+	BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+	BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+	/* cargar el numero de syscall */
+	BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+	/* lista blanca: read, write, exit_group -> permitir */
+	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_read,       3, 0),
+	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_write,      2, 0),
+	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit_group, 1, 0),
+	/* lo demas: fallar con EPERM en vez de matar */
+	BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+	BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+};
+```
+
+Cargarlo requiere dos pasos. Primero `PR_SET_NO_NEW_PRIVS`, y solo entonces se instala el filtro con la syscall `seccomp`:
+
+```c
+struct sock_fprog prog = {
+	.len    = sizeof(filtro) / sizeof(filtro[0]),
+	.filter = filtro,
+};
+
+prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+/* a partir de aqui, cualquier syscall fuera de la lista falla */
+```
+
+## no_new_privs: el candado imprescindible
+
+Ese `prctl(PR_SET_NO_NEW_PRIVS, 1, ...)` no es burocracia: sin él, la syscall `seccomp` falla salvo que tengas `CAP_SYS_ADMIN`. La razón es sutil y hermosa. `no_new_privs` fija en el proceso una promesa del kernel: ninguna `execve` posterior podrá otorgarle más privilegios de los que ya tiene —los bits setuid de los binarios se ignoran, las capabilities de fichero no se aplican—. Sin esa promesa, un filtro podría convertirse en un arma: bastaría filtrar selectivamente una syscall que un programa setuid usa para *dejar* privilegios (por ejemplo `setuid`), forzarla a fallar en silencio, y quedarte con un proceso privilegiado que creía haberlos soltado. Exigir `no_new_privs` cierra esa vía: si no puedes escalar privilegios con `execve`, tu filtro no puede engañar a nadie para que te los dé.
+
+## Las acciones y el supervisor externo
+
+El valor que devuelve el filtro determina el destino de la syscall. Estas son las acciones, de la más letal a la más permisiva:
+
+```c
+#define SECCOMP_RET_KILL_PROCESS  0x80000000U  /* mata el proceso entero */
+#define SECCOMP_RET_KILL_THREAD   0x00000000U  /* mata solo el hilo */
+#define SECCOMP_RET_TRAP          0x00030000U  /* SIGSYS sincrono */
+#define SECCOMP_RET_ERRNO         0x00050000U  /* falla con el errno indicado */
+#define SECCOMP_RET_USER_NOTIF    0x7fc00000U  /* delegar a un supervisor */
+#define SECCOMP_RET_TRACE         0x7ff00000U  /* ceder a un ptracer */
+#define SECCOMP_RET_LOG           0x7ffc0000U  /* permitir y registrar */
+#define SECCOMP_RET_ALLOW         0x7fff0000U  /* permitir */
+```
+
+`SECCOMP_RET_USER_NOTIF`, incorporado en 5.0, es la pieza más moderna y la que hace posible el aislamiento sofisticado de contenedores. En lugar de permitir o denegar, el filtro *suspende* la syscall y entrega una notificación por un descriptor de fichero a un proceso supervisor en espacio de usuario. El supervisor inspecciona los argumentos, decide, e incluso puede realizar la operación en nombre del proceso y devolver el resultado. Así un runtime intercepta `mount` desde dentro de un contenedor sin conceder `CAP_SYS_ADMIN`: la syscall no la ejecuta el kernel para el contenedor, la emula un supervisor de confianza.
+
+<Mermaid code={`sequenceDiagram
+  participant P as Proceso
+  participant K as Kernel seccomp
+  participant S as Supervisor
+  P->>K: invoca una syscall
+  K->>K: ejecuta el filtro BPF sobre seccomp_data
+  alt en la lista blanca
+    K->>P: SECCOMP_RET_ALLOW y continua
+  else requiere decision externa
+    K->>S: notificacion por el fd
+    S->>K: respuesta permitir o emular
+    K->>P: resultado
+  end`} />
+
+## Quién lo usa, y por qué importa
+
+`seccomp` es hoy invisible y ubicuo. Chrome envuelve cada proceso *renderer* —el que ejecuta el HTML y JavaScript no confiables de la web— en un filtro que bloquea la inmensa mayoría de syscalls; un exploit del motor de renderizado se encuentra, tras tomar el proceso, con casi todas las puertas al kernel cerradas. `systemd` expone esto de forma declarativa en cualquier unidad de servicio, y las curadas listas `@system-service` o `@privileged` ahorran enumerar syscalls a mano:
+
+```ini
+[Service]
+SystemCallFilter=@system-service      # permitir el conjunto tipico de un servicio
+SystemCallFilter=~@privileged @reboot  # pero negar las privilegiadas y reboot
+SystemCallErrorNumber=EPERM
+```
+
+Y Docker aplica por defecto un perfil que bloquea unas cuarenta y cuatro syscalls peligrosas —`kexec_load`, `mount`, `ptrace`, `bpf` y compañía— a todo contenedor sin que el usuario haga nada. En los tres casos el principio es el mismo: no confiar en que el código no llame a una syscall peligrosa, sino hacer que *no pueda*.
+
+<Callout type="tip" title="Enumera antes de filtrar">
+No adivines qué syscalls necesita tu programa: mídelo. Ejecuta `strace -f -c ./programa` para obtener el recuento por syscall de una ejecución representativa, o usa `SCMP_ACT_LOG` con `libseccomp` para registrar sin bloquear durante una fase de aprendizaje. Un filtro construido a ojo o bloquea de más —y el programa muere en producción con un `SIGSYS` misterioso— o bloquea de menos y no protege. La lista blanca correcta se descubre observando, no imaginando.
+</Callout>
+
+<Callout type="dios" title="La seguridad es restar, no sumar">
+Hay dos maneras de pensar la defensa de un sistema, y seccomp encarna la que de verdad funciona. La primera, la intuitiva, es aditiva: identificar las amenazas conocidas y añadir, una por una, una contramedida para cada una. Es la mentalidad del antivirus, de la lista negra, del parche reactivo. Tiene un defecto congénito: solo defiende de lo que ya sabes que existe, y el atacante siempre puede buscar la amenaza que aún no está en tu lista. La segunda manera, la que seccomp materializa, es sustractiva: no enumerar lo prohibido sino declarar lo permitido, y negar por defecto todo lo demás, incluido lo que todavía no se ha inventado. Cuando un renderer de Chrome declara que solo usará doscientas syscalls y prohíbe el resto, no está defendiéndose de vulnerabilidades conocidas del kernel; está defendiéndose de las que se descubrirán el año que viene tras una syscall que su código jamás necesitó tocar. Esta inversión —de la lista negra a la lista blanca, de enumerar el mal a delimitar el bien— es el principio más profundo de toda la seguridad computacional, y reaparece en cada capa de este nivel. Las capabilities restan poder de root. Los namespaces restan visibilidad del sistema. Los LSM restan acciones sobre objetos etiquetados. Todos comparten la misma humildad epistémica: reconocer que no puedes enumerar todas las formas en que un sistema puede ser atacado, y por tanto renunciar a intentarlo, invirtiendo la carga de la prueba. En vez de preguntar qué podría salir mal y taparlo, seccomp pregunta qué necesito de verdad y cierra todo lo demás. La superficie de ataque más pequeña no es la que tiene menos agujeros conocidos: es la que ni siquiera existe porque la cerraste antes de que nadie encontrara el agujero.
+</Callout>
+
+<Reto title="Encoge tu superficie de ataque">
+1. Escribe un programa que instale el filtro de lista blanca de arriba y verifica que un `open` posterior falla con `EPERM` mientras `write` a `stdout` funciona.
+2. Cámbialo a `SECCOMP_RET_KILL_PROCESS` y observa la diferencia: en vez de un errno recibes un `SIGSYS` que aparece en `dmesg`.
+3. Ejecuta `strace -f -c` sobre un programa real y razona qué syscalls formarían su lista blanca mínima.
+4. Explica en tres líneas qué agujero abre olvidar la comprobación de `arch` en un filtro sobre x86-64.
+5. Argumenta por qué `SECCOMP_RET_USER_NOTIF` permite a un contenedor ejecutar operaciones privilegiadas de forma segura sin recibir `CAP_SYS_ADMIN`.
+</Reto>

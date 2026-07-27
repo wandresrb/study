@@ -1,0 +1,140 @@
+---
+title: "Eventos, filtros y latency tracers"
+description: "Activar eventos concretos con set_event y comodines, reducir el ruido filtrándolos por condición con el lenguaje de filtros de ftrace, disparar acciones con triggers e histogramas en el kernel, y cazar picos con los latency tracers irqsoff, preemptoff y wakeup_rt que registran automáticamente el peor caso."
+subject: kernel
+level: 48
+order: 5
+icon: "48.5"
+duracion: "16 min"
+---
+
+<Lead>
+Activar un tracepoint es fácil; lo difícil es no ahogarte. Un kernel bajo carga dispara `sched_switch` decenas de miles de veces por segundo, y tu problema es una sola de esas veces: la petición gigante, la interrupción que se demoró, la tarea de tiempo real que despertó tarde. Este nivel te da las tres armas para encontrar esa aguja. Filtras el evento por condición para que solo se registre cuando importa; disparas triggers que reaccionan en el propio kernel; y sueltas los latency tracers, que no capturan todo sino que vigilan en silencio y solo guardan el **peor caso** que hayan visto. Es el paso de trazar a diagnosticar.
+</Lead>
+
+<Objetivos>
+
+- Activar eventos individuales y familias enteras con `enable` y `set_event`.
+- Filtrar eventos por condición con el lenguaje de filtros de `ftrace`.
+- Disparar acciones con triggers e histogramas agregados dentro del kernel.
+- Cazar picos de latencia con `irqsoff`, `preemptoff` y `wakeup_rt`.
+
+</Objetivos>
+
+## Activar eventos concretos
+
+Cada evento se enciende escribiendo `1` en su archivo `enable`, pero para familias enteras hay atajos. El archivo `set_event` acepta nombres y comodines, y activar por subsistema completo se hace con `sched:*`.
+
+```bash
+cd /sys/kernel/tracing
+echo 1 > events/block/block_rq_issue/enable   # un evento
+echo 'sched:sched_wakeup' >> set_event         # anadir por nombre
+echo 'irq:*' >> set_event                       # toda la familia irq
+cat set_event                                    # ver lo activo
+echo > set_event                                 # apagar todo de golpe
+```
+
+Encender a ciegas, sin embargo, reproduce el problema del nivel anterior: volumen. La potencia real llega cuando cada evento activo lleva una condición que decide si se registra.
+
+## Filtrar por condición
+
+Cada directorio de evento tiene un archivo `filter` que acepta una expresión sobre los campos que viste en `format`. El kernel evalúa esa expresión **antes** de escribir el registro en el buffer: los eventos que no la cumplen no cuestan casi nada y no ensucian la traza.
+
+```bash
+# Solo peticiones de bloque mayores de 4 KiB
+echo 'bytes > 4096' > events/block/block_rq_issue/filter
+
+# Solo cambios de contexto que dejan una tarea de alta prioridad
+echo 'prev_prio < 100' > events/sched/sched_switch/filter
+
+# Combinar condiciones y comparar cadenas con glob
+echo 'comm ~ "nginx*" && bytes >= 65536' > events/block/block_rq_issue/filter
+
+echo 0 > events/block/block_rq_issue/filter     # limpiar el filtro
+```
+
+El lenguaje admite los operadores relacionales `==`, `!=`, `<`, `<=`, `>` y `>=` sobre campos numéricos, el `&` de bits para probar banderas, y el `~` de glob para cadenas. Se combinan con `&&` y `||` y se agrupan con paréntesis. Hay campos comunes a todo evento con el prefijo `common_`, como `common_pid`, útil para atar el filtro a un proceso. Filtrar en el kernel, y no con `grep` después, es lo que hace viable trazar un evento frecuente en producción: la decisión de descartar ocurre en el camino caliente, no en tu terminal.
+
+## Triggers e histogramas
+
+Un evento puede además **disparar una acción** cuando ocurre, mediante su archivo `trigger`. Los más usados detienen la traza, apilan la pila o agregan. Detener el trazado justo cuando salta una condición congela el buffer con el contexto que la precede —un cazatrampas perfecto para eventos raros.
+
+```bash
+# Parar la captura en cuanto llegue una peticion de mas de 1 MiB
+echo 'traceoff if bytes > 1048576' > events/block/block_rq_issue/trigger
+
+# Agregar en el kernel: cuantos bytes emite cada proceso, sin sacar cada evento
+echo 'hist:key=comm:val=bytes:sort=bytes.descending' \
+	> events/block/block_rq_issue/trigger
+cat events/block/block_rq_issue/hist
+```
+
+```text
+{ comm: fio            } hitcount:      8123  bytes:  532938752
+{ comm: kworker/2:1H   } hitcount:       402  bytes:    1646592
+Totals:
+    Hits: 8525   Entries: 2   Dropped: 0
+```
+
+Los **histogramas** (hist triggers) son el salto cualitativo: en lugar de emitir un registro por evento y agregar fuera, el kernel mantiene una tabla hash indexada por la clave que pides y acumula ahí. Sacas un resumen, no un torrente. Es la misma idea que popularizó eBPF, disponible en `ftrace` sin escribir un solo programa.
+
+Otros dos triggers completan el arsenal. `stacktrace` guarda la pila de llamadas del kernel cada vez que el evento salta, y `snapshot` copia el buffer entero a un búfer secundario para preservarlo mientras la traza principal sigue viva. Ambos aceptan la misma cláusula `if` que los filtros, y se retiran anteponiendo un `!`.
+
+```bash
+# apilar la pila del kernel cuando una peticion supere 1 MiB
+echo 'stacktrace if bytes > 1048576' > events/block/block_rq_issue/trigger
+# retirar ese mismo trigger
+echo '!stacktrace if bytes > 1048576' > events/block/block_rq_issue/trigger
+```
+
+## Latency tracers: cazar el peor caso
+
+Los latency tracers invierten la lógica: no registras y buscas después el pico, sino que el tracer vigila continuamente una magnitud y **solo guarda la traza del máximo** que ha visto. `irqsoff` mide el intervalo más largo con las interrupciones deshabilitadas; `preemptoff`, con la preempción deshabilitada; `preemptirqsoff`, con cualquiera de las dos; y `wakeup`/`wakeup_rt`/`wakeup_dl` miden la latencia de planificación: cuánto tarda una tarea (la de mayor prioridad, o una de tiempo real, o una deadline) desde que se la despierta hasta que corre.
+
+```bash
+echo irqsoff > current_tracer
+echo 0 > tracing_max_latency     # poner el maximo a cero para empezar limpio
+echo 1 > tracing_on
+# ... reproducir la carga ...
+cat tracing_max_latency          # el peor caso en microsegundos, p.ej. 142
+cat trace                        # la traza EXACTA que produjo ese maximo
+```
+
+<Mermaid code={`flowchart LR
+  A[local_irq_disable] --> B[seccion critica larga]
+  B --> C[local_irq_enable]
+  A -. irqsoff mide esta ventana .-> C`} />
+
+Para la latencia de planificación de tiempo real, `wakeup_rt` es el instrumento canónico: lanzas tu tarea con prioridad de tiempo real y el tracer captura el peor retraso entre su despertar y su ejecución, que es exactamente la métrica que un sistema RT debe acotar.
+
+```bash
+echo wakeup_rt > current_tracer
+echo 0 > tracing_max_latency
+chrt -f 80 ./tarea_critica         # correr con prioridad FIFO 80
+cat tracing_max_latency            # peor latencia de despertar, en us
+```
+
+<Cards>
+  <Card icon="🔻" title="irqsoff / preemptoff">
+    Miden el intervalo máximo con interrupciones o preempción deshabilitadas. Cazan secciones críticas demasiado largas que degradan la respuesta del sistema.
+  </Card>
+  <Card icon="⏱️" title="wakeup_rt / wakeup_dl">
+    Miden la latencia de planificación de la tarea de tiempo real o deadline de mayor prioridad. La métrica que valida si un sistema RT cumple sus plazos.
+  </Card>
+</Cards>
+
+<Callout type="info" title="tracing_thresh registra solo lo que supera un umbral">
+Con `function_graph` y los latency tracers, escribir un valor en microsegundos en `tracing_thresh` hace que solo se registren las funciones o latencias que lo superan. Convierte una traza densa en una lista corta de culpables, sin filtrar campo a campo.
+</Callout>
+
+<Callout type="dios" title="El peor caso no se muestrea: se acecha">
+Detente en la diferencia epistemológica entre los latency tracers y todo lo anterior, porque encierra la lección más difícil de la observabilidad. Filtrar un evento, agregarlo en un histograma, muestrear con `perf`: todo eso responde bien a preguntas sobre el comportamiento típico, sobre la distribución, sobre dónde se va el tiempo en promedio. Pero un pico de latencia no es un fenómeno estadístico, es un fenómeno adversarial. Ocurre una vez entre millones, dura ciento cuarenta microsegundos en un mar de operaciones de nanosegundos, y es justo el que rompe el plazo de tiempo real o dispara la alerta a las tres de la madrugada. Si lo persigues muestreando, casi con certeza no lo verás: la probabilidad de que tu muestra caiga en esa única ventana es ínfima. Si lo persigues registrándolo todo, el volumen te sepulta y el propio coste del registro deforma la latencia que mides. Los latency tracers resuelven esta paradoja con un cambio de estrategia radical: en vez de capturar y buscar, instrumentan la magnitud misma —el tiempo con interrupciones apagadas, el retraso de un despertar— y mantienen un solo registro, el del máximo histórico, sobrescribiéndolo únicamente cuando aparece uno peor. No muestrean el sistema: lo acechan. Están en silencio, sin coste apreciable, hasta que el peor caso se manifiesta, y entonces lo atrapan con toda su traza de contexto: qué tarea, qué pila, qué función tenía las interrupciones cerradas. Interioriza esta inversión, porque separa a quien observa medias de quien caza colas: para lo raro y catastrófico no sirve mirar más, sino instrumentar la métrica exacta y dejar que el peor caso venga a ti. Ese es el final del camino que abriste en la primera lección —observar sin perturbar—, llevado hasta su forma más afilada: observar sin ni siquiera mirar, hasta que el sistema te enseña su peor momento.
+</Callout>
+
+<Reto title="Caza tu propio pico de latencia">
+1. Activa `block_rq_issue` con el filtro `bytes > 4096` y comprueba, comparando el volumen de la traza con y sin filtro, cuántos eventos te ahorraste registrar.
+2. Instala un hist trigger sobre `block_rq_issue` con clave `comm` y valor `bytes`, y averigua qué proceso mueve más datos sin sacar un solo evento crudo.
+3. Pon un trigger `traceoff if bytes > 1048576`, reproduce E/S grande y explica por qué el buffer congelado contiene el contexto *anterior* al evento.
+4. Lanza `irqsoff`, reinicia `tracing_max_latency` a cero, provoca carga y lee tanto el máximo como la traza que lo produjo; identifica qué función tenía las interrupciones cerradas.
+5. Con `wakeup_rt` y una tarea `chrt -f 80`, mide la peor latencia de despertar y razona por qué esta métrica, y no la media, es la que define si un sistema de tiempo real es correcto.
+</Reto>

@@ -1,0 +1,146 @@
+---
+title: "Deadlocks de spinlocks y las reglas de oro"
+description: "Los tres deadlocks clásicos —doble adquisición, orden inverso ABBA y el de IRQ— con código que los provoca, las reglas de oro para no caer, y el anticipo de lockdep, el validador que los caza antes de que ocurran."
+subject: kernel
+level: 15
+order: 5
+icon: "15.5"
+duracion: "13 min"
+---
+
+<Lead>
+Un spinlock mal usado no da un error: cuelga la máquina en silencio. Y casi todos los cuelgues por locks caen en tres patrones que se repiten desde hace décadas: cogerte a ti mismo, cogerlos en orden cruzado, y olvidarte de la interrupción. Conocerlos de memoria —y las reglas de oro que los evitan— es lo que separa el código de kernel que funciona del que un día, bajo carga, se queda mudo. Y al final te espera lockdep, la red de seguridad que los caza antes de que ocurran.
+</Lead>
+
+<Objetivos>
+
+- Reconocer y evitar la doble adquisición (los spinlocks no son recursivos).
+- Entender el deadlock ABBA y aplicar un orden global de locks.
+- Recordar el deadlock de IRQ y su regla.
+- Conocer las reglas de oro y qué hace lockdep por ti.
+
+</Objetivos>
+
+## Deadlock 1: doble adquisición
+
+Los spinlocks del kernel **no son recursivos**. Coger dos veces el mismo lock sin soltarlo es esperarte a ti mismo para siempre:
+
+```c
+spin_lock(&dev->lock);
+...
+spin_lock(&dev->lock);   /* DEADLOCK: giras esperando un lock que ya tienes */
+```
+
+Rara vez es tan obvio. Suele ser indirecto: la función `a()` coge el lock y llama a `b()`, que —quizá tres llamadas más abajo— vuelve a cogerlo. La cura es un patrón disciplinado: una versión `_locked` que asume que el lock ya está cogido, y una envoltura que lo coge:
+
+```c
+/* asume el lock cogido; lo documenta y lo verifica */
+static void contar_locked(struct mi_dispositivo *dev)
+{
+	lockdep_assert_held(&dev->lock);
+	dev->n++;
+}
+
+/* envoltura que adquiere y delega */
+static void contar(struct mi_dispositivo *dev)
+{
+	spin_lock(&dev->lock);
+	contar_locked(dev);
+	spin_unlock(&dev->lock);
+}
+```
+
+Que los spinlocks no sean recursivos es una decisión de diseño: un lock recursivo esconde bugs de estructura y cuesta más. El kernel prefiere que separes explícitamente "quién tiene el lock".
+
+## Deadlock 2: orden inverso ABBA
+
+El más traicionero. Dos núcleos cogen dos locks en orden opuesto:
+
+```c
+/* CPU0 */                     /* CPU1 */
+spin_lock(&A);                 spin_lock(&B);
+spin_lock(&B);  /* espera B */ spin_lock(&A);  /* espera A */
+```
+
+CPU0 tiene A y quiere B; CPU1 tiene B y quiere A. Ninguno suelta lo que tiene hasta conseguir lo que le falta. Espera circular: deadlock.
+
+<Mermaid code={`flowchart LR
+  P0[CPU0 tiene A, quiere B] -->|espera| P1[CPU1 tiene B, quiere A]
+  P1 -->|espera| P0
+  style P0 fill:#f38ba8,color:#11111b
+  style P1 fill:#f38ba8,color:#11111b`} />
+
+La regla: define un **orden global** para adquirir los locks y respétalo siempre. Si el orden natural (por rol, por jerarquía) no está claro, ordena por dirección para tener un orden total, como hace el planificador con las colas de ejecución:
+
+```c
+/* ordena por dirección: mismo orden en todos los núcleos */
+static void lock_dos(spinlock_t *x, spinlock_t *y)
+{
+	if (x < y) {
+		spin_lock(x);
+		spin_lock(y);
+	} else {
+		spin_lock(y);
+		spin_lock(x);
+	}
+}
+```
+
+Alternativa cuando no puedes fijar un orden: `spin_trylock` (nivel 15.4). Coges A, intentas B; si falla, sueltas A y reintentas. Rompes la espera circular a costa de un bucle de reintento.
+
+## Deadlock 3: el de la interrupción
+
+El que viste en el nivel 15.3, aquí como regla: si un lock se coge *alguna vez* en contexto de interrupción, en contexto de proceso hay que cogerlo **siempre** con `spin_lock_irqsave`. Basta un solo sitio que lo coja con las IRQs activas para que, el día que la interrupción caiga en ese núcleo a mitad de la sección, la máquina se cuelgue.
+
+```c
+/* si mi_handler() coge dev->lock, TODO el código de proceso debe usar irqsave */
+spin_lock_irqsave(&dev->lock, flags);
+...
+spin_unlock_irqrestore(&dev->lock, flags);
+```
+
+## Las reglas de oro y el anticipo de lockdep
+
+Destiladas, las normas que evitan casi todos los deadlocks de spinlock:
+
+<Cards>
+  <Card icon="🔢" title="Orden global">
+    Adquiere siempre los locks en el mismo orden en todo el kernel. El ABBA solo existe si alguien rompe el orden.
+  </Card>
+  <Card icon="😴" title="Nunca dormir">
+    Cero `schedule`, `kmalloc(GFP_KERNEL)` o `mutex` dentro de un spinlock (nivel 15.2). Secciones cortísimas.
+  </Card>
+  <Card icon="⚡" title="Coherencia con IRQ">
+    Si el lock lo toca una interrupción o un softirq, usa `irqsave`/`bh` en todos los sitios, sin excepción.
+  </Card>
+  <Card icon="🧩" title="No llamar a ciegas">
+    No invoques callbacks ni funciones ajenas con un lock cogido: podrían coger otro lock y crear un ABBA invisible.
+  </Card>
+</Cards>
+
+Y aun así, ningún humano audita todos los caminos de un kernel de millones de líneas. Por eso existe **lockdep** (`CONFIG_PROVE_LOCKING`, nivel 26): un validador que, en runtime, construye un grafo de dependencias "el lock X se cogió mientras se tenía el lock Y". Si alguna vez ve las dos aristas —A antes que B *y* B antes que A—, avisa aunque el deadlock real no haya llegado a pasar:
+
+```text
+======================================================
+WARNING: possible circular locking dependency detected
+7.1.0 #1 Not tainted
+------------------------------------------------------
+insmod/142 is trying to acquire lock:
+ ffff9a0e (&B){+.+.}, at: b_func+0x1c/0x40 [mi_driver]
+but task is already holding lock:
+ ffff9a02 (&A){+.+.}, at: a_func+0x2e/0x80 [mi_driver]
+```
+
+lockdep también vigila la coherencia de IRQ: marca cada lock como irq-safe o irq-unsafe y grita si lo coges con las IRQs activas en un sitio y desde un manejador en otro. Convierte "espero haber acertado el orden" en una prueba que corre en tu banco de desarrollo. Actívalo siempre en los kernels de prueba: caza en el primer minuto lo que en producción tardaría meses en colgar la máquina exacta del cliente exacto.
+
+<Callout type="dios" title="El deadlock no es un bug: es una propiedad del grafo de locks">
+El salto mental que lo cambia todo es dejar de ver los deadlocks como accidentes puntuales y verlos como lo que son: ciclos en un grafo dirigido. Cada vez que tu código coge B teniendo A, dibuja una arista A→B. El kernel entero, sumando todos sus caminos, es un grafo gigantesco de esas aristas. Un deadlock por orden es, exactamente, un ciclo en ese grafo —ni más ni menos—. Esta abstracción es poderosísima: reduce un problema temporal, no determinista y casi imposible de reproducir ("a veces se cuelga bajo carga") a una propiedad estructural, estática y decidible ("¿hay un ciclo?"). Y una propiedad estructural una máquina la puede verificar: eso es lockdep, un detector de ciclos sobre el grafo que tu código va tejiendo en cada adquisición. Por eso las reglas de oro no son supersticiones, son la forma de mantener el grafo acíclico por construcción: un orden global garantiza que todas las aristas apuntan en el mismo sentido, y un DAG no tiene ciclos. Cuando piensas en locks como un grafo que debe permanecer acíclico, has pasado de rezar a demostrar.
+</Callout>
+
+<Reto title="Provoca, diagnostica y previene">
+1. Escribe una doble adquisición del mismo lock y observa el cuelgue en QEMU; luego arréglalo con el patrón `_locked`.
+2. Monta un ABBA con dos locks y dos hilos, y reprodúcelo; resuélvelo con orden por dirección.
+3. Activa `CONFIG_PROVE_LOCKING` y comprueba que lockdep detecta el ABBA antes incluso de que se cuelgue.
+4. Toma un lock compartido con una IRQ y verifica que lockdep marca el uso sin `irqsave`.
+5. Redacta, para tu driver, la tabla de orden de locks: qué protege cada uno y en qué orden se cogen.
+</Reto>

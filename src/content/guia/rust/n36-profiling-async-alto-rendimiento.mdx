@@ -1,0 +1,131 @@
+---
+title: "Profiling async: el poll time, la contención y las herramientas"
+description: "Perfilar código async no es cazar el porcentaje de CPU, sino proteger la cooperación. La métrica reina es el poll time: cuánto retiene una tarea el hilo antes de ceder, porque cada poll largo inyecta latencia en todas las demás. A eso se suma la contención de locks async, que serializa tareas en silencio. Tres herramientas se reparten el trabajo: tokio-console para el reparto de hilos, tracing para la latencia lógica por span, y samply para el punto caliente de CPU dentro de un poll."
+subject: rust
+level: 36
+order: 5
+icon: "36.5"
+duracion: "19 min"
+---
+
+<Lead>
+Perfilar código síncrono es, en esencia, cazar el punto caliente: dónde se va el porcentaje de CPU. En async esa pregunta sigue existiendo, pero deja de ser la principal, y confundirlas es el error que arruina el análisis. La métrica que gobierna el rendimiento async no es cuánta CPU consume una función, sino cuánto **retiene el hilo trabajador antes de ceder**: el *poll time*. Un `poll` que dura un milisegundo no solo cuesta ese milisegundo; se lo *inyecta como latencia* a todas las demás tareas que esperaban su turno en ese hilo. La salud de un sistema async no se mide por su uso de CPU —un servidor de E/S sano está casi siempre ocioso— sino por lo bien que sus tareas cooperan: `poll` cortos, cesión frecuente, ningún egoísta que acapare. A eso se suma un segundo enemigo silencioso, la contención de locks async, que serializa tareas sin gastar CPU visible. Perfilar async, por tanto, no es optimizar el cálculo: es **proteger la cooperación**, y para ello hay tres herramientas que se reparten planos distintos del problema.
+</Lead>
+
+<Objetivos>
+
+- Entender por qué el *poll time* —no el porcentaje de CPU— es la métrica primaria del rendimiento async.
+- Detectar y medir la **contención de locks async** (`tokio::sync::Mutex`, `Semaphore`) que serializa tareas.
+- Repartir el trabajo entre tres herramientas: `tokio-console`, `tracing` con tiempos, y `samply`.
+- Aplicar una metodología: primero el `poll` largo, luego decidir si es CPU, bloqueo o contención.
+
+</Objetivos>
+
+## El poll time es la latencia que repartes a los demás
+
+Recupera la métrica reina de la lección de `tokio-console`. Cada vez que el executor sondea una tarea, esta corre hasta el siguiente `.await` y entonces cede. El tiempo de ese tramo es el *poll time*, y su importancia trasciende a la tarea que lo consume. Como un puñado de hilos trabajadores multiplexa miles de tareas de forma **cooperativa**, mientras un `poll` está en marcha ese hilo no puede atender a nadie más. Un `poll` de un milisegundo es un milisegundo de latencia añadido a la cola de todo lo que ese hilo tenía pendiente.
+
+```rust
+// Dos versiones que consumen la MISMA CPU total, pero se perfilan al reves.
+async fn buena(items: &[Item]) {
+    for item in items {
+        procesar(item);              // trozo corto
+        tokio::task::yield_now().await; // cede: poll time bajo, latencia repartida
+    }
+}
+
+async fn mala(items: &[Item]) {
+    for item in items {
+        procesar(item);              // nunca cede: un unico poll larguisimo
+    }                                // misma CPU, pero acapara el hilo de golpe
+}
+```
+
+Aquí está la trampa que un perfilador de CPU clásico no ve: ambas funciones aparecen con **idéntico** consumo de CPU en un *flamegraph*, porque calculan lo mismo. Pero su efecto sobre la latencia del sistema es opuesto. La primera reparte su trabajo en `poll` cortos y deja respirar a las demás tareas; la segunda lo apelmaza en un `poll` monstruoso que las hace esperar. El porcentaje de CPU es ciego a esta diferencia; el *poll time* la mide con exactitud. Por eso `tokio-console`, y no un perfilador de CPU, es el primer instrumento que abres para un problema de latencia async.
+
+<Callout type="tip" title="Trocea el cómputo con yield_now, o muévelo fuera">
+Cuando una tarea tiene un tramo de CPU inevitable, tienes dos salidas. Si el trabajo se puede *dividir*, intercala `tokio::task::yield_now().await` para cortarlo en `poll` cortos que ceden el hilo entre iteraciones. Si es un bloque indivisible y pesado —comprimir, cifrar, un hash costoso—, no lo trocees: sácalo del executor con `tokio::task::spawn_blocking`, que lo manda a un pool de hilos reservado para lo bloqueante, tal como viste en el nivel 32. La regla es la misma que gobierna todo async: el executor es para esperar y ceder, no para calcular sin pausa.
+</Callout>
+
+## La contención de locks async, el enemigo sin CPU
+
+El segundo enemigo del rendimiento async no gasta CPU: la desperdicia en forma de espera. Si muchas tareas compiten por el mismo `tokio::sync::Mutex`, se **serializan**: por rápida que sea la sección crítica, solo una avanza a la vez y las demás hacen cola. El sistema parece ocioso —poca CPU, muchos hilos idle— y sin embargo la latencia se dispara, porque el cuello de botella no es el cálculo sino el turno.
+
+La vista de recursos de `tokio-console` es donde esto se ve: cada `Mutex` o `Semaphore` muestra cuántas tareas esperan y cuánto llevan esperando. Una cola larga y persistente sobre un candado es la firma de la contención. Las curas son las del diseño concurrente, no las del microoptimizado:
+
+<Cards>
+  <Card icon="✂️" title="Fragmenta el candado (sharding)">
+    Un `Mutex` sobre un mapa entero se vuelve `N` mutexes sobre `N` fragmentos por hash de clave. Las tareas que tocan claves distintas dejan de competir. La contención cae por el factor de fragmentación.
+  </Card>
+  <Card icon="📖" title="RwLock si dominan las lecturas">
+    Si el 99 por ciento de los accesos solo leen, un `RwLock` deja pasar a todos los lectores en paralelo y solo serializa las escrituras. Elige según la proporción real, medida, no supuesta.
+  </Card>
+  <Card icon="📬" title="Pasa mensajes en vez de compartir">
+    La cura de raíz del nivel 31: si un solo *actor* posee el estado y las demás tareas le mandan mensajes por un canal, no hay candado que contender. La posesión única sustituye a la exclusión mutua.
+  </Card>
+  <Card icon="⏳" title="No sostengas el lock en el await">
+    Como en la lección anterior: un candado retenido a través de un `.await` no solo arriesga interbloqueo, alarga brutalmente su tenencia y multiplica la contención. Suéltalo antes de suspender.
+  </Card>
+</Cards>
+
+## Tres herramientas, tres planos del problema
+
+No hay un perfilador único de async porque el problema tiene capas distintas, cada una con su instrumento. La destreza consiste en saber cuál abrir para qué pregunta.
+
+<Cards>
+  <Card icon="📊" title="tokio-console: el reparto de hilos">
+    Responde "¿quién acapara el executor y qué candado tiene cola?". *Poll times*, *busy* frente a idle, contención de recursos. Es el primer instrumento para latencia y para cazar la tarea que no cede.
+  </Card>
+  <Card icon="🌲" title="tracing: la latencia lógica">
+    Los spans llevan duración. Un subscriber de tiempos —o `tracing-flame` para un *flamegraph* de spans— responde "¿qué `.await` domina el tiempo de una petición?". Es la latencia por *operación lógica*, no por hilo.
+  </Card>
+  <Card icon="🔥" title="samply: el punto caliente de CPU">
+    Un perfilador de muestreo moderno con interfaz de Firefox Profiler. Muestrea pilas nativas del SO y responde "¿en qué código se quema la CPU dentro de un `poll`?". Insustituible cuando el `poll` largo resultó ser cómputo puro.
+  </Card>
+</Cards>
+
+`samply` merece una advertencia derivada de la primera lección del nivel: como muestrea las **pilas del sistema operativo**, verás los marcos de `poll` y del executor envolviendo tu código, y la pila lógica async aparecerá fragmentada por las suspensiones. Es perfecto para localizar un bucle de CPU concreto —el "dónde se quema"— pero no reconstruye el "quién llamó a quién" lógico; ese plano lo da `tracing`. Por eso las herramientas se complementan en vez de competir: usa una para cada pregunta.
+
+```bash
+# samply: perfila un binario y abre la interfaz de Firefox Profiler.
+cargo build --release
+samply record ./target/release/mi_servicio
+```
+
+<Mermaid code={`flowchart TD
+  A[Latencia async alta] --> B[tokio-console busca poll time alto]
+  B --> C[Hay un poll largo]
+  C --> D[Es CPU pura dentro del poll]
+  C --> E[Es una llamada bloqueante]
+  C --> F[Es contencion de un lock]
+  D --> D2[samply localiza el punto caliente]
+  E --> E2[spawn_blocking saca el bloqueo del executor]
+  F --> F2[sharding RwLock o paso de mensajes]
+  B --> G[No hay poll largo pero hay cola]
+  G --> H[tracing mide que await domina la peticion]
+  style A fill:#f38ba8,color:#11111b
+  style B fill:#89b4fa,color:#11111b
+  style D2 fill:#fab387,color:#11111b
+  style H fill:#a6e3a1,color:#11111b`} />
+
+La metodología ata las tres: empieza siempre por `tokio-console` para encontrar el `poll` largo o la cola de un candado; si es un `poll` largo, decide con la naturaleza del código si es CPU —y entonces `samply` te da el punto caliente—, bloqueo —y entonces `spawn_blocking`— o contención —y entonces rediseñas el candado—; y usa `tracing` con tiempos para atribuir la latencia a la operación lógica cuando el problema no es un solo egoísta sino la suma de muchas esperas.
+
+<Callout type="tip" title="Mide la distribución, no la media">
+El promedio de *poll time* engaña: mil `poll` de un microsegundo y uno de cien milisegundos dan una media minúscula, y sin embargo ese `poll` solitario arruina la latencia de cola —el p99— de todo el hilo. Por eso `tokio-console` reporta también el **máximo**, y por eso al perfilar async se miran la *distribución* y los percentiles altos, no la media. La misma lógica vale para la latencia de petición que mides con `tracing`: un histograma revela el `.await` que se dispara de vez en cuando, invisible en cualquier promedio. En sistemas de alto rendimiento, la cola es el producto.
+</Callout>
+
+<Callout type="dios" title="Perfilar async es separar la espera inherente de la latencia que un mal reparto inyecta">
+Todo el capítulo del rendimiento async descansa en una distinción que el profiling síncrono nunca necesitó hacer: la que separa la **espera inherente** de la **latencia inyectada**. Una petición a una base de datos tarda diez milisegundos, y esos diez milisegundos no son un bug ni un punto caliente: son física, la latencia irreducible de la E/S que async, como enseñó el nivel 32, ni acelera ni pretende acelerar. Un perfilador de CPU clásico es ciego a esta espera —la tarea está dormida, no consume ciclos— y por eso, aplicado a un servicio de E/S, muestra un sistema casi ocioso y no encuentra nada que optimizar, justo cuando la latencia percibida es terrible. El problema real casi nunca está en la espera inherente, sino en la latencia que un mal reparto *añade* encima de ella: el `poll` que se alarga y hace esperar su turno a mil tareas, el candado que serializa lo que debía correr en paralelo, el bloqueo que congela un hilo entero. Esa latencia inyectada no aparece en el uso de CPU porque no es cálculo: es *tiempo de cola*, tiempo que las tareas pasan listas pero sin hilo que las atienda. Y aquí se cierra el arco de todo el nivel. La primera lección mostró que el objeto a observar en async no es la pila sino la tarea; el profiling añade que la *magnitud* a medir no es la CPU sino el *poll time*, porque el `poll time` es precisamente la latencia que cada tarea reparte —o niega— a las demás. Optimizar async no es hacer el cálculo más rápido, que rara vez es el cuello de botella; es proteger el pacto cooperativo del que depende que miles de tareas convivan sobre pocos hilos. Las tres herramientas no son redundantes: `tokio-console` audita el reparto, `tracing` atribuye la latencia lógica, `samply` caza el cómputo cuando de verdad lo hay. Saber cuál abrir es saber qué clase de latencia estás persiguiendo, y distinguir la espera que no puedes evitar de la que tú mismo inyectaste es la diferencia entre optimizar el sistema y perseguir un fantasma en un perfilador que mira el eje equivocado.
+</Callout>
+
+<Callout type="note" title="Lo esencial del profiling async">
+La métrica primaria no es el porcentaje de CPU sino el *poll time*: cuánto retiene una tarea el hilo antes de ceder, porque cada `poll` largo inyecta latencia a todas las demás —y dos funciones con idéntica CPU se perfilan al revés según cedan o no—. Trocea el cómputo con `yield_now` o sácalo con `spawn_blocking`. El segundo enemigo, la contención de locks async, serializa tareas sin gastar CPU visible; se cura con *sharding*, `RwLock` o paso de mensajes, y se ve en la vista de recursos de `tokio-console`. Tres herramientas, tres planos: `tokio-console` para el reparto de hilos, `tracing` con tiempos para la latencia lógica por span, `samply` para el punto caliente de CPU dentro de un `poll`. Primero el `poll` largo; luego decide si es CPU, bloqueo o contención.
+</Callout>
+
+<Reto title="Mide la latencia que repartes">
+1. Escribe dos tareas que consuman la misma CPU total, una cediendo con `yield_now` y otra sin ceder, y compáralas en `tokio-console`: verás igual *busy* pero *poll time* opuesto. Explica el efecto sobre la latencia de las tareas vecinas.
+2. Crea contención poniendo diez tareas a competir por un `tokio::sync::Mutex` y obsérvala en la vista de recursos; luego fragmenta el candado en cuatro y mide la mejora.
+3. Instrumenta una petición con spans y usa un subscriber de tiempos (o `tracing-flame`) para averiguar qué `.await` domina su latencia. Contrasta esa vista lógica con la de `tokio-console`.
+4. Perfila con `samply` un servicio que tiene un bucle de CPU dentro de un `poll`; localiza el punto caliente y observa cómo los marcos de `poll` y del executor envuelven tu código.
+5. Toma un caso de latencia alta y recórrelo con la metodología completa: `tokio-console` para el `poll` largo, decide CPU frente a bloqueo frente a contención, y aplica la cura correspondiente. Justifica por qué un perfilador de CPU a solas te habría despistado.
+</Reto>

@@ -1,0 +1,143 @@
+---
+title: "Contadores y estructuras per-CPU: sumar al leer"
+description: "El patrón per-CPU en la práctica: percpu_counter para estadísticas sin contención, con delta local barato y suma global exacta bajo demanda; percpu_ref para conteo de referencias en el camino caliente; y u64_stats_sync para leer contadores de 64 bits sin desgarro en máquinas de 32 bits. La escritura es gratis, la lectura paga la agregación."
+subject: kernel
+level: 26
+order: 4
+icon: "26.4"
+duracion: "16 min"
+---
+
+<Lead>
+Una variable per-CPU cruda (26.3) resuelve un contador simple, pero la vida real pide más: un contador que también dé un total exacto cuando se necesite, un contador de referencias que no rebote una línea de caché en cada `get`, estadísticas de 64 bits seguras en hardware de 32. Linux empaqueta esos patrones en tres herramientas afiladas —`percpu_counter`, `percpu_ref` y `u64_stats_sync`— unidas por una misma idea: **haz la escritura trivial y paga el precio al leer**.
+</Lead>
+
+<Objetivos>
+
+- Usar `percpu_counter` para estadísticas sin contención con lectura exacta bajo demanda.
+- Entender el mecanismo de batch: cuándo el delta local se vuelca al global.
+- Aplicar `percpu_ref` para conteo de referencias en el camino caliente.
+- Leer contadores de 64 bits sin desgarro con `u64_stats_sync`.
+</Objetivos>
+
+## percpu_counter: barato al escribir, exacto al leer
+
+El problema: un contador de "bloques libres" de un sistema de archivos se actualiza millones de veces por segundo desde todos los núcleos, pero se necesita su valor **exacto** solo de vez en cuando (al comprobar cuota, por ejemplo). Un `atomic64_t` global rebotaría su línea de caché entre sockets en cada incremento. `percpu_counter` (`include/linux/percpu_counter.h`) rompe el compromiso:
+
+```c
+#include <linux/percpu_counter.h>
+
+struct percpu_counter bloques_libres;
+percpu_counter_init(&bloques_libres, 0, GFP_KERNEL);
+
+/* Camino caliente: casi siempre solo toca el delta del nucleo local */
+percpu_counter_add(&bloques_libres, -1);
+
+/* Lectura barata y aproximada: devuelve solo el acumulado global */
+s64 aprox = percpu_counter_read(&bloques_libres);
+
+/* Lectura exacta: bloquea y suma el global mas todos los deltas */
+s64 exacto = percpu_counter_sum(&bloques_libres);
+
+percpu_counter_destroy(&bloques_libres);
+```
+
+La estructura revela el diseño de dos niveles:
+
+```c
+struct percpu_counter {
+	raw_spinlock_t lock;     /* protege 'count' durante los volcados */
+	s64 count;               /* acumulado global, aproximado          */
+	s32 __percpu *counters;  /* delta pequeno por CPU                  */
+};
+```
+
+Cada núcleo suma a su `s32` local sin tocar nada compartido. Cuando ese delta local supera en valor absoluto el **batch** (`percpu_counter_batch`, que crece con el número de CPUs online), la operación toma el `lock`, **vuelca** el delta al `count` global y pone el local a cero. Así, el `count` global nunca se aleja del valor real más que `batch * num_cpus`, y la contención sobre el lock es rarísima. `percpu_counter_read` devuelve el `count` al instante (aproximado); `percpu_counter_sum` toma el lock y recorre las copias para dar el valor exacto.
+
+<Callout type="tip" title="Aproximado casi siempre, exacto casi nunca">
+El arte está en elegir la lectura correcta. Para decidir "¿me acerco al límite?" basta `percpu_counter_read_positive`: barato y suficiente. Reserva `percpu_counter_sum` para el momento crítico —la comprobación final de cuota, un `statfs`— donde el error del batch importaría. Muchos bugs de rendimiento en sistemas de archivos han sido, literalmente, un `percpu_counter_sum` en un camino caliente donde sobraba el aproximado.
+</Callout>
+
+<Mermaid code={`flowchart LR
+  A[Escritura muy frecuente] --> B[Suma al delta del nucleo local]
+  B --> C{El delta supera el batch}
+  C -->|No| D[Termina sin tocar nada compartido]
+  C -->|Si| E[Vuelca el delta al global bajo lock]
+  F[Lectura aproximada] --> G[Devuelve solo el global sin lock]
+  H[Lectura exacta] --> I[Suma el global y todos los deltas per CPU]
+  style D fill:#a6e3a1,color:#11111b
+  style G fill:#89b4fa,color:#11111b`} />
+
+## percpu_ref: conteo de referencias sin rebote
+
+Un `refcount_t` (nivel 14) es atómico y global: perfecto para objetos poco compartidos, veneno para uno que miles de núcleos referencian por segundo, como una cola de `blk-mq` o un contexto de `io_uring`. `percpu_ref` (`include/linux/percpu-refcount.h`) tiene **dos modos** y transita entre ellos:
+
+```c
+#include <linux/percpu-refcount.h>
+
+struct percpu_ref ref;
+percpu_ref_init(&ref, liberar_objeto, 0, GFP_KERNEL);
+
+/* Modo PER-CPU: get/put solo tocan el contador local. Casi gratis */
+percpu_ref_get(&ref);
+/* ...usar el objeto con la garantia de que no morira... */
+percpu_ref_put(&ref);
+
+/* Al empezar a destruir: pasa a modo atomico y drena */
+percpu_ref_kill(&ref);   /* cuando la suma global llega a 0 -> liberar_objeto */
+```
+
+Mientras el objeto vive, `percpu_ref` está en **modo per-CPU**: cada `get`/`put` incrementa o decrementa un contador local, sin coste de sincronización y sin poder saber el total (no importa: solo importa que no sea cero). Cuando alguien llama a `percpu_ref_kill`, la referencia cambia a **modo atómico**: colapsa todas las copias en un `atomic_t` global y, en cuanto ese contador llega a cero, invoca el callback de liberación. Es el patrón exacto para objetos con una fase caliente de referencias baratas y una fase final de destrucción ordenada.
+
+## u64_stats_sync: 64 bits sin desgarro
+
+Los contadores de red son de 64 bits, pero en una máquina de 32 bits escribir un `u64` son **dos** escrituras de 32 que un lector puede pillar a medias, obteniendo un valor desgarrado (`torn`). `u64_stats_sync` (`include/linux/u64_stats_sync.h`) protege la lectura con un seqcount, sin coste en 64 bits:
+
+```c
+#include <linux/u64_stats_sync.h>
+
+struct pcpu_stats {
+	u64_stats_t          rx_packets;
+	u64_stats_t          rx_bytes;
+	struct u64_stats_sync syncp;
+};
+static DEFINE_PER_CPU(struct pcpu_stats, netstats);
+
+/* Escritor (en su propio nucleo): marca el intervalo */
+void contar_rx(unsigned int len)
+{
+	struct pcpu_stats *s = this_cpu_ptr(&netstats);
+	u64_stats_update_begin(&s->syncp);
+	u64_stats_inc(&s->rx_packets);
+	u64_stats_add(&s->rx_bytes, len);
+	u64_stats_update_end(&s->syncp);
+}
+
+/* Lector: reintenta si el escritor se cruzo (patron seqlock) */
+u64 leer_rx_packets(int cpu)
+{
+	struct pcpu_stats *s = per_cpu_ptr(&netstats, cpu);
+	unsigned int start;
+	u64 v;
+
+	do {
+		start = u64_stats_fetch_begin(&s->syncp);
+		v = u64_stats_read(&s->rx_packets);
+	} while (u64_stats_fetch_retry(&s->syncp, start));
+	return v;
+}
+```
+
+Lo elegante: en máquinas de 64 bits, donde un `u64` se escribe atómicamente, todas estas macros se compilan a **nada** (el seqcount desaparece). Pagas la protección solo donde de verdad hace falta. Este patrón mueve las estadísticas de `struct net_device` y de casi todos los drivers de red del kernel.
+
+<Callout type="dios" title="Sumar al leer: el arte de mover el coste a donde no duele">
+Mira lo que comparten las tres herramientas, porque es un principio de diseño que trasciende el kernel. En las tres, la operación **frecuente** —incrementar el contador, coger la referencia, sumar el byte— se ha vuelto casi gratis: toca solo memoria local del núcleo, sin locks ni líneas compartidas. Y en las tres, el precio se ha reubicado en la operación **rara** —leer el total exacto, destruir el objeto, muestrear la estadística—, que sí paga una agregación sobre todos los núcleos. Esto es optimización guiada por la asimetría del acceso, y es una de las decisiones más rentables que existen. Un contador se incrementa un millón de veces y se lee una; un objeto se referencia sin cesar y se destruye una vez. Diseñar para que la operación abundante sea trivial y la escasa cargue con todo el trabajo convierte un cuello de botella en un no-problema. La lección general, que llevarás mucho más allá del kernel: antes de optimizar una estructura concurrida, **mide qué operación domina** y rediseña el dato para que *esa* sea la barata, aunque encarezcas las demás. "Sumar al leer" no es un truco de contadores; es la forma de pensar de quien construye software que escala.
+</Callout>
+
+<Reto title="Aplica el patrón de sumar al leer">
+1. Sustituye un `atomic64_t` global por un `percpu_counter` y explica cuándo usarías `read` frente a `sum`.
+2. Describe qué es el batch y cómo acota el error entre el `count` global y el valor real.
+3. Explica los dos modos de `percpu_ref` y qué provoca la transición entre ellos.
+4. Razona por qué `u64_stats_sync` se compila a nada en máquinas de 64 bits y por qué hace falta en 32.
+5. Localiza `percpu_counter` en `fs/ext4/` o `mm/` y `percpu_ref` en `block/` o `io_uring/`, e identifica qué protege cada uno.
+</Reto>

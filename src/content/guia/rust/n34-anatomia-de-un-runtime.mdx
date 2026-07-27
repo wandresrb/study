@@ -1,0 +1,145 @@
+---
+title: "Anatomía de un runtime: scheduler, driver de E/S y timer"
+description: "Un runtime async no es una pieza, sino un ensamblaje de tres subsistemas que cooperan: el scheduler que decide quién corre y llama a poll, el driver de E/S que habla con el núcleo vía epoll o io_uring y fabrica los wakers reales, y el timer que gobierna sleeps y timeouts. Tokio es el ensamblaje de facto de los tres, y separarlos es entender qué significa realmente ejecutar async."
+subject: rust
+level: 34
+order: 1
+icon: "34.1"
+duracion: "19 min"
+---
+
+<Lead>
+En el nivel 32 quedó claro el reparto: el lenguaje define `Future` y `poll`, pero se **niega** a traer el motor que los conduce. Ese motor tiene un nombre —runtime— y un error común es imaginarlo como una caja monolítica. No lo es. Un runtime async es el ensamblaje de **tres subsistemas** que cooperan: el *scheduler*, que decide qué tarea corre y la avanza con `poll`; el *driver de E/S* —el reactor—, que habla con el núcleo mediante `epoll`, `kqueue` o `io_uring` y fabrica los `Waker` reales; y el *timer*, que gobierna `sleep`, `timeout` e `interval`. Tokio es, ante todo, el ensamblaje maduro de estas tres piezas. Verlas por separado —qué hace cada una y cómo se enganchan— es entender, por fin, qué significa "ejecutar" código asíncrono.
+</Lead>
+
+<Objetivos>
+
+- Distinguir los tres subsistemas de un runtime: scheduler, driver de E/S y timer.
+- Recorrer el bucle del executor: `poll` produce `Pending`, la tarea se aparca, el waker la despierta.
+- Comprender cómo el reactor sobre `epoll`/`kqueue`/`io_uring` convierte la disponibilidad del núcleo en `Waker`.
+- Justificar por qué Tokio es el estándar de facto: no por su scheduler, sino por su ecosistema.
+
+</Objetivos>
+
+Antes de recorrer las piezas, conviene fijar el mapa, porque las tres se comunican por un **único canal** —el `Waker`— y convergen en un **único punto de bloqueo**, la syscall donde el hilo se duerme de verdad. El scheduler *consume* tareas listas; el driver de E/S y el timer *producen* disponibilidad y, al hacerlo, fabrican los `Waker` que devuelven una tarea al scheduler. Ese circuito cerrado —consumir, aparcar, despertar, reencolar— es el runtime en una frase.
+
+## El scheduler: quién llama a poll y cuándo
+
+En el nivel 32 viste `poll` como una **interfaz**: la pregunta "¿ya terminaste?" que se le hace a un future. Lo que faltaba era quién la formula. Ese es el scheduler: el subsistema que **posee** las tareas y las conduce. Mantiene un conjunto de tareas *listas*, extrae una, la avanza con `poll` y observa la respuesta. Si es `Ready`, la tarea acabó y entrega su valor. Si es `Pending`, la tarea no puede progresar ahora, así que el scheduler la **aparca** y pasa a la siguiente sin bloquear el hilo. Una tarea aparcada no se vuelve a tocar hasta que *algo* la declara lista de nuevo, y ese algo es su `Waker`.
+
+```rust
+// La esencia del bucle, sin robo de trabajo ni multihilo:
+// 1. saca una tarea del conjunto de listas
+// 2. la avanza con poll(cx), donde cx lleva su Waker
+// 3. si devuelve Ready, la retira; entrega el Output
+// 4. si devuelve Pending, la aparca: no la reencola
+// 5. cuando el Waker de esa tarea se invoca, vuelve al conjunto de listas
+```
+
+La sutileza que distingue un runtime real de este juguete es el paso 5. El scheduler no sondea en un bucle ocupado preguntando "¿ya?, ¿ya?" a tareas dormidas —eso quemaría un núcleo entero girando en vano—. Se **duerme** cuando no hay nada listo, y confía en que los otros dos subsistemas lo despierten en el instante justo. Cómo reparte ese trabajo entre varios hilos —el robo de trabajo— es el tema del nivel 34.3; aquí basta con fijar que el scheduler es el **consumidor** de disponibilidad que los otros dos producen.
+
+Ese dormir y despertar tiene nombres técnicos: el scheduler *aparca* el hilo trabajador cuando su cola de tareas listas se vacía —lo suspende sobre la primitiva de bloqueo del sistema— y lo *desaparca* cuando llega trabajo. El `Waker` es el token que enlaza los dos extremos del circuito: la tarea, al devolver `Pending`, deja su `Waker` en manos de quien la despertará, y ese alguien —el reactor o el timer— lo invocará para reencolarla. Sin `Waker` no habría forma de que la disponibilidad producida por los otros subsistemas encontrara el camino de vuelta a la **tarea concreta** que la esperaba; sería como saber que sonó un timbre sin saber qué puerta abrir.
+
+Un rasgo define este scheduler y conviene nombrarlo ya: es **cooperativo**, no expropiativo. A diferencia del planificador del sistema operativo, que puede arrebatarle el turno a un hilo en cualquier instante, el scheduler async solo recupera el control de una tarea cuando esta *cede* voluntariamente al devolver `Pending` en un `.await`. Entre dos puntos de suspensión, la tarea manda sobre su hilo sin interrupción. Esta propiedad es la fuente de la eficiencia —no hay expropiaciones que salvar y restaurar contextos— y también de su talón de Aquiles: una tarea que computa largo sin ningún `.await` no cede nunca, y mientras no ceda ninguna otra avanza en ese hilo. Los niveles 34.3 y 34.5 vuelven sobre esta tensión; por ahora basta con retenerla como el precio del modelo cooperativo.
+
+## El driver de E/S: el reactor que fabrica wakers
+
+Un future bloqueado en un socket devolvió `Pending`, pero ¿quién invoca su `Waker` cuando el socket por fin tiene datos? El **driver de E/S**, también llamado *reactor*. Es la pieza que integra con la API de disponibilidad del sistema operativo: `epoll` en Linux, `kqueue` en macOS y BSD, IOCP en Windows y, cada vez más, `io_uring`. Tokio se apoya en la crate `mio` para unificar esas APIs bajo una interfaz portable.
+
+El baile es este. Cuando una tarea hace `socket.read(..).await` y no hay datos, la lectura subyacente devuelve `WouldBlock`; el future **registra su interés** por ese descriptor en el reactor —"despiértame cuando este `fd` sea legible"—, guarda el `Waker` de la tarea y devuelve `Pending`. El reactor, en su propio bucle, hace una única llamada `epoll_wait` que espera sobre *miles* de descriptores a la vez. Cuando el núcleo señala que uno está listo, el reactor busca el `Waker` asociado y lo **invoca**, lo que reencola la tarea en el scheduler.
+
+```rust
+// Lo que hace, en esencia, un future de lectura al no poder progresar:
+//   match socket.try_read(&mut buf) {
+//       Ok(n)  => Poll::Ready(Ok(n)),               // habia datos: listo
+//       Err(e) if e.kind() == WouldBlock => {
+//           reactor.registrar(fd, LEGIBLE, cx.waker());  // deja su waker
+//           Poll::Pending                                 // y se aparca
+//       }
+//       Err(e) => Poll::Ready(Err(e)),
+//   }
+```
+
+El punto clave es que el `Waker` que el future entrega al reactor es el *mismo* que el scheduler le pasó dentro del `Context` al hacer `poll`. Así se cierra el lazo: el scheduler avanzó la tarea, la tarea depositó su waker en el reactor, y el reactor lo usará para devolvérsela al scheduler. Ninguna de las tres piezas conoce los detalles internos de las otras; se coordinan solo a través de ese token.
+
+Un matiz de arquitectura que sorprende a muchos: el reactor no tiene por qué correr en un hilo dedicado. En Tokio, el driver de E/S lo conduce el **mismo** trabajador que está a punto de aparcarse por falta de tareas: antes de dormirse sobre `epoll_wait`, ese trabajador se ofrece a ser quien atienda la E/S para todos. Así se evita reservar un hilo entero solo para vigilar descriptores; el rol de reactor circula entre los trabajadores según quién esté a punto de quedarse ocioso. Es otra manifestación del principio de coste cero: no pagas un hilo extra por un trabajo que un trabajador ocioso puede asumir de paso.
+
+<Callout type="info" title="Readiness frente a completion: epoll vs io_uring">
+`epoll` y `kqueue` son APIs de *disponibilidad*: te avisan de que un `fd` está listo para que **tú** hagas la lectura. `io_uring`, en cambio, es de *completación*: le entregas la operación entera —"lee estos bytes"— y te avisa cuando **ya está hecha**, sin syscalls por operación. El modelo cambia lo suficiente como para que Tokio lo soporte por una vía aparte (`tokio-uring`), pero la abstracción que ve tu código —`.await` sobre un `TcpStream`— es la misma. El reactor absorbe la diferencia.
+</Callout>
+
+## El timer: la rueda de tiempo
+
+`sleep`, `timeout` e `interval` necesitan un reloj, y aquí acecha una trampa de escala. Lo ingenuo sería pedir al sistema operativo un temporizador por cada `sleep`; con un millón de tareas dormidas, un millón de temporizadores hunden el rendimiento. Tokio usa en su lugar una **rueda de tiempo jerárquica** (*hierarchical timing wheel*): cubos ordenados por granularidad temporal que permiten insertar y retirar plazos en tiempo constante amortizado, sin importar cuántos haya pendientes.
+
+Pero la elegancia real está en cómo se enlaza con el reactor. El timer calcula el **plazo más próximo** de todos los pendientes y lo pasa como *timeout* de la misma llamada `epoll_wait` que espera la E/S. Así, una única primitiva de bloqueo del sistema operativo sirve a las dos causas por las que una tarea puede estar dormida: *hay datos en un socket* o *venció un plazo*. Cuando `epoll_wait` retorna —sea por un `fd` listo o por agotarse el tiempo—, el runtime dispara los `Waker` correspondientes. E/S y tiempo comparten un solo punto donde el hilo se duerme de verdad.
+
+```rust
+use tokio::time::{sleep, timeout, Duration};
+
+async fn con_plazos() {
+    // sleep: cede la tarea 100 ms sin bloquear el hilo trabajador
+    sleep(Duration::from_millis(100)).await;
+
+    // timeout: envuelve un future y falla si tarda mas de la cuenta
+    let r = timeout(Duration::from_secs(2), sleep(Duration::from_secs(5))).await;
+    assert!(r.is_err()); // el plazo vencio antes de completarse el future
+}
+```
+
+Toda esta maquinaria depende de que hayas encendido el driver de tiempo al construir el runtime (`enable_all` o `enable_time`, nivel 34.2); sin él, el primer `sleep` entra en pánico porque no hay quién atienda la rueda. El timer no es un lujo opcional del que puedas olvidarte: es un subsistema que se arranca explícitamente.
+
+<Mermaid code={`flowchart TD
+  S[El scheduler avanza la tarea con poll] --> P[La tarea responde Pending]
+  P --> IO[El driver registra el descriptor en epoll]
+  P --> TM[El timer anota el plazo en la rueda]
+  IO -->|el socket ya tiene datos| W[Se invoca el waker de la tarea]
+  TM -->|vence el plazo| W
+  W --> S
+  S --> R[La tarea responde Ready y entrega el valor]
+  style S fill:#89b4fa,color:#11111b
+  style IO fill:#a6e3a1,color:#11111b
+  style TM fill:#fab387,color:#11111b
+  style W fill:#cba6f7,color:#11111b
+  style R fill:#f9e2af,color:#11111b`} />
+
+## Por qué Tokio es el estándar
+
+Conviene ser honesto: Tokio no domina porque su scheduler sea intocable —Glommio o monoio ganan en nichos de latencia extrema—. Domina por **efecto de red**. Alrededor de sus tres subsistemas cristalizó un ecosistema tan vasto que salirse de él te deja sin piezas: el servidor HTTP `hyper`, el framework `axum`, el cliente `reqwest`, el gRPC `tonic`, la capa de middleware `tower`, el acceso a base de datos `sqlx`. Todos asumen Tokio. Elegir el runtime, en la práctica, es elegir a qué galaxia de crates te enchufas.
+
+Ese efecto de red se retroalimenta: cuantas más crates asumen Tokio, más caro resulta a una crate nueva no hacerlo, y más trabajo recibe su scheduler, lo que financia su refinamiento continuo —Tokio ha reescrito su planificador varias veces sin romper a nadie—. La madurez no es solo del código, sino de la documentación, las herramientas de diagnóstico (`tokio-console`) y la respuesta a fallos. Para el 99 % de los servicios de red, la pregunta "¿qué runtime?" tiene una respuesta aburrida y correcta, y la aburrición es una virtud en infraestructura.
+
+<Callout type="tip" title="Empieza por Tokio, migra solo con una razón concreta">
+No conviertas la elección de runtime en un examen de pureza. Para casi todo servicio de red, Tokio es la respuesta por defecto: su ecosistema te ahorra reescribir piezas que ya existen y están probadas. Reserva las alternativas para necesidades específicas y demostrables —`no_std` y embebido piden Embassy; una latencia de cola extrema puede justificar un modelo de un hilo por núcleo sobre `io_uring`—. Elegir bien es ajustar la herramienta a la carga, no perseguir el scheduler más veloz del papel.
+</Callout>
+
+<Cards>
+  <Card icon="🧠" title="Scheduler">
+    Posee las tareas y las conduce con `poll`. Aparca las que devuelven `Pending` y reparte el trabajo entre hilos. Es el consumidor de disponibilidad.
+  </Card>
+  <Card icon="📡" title="Driver de E/S">
+    El reactor sobre `epoll`/`kqueue`/`io_uring`. Espera sobre miles de descriptores y fabrica los `Waker` reales que reencolan tareas.
+  </Card>
+  <Card icon="⏱️" title="Timer">
+    Una rueda de tiempo jerárquica. Gobierna `sleep` y `timeout` con coste constante y comparte el punto de bloqueo con la E/S.
+  </Card>
+  <Card icon="🌍" title="Ecosistema">
+    `hyper`, `axum`, `tonic`, `tower`, `sqlx`, `reqwest`. La razón real de que Tokio sea el estándar no es técnica, es gravitacional.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Las tres piezas son una sola idea: convertir la espera en una notificación">
+Mira los tres subsistemas juntos y verás que no son tres funciones distintas, sino tres caras de un único movimiento conceptual: *transformar la espera de bloqueo en espera por notificación*. El modelo de un hilo por tarea, que el nivel 29 diagnosticó como insostenible, gasta su ineficiencia precisamente en la espera: cada hilo se sienta bloqueado frente a **su** socket, consumiendo megabytes de pila para no hacer nada más que aguardar. El runtime demuele ese despilfarro invirtiendo la pregunta. En vez de que cada tarea pregunte activamente "¿ya estás listo?" a su recurso —lo que exigiría un hilo por tarea para poder preguntar en paralelo—, el runtime hace que cada tarea **declare su interés** y se duerma, y delega en una sola pieza —el reactor— la tarea de vigilar *todos* los recursos a la vez con una única syscall. El scheduler es el lado activo de esa inversión: no busca trabajo girando en vano, sino que se duerme hasta que un waker —fabricado por el reactor o por el timer— lo empuja. El driver de E/S es el traductor: convierte el lenguaje del núcleo, "el descriptor 7 es legible", al lenguaje del runtime, "invoca este waker". Y el timer es el mismo traductor aplicado al reloj: convierte "vencieron 100 milisegundos" en otra invocación de waker, y lo hace compartiendo la misma llamada de bloqueo que la E/S, porque *dormir esperando datos* y *dormir esperando un plazo* son, a ojos del sistema operativo, la misma operación con distinto motivo de despertar. Por eso los tres subsistemas convergen en un único punto donde el hilo se duerme de verdad —`epoll_wait` con un timeout— y en un único vocabulario de reanudación —el `Waker`—. Cuando internalizas esto, la palabra "runtime" deja de ser una nube vaga y se vuelve un mecanismo que puedes dibujar: un bucle que se duerme sobre una syscall que vigila miles de recursos y un reloj, y que al despertar reencola exactamente las tareas cuya espera terminó. Tokio no inventó esta idea —el patrón reactor es viejo—, pero la ensambló con un scheduler de robo de trabajo, un reactor portable y una rueda de tiempo, y la envolvió en `async`/`.await` para que tú escribas código secuencial y obtengas, gratis, la maquinaria que convierte cien mil esperas en cien mil notificaciones sobre un puñado de hilos.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+Un runtime async son tres subsistemas: el **scheduler** posee las tareas y las avanza con `poll`, aparcando las que dan `Pending`; el **driver de E/S** o reactor integra con `epoll`/`kqueue`/`io_uring` (vía `mio`) y fabrica los `Waker` que reencolan tareas; el **timer** es una rueda jerárquica que gobierna `sleep`/`timeout` compartiendo la llamada de bloqueo con la E/S. Los tres convergen en un punto de sueño único y un vocabulario de despertar único, el `Waker`. Tokio es el estándar por su ecosistema —`hyper`, `axum`, `tonic`, `sqlx`—, no por una superioridad intrínseca del scheduler.
+</Callout>
+
+<Reto title="Desmonta el motor en sus tres piezas">
+1. Clasifica cada elemento en scheduler, driver de E/S o timer: `epoll_wait`, `sleep`, el bucle que hace `poll`, la rueda de tiempo, el `Waker` que reencola una tarea, el registro de un `fd`.
+2. Explica por qué un runtime que hiciera *busy-polling* —sondear tareas dormidas en bucle— quemaría un núcleo, y qué pieza evita ese despilfarro.
+3. Argumenta por qué el timer pasa su plazo más próximo como *timeout* de `epoll_wait` en vez de usar un temporizador del sistema por cada `sleep`.
+4. Describe la diferencia entre una API de *disponibilidad* (`epoll`) y una de *completación* (`io_uring`), y qué cambia para el reactor.
+5. Da dos razones por las que un servicio de red nuevo debería empezar con Tokio aunque otro runtime tenga un scheduler más rápido en el papel.
+</Reto>

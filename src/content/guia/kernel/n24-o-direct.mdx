@@ -1,0 +1,120 @@
+---
+title: "O_DIRECT: saltarse el cache y su vínculo con io_uring"
+description: "Cuando una base de datos gestiona su propia caché, el page cache estorba y duplica datos. `O_DIRECT` hace DMA directo entre el búfer del usuario y el disco, con estrictas reglas de alineación, y encuentra su forma natural en la E/S asíncrona de `io_uring`."
+subject: kernel
+level: 24
+order: 5
+icon: "24.5"
+duracion: "16 min"
+---
+
+<Lead>
+Todo el nivel ha defendido el page cache como una bendición. Ahora el giro: hay software que no lo quiere. Una base de datos como PostgreSQL o InnoDB gestiona su propio *buffer pool*, conoce su patrón de acceso mejor que ninguna heurística del kernel, y sufre si el kernel cachea por segunda vez lo que ella ya cachea. `O_DIRECT` es la puerta de escape: E/S que va directa entre el búfer del proceso y el disco, sin pasar por el page cache. Y es precisamente el terreno donde `io_uring` (nivel 40) despliega todo su poder.
+</Lead>
+
+<Objetivos>
+
+- Entender por qué el doble cacheo perjudica a quien gestiona su propia caché.
+- Abrir un archivo con `O_DIRECT` y cumplir sus reglas de alineación.
+- Consultar la alineación exacta con `statx` y `STATX_DIOALIGN`.
+- Conectar `O_DIRECT` con la E/S asíncrona de `io_uring` y con `RWF_DONTCACHE`.
+
+</Objetivos>
+
+## Cuando el cache estorba
+
+Una base de datos mantiene su propio *buffer pool*: decide qué páginas retener, cuándo expulsarlas y cuándo bajarlas, con conocimiento semántico que el kernel no tiene. Si además la E/S pasa por el page cache, ocurre el **doble cacheo**: el mismo bloque ocupa RAM dos veces —en el buffer pool de la base y en el page cache del kernel— y el kernel gasta ciclos gestionando un cache que la aplicación ya duplica. Peor aún, el readahead del kernel adivina mal el patrón de una base de datos que salta por todo el archivo.
+
+`O_DIRECT` elimina esa capa. La E/S se hace por **DMA directo** entre el búfer del proceso y el dispositivo: el dato ni entra ni sale del page cache.
+
+```c
+/* abre saltandose el page cache */
+int fd = open("/var/lib/db/tablespace", O_RDWR | O_DIRECT);
+```
+
+<Mermaid code={`flowchart TD
+  subgraph Bufferizada
+    A1[write] --> A2[copia al folio del page cache] --> A3[writeback al disco]
+  end
+  subgraph Directa
+    B1[write con O_DIRECT] --> B2[DMA directo desde el buffer del usuario] --> B3[disco]
+  end`} />
+
+El precio es que renuncias a todo lo que el cache te daba gratis: no hay readahead, no hay reúso entre lecturas, y cada E/S es un viaje real al dispositivo. Solo compensa cuando tu aplicación cachea mejor que el kernel — que es justo el caso de un motor de base de datos, y casi de nadie más. Para un archivo normal, `O_DIRECT` suele ser más lento, no más rápido.
+
+## Las reglas de alineación
+
+El DMA directo impone restricciones que la E/S bufferizada absorbía por ti. Como el dato viaja directo al hardware, el **búfer en memoria**, el **offset en el archivo** y la **longitud** deben estar alineados al tamaño de bloque lógico del dispositivo (512 bytes o 4 KiB, típicamente). Un búfer desalineado o una longitud impar hacen fallar la lectura con `EINVAL`.
+
+```c
+#include <stdlib.h>
+void *buf;
+/* búfer alineado a 4 KiB: posix_memalign, no un malloc cualquiera */
+posix_memalign(&buf, 4096, 65536);
+
+/* offset y longitud multiplos del bloque logico */
+ssize_t n = pread(fd, buf, 65536, 0);   /* OK: 0 y 65536 alineados */
+/* pread(fd, buf, 1000, 3);  ->  EINVAL: ni offset ni longitud alineados */
+```
+
+Adivinar la alineación correcta era históricamente frágil. Los kernels modernos la exponen con exactitud vía `statx` y el flag `STATX_DIOALIGN`, que devuelve tanto la alineación del búfer en memoria como la de offset y longitud:
+
+```c
+struct statx stx;
+statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx);
+/* stx.stx_dio_mem_align    -> alineacion exigida al buffer en memoria */
+/* stx.stx_dio_offset_align -> alineacion exigida a offset y longitud */
+```
+
+<Callout type="warn" title="No mezcles directo y bufferizado sobre el mismo archivo">
+Escribir a un archivo por `O_DIRECT` mientras otro descriptor lo lee bufferizado (o al revés) abre una ventana de **incoherencia**: la escritura directa va al disco esquivando el page cache, mientras el lector bufferizado ve un folio cacheado desahuciado. El kernel intenta invalidar los folios afectados, pero la coherencia no está garantizada y el resultado puede ser dato viejo. Un archivo se gestiona de una manera o de la otra, nunca a la vez.
+</Callout>
+
+## O_DIRECT, io_uring y RWF_DONTCACHE
+
+Aquí converge la historia. `O_DIRECT` síncrono tiene un problema: sin el page cache que absorbía la asincronía, cada lectura bloquea al hilo hasta que el disco responde. La solución no es volver al cache, sino hacer la E/S **asíncrona de verdad**, y ese es exactamente el propósito de `io_uring` (nivel 40). Con `io_uring` sobre descriptores `O_DIRECT` obtienes lo que las bases de datos llevaban décadas persiguiendo: E/S directa, asíncrona, por lotes y sin copias.
+
+```c
+/* io_uring brilla justo aqui: E/S directa y asincrona, sin copia al cache */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, fd, buf, len, offset);   /* fd abierto con O_DIRECT */
+io_uring_submit(&ring);
+/* ...haces otro trabajo mientras el DMA vuela... */
+io_uring_wait_cqe(&ring, &cqe);                  /* recoge la E/S completada */
+```
+
+Con `IORING_SETUP_IOPOLL` sobre `O_DIRECT`, `io_uring` puede incluso *sondear* la finalización sin interrupciones, exprimiendo un NVMe hasta millones de operaciones por segundo por hilo. No es casualidad que `io_uring` naciera del mundo del almacenamiento de alto rendimiento: es la culminación de la idea de que, cuando la aplicación cachea por su cuenta, el trabajo del kernel es **quitarse de en medio** con la máxima eficiencia.
+
+Entre ambos extremos —el cache que todo lo retiene y el `O_DIRECT` que todo lo esquiva— los kernels 7.x ofrecen un término medio, `RWF_DONTCACHE`: E/S **bufferizada** normal (con sus reglas relajadas y su coherencia), pero cuyos folios se marcan para descartarse (*drop-behind*) en cuanto se usan, evitando que un barrido enorme desaloje el conjunto de trabajo útil del cache.
+
+```c
+/* bufferizada pero sin ensuciar el cache a largo plazo: ideal para copias grandes */
+struct iovec iov = { .iov_base = buf, .iov_len = len };
+preadv2(fd, &iov, 1, offset, RWF_DONTCACHE);
+```
+
+Tres estrategias, tres contratos distintos con el kernel. Elegir es decidir cuánto control cedes y cuánto trabajo asumes:
+
+<Cards>
+  <Card icon="📦" title="Bufferizada">
+    El camino por defecto. El kernel cachea, hace readahead y difiere el writeback. Ideal cuando reúsas datos y confías en sus heurísticas.
+  </Card>
+  <Card icon="🎯" title="O_DIRECT">
+    DMA directo, sin cache. Para quien gestiona su propia caché y exige control total. Rápido solo con E/S asíncrona; frágil por la alineación.
+  </Card>
+  <Card icon="💨" title="RWF_DONTCACHE">
+    Bufferizada pero drop-behind: coherencia y alineación relajada sin dejar residuo en el cache. El término medio para barridos únicos.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="O_DIRECT es la confesión de que un cache general no siempre gana">
+La revelación con la que cierra este nivel es casi filosófica. El page cache es una caché de propósito general: buena para todos porque no sabe nada de nadie. Pero una caché que conoce su patrón de acceso —qué página se reusará, cuál no, en qué orden— siempre podrá superar a una que solo ve una corriente anónima de lecturas y escrituras. `O_DIRECT` es la forma en que el kernel admite ese límite: no intenta ser más listo que un motor de base de datos sobre sus propios datos, sino que le cede el control y se aparta. La aplicación se convierte en un gestor de caché rival, y el papel del kernel se invierte: de proveedor de la abstracción a mero conducto de DMA lo más fino y directo posible. Esa misma inversión de filosofía —del kernel que hace por ti al kernel que te deja hacer— es la que engendró `io_uring`: si la aplicación va a gestionar su cache y su concurrencia, dale un canal de E/S asíncrono, sin copias, por lotes y sin syscalls por operación, y hazte a un lado. Entender `O_DIRECT` no es memorizar un flag de `open`, sino captar cuándo la abstracción más elegante del sistema es también un estorbo, y por qué un buen kernel ofrece tanto la abstracción como la puerta para saltársela. Saber elegir entre las dos, con `RWF_DONTCACHE` como matiz intermedio, es la marca de quien de verdad entiende el subsistema de almacenamiento.
+</Callout>
+
+<Reto title="Salta el cache y mídelo">
+1. Copia un archivo grande con `dd if=origen of=/dev/null` y luego con `dd ... iflag=direct`; compara `Cached` en `/proc/meminfo` antes y después de cada uno.
+2. Intenta un `pread` con `O_DIRECT` usando un búfer de `malloc` y una longitud impar; confirma el `EINVAL` y arréglalo con `posix_memalign` y una longitud alineada.
+3. Consulta con `statx` y `STATX_DIOALIGN` la alineación exacta que exige tu dispositivo.
+4. Razona por qué mezclar E/S directa y bufferizada sobre el mismo archivo puede devolver datos incoherentes.
+5. Explica por qué `O_DIRECT` es lento síncrono pero se vuelve rápido con `io_uring`, y en qué se diferencia de `RWF_DONTCACHE`.
+</Reto>

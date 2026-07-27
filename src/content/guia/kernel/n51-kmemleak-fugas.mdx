@@ -1,0 +1,136 @@
+---
+title: "kmemleak: cazar fugas de memoria del kernel"
+description: "kmemleak es un detector de fugas conservador, un recolector de basura de mentira que rastrea cada kmalloc y vmalloc, escanea la memoria del kernel buscando punteros que los alcancen, y reporta lo inalcanzable. CONFIG_DEBUG_KMEMLEAK, el árbol rojo-negro de objetos, min_count, la interfaz de debugfs y cómo interpretar un informe."
+subject: kernel
+level: 51
+order: 3
+icon: "51.3"
+duracion: "16 min"
+---
+
+<Lead>
+Una fuga de memoria del kernel no corrompe nada, no da un oops, no dispara un sanitizer: simplemente, memoria que se reservó y nunca se liberó se acumula en silencio hasta que, semanas después, la máquina se queda sin RAM. No hay redzone que pisar ni dirección ilegítima que consultar, porque el objeto fugado es perfectamente válido; su único pecado es que ya nadie lo alcanza. kmemleak caza exactamente eso, y lo hace con la técnica de un recolector de basura que no recolecta.
+</Lead>
+
+<Objetivos>
+
+- Entender kmemleak como un mark-and-sweep conservador que no libera, solo delata.
+- Ver cómo rastrea las asignaciones en un árbol rojo-negro y qué es min_count.
+- Manejar su interfaz de debugfs: scan, clear y las anotaciones.
+- Interpretar un informe de objeto no referenciado y llegar a la línea culpable.
+
+</Objetivos>
+
+## Un recolector de basura que no recolecta
+
+`CONFIG_DEBUG_KMEMLEAK` implementa un detector de fugas *conservador* por marcado y barrido. La idea es la de un recolector de basura tracing, pero invertida: en vez de liberar lo inalcanzable, lo *reporta*. Engancha las rutas de asignación del kernel —`kmalloc`, `kmem_cache_alloc`, `vmalloc`, `alloc_percpu`— y por cada objeto vivo guarda una entrada con su rango de direcciones y la pila que lo creó.
+
+```c
+/* mm/kmemleak.c: el metadato por objeto rastreado */
+struct kmemleak_object {
+	raw_spinlock_t		lock;
+	unsigned int		flags;
+	struct rb_node		rb_node;     /* indexado por rango de direcciones */
+	unsigned long		pointer;
+	size_t			size;
+	int			count;       /* referencias halladas en el ultimo barrido */
+	int			min_count;   /* umbral para considerarlo alcanzable */
+	unsigned long		*trace;      /* pila de la asignacion */
+};
+```
+
+Las entradas viven en un **árbol rojo-negro** indexado por el rango de direcciones, de modo que dada una palabra cualquiera de memoria, kmemleak puede preguntar en tiempo logarítmico si cae dentro de algún objeto rastreado. El campo clave es `min_count`: cuántas referencias hacen falta para dar el objeto por alcanzable. El valor normal es `1` —basta un puntero que lo apunte—; `0` significa "no lo reportes nunca aunque no lo vea", y `-1` lo excluye del barrido.
+
+## El barrido: marcar lo alcanzable, delatar lo demás
+
+Cada escaneo recorre las regiones raíz —segmentos de datos, `.bss`, las pilas de las tareas— y la memoria de los propios objetos rastreados, tratando **cada palabra alineada como un posible puntero**. Si esa palabra cae dentro del rango de un objeto del árbol, incrementa su `count`. Al terminar, todo objeto cuyo `count` no alcanza su `min_count` es un candidato a fuga. Es *conservador* en el sentido técnico: como no distingue un puntero real de un entero que casualmente parece una dirección, nunca reporta un falso negativo por descuido, pero sí puede callar una fuga si algún entero apunta por azar al objeto huérfano.
+
+<Mermaid code={`flowchart TD
+  A[kmalloc o vmalloc] -->|kmemleak_alloc| RB[Objeto en el arbol rojo-negro]
+  RB --> SC[Barrido: recorrer datos bss y pilas]
+  SC --> W{La palabra cae en un rango rastreado}
+  W -- si --> M[Incrementa count del objeto]
+  W -- no --> N[Sigue a la siguiente palabra]
+  M --> Q{count menor que min_count tras dos barridos}
+  Q -- si --> LEAK[Objeto no referenciado: candidato a fuga]
+  Q -- no --> LIVE[Alcanzable: se ignora]
+  style LEAK fill:#f38ba8,color:#11111b
+  style LIVE fill:#a6e3a1,color:#11111b`} />
+
+Un objeto solo se reporta si sigue inalcanzable tras **dos barridos consecutivos**, para no delatar asignaciones que aún no han tenido tiempo de ser enlazadas. El primer barrido llega automático minutos después del arranque; los siguientes los disparas tú. Como escanea toda la memoria del kernel tratando cada palabra como puntero, su coste en tiempo y memoria es alto: es una herramienta de kernel de laboratorio.
+
+## Usarlo: debugfs y anotaciones
+
+Toda la operación pasa por un único fichero en debugfs:
+
+```bash
+# forzar un barrido y leer la lista de sospechosos
+echo scan  > /sys/kernel/debug/kmemleak
+cat          /sys/kernel/debug/kmemleak
+
+# limpiar la lista actual (tras revisarla), o volcar un objeto concreto
+echo clear         > /sys/kernel/debug/kmemleak
+echo dump=0xffff888103a4c800 > /sys/kernel/debug/kmemleak
+```
+
+Se arranca con el parámetro `kmemleak=on` (o `=off` para desactivarlo del todo, algo obligado si `CONFIG_DEBUG_KMEMLEAK_DEFAULT_OFF` no basta y la máquina va justa). Cuando el escaneo conservador produce falsos positivos —guardaste la dirección desplazada, o solo en un registro— hay anotaciones para instruir al detector desde el código:
+
+```c
+kmemleak_not_leak(ptr);   /* esta vivo aunque no le veas referencias */
+kmemleak_ignore(ptr);     /* no lo rastrees en absoluto */
+kmemleak_no_scan(ptr);    /* rastrealo, pero no escanees su interior */
+```
+
+`kmemleak_not_leak()` sube el `min_count` a cero; `kmemleak_ignore()` lo saca del árbol; `kmemleak_no_scan()` es para buffers de datos puros que nunca contienen punteros, y ahorra trabajo al barrido. Usadas con criterio, reducen el ruido sin esconder fugas reales.
+
+Si tu subsistema reparte memoria desde un pool propio —no desde `kmalloc`—, kmemleak no lo ve, y hay que enseñárselo con las mismas primitivas que usa por dentro:
+
+```c
+/* rastrear objetos de un asignador a medida */
+kmemleak_alloc(obj, size, 1, GFP_KERNEL);   /* al repartirlo */
+kmemleak_free(obj);                          /* al devolverlo */
+```
+
+```bash
+# controlar el escaneo de las pilas en caliente
+echo stack=off > /sys/kernel/debug/kmemleak
+```
+
+Conviene además conocer su modo de fallo: kmemleak guarda sus metadatos en un pool de tamaño fijo (`CONFIG_DEBUG_KMEMLEAK_MEM_POOL_SIZE`), y si el kernel crea más objetos de los que ese pool puede describir, se autodesactiva con un `kmemleak: Cannot allocate a kmemleak_object structure` en `dmesg` y deja de reportar. En cargas con millones de objetos vivos hay que ampliar el pool al compilar, o kmemleak se apagará justo cuando más falta hace.
+
+## Interpretar un informe
+
+Cada entrada del volcado es un objeto huérfano con toda su ficha de nacimiento:
+
+```text
+unreferenced object 0xffff888103a4c800 (size 128):
+  comm "insmod", pid 1523, jiffies 4294901760
+  hex dump (first 32 bytes):
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    41 42 43 44 00 00 00 00 00 00 00 00 00 00 00 00  ABCD............
+  backtrace (crc 9f3c1a2b):
+    [<ffffffff812a4c17>] kmalloc_trace_noprof+0x27/0x120
+    [<ffffffffc0a01033>] mi_init+0x33/0x1000 [mi_modulo]
+    [<ffffffff810023a7>] do_one_initcall+0x77/0x3c0
+    [<ffffffff8134f2be>] do_init_module+0x8e/0x2d0
+```
+
+Léelo de arriba abajo. La primera línea da la dirección y el tamaño del objeto fugado; `comm` y `pid` dicen qué proceso lo asignó, y `jiffies` cuándo. El volcado hexadecimal muestra el contenido —aquí, unos bytes `ABCD` que ayudan a reconocer la estructura—. Y la joya es el `backtrace`: la pila exacta de la asignación, que casi siempre apunta a la línea que olvidó su `kfree`. El `crc` que acompaña al backtrace en kernels recientes deduplica informes idénticos, de modo que una fuga repetida mil veces no inunde el buffer con mil copias.
+
+Una lectura fina distingue dos formas de huérfano. Un objeto con cero referencias halladas es una fuga limpia. Pero un objeto con alguna referencia que aun así se reporta suele ser síntoma de una fuga *encadenada*: su único enlace vive dentro de otra estructura que a su vez se está fugando, de modo que ninguna raíz alcanza a ninguno de los dos. Cuando veas varios objetos relacionados en el mismo informe, tira del que está más arriba en la cadena de propiedad: la fuga raíz casi siempre está aguas arriba, y liberarla arrastra a las demás.
+
+<Callout type="tip" title="Antes de la artillería pesada, mira la tendencia">
+kmemleak es caro. Antes de encenderlo, una fuga que solo crece se puede oler más barato: vigila si los `active_objs` de una caché en `/proc/slabinfo` suben de forma monótona y no bajan nunca (nivel 21), o si `slabtop -s c` sube arriba una caché que engorda sin parar. Si la tendencia confirma la sospecha, entonces kmemleak te da la pila culpable; si no, te has ahorrado el coste del barrido conservador.
+</Callout>
+
+<Callout type="dios" title="La alcanzabilidad como definición operativa de fuga">
+Fíjate en la sutileza conceptual, porque es lo que hace posible detectar lo indetectable. Una fuga de memoria no tiene síntoma: el objeto fugado es válido, su contenido es coherente, ningún acceso a él fallaría. ¿Cómo se caza un error que por definición no produce ningún efecto observable? kmemleak da una respuesta preciosa: redefine "fuga" como una propiedad puramente estructural del grafo de la memoria —un objeto es una fuga si es *inalcanzable* desde las raíces del kernel—, y esa propiedad sí es computable, porque es exactamente la que calcula un recolector de basura tracing. La genialidad es aplicar la maquinaria de la recolección de basura a un lenguaje que no tiene recolección: C no puede liberar automáticamente lo inalcanzable porque no sabe distinguir un puntero de un entero, pero kmemleak convierte esa misma limitación en virtud siendo *conservador* —trata toda palabra como si fuera un puntero—, con lo que puede errar hacia el silencio pero nunca hacia la falsa alarma sistemática. Y como no puede liberar sin arriesgarse a desastres, no libera: solo delata. Es un recolector de basura que renuncia a recolectar y se queda con la única parte segura, el análisis de alcanzabilidad, convirtiéndolo de mecanismo de gestión en instrumento de diagnóstico. Toda la depuración de sistemas consiste en esto: encontrar una propiedad computable que capture el error invisible, y kmemleak lo hace con una elegancia que roza lo teórico.
+</Callout>
+
+<Reto title="Sigue el rastro de lo inalcanzable">
+1. Compila un kernel con `CONFIG_DEBUG_KMEMLEAK` y arráncalo con `kmemleak=on` en QEMU.
+2. Escribe un módulo que haga un `kmalloc` en su `init` y nunca lo libere; fuerza `echo scan` y encuentra tu objeto en el informe.
+3. Localiza en el backtrace la línea exacta que olvidó el `kfree` y corrígela.
+4. Provoca un falso positivo guardando la dirección desplazada y siléncialo con `kmemleak_not_leak()`.
+5. Contrasta la señal de kmemleak con la tendencia de `active_objs` en `/proc/slabinfo` para la misma fuga.
+</Reto>

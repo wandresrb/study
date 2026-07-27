@@ -1,0 +1,138 @@
+---
+title: "kretprobes: interceptar el retorno, y el eje estático-dinámico"
+description: "Cómo un kretprobe secuestra la dirección de retorno de una función para medir su valor y su latencia, el mecanismo rethook con su pozo de instancias y maxactive, las trampas de contexto y rendimiento, y la comparación con los tracepoints estáticos: dos filosofías de la observabilidad, la dinámica y la curada."
+subject: kernel
+level: 49
+order: 2
+icon: "49.2"
+duracion: "16 min"
+---
+
+<Lead>
+Sondear la entrada de una función es fácil: hay una instrucción fija donde plantar el breakpoint. Pero el retorno es escurridizo. Una función no vuelve a un sitio fijo, sino a quien la llamó, que cambia en cada invocación; la dirección de retorno vive en la pila, no en el código. Y sin embargo, el retorno es donde está la información jugosa: el valor devuelto, el `-ENOMEM` que delata el fallo, la latencia total de la llamada. El kretprobe resuelve el acertijo con un secuestro elegante: no sondea una instrucción, sino que roba la dirección de retorno y planta una trampa en el único sitio por el que la función tendrá que pasar.
+</Lead>
+
+<Objetivos>
+
+- Interceptar el valor devuelto por una función con `register_kretprobe` y `regs_return_value`.
+- Entender la trampa de retorno `rethook` y el pozo de instancias gobernado por `maxactive`.
+- Correlacionar entrada y salida con `entry_handler` y datos por instancia.
+- Situar kprobes y kretprobes frente a los tracepoints en el eje dinámico-estático.
+
+</Objetivos>
+
+## El problema del retorno
+
+Un `kretprobe` se apoya en un kprobe ordinario plantado en la entrada de la función. Cuando ese kprobe de entrada dispara, el núcleo hace la maniobra clave: lee la dirección de retorno real de la pila, la guarda a buen recaudo, y la **sustituye** por la dirección de un trampolín propio del kretprobe. La función se ejecuta con total normalidad; pero cuando llega su instrucción `ret`, en lugar de volver a quien la llamó, salta al trampolín. Allí corre tu manejador de retorno, se restaura la dirección real y se salta a ella. El llamante original nunca se entera.
+
+```c
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/kprobes.h>
+#include <linux/ktime.h>
+
+static struct kretprobe rp = {
+	.kp.symbol_name = "vfs_read",
+	.maxactive      = 64,               /* retornos concurrentes rastreables */
+	.data_size      = sizeof(ktime_t),  /* memoria privada por instancia */
+};
+
+/* corre a la ENTRADA: sella el instante de inicio */
+static int entrada(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	ktime_t *t0 = (ktime_t *)ri->data;
+	*t0 = ktime_get();
+	return 0;   /* 0 = arma el retorno; distinto de 0 = omitelo */
+}
+
+/* corre en el RETORNO: mide la latencia y lee el valor devuelto */
+static int retorno(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	ktime_t *t0 = (ktime_t *)ri->data;
+	long ret = regs_return_value(regs);
+	s64 ns = ktime_to_ns(ktime_sub(ktime_get(), *t0));
+
+	pr_info("vfs_read devolvio %ld en %lld ns\n", ret, ns);
+	return 0;
+}
+
+static int __init mi_init(void)
+{
+	rp.entry_handler = entrada;
+	rp.handler       = retorno;
+	return register_kretprobe(&rp);
+}
+
+static void __exit mi_exit(void)
+{
+	pr_info("kretprobe: %d retornos perdidos\n", rp.nmissed);
+	unregister_kretprobe(&rp);
+}
+
+module_init(mi_init);
+module_exit(mi_exit);
+MODULE_LICENSE("GPL");
+```
+
+`regs_return_value(regs)` extrae el valor devuelto —en x86-64, el registro `rax`—. El `entry_handler` y el `handler` comparten un bloque de memoria de `data_size` bytes en `ri->data`, único por invocación en vuelo: ahí guardas el instante de entrada para restarlo en la salida y obtener la latencia. Si el `entry_handler` devuelve distinto de cero, se descarta el rastreo de ese retorno concreto, útil para filtrar por argumento sin gastar una instancia.
+
+## El pozo de instancias y maxactive
+
+¿Por qué "instancias"? Porque varias invocaciones de la misma función pueden estar en vuelo a la vez: en distintas CPUs, o anidadas por recursión. Cada una necesita recordar **su** dirección de retorno real y **sus** datos privados. El kretprobe mantiene un pozo de `struct kretprobe_instance`, de tamaño `maxactive`. En la entrada se toma una instancia libre; en el retorno se devuelve al pozo.
+
+<Mermaid code={`sequenceDiagram
+  participant F as vfs_read
+  participant E as kprobe de entrada
+  participant P as Pozo de instancias
+  participant T as Trampolin rethook
+  E->>P: toma una instancia libre
+  E->>E: guarda la direccion de retorno real
+  E->>E: ejecuta entry_handler
+  F->>T: al hacer ret salta al trampolin
+  T->>T: ejecuta handler y lee regs_return_value
+  T->>P: devuelve la instancia al pozo
+  T->>F: restaura la direccion real y vuelve`} />
+
+Si en un pico de concurrencia todas las instancias están ocupadas, la entrada no puede rastrear ese retorno: no lo secuestra, y suma uno a `rp.nmissed`. El valor por defecto de `maxactive` ronda el número de CPUs, generoso para funciones planas pero insuficiente para funciones recursivas o muy concurridas. Si `nmissed` crece, súbelo. En los núcleos desde la versión 5.19, todo el secuestro de retorno se factorizó en un mecanismo común llamado `rethook`, compartido con `fprobe`, y el pozo usa `objpool` para asignar instancias sin cerrojo y escalar en máquinas de muchos núcleos.
+
+<Callout type="warn" title="Las trampas del retorno">
+Un kretprobe cuesta el doble que un kprobe: golpea en la entrada y en el retorno, más la contabilidad del pozo. Y hay funciones que sencillamente no puede rastrear. Las funciones **inlinadas** no tienen marco de llamada propio, así que no hay entrada ni retorno que secuestrar. Las optimizadas con **tail-call** saltan a la siguiente función sin un `ret` propio. Y una función `noreturn` nunca vuelve, de modo que la instancia queda colgada hasta agotar el pozo. Comprueba siempre `nmissed` antes de fiarte de las cuentas.
+</Callout>
+
+## Estático frente a dinámico: los tracepoints
+
+kprobes y kretprobes son instrumentación **dinámica**: se plantan en tiempo de ejecución sobre cualquier símbolo, sin que el desarrollador del kernel previera que quisieras observarlo. Su reverso es la instrumentación **estática**: los tracepoints, puntos de rastreo que el propio código del kernel declara en sitios cuidadosamente elegidos. Se definen con la macro `TRACE_EVENT` y viven en `include/trace/events/`.
+
+```c
+/* el punto de llamada, en kernel/sched/core.c */
+trace_sched_switch(preempt, prev, next, prev_state);
+```
+
+La magia está en qué compila ese `trace_sched_switch`. No es una llamada normal: es un `nop` guardado por una *static key* (jump label). Mientras nadie está enganchado al tracepoint, el sitio es literalmente una instrucción `nop` —coste cero, ni una rama que predecir—. En el instante en que alguien activa el tracepoint, el núcleo reescribe ese `nop` por un salto a la lista de sondas registradas. La instrumentación está siempre presente en el binario, pero solo pesa cuando se enciende.
+
+```bash
+# los tracepoints disponibles, ya compilados en el kernel
+sudo cat /sys/kernel/tracing/available_events | grep sched:
+# sched:sched_switch
+# sched:sched_wakeup
+# perf puede engancharse a cualquiera de ellos
+perf record -e sched:sched_switch -a sleep 3
+```
+
+La diferencia decisiva es de estabilidad. Un tracepoint es un contrato semiestable: sus argumentos forman parte de la interfaz que las herramientas consumen, y los mantenedores procuran no romperlos. Un kprobe, en cambio, se ata a un símbolo interno que puede renombrarse, quedar inlinado o desaparecer entre versiones —`_do_fork` se convirtió en `kernel_clone`, y todo script que lo sondeaba se rompió—. El tracepoint es curado, estable y de coste nulo apagado, pero solo existe donde un humano decidió ponerlo. El kprobe llega a cualquier rincón, pero paga en fragilidad y en coste. Dos filosofías de la misma pregunta.
+
+<Callout type="info" title="perf y BPF hablan con ambos">
+No tienes que elegir la tubería: tanto `perf` como BPF se enganchan a las dos clases. Un programa BPF de tipo `BPF_PROG_TYPE_TRACEPOINT` corre en un tracepoint estático; uno de tipo `BPF_PROG_TYPE_KPROBE`, en un kprobe dinámico. La regla práctica es simple: si existe un tracepoint que te da lo que necesitas, úsalo, porque no se romperá; si no existe, baja al kprobe y acepta su fragilidad a cambio de su alcance.
+</Callout>
+
+<Callout type="dios" title="Dos maneras de mirar: la ventana tallada y el taladro">
+Levanta la vista sobre el detalle técnico, porque acabas de tocar una tensión que recorre toda la ingeniería de sistemas: la que hay entre lo previsto y lo improvisado, entre la interfaz y la implementación. El tracepoint es una ventana que el arquitecto talló en el muro: está donde él decidió, tiene el tamaño que él eligió, y por eso da a un paisaje estable que puedes fotografiar hoy y dentro de diez años con la misma cámara. El kprobe es el taladro que traes tú: perfora el muro donde te dé la gana, incluso donde el arquitecto jamás pensó que alguien miraría, pero abres un agujero en la implementación desnuda, y la implementación no te debe nada —mañana el muro puede estar en otro sitio y tu agujero dará al vacío—. Ninguna de las dos es superior; son duales. La observabilidad madura de un sistema se mide precisamente por cuántas ventanas talladas ofrece, porque cada tracepoint es una promesa: "esto lo puedes observar, y me comprometo a que siga significando lo mismo". Cuando un subsistema solo se deja instrumentar con kprobes, te está diciendo que su interior es privado y volátil; cuando se llena de tracepoints, está publicando un contrato de observabilidad. Y ahí está la lección profunda para quien diseña sistemas: exponer buenos puntos de observación estables es un acto de diseño de interfaz tan serio como exponer buenas llamadas al sistema. El taladro siempre estará disponible para las emergencias, pero un sistema que obliga a taladrar para entenderlo es un sistema que no ha terminado de pensarse.
+</Callout>
+
+<Reto title="Mide latencias y compara las dos filosofías">
+1. Compila el módulo de `vfs_read`, genera carga con `dd if=/archivo of=/dev/null` y observa en `dmesg` los valores devueltos y las latencias en nanosegundos.
+2. Fuerza `nmissed` a crecer bajando `maxactive` a 1 y lanzando lecturas concurrentes desde varias terminales; explica qué retornos se pierden y por qué.
+3. Sondea con un kretprobe una función que sospeches inlinada, verifica que `register_kretprobe` falla o que nunca dispara, y confírmalo en `objdump`.
+4. Sustituye tu kretprobe por el tracepoint `sched:sched_switch` con `perf record` y razona qué garantía de estabilidad ganas y qué alcance pierdes.
+5. Argumenta, en un párrafo, por qué el renombrado de `_do_fork` a `kernel_clone` rompió miles de scripts de kprobes pero no habría roto un tracepoint equivalente.
+</Reto>

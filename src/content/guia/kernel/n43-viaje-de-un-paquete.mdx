@@ -1,0 +1,146 @@
+---
+title: "El viaje de un paquete: de la NIC al socket y vuelta"
+description: "El recorrido completo de un paquete por el kernel: la DMA de la NIC al anillo, la interrupción que enciende NAPI, el ascenso por L2, L3 y L4 hasta la cola de recepción del socket, y el camino inverso desde `sendmsg` a través del qdisc y `ndo_start_xmit`. La visión aérea que da sentido a todo el nivel."
+subject: kernel
+level: 43
+order: 1
+icon: "43.1"
+duracion: "18 min"
+---
+
+<Lead>
+Un byte llega por el cable. Termina, milisegundos después, en el búfer que tu `read` de un socket devolvió. Entre esos dos instantes hay un viaje de una precisión asombrosa: la NIC deposita el paquete en memoria por DMA, levanta una interrupción, el kernel decide dejar de interrumpir y ponerse a sondear, y una misma estructura —el `sk_buff`— asciende capa a capa, desnudándose de cabeceras hasta que solo queda la carga útil que la aplicación pidió. Este nivel entero es ese viaje contado despacio. Empecemos por el mapa completo, de la NIC al socket y de vuelta.
+</Lead>
+
+<Objetivos>
+
+- Trazar el camino de recepción: NIC, DMA, interrupción, NAPI, softirq, pila, socket.
+- Entender por qué NAPI mezcla interrupción y sondeo para sobrevivir a la carga.
+- Trazar el camino de transmisión: `sendmsg`, pila, qdisc, `ndo_start_xmit`, NIC.
+- Situar `sk_buff` y `net_device` como los dos ejes sobre los que gira todo.
+
+</Objetivos>
+
+## RX: la NIC despierta a la CPU, y la CPU decide sondear
+
+La tarjeta escribe el paquete recibido directamente en memoria RAM por DMA, en un anillo de descriptores que el driver preparó de antemano. Luego eleva una interrupción. Pero atender una interrupción por paquete es suicida: a diez millones de paquetes por segundo, la CPU no haría otra cosa que entrar y salir del manejador. La respuesta del kernel es **NAPI**: en cuanto llega la primera interrupción, el driver la enmascara y pide sondear.
+
+```c
+/* Contexto de interrupcion dura: no se procesa el paquete aqui, solo se agenda NAPI */
+static irqreturn_t mi_irq(int irq, void *data)
+{
+	struct mi_priv *priv = data;
+
+	if (napi_schedule_prep(&priv->napi)) {
+		mi_disable_rx_irq(priv);        /* deja de interrumpir; ahora sondeamos */
+		__napi_schedule(&priv->napi);   /* levanta NET_RX_SOFTIRQ */
+	}
+	return IRQ_HANDLED;
+}
+```
+
+El softirq `NET_RX_SOFTIRQ`, servido por `net_rx_action`, llama a la función `poll` del driver con un presupuesto de paquetes. El driver cosecha el anillo, envuelve cada trama en un `sk_buff` y lo entrega a la pila con `napi_gro_receive`, que además fusiona segmentos contiguos (GRO) para amortizar el coste del ascenso.
+
+```c
+/* Contexto softirq: se drena el anillo hasta agotar el presupuesto */
+static int mi_poll(struct napi_struct *napi, int budget)
+{
+	struct mi_priv *priv = container_of(napi, struct mi_priv, napi);
+	int done = 0;
+
+	while (done < budget) {
+		struct sk_buff *skb = mi_fetch_rx(priv);   /* saca una trama del anillo DMA */
+		if (!skb)
+			break;
+		skb->protocol = eth_type_trans(skb, priv->netdev);
+		napi_gro_receive(napi, skb);               /* entra a la pila */
+		done++;
+	}
+
+	if (done < budget) {
+		napi_complete_done(napi, done);            /* nada mas que hacer */
+		mi_enable_rx_irq(priv);                    /* vuelve a permitir interrupciones */
+	}
+	return done;
+}
+```
+
+Si el tráfico es intenso, `poll` agota el presupuesto y el softirq lo reprograma sin reactivar la interrupción: bajo carga, el sistema **sondea** y no interrumpe; en reposo, **interrumpe** y no gasta CPU sondeando. Ese doble régimen es la genialidad de NAPI.
+
+## Subir por la pila: L2, L3, L4, socket
+
+`eth_type_trans` ya hizo el trabajo de L2: leyó la cabecera Ethernet, la retiró del `sk_buff` y devolvió el `EtherType` en `skb->protocol`. A partir de ahí, `__netif_receive_skb_core` despacha según ese protocolo hacia el manejador registrado —`ip_rcv` para `ETH_P_IP`—, que valida la cabecera IP, decide en `NF_INET_PRE_ROUTING` y consulta la tabla de rutas.
+
+<Cards>
+  <Card icon="🔌" title="L2 Ethernet">
+    `eth_type_trans` desnuda la trama, fija `skb->protocol` y deja el `sk_buff` apuntando a la cabecera de red.
+  </Card>
+  <Card icon="🌐" title="L3 IP">
+    `ip_rcv` valida y enruta: entrega local por `ip_local_deliver` o reenvía por `ip_forward` segun la tabla de rutas.
+  </Card>
+  <Card icon="📨" title="L4 y socket">
+    `tcp_v4_rcv` o `udp_rcv` buscan el socket dueno, encolan la carga y llaman a `sk_data_ready` para despertar a la app.
+  </Card>
+</Cards>
+
+Cuando el destino es local, `ip_local_deliver` reensambla fragmentos si los hay, cruza el hook `NF_INET_LOCAL_IN` y salta al manejador de L4 según el campo protocolo: `tcp_v4_rcv` o `udp_rcv`. Este busca el socket dueño del cuádruple puerto-dirección, encola el `sk_buff` en su cola de recepción y llama a `sk->sk_data_ready`, que despierta al proceso dormido en `recvmsg`. El viaje de subida termina exactamente donde tu aplicación esperaba.
+
+## TX: el camino inverso, del socket al cable
+
+La transmisión invierte cada paso. `sendmsg` entra en `tcp_sendmsg` o `udp_sendmsg`, que copian los datos de usuario a un `sk_buff` nuevo, reservando headroom para las cabeceras que aún faltan. L4 antepone su cabecera, L3 la suya en `ip_queue_xmit`, y `dev_queue_xmit` entrega el paquete al **qdisc**, la disciplina de cola que ordena, prioriza o limita el tráfico antes de tocar el hardware.
+
+```c
+/* El nucleo ya resolvio ruta, cabeceras y qdisc; llama a tu driver para poner la trama en el cable */
+static netdev_tx_t mi_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct mi_priv *priv = netdev_priv(dev);
+
+	if (mi_ring_full(priv)) {
+		netif_stop_queue(dev);          /* sin sitio: para la cola, reintentar luego */
+		return NETDEV_TX_BUSY;
+	}
+
+	mi_dma_map_and_arm(priv, skb);          /* programa el descriptor DMA de TX */
+	netdev_sent_queue(dev, skb->len);       /* alimenta el control de flujo BQL */
+	return NETDEV_TX_OK;
+}
+```
+
+Tras el qdisc, `sch_direct_xmit` invoca `dev_hard_start_xmit`, que finalmente llama a tu `ndo_start_xmit`. El driver programa un descriptor DMA de transmisión y avisa a la NIC; cuando esta termina de enviar, una interrupción de TX permite liberar el `sk_buff` con `dev_kfree_skb`. La simetría es total: lo que subió desnudándose de cabeceras, baja vistiéndolas.
+
+## Los dos ejes del viaje: sk_buff y net_device
+
+Reduce todo lo anterior a su esqueleto y solo quedan dos estructuras, presentes en cada paso. El `sk_buff` **es** el paquete: lo que se recibe, asciende, se transmite y se libera. El `net_device` **es** la interfaz: el punto por el que entra o sale, y el que aporta la implementación concreta de `ndo_start_xmit`. Y un campo los enlaza: todo skb lleva en `skb->dev` la interfaz con la que está tratando en cada instante.
+
+```c
+/* El skb sabe siempre por que interfaz viaja: skb->dev es su net_device */
+struct net_device *dev = skb->dev;
+skb->protocol = eth_type_trans(skb, dev);   /* L2 usa la interfaz para leer la trama */
+/* ...y al transmitir, el nucleo elige dev por la ruta y llama a dev->netdev_ops->ndo_start_xmit */
+```
+
+No es casualidad que el resto de este nivel se dedique, casi por completo, a estas dos estructuras: la lección 2 abre en canal el `sk_buff` —headroom, punteros de cabecera, clonado— y la lección 3, el `net_device` y su tabla de operaciones. Todo lo demás —las capas de la lección 4, los hooks de la lección 5— son funciones que reciben un `sk_buff`, consultan su `net_device` y deciden qué hacer con él. Si dominas estas dos piezas, dominas la pila.
+
+<Mermaid code={`flowchart LR
+  subgraph RX_subida
+    N1[NIC DMA al anillo] --> N2[IRQ agenda NAPI] --> N3[poll y GRO] --> N4[ip_rcv L3] --> N5[tcp_v4_rcv L4] --> N6[cola del socket]
+  end
+  subgraph TX_bajada
+    T1[sendmsg] --> T2[tcp_sendmsg L4] --> T3[ip_queue_xmit L3] --> T4[qdisc] --> T5[ndo_start_xmit] --> T6[NIC al cable]
+  end`} />
+
+<Callout type="info" title="El backlog: cuando no hay NAPI">
+No todo el tráfico entra por un driver NAPI. Los paquetes que se reinyectan —por ejemplo desde un túnel o `veth`— pasan por `netif_rx`, que los encola en la **backlog queue** per-CPU. Esa cola es, de hecho, un `napi_struct` interno del propio kernel: el mismo mecanismo de sondeo, reutilizado para tráfico que no nace de una NIC física. NAPI no es una API de drivers, es el motor de recepción de todo el sistema.
+</Callout>
+
+<Callout type="dios" title="Un solo puntero recorre siete capas, y las capas son una ilusión útil">
+Detente en lo que de verdad ocurre, porque disuelve el modelo con el que aprendiste redes. El modelo OSI dibuja siete estratos apilados, y uno imagina el dato copiándose de una capa a la siguiente como quien baja cajas por una escalera. Dentro del kernel no hay tal copia ni tal escalera: hay **un solo bloque de memoria**, el `sk_buff`, y un puntero `skb->data` que se desliza sobre él. Subir por la pila no es mover el paquete de sitio, es avanzar ese puntero unos bytes para dejar atrás una cabecera; bajar no es copiar, es retroceder el puntero para escribir la cabecera nueva en el headroom que se reservó justo para eso. La encapsulación y la desencapsulación —el corazón conceptual de toda red— resultan ser, en la implementación real, aritmética de punteros sobre un búfer compartido. Las capas no son lugares por los que el dato viaja; son roles que un mismo trozo de memoria interpreta según qué función lo esté mirando. Y esa es la razón profunda de que Linux pueda mover decenas de millones de paquetes por segundo: no porque las capas sean baratas, sino porque, por dentro, **no existen**. Existe un búfer, un puntero y una secuencia de funciones que se lo pasan sin soltarlo jamás. Entender esto reordena el resto del nivel: cada estructura que verás —el `sk_buff`, el `net_device`, los hooks de netfilter— es una pieza de la maquinaria que mantiene ese único búfer en movimiento sin copiarlo nunca.
+</Callout>
+
+<Reto title="Sigue a un paquete con tus propios ojos">
+1. Con `ftrace`, activa el graph tracer sobre `netif_receive_skb` y `napi_gro_receive`, haz un `ping` y lee el árbol de llamadas del camino RX.
+2. Traza `__dev_queue_xmit` y `dev_hard_start_xmit` durante un `curl` y reconstruye el camino TX hasta `ndo_start_xmit`.
+3. Mira `/proc/interrupts` antes y después de saturar una interfaz: observa cómo el conteo de la IRQ de red apenas sube pese al tráfico masivo, y explica por qué gracias a NAPI.
+4. Con `ethtool -S` de tu NIC, correlaciona los contadores de RX y TX con el número de paquetes que envías, y localiza dónde encajan `poll` y `ndo_start_xmit` en esas cifras.
+5. Argumenta en tres líneas por qué GRO en recepción reduce el trabajo de la pila sin cambiar lo que la aplicación acaba leyendo.
+</Reto>

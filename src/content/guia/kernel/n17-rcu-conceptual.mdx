@@ -1,0 +1,151 @@
+---
+title: "RCU conceptual: publicar, suscribir y grace periods"
+description: "El modelo mental de RCU: publicar-suscribir con barreras, lectores que no bloquean jamás, y el grace period como la garantía que permite liberar memoria sin rastrear a un solo lector."
+subject: kernel
+level: 17
+order: 2
+icon: "17.2"
+duracion: "15 min"
+---
+
+<Lead>
+RCU se sostiene sobre tres ideas que encajan como un mecanismo de relojería: publicar y suscribir con barreras, lectores que nunca esperan a nadie, y el grace period, el intervalo tras el cual es demostrablemente seguro liberar la versión vieja. Entiende estas tres y entenderás RCU entera.
+</Lead>
+
+<Objetivos>
+
+- El modelo publicar/suscribir y las barreras que lo sostienen.
+- Por qué los lectores nunca bloquean y qué garantiza eso.
+- Qué es un grace period y qué promete exactamente.
+- Estados quiescentes: detectar el fin sin rastrear lectores.
+
+</Objetivos>
+
+## Publicar y suscribir
+
+RCU coordina a lectores y escritores mediante un único puntero. El escritor **publica** un objeto nuevo haciendo que el puntero apunte a él; el lector se **suscribe** cargando ese puntero. La sutileza está en el orden de la memoria.
+
+Cuando el escritor inicializa un objeto y luego publica el puntero, un compilador o una CPU agresiva podrían reordenar las escrituras y hacer visible el puntero **antes** de que los campos del objeto estén escritos. Un lector vería un puntero válido a un objeto medio construido. `rcu_assign_pointer` inserta una **barrera de liberación** (`smp_store_release`) que impide ese reordenamiento: si ves el puntero nuevo, ves el objeto completo.
+
+```c
+/* Escritor: publicar */
+struct config *nuevo = kmalloc(sizeof(*nuevo), GFP_KERNEL);
+nuevo->valor = 42;                 /* (1) inicializa el objeto */
+rcu_assign_pointer(cfg, nuevo);    /* (2) publica con barrera de release */
+
+/* Lector: suscribirse */
+struct config *p = rcu_dereference(cfg);   /* barrera de dependencia */
+if (p)
+	usar(p->valor);            /* garantizado: ve el 42, no basura */
+```
+
+`rcu_dereference` es la otra mitad: garantiza que la carga de `p->valor` no se especule **antes** de la carga de `p`, respetando la dependencia de direcciones. En arquitecturas de memoria débil (ARM, PowerPC) esto importa de verdad; el difunto DEC Alpha llegaba a reordenar incluso cargas dependientes, y de ahí viene toda esta maquinaria de barreras. Sin las dos mitades, publicar/suscribir es una carrera silenciosa.
+
+Sin la pareja de barreras, el hardware puede reordenar así:
+
+```c
+/* MAL: publicar sin barrera */
+nuevo->valor = 42;
+cfg = nuevo;             /* la CPU puede hacer visible 'cfg' ANTES del 42 */
+
+/* Un lector concurrente: */
+p = cfg;                 /* ve el puntero nuevo... */
+usar(p->valor);          /* ...pero podria leer basura en vez del 42 */
+```
+
+`rcu_assign_pointer` y `rcu_dereference` cierran exactamente esa ventana.
+
+<Callout type="tip" title="El modelo en una frase">
+Publicar es "escribir el puntero con barrera de release"; suscribirse es "leer el puntero con barrera de dependencia"; el grace period es "esperar a que el mundo pase de página". Si retienes solo eso, ya tienes el 80% de RCU.
+</Callout>
+
+## Los lectores nunca bloquean
+
+`rcu_read_lock()` no adquiere nada. No gira, no duerme, no espera a ningún escritor. Marca el **inicio** de una sección crítica de lectura y ya está. La consecuencia es radical: los escritores nunca bloquean a los lectores, y los lectores nunca bloquean a los escritores. Lecturas y escrituras avanzan **a la vez**.
+
+Durante una actualización, la versión vieja y la nueva coexisten un instante. Un lector puede ver una u otra, pero siempre una versión **consistente y completa**. Piensa en un lector recorriendo una lista justo cuando un escritor sustituye un nodo: el que empezó antes termina su recorrido sobre la versión vieja, coherente de principio a fin; el que empieza después ve la nueva. Nadie ve una mezcla.
+
+Lo que RCU garantiza no es que veas lo último, sino algo más humilde y más útil: **garantía de existencia**. El objeto que dereferencias dentro de la sección no será liberado mientras estés dentro.
+
+Esta propiedad —lecturas que jamás esperan— hace a RCU inmune a patologías de los candados: no hay inversión de prioridad del lado lector, no hay deadlock posible entre lector y escritor, y la latencia de una lectura es diminuta y acotada por más escritores que compitan a la vez.
+
+<Callout type="info" title="Consistencia sin exclusión">
+RCU no da exclusión mutua entre lector y escritor: da coexistencia segura de versiones. El lector no ve un objeto a medio modificar porque el escritor nunca modifica el objeto publicado in situ: crea una copia nueva y cambia el puntero de golpe. La atomicidad la aporta el intercambio del puntero, no un candado.
+</Callout>
+
+## Grace period: el corazón de RCU
+
+Si los lectores no dejan rastro, ¿cómo sabe el escritor cuándo es seguro liberar la versión vieja? Con el **grace period**.
+
+Un grace period es un intervalo de tiempo tal que **toda sección crítica de lectura que estaba en curso al inicio del intervalo ha terminado al final**. Si el escritor (1) desenlaza un objeto para que ningún lector nuevo pueda alcanzarlo, y luego (2) espera un grace period, entonces cualquier lector que **pudiera** tener una referencia a ese objeto ya ha salido de su sección. Solo entonces liberar es seguro.
+
+Dicho de otro modo: el grace period no pregunta *quién* leía, sino *cuándo* es imposible que quede alguien leyendo la versión vieja. Esa diferencia de enfoque es todo.
+
+<Mermaid code={`flowchart LR
+  A[Escritor desenlaza el objeto] --> B[Inicio del grace period]
+  B --> C[Espera a que cada CPU pase por un estado quiescente]
+  C --> D[Fin del grace period]
+  D --> E[Ningun lector previo conserva referencia]
+  E --> F[Liberar es seguro]
+  style B fill:#f9e2af,color:#11111b
+  style D fill:#a6e3a1,color:#11111b
+  style F fill:#89b4fa,color:#11111b`} />
+
+Este compás de tres tiempos —desenlazar, esperar el grace period, liberar— es la base de toda destrucción diferida en el kernel; todo el lado escritor del nivel 17.4 no es más que variaciones sobre él.
+
+Fíjate en lo que RCU **no** hace: no cuenta lectores, no lleva un registro de quién entró. Rastrear a cada lector exigiría exactamente la contabilidad compartida que queríamos evitar (nivel 17.1). RCU hace algo más astuto.
+
+## Estados quiescentes: detectar sin rastrear
+
+RCU no observa a los lectores; observa a las **CPUs**. Define un **estado quiescente** como un instante en el que una CPU está, con certeza, fuera de toda sección crítica de lectura. En la RCU clásica (no expropiativa) los lectores no pueden dormir, así que un **cambio de contexto**, un retorno a espacio de usuario o entrar en idle son estados quiescentes: si la CPU cambia de tarea, es que no sostiene ninguna referencia RCU.
+
+La regla del grace period se vuelve entonces mecánica: **cuando cada CPU ha pasado al menos por un estado quiescente, un grace period ha transcurrido.** No hace falta saber quién leía; basta con saber que todos los que leían han sido, necesariamente, expulsados por un punto quiescente.
+
+```c
+/* La forma canonica del lado escritor */
+p = cfg;                          /* recuerda el viejo */
+rcu_assign_pointer(cfg, nuevo);   /* publica: nuevos lectores ven 'nuevo' */
+synchronize_rcu();                /* espera un grace period completo */
+kfree(p);                         /* los lectores de 'p' ya salieron: seguro */
+```
+
+En Linux 7.x el motor que implementa esto es **Tree RCU**: una jerarquía de estructuras `rcu_node` que agregan los reportes de estado quiescente de las CPUs hacia una raíz. Esa jerarquía existe por la misma razón que RCU: evitar que el propio mecanismo de grace period tenga un único candado global que rebotaría entre núcleos. Un kthread por grace period (`rcu_gp_kthread`) orquesta el avance, y las CPUs reportan sus estados desde el `RCU_SOFTIRQ`.
+
+Ese diseño en árbol es la razón de que el propio motor de RCU escale: en una máquina de miles de núcleos, ninguna CPU escribe en un contador global; cada una reporta a su `rcu_node` local, y los reportes se agregan por niveles hasta la raíz. RCU aplica a su propia maquinaria la misma medicina que receta al resto del kernel.
+
+Esperar un grace period normal es cómodo pero puede tardar milisegundos, porque avanza al ritmo perezoso del planificador. Cuando la latencia importa hay atajos: `synchronize_rcu_expedited()` fuerza el grace period enviando IPIs a las CPUs para que reporten ya, y la familia de grace periods sondeados (`get_state_synchronize_rcu()` + `poll_state_synchronize_rcu()`) permite apuntar el estado actual y comprobar más tarde, sin bloquear, si ya ha pasado un grace period.
+
+```c
+unsigned long cookie = get_state_synchronize_rcu();  /* apunta el 'ahora' */
+/* ...haces otro trabajo util mientras el mundo avanza... */
+if (poll_state_synchronize_rcu(cookie))
+	kfree(viejo);        /* ya paso un grace period: seguro, sin bloquear */
+```
+
+<Cards>
+  <Card icon="⏳" title="synchronize_rcu">
+    Bloquea hasta un grace period completo. Simple y suave con el sistema, pero puede tardar milisegundos.
+  </Card>
+  <Card icon="⚡" title="synchronize_rcu_expedited">
+    Fuerza el grace period con IPIs. Rápido, pero perturba a todas las CPUs. Solo para urgencias.
+  </Card>
+  <Card icon="🎫" title="grace period sondeado">
+    `get_state` y `poll_state`: apuntas el ahora y compruebas después sin bloquear. Ideal para diferir trabajo.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="Expedito no es gratis">
+`synchronize_rcu_expedited()` acorta la latencia a costa de **interrumpir** a todas las CPUs con IPIs para arrancarles un estado quiescente inmediato. Bajo carga masiva eso es ruido que perturba a todo el sistema. Úsalo cuando de verdad no puedes esperar (arranque, hotplug de CPU, caminos de baja frecuencia y alta urgencia), no como el `synchronize_rcu` de todos los días.
+</Callout>
+
+<Callout type="dios" title="El truco que hace posible lo imposible">
+El golpe de genialidad de RCU es convertir una pregunta imposible de responder barata —¿ha terminado cada lector concreto?— en una pregunta trivial y libre de contención —¿ha pasado cada CPU por un estado quiescente?—. La primera exige que los lectores escriban su presencia en algún sitio compartido; la segunda no exige nada de los lectores, porque el estado quiescente es un subproducto natural de que el planificador haga su trabajo. El grace period no espera a los lectores: espera al tiempo. Y como todo lector clásico es más corto que el intervalo entre dos cambios de contexto de una CPU, esperar a que todas las CPUs pasen por un punto quiescente garantiza, por construcción, que todos los lectores preexistentes han terminado. Es una de esas ideas que, una vez la ves, reorganiza cómo piensas la concurrencia: en lugar de sincronizar en el espacio (candados sobre datos), RCU sincroniza en el tiempo (esperar a que el mundo avance lo suficiente). Toda la escalabilidad de RCU brota de esta única inversión.
+</Callout>
+
+<Reto title="Razona el grace period">
+1. Explica por qué publicar con `rcu_assign_pointer` y suscribirse con `rcu_dereference` evita que un lector vea un objeto medio inicializado.
+2. Define grace period sin usar la palabra "lector": solo en términos de estados quiescentes.
+3. ¿Por qué un cambio de contexto es un estado quiescente válido en la RCU clásica?
+4. Compara `synchronize_rcu()`, `synchronize_rcu_expedited()` y el grace period sondeado: latencia frente a perturbación del sistema.
+5. Explica qué garantiza RCU (existencia) y qué NO garantiza (ver siempre el último valor).
+</Reto>

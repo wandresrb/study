@@ -1,0 +1,161 @@
+---
+title: "Qué es async: concurrencia masiva de E/S sin un hilo por tarea"
+description: "La programación asíncrona resuelve un problema concreto: atender decenas de miles de tareas que pasan casi todo su tiempo esperando E/S, sin pagar un hilo del sistema por cada una. Qué la distingue de los hilos del nivel 29, por qué escala para E/S y por qué no aporta nada al cómputo puro."
+subject: rust
+level: 32
+order: 1
+icon: "32.1"
+duracion: "17 min"
+---
+
+<Lead>
+Un servidor moderno puede tener cien mil conexiones abiertas y, en cualquier instante, casi todas están *sin hacer nada*: esperando un byte de la red, una respuesta de la base de datos, un bloque del disco. El trabajo real es una chispa; la espera es el océano. La pregunta que define a `async` es brutal en su simplicidad: ¿cómo atiendes cien mil esperas simultáneas sin dedicar cien mil hilos del sistema operativo a estar, literalmente, parados? La respuesta no es hacer los hilos más rápidos, sino **dejar de atar una tarea a un hilo**. Async es concurrencia de muchísimas tareas de E/S multiplexadas sobre unos pocos hilos, y entender por qué eso escala —y por qué no siempre— es el cimiento de todo lo que sigue.
+</Lead>
+
+<Objetivos>
+
+- Identificar el trabajo *ligado a E/S* y por qué la espera domina su coste.
+- Contrastar el modelo un-hilo-por-tarea del nivel 29 con la multiplexación asíncrona.
+- Comprender por qué una tarea async es órdenes de magnitud más barata que un hilo.
+- Distinguir cuándo async escala y cuándo los hilos siguen siendo la herramienta correcta.
+
+</Objetivos>
+
+## El problema: casi todo es esperar
+
+Clasificamos el trabajo por dónde se va el tiempo. Una tarea *ligada a la CPU* —comprimir, cifrar, calcular— mantiene el procesador ocupado de principio a fin. Una tarea *ligada a la E/S* hace lo contrario: unos pocos microsegundos de CPU para preparar una petición y luego milisegundos, a veces segundos, de pura espera hasta que la red o el disco responden. En un servicio de red esa proporción es demoledora: por cada instante calculando hay miles de instantes esperando.
+
+Pon números concretos: formatear una consulta puede costar diez microsegundos de CPU, y la respuesta de la base de datos, diez milisegundos. Mil a uno. Durante esos diez milisegundos, un hilo dedicado a la conexión no hace nada más que ocupar memoria y un asiento en el planificador. Multiplícalo por cien mil conexiones y verás por qué el modelo obvio no aguanta.
+
+```rust
+use std::io::Read;
+use std::net::TcpStream;
+
+fn atender(mut conexion: TcpStream) {
+    let mut buffer = [0u8; 1024];
+    let n = conexion.read(&mut buffer).unwrap(); // el hilo se PARA aqui
+    // ... procesar los n bytes ...
+}
+```
+
+La llamada `read` es *bloqueante*: mientras no lleguen datos, el hilo que la ejecuta queda suspendido por el sistema operativo, incapaz de hacer nada más. Si quieres atender otra conexión a la vez, necesitas otro hilo. Ese es el reto que la industria bautizó como el problema *C10k*: sostener diez mil conexiones concurrentes —hoy diez millones— en una sola máquina.
+
+## Un hilo por tarea: el modelo y su techo
+
+La solución directa, que viste en el nivel 29, es lanzar un hilo por cada conexión:
+
+```rust
+use std::net::TcpListener;
+use std::thread;
+
+fn main() -> std::io::Result<()> {
+    let escucha = TcpListener::bind("127.0.0.1:8080")?;
+    for conexion in escucha.incoming() {
+        let conexion = conexion?;
+        thread::spawn(move || atender(conexion)); // un hilo por conexion
+    }
+    Ok(())
+}
+```
+
+Simple y correcto, pero cada hilo del sistema tiene un precio fijo. Reserva una **pila** propia —dos megabytes por defecto en Rust—, el kernel guarda su estado de planificación, y alternar entre hilos es un *cambio de contexto*: cruzar al núcleo, salvar y restaurar registros, y ensuciar cachés y TLB. Con cien conexiones no se nota; con cien mil, las pilas suman cientos de gigabytes reservados y el planificador del kernel gasta más ciclos repartiendo turnos que haciendo trabajo útil. El modelo es perfecto a pequeña escala y se derrumba a la grande, justo donde vive la E/S masiva.
+
+La aritmética es cruel de tan simple:
+
+```rust
+// Intuicion del coste (no es codigo, es una cuenta de servilleta):
+//   10_000 hilos  x  2 MiB de pila  =  ~20 GiB reservados solo en pilas
+//   10_000 tareas x  ~300 bytes     =  ~3 MiB para representar lo mismo
+```
+
+Un factor de *miles* separa ambas columnas, y no es un detalle de implementación que un kernel más listo pueda limar: es la consecuencia de dedicar una pila entera y un asiento en el planificador a algo que, la mayor parte del tiempo, solo espera. Esa distancia es la razón de ser de async.
+
+## Async: multiplexar tareas sobre hilos
+
+La idea central es romper la ecuación *una tarea, un hilo*. Una tarea async no es un hilo del sistema: es un **valor** —una máquina de estados que verás en la lección cuatro— que vive en el heap y ocupa solo lo que necesita recordar entre esperas, típicamente unos cientos de bytes. Un puñado de hilos trabajadores ejecuta un *executor* que hace lo siguiente en bucle: coge una tarea lista, la corre hasta que se toparía con una espera de E/S, y en ese punto —un `.await`— la tarea **cede** el hilo, que agarra otra tarea lista al instante. La espera en sí se delega a un mecanismo del sistema —`epoll`, `kqueue`, `io_uring`— capaz de vigilar miles de descriptores a la vez con un solo hilo.
+
+```rust
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let escucha = TcpListener::bind("127.0.0.1:8080").await?;
+    loop {
+        let (conexion, _) = escucha.accept().await?;
+        tokio::spawn(async move { atender(conexion).await }); // una TAREA, no un hilo
+    }
+}
+```
+
+Estructuralmente es casi idéntico —un bucle que acepta y despacha—, pero `tokio::spawn` no crea un hilo: crea una tarea. Diez mil conexiones son diez mil tareas repartidas sobre, quizá, ocho hilos trabajadores. Cuando `atender` llega a un `.await` sobre una lectura que aún no tiene datos, la tarea suelta el hilo y este atiende a otra. Nadie se queda parado esperando.
+
+<Callout type="info" title="Un solo hilo vigila miles de esperas">
+El truco que abarata la espera vive en el sistema operativo: interfaces como `epoll` en Linux, `kqueue` en BSD y macOS, o `io_uring`, permiten a **un** hilo preguntar de golpe "¿cuál de estos diez mil descriptores tiene ya datos?" y dormirse hasta que alguno los tenga. El reactor del runtime se apoya en esa capacidad: no hay un hilo esperando por conexión, hay un hilo esperando por *todas*. Async es, en el fondo, la ergonomía de escribir código lineal encima de ese mecanismo de *readiness*, que sin async obligaría a un bucle de eventos manual, disperso y propenso a errores.
+</Callout>
+
+<Cards>
+  <Card icon="🧵" title="Hilo del sistema">
+    Pila de megabytes, estado en el kernel, planificación *preventiva*. El cambio de contexto cruza al núcleo. Se cuentan por miles antes de doler.
+  </Card>
+  <Card icon="🪶" title="Tarea async">
+    Una máquina de estados de cientos de bytes en el heap, planificada por el runtime en espacio de usuario de forma *cooperativa*. Se cuentan por millones.
+  </Card>
+  <Card icon="🌊" title="Ligado a E/S: async brilla">
+    El tiempo se va esperando. Async solapa miles de esperas sobre pocos hilos, convirtiendo memoria y cambios de contexto en casi nada.
+  </Card>
+  <Card icon="🔥" title="Ligado a CPU: async no ayuda">
+    No hay espera que solapar. Para exprimir núcleos usa hilos o `rayon`; un cálculo largo dentro de async *congela* al executor.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart LR
+  M[Muchas tareas ligadas a la espera] --> Q1[Modelo un hilo por tarea]
+  M --> Q2[Modelo async]
+  Q1 --> R1[Un hilo con pila propia por tarea]
+  R1 --> C1[Coste alto memoria y cambio de contexto]
+  Q2 --> R2[Muchas tareas sobre pocos hilos]
+  R2 --> C2[Coste bajo escala a millones]
+  style Q1 fill:#89b4fa,color:#11111b
+  style Q2 fill:#cba6f7,color:#11111b
+  style C1 fill:#f38ba8,color:#11111b
+  style C2 fill:#a6e3a1,color:#11111b`} />
+
+## Cuándo async, y cuándo no
+
+Conviene separar dos palabras que solemos confundir. **Concurrencia** es *estructurar* un programa para lidiar con muchas cosas a la vez; **paralelismo** es *ejecutarlas* de verdad al mismo tiempo en varios núcleos. Async es ante todo una herramienta de concurrencia —organiza miles de tareas— que un runtime multihilo puede además paralelizar. Pero la concurrencia solo compra algo cuando hay algo que solapar, y lo que async solapa es *espera*.
+
+Dicho en una frase: el paralelismo es cuántos núcleos usas; la concurrencia es cuántas cosas gestionas a la vez. Async brilla en la segunda, y la primera te la aporta el runtime cuando de verdad hace falta, sin que cambies tu forma de escribir el código.
+
+De ahí la regla que decide la herramienta: **async para esperar, hilos para computar**. Si tu carga pasa el tiempo esperando red o disco, async te deja atender un mar de conexiones con recursos mínimos. Si tu carga pasa el tiempo calculando, async no te regala nada —no hay huecos de espera— y encima un cálculo largo dentro de una tarea bloquea al hilo trabajador y hambrea a todas las demás tareas que comparten ese hilo.
+
+Cuando lo inevitable ocurre —necesitas algo pesado de CPU en medio de un servicio async—, la salida no es sufrirlo, sino *delegarlo*:
+
+```rust
+// CPU pesado dentro de async: MAL, congela el hilo trabajador y sus tareas vecinas.
+let hash = calcular_hash_lento(&datos);
+
+// Remedio: delega el trabajo bloqueante a un pool aparte y sigue cediendo.
+let hash = tokio::task::spawn_blocking(move || calcular_hash_lento(datos)).await?;
+```
+
+`spawn_blocking` mueve el cómputo a un pool de hilos reservado para lo bloqueante, de modo que los hilos del executor siguen atendiendo esperas sin atascarse. Es la costura entre los dos mundos: async orquesta la espera, un hilo aparte carga con el cálculo.
+
+<Callout type="warn" title="Nunca bloquees el hilo del executor">
+Un `.await` cede; una llamada *bloqueante* o un bucle de CPU largo, no. Si dentro de una tarea async invocas `std::thread::sleep`, lees un fichero con la API síncrona o comprimes un gigabyte, el hilo trabajador queda congelado y ninguna otra tarea que dependa de él avanza. Para trabajo pesado o bloqueante, delégalo con `tokio::task::spawn_blocking` o un pool aparte. La cooperación del modelo async es un pacto: cada tarea debe *ceder* con frecuencia.
+</Callout>
+
+<Callout type="dios" title="Async desacopla la unidad de concurrencia de la unidad de paralelismo">
+Durante décadas el hilo del sistema fue a la vez la unidad de concurrencia —una cosa que ocurre a la vez que otras— y la unidad de paralelismo —una cosa que corre en un núcleo—. Atarlas parecía natural, pero es carísimo cuando la mayoría de esas cosas no *corren*, sino que *esperan*: pagas una pila de megabytes y un asiento en el planificador del kernel para que un hilo se quede quieto ante un socket mudo. La revelación de async es que la concurrencia de E/S no necesita hilos, necesita *un sitio donde guardar el punto en que cada tarea se quedó esperando*, y ese sitio puede ser un objeto diminuto en el heap en vez de una pila entera. Al reificar la espera como un valor —la máquina de estados de la lección cuatro— async separa lo que estaba fundido: la tarea pasa a ser barata y abundante, mientras el hilo, caro y escaso, se reserva para lo que de verdad quema CPU. La planificación se muda del kernel, que reparte turnos por la fuerza y sin saber nada de tu programa, al runtime en espacio de usuario, que sabe exactamente cuándo una tarea puede avanzar porque un descriptor se volvió legible. Por eso async no *acelera* ninguna operación individual: una lectura de red tarda lo mismo. Lo que hace es dejar que diez mil esperas convivan sobre ocho hilos, transformando un problema de memoria y cambios de contexto en un problema de bookkeeping ligero. Y por eso, simétricamente, no ofrece nada al cómputo puro: donde no hay espera que solapar, no hay nada que multiplexar, y volver a los hilos —o a `rayon`— es lo correcto. La primera pregunta ante cualquier carga no es "¿lo hago async?", sino "¿este trabajo espera o calcula?". La respuesta elige el modelo, y elegir mal —async para calcular, o un hilo por cada conexión ociosa— no es un matiz de estilo: es escalar contra la naturaleza del problema.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+El trabajo ligado a E/S pasa casi todo el tiempo esperando; un hilo por tarea desperdicia megabytes de pila y turnos del kernel en esperas ociosas. Async rompe la ecuación una-tarea-un-hilo: una tarea es un valor barato —cientos de bytes— multiplexado sobre pocos hilos que ceden en cada `.await`. Escala a millones para E/S porque *solapa* esperas apoyándose en el `readiness` del sistema; no aporta nada al cómputo puro, donde no hay espera que solapar y bloquear al hilo del executor es un pecado. La regla que decide todo: async para esperar, hilos para calcular.
+</Callout>
+
+<Reto title="Mide la diferencia entre esperar y calcular">
+1. Escribe un servidor TCP con un hilo por conexión y otro con `tokio::spawn`; abre mil conexiones ociosas contra cada uno y compara la memoria residente del proceso.
+2. Clasifica en *ligado a E/S* o *ligado a CPU*: servir una API REST, redimensionar diez mil imágenes, un proxy inverso, entrenar un modelo. Justifica cada uno.
+3. Explica con tus palabras por qué diez mil tareas async caben en ocho hilos pero diez mil hilos del sistema no caben cómodamente en ninguna máquina.
+4. Mete un bucle de CPU de dos segundos dentro de una tarea async sobre un runtime `current_thread` y observa cómo las demás tareas dejan de avanzar; luego muévelo a `spawn_blocking` y comprueba que se cura.
+5. Argumenta por qué "hacer los hilos más rápidos" nunca habría resuelto el problema C10k, y qué recurso concreto es el que async ahorra.
+</Reto>

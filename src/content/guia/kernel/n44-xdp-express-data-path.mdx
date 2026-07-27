@@ -1,0 +1,148 @@
+---
+title: "XDP: un programa eBPF antes de que exista el paquete"
+description: "XDP ejecuta un programa eBPF en el driver, sobre el marco crudo recién dejado por DMA, antes de que se construya el sk_buff; el contexto xdp_buff en el kernel y xdp_md que ve el programa, las cuatro acciones XDP_DROP, XDP_PASS, XDP_TX y XDP_REDIRECT, la comprobación de límites que exige el verificador, y los modos nativo, offloaded y genérico."
+subject: kernel
+level: 44
+order: 4
+icon: "44.4"
+duracion: "18 min"
+---
+
+<Lead>
+Todo el coste de la red —reservar un `sk_buff`, despachar por protocolo, buscar el socket, encolar, despertar— se gasta en convertir unos bytes en un ciudadano de primera clase de la pila. XDP hace la pregunta que anula todo ese gasto: ¿merece este paquete llegar siquiera a ser un `sk_buff`? Ejecuta un programa eBPF en el driver, sobre el marco crudo que el DMA acaba de depositar en una página, en el gancho más temprano que existe: antes de que nazca la estructura que lo representaría. Un paquete descartado en XDP se tira mientras todavía es memoria anónima, no un objeto con metadatos, hogar y despertar.
+</Lead>
+
+<Objetivos>
+
+- Entender qué es XDP y por qué corre antes del `sk_buff`, sobre el marco crudo.
+- Conocer el contexto `xdp_buff` del kernel y el `xdp_md` que ve el programa eBPF.
+- Dominar las cuatro acciones `XDP_DROP`, `XDP_PASS`, `XDP_TX` y `XDP_REDIRECT`.
+- Distinguir los modos nativo, offloaded y genérico, y la obligación de acotar accesos.
+
+</Objetivos>
+
+## Antes del skb: el gancho más temprano
+
+En la ruta clásica, el `poll` del driver (nivel 44.1) construye un `sk_buff` por cada marco antes de entregarlo. XDP se inserta justo antes de ese paso: el driver corre tu programa sobre el marco todavía crudo, y solo si el veredicto es "que pase" se paga la construcción del `sk_buff`. El programa es código eBPF verificado y compilado por el JIT a código nativo, sin cambio de contexto ni copia. Ejecutarlo antes del `sk_buff` es lo que le da su velocidad: descartar en XDP es lo más barato que la máquina puede hacer con un paquete.
+
+## El contexto: xdp_buff y xdp_md
+
+En el kernel, el marco se describe con un `struct xdp_buff` que apunta directamente a la página del DMA: `data` y `data_end` acotan el paquete, `data_meta` deja un hueco para metadatos, `data_hard_start` marca el principio real del buffer. El programa eBPF, en cambio, ve una vista reducida y estable, `struct xdp_md`, con los mismos límites como enteros de 32 bits.
+
+```c
+/* lo que ve el programa eBPF: contexto reducido y estable */
+struct xdp_md {
+	__u32 data;             /* inicio del paquete */
+	__u32 data_end;         /* fin del paquete */
+	__u32 data_meta;        /* metadatos por delante del paquete */
+	__u32 ingress_ifindex;  /* interfaz de entrada */
+	__u32 rx_queue_index;   /* cola de RX que lo entrego */
+};
+```
+
+## Un programa XDP y sus acciones
+
+El programa recibe el contexto, inspecciona el paquete y devuelve una acción. La regla inviolable: **antes de tocar cualquier byte hay que comprobar que está dentro de los límites**, o el verificador rechaza el programa al cargarlo. Ese contrato es lo que hace seguro ejecutar código no confiable en la ruta más caliente del sistema.
+
+```c
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+
+SEC("xdp")
+int xdp_filtro(struct xdp_md *ctx)
+{
+	void *data     = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+
+	if ((void *)(eth + 1) > data_end)     /* comprobacion de limites obligatoria */
+		return XDP_DROP;
+
+	if (eth->h_proto != bpf_htons(ETH_P_IP))
+		return XDP_PASS;                  /* no es IPv4: que siga la pila */
+
+	struct iphdr *ip = (void *)(eth + 1);
+	if ((void *)(ip + 1) > data_end)      /* acotar de nuevo antes de leer ip */
+		return XDP_DROP;
+
+	if (ip->protocol == IPPROTO_ICMP)
+		return XDP_DROP;                  /* tira todo el ICMP, a velocidad de linea */
+
+	return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+```
+
+Cada valor de retorno es una decisión sobre el destino del marco:
+
+<Cards>
+  <Card icon="🗑️" title="XDP_DROP">
+    Recicla la página de inmediato. El descarte más barato de toda la pila: jamás se reservó un `sk_buff`. Es la primitiva anti-DDoS, millones de paquetes por segundo por núcleo.
+  </Card>
+  <Card icon="⬆️" title="XDP_PASS">
+    Deja seguir. El driver construye el `sk_buff` y lo entrega a la pila normal. Es el único camino que paga el coste de un `sk_buff`.
+  </Card>
+  <Card icon="↩️" title="XDP_TX">
+    Reenvía el marco por la **misma** interfaz. Reflexión pura: responder ARP o ICMP, rebotar tráfico, sin subir a la pila.
+  </Card>
+  <Card icon="🔀" title="XDP_REDIRECT">
+    Lo desvía a otro sitio vía un mapa: otra NIC, otra CPU o un socket `AF_XDP` en usuario. La base de routers software y de los caminos rápidos.
+  </Card>
+</Cards>
+
+## Modos de XDP y el despacho en el driver
+
+En el modo **nativo**, el driver implementa `ndo_bpf` y corre el programa dentro de su `poll`, antes del `sk_buff`. El despacho de la acción es un simple `switch`:
+
+```c
+/* dentro del poll del driver, sobre el marco recien llegado por DMA */
+struct xdp_buff xdp;
+xdp_init_buff(&xdp, frame_sz, &rxq->xdp_rxq);
+xdp_prepare_buff(&xdp, page_addr, headroom, len, true);
+
+act = bpf_prog_run_xdp(xdp_prog, &xdp);   /* corre el programa JITeado */
+switch (act) {
+case XDP_PASS:
+	skb = mi_construir_skb(priv, &xdp);   /* SOLO aqui nace el sk_buff */
+	napi_gro_receive(napi, skb);
+	break;
+case XDP_TX:
+	mi_xdp_xmit_de_vuelta(priv, &xdp);    /* rebota por la misma NIC */
+	break;
+case XDP_REDIRECT:
+	xdp_do_redirect(dev, &xdp, xdp_prog); /* a otra NIC, CPU o socket */
+	break;
+case XDP_DROP:
+default:
+	xdp_return_buff(&xdp);                /* recicla la pagina; jamas hubo skb */
+}
+```
+
+Hay dos modos más. El **offloaded** ejecuta el programa en la propia SmartNIC, con cero CPU del anfitrión. El **genérico** (`xdpgeneric`) lo corre en la pila, **después** de que el `sk_buff` ya se construyó: es un respaldo lento para drivers sin soporte nativo, útil para desarrollar pero incapaz de dar velocidad de línea, precisamente porque pierde la ventaja de correr antes del `sk_buff`.
+
+<Mermaid code={`flowchart TD
+  F[Marco crudo dejado por DMA] --> P[bpf_prog_run_xdp corre el programa]
+  P -->|XDP_DROP| R[xdp_return_buff recicla la pagina sin skb]
+  P -->|XDP_PASS| S[construir sk_buff y a la pila]
+  P -->|XDP_TX| T[rebotar por la misma NIC]
+  P -->|XDP_REDIRECT| RD[mapa hacia otra NIC CPU o socket]`} />
+
+<Callout type="danger" title="Sin comprobar límites no hay programa">
+El verificador rechaza cualquier acceso al paquete que no vaya precedido de una comparación `puntero + N <= data_end`. No es un consejo de estilo: es la condición que garantiza que un programa cargado por un operador no pueda leer fuera de la página del DMA. Olvidarla no produce un fallo en ejecución sino un rechazo en la carga, con un volcado del verificador que señala la instrucción culpable.
+</Callout>
+
+<Callout type="dios" title="El trabajo más barato es el que rechazas antes de crear el objeto que lo representa">
+Da un paso atrás y reconoce que XDP no es una optimización de red sino un principio general disfrazado de una. Un paquete descartado por `iptables` es caro porque se descarta tarde: para cuando la regla decide tirarlo, ya se reservó su `sk_buff`, ya se rellenaron sus metadatos, ya se le buscó una ruta y quizá un socket, ya se le dio un hogar en una cola. Se ha invertido en él todo el trabajo de convertirlo en ciudadano antes de deportarlo. XDP mueve la decisión a **antes** de que el objeto exista: tira el paquete mientras aún son bytes anónimos en una página de DMA, sin nombre, sin estructura, sin despertar. La lección trasciende la red y reordena cómo piensas todo sistema de alto rendimiento: el trabajo más barato no es el que optimizas, es el que te niegas a hacer antes de reservar el objeto que lo representaría. Y cosida a esa lección viene una segunda, igual de honda: durante treinta años, "ejecuta mi código en la ruta caliente del driver" significaba un módulo de kernel capaz de corromper cualquier cosa, y por eso el plano de datos programable vivía fuera del kernel, en bypass tipo DPDK, renunciando a la seguridad a cambio de velocidad. El verificador de eBPF disuelve ese dilema: convierte "mi código en el driver" en una función demostrablemente segura que el JIT vuelve nativa, sin módulo, sin copia, sin cambio de contexto. El plano de datos se hizo programable sin dejar de ser seguro. XDP es el punto exacto donde esas dos ideas se encuentran —rechazar temprano y ejecutar seguro— y por eso es la base de todo lo que viene en la última lección del nivel.
+</Callout>
+
+<Reto title="Carga tu primer programa XDP">
+1. Escribe el programa que tira ICMP, compílalo con `clang -target bpf` y cárgalo con `ip link set dev X xdpgeneric obj filtro.o sec xdp`; haz `ping` a través y confirma que se detiene.
+2. Quita una comprobación de límites e intenta cargarlo; lee el rechazo del verificador y explica qué invariante rompiste.
+3. Traza la vida de un paquete y señala dónde libera memoria un `XDP_DROP` frente a dónde lo hace un `DROP` de `iptables`; cuenta qué reservó el segundo antes de tirarlo.
+4. Argumenta por qué `XDP_REDIRECT` necesita un mapa y `XDP_TX` no.
+5. Razona cuándo es aceptable el modo genérico y por qué solo el nativo entrega descarte a velocidad de línea.
+</Reto>

@@ -1,0 +1,154 @@
+---
+title: "Qué hace el planificador: tareas, estados y runqueues"
+description: "El planificador decide qué tarea corre en cada CPU y por cuánto tiempo. Los campos de struct task_struct que gobiernan esa decisión, la máquina de estados de una tarea con TASK_RUNNING, TASK_INTERRUPTIBLE y TASK_UNINTERRUPTIBLE, la runqueue por CPU struct rq a la que se llega con cpu_rq y this_rq, y el idioma set_current_state para dormir sin perder despertares."
+subject: kernel
+level: 46
+order: 1
+icon: "46.1"
+duracion: "16 min"
+---
+
+<Lead>
+En cada instante, un núcleo ejecuta exactamente una tarea; todas las demás esperan. El planificador es el árbitro que responde, cientos de veces por segundo y por cada CPU, a dos preguntas inseparables: cuál de las tareas listas debe correr ahora, y durante cuánto tiempo antes de volver a preguntar. De esa decisión repetida emerge la ilusión de que miles de procesos avanzan a la vez sobre un puñado de núcleos. Antes del algoritmo hay que dominar las tres piezas sobre las que opera: la tarea, su estado y la cola donde compite.
+</Lead>
+
+<Objetivos>
+
+- Leer los campos de `struct task_struct` que le importan al planificador.
+- Distinguir los estados de una tarea y leerlos y escribirlos con seguridad.
+- Entender la runqueue por CPU `struct rq` y llegar a ella con `cpu_rq` y `this_rq`.
+- Dormir sin perder despertares con el idioma `set_current_state`.
+
+</Objetivos>
+
+## La tarea: struct task_struct
+
+Para el kernel no existen los procesos ni los hilos como entidades separadas: existe la **tarea**, y cada una es un `struct task_struct` (el descriptor de proceso) declarado en `include/linux/sched.h`. Es una de las estructuras más grandes del núcleo, con cientos de campos; el planificador solo mira un puñado:
+
+```c
+struct task_struct {
+	/* En los kernels actuales el estado vive aqui; se lee con READ_ONCE */
+	unsigned int			__state;
+	void				*stack;       /* pila de kernel de la tarea */
+
+	int				on_cpu;       /* corriendo en una CPU ahora mismo? */
+	int				on_rq;        /* encolada en alguna runqueue? */
+
+	int				prio;         /* prioridad efectiva (dinamica) */
+	int				static_prio;  /* derivada de nice */
+	int				normal_prio;
+	unsigned int			rt_priority;  /* prioridad de tiempo real 1..99 */
+
+	const struct sched_class	*sched_class; /* que clase la planifica */
+	struct sched_entity		se;           /* estado para fair/EEVDF */
+	struct sched_rt_entity		rt;           /* estado para FIFO/RR */
+	struct sched_dl_entity		dl;           /* estado para DEADLINE */
+	unsigned int			policy;       /* SCHED_NORMAL, SCHED_FIFO... */
+
+	int				nr_cpus_allowed;
+	const cpumask_t			*cpus_ptr;
+	cpumask_t			cpus_mask;    /* afinidad: donde puede correr */
+
+	struct mm_struct		*mm;          /* espacio de direcciones */
+	struct mm_struct		*active_mm;
+	pid_t				pid;
+	pid_t				tgid;         /* id del grupo de hilos */
+	/* ...cientos de campos mas: credenciales, ficheros, senales... */
+};
+```
+
+Cada `sched_entity`, `sched_rt_entity` y `sched_dl_entity` empotrada guarda el estado que su clase respectiva necesita para ordenar la tarea. El puntero `sched_class` es el que decide cuál de esas tres máquinas la gobierna. El descriptor de la tarea actual siempre está a mano mediante la macro `current`, que en x86-64 lo recupera de una variable per-CPU en tiempo constante.
+
+## Los estados de una tarea
+
+El campo `__state` es una máquina de estados. Sus valores son máscaras de bits, y solo unos pocos importan a diario:
+
+```c
+/* include/linux/sched.h: valores de ->__state */
+#define TASK_RUNNING            0x00000000  /* lista: corriendo o esperando turno */
+#define TASK_INTERRUPTIBLE      0x00000001  /* durmiendo; despierta con evento o senal */
+#define TASK_UNINTERRUPTIBLE    0x00000002  /* durmiendo; ignora senales (estado D) */
+#define __TASK_STOPPED          0x00000004  /* detenida por SIGSTOP */
+#define __TASK_TRACED           0x00000008  /* detenida bajo ptrace */
+#define TASK_DEAD               0x00000080  /* saliendo, aun no cosechada */
+#define TASK_NOLOAD             0x00000400  /* no cuenta para la carga media */
+#define TASK_IDLE               (TASK_UNINTERRUPTIBLE | TASK_NOLOAD)
+```
+
+La distinción fundamental es sutil: `TASK_RUNNING` no significa "corriendo", sino **ejecutable**. Una tarea `TASK_RUNNING` está en una runqueue esperando su turno, o bien es la que ocupa la CPU en este instante; el campo `on_cpu` desambigua. Solo las tareas `TASK_RUNNING` compiten; una que duerme (`TASK_INTERRUPTIBLE` o `TASK_UNINTERRUPTIBLE`) ha sido **sacada** de la runqueue y no consume nada hasta que alguien la despierte.
+
+`TASK_INTERRUPTIBLE` es el sueño normal: espera un evento y también puede romperse con una señal. `TASK_UNINTERRUPTIBLE` es el sueño obstinado —el estado `D` que ves en `ps`— reservado para esperas que no deben interrumpirse a media faena, como una E/S de disco en curso. Su primo `TASK_IDLE` es un `TASK_UNINTERRUPTIBLE` que no infla el `loadavg`, pensado para hilos de kernel que duermen la mayor parte del tiempo.
+
+<Callout type="warn" title="Nunca leas ni escribas __state a pelo">
+El estado se lee con `READ_ONCE(p->__state)` o con ayudantes como `task_is_running(p)`, y se escribe con `set_current_state` o `WRITE_ONCE`. Una lectura o escritura ordinaria permite al compilador partir, reordenar o recargar el acceso, y en un campo que un despertador concurrente puede tocar en cualquier momento eso es una carrera de datos con final impredecible.
+</Callout>
+
+## La runqueue: una cola por CPU
+
+No hay una cola global de tareas listas. Hay **una runqueue por CPU**, `struct rq` (definida en `kernel/sched/sched.h`), y planificar es, en el caso común, una decisión puramente local protegida por un lock de esa CPU:
+
+```c
+struct rq {
+	raw_spinlock_t		__lock;    /* protege esta runqueue */
+	unsigned int		nr_running; /* cuantas tareas listas hay aqui */
+
+	struct cfs_rq		cfs;       /* subcola de la clase fair (EEVDF) */
+	struct rt_rq		rt;        /* subcola de tiempo real */
+	struct dl_rq		dl;        /* subcola de deadline */
+
+	struct task_struct __rcu *curr;    /* la tarea que corre ahora */
+	struct task_struct	*idle;     /* la tarea idle de este nucleo */
+	struct task_struct	*stop;     /* el hilo stop/migracion */
+	u64			clock;     /* reloj de la runqueue */
+	/* ... */
+};
+
+DECLARE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+#define cpu_rq(cpu)   (&per_cpu(runqueues, (cpu)))
+#define this_rq()     this_cpu_ptr(&runqueues)
+#define task_rq(p)    cpu_rq(task_cpu(p))
+```
+
+Que la runqueue sea per-CPU es la raíz de la escalabilidad del planificador: elegir a quién correr en la CPU 3 no toca ninguna estructura compartida con la CPU 47, así que no hay contención en el camino caliente. Solo cuando el balanceador de carga migra tareas entre núcleos hace falta tomar dos `rq->lock` a la vez, y para eso existe un orden estricto de adquisición que evita el interbloqueo. Cada `rq` contiene una subcola por clase (`cfs`, `rt`, `dl`), porque cada clase ordena a sus tareas con su propia estructura de datos.
+
+## Dormir sin perder despertares
+
+La operación más delicada que hace una tarea es dormirse esperando una condición. Hacerlo mal produce el *lost wakeup*: comprobar la condición, encontrarla falsa, y quedarse dormido para siempre justo cuando otro hilo la volvía verdadera. El idioma canónico lo evita con una barrera:
+
+```c
+/* Esperar a que 'condicion_lista' se cumpla, sin perder el despertar */
+for (;;) {
+	set_current_state(TASK_INTERRUPTIBLE);  /* store + barrera de memoria */
+	if (condicion_lista)
+		break;
+	if (signal_pending(current)) {
+		ret = -ERESTARTSYS;
+		break;
+	}
+	schedule();                              /* cede la CPU: aqui se duerme */
+}
+__set_current_state(TASK_RUNNING);           /* despiertos y ejecutables */
+```
+
+La clave está en el orden. `set_current_state` no es una asignación cualquiera: usa `smp_store_mb`, que publica el estado `TASK_INTERRUPTIBLE` **antes** de que la CPU lea `condicion_lista`. El despertador, en el otro extremo, hace lo simétrico: escribe la condición y luego, en `wake_up`, lee `__state` para decidir si reencolar la tarea. Con las dos barreras cruzadas, si la condición se cumple justo en el hueco, o bien nuestra comprobación la ve y no dormimos, o bien el despertador ve `TASK_INTERRUPTIBLE` y nos reencola. Nunca ambos fallan a la vez. Envolver esto es justo lo que hacen `wait_event_interruptible` y las colas de espera.
+
+<Mermaid code={`stateDiagram-v2
+  [*] --> RUNNING: fork crea la tarea
+  RUNNING --> INTERRUPTIBLE: espera un evento
+  RUNNING --> UNINTERRUPTIBLE: espera E/S critica
+  INTERRUPTIBLE --> RUNNING: wake_up o senal
+  UNINTERRUPTIBLE --> RUNNING: wake_up
+  RUNNING --> DEAD: do_exit
+  DEAD --> [*]: la cosecha el padre`} />
+
+<Callout type="dios" title="El planificador fabrica el tiempo compartido">
+Detente en lo que el planificador realmente produce, porque es una de las ilusiones fundacionales de la computación moderna. Un núcleo físico es rigurosamente secuencial: ejecuta una instrucción tras otra, de una sola tarea, sin excepción. Y sin embargo tu máquina sostiene miles de procesos que, para todos los efectos observables, avanzan simultáneamente. Esa simultaneidad no existe en el hardware; es un artefacto que el planificador teje troceando el tiempo en rodajas de milisegundos y rotando quién ocupa la CPU tan deprisa que ningún humano, y casi ningún programa, percibe la costura. Todo lo que estudiarás en este nivel —tiempo virtual, plazos, clases, preempción— es maquinaria al servicio de esa única mentira útil: convertir un recurso indivisible y secuencial en la apariencia de muchos recursos concurrentes, repartidos con una justicia que puedes definir y medir. Cuando internalizas que `task_struct`, `__state` y `struct rq` no describen procesos sino los engranajes de esa ilusión, dejas de ver el planificador como un detalle del sistema operativo y empiezas a verlo como lo que es: el órgano que fabrica el tiempo que los programas creen habitar. Cada decisión que toma es una respuesta a la pregunta más escasa de todas —quién merece existir en el presente— y esa pregunta, repetida millones de veces por segundo, es la que da forma a la experiencia de usar un ordenador.
+</Callout>
+
+<Reto title="Inspecciona las tres piezas en tu propia máquina">
+1. Lee `/proc/PID/status` de un proceso y localiza su `State`, su `voluntary_ctxt_switches` y su `Cpus_allowed`. Relaciónalos con `__state`, la cesión de CPU y `cpus_mask`.
+2. Escribe un módulo que recorra las tareas con `for_each_process` e imprima `pid`, `comm` y `p->__state`, y explica por qué la mayoría no están en `TASK_RUNNING`.
+3. Provoca un proceso en estado `D` (por ejemplo con una E/S lenta) y arguméntalo desde `TASK_UNINTERRUPTIBLE`.
+4. Reescribe un sueño usando el bucle con `set_current_state` y demuestra, paso a paso, dónde se cerraría un *lost wakeup* si invirtieras el orden respecto a `schedule`.
+5. Con `cat /proc/schedstat` observa `nr_running` por CPU y razona por qué la runqueue es per-CPU y no global.
+</Reto>

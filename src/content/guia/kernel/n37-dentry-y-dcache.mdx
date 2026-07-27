@@ -1,0 +1,130 @@
+---
+title: "struct dentry: la caché que hace veloz al path lookup"
+description: "La `dentry` asocia un nombre con un inodo dentro de un directorio padre, y la dcache retiene esas asociaciones para que resolver una ruta no toque el disco. Por qué existe separada del inodo, qué son las dentries negativas y cómo la búsqueda RCU recorre una ruta sin tomar candados."
+subject: kernel
+level: 37
+order: 3
+icon: "37.3"
+duracion: "16 min"
+---
+
+<Lead>
+Resolver `/usr/lib/libc.so.6` obliga a mirar dentro de tres directorios en cascada, y cada mirada, si tocara el disco, costaría una eternidad en tiempos de CPU. La `dentry` es la respuesta del núcleo a ese problema: un objeto ligero que recuerda "dentro de este directorio, el nombre X corresponde a este inodo". Millones de ellas forman la dcache, la estructura más caliente del VFS, la que convierte el recorrido de una ruta en un paseo por tablas hash en RAM. Y aquí se resuelve por fin el misterio del nivel anterior: si el inodo no tiene nombre, es porque el nombre vive aquí.
+</Lead>
+
+<Objetivos>
+
+- Entender la `dentry` como el vínculo entre un nombre y un inodo dentro de un padre.
+- Comprender por qué la dcache existe separada del icache y qué acelera exactamente.
+- Reconocer las dentries negativas y su papel al cachear ausencias.
+- Distinguir el path walk en modo RCU del modo con referencias y por qué el primero no toma candados.
+
+</Objetivos>
+
+## Un nombre dentro de un directorio
+
+La `dentry` es deliberadamente pequeña porque hay muchísimas. Sus campos calientes están agrupados para que quepan en pocas líneas de caché de CPU:
+
+```c
+/* include/linux/dcache.h (recortado) */
+struct dentry {
+	unsigned int             d_flags;      /* DCACHE_* protegido por d_lock */
+	seqcount_spinlock_t      d_seq;        /* seqlock para el rcu-walk */
+	struct hlist_bl_node     d_hash;       /* enlace en la tabla hash global */
+	struct dentry           *d_parent;     /* el directorio que la contiene */
+	struct qstr              d_name;        /* el nombre: cadena mas su hash */
+	struct inode            *d_inode;       /* el inodo, o NULL si es negativa */
+	unsigned char            d_iname[40];   /* nombres cortos, sin malloc aparte */
+	const struct dentry_operations *d_op;   /* vtable, a menudo NULL */
+	struct super_block      *d_sb;          /* montaje al que pertenece */
+	struct lockref           d_lockref;     /* candado y refcount en un u64 */
+	struct hlist_head        d_children;    /* sus hijas */
+	struct hlist_node        d_sib;         /* hermana en la lista del padre */
+};
+```
+
+Tres campos cuentan la historia. `d_parent` y `d_name` responden "quién soy y dónde": este nombre, dentro de este directorio. `d_inode` responde "a qué apunto". Y `d_lockref` es una joya de ingeniería: fusiona un spinlock y un contador de referencias de 32 bits en una sola palabra de 64 que se manipula con operaciones atómicas, evitando tomar el candado en el caso común. La dcache global es una tabla hash indexada por la pareja `d_parent` más el hash de `d_name`; buscar un componente de ruta es calcular ese hash y recorrer una cadena corta.
+
+## Por qué separada del inodo
+
+Podría parecer redundante tener dentries e inodos como objetos distintos. No lo es, y la razón conecta directamente con el nivel 37.2: **un inodo puede tener muchos nombres**. Si el nombre viviera dentro del inodo, los enlaces duros serían imposibles. Al vivir en dentries independientes, un mismo inodo cuelga de varias, todas enlazadas en su lista de alias:
+
+<Mermaid code={`flowchart TD
+  R[dentry raiz /] --> U[dentry usr]
+  U --> L[dentry lib]
+  R2[dentry etc] --> P[dentry passwd]
+  L -->|d_inode| I1[inode 8842]
+  P -->|d_inode| I2[inode 133]
+  A[dentry enlace-duro] -->|d_inode| I2`} />
+
+La separación tiene un segundo motivo, más profundo: la dcache es **prescindible**. Es una caché pura; si el núcleo necesita RAM, el reclaim (nivel 25) puede tirar dentries no usadas y reconstruirlas después preguntando de nuevo al sistema de archivos. Los inodos, con datos sucios pendientes, no siempre pueden descartarse tan a la ligera. Fundir ambos en una estructura ataría dos ciclos de vida que conviene mantener sueltos: los nombres, volátiles y reconstruibles; el archivo, persistente.
+
+Ese descarte se gobierna por el conteo de referencias empotrado en `d_lockref`. `dget` incrementa la cuenta y `dput` la decrementa; una dentry con cuenta cero no se destruye al instante, sino que pasa a la lista LRU de su superbloque, donde espera como candidata a reciclaje. Un *shrinker* registrado —`super_block` expone `nr_cached_objects` y `free_cached_objects` en sus operaciones— recorre esa LRU bajo presión de memoria y poda las dentries más frías. Así, el árbol de nombres se contrae y se expande según la RAM disponible, sin que el usuario lo note salvo por un `lookup` ocasionalmente más lento.
+
+## Dentries negativas: cachear lo que no existe
+
+Aquí está la sutileza que revela la potencia del diseño. Una dentry con `d_inode` a `NULL` es **negativa**: recuerda que un nombre concreto *no existe* dentro de un directorio. Parece un desperdicio guardar ausencias, pero es una optimización crucial:
+
+```c
+/* comprobar si una dentry es negativa */
+static inline bool d_is_negative(const struct dentry *dentry)
+{
+	return d_inode(dentry) == NULL;
+}
+```
+
+Piensa en un compilador buscando una cabecera por diez directorios de `-I`: cada intento fallido, sin dentries negativas, volvería a preguntar al sistema de archivos "¿existe `stdio.h` aquí?" una y otra vez. Con la caché negativa, el primer "no" queda grabado y los siguientes se responden desde RAM. Los arranques del sistema y las compilaciones grandes generan tormentas de fallos de ruta, y la dcache negativa las absorbe casi por completo.
+
+## El path walk: RCU frente a referencias
+
+Recorrer una ruta es descomponerla en componentes y resolver cada uno buscándolo en la dcache bajo su padre. El núcleo intenta primero el **rcu-walk**, un camino rápido que no toma ni un solo candado: lee las dentries bajo protección RCU (nivel 17) y valida cada paso con el seqlock `d_seq`, de modo que varias CPU pueden recorrer el mismo árbol de directorios en paralelo sin contención:
+
+```c
+/* fs/namei.c (esquema del camino rapido) */
+static struct dentry *lookup_fast(struct nameidata *nd)
+{
+	if (nd->flags & LOOKUP_RCU) {
+		unsigned seq;
+		/* busqueda sin candados, validada por seqlock */
+		struct dentry *dentry = __d_lookup_rcu(nd->path.dentry,
+						       &nd->last, &seq);
+		if (unlikely(!dentry))
+			return NULL;                 /* fallo: caeremos al ref-walk */
+		/* revalida con d_seq; si cambio, abortamos el rcu-walk */
+		return dentry;
+	}
+	return __d_lookup(nd->path.dentry, &nd->last);  /* camino con refcount */
+}
+```
+
+Si el rcu-walk tropieza —un componente no está en la dcache, un `d_seq` cambió bajo los pies, o hay que dormir— el núcleo hace `unlazy_walk` y reintenta en **ref-walk**: el camino lento que toma referencias reales con `d_lockref` y puede bloquear. Cuando ni siquiera ahí está el nombre, se acude al inodo del directorio y su `i_op->lookup`, que es el puente al disco del nivel 37.5. Algunos sistemas de archivos afinan la búsqueda con `dentry_operations`:
+
+```c
+/* include/linux/dcache.h (recortado) */
+struct dentry_operations {
+	int  (*d_revalidate)(struct dentry *, unsigned int);  /* clave en NFS */
+	int  (*d_hash)(const struct dentry *, struct qstr *);
+	int  (*d_compare)(const struct dentry *, unsigned int,
+			  const char *, const struct qstr *);
+	int  (*d_delete)(const struct dentry *);
+	void (*d_release)(struct dentry *);
+};
+```
+
+`d_revalidate` es indispensable para sistemas de archivos en red: una dentry cacheada localmente puede haber quedado obsoleta si otro cliente renombró el archivo, así que NFS la revalida antes de fiarse. `d_hash` y `d_compare` permiten sistemas de archivos insensibles a mayúsculas sin ensuciar el núcleo genérico.
+
+<Callout type="tip" title="Observa la dcache trabajando">
+El `slabtop` te muestra el objeto `dentry` como uno de los mayores consumidores de slab en una máquina activa, prueba de cuántas se retienen. Con `sysctl fs.dentry-state` ves el reparto entre dentries usadas y no usadas. Y `echo 2 > /proc/sys/vm/drop_caches` suelta dentries e inodos cacheados: cronometra un `find` grande antes y después para sentir la diferencia.
+</Callout>
+
+<Callout type="dios" title="La dcache es la geometria del sistema de archivos reconstruida en RAM">
+Da un paso atrás y mira lo que la dcache realmente es. El árbol de directorios que tú percibes —esa jerarquía de carpetas dentro de carpetas— no existe como tal en el inodo, que solo conoce números y bloques; existe reconstruido, componente a componente, en la telaraña de dentries enlazadas por `d_parent` y `d_children`. Cada vez que resuelves una ruta, no navegas el disco: navegas esta réplica en memoria de su forma, y el disco solo aparece cuando la réplica tiene un hueco. Esa inversión es lo que hace que el path lookup, la operación más frecuente de todo el sistema de archivos —cada `open`, cada `stat`, cada `exec` la ejecuta— cueste nanosegundos en lugar de milisegundos. Y la elección de hacerla una caché reconstruible, y no una estructura autoritativa, es lo que permite el rcu-walk: como ninguna dentry es la verdad última (la verdad está en el inodo y en el disco), el núcleo puede leerlas de forma optimista, sin candados, y limitarse a validar con un seqlock que nada cambió mientras miraba; si algo cambió, descarta el trabajo y reintenta por el camino seguro. Es el patrón lector-optimista del nivel 17 aplicado a la estructura más caliente del núcleo, y explica por qué Linux escala el acceso concurrente al sistema de archivos a cientos de núcleos sin que la resolución de rutas se convierta en un cuello de botella. La dcache no acelera el sistema de archivos: lo reinventa como una estructura de memoria que el disco solo respalda.
+</Callout>
+
+<Reto title="Mide y provoca la dcache">
+1. Con `sysctl fs.dentry-state`, anota el número de dentries antes y después de un `find /usr -type f > /dev/null`.
+2. Genera dentries negativas ejecutando `stat /noexiste1 /noexiste2 ...` en bucle y razona por qué el segundo `stat` del mismo nombre es más rápido.
+3. Explica, apoyándote en `i_nlink` del nivel 37.2, por qué el nombre no puede vivir dentro del inodo si queremos enlaces duros.
+4. Describe qué valida el seqlock `d_seq` durante un rcu-walk y qué ocurre si detecta un cambio a mitad de camino.
+5. Argumenta por qué NFS necesita implementar `d_revalidate` mientras que ext4 en un disco local puede prescindir de él.
+</Reto>

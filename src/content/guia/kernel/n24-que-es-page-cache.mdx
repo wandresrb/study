@@ -1,0 +1,135 @@
+---
+title: "El page cache: por qué la segunda lectura es gratis"
+description: "El kernel retiene en la RAM libre cada página de archivo que lee o escribe, y por eso releer un archivo no vuelve a tocar el disco. Qué es el page cache, cómo verlo en `/proc/meminfo`, y los `folios` como la evolución moderna de las páginas de cache."
+subject: kernel
+level: 24
+order: 1
+icon: "24.1"
+duracion: "14 min"
+---
+
+<Lead>
+Entre tu CPU, que trabaja en nanosegundos, y tu disco, que responde en microsegundos o milisegundos, hay un abismo de varios órdenes de magnitud. El page cache es cómo el kernel lo salva: cada página de archivo leída o escrita queda retenida en la RAM libre, de modo que la segunda vez que la pides no hay disco de por medio. No es un lujo opcional — es la razón de que tu sistema no vaya al ritmo del componente más lento que tiene.
+</Lead>
+
+<Objetivos>
+
+- Entender qué guarda el page cache y por qué la segunda lectura es instantánea.
+- Ver el cache vivo en `/proc/meminfo` y vaciarlo con `drop_caches`.
+- Conocer el `folio` como unidad moderna del page cache.
+- Distinguir `struct page` de `struct folio` y para qué sirven los folios grandes.
+
+</Objetivos>
+
+## La RAM libre es RAM desperdiciada
+
+Cuando un programa lee un archivo, el kernel no descarta esos datos al terminar la llamada: los deja en RAM, indexados por archivo y offset. Si alguien vuelve a pedir el mismo trozo, se sirve desde memoria en microsegundos en lugar de esperar al disco. Esa reserva de páginas de archivo residentes es el **page cache**, y ocupa toda la memoria que nadie más esté usando. De ahí el mantra del kernel: la RAM libre es RAM desperdiciada.
+
+<Mermaid code={`flowchart LR
+  A[Programa pide read del archivo] --> B{La pagina esta en el page cache}
+  B -->|si, hit| C[Copia desde RAM en microsegundos]
+  B -->|no, miss| D[Lee del disco a un folio]
+  D --> E[Guarda el folio en el cache]
+  E --> C`} />
+
+Puedes verlo en `/proc/meminfo`. El campo `Cached` es el grueso del page cache; `Buffers` son los metadatos de bloque del dispositivo:
+
+```bash
+$ grep -E 'MemFree|Buffers|Cached' /proc/meminfo
+MemFree:          231004 kB
+Buffers:          402180 kB
+Cached:          9814272 kB
+```
+
+Para demostrar el efecto, vacía el cache y cronometra la misma lectura dos veces. `drop_caches` es una interfaz de depuración que suelta las páginas limpias; `sync` primero baja a disco las sucias para que no se pierda nada:
+
+```bash
+# lectura fria: viene del disco
+$ sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ time cat pelicula.mkv > /dev/null      # real 4.1s
+
+# lectura caliente: ya esta todo en RAM
+$ time cat pelicula.mkv > /dev/null      # real 0.2s
+```
+
+Ese factor de veinte no es magia: es la diferencia entre tocar el disco y tocar la RAM. Los valores de `drop_caches` son `1` para el page cache, `2` para el cache de slab (dentries e inodos) y `3` para ambos. Nunca es necesario en producción; existe solo para medir.
+
+El cache acelera por tres propiedades del acceso real a datos, que explotan la localidad de tus programas sin que muevas un dedo:
+
+<Cards>
+  <Card icon="⏱️" title="Localidad temporal">
+    Lo leído hace un instante suele releerse pronto. El cache lo retiene y la relectura ni roza el disco.
+  </Card>
+  <Card icon="➡️" title="Localidad espacial">
+    Quien lee un bloque suele seguir con el vecino. El readahead (nivel 24.3) trae los siguientes por anticipado.
+  </Card>
+  <Card icon="👥" title="Compartición">
+    Un mismo archivo abierto por muchos procesos se cachea una sola vez: todos comparten los mismos folios.
+  </Card>
+</Cards>
+
+## Del struct page al folio
+
+Históricamente la unidad del page cache era el `struct page`: un descriptor por cada página física de `PAGE_SIZE` (4 KiB en x86-64). El problema es que un `struct page` podía ser una página suelta o la cabecera de una **página compuesta** de varias, y el código tenía que preguntar constantemente cuál era, con el riesgo perenne de manipular por error una *tail page*. El `folio` resuelve esa ambigüedad de raíz: es, por definición, un puntero a la **página de cabecera**, nunca a una cola.
+
+```c
+/* include/linux/mm_types.h (recortado) */
+struct folio {
+	unsigned long flags;            /* PG_locked, PG_dirty, PG_uptodate... */
+	union {
+		struct list_head lru;   /* posicion en las listas de reclaim */
+		/* ... */
+	};
+	struct address_space *mapping;  /* a que cache pertenece */
+	pgoff_t index;                  /* offset dentro de la cache, en paginas */
+	union {
+		void *private;          /* datos privados del sistema de archivos */
+		swp_entry_t swap;
+	};
+	atomic_t _mapcount;
+	atomic_t _refcount;             /* cuenta de referencias del folio entero */
+	/* ... */
+};
+```
+
+Un folio y un `struct page` comparten la misma memoria — la conversión es de coste cero — pero el tipo distinto impone una disciplina: una función que recibe un `struct folio *` sabe que tiene la cabecera y que puede razonar sobre `_refcount` y `flags` del objeto completo. La migración masiva de la API del page cache de `page` a `folio` fue el gran refactor de los kernels 6.x, y en 7.x el `folio` ya es el ciudadano de primera clase; `struct page` queda como el ladrillo físico subyacente.
+
+## Folios grandes: una cabecera para muchas páginas
+
+La ventaja decisiva del folio es que puede cubrir más de una página. Un folio de **orden N** abarca `2^N` páginas físicas contiguas con un único descriptor, una sola entrada en las listas de reclaim y un solo lock. Para un archivo de gigabytes, eso divide entre cientos el número de objetos que el kernel debe rastrear.
+
+```c
+folio_order(folio);      /* log2 del numero de paginas: 0, 2, 4, 9... */
+folio_nr_pages(folio);   /* 1 << order */
+folio_size(folio);       /* bytes: PAGE_SIZE << order */
+folio_test_large(folio); /* cierto si el orden es mayor que cero */
+```
+
+Los sistemas de archivos que soportan folios grandes lo declaran al crear la cache del inodo, y a partir de ahí el readahead y la escritura asignan folios del mayor orden razonable en lugar de páginas sueltas:
+
+```c
+/* al inicializar el inode: habilita folios grandes en su cache */
+mapping_set_large_folios(inode->i_mapping);
+```
+
+<Callout type="tip" title="Menos objetos, menos contención">
+Cada folio grande que reemplaza a dieciséis páginas de 4 KiB elimina quince descriptores de las listas LRU, quince bloqueos potenciales y quince entradas de metadatos. En cargas de E/S secuencial masiva, ese colapso de contabilidad se traduce en menos presión de reclaim, menos fallos de TLB cuando el archivo se mapea, y un camino de escritura y readahead sensiblemente más corto.
+</Callout>
+
+## Qué vive en el cache y qué no
+
+El page cache guarda **datos respaldados por un archivo o dispositivo**: el contenido de archivos regulares, los metadatos de bloque leídos por el sistema de archivos, y las páginas que respaldan un `mmap` de archivo. Todo eso tiene un origen en disco al que volver, así que el kernel puede descartarlo cuando necesita RAM y recargarlo después. La memoria **anónima** —el `malloc` de un proceso, su pila— no está en el page cache: no tiene archivo detrás, y su único respaldo posible es el *swap*.
+
+Lo profundo es que `read`, `write` y `mmap` de un mismo archivo convergen en los **mismos folios**. Escribir por `write()` y leer lo escrito por un puntero de `mmap` es coherente porque ambos ven la misma página de cache; no hay dos copias que sincronizar. La única forma deliberada de esquivar el cache es `O_DIRECT` (nivel 24.5), y precisamente por eso mezclarlo con E/S bufferizada sobre el mismo archivo es peligroso.
+
+<Callout type="dios" title="El cache borra la frontera entre memoria y disco">
+La idea que reorganiza todo lo demás es esta: el page cache convierte un archivo en un objeto de memoria. Deja de haber dos mundos —lo que está en RAM y lo que está en disco— y pasa a haber uno solo, un espacio de páginas cuyo respaldo persistente es un detalle de implementación. `read()` es rellenar ese espacio desde el disco; `write()` es ensuciarlo y prometer bajarlo luego; `mmap()` es exponerlo directamente al proceso sin copia intermedia. Los tres caminos, que parecen mecanismos distintos, son la misma operación sobre los mismos folios. Cuando lo interiorizas, el conjunto de trabajo de toda la máquina —lo que de verdad está caliente— deja de ser una abstracción difusa y se vuelve algo concreto: son los folios que ahora mismo viven en el page cache, y gestionar memoria es, en el fondo, el arte de decidir cuáles conservar y cuáles expulsar. Ese es el eje sobre el que gira el resto del nivel.
+</Callout>
+
+<Reto title="Toca el cache con tus manos">
+1. Vacía el cache con `sync && echo 3 | sudo tee /proc/sys/vm/drop_caches` y compara `time cat archivo-grande > /dev/null` en frío y en caliente.
+2. Observa cómo sube `Cached` en `/proc/meminfo` tras la primera lectura.
+3. Con `fincore archivo-grande` (de util-linux) mira cuántas páginas del archivo residen en el cache antes y después.
+4. Explica por qué la memoria anónima de un proceso no aparece en `Cached` y a dónde va cuando escasea la RAM.
+5. Razona por qué `read()` y un `mmap()` del mismo archivo nunca ven versiones distintas del dato.
+</Reto>

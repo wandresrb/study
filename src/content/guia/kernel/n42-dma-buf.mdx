@@ -1,0 +1,138 @@
+---
+title: "DMA-BUF: compartir buffers entre dispositivos"
+description: "El framework del kernel para que dos dispositivos —GPU, cámara, codificador de vídeo, pantalla— compartan el mismo buffer sin copiarlo. Un exportador crea un dma_buf y lo publica como un descriptor de fichero; un importador lo toma por ese fd, lo adjunta y obtiene una sg_table con direcciones DMA. El fd como moneda de cambio, las dma_fence para sincronizar, y por qué DMA-BUF es la columna vertebral de los gráficos zero-copy modernos."
+subject: kernel
+level: 42
+order: 4
+icon: "42.4"
+duracion: "18 min"
+---
+
+<Lead>
+Una cámara captura un fotograma, una GPU lo procesa, un codificador lo comprime y una pantalla lo muestra. Cuatro dispositivos, un mismo fotograma. Copiarlo entre cada etapa —a 4K y 60 fps— fundiría el ancho de banda de memoria de cualquier sistema. DMA-BUF es la respuesta del kernel: un framework para que esos dispositivos compartan **el mismo buffer físico**, pasándose no los datos sino un descriptor de fichero que los representa. Es el zero-copy elevado de un proceso a todo un pipeline de hardware.
+</Lead>
+
+<Objetivos>
+
+- Entender el problema que resuelve DMA-BUF: compartir un buffer entre drivers sin copiar.
+- Escribir un exportador con `dma_buf_ops` y publicarlo como un fd con `dma_buf_export`.
+- Escribir un importador que toma el fd, adjunta el dispositivo y mapea la `sg_table`.
+- Situar las `dma_fence` y el papel de DMA-BUF en el stack gráfico moderno.
+
+</Objetivos>
+
+## El problema: un buffer, muchos dispositivos
+
+Sin un marco común, cada driver reserva su propia memoria y compartir significa copiar de una a otra, a menudo pasando por userspace. DMA-BUF define un objeto —`struct dma_buf`— que **envuelve** un buffer y lo hace transferible entre subsistemas. Un lado lo **exporta** (es el dueño, quien lo reservó); otros lo **importan** para leer o escribir por DMA. Y el vínculo entre ambos no es un puntero de kernel: es un descriptor de fichero, que puede viajar por userspace y cruzar procesos.
+
+## El exportador: dma_buf_ops y dma_buf_export
+
+El dueño del buffer implementa un puñado de callbacks. Los dos centrales, `map_dma_buf` y `unmap_dma_buf`, se ejecutan cuando un importador quiere acceso: devuelven una `sg_table` con las direcciones DMA vistas desde ese dispositivo concreto.
+
+```c
+#include <linux/dma-buf.h>
+
+static struct sg_table *exp_map(struct dma_buf_attachment *att,
+                                enum dma_data_direction dir)
+{
+	struct my_buf *b = att->dmabuf->priv;
+	/* Mapea las paginas de 'b' para el dispositivo importador (att->dev)
+	   y devuelve su tabla scatter-gather con direcciones DMA validas. */
+	return my_build_sgt(b, att->dev, dir);
+}
+
+static void exp_unmap(struct dma_buf_attachment *att,
+                      struct sg_table *sgt, enum dma_data_direction dir)
+{
+	dma_unmap_sgtable(att->dev, sgt, dir, 0);
+	sg_free_table(sgt);
+	kfree(sgt);
+}
+
+static const struct dma_buf_ops exp_ops = {
+	.map_dma_buf   = exp_map,
+	.unmap_dma_buf = exp_unmap,
+	.release       = exp_release,   /* liberar el buffer cuando nadie lo usa */
+	.mmap          = exp_mmap,       /* opcional: exponerlo tambien a userspace */
+};
+```
+
+Con los callbacks listos, creas el `dma_buf` y obtienes su fd:
+
+```c
+DEFINE_DMA_BUF_EXPORT_INFO(info);
+info.ops   = &exp_ops;
+info.size  = b->size;
+info.flags = O_RDWR | O_CLOEXEC;
+info.priv  = b;                     /* tu buffer, recuperable via dmabuf->priv */
+
+struct dma_buf *dmabuf = dma_buf_export(&info);
+if (IS_ERR(dmabuf))
+	return PTR_ERR(dmabuf);
+
+int fd = dma_buf_fd(dmabuf, O_CLOEXEC);   /* el fd que viaja a userspace */
+```
+
+Ese `fd` es todo lo que hace falta compartir. Un proceso lo recibe, lo pasa a otro driver por un `ioctl`, y el buffer entero queda accesible al segundo dispositivo sin haber copiado un byte.
+
+## El importador: dma_buf_get, attach y map
+
+El otro lado recupera el objeto desde el fd, se adjunta como consumidor y pide el mapeo para su propio dispositivo.
+
+```c
+struct dma_buf *dmabuf = dma_buf_get(fd);        /* fd -> struct dma_buf */
+struct dma_buf_attachment *att = dma_buf_attach(dmabuf, importer_dev);
+
+/* Mapea para MI dispositivo: obtengo direcciones DMA que mi motor entiende */
+struct sg_table *sgt =
+	dma_buf_map_attachment_unlocked(att, DMA_FROM_DEVICE);
+
+program_dma_engine(importer_dev, sgt->sgl);      /* mi hardware lee de ahi */
+
+/* al terminar, en orden inverso */
+dma_buf_unmap_attachment_unlocked(att, sgt, DMA_FROM_DEVICE);
+dma_buf_detach(dmabuf, att);
+dma_buf_put(dmabuf);
+```
+
+La belleza del `attach` es que cada importador obtiene la `sg_table` **traducida a su propia vista**: si el dispositivo está detrás de una IOMMU (nivel 27), las direcciones que recibe son las de su espacio DMA, no las físicas crudas. El mismo buffer, direcciones distintas para cada consumidor, y ni una copia. En Linux 7.x los ayudantes con sufijo `_unlocked` son la interfaz para quien no sostiene ya el `dma_resv` del buffer.
+
+<Callout type="info" title="Coherencia entre etapas: dma_buf_begin_cpu_access">
+Si la CPU va a leer o escribir el buffer entre dos usos de dispositivo, debe enmarcar el acceso con `dma_buf_begin_cpu_access` y `dma_buf_end_cpu_access`, que sincronizan cachés en las plataformas que lo necesitan. Igual que en el nivel 42.2, compartir memoria entre motores obliga a ser explícito con la coherencia: nadie puede asumir que su caché refleja lo que otro dispositivo acaba de escribir por DMA.
+</Callout>
+
+## Sincronizar y el papel en gráficos: dma_fence
+
+Compartir el buffer no basta: hay que sincronizar **cuándo** cada dispositivo puede tocarlo. Ese es el trabajo de `dma_fence`, una promesa de "esta operación habrá terminado". Se guardan en el `dma_resv` asociado al `dma_buf`: la GPU adjunta una fence al terminar de renderizar, y la pantalla espera esa fence antes de escanear el fotograma. Así se encadenan etapas sin copias y sin bloqueos activos.
+
+```c
+/* La pantalla espera a que la GPU termine antes de leer el buffer */
+struct dma_resv *resv = dmabuf->resv;
+dma_resv_wait_timeout(resv, DMA_RESV_USAGE_READ, true,
+                      msecs_to_jiffies(100));
+```
+
+Sobre esta base se construyen los gráficos modernos. En DRM, la extensión **PRIME** convierte un buffer de GPU en un fd DMA-BUF (`DRM_IOCTL_PRIME_HANDLE_TO_FD`) y de vuelta. Wayland pasa esos fds del cliente al compositor por el protocolo `linux-dmabuf`, y Vulkan los importa y exporta con `VK_KHR_external_memory_fd`. El resultado es un pipeline de extremo a extremo —cámara, GPU, codificador, pantalla, compositor— donde el fotograma vive en un solo sitio y todos lo miran a través de su propio fd.
+
+<Mermaid code={`flowchart LR
+  C[Camara exportador] -->|dma_buf_fd| FD[Descriptor de fichero]
+  FD -->|dma_buf_get| G[GPU importador]
+  FD -->|dma_buf_get| V[Codificador de video]
+  FD -->|dma_buf_get| D[Pantalla]
+  style C fill:#89b4fa,color:#11111b
+  style FD fill:#f9e2af,color:#11111b
+  style G fill:#a6e3a1,color:#11111b
+  style V fill:#cba6f7,color:#11111b
+  style D fill:#94e2d5,color:#11111b`} />
+
+<Callout type="dios" title="El fd deja de nombrar un fichero y pasa a nombrar un buffer de hardware">
+Reconoce la genialidad de la decisión de diseño, porque encierra toda una filosofía de Unix llevada a su extremo. El problema era compartir memoria entre dispositivos heterogéneos —una GPU, una cámara, un codificador, cada uno con su driver, su espacio DMA, su IOMMU— sin copiar y sin acoplarlos entre sí. La solución no inventó un mecanismo nuevo: reutilizó el objeto más viejo y universal del kernel, el descriptor de fichero, y le hizo significar algo que jamás significó, un buffer de hardware compartido. Un `int`, un simple número, se convierte en una capacidad transferible: quien lo posee posee acceso al buffer, puede pasarlo a otro proceso por un socket Unix, dárselo a otro driver por un `ioctl`, y el kernel se encarga de traducir ese mismo buffer físico a la vista DMA de cada consumidor. Ahí está la lección que trasciende los gráficos: los grandes marcos de sistemas no suelen añadir primitivas, sino que redefinen las que ya existen para que carguen un significado nuevo. "Todo es un fichero" empezó siendo una comodidad para leer y escribir dispositivos como flujos de bytes; DMA-BUF lo estira hasta "todo lo compartible es un fd", y de golpe un buffer de vídeo de cuatro megabytes viaja entre subsistemas y procesos con la misma facilidad con que se pasa un `stdout` a un hijo. Cuando entiendes que el fd es, en realidad, un asa genérica sobre cualquier recurso del kernel que quiera ser compartido y contado por referencia, dejas de ver ficheros y empiezas a ver el verdadero vocabulario del sistema. DMA-BUF es zero-copy, sí, pero antes que eso es una clase magistral sobre cómo la abstracción correcta hace que problemas enormes se disuelvan en algo que ya sabías usar.
+</Callout>
+
+<Reto title="Comparte un fotograma entre dos drivers">
+1. Escribe un módulo exportador que reserve un buffer, implemente `dma_buf_ops` con `map_dma_buf`/`unmap_dma_buf` y publique un fd con `dma_buf_export` y `dma_buf_fd`.
+2. Escribe un módulo importador que, dado el fd, haga `dma_buf_get`, `dma_buf_attach` y `dma_buf_map_attachment_unlocked`, y recorra la `sg_table` resultante.
+3. Enmarca un acceso de CPU con `dma_buf_begin_cpu_access`/`dma_buf_end_cpu_access` y explica qué sincroniza en tu plataforma.
+4. Investiga PRIME en un driver DRM real: localiza `DRM_IOCTL_PRIME_HANDLE_TO_FD` y describe cómo un buffer de GPU se convierte en un fd DMA-BUF.
+5. Razona por qué cada importador recibe una `sg_table` distinta para el mismo buffer y qué papel juega la IOMMU en esa traducción.
+</Reto>

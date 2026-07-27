@@ -1,0 +1,144 @@
+---
+title: "GPIO como entrada, salida e interrupción, y desde el device tree"
+description: "Las tres caras de un GPIO: leerlo como entrada, forzarlo como salida y convertirlo en fuente de interrupción con gpiod_to_irq para reaccionar a un flanco sin sondeo. Cómo el device tree describe las líneas con la propiedad -gpios y la polaridad, y cómo montar un driver de botón con un manejador de IRQ con hilo."
+subject: kernel
+level: 33
+order: 2
+icon: "33.2"
+duracion: "16 min"
+---
+
+<Lead>
+Un pin de entrada se puede leer de dos maneras radicalmente distintas. La ingenua es el **sondeo**: preguntar su valor una y otra vez en un bucle, quemando CPU para casi siempre obtener "sigue igual". La correcta, cuando el hardware lo permite, es la **interrupción**: pedirle a la línea que avise ella misma en cuanto cambie de nivel. Un botón que se pulsa una vez por minuto no merece un núcleo girando en vacío. En esta lección un mismo pin será entrada, salida y disparador de interrupciones, y aprenderás a describir su conexión física en el device tree.
+</Lead>
+
+<Objetivos>
+
+- Configurar un GPIO como salida y como entrada, y leer su valor lógico.
+- Convertir una línea en fuente de interrupción con `gpiod_to_irq` y `devm_request_threaded_irq`.
+- Describir la conexión en el device tree con la propiedad `-gpios` y las banderas de polaridad.
+- Entender el antirrebote (debounce) y por qué un manejador de IRQ con hilo encaja con GPIOs que duermen.
+
+</Objetivos>
+
+## Entrada, salida y el mismo descriptor
+
+Un mismo `struct gpio_desc` sirve para las tres funciones; solo cambia cómo lo configuras. Como salida, escribes su valor lógico; como entrada, lo lees. La dirección se fija al pedirlo con `gpiod_get` o se cambia después:
+
+```c
+/* salida: forzar una linea de reset y soltarla */
+gpiod_direction_output(reset, 1);   /* activa el reset (nivel logico 1) */
+udelay(10);
+gpiod_set_value(reset, 0);          /* libera el reset */
+
+/* entrada: muestrear el estado de un pin */
+gpiod_direction_input(sense);
+int activo = gpiod_get_value(sense);   /* 1 = activo segun la polaridad del DT */
+```
+
+El sondeo puro es correcto pero derrochador: para saber si un botón se ha pulsado tendrías que leer `gpiod_get_value` en un bucle o con un temporizador. Solo tiene sentido cuando la señal cambia tan rápido y de forma tan continua que una interrupción por flanco saturaría el sistema. Para un botón, un sensor de tapa o una señal de "datos listos" de un sensor, la interrupción es la herramienta correcta.
+
+## De línea a interrupción: gpiod_to_irq
+
+Muchos controladores de GPIO pueden generar una interrupción cuando una línea cambia de nivel. El puente entre "línea" e "interrupción" es `gpiod_to_irq`, que traduce el descriptor al número de IRQ de Linux que le corresponde. Con ese número pides la interrupción como cualquier otra:
+
+```c
+#include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
+#include <linux/platform_device.h>
+
+struct button {
+        struct device    *dev;
+        struct gpio_desc *gpiod;
+};
+
+static irqreturn_t button_isr(int irq, void *data)
+{
+        struct button *b = data;
+        /* contexto con hilo: podemos dormir, asi que usamos la variante cansleep */
+        int pressed = gpiod_get_value_cansleep(b->gpiod);
+
+        dev_info(b->dev, "boton %s\n", pressed ? "pulsado" : "soltado");
+        return IRQ_HANDLED;
+}
+
+static int button_probe(struct platform_device *pdev)
+{
+        struct device *dev = &pdev->dev;
+        struct button *b;
+        int irq, ret;
+
+        b = devm_kzalloc(dev, sizeof(*b), GFP_KERNEL);
+        if (!b)
+                return -ENOMEM;
+        b->dev = dev;
+
+        /* "trigger-gpios" en el DT -> con_id "trigger", como entrada */
+        b->gpiod = devm_gpiod_get(dev, "trigger", GPIOD_IN);
+        if (IS_ERR(b->gpiod))
+                return dev_err_probe(dev, PTR_ERR(b->gpiod), "sin GPIO\n");
+
+        /* antirrebote por hardware si el controlador lo soporta */
+        gpiod_set_debounce(b->gpiod, 50000);   /* 50 ms en microsegundos */
+
+        irq = gpiod_to_irq(b->gpiod);
+        if (irq < 0)
+                return dev_err_probe(dev, irq, "la linea no genera IRQ\n");
+
+        ret = devm_request_threaded_irq(dev, irq, NULL, button_isr,
+                                        IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+                                        "mybutton", b);
+        if (ret)
+                return dev_err_probe(dev, ret, "no pude pedir la IRQ\n");
+
+        return 0;
+}
+```
+
+Tres detalles hacen que esto sea correcto y no solo compilable. `devm_request_threaded_irq` con el manejador rápido a `NULL` y la función a `button_isr` corre el manejador en un **hilo del kernel**, no en contexto de interrupción duro; por eso `IRQF_ONESHOT` es obligatorio, y por eso dentro puedes llamar a `gpiod_get_value_cansleep` aunque la línea cuelgue de un bus I2C que duerme. `IRQF_TRIGGER_FALLING` pide que la interrupción salte en el flanco de bajada; según la polaridad y el botón usarías `IRQF_TRIGGER_RISING` o los dos con `IRQF_TRIGGER_BOTH`. Y `gpiod_set_debounce` intenta que el propio hardware filtre los rebotes mecánicos del contacto; devuelve `-ENOTSUPP` si el controlador no sabe hacerlo, en cuyo caso el antirrebote se resuelve por software.
+
+<Mermaid code={`flowchart LR
+  Btn[Boton fisico] -->|flanco de bajada| Pin[Linea GPIO]
+  Pin -->|gpiod_to_irq| Irq[Numero de IRQ Linux]
+  Irq -->|request_threaded_irq| Hilo[Manejador con hilo]
+  Hilo -->|gpiod_get_value_cansleep| Estado[Lee el estado y actua]`} />
+
+## Obtener el GPIO desde el device tree
+
+El driver nunca inventa el número de pin: lo recibe del device tree. La convención es una propiedad con sufijo `-gpios` cuyo prefijo es el nombre de función que pasarás a `gpiod_get`. El valor referencia el controlador, la línea dentro de él y una bandera de polaridad de `<dt-bindings/gpio/gpio.h>`:
+
+```dts
+/* nodo del dispositivo en el device tree */
+mybutton {
+        compatible = "myvendor,mybutton";
+        trigger-gpios = <&gpio0 17 GPIO_ACTIVE_LOW>;   /* linea 17, activa a 0 V */
+};
+```
+
+Con esa descripción, `devm_gpiod_get(dev, "trigger", GPIOD_IN)` encuentra la propiedad `trigger-gpios`, resuelve `&gpio0` al proveedor, toma la línea 17 y graba en el descriptor que es active-low. A partir de ahí `gpiod_get_value` devuelve 1 cuando el botón está pulsado —a 0 voltios— sin que el driver piense en voltajes. La vieja alternativa, `of_get_named_gpio`, devolvía un entero crudo y obligaba a resolver la polaridad a mano; la API de descriptores la absorbe entera.
+
+Cuando un dispositivo controla varias líneas homogéneas —un teclado matricial, un bus paralelo— pedirlas una a una es tedioso. `gpiod_get_array` reserva de golpe todas las líneas de un mismo prefijo y devuelve un `struct gpio_descs` con un vector de descriptores y su cuenta:
+
+```c
+struct gpio_descs *rows = devm_gpiod_get_array(dev, "row", GPIOD_IN);
+if (IS_ERR(rows))
+        return PTR_ERR(rows);
+for (unsigned int i = 0; i < rows->ndescs; i++)
+        estado[i] = gpiod_get_value_cansleep(rows->desc[i]);
+```
+
+<Callout type="info" title="Interrupción de GPIO frente a interrupción nativa">
+Hay dos formas de que un dispositivo del device tree reciba interrupciones. Si su señal cuelga de una línea GPIO capaz de interrumpir, se usa `gpiod_to_irq` sobre el descriptor. Si el dispositivo se cablea a una entrada dedicada del controlador de interrupciones, el device tree lo declara con las propiedades `interrupts` o `interrupts-extended` y el driver usa `platform_get_irq`. Muchos sensores ofrecen las dos: una línea de datos listos que puedes tratar como GPIO-IRQ o como IRQ nativa. El resultado —un número de IRQ para `request_irq`— es el mismo; cambia solo de dónde sale.
+</Callout>
+
+<Callout type="dios" title="La interrupción es la entrada que se niega a esperar">
+Fíjate en lo que de verdad separa el sondeo de la interrupción, porque es una de las ideas madre de la programación de sistemas. En el sondeo, el software es el sujeto activo: pregunta, y el hardware responde pasivamente. En la interrupción se invierte el flujo de control: el hardware es quien habla, y el software duerme hasta que lo llaman. La misma línea física —diecisiete, en nuestro botón— puede vivir en cualquiera de los dos mundos, y la elección entre ellos define si un núcleo entero gira en vacío o si el sistema consume energía solo cuando pasa algo. Un GPIO capaz de interrumpir es el punto exacto donde el mundo analógico de un contacto mecánico entra en la máquina de estados del kernel: un cambio de voltaje se convierte en un flanco, el flanco en una IRQ, la IRQ en la ejecución de tu manejador. Y observa la simetría con lo aprendido sobre concurrencia: esa entrada asíncrona llega en cualquier instante, entre dos instrucciones cualesquiera, así que el estado que tu manejador comparte con el resto del driver necesita la misma protección que cualquier dato tocado desde dos contextos. Interrupción no es solo "una forma eficiente de leer un pin": es admitir que el hardware es un actor concurrente más, con voz propia y sin turno.
+</Callout>
+
+<Reto title="Un botón que interrumpe">
+1. Escribe el nodo del device tree para un botón en la línea 5 del `gpio2`, active-low, y explica qué `con_id` pasarías a `gpiod_get`.
+2. Justifica por qué el manejador usa `gpiod_get_value_cansleep` y no `gpiod_get_value`, y qué cambiaría si la interrupción no fuera con hilo.
+3. Razona por qué `IRQF_ONESHOT` es obligatorio cuando el manejador rápido es `NULL`.
+4. Compara el coste de detectar diez pulsaciones por hora con sondeo cada milisegundo frente a una IRQ por flanco.
+5. Añade antirrebote por software con un temporizador si `gpiod_set_debounce` devuelve `-ENOTSUPP`, y explica qué carrera evita.
+</Reto>

@@ -1,0 +1,121 @@
+---
+title: "vmalloc, vfree y vzalloc: cuándo usarlo y qué cuesta"
+description: "La API de vmalloc en detalle: cuándo conviene una reserva grande que no necesita ser físicamente contigua, cómo se construye por dentro con vm_struct y páginas sueltas, y su coste real en tablas de páginas, presión de TLB, latencia de reserva y liberación perezosa."
+subject: kernel
+level: 22
+order: 2
+icon: "22.2"
+duracion: "16 min"
+---
+
+<Lead>
+`vmalloc` resuelve un problema concreto: necesitas un búfer grande y contiguo a la vista, pero no te importa que sus páginas anden dispersas por la RAM. A cambio de esa libertad frente a la fragmentación, pagas un peaje que `kmalloc` no cobra: tablas de páginas propias, entradas de TLB que no se comparten, una reserva más lenta y una liberación diferida. Saber cuándo merece la pena ese peaje es todo el nivel.
+</Lead>
+
+<Objetivos>
+
+- Dominar `vmalloc`, `vzalloc`, `__vmalloc` y `vfree`, y cuándo elegirlos.
+- Entender cómo se construye una reserva vmalloc: `vm_struct`, páginas sueltas y tablas de páginas.
+- Cuantificar su coste: tablas de páginas, presión de TLB y latencia de reserva.
+- Comprender la liberación perezosa y el `vmalloc_to_page` que necesitas para recorrerlo.
+
+</Objetivos>
+
+## La API y cuándo usarla
+
+`vmalloc` es para reservas **grandes** cuya contigüidad física a nadie le importa: la memoria de un módulo al cargarse, tablas hash gigantes, búferes de firmware, el área de `xt_alloc_table_info` de netfilter. La regla práctica: si son más de un par de páginas y no van a alimentar un DMA plano, `vmalloc` (o mejor `kvmalloc`, nivel 22.1) es tu asignador.
+
+```c
+#include <linux/vmalloc.h>
+
+void *vmalloc(unsigned long size);              /* virtualmente contiguo, sin poner a cero */
+void *vzalloc(unsigned long size);              /* idem, memoria a cero */
+void *__vmalloc(unsigned long size, gfp_t gfp); /* control fino del contexto de reserva */
+void *vmalloc_node(unsigned long size, int nid);/* fija el nodo NUMA de origen */
+void  vfree(const void *addr);                  /* libera; acepta NULL sin quejarse */
+```
+
+```c
+char *big = vzalloc(16 << 20);   /* 16 MB a cero, virtualmente contiguos */
+if (!big)
+	return -ENOMEM;
+/* ... uso ... */
+vfree(big);
+```
+
+Todas estas vías reservan con `GFP_KERNEL` por dentro y **pueden dormir**: jamás llames a `vmalloc` con un spinlock tomado, en un manejador de interrupción ni en ningún contexto atómico. Ese es su primer coste, y el más fácil de olvidar.
+
+## Qué ocurre por dentro
+
+Una reserva `vmalloc` da tres pasos. Primero busca un hueco en la **arena virtual** de la zona vmalloc y lo reserva como un `vm_struct` (los rangos libres se gestionan con un árbol rojo-negro de `vmap_area`). Segundo, pide al buddy allocator las `nr_pages` páginas **de orden cero**, una a una, sin exigir que sean vecinas. Tercero, cose esas páginas en el rango virtual reservado escribiendo las entradas de tabla de páginas correspondientes.
+
+```c
+/* include/linux/vmalloc.h  (campos principales) */
+struct vm_struct {
+	struct vm_struct	*next;
+	void			*addr;      /* inicio del rango virtual */
+	unsigned long		size;
+	unsigned long		flags;
+	struct page		**pages;    /* el array de paginas sueltas */
+	unsigned int		nr_pages;
+	phys_addr_t		phys_addr;
+	const void		*caller;    /* quien reservo: visible en vmallocinfo */
+};
+```
+
+De ahí sale la propiedad que lo define: los marcos físicos están dispersos, así que `virt_to_phys` **no** sirve sobre un puntero vmalloc. Para obtener la página real hay que recorrer las tablas de páginas:
+
+```c
+struct page *pg = vmalloc_to_page(big + off);  /* camina PGD..PTE; no es una resta */
+```
+
+Puedes auditar cada reserva viva, con su tamaño y su llamante, en `/proc/vmallocinfo`. Y si ya tienes un array de páginas y solo quieres una vista contigua de ellas, `vmap(pages, count, flags, prot)` hace justo el tercer paso sin el segundo.
+
+Hay un detalle recursivo que revela por qué la ruta es cara: el propio array `pages` —los punteros a las `nr_pages` páginas— es también memoria que hay que reservar, y para reservas enormes ese array puede a su vez necesitar `vmalloc`. La maquinaria se apoya en parte sobre sí misma, y esa es una de las razones de que su latencia de reserva sea mensurable frente a sacar un objeto de un cache de slab caliente.
+
+## El coste, entrada por entrada
+
+<Cards>
+  <Card icon="📄" title="Tablas de páginas">
+    Cada reserva escribe PTEs propias, una por página. Ese metadato consume memoria y trabajo de CPU que `kmalloc`, apoyado en el direct map ya mapeado, no paga jamás.
+  </Card>
+  <Card icon="🎯" title="Presión de TLB">
+    El direct map cubre la RAM con páginas enormes de 2 MB o 1 GB: pocas entradas de TLB para muchísima memoria. Una reserva vmalloc de páginas de 4 KB gasta una entrada de TLB por cada 4 KB.
+  </Card>
+  <Card icon="😴" title="Puede dormir">
+    Reserva con `GFP_KERNEL`: inservible en contexto atómico. `kmalloc(GFP_ATOMIC)` sí funciona ahí; `vmalloc` no tiene equivalente.
+  </Card>
+  <Card icon="🐢" title="Latencia">
+    Buscar el rango virtual, pedir N páginas sueltas y programar N PTEs es mucho más caro que sacar un objeto de un cache de slab caliente.
+  </Card>
+</Cards>
+
+El coste de TLB es el más insidioso porque no aparece en el momento de la reserva, sino después, en cada acceso: un búfer vmalloc recorrido intensamente genera fallos de TLB que el mismo búfer en el direct map no tendría. Por eso Linux 7.x, cuando la arquitectura lo permite (`CONFIG_HAVE_ARCH_HUGE_VMALLOC`), respalda las reservas vmalloc **grandes** con páginas de tamaño PMD (2 MB) siempre que el tamaño y la alineación lo permitan, reduciendo drásticamente las entradas de TLB. Es automático; se desactiva con el parámetro de arranque `nohugevmalloc`, y puedes forzarlo con `vmalloc_huge(size, gfp)`.
+
+Queda un coste más, a menudo ignorado: reservar el rango dentro de la arena virtual es una operación serializada. Buscar y apartar el hueco libre pasa por estructuras protegidas, y una tormenta de `vmalloc`/`vfree` concurrentes desde muchos núcleos puede convertir la gestión del espacio virtual en un punto de contención. `vmalloc` no es solo «más lento por acceso»: también escala peor bajo martilleo que un cache de slab por-CPU, que sirve objetos sin tocar estado global.
+
+<Callout type="info" title="La liberación es perezosa a propósito">
+`vfree` no desmapea de inmediato. Desmapear obligaría a un flush de TLB en **todas** las CPUs (un IPI global costosísimo) por cada liberación. En su lugar, el rango se marca como pendiente y se acumula en una lista *lazy*; cuando el total supera un umbral (`lazy_max_pages`), un purgado por lotes desmapea muchos rangos y hace un único flush de TLB para todos. Es el mismo principio que en tantos sitios del kernel: convertir muchas operaciones caras en una sola amortizada. El efecto visible es que la memoria de una reserva vmalloc recién liberada puede seguir «reservada» en `/proc/vmallocinfo` un instante más.
+</Callout>
+
+## Lo que vmalloc no puede hacer
+
+No lo pases a un dispositivo que haga DMA a memoria física plana: sus páginas están dispersas y el hardware, que no ve tus tablas de páginas, leería basura contigua. Para eso está el DMA con scatter-gather o `dma_alloc_coherent` (nivel 27). Tampoco es gratis en 32-bit, donde la zona vmalloc es diminuta y agotarla es un fallo real; en x86-64 la zona mide 32 TB y ese problema desaparece. Y como cada reserva construye tablas de páginas, hacer `vmalloc` de objetos **pequeños** en un camino caliente es un despilfarro puro: para eso está el slab.
+
+Vale la pena ver quién usa `vmalloc` en el árbol real, porque el patrón se repite: reservas grandes, de vida media o larga, sin exigencia de contigüidad física. El cargador de módulos aloja ahí el texto y los datos de cada `.ko`. El `xt_alloc_table_info` de netfilter guarda tablas de reglas que pueden ser enormes. Los búferes en anillo de `perf`, muchas tablas hash dimensionadas en el arranque y el `swap_map` de cada área de swap viven en vmalloc. Ninguno alimenta un DMA plano; todos serían candidatos a fallar con `kmalloc` por puro tamaño.
+
+<Callout type="tip" title="Regla mnemotécnica del asignador">
+Slab para lo pequeño y frecuente; `alloc_pages` cuando quieres marcos crudos y controlas tú el mapeo; `kmalloc` cuando necesitas contigüidad física; `vmalloc` cuando necesitas un rango virtual grande y contiguo sin importarte la física; y `kvmalloc` cuando quieres «grande y contiguo a la vista» dejando que el kernel decida la vía. Memoriza el eje —tamaño frente a exigencia de contigüidad física— y el asignador correcto cae solo.
+</Callout>
+
+<Callout type="dios" title="La contigüidad es una propiedad del observador">
+Interioriza esto y `vmalloc` deja de ser una API para volverse una idea. La misma reserva de 16 MB es, a la vez, **contigua y dispersa**: depende de quién la mire. La CPU, que accede a través de la MMU, ve dieciséis megabytes perfectamente seguidos y no puede notar la diferencia con `kmalloc`. Un motor de DMA que hace traducción de direcciones por su cuenta, saltándose las tablas de páginas del kernel, ve dieciséis megabytes de fragmentos inconexos esparcidos por toda la RAM. No hay una geometría verdadera del búfer: hay dos, una por cada observador, y ambas son igual de reales. Esto reescribe qué significa «contiguo»: no es una propiedad de los bytes, sino de la ruta de traducción que los alcanza. Cuando eliges entre `kmalloc` y `vmalloc` no estás eligiendo una disposición de memoria, estás eligiendo **qué observadores verán tu búfer como una pieza sola**. Y por eso el bug clásico —pasar un puntero vmalloc a un dispositivo— no es un descuido de API: es haber confundido tu geometría con la del hardware.
+</Callout>
+
+<Reto title="Mide el peaje">
+1. Reserva 64 MB con `vmalloc` y con `kmalloc` (si este último te lo permite) y localiza ambas en `/proc/vmallocinfo` y por `virt_to_phys`; comprueba que `virt_to_phys` es basura para la vmalloc.
+2. Recorre `vmalloc_to_page` sobre tres offsets distintos de tu búfer vmalloc y verifica que las páginas físicas **no** son consecutivas.
+3. Reserva algo mayor que 2 MB en un kernel con huge vmalloc activo y comprueba en `/proc/vmallocinfo` si aparece respaldado por páginas grandes.
+4. Explica por qué `vfree` no hace flush de TLB inmediato y qué controla `lazy_max_pages`.
+5. Argumenta por qué llamar a `vmalloc` con un spinlock tomado es un bug, y qué mensaje de `might_sleep` lo delata.
+</Reto>

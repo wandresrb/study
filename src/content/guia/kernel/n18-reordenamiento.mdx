@@ -1,0 +1,132 @@
+---
+title: "El reordenamiento: el orden que escribes no es el que se ejecuta"
+description: "El compilador y la CPU reordenan tus instrucciones para ir más rápido. En un hilo no lo notas; entre núcleos, ese reordenamiento corrompe datos. El patrón flag+datos y por qué exige barreras."
+subject: kernel
+level: 18
+order: 1
+icon: "18.1"
+duracion: "14 min"
+---
+
+<Lead>
+Escribes `data = 42;` y luego `ready = 1;`, y das por hecho que la máquina ejecuta en ese orden. No es cierto. El compilador reordena para optimizar y la CPU ejecuta fuera de orden para no esperar a la memoria. En un solo hilo la ilusión es perfecta; en cuanto otro núcleo observa tus variables, la ilusión se rompe y aparecen bugs que no existen en el código fuente.
+</Lead>
+
+<Objetivos>
+
+- Entender la regla "as-if" y por qué el orden de programa no es el de ejecución.
+- Separar el reordenamiento del compilador del de la CPU.
+- Ver el patrón flag+datos y cómo se corrompe sin barreras.
+- Situar los modelos de memoria: el TSO fuerte de x86 frente a los débiles de ARM.
+
+</Objetivos>
+
+## La regla "as-if": la ilusión del orden
+
+El estándar de C —y el silicio— solo prometen una cosa: que **un** hilo de ejecución observa resultados consistentes con ejecutar el código en orden de programa. Es la regla *as-if*. Todo lo demás es negociable: reordenar dos escrituras independientes, guardar un valor en un registro en vez de en memoria, ejecutar dos instrucciones en paralelo, especular una rama. Todo legal, siempre que el resultado visto por *ese* hilo sea idéntico al secuencial.
+
+El problema nace cuando un segundo núcleo lee tu memoria. Ese núcleo es un observador que la regla *as-if* no contempla: puede ver los estados intermedios que a ti se te ocultan. La abstracción secuencial es local a un hilo, y la concurrencia vive justo en la fuga de esa abstracción.
+
+## Dos reordenadores independientes
+
+Hay dos capas que reordenan, y conviene no confundirlas nunca:
+
+```c
+/* Lo que escribes */
+int calcular(int *a, int *b)
+{
+	*a = 1;
+	*b = 2;
+	return *a + *b;
+}
+```
+
+Con `-O2`, el compilador puede emitir la escritura de `*b` antes que la de `*a` (son independientes), o mantener valores en registros y no tocar memoria hasta el final. Es reordenamiento **estático**, en tiempo de compilación; lo ves con `objdump -d`. Otro núcleo que espere sobre `*b` podría verlo a `2` mientras `*a` sigue rancio.
+
+La segunda capa es la **CPU**. Un núcleo moderno es superescalar y especulativo: emite y retira instrucciones en un orden distinto al de búsqueda, y un *store buffer* retiene las escrituras retiradas antes de que lleguen a la caché. Por eso una escritura puede hacerse visible a otros núcleos *después* de una lectura posterior. Es reordenamiento **dinámico**, en tiempo de ejecución.
+
+<Callout type="warn" title="Coherencia no es ordenación">
+La coherencia de caché (protocolo MESI) garantiza que todos los núcleos acaben de acuerdo sobre el valor final de *cada* dirección por separado. No dice **nada** sobre el orden relativo de accesos a direcciones *distintas*. Coherencia y ordenación son ejes ortogonales: puedes tener la primera y carecer por completo de la segunda. Ahí es donde muere la intuición.
+</Callout>
+
+## El patrón flag+datos: donde todo se rompe
+
+Es el patrón de concurrencia más básico: un productor rellena un dato y levanta una bandera; un consumidor espera la bandera y lee el dato.
+
+```c
+int data;
+int ready;
+
+/* CPU 0: productor */
+void publicar(void)
+{
+	data = 42;      /* (1) escribe el dato */
+	ready = 1;      /* (2) anuncia que está listo */
+}
+
+/* CPU 1: consumidor */
+void consumir(void)
+{
+	while (ready == 0)   /* (3) espera el anuncio */
+		;
+	usar(data);          /* (4) lee el dato */
+}
+```
+
+La intuición dice: (1) ocurre antes de (2), así que cuando (3) ve `ready == 1`, (4) leerá `42`. Es falso por **cuatro** motivos independientes, cualquiera de los cuales basta para romperlo:
+
+- El compilador de CPU 0 reordena y emite (2) antes de (1): son escrituras a direcciones distintas.
+- El compilador de CPU 1 iza la carga de `ready` fuera del bucle a un registro (nivel 18.2): bucle infinito. O precarga `data` antes de (3).
+- La CPU 0 drena su store buffer en otro orden: (2) llega a la caché antes que (1).
+- La CPU 1 ejecuta la carga de `data` especulativamente, antes de que (3) confirme la bandera.
+
+El resultado es que (4) lee basura pese a un código fuente impecable. Y como (1) y (2) tocan direcciones diferentes, la coherencia de caché no te rescata.
+
+<Mermaid code={`flowchart LR
+  subgraph P [Orden de programa en CPU0]
+    A1[escribe data 42] --> A2[escribe ready 1]
+  end
+  subgraph O [Orden que CPU1 puede observar]
+    B2[ve ready 1] --> B1[ve data rancio]
+  end
+  A2 -. reordenado .-> B2
+  A1 -. retrasado .-> B1`} />
+
+## Modelos de memoria: no todas las CPU mienten igual
+
+La cantidad de reordenamiento que permite el hardware es el **modelo de memoria** de la arquitectura, y varía brutalmente:
+
+- **x86 y x86-64: TSO** (Total Store Order). Modelo fuerte. Solo permite un reordenamiento: una carga posterior puede adelantar a una escritura anterior a otra dirección (el store buffer). Cargas nunca se reordenan con cargas, escrituras nunca con escrituras. Por eso x86 **esconde** casi todos estos bugs: código roto en ARM "funciona" en tu portátil.
+- **ARMv8, POWER, RISC-V: débilmente ordenados.** Permiten casi cualquier reordenamiento de accesos independientes, salvo los ligados por dependencias. Hardware más barato y escalable, pero el programador debe insertar barreras a mano.
+
+El kernel se compila para decenas de arquitecturas. No puedes apoyarte en la fortaleza accidental de tu CPU: escribes contra el **Linux Kernel Memory Model** (LKMM), un modelo formal en `tools/memory-model/` que se valida con tests *litmus* mediante `herd7`. La prosa canónica es `Documentation/memory-barriers.txt`.
+
+## El store buffer: el desorden que hasta x86 permite
+
+Incluso el fuerte TSO de x86 deja pasar **un** reordenamiento, y muerde. El store buffer retiene las escrituras retiradas de un núcleo antes de que drenen a la caché; mientras tanto, ese núcleo puede ejecutar una carga posterior a *otra* dirección. Así, una escritura seguida de una carga a otra ubicación puede parecer reordenada (Escritura-Carga). El test litmus canónico es *Store Buffering*:
+
+```c
+int x, y;   /* ambos 0 al inicio */
+
+/* CPU 0 */          /* CPU 1 */
+x = 1;               y = 1;
+r0 = y;              r1 = x;
+```
+
+La intuición dice que al menos uno de `r0` y `r1` debe acabar en 1: alguien escribió primero. En x86, **ambos pueden ser 0**: la escritura de cada núcleo espera en su store buffer mientras su carga lee de la caché el cero que el otro aún no ha propagado. Es real y reproducible en cualquier x86, y la razón de que `smp_mb()` exista incluso ahí: solo una barrera total —que drena el store buffer— lo prohíbe. Ni `smp_rmb` ni `smp_wmb` sirven aquí, porque ninguna ordena Escritura-Carga. Este es el único reordenamiento que obliga a un fence completo, y la semilla de por qué la exclusión mutua de Dekker y Peterson necesita `smp_mb`.
+
+## Por qué estos bugs no salen en las pruebas
+
+Un bug de reordenamiento es probabilístico: depende de que dos núcleos coincidan en una ventana de nanosegundos, así que puede aparecer una vez cada millones de ejecuciones. Un `printk` o un depurador introducen latencia y sincronización que **cierran** la ventana: el clásico Heisenbug que se esfuma al observarlo. Y como x86 esconde tres de los cuatro reordenamientos, tu banco de pruebas x86 da falsa confianza a código que revienta en ARM en producción. La moraleja metodológica es dura: la corrección de la concurrencia no se **prueba**, se **demuestra** contra el modelo de memoria. Por eso el kernel tiene el LKMM y `herd7`: para verificar de forma exhaustiva pequeños fragmentos que ninguna cantidad de tests cubriría.
+
+<Callout type="dios" title="La abstracción secuencial es la mayor mentira útil de la computación">
+Todo tu instinto de programador se construyó sobre una ilusión magnífica: que la máquina ejecuta tus líneas de arriba abajo. El compilador y el silicio conspiran, con décadas de ingeniería, para sostener esa ilusión de forma perfecta dentro de un hilo, porque es lo que permite que el código secuencial sea razonable. Pero la ilusión es estrictamente **local**: cada núcleo tiene su propia visión del orden de los eventos, y no existe un "ahora" global compartido. Un multinúcleo es un sistema distribuido en miniatura, y el reordenamiento es la relatividad de ese sistema. El kernel vive entero dentro de esa fuga: cada spinlock (nivel 15), cada RCU (nivel 17), cada algoritmo sin bloqueo es una negociación explícita con el reordenamiento. Dominar estas cinco lecciones es aprender el idioma con el que se negocia. A partir de aquí ya no programas líneas: programas relaciones de visibilidad entre núcleos.
+</Callout>
+
+<Reto title="Ve la mentira con tus propios ojos">
+1. Escribe el ejemplo flag+datos como módulo (o programa de usuario) y ejecútalo en x86: verás que "funciona" por el TSO.
+2. Compila `calcular` con `gcc -O2 -S` e inspecciona el ensamblador: localiza el reordenamiento o el uso de registros.
+3. Para cada uno de los cuatro reordenamientos posibles, di si x86 lo permite y si ARM lo permite.
+4. Lee la introducción de `Documentation/memory-barriers.txt` (sección "ABSTRACT MEMORY ACCESS MODEL").
+5. Extra: instala `herd7` y ejecuta un test litmus de *message passing* sobre el modelo débil.
+</Reto>

@@ -1,0 +1,164 @@
+---
+title: "Buffers y descriptores registrados: pagar el peaje una sola vez"
+description: "Cada operación de E/S asíncrona ingenua paga en el kernel un `fget` del descriptor y un `get_user_pages` del búfer. `io_uring_register` con `IORING_REGISTER_BUFFERS` y descriptores fijos pre-paga esa validación una vez y la saca del camino caliente hacia los millones de operaciones por segundo."
+subject: kernel
+level: 41
+order: 1
+icon: "41.1"
+duracion: "18 min"
+---
+
+<Lead>
+En el nivel 40 le pediste a `io_uring` una lectura y voló. Pero mira de cerca qué hace el kernel por cada `sqe` que envías: resuelve el descriptor a una `struct file` y le sube el refcount, y fija en RAM las páginas de tu búfer con `get_user_pages` para que el reclaim no se las lleve durante el DMA. Al terminar, deshace ambas cosas. A cien mil operaciones por segundo ese ir y venir de refcounts y pins domina el perfil. La respuesta de `io_uring` es un contrato con el kernel: **regístralo una vez y no lo revalido nunca más**.
+</Lead>
+
+<Objetivos>
+
+- Ver el coste por operación que esconde una E/S asíncrona ingenua.
+- Pre-registrar búferes con `IORING_REGISTER_BUFFERS` y usarlos con `READ_FIXED`.
+- Registrar una tabla de descriptores y operar con `IOSQE_FIXED_FILE`.
+- Actualizar la tabla en caliente y crear descriptores directos sin `fd` de usuario.
+
+</Objetivos>
+
+## El coste oculto de cada sqe
+
+Una lectura `io_uring` normal parece gratis, pero cada envío arrastra dos operaciones repetidas dentro del kernel. Primero, el descriptor entero se resuelve: `fget` toma la `struct file`, incrementa un contador atómico y, al completar, `fput` lo devuelve. Segundo, el búfer del usuario se **fija**: `get_user_pages` recorre las tablas de página, bloquea cada folio en memoria para que el reclaim (nivel 25) no lo desaloje mientras el hardware escribe, y luego lo suelta.
+
+```c
+/* Lectura io_uring normal: el fd se resuelve y el búfer se fija EN CADA sqe */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, fd, buf, len, offset);
+io_uring_submit(&ring);
+/* Por cada envío el kernel hace fget(fd) + get_user_pages(buf) y los deshace al completar */
+```
+
+Para una E/S grande y esporádica ese coste es ruido. Para un motor que dispara ráfagas de operaciones diminutas contra un NVMe, es el cuello de botella: estás pagando la traducción de direcciones y el refcount de un recurso que **no cambia** entre operaciones. Registrarlo es declararle al kernel esa invariante.
+
+El detalle fino es que `get_user_pages` no solo recorre tablas de página: incrementa el refcount de cada folio y toca el bloqueo del `mm_struct` (nivel 23). Bajo E/S concurrente y multihilo, ese bloqueo se convierte en un punto de contención global, y el atómico del refcount rebota entre cachés de distintos núcleos. Ninguno de esos costes tiene que ver con *los datos*: son puro impuesto de gestión, repetido en cada operación, sobre un búfer que llevas horas reutilizando idéntico.
+
+## Búferes registrados: IORING_REGISTER_BUFFERS
+
+`io_uring_register_buffers` toma un vector de `iovec` y fija sus páginas **una sola vez**, en el registro. A partir de ahí, las variantes `READ_FIXED` y `WRITE_FIXED` referencian el búfer por índice y el kernel ya tiene las páginas ancladas y validadas.
+
+```c
+/* Pre-registrar N búferes: get_user_pages se ejecuta una vez, aquí y no más */
+struct iovec iov[N];
+for (int i = 0; i < N; i++) {
+	iov[i].iov_base = buffers[i];   /* memoria ya reservada, idealmente alineada a página */
+	iov[i].iov_len  = BUF_SIZE;
+}
+if (io_uring_register_buffers(&ring, iov, N) < 0)
+	perror("io_uring_register_buffers");
+```
+
+```c
+/* READ_FIXED no vuelve a fijar páginas: entrega buf_index y el kernel busca el pin */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read_fixed(sqe, fd, buffers[i], len, offset, /*buf_index=*/i);
+io_uring_submit(&ring);
+```
+
+El puntero que pasas debe caer **dentro** del búfer registrado `i` (puedes leer a un subrango), pero nunca fuera: el kernel valida ese contenimiento, no la página suelta. Simétricamente, `io_uring_prep_write_fixed` escribe desde un búfer registrado.
+
+Para rotar el pool en caliente —liberar unas ranuras y publicar otras sin desregistrar la tabla entera— están las actualizaciones parciales, disponibles en kernels 7.x junto a los conjuntos dispersos e identificados por etiqueta (`IORING_REGISTER_BUFFERS2`):
+
+```c
+/* Sustituir el búfer de la ranura j sin tocar el resto del pool ya registrado */
+struct iovec nuevo = { .iov_base = otro_buf, .iov_len = BUF_SIZE };
+io_uring_register_buffers_update_tag(&ring, /*off=*/j, &nuevo, /*tags=*/NULL, 1);
+```
+
+La etiqueta opcional es un `u64` que el kernel devuelve cuando el búfer se libera de verdad, útil para saber cuándo es seguro reciclar la memoria de una ranura que acabas de reemplazar mientras había E/S en vuelo sobre ella.
+
+## Descriptores fijos: IORING_REGISTER_FILES
+
+El mismo truco vale para el descriptor. `io_uring_register_files` publica una tabla de `fd` en el `io_uring`; desde entonces el campo `sqe->fd` deja de ser un descriptor y pasa a ser un **índice** en esa tabla, marcado con `IOSQE_FIXED_FILE`. El kernel salta el `fget`/`fput` y usa la `struct file` cacheada.
+
+```c
+/* Registrar una tabla de descriptores elimina el fget/fput por operación */
+int fds[N];
+/* ...abrir o aceptar N descriptores en fds[]... */
+io_uring_register_files(&ring, fds, N);
+```
+
+```c
+/* Ahora sqe->fd es un índice; IOSQE_FIXED_FILE se lo dice al kernel */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, /*index=*/3, buf, len, offset);
+sqe->flags |= IOSQE_FIXED_FILE;   /* fd=3 => cuarta entrada de la tabla registrada */
+io_uring_submit(&ring);
+```
+
+Registrar `-1` en una ranura la deja **vacía**: puedes reservar una tabla dispersa de miles de ranuras y llenarlas a medida que aceptas conexiones, sin conocer los descriptores de antemano. Es el sustrato natural de un servidor que crea sockets sin parar.
+
+```c
+/* Tabla dispersa: mil ranuras vacías, listas para recibir descriptores directos */
+io_uring_register_files_sparse(&ring, 1000);
+```
+
+<Mermaid code={`flowchart TD
+  subgraph Sin_registrar
+    A1[submit sqe] --> A2[fget del fd] --> A3[get user pages del buffer] --> A4[E-S] --> A5[unpin y fput]
+  end
+  subgraph Registrado
+    R0[register una sola vez] --> R1[paginas fijas y file cacheado]
+    B1[submit read_fixed] --> B2[lookup por buf_index] --> B3[E-S sin revalidar]
+  end`} />
+
+## Tablas dinámicas y descriptores directos
+
+Una tabla estática sirve para almacenamiento, pero un servidor de red crea y cierra descriptores todo el rato. Dos herramientas lo resuelven. La primera, actualizar ranuras en caliente sin re-registrar todo:
+
+```c
+/* Sustituir dos ranuras sin desregistrar la tabla completa */
+int nuevos[2] = { fd_a, fd_b };
+io_uring_register_files_update(&ring, /*off=*/10, nuevos, 2);
+```
+
+La segunda, y más radical, son los **descriptores directos**: una operación como `accept` u `openat` instala el nuevo descriptor **directamente en la tabla registrada**, sin que jamás exista un `fd` en el espacio del proceso. Nunca tocas la tabla de descriptores del núcleo ni pagas su bloqueo.
+
+```c
+/* accept_direct instala el socket en la tabla; IORING_FILE_INDEX_ALLOC elige la ranura */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_accept_direct(sqe, listen_fd, NULL, NULL, 0, IORING_FILE_INDEX_ALLOC);
+io_uring_submit(&ring);
+/* el CQE devuelve en cqe->res el índice asignado, listo para READ con IOSQE_FIXED_FILE */
+```
+
+<Callout type="tip" title="Los descriptores directos evitan la tabla de fd compartida">
+La tabla de descriptores de un proceso (`files_struct`) está protegida por un cerrojo que todos los hilos comparten: instalar un `fd` clásico con `accept` la bloquea. Los descriptores directos escriben en la tabla privada del `io_uring`, que no comparte ese cerrojo, así que un servidor con decenas de hilos aceptando conexiones deja de serializar en ese punto. Además, un descriptor directo nunca es visible por número desde el proceso, lo que reduce la superficie a `dup`, fugas y cierres accidentales.
+</Callout>
+
+<Cards>
+  <Card icon="📌" title="Búfer registrado">
+    Páginas fijadas una vez con `get_user_pages`. `READ_FIXED`/`WRITE_FIXED` los referencian por `buf_index`. Elimina el pin/unpin por operación.
+  </Card>
+  <Card icon="🗂️" title="Descriptor fijo">
+    Tabla de `struct file` cacheadas. `IOSQE_FIXED_FILE` convierte `sqe->fd` en índice. Sin `fget`/`fput` en el camino caliente.
+  </Card>
+  <Card icon="✨" title="Descriptor directo">
+    `accept`/`open` instalan el descriptor dentro de la tabla, sin `fd` de usuario. Ni tabla de descriptores del proceso ni su cerrojo.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="Registrar fija memoria: cuenta contra RLIMIT_MEMLOCK">
+Fijar páginas no es gratis en el otro sentido: esa memoria queda inmovilizada y no puede desalojarse ni swapearse mientras esté registrada. El total se contabiliza contra `RLIMIT_MEMLOCK` del proceso, y un pool de búferes registrados demasiado grande fallará el registro con `ENOMEM` o `EPERM`. Registrar es un compromiso de RAM real: dimensiona el pool, no lo infles.
+</Callout>
+
+```bash
+# Cuánta memoria puede fijar el proceso: el techo que topa el registro de búferes
+ulimit -l                       # KiB fijables (RLIMIT_MEMLOCK); súbelo si el registro falla
+```
+
+<Callout type="dios" title="Registrar es mover la validación fuera del bucle">
+Detente en la forma de esta idea, porque reaparecerá en todo el nivel. Cada operación de E/S encierra dos clases de trabajo: el trabajo *variable* —qué bytes, a qué offset, hacia dónde— y el trabajo *invariante* —¿es válido este descriptor?, ¿están estas páginas en RAM?—. La E/S clásica los mezcla y repite el invariante en cada llamada, como quien revalida el pasaporte en cada paso de un aeropuerto que ya cruzó. Registrar separa ambos: pagas la validación una vez, obtienes un vale barato —un índice—, y el camino caliente solo hace el trabajo que de verdad cambia. Es la misma optimización que un JIT aplica al sacar una comprobación fuera de un bucle, o que un `kmem_cache` aplica al preconstruir objetos. Y no es un mero detalle de rendimiento: es la precondición de todo lo que sigue. `IORING_SETUP_SQPOLL` (siguiente lección) pone a un hilo del kernel a vaciar tu cola sin tu contexto, y ese hilo **no puede** hacer `fget` de un descriptor arbitrario de tu proceso; solo funciona sobre descriptores fijos. Registrar no es una opción para exprimir el último 5 por ciento: es lo que hace posible que el kernel opere en tu nombre sin ti. Interioriza que la abstracción rápida no es la que hace el trabajo deprisa, sino la que consigue no repetir el que ya estaba hecho.
+</Callout>
+
+<Reto title="Saca el pin del camino caliente">
+1. Escribe un bucle que lea 100000 bloques de 4 KiB con `io_uring_prep_read` normal y perfila con `perf top` cuánto tiempo se va en `get_user_pages_fast` y `__fget`.
+2. Convierte el búfer a registrado con `io_uring_register_buffers` y las lecturas a `io_uring_prep_read_fixed`; vuelve a perfilar y compara.
+3. Registra el descriptor con `io_uring_register_files` y marca `IOSQE_FIXED_FILE`; confirma que `__fget` desaparece del perfil.
+4. Monta un `accept_direct` con `IORING_FILE_INDEX_ALLOC` y lee del socket resultante sin que exista nunca un `fd` en tu proceso.
+5. Argumenta en tres líneas por qué `IORING_SETUP_SQPOLL` prácticamente exige descriptores fijos.
+</Reto>

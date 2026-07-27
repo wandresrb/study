@@ -1,0 +1,143 @@
+---
+title: "Por qué Rust en el kernel: matar la clase de bug dominante"
+description: "Alrededor del 70% de las vulnerabilidades graves del kernel son errores de gestión de memoria — use-after-free, buffer overflow, doble free, data races — y Rust las elimina en tiempo de compilación, sin recolector de basura y sin coste en runtime. Esta lección explica la clase de bug que domina el CVE, qué garantiza el borrow checker y la decisión de 2022 a 2026 que convirtió a Rust en lenguaje central del kernel."
+subject: kernel
+level: 54
+order: 1
+icon: "54.1"
+duracion: "17 min"
+---
+
+<Lead>
+Durante treinta años el kernel se escribió en C y ensamblador, y durante treinta años la misma familia de errores reapareció en cada auditoría: un puntero que se usa después de liberarse, un índice que se sale del array, una memoria que se libera dos veces. No son descuidos de programadores mediocres; los comete la gente que escribe el software más revisado del planeta, porque C no da ninguna herramienta para impedirlos. La entrada de Rust en el kernel no es una moda de lenguaje: es la decisión estratégica de atacar, de raíz y en tiempo de compilación, la clase de bug que produce la mayoría de las vulnerabilidades explotables.
+</Lead>
+
+<Objetivos>
+
+- Reconocer que en torno al 70% de las vulnerabilidades graves del kernel son errores de memoria.
+- Distinguir las clases que Rust elimina: use-after-free, buffer overflow, doble free y data races.
+- Entender por qué esa garantía es en compilación, sin recolector y sin coste en runtime.
+- Situar la decisión de 2022 a 2026 que hizo de Rust un lenguaje central junto a C.
+
+</Objetivos>
+
+## La clase de bug que domina el CVE
+
+Cuando Microsoft y el equipo de seguridad de Chrome clasificaron años de vulnerabilidades graves, llegaron al mismo número por caminos independientes: cerca del **70%** eran errores de seguridad de memoria. Los análisis de CVE del propio kernel de Linux muestran el mismo patrón, con el `use-after-free` como el patógeno más frecuente y más explotable. La razón es estructural: en C, el compilador no sabe cuándo un puntero deja de ser válido, así que no puede quejarse.
+
+```c
+struct conexion *c;
+
+c = kmalloc(sizeof(*c), GFP_KERNEL);
+/* ...se usa la conexion... */
+kfree(c);                 /* la memoria vuelve al asignador */
+
+/* miles de lineas despues, en otra ruta del codigo: */
+c->estado = ACTIVA;       /* use-after-free: el compilador de C calla */
+```
+
+El mismo silencio cubre el desbordamiento de un buffer, donde un índice fuera de rango escribe sobre la memoria del vecino sin que nada lo detenga:
+
+```c
+u8 cabecera[16];
+cabecera[indice] = valor;   /* si indice >= 16, pisa memoria contigua: nadie avisa */
+```
+
+Ese fragmento compila sin una sola advertencia. En producción, `c` puede apuntar ya a otra estructura recién asignada en el mismo hueco, y escribir en `c->estado` corrompe un objeto ajeno: la base de un exploit. La misma indiferencia del compilador permite tres familias hermanas, y todas comparten el mismo origen: nadie vigila la validez ni la propiedad de la memoria.
+
+<Cards>
+  <Card icon="🎯" title="Use-after-free">
+    Usar un puntero después de `kfree`. El hueco puede alojar ya otro objeto, y escribir en él corrompe memoria ajena. Es el patógeno más frecuente y explotable del kernel.
+  </Card>
+  <Card icon="📏" title="Buffer overflow">
+    Un índice fuera de rango que pisa la memoria contigua. En C nadie comprueba los límites, y el desbordamiento es silencioso hasta que corrompe algo crítico.
+  </Card>
+  <Card icon="♻️" title="Doble free">
+    Liberar dos veces el mismo puntero corrompe las listas internas del asignador y abre la puerta a redirigir asignaciones futuras.
+  </Card>
+  <Card icon="🏁" title="Data race">
+    Dos CPUs tocando el mismo dato sin sincronización. El resultado es no determinista y, a menudo, una estructura corrupta.
+  </Card>
+</Cards>
+
+## Qué garantiza el borrow checker
+
+Rust ataca el origen. Su sistema de tipos codifica tres reglas que el compilador verifica antes de emitir código: cada valor tiene un **dueño** único; cuando el dueño desaparece, el valor se libera; y las **referencias** a un valor no pueden sobrevivir al valor ni convivir una mutable con otras. El `borrow checker` es el paso del compilador que demuestra esas reglas. El mismo error de antes, traducido a Rust, no llega al binario:
+
+```rust
+let c = KBox::new(Conexion::nueva(), GFP_KERNEL)?;
+consumir(c);              // `c` se MUEVE hacia consumir; aqui deja de existir
+
+c.estado = Estado::Activa; // error[E0382]: borrow of moved value: `c`
+```
+
+`rustc` rechaza la compilación con `E0382`: `c` fue movido a `consumir`, su dueño cambió, y el nombre `c` ya no designa nada válido. El `use-after-free` no es un bug que Rust detecte en ejecución con un `sanitizer`: es un programa que **no se puede escribir**. Lo mismo ocurre con el resto de la familia, y cada garantía cae de una regla distinta del sistema de tipos:
+
+```rust
+// Buffer overflow: el acceso a un slice comprueba limites. El desborde
+// se vuelve un panic controlado, no una corrupcion silenciosa contigua.
+let x = registros[i];          // panic si i >= len, jamas comportamiento indefinido
+
+// Data race: compartir un dato entre CPUs exige que su tipo sea `Sync`.
+// Si no lo es, el programa concurrente ni siquiera compila.
+fn en_otra_cpu(d: &Contador) { /* ... */ }   // solo valido si Contador es Sync
+```
+
+Las semánticas de **movimiento** hacen imposible el `double free`, porque tras mover un valor su antiguo nombre queda inutilizable y no hay forma de destruirlo dos veces. La **acotación de límites** convierte el `buffer overflow` en un fallo controlado en el punto exacto, no en una escritura fuera de rango que se descubre horas después. Y el sistema de marcas `Send` y `Sync` prohíbe compartir entre hilos lo que no es seguro compartir, cerrando la puerta a la `data race` en compilación. Una clase de bug, una regla que la clausura: esa es la simetría que hace de Rust algo más que un C con mejores avisos.
+
+El corazón de todas esas reglas es una sola invariante, la más profunda del lenguaje: en todo momento, un dato puede tener muchas referencias de solo lectura **o** una única de escritura, pero jamás ambas a la vez. Esa disyunción —compartir o mutar, nunca las dos— es exactamente la condición que vuelve imposible la `data race`, y el compilador la impone incluso en código de un solo hilo:
+
+```rust
+let mut c = Contador { n: 0 };
+let solo_leer = &c;          // prestamo compartido: acceso de solo lectura
+let escribir = &mut c;       // error[E0502]: no se puede prestar `c` como
+                             // mutable porque sigue prestado en solo_leer
+```
+
+No es una restricción sobre la concurrencia añadida aparte: es la misma regla de propiedad, y de ella se deducen a la vez la ausencia de `data race` y la de `use-after-free`, porque una referencia nunca puede sobrevivir al dato del que la tomó prestada. Un único principio geométrico —quién puede mirar y quién puede tocar, y nunca a la vez— sostiene todo el edificio de la seguridad.
+
+<Callout type="info" title="El unsafe no es una trampa, es una frontera">
+Rust no niega que el kernel necesite operaciones peligrosas: desreferenciar un puntero crudo del hardware, hablar con una API C. Las encierra tras la palabra `unsafe`, que marca los pocos lugares donde el programador —no el compilador— responde por la corrección. La diferencia con C es de superficie: en C todo el programa es implícitamente `unsafe`; en Rust ese poder queda confinado a bloques pequeños, auditables y buscables con `grep`. Lo veremos en detalle en la lección 54.3.
+</Callout>
+
+## Sin recolector, sin coste en runtime
+
+La objeción evidente es el precio. Los lenguajes que garantizan seguridad de memoria suelen pagarla con un **recolector de basura** que se detiene a rastrear la memoria viva, y un recolector es inadmisible en un kernel: introduce pausas impredecibles justo donde hace falta latencia acotada, y no puede correr en el contexto de interrupción. Rust no usa recolector. Sus garantías se demuestran en compilación y se **borran** del binario: el `borrow checker` no deja rastro en el código máquina, y la liberación de memoria se inserta de forma determinista donde el dueño sale de ámbito, exactamente como el `kfree` que tú habrías escrito a mano.
+
+```rust
+// El iterador con acotacion de limites y el bucle crudo compilan
+// al MISMO codigo maquina: las abstracciones de Rust son de coste cero.
+let suma: u32 = registros.iter().map(|r| r.contador).sum();
+```
+
+Esa filosofía tiene nombre: **abstracciones de coste cero**. Lo que no usas no lo pagas, y lo que usas no podrías haberlo escrito mejor a mano. La monomorfización especializa los genéricos en tiempo de compilación, el `inlining` disuelve las capas, y el resultado es un binario indistinguible del equivalente en C, con la misma disposición de memoria y la misma llamada al mismo `kmalloc`. La seguridad no se paga en `runtime`; se paga una sola vez, en el compilador, cuando este rechaza el programa incorrecto.
+
+Este punto es el que desarma la objeción más común de la comunidad del kernel. Un kernel no puede permitirse ni una pausa de recolector, ni un `runtime` que crezca bajo los pies, ni indeterminismo en la latencia: gobierna hardware con plazos de microsegundos y corre en contextos donde ceder la CPU está prohibido. Cualquier lenguaje seguro que exigiera un recolector quedaba descartado de entrada. Rust es la primera propuesta que ofrece seguridad de memoria **sin** ese peaje, porque su modelo de propiedad resuelve en compilación lo que otros resuelven rastreando en ejecución. Por eso encaja donde ningún otro lenguaje seguro podía: no pide nada que el contexto de interrupción no pueda dar.
+
+## La decisión: de 2022 a 2026
+
+El soporte de Rust se fusionó en Linux **6.1** en diciembre de 2022, tras años de RFC y de prototipos, y entró marcado como *experimental*: un pie dentro de la puerta, con el compromiso explícito de que Rust nunca reemplazaría a C ni obligaría a reescribir nada. Durante los años siguientes maduraron el crate `kernel`, las abstracciones seguras y los primeros drivers reales. En **julio de 2026** cae la etiqueta de experimental: Rust pasa a ser un lenguaje de primera clase del kernel, junto a C y ensamblador, y el subsistema de gráficos fija la política más contundente hasta la fecha — los drivers de GPU **nuevos** solo se aceptan en Rust.
+
+La cronología no es un trámite administrativo: refleja la única forma en que un cambio así podía ocurrir en un proyecto de esta magnitud. Primero una prueba de concepto que no molesta a nadie porque nada depende de ella; luego años de maduración silenciosa mientras las abstracciones se ganan la confianza de los mantenedores; después los primeros drivers que demuestran que la promesa funciona en hardware real; y solo entonces, cuando el terreno ya está probado, la retirada de la etiqueta de experimental y la primera política que exige Rust para lo nuevo. Cada paso desactivó una objeción antes de dar el siguiente. Los detalles técnicos de esa convivencia —la FFI, los `bindings`, el crate `kernel`— son el tema de la lección 54.2.
+
+<Callout type="tip" title="El Rust del kernel no es el Rust de aplicación">
+Aunque el lenguaje es idéntico, el kernel usa `no_std`: no hay biblioteca estándar, ni el `Vec` o el `String` de siempre, ni un `panic` que se limite a abortar un proceso. En su lugar están el crate `kernel` y sus tipos propios —`KBox`, `Arc`, `Result`— pensados para un mundo sin sistema operativo debajo. Si llegas desde Rust de aplicación, la sintaxis te resultará familiar pero el vocabulario será nuevo; y ese vocabulario es justo lo que desmontan las cuatro lecciones restantes de este nivel.
+</Callout>
+
+<Mermaid code={`timeline
+  2021 : Primeras RFC de Rust for Linux
+  2022 : Fusion en Linux 6.1 marcado experimental
+  2024 : Madura el crate kernel y llegan drivers reales
+  2026 : Julio deja de ser experimental y es lenguaje central`} />
+
+<Callout type="dios" title="No es un lenguaje nuevo: es mover la verificación del humano al compilador">
+Detente en lo que de verdad ha cambiado, porque es más profundo que sustituir una sintaxis por otra. Durante toda la historia de C la corrección de la memoria fue una obligación del programador: cada `kfree` era una promesa personal de que nadie volvería a tocar ese puntero, cada índice una apuesta de que el array era suficientemente grande, cada acceso compartido un pacto tácito de que otro hilo respetaba el mismo lock. El kernel funciona porque miles de personas cumplen esas promesas casi siempre; las vulnerabilidades son las veces que alguien, una en diez mil, no la cumplió. Rust no pide cumplir mejor la promesa: cambia quién la verifica. Traslada del humano al compilador la carga de demostrar que la memoria se usa bien, y lo hace con un sistema de tipos lo bastante expresivo para codificar propiedad, vida y exclusión como hechos matemáticos que la máquina comprueba antes de emitir una sola instrucción. Esto invierte la economía del error. En C, escribir el bug es gratis y encontrarlo cuesta una auditoría, un `fuzzer` o un incidente en producción; en Rust, el bug de memoria no llega a existir porque el programa que lo contiene no compila. Y como la demostración ocurre en compilación y se borra del binario, no se paga con un recolector ni con pausas ni con ciclos: se paga una vez, con el rigor de tener que convencer al compilador. Cuando internalizas que el 70% de las vulnerabilidades graves no son mala suerte sino la consecuencia inevitable de un lenguaje que no puede razonar sobre la memoria, entiendes que meter Rust en el kernel no es adoptar una herramienta más moderna: es reconocer que la verificación de la clase de bug más peligrosa del software de sistemas era demasiado importante para dejarla en manos de la disciplina humana, y devolvérsela a la máquina.
+</Callout>
+
+<Reto title="Mide la clase de bug que Rust elimina">
+1. Busca en la base de datos de CVE del kernel tres vulnerabilidades recientes de `use-after-free` y clasifica cada una según qué la habría impedido: propiedad, vida o exclusión.
+2. Escribe en C un `double free` que compile sin advertencias y razona por qué el compilador no puede detectarlo.
+3. Traduce ese mismo programa a Rust con `KBox` y describe con qué error de `rustc` se rechaza, y en qué regla del `borrow checker` se apoya.
+4. Explica, en tres líneas, por qué un recolector de basura sería inadmisible en el contexto de interrupción del nivel 34.
+5. Argumenta por qué la política de gráficos de 2026 —drivers nuevos solo en Rust— es coherente con la estadística del 70% y no una imposición arbitraria.
+</Reto>

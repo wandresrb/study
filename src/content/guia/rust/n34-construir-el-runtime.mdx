@@ -1,0 +1,152 @@
+---
+title: "El runtime por dentro: tokio::main, multihilo y construcción manual"
+description: "El atributo tokio::main es azúcar que oculta una decisión: qué scheduler arranca tu programa. Multihilo con robo de trabajo o current_thread de un solo hilo cambian las garantías que tu código debe cumplir. Detrás del atributo vive un Builder que puedes invocar a mano para controlar hilos, drivers y puntos de entrada, y un Handle para entrar al runtime desde código síncrono."
+subject: rust
+level: 34
+order: 2
+icon: "34.2"
+duracion: "18 min"
+---
+
+<Lead>
+`#[tokio::main]` es la primera línea de casi todo programa async, y precisamente por cómoda es fácil no ver lo que decide por ti. No es magia: es una macro que **reescribe** tu `async fn main` en una `fn main` síncrona que construye un runtime y hace `block_on`. La pregunta interesante es *qué* runtime construye, porque ahí se juega una elección con consecuencias: el scheduler **multihilo** con robo de trabajo o el **current_thread** de un solo hilo imponen contratos distintos a tu código. Y por debajo del atributo vive un `Builder` que puedes llamar a mano cuando el azúcar no basta: para fijar el número de hilos, activar solo los drivers que uses, o arrancar un runtime desde un `main` que no puede ser async. Abrir esta caja es dejar de programar de memoria.
+</Lead>
+
+<Objetivos>
+
+- Ver en qué expande `#[tokio::main]` y por qué el `main` real es síncrono.
+- Contrastar el scheduler multihilo con el `current_thread` y las garantías que cambia.
+- Construir un `Runtime` a mano con `Builder`, eligiendo hilos y drivers con `enable_all`.
+- Usar `block_on`, `spawn` y `Handle` para tender puentes entre lo síncrono y lo asíncrono.
+
+</Objetivos>
+
+## Qué expande #[tokio::main]
+
+La macro no añade capacidades ocultas; solo escribe por ti un `main` síncrono que ninguna función `async fn main` podría ser. Estas dos versiones son equivalentes:
+
+```rust
+#[tokio::main]
+async fn main() {
+    trabajo().await;
+}
+```
+
+```rust
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()          // activa driver de E/S y timer
+        .build()
+        .unwrap()
+        .block_on(async {
+            trabajo().await;
+        });
+}
+```
+
+Tres verbos concentran todo: `new_multi_thread` elige el scheduler; `enable_all` enciende el driver de E/S y el timer del nivel anterior; `block_on` es el **puente** que conduce el future del `main` hasta el final sobre el hilo actual, bloqueando ese hilo hasta que termina. La macro por defecto usa el scheduler multihilo. Con `#[tokio::main(flavor = "current_thread")]` cambia a `new_current_thread`, y con `worker_threads = N` fija cuántos hilos trabajadores tendrá el multihilo.
+
+Los valores por defecto merecen conocerse porque son los que heredas al no decir nada. El multihilo arranca tantos hilos trabajadores como núcleos lógicos detecte el sistema —ni uno más, porque más hilos que núcleos solo añaden cambios de contexto sin ganar paralelismo—. Aparte de esos trabajadores, todo runtime mantiene en reserva un **pool de hilos de bloqueo** que empieza vacío y crece bajo demanda hasta 512, destinado a `spawn_blocking` (nivel 34.5); no lo confundas con los trabajadores del scheduler, son dos poblaciones de hilos con propósitos opuestos.
+
+## Multihilo frente a current_thread
+
+No son dos ajustes de rendimiento intercambiables: son dos **modelos** con contratos distintos. El multihilo levanta un pool de hilos trabajadores —por defecto, uno por núcleo— y reparte las tareas entre ellos robándose trabajo. Una tarea puede empezar en un hilo y continuar en otro. Esa movilidad es justo la razón de que `tokio::spawn` exija `Send + 'static`: el future debe poder **cruzar** de hilo.
+
+El `current_thread`, en cambio, conduce todas las tareas sobre un único hilo, intercalándolas cooperativamente. Nada cruza de hilo, así que las tareas ya no necesitan ser `Send`; puedes usar dentro tipos como `Rc` que el multihilo prohíbe. El precio es que no hay paralelismo: si una tarea monopoliza el hilo, las demás esperan.
+
+<Callout type="tip" title="Cuándo elegir current_thread">
+El multihilo es el valor por defecto sensato para un servidor: aprovecha todos los núcleos. Reserva `current_thread` para tres casos: pruebas deterministas —una tarea a la vez, sin no-determinismo entre hilos—; escenarios de un solo núcleo o embebido; y cuando quieres usar tipos `!Send` (como `Rc` o punteros a datos locales al hilo) sin pelear con el borrow checker. No es "el runtime lento", es "el runtime sin cruce de hilos".
+</Callout>
+
+## Construir un Runtime a mano
+
+A veces el atributo estorba: quieres un `main` síncrono que arranca otras cosas antes del runtime, necesitas ajustar el pool con precisión, o construyes un runtime dentro de una librería. El `Builder` te da control total, y el `Runtime` resultante es un valor normal que posees y sueltas:
+
+```rust
+use tokio::runtime::Builder;
+
+fn main() {
+    let rt = Builder::new_multi_thread()
+        .worker_threads(4)              // 4 hilos, no uno por nucleo
+        .thread_name("mi-runtime")
+        .enable_all()                   // E/S y timer; enable_io/enable_time por separado
+        .build()
+        .expect("no se pudo construir el runtime");
+
+    let resultado = rt.block_on(async {
+        let a = tokio::spawn(async { 20 });
+        let b = tokio::spawn(async { 22 });
+        a.await.unwrap() + b.await.unwrap()
+    });
+
+    println!("resultado: {resultado}");
+    // al soltar rt aqui, el runtime se apaga y espera a sus hilos
+}
+```
+
+Dos matices de diseño importan. Primero, `enable_all` no es decorativo: si omites el driver de tiempo, todo `sleep` entrará en pánico porque no hay quién lo atienda; activa solo lo que uses si buscas un binario mínimo. Segundo, el `Runtime` es dueño de sus hilos trabajadores: cuando la variable `rt` se suelta, el runtime inicia su apagado y espera a que los hilos terminen, aplicando el `Drop` determinista del nivel 8 a un recurso tan pesado como un pool entero.
+
+## block_on, spawn y Handle
+
+Un `Runtime` ofrece tres verbos para relacionarte con él. `block_on` conduce un future hasta el final **bloqueando** el hilo llamante —es tu entrada desde el mundo síncrono—. `spawn` entrega un future al runtime como tarea independiente y devuelve un `JoinHandle` sin bloquear. Y cuando necesitas invocar a Tokio desde código que no tiene el `Runtime` a mano, existe el `Handle`: una referencia clonable y barata al runtime.
+
+```rust
+use tokio::runtime::Handle;
+
+fn desde_codigo_sincrono() {
+    // Handle::current() solo funciona dentro del contexto de un runtime
+    let handle = Handle::current();
+    handle.spawn(async {
+        // corre sobre el runtime aunque estemos en una funcion no async
+    });
+}
+```
+
+`Handle::current()` recupera el runtime en cuyo contexto se ejecuta el hilo, y falla si no hay ninguno —"debe llamarse dentro de un runtime de Tokio"—. Es el mecanismo que usan librerías y callbacks síncronos para volver a inyectar trabajo asíncrono sin recibir el `Runtime` como parámetro.
+
+Hay una pieza gemela para el problema inverso: entrar al *contexto* del runtime sin conducir un future. Muchas funciones de Tokio —crear un `TcpStream`, armar un `sleep`— exigen ejecutarse "dentro de un runtime" aunque tú no vayas a hacer `await` en ese instante. `Runtime::enter` devuelve una guarda que instala ese contexto en el hilo actual mientras viva:
+
+```rust
+let rt = tokio::runtime::Runtime::new().unwrap();
+let _guard = rt.enter();     // instala el contexto en este hilo
+// aqui dentro, funciones que exigen "estar en un runtime" ya no entran en panico;
+// al soltar _guard, el contexto se retira. No conduce ningun future: eso es block_on.
+```
+
+La distinción es fina pero importa: `block_on` **conduce** un future y bloquea; `enter` solo **marca** el hilo como perteneciente al runtime para que las APIs que lo exigen funcionen. Confundirlas lleva a los pánicos "must be called from within a runtime" que desconciertan a quien mezcla código síncrono y asíncrono sin tener presente esta frontera de contexto.
+
+<Mermaid code={`flowchart TD
+  A[tokio main sobre tu async fn main] --> B[Builder elige el scheduler]
+  B --> M[new_multi_thread reparte entre hilos]
+  B --> C[new_current_thread usa un solo hilo]
+  M --> E[enable_all activa E S y timer]
+  C --> E
+  E --> D[build produce el Runtime]
+  D --> O[block_on conduce el future y bloquea el hilo]
+  D --> S[spawn lanza tareas sin bloquear]
+  D --> H[handle permite entrar desde codigo sincrono]
+  style A fill:#cba6f7,color:#11111b
+  style M fill:#89b4fa,color:#11111b
+  style C fill:#fab387,color:#11111b
+  style D fill:#a6e3a1,color:#11111b
+  style O fill:#f9e2af,color:#11111b`} />
+
+<Callout type="warn" title="No construyas un runtime dentro de otro">
+Llamar a `Runtime::new()` o `block_on` **dentro** de una tarea que ya corre sobre un runtime provoca un pánico: "Cannot start a runtime from within a runtime". El error parece caprichoso pero es lógico: `block_on` bloquea el hilo trabajador, y bloquear un trabajador es exactamente lo que async existe para evitar. Si necesitas ejecutar código bloqueante desde una tarea, la herramienta es `spawn_blocking` (nivel 34.5), no un runtime anidado.
+</Callout>
+
+<Callout type="dios" title="El atributo es una decisión disfrazada de conveniencia">
+`#[tokio::main]` es un caso de estudio de cómo el azúcar sintáctico, al hacer invisible una decisión, la hace también irreflexiva. Lo que la macro esconde no es complejidad accidental —el `Builder` de cuatro líneas no es difícil—, sino una **elección de modelo de concurrencia** que determina qué puede y qué no puede hacer tu código. Cuando escribes el atributo sin pensar, heredas el scheduler multihilo, y con él un contrato: cada tarea que lances será obligada a ser `Send + 'static`, porque el runtime se reserva el derecho de moverla de hilo en mitad de su ejecución. Ese contrato no es una molestia arbitraria del compilador; es la **sombra** de una decisión que tomaste sin verla al escribir seis caracteres de atributo. El día que un error te diga "el future no es `Send`" y no entiendas por qué, la respuesta estará aquí: elegiste, sin saberlo, un runtime que mueve tareas entre hilos, y el borrow checker está haciendo cumplir esa elección en tiempo de compilación. La lección más honda es que en Rust el modelo de ejecución y el sistema de tipos no son capas separadas: la elección de scheduler *reverbera* hacia arriba hasta las restricciones que tu código debe satisfacer. Un `current_thread` relaja `Send` porque garantiza que nada cruza de hilo; un multihilo lo exige porque no puede garantizarlo. El tipo de tus tareas es, literalmente, una consecuencia del scheduler que arrancaste. Por eso abrir la caja del atributo no es un ejercicio de curiosidad, sino de responsabilidad: quien construye el runtime a mano ve la decisión que toma —`new_multi_thread` frente a `new_current_thread`, cuántos hilos, qué drivers— en lugar de heredarla ciega. Y cuando entiendes que `block_on` bloquea el hilo llamante, que `spawn` no, y que un `Handle` es el pasaporte para volver a entrar desde lo síncrono, dejas de ver el runtime como un pórtico mágico al que se entra con un atributo y empiezas a verlo como lo que es: un objeto que construyes, posees, configuras y sueltas, con un `Drop` que apaga un pool de hilos con la misma naturalidad con que sueltas un `String`.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+`#[tokio::main]` reescribe tu `async fn main` en una `fn main` síncrona que construye un runtime con `Builder`, hace `enable_all` y llama a `block_on`. El scheduler **multihilo** (por defecto, un hilo por núcleo) mueve tareas entre hilos y por eso `spawn` exige `Send + 'static`; el **current_thread** usa un solo hilo, relaja `Send` y admite tipos `!Send`, a costa del paralelismo. A mano, `Builder::new_multi_thread().worker_threads(n).enable_all().build()` da control total, y el `Runtime` es un valor que posees y cuyo `Drop` apaga el pool. `block_on` conduce y bloquea; `spawn` lanza sin bloquear; `Handle` y `enter` tienden puentes desde código síncrono. Nunca anides un runtime dentro de otro.
+</Callout>
+
+<Reto title="Toma el control del runtime">
+1. Reescribe un `#[tokio::main]` como un `fn main` síncrono equivalente usando `Builder::new_multi_thread`, `enable_all` y `block_on`. Confirma que se comporta igual.
+2. Cambia a `flavor = "current_thread"` e intenta meter un `Rc` compartido entre dos tareas; observa que ahora compila donde el multihilo lo rechazaría, y explica por qué.
+3. Construye un runtime con `worker_threads(1)` y otro con el número de núcleos; mide un trabajo con varias tareas y razona la diferencia.
+4. Provoca a propósito un pánico "Cannot start a runtime from within a runtime" y explica qué hilo se intentó bloquear.
+5. Desde una función síncrona invocada dentro de una tarea, usa `Handle::current()` para lanzar más trabajo; explica cuándo `Handle::current()` fallaría.
+</Reto>
