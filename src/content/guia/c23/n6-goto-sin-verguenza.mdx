@@ -1,0 +1,169 @@
+---
+title: "goto sin vergüenza"
+description: "El patrón de limpieza en cascada del kernel de Linux: por qué C necesita goto, cómo nombrar las etiquetas, la mejora de C23 con etiquetas al final de bloque, y las alternativas con sus límites reales."
+subject: c23
+level: 6
+order: 4
+icon: "6.4"
+duracion: "13 min"
+---
+
+<Lead>
+La carta de Dijkstra de 1968 no decía que `goto` fuera malo: decía que el salto arbitrario destruye la correspondencia entre el texto del programa y su ejecución. Sesenta años después, C sigue teniendo `goto` y el kernel de Linux lo usa miles de veces, siempre con la misma forma. No es una excepción vergonzante al buen estilo: es la respuesta correcta a un agujero concreto del lenguaje, la ausencia de destructores.
+</Lead>
+
+<Objetivos>
+
+- Entender por qué C, sin destructores ni `defer`, necesita un salto de salida.
+- Escribir el patrón de limpieza en cascada tal como se usa en el kernel.
+- Aplicar las reglas de disciplina: hacia adelante, etiquetas con nombre y orden inverso.
+- Conocer las alternativas y sus límites: `__attribute__((cleanup))` y anidamiento.
+
+</Objetivos>
+
+## Por qué C necesita goto
+
+Cuando una función adquiere varios recursos, cada fallo intermedio obliga a deshacer **exactamente** lo adquirido hasta ese punto. C++ resuelve esto con destructores, Go con `defer`, Rust con `Drop`. C no tiene nada de eso, así que quedan tres caminos: anidar, duplicar o saltar.
+
+```c
+/* Camino 1: anidar. Legible con dos recursos, ilegible con cinco. */
+void abrir_anidado(void)
+{
+    FILE *f = fopen("datos", "rb");
+    if (f) {
+        char *buf = malloc(4096);
+        if (buf) {
+            int fd = crear_socket();
+            if (fd >= 0) {
+                /* trabajo real: sepultado a cuatro niveles */
+                cerrar_socket(fd);
+            }
+            free(buf);
+        }
+        fclose(f);
+    }
+}
+```
+
+El anidamiento empuja la lógica útil hacia la derecha y la mezcla con la gestión de errores. La duplicación —repetir el bloque de liberación en cada `return`— es peor: cada vez que añades un recurso hay que tocar N puntos de limpieza, y el día que olvides uno tendrás una fuga que ningún test funcional detecta. `goto` da la tercera opción: **una sola** ruta de salida, escrita una vez, escalonada.
+
+## El patrón de limpieza en cascada
+
+Esta es la forma canónica. Las etiquetas se ordenan de modo que cada punto de entrada libere justo lo que ya se había adquirido, y la caída natural entre etiquetas hace el resto:
+
+```c
+int procesar_todo(const char *ruta)
+{
+    int ret;
+
+    FILE *f = fopen(ruta, "rb");
+    if (!f)
+        return -EIO;                 /* nada adquirido: salida directa */
+
+    char *buf = malloc(BUF_SZ);
+    if (!buf) {
+        ret = -ENOMEM;
+        goto err_cerrar;             /* deshace: fopen */
+    }
+
+    int fd = crear_socket();
+    if (fd < 0) {
+        ret = fd;
+        goto err_liberar;            /* deshace: malloc y fopen */
+    }
+
+    ret = trabajo_real(f, buf, fd);
+    if (ret)
+        goto err_socket;             /* deshace: socket, malloc y fopen */
+
+    ret = 0;
+
+err_socket:
+    cerrar_socket(fd);
+err_liberar:
+    free(buf);
+err_cerrar:
+    fclose(f);
+    return ret;
+}
+```
+
+Fíjate en la propiedad clave: la cascada se recorre **en orden inverso al de adquisición**, igual que lo haría una pila de destructores. Y el camino de éxito atraviesa exactamente las mismas etiquetas, así que solo hay una secuencia de liberación en todo el cuerpo. Añadir un cuarto recurso significa insertar un bloque y una etiqueta, no revisar cinco `return`.
+
+<Mermaid code={`flowchart TD
+  A[fopen] -->|falla| X[return codigo de error]
+  A -->|ok| B[malloc]
+  B -->|falla| L3[err_cerrar: fclose]
+  B -->|ok| C[crear socket]
+  C -->|falla| L2[err_liberar: free]
+  C -->|ok| D[trabajo real]
+  D --> L1[err_socket: cerrar socket]
+  L1 --> L2
+  L2 --> L3
+  L3 --> Z[return ret]
+  style L1 fill:#f9e2af,color:#11111b
+  style L2 fill:#f9e2af,color:#11111b
+  style L3 fill:#f9e2af,color:#11111b
+  style Z fill:#a6e3a1,color:#11111b`} />
+
+## Las reglas de la casa
+
+El patrón solo se sostiene si lo aplicas con disciplina. Estas son las cuatro normas que el kernel impone de facto y que `checkpatch` vigila en parte:
+
+<Cards>
+  <Card icon="⬇️" title="Solo hacia adelante">
+    Un salto hacia atrás convierte el flujo en un bucle disfrazado. Si necesitas repetir, usa un bucle de verdad.
+  </Card>
+  <Card icon="🏷️" title="Etiquetas que dicen qué deshacen">
+    Nombres como `err_liberar_buf` o `out_unlock`, nunca `fin1` ni `label2`. La etiqueta documenta el estado en el que entras.
+  </Card>
+  <Card icon="🔄" title="Orden inverso estricto">
+    Libera al revés de como adquiriste. Cualquier otro orden acaba usando un recurso ya liberado.
+  </Card>
+  <Card icon="🎯" title="Solo para errores y salida">
+    Nada de saltar a mitad de lógica de negocio. El único destino legítimo es la sección de limpieza al final de la función.
+  </Card>
+</Cards>
+
+Dos restricciones del lenguaje conviene tenerlas presentes. `goto` **no puede saltar dentro del alcance de un array de longitud variable**: es una violación de restricción y el compilador la rechaza, precisamente porque el array no habría sido creado. Y aunque las etiquetas tienen alcance de función entera, saltar por encima de la inicialización de una variable la deja con valor indeterminado, igual que en `switch`.
+
+C23 trae un arreglo pequeño pero agradecido: ahora una **etiqueta puede aparecer al final de un bloque**, sin sentencia detrás. En C17 había que escribir un punto y coma solitario para que compilara; ese `;` fantasma desaparece.
+
+```c
+salir:
+    desbloquear(&lock);
+fin:      /* C23: la etiqueta puede ir justo antes de la llave de cierre */
+}
+```
+
+## Alternativas y sus límites
+
+La alternativa real en GCC y Clang es `__attribute__((cleanup(fn)))`: asocia a una variable automática una función que se invoca al salir de su alcance, por cualquier vía. El kernel la usa desde 2023 en su capa `cleanup.h` con macros como `__free` y `guard`.
+
+```c
+static inline void liberar_p(void *p) { free(*(void **)p); }
+#define AUTOFREE __attribute__((cleanup(liberar_p)))
+
+int con_cleanup(void)
+{
+    AUTOFREE char *buf = malloc(4096);
+    if (!buf)
+        return -ENOMEM;
+    /* se libera solo al salir, por cualquier return */
+    return trabajo(buf);
+}
+```
+
+Sus límites son concretos: **no es estándar** —C23 no lo incluye, aunque hay una propuesta de `defer` en discusión para la siguiente revisión—, obliga a escribir una función de limpieza por tipo de recurso, y el orden de destrucción, aunque es el inverso de declaración, se vuelve difícil de auditar cuando las macros lo esconden. En código portable estricto, la cascada de `goto` sigue siendo la herramienta que todo el mundo entiende sin leer una macro.
+
+<Callout type="dios" title="goto no es un salto: es el destructor que C nunca tuvo">
+Lo que hace legítimo este patrón no es que `goto` sea inocuo, sino que aquí **no se usa como salto arbitrario**. La cascada de etiquetas es una implementación manual y explícita de la destrucción en orden inverso: la misma semántica que un compilador de C++ genera invisiblemente al final de cada alcance. Vista así, la objeción de Dijkstra —que el salto rompe la correspondencia entre texto y ejecución— no aplica, porque la cascada es **estrictamente monótona hacia adelante** y su estructura textual coincide exactamente con la pila de recursos. El criterio general que se deduce es más valioso que la regla concreta: una construcción de bajo nivel es aceptable cuando su uso está encapsulado en un patrón reconocible y verificable a simple vista, y es peligrosa cuando cada aparición hay que razonarla de cero. Por eso el kernel puede tener decenas de miles de `goto` sin volverse ilegible, y por eso el mismo `goto` en manos indisciplinadas produce código que nadie se atreve a tocar. La herramienta no decide; la disciplina sí.
+</Callout>
+
+<Reto title="Cascada limpia">
+1. Reescribe la función anidada de cuatro niveles usando cascada de etiquetas y compara la legibilidad.
+2. Añade un cuarto recurso al ejemplo y comprueba que solo tocas dos sitios.
+3. Ejecuta la versión con fallo intermedio bajo `valgrind` o ASan y verifica que no hay fugas por ninguna ruta.
+4. Implementa `AUTOFREE` con `__attribute__((cleanup))` y compara el ensamblador con la versión de `goto`.
+5. Busca en las fuentes del kernel un `goto` con etiqueta `out_unlock` y reconstruye qué recursos deshace.
+</Reto>

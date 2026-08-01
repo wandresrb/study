@@ -1,0 +1,167 @@
+---
+title: "AFL++ y el fuzzing de verdad"
+description: "Instrumentación en tiempo de enlace, fork server y modo persistente, el motor de mutaciones con diccionarios y CmpLog, y la campaña completa contra un parser real: sembrar, paralelizar, leer la pantalla y triar los hallazgos."
+subject: c23
+level: 25
+order: 4
+icon: "25.4"
+duracion: "19 min"
+---
+
+<Lead>
+`libFuzzer` vive dentro de tu proceso y fuzzea una función. `AFL++` fuzzea un **programa**: lo instrumenta, lo lanza, lo mata, lo reinicia miles de veces por segundo y mantiene una cola de entradas con una contabilidad de energía que decide a cuál dedicar el siguiente millón de mutaciones. Es la herramienta con la que se han encontrado la mayoría de los CVE de memoria de la última década, y su curva de aprendizaje está enteramente en las decisiones que toma antes de la primera mutación.
+</Lead>
+
+<Objetivos>
+
+- Elegir el modo de instrumentación adecuado y medir su estabilidad.
+- Convertir un programa que lee de fichero en un objetivo persistente rápido.
+- Dirigir el motor con diccionarios, CmpLog y planificaciones de energía.
+- Montar una campaña paralela contra un parser real y triar lo que produce.
+
+</Objetivos>
+
+## Instrumentar: del fork server al modo persistente
+
+`AFL++` reemplaza al compilador. Sus envoltorios insertan, en cada bloque básico, código que marca una transición de arista en un mapa compartido de sesenta y cinco mil bytes que el proceso padre lee tras cada ejecución.
+
+```bash
+# el mejor modo si tu proyecto enlaza con LTO: mapa sin colisiones
+export CC=afl-clang-lto CXX=afl-clang-lto++
+export AFL_LLVM_LAF_ALL=1          # parte comparaciones grandes en pequenas
+
+meson setup build-fuzz && ninja -C build-fuzz
+```
+
+Los modos importan. `afl-clang-lto` asigna identificadores de arista en tiempo de enlace y elimina las colisiones del esquema clásico de identificadores aleatorios; `afl-clang-fast` usa un paso de LLVM y es el recurso cuando LTO no es viable; `afl-gcc-fast` hace lo mismo con un plugin de GCC; y el modo QEMU instrumenta binarios **sin fuentes**, a costa de un orden de magnitud de velocidad.
+
+`AFL_LLVM_LAF_ALL` merece una explicación. Divide las comparaciones anchas en cadenas de comparaciones de un byte, de modo que acertar el primer byte de un valor mágico ya produce cobertura nueva. Convierte un acantilado de cuatro bytes en cuatro escalones.
+
+Luego viene la velocidad. El fork server evita pagar `execve` y la carga dinámica en cada ejecución: el proceso se detiene una vez inicializado y a partir de ahí se clona. El modo persistente va más allá y ejecuta miles de entradas dentro del mismo proceso:
+
+```c
+#include <unistd.h>
+#include "parser.h"
+
+__AFL_FUZZ_INIT();
+
+int main(void) {
+    biblioteca_init();               /* trabajo caro, una sola vez */
+    __AFL_INIT();                    /* el fork server arranca aqui */
+
+    unsigned char *buf = __AFL_FUZZ_TESTCASE_BUF;
+
+    while (__AFL_LOOP(100000)) {
+        int len = __AFL_FUZZ_TESTCASE_LEN;
+        struct doc *d = doc_parsear(buf, len);
+        if (d) doc_liberar(d);
+    }
+    return 0;
+}
+```
+
+```bash
+afl-clang-lto -std=c23 -g -fsanitize=address harness.c parser.c -o fuzz_parser
+```
+
+Colocar `__AFL_INIT` **después** de la inicialización cara es la diferencia entre trescientas y treinta mil ejecuciones por segundo. La condición para que el modo persistente sea correcto es la misma del harness de `libFuzzer`: ningún estado debe sobrevivir a la iteración. Si sobrevive, la métrica `stability` de la pantalla caerá por debajo del noventa por ciento y ahí tienes tu diagnóstico.
+
+## El motor: mutaciones, diccionarios y CmpLog
+
+El motor alterna estrategias. Las **deterministas** recorren la entrada bit a bit y byte a byte con volteos, sumas y sustituciones de valores interesantes como cero, `INT_MAX` o menos uno. Las de **havoc** aplican pilas aleatorias de mutaciones: borrar bloques, duplicarlos, insertar constantes. Y el **splice** cruza dos entradas del corpus por un punto aleatorio, que es como aparecen combinaciones de campos que ninguna mutación local habría producido.
+
+Todo eso sigue siendo ciego ante el contenido semántico. Por eso las dos armas que más rendimiento dan son externas al motor:
+
+```ini
+# diccionario formato.dict
+kw_seccion="[seccion]"
+kw_incluir="include"
+magia="\x89PNG\x0d\x0a\x1a\x0a"
+sep="=="
+```
+
+```bash
+# CmpLog: un segundo binario instrumentado que registra operandos
+export AFL_LLVM_CMPLOG=1
+afl-clang-lto -std=c23 -g harness.c parser.c -o fuzz_parser_cmplog
+unset AFL_LLVM_CMPLOG
+
+afl-fuzz -i semillas/ -o salida/ -x formato.dict \
+         -c ./fuzz_parser_cmplog -- ./fuzz_parser
+```
+
+El diccionario inyecta los tokens de tu gramática en las mutaciones. CmpLog hace lo mismo pero automáticamente y en ejecución: el binario `-c` registra los operandos de cada comparación, y el motor los usa para sustituir en la posición exacta de la entrada que los produjo. Es la técnica que resuelve checksums simples y comparaciones de cadenas sin que tengas que enumerarlas.
+
+<Cards>
+  <Card icon="📖" title="Diccionario">
+    Tokens y constantes de tu formato. Barato, manual, brutalmente eficaz cuando el formato es textual.
+  </Card>
+  <Card icon="🧲" title="CmpLog">
+    Extrae los operandos de comparación en ejecución. Rompe magias, longitudes y cadenas sin conocimiento previo.
+  </Card>
+</Cards>
+
+## Una campaña contra un parser real
+
+<Mermaid code={`flowchart TD
+  A[Compilar con afl clang lto] --> B[Preparar semillas validas]
+  B --> C[Podar con afl cmin]
+  C --> D[Lanzar maestro con -M]
+  D --> E[Lanzar secundarios con -S y estrategias distintas]
+  E --> F[Vigilar afl whatsup]
+  F --> G[Crashes en salida barra crashes]
+  G --> H[Reducir con afl tmin]
+  H --> I[Test de regresion en el repositorio]
+  style D fill:#89b4fa,color:#11111b
+  style I fill:#a6e3a1,color:#11111b`} />
+
+```bash
+# semillas: ficheros validos, pequenos y variados
+afl-cmin -i ejemplos/ -o semillas/ -- ./fuzz_parser
+
+# maestro: estrategias deterministas y planificacion equilibrada
+afl-fuzz -i semillas/ -o salida/ -M principal -x formato.dict -- ./fuzz_parser
+
+# secundarios: cada uno con planificacion de energia distinta
+afl-fuzz -i semillas/ -o salida/ -S sec1 -p fast    -- ./fuzz_parser
+afl-fuzz -i semillas/ -o salida/ -S sec2 -p explore -- ./fuzz_parser
+afl-fuzz -i semillas/ -o salida/ -S sec3 -p exploit -c ./fuzz_parser_cmplog -- ./fuzz_parser
+afl-whatsup salida/          # resumen agregado de todas las instancias
+```
+
+La planificación de energía decide cuántas mutaciones recibe cada entrada de la cola. `explore` reparte de forma equilibrada, `fast` favorece las entradas que llegan a rutas poco visitadas, `exploit` insiste donde ya hay señal. Ejecutar varias instancias con planificaciones distintas y un directorio de salida compartido hace que se sincronicen los descubrimientos: lo que una encuentra, todas lo heredan. Si compilas con `ASan` mediante `AFL_USE_ASAN=1`, añade `-m none`: el mapa de sombra reserva un espacio de direcciones enorme y la contabilidad de memoria por defecto mataría el proceso al arrancar.
+
+## Leer la pantalla y triar
+
+Cuatro métricas de la interfaz deciden si la campaña va bien:
+
+- **stability** por debajo del noventa por ciento: hay no determinismo. Estado residual entre iteraciones, punteros o tiempos que entran en la lógica, hilos.
+- **map density**: qué fracción del mapa de aristas se ha tocado. Muy baja indica que el fuzzer no atraviesa la validación inicial.
+- **cycles done** creciendo sin hallazgos nuevos: la campaña se ha saturado. Toca mejorar semillas, diccionario o el propio harness, no añadir tiempo.
+- **exec speed**: por debajo de mil por segundo, todo lo demás da igual. Investiga primero la velocidad.
+
+Y el triaje de cada crash es un procedimiento fijo:
+
+```bash
+# 1. reproducir fuera del fuzzer
+./fuzz_parser < salida/principal/crashes/id:000000*
+
+# 2. reducir la entrada al minimo que conserva el crash
+afl-tmin -i salida/principal/crashes/id:000000* -o minimo.bin -- ./fuzz_parser
+
+# 3. explorar variantes del mismo crash para juzgar su explotabilidad
+afl-fuzz -C -i salida/principal/crashes/ -o exploracion/ -- ./fuzz_parser
+```
+
+<Callout type="dios" title="El fuzzing no encuentra bugs: mide cuánto entiendes tu formato">
+Después de la primera campaña, todo el mundo aprende la misma lección incómoda: el cuello de botella nunca es la potencia de cómputo. Doblar los núcleos rara vez dobla los hallazgos, mientras que una hora dedicada a escribir un diccionario decente o a desactivar el checksum de integridad puede multiplicar la cobertura por diez. La razón es estructural. Un fuzzer guiado por cobertura es un buscador ciego de máximos locales sobre el paisaje que define tu código, y ese paisaje lo dibujaste tú al escribir el parser: cada validación temprana es una pared, cada campo de longitud es un cerrojo, cada función criptográfica es un acantilado infinito. Las herramientas que `AFL++` ofrece —LAF, CmpLog, diccionarios, modo persistente— no son optimizaciones sino **traducciones de tu conocimiento del formato al lenguaje del motor**. Por eso las campañas serias empiezan por el harness y no por el hardware, y por eso los proyectos que llevan años fuzzeando acaban con parsers construidos de otra manera: fases separadas, sin abortos, con las barreras verificables aisladas tras un flag. Existe además un corolario que casi nadie enuncia: una campaña larga sin hallazgos no es una prueba de que el código sea seguro, sino una medición de hasta dónde llegó el fuzzer. La única forma de distinguir las dos cosas es mirar la cobertura, y de eso trata la siguiente lección.
+</Callout>
+
+<Reto title="Una campaña completa contra un parser">
+1. Coge un parser real y pequeño —un lector de INI, un decodificador de base64, un analizador de cabeceras HTTP— y compílalo con `afl-clang-lto` y modo persistente. Anota las ejecuciones por segundo antes y después de mover `__AFL_INIT` detrás de la inicialización.
+2. Lanza la campaña sin diccionario durante diez minutos y apunta la densidad del mapa. Repite con un diccionario de los tokens del formato y compara.
+3. Construye el binario CmpLog y añádelo con `-c`. Mide el tiempo hasta atravesar una comprobación de cuatro bytes mágicos con y sin él.
+4. Introduce a propósito un estado global que sobreviva entre iteraciones y observa cómo se desploma `stability`.
+5. Monta cuatro instancias con `-M` y `-S` y planificaciones distintas, deja correr una hora y usa `afl-whatsup` para ver cuál aportó más entradas a la cola compartida.
+6. Reduce un crash con `afl-tmin` y añade el fichero mínimo como test de regresión en tu suite.
+</Reto>

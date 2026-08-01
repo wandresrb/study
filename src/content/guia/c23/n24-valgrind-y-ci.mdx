@@ -1,0 +1,151 @@
+---
+title: "Valgrind y los sanitizers en integración continua"
+description: "Emular la CPU frente a instrumentar el binario: por qué Valgrind sigue ganando en escenarios concretos, y cómo montar la batería de comprobación automática que ningún cambio debería poder esquivar."
+subject: c23
+level: 24
+order: 5
+icon: "24.5"
+duracion: "17 min"
+---
+
+<Lead>
+Se repite que los sanitizers hicieron obsoleto a `Valgrind`. Es falso, y creerlo te deja ciego en varios frentes concretos. Son tecnologías distintas —una recompila tu código, la otra emula la máquina— y esa diferencia arquitectónica determina exactamente qué puede ver cada una. Esta lección cierra el nivel enseñándote a elegir entre ambas con criterio y, sobre todo, a montar la batería automática que hace que nada de todo esto dependa de que alguien se acuerde de ejecutarlo.
+</Lead>
+
+<Objetivos>
+
+- Distinguir instrumentación en compilación de instrumentación binaria dinámica.
+- Identificar los escenarios donde `Valgrind` sigue siendo la única opción.
+- Diseñar una matriz de compilaciones que cubra todas las clases de error.
+- Automatizarla en integración continua con códigos de salida y supresiones.
+
+</Objetivos>
+
+## Dos filosofías
+
+Los sanitizers son un asunto del **compilador**: modifican tu código al generarlo, insertando comprobaciones donde hace falta y aprovechando toda la información de tipos, tamaños y marcos de pila que solo existe en esa fase. Por eso ven variables locales, globales y campos, y por eso son rápidos: el chequeo son tres instrucciones junto al acceso.
+
+`Valgrind` no toca tu compilación. Toma el binario ya construido, lo traduce a una representación intermedia llamada `VEX`, la instrumenta y la recompila a código nativo, bloque a bloque, mientras se ejecuta sobre una CPU sintética. `Memcheck`, su herramienta estrella, mantiene por cada byte un bit de direccionabilidad y por cada bit un bit de definición. No sabe nada de tus tipos —esa información se perdió al compilar—, pero a cambio ve absolutamente todo lo que la máquina hace, venga del código que sea.
+
+<Cards>
+  <Card icon="🧪" title="Sanitizers: compilar">
+    Necesitan el fuente y recompilar. Ven pila, globales y campos. Dos veces más lento. Ejecución paralela real de los hilos.
+  </Card>
+  <Card icon="🔬" title="Valgrind: emular">
+    No necesita ni recompilar ni el fuente. Solo ve el heap. De diez a cincuenta veces más lento. Serializa los hilos en una CPU virtual.
+  </Card>
+</Cards>
+
+## Cuándo Valgrind sigue ganando
+
+Cinco escenarios donde no hay discusión posible:
+
+- **No puedes recompilar.** Bibliotecas de terceros sin fuente, paquetes de la distribución, binarios ya desplegados, un `plugin` cargado dinámicamente. Valgrind los instrumenta igual, incluidos el enlazador dinámico y la propia `libc`.
+- **Memoria no inicializada sin reconstruir el mundo.** Los bits de definición de `Memcheck` funcionan sobre todo el proceso, sin exigir que cada dependencia esté instrumentada. Es la respuesta pragmática al requisito imposible de `MSan` que vimos en la lección anterior.
+- **Perfilado de montículo.** `Massif` te da la evolución del uso de heap en el tiempo y quién lo pidió; `DHAT` señala bloques que se reservan y nunca se leen, o que viven microsegundos. Ningún sanitizer hace eso.
+- **Medición determinista.** `Callgrind` y `Cachegrind` simulan la jerarquía de caché y cuentan instrucciones exactas. Un contador de instrucciones no tiene ruido: puedes detectar una regresión de rendimiento del uno por ciento en una máquina compartida de CI, algo imposible midiendo tiempo de reloj.
+- **Cadenas de herramientas antiguas o exóticas.** Compiladores sin soporte de sanitizers, arquitecturas donde nunca se portaron.
+
+Y las tres debilidades que debes compensar siempre con `ASan`: Valgrind **no** detecta desbordamientos de arrays locales ni de globales, porque solo pone zonas rojas alrededor de bloques del montículo; no detecta el uso de un marco de pila ya abandonado; y al serializar los hilos altera radicalmente el entrelazado, lo que oculta carreras que `TSan` encontraría de inmediato.
+
+```bash
+# la invocacion util, no la de la wiki
+valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
+         --errors-for-leak-kinds=definite --error-exitcode=1 ./prog
+
+# perfilado de montículo y conteo determinista de instrucciones
+valgrind --tool=massif ./prog
+valgrind --tool=callgrind --cache-sim=yes ./prog
+```
+
+`--error-exitcode=1` es la bandera que convierte a Valgrind en una prueba automática: sin ella termina con éxito aunque haya escupido cien errores, y tu integración continua se queda en verde.
+
+Igual que ASan tiene su API de envenenamiento, Valgrind se deja enseñar tus asignadores propios mediante las peticiones de cliente de `valgrind/memcheck.h`, que describen los bloques que reparte tu arena:
+
+```c
+#include <valgrind/memcheck.h>
+
+VALGRIND_MALLOCLIKE_BLOCK(p, n, 0, 0);   /* esto es un bloque de n bytes */
+VALGRIND_MAKE_MEM_UNDEFINED(p, n);       /* con contenido aun sin definir */
+VALGRIND_FREELIKE_BLOCK(p, 0);           /* y aqui deja de ser valido */
+```
+
+Compiladas fuera de Valgrind, esas macros se convierten en instrucciones inocuas que no cuestan nada, así que pueden quedarse en el código de producción sin condicionales.
+
+## La matriz de comprobación
+
+Ninguna configuración sola cubre todas las clases de error, y varias son mutuamente excluyentes. La respuesta profesional no es elegir: es construir la misma suite de pruebas contra varias configuraciones y ejecutarlas todas.
+
+<Mermaid code={`flowchart LR
+  A[Commit] --> B[Avisos como errores mas analisis estatico]
+  B --> C[Build asan mas ubsan]
+  C --> D[Build tsan]
+  D --> E[Build limpio bajo valgrind memcheck]
+  E --> F[Fuzzing corto sobre el build asan]
+  F --> G[Fusionar]
+  style B fill:#89b4fa,color:#11111b
+  style C fill:#a6e3a1,color:#11111b
+  style D fill:#f9e2af,color:#11111b
+  style E fill:#cba6f7,color:#11111b
+  style G fill:#a6e3a1,color:#11111b`} />
+
+Con Meson, los directorios paralelos del nivel 17 hacen que esto sea casi gratis, y `add_test_setup` permite envolver cada prueba en Valgrind sin tocar ni una línea de los tests:
+
+```bash
+cat >> meson.build <<'EOF'
+add_test_setup('valgrind',
+  exe_wrapper: [find_program('valgrind'),
+                '--leak-check=full',
+                '--track-origins=yes',
+                '--error-exitcode=1'],
+  timeout_multiplier: 20)
+EOF
+
+meson setup build-asan -Db_sanitize=address,undefined -Dbuildtype=debugoptimized
+meson setup build-tsan -Db_sanitize=thread          -Dbuildtype=debugoptimized
+meson setup build-val                                -Dbuildtype=debug
+
+meson test -C build-asan
+meson test -C build-tsan
+meson test -C build-val --setup=valgrind
+```
+
+<Callout type="tip" title="Las supresiones son deuda, no solución">
+Tanto Valgrind como los sanitizers admiten ficheros de supresión para silenciar hallazgos en código ajeno que no puedes arreglar. Úsalos, pero trátalos como lo que son: una lista de excepciones que debe estar en el repositorio, comentada una por una con la razón y con la fecha, y revisada cuando actualizas dependencias. Un fichero de supresiones que nadie ha mirado en dos años es un lugar donde los bugs reales se esconden con total impunidad.
+</Callout>
+
+## Automatizarla
+
+El guion que ata todo esto es más corto de lo que parece, y lo importante son las variables de entorno: sin ellas, los sanitizers informan y siguen adelante, y tu integración continua no se entera de nada.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:abort_on_error=1:strict_string_checks=1
+export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+export TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+export LSAN_OPTIONS=suppressions=ci/lsan.supp
+
+# 1. el compilador como primer filtro: es gratis y encuentra muchisimo
+gcc -std=c23 -Wall -Wextra -Wpedantic -Werror -fanalyzer -c src/*.c -o /dev/null
+
+# 2. la bateria dinamica
+meson test -C build-asan --print-errorlogs
+meson test -C build-tsan --print-errorlogs
+meson test -C build-val  --setup=valgrind --print-errorlogs
+```
+
+Tres reglas para que esto sobreviva al contacto con un equipo real. Primera: la comprobación tiene que ser **bloqueante**; un aviso que no impide fusionar se ignora en dos semanas. Segunda: separa lo rápido de lo lento —`ASan` y `UBSan` en cada empuje, `TSan` y Valgrind en la rama principal o de noche—, porque una batería que tarda cuarenta minutos acaba desactivada. Tercera: cuando un fallo aparezca, el arreglo es el código, nunca la supresión.
+
+<Callout type="dios" title="Esto es lo que separa el C profesional del C amateur">
+Hay una idea muy extendida y muy dañina: que la seguridad en C es cuestión de disciplina personal, de ser un programador cuidadoso que no comete esos errores. Es falsa, y lo demuestra el registro histórico completo. Los desbordamientos y los use-after-free que han provocado las brechas más caras de las últimas tres décadas no los escribieron aficionados: los escribieron los mejores ingenieros de sistemas del mundo, en `OpenSSL`, en el kernel de Linux, en los intérpretes y navegadores más revisados del planeta, con revisión por pares y años de escrutinio público. La gestión manual de memoria y el comportamiento indefinido son, sencillamente, superiores a la capacidad de atención sostenida de cualquier ser humano. Lo que ha cambiado el panorama no es que hayamos empezado a tener más cuidado, sino que hemos dejado de depender del cuidado: `ASan` para la memoria, `UBSan` para la semántica, `TSan` para la concurrencia, `Valgrind` para lo que no puedes recompilar, y un servidor que ejecuta las cuatro en cada cambio sin cansarse, sin distraerse y sin ceder ante una fecha de entrega. Esa es, hoy, la diferencia real entre un proyecto en C que puedes desplegar con tranquilidad y uno que es una brecha esperando fecha. Y es una diferencia que se compra con un fichero de configuración de veinte líneas, escrito una sola vez. No hay en toda la ingeniería de software mucha inversión con semejante retorno.
+</Callout>
+
+<Reto title="Monta la batería y ciérrala">
+1. Añade a tu proyecto los tres directorios de compilación: `address,undefined`, `thread` y uno limpio para Valgrind.
+2. Registra el `add_test_setup` de Valgrind y comprueba que `--error-exitcode=1` hace fallar realmente la prueba ante una fuga.
+3. Introduce a propósito un desbordamiento de un array **local** y verifica que ASan lo caza y Valgrind no. Después una lectura no inicializada dentro de una biblioteca que no recompiles, y comprueba lo contrario.
+4. Escribe el guion de integración continua completo, con las variables de entorno, y haz que un cambio con un error no pueda fusionarse.
+5. Mide con `Callgrind` el conteo de instrucciones de tu ruta caliente y guárdalo como línea base para detectar regresiones de rendimiento sin ruido.
+</Reto>

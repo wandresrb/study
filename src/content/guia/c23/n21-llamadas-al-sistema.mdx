@@ -1,0 +1,148 @@
+---
+title: "Llamadas al sistema: el borde entre tu código y el kernel"
+description: "La convención propia de la instrucción syscall y en qué se aparta de System V, qué añade realmente el envoltorio de libc sobre la llamada desnuda, el atajo del vDSO y cómo se observa la frontera con strace."
+subject: c23
+level: 21
+order: 5
+icon: "21.5"
+duracion: "18 min"
+---
+
+<Lead>
+Tu programa no puede leer un fichero. No tiene permiso para tocar el disco, ni para abrir un socket, ni para reservar una página de memoria. Todo lo que parece que hace, en realidad lo pide. Y esa petición atraviesa una frontera custodiada por su propia convención de llamada, distinta de la que has estudiado hasta ahora, con su propio protocolo de errores y su propio catálogo de trampas. Entre tu `printf` y el kernel hay más capas de las que sospechas, y saber cuáles son separa a quien usa un sistema operativo de quien lo entiende.
+</Lead>
+
+<Objetivos>
+
+- Describir la convención de la instrucción `syscall` y sus diferencias con `System V`.
+- Interpretar el protocolo de error del kernel y su traducción a `errno`.
+- Distinguir la llamada al sistema del envoltorio de libc y saber cuándo no coinciden.
+- Observar y medir el tráfico de llamadas con `strace` y sus alternativas.
+
+</Objetivos>
+
+## El borde: la instrucción `syscall`
+
+Cambiar de anillo de privilegio no es una llamada a función: es una instrucción específica que transfiere el control a una dirección que el kernel registró al arrancar. En x86-64 esa instrucción es `syscall`, y trae consigo una convención parecida a la de `System V` pero **deliberadamente distinta en dos puntos**.
+
+El número de la llamada viaja en `rax`. Los argumentos, hasta seis, viajan en `rdi`, `rsi`, `rdx`, `r10`, `r8` y `r9`. El cuarto registro no es `rcx`, y no es un capricho: la propia instrucción `syscall` guarda en `rcx` la dirección de retorno y en `r11` el registro de banderas, de modo que ambos quedan destruidos y no pueden llevar datos. Todo lo demás lo preserva el kernel.
+
+```asm
+    mov  rax, 1          ; numero de write en x86-64
+    mov  rdi, 1          ; fd = salida estandar
+    lea  rsi, [rip+msg]  ; buffer
+    mov  rdx, 13         ; longitud
+    syscall              ; rcx y r11 quedan destruidos
+    ; rax trae el resultado
+```
+
+El protocolo de error es igual de peculiar. El kernel **no** usa `errno` ni ninguna variable global: devuelve el resultado en `rax` y, si algo falló, devuelve el código de error **negado**. Cualquier valor de retorno entre menos 4095 y menos 1 debe interpretarse como un fallo cuyo código es su valor absoluto. Esa convención existe porque permite señalar el error sin gastar un segundo registro ni una escritura en memoria, a costa de reservar un rango de valores que ninguna llamada legítima puede devolver.
+
+Los números tampoco son universales. Cada arquitectura tiene su propia tabla, generada durante la compilación del kernel, y el mismo número significa cosas distintas en x86-64, en `AArch64` y en el modo de 32 bits. Puedes consultarlos en `asm/unistd.h` o listarlos con `ausyscall --dump`. Que `write` sea el número 1 en x86-64 y el 64 en `AArch64` es la razón de que jamás debas escribirlos literalmente en tu código.
+
+```bash
+grep -w '__NR_write' /usr/include/asm/unistd_64.h
+ausyscall --dump | head -20
+```
+
+<Callout type="tip" title="Seis argumentos y ni uno más">
+El límite de seis no es una elección estética: es el número de registros disponibles una vez descontados `rax`, `rcx` y `r11`. Cuando una operación necesita más información, el diseño obliga a empaquetarla en una estructura y pasar un puntero, y ahí nace un patrón que verás por todo el kernel: llamadas como `clone3` o `openat2` reciben un puntero a una estructura **más un tamaño**, de modo que versiones futuras puedan ampliarla sin romper a los binarios antiguos. Es la misma técnica de estabilidad de ABI que estudiaste para bibliotecas, aplicada a la frontera más crítica del sistema.
+</Callout>
+
+## Qué añade el envoltorio de libc
+
+Cuando escribes `write(1, buf, 13)` no ejecutas la instrucción `syscall`: llamas a una función de la libc que la ejecuta por ti. Ese envoltorio parece una formalidad y no lo es.
+
+<Cards>
+  <Card icon="🔗" title="Traduce el error">
+    Convierte el retorno negativo del kernel en el clásico menos uno y deposita el código en `errno`, que además es una variable por hilo, no global.
+  </Card>
+  <Card icon="🔗" title="Adapta la interfaz">
+    Ajusta tipos y variantes históricas, gestiona argumentos variádicos como el modo de `open` y oculta diferencias entre versiones del kernel.
+  </Card>
+  <Card icon="🔗" title="Coordina el runtime">
+    `fork` ejecuta manejadores registrados, las llamadas bloqueantes actúan como puntos de cancelación de hilos y algunas ajustan estado interno de la libc.
+  </Card>
+  <Card icon="🔗" title="Acelera con el vDSO">
+    Varias llamadas de tiempo se resuelven sin cruzar al kernel, leyendo datos de una página que el propio kernel mantiene actualizada.
+  </Card>
+</Cards>
+
+Que `errno` sea por hilo merece una parada. No es una variable: es una macro que se expande a una expresión que devuelve la dirección del `errno` del hilo actual, precisamente para que dos hilos que fallan a la vez no se pisen el código de error. Y como cualquier función de la libc puede modificarlo al tener éxito, la regla de uso correcta es leerlo **inmediatamente** después de detectar el fallo, no después de imprimir un mensaje.
+
+La otra consecuencia de vivir sobre una frontera es que las llamadas bloqueantes pueden interrumpirse. Si llega una señal mientras esperas, la llamada regresa con `EINTR` sin haber hecho nada, y el código correcto reintenta.
+
+```c
+ssize_t n;
+do {
+    n = read(fd, buf, tam);
+} while (n == -1 && errno == EINTR);
+```
+
+Esa forma repetida por todo el código de sistemas no es paranoia: es la traducción directa de que la ejecución de tu proceso puede ser desviada en cualquier punto por un evento asíncrono.
+
+La consecuencia más útil de esta capa es que **la correspondencia entre función de C y llamada al sistema casi nunca es uno a uno**. `fopen` acaba en `openat`, no en `open`. `malloc` no tiene llamada propia: pide memoria con `brk` o `mmap` y reparte por su cuenta, razón por la cual mil `malloc` seguidos pueden no producir ni una sola llamada al sistema. Y `printf` acumula en un buffer de usuario y descarga con un único `write`, que es exactamente por qué un programa que aborta pierde la salida que creía haber escrito.
+
+<Mermaid code={`flowchart TD
+  A[printf en tu codigo] --> B[Buffer de la libc en espacio de usuario]
+  B --> C[Envoltorio write de la libc]
+  C --> D[Instruccion syscall: cambio de anillo]
+  D --> E[Kernel: numero en rax, argumentos en rdi rsi rdx r10]
+  E --> F[Retorno en rax, negativo si hay error]
+  F --> G[La libc traduce a menos uno y rellena errno]
+  style D fill:#f38ba8,color:#11111b
+  style B fill:#f9e2af,color:#11111b`} />
+
+## Cuando no hay envoltorio
+
+De vez en cuando el kernel ofrece algo que tu libc todavía no expone. Para esos casos existe una función genérica que recibe el número de la llamada y sus argumentos, declarada en `sys/syscall.h`.
+
+```c
+#define _GNU_SOURCE
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <errno.h>
+
+long id_hilo(void)
+{
+    long r = syscall(SYS_gettid);   /* devuelve menos uno y fija errno */
+    return r;
+}
+```
+
+Esta puerta trasera tiene un precio que conviene enunciar. El código deja de ser portable, porque los números de llamada difieren entre arquitecturas y no forman parte de ninguna norma. Se pierden los servicios del envoltorio, incluida la coordinación con el runtime de hilos. Y es fácil equivocarse con los tipos, porque la función genérica es variádica y no valida nada. Úsala cuando no haya alternativa, no por elegancia.
+
+En el extremo opuesto está el **vDSO**, una biblioteca compartida que el kernel proyecta dentro del espacio de direcciones de cada proceso. No contiene una llamada al sistema: contiene código de usuario que lee datos que el kernel mantiene actualizados en una página compartida. Consultar la hora con `clock_gettime` no cruza ninguna frontera de privilegio, y por eso un programa que la invoca un millón de veces por segundo sigue siendo viable.
+
+```bash
+ldd /bin/true          # aparece linux-vdso.so.1 sin ruta: no es un fichero
+```
+
+## Observar el borde
+
+`strace` intercepta cada cruce de la frontera y lo imprime con sus argumentos descodificados y su resultado. Es, con diferencia, la herramienta más rápida para responder a la pregunta "qué está haciendo realmente este programa".
+
+```bash
+strace ./prog                        # todas las llamadas, en orden
+strace -f -e trace=openat,read ./prog  # seguir hilos y filtrar por familia
+strace -c ./prog                     # resumen: cuenta y tiempo por llamada
+strace -p 1234 -y                    # adjuntarse a un proceso vivo, con nombres de fd
+```
+
+Tres lecturas de esa salida valen por horas de conjeturas. Un programa que no encuentra un fichero de configuración te muestra en `openat` exactamente qué rutas probó. Un programa lento por sobrecarga de sistema aparece en `-c` con miles de llamadas diminutas donde debería haber unas pocas grandes. Y un fallo intermitente en red suele reducirse a un `EINTR` o un `EAGAIN` que alguien olvidó reintentar.
+
+Hay una lectura más, menos evidente, que convierte a `strace` en herramienta de seguridad: el conjunto de llamadas que un programa emplea **es** su superficie de ataque frente al kernel. Registrar ese conjunto durante una ejecución representativa es el primer paso para construir un filtro `seccomp` que prohíba todo lo demás. Un servidor que solo necesita leer, escribir y aceptar conexiones no tiene por qué conservar el derecho a ejecutar `execve`.
+
+El coste es alto: `strace` usa `ptrace`, que detiene el proceso en cada cruce y puede multiplicar por decenas el tiempo de ejecución. Para producción existen alternativas basadas en instrumentación del kernel, como `perf trace` o `bpftrace`, que muestrean con un impacto mucho menor. Y `ltrace`, su primo, intercepta llamadas a bibliotecas en lugar de al kernel, lo que sirve precisamente para ver la capa que `strace` no muestra.
+
+<Callout type="dios" title="La frontera de llamadas es la única ABI que Linux jamás rompe">
+Todo lo que has estudiado en este nivel converge aquí, y conviene ver la jerarquía completa. Dentro del kernel no hay ninguna estabilidad: sus interfaces internas cambian de una versión a otra sin aviso, deliberadamente, porque los desarrolladores quieren libertad para reorganizar el código. Un módulo compilado para una versión no carga en la siguiente, y eso es una decisión, no un descuido. Pero justo un milímetro más allá, en la frontera de las llamadas al sistema, rige la regla contraria y absoluta: **no se rompe el espacio de usuario**. Un binario estático compilado en 1998 se ejecuta hoy sobre un kernel moderno. Nunca se retira una llamada, nunca se cambia el significado de un argumento; cuando algo necesita evolucionar se añade una variante con nombre nuevo, y por eso conviven `open`, `openat` y `openat2`. Esa asimetría es una de las decisiones de arquitectura más consecuentes de la historia del software, y explica por qué Linux se convirtió en sustrato universal: ofrece un contrato inmutable hacia arriba precisamente porque se reserva libertad total hacia dentro. La lección trasciende el sistema operativo. Cuando diseñes cualquier cosa, la pregunta que decide su longevidad no es qué interfaz es más elegante, sino **dónde colocas la línea de compromiso**: qué prometes para siempre y qué te reservas el derecho a rehacer. Poner esa línea demasiado arriba te condena a arrastrar decisiones malas durante décadas; ponerla demasiado abajo hace que nadie construya sobre ti. Los sistemas que duran son los que la colocan con puntería y luego la respetan con fanatismo.
+</Callout>
+
+<Reto title="Cruza la frontera a mano">
+1. Escribe un programa que llame a `write` y otro que ejecute la instrucción `syscall` en ensamblador en línea; compara ambos con `strace` y comprueba que el kernel ve lo mismo.
+2. Provoca un error abriendo un fichero inexistente con la función genérica y verifica que el retorno crudo es el código negado.
+3. Cuenta con `strace -c` cuántas llamadas hace un programa que imprime diez mil líneas, primero con la salida a terminal y después redirigida a un fichero; explica la diferencia de tamaño de buffer.
+4. Comprueba con `strace` que un bucle de un millón de `clock_gettime` no genera ninguna llamada al sistema, y localiza el vDSO con `ldd`.
+5. Reserva memoria con `malloc` en un bucle y observa cuántas veces aparecen `brk` o `mmap` frente al número de reservas.
+</Reto>

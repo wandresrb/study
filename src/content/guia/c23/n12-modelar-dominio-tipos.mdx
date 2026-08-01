@@ -1,0 +1,159 @@
+---
+title: "Modelar el dominio con tipos"
+description: "Tipos opacos, envoltorios de un solo campo y handles con generación: las tres herramientas con las que C se acerca a la seguridad de tipos que el lenguaje no te da de serie, y el criterio para saber dónde vale la pena pagarlas."
+subject: c23
+level: 12
+order: 5
+icon: "12.5"
+duracion: "18 min"
+---
+
+<Lead>
+C tiene un sistema de tipos débil por diseño: casi todo se convierte en casi todo, los alias no distinguen nada y un puntero es un puntero venga de donde venga. Pero débil no significa inútil. Con tres construcciones —la struct incompleta, la struct de un solo campo y el índice con generación— puedes fabricar fronteras que el compilador sí vigila, y concentrarlas exactamente donde los errores cuestan caro. No obtendrás las garantías de Rust; obtendrás bastantes más de las que el lenguaje parece ofrecer.
+</Lead>
+
+<Objetivos>
+
+- Diseñar tipos opacos completos: interfaz, propiedad y las variantes cuando el heap no es opción.
+- Crear tipos distintos con envoltorios de un solo campo y medir su coste real.
+- Sustituir punteros por handles con generación para convertir el uso tras liberar en un error detectable.
+- Saber qué invariantes C no puede expresar y dónde poner entonces la disciplina.
+
+</Objetivos>
+
+## Tipos opacos: la frontera que el compilador vigila
+
+Un tipo opaco es una `struct` declarada en el header **sin cuerpo**. El compilador la trata como tipo incompleto: sabe que existe, ignora su tamaño y rechaza cualquier intento de tocar sus campos o de declarar una variable de ese tipo por valor.
+
+```c
+/* buffer.h */
+typedef struct Buffer Buffer;                    /* incompleto a proposito */
+
+[[nodiscard]] Buffer *buffer_crear(size_t capacidad);
+void                  buffer_destruir(Buffer *b);
+[[nodiscard]] bool    buffer_escribir(Buffer *b, const void *datos, size_t n);
+size_t                buffer_longitud(const Buffer *b);
+```
+
+Esa incompletitud es el contrato entero. El usuario no puede leer un campo aunque quiera, no puede depender del tamaño y no se romperá cuando añadas, reordenes o elimines miembros; la única superficie que existe es la que has declarado. A cambio pagas dos precios reales: la struct solo puede vivir tras un puntero —normalmente en el heap—, y cada acceso pasa por una llamada que el compilador no puede insertar si la definición vive en otra unidad de traducción, salvo que actives optimización en tiempo de enlazado.
+
+El atributo `[[nodiscard]]`, estandarizado en C23, cierra la fuga más frecuente de este diseño: ignorar el valor devuelto. Aplicado al constructor y a toda función que informe de un fallo, convierte en advertencia lo que antes era un descuido invisible.
+
+Cuando el heap no es una opción —código embebido, arranque, rutas sin asignación dinámica— existe la variante *opaca con tamaño*: el header expone un búfer de bytes con tamaño y alineación fijados, y la implementación coloca dentro la struct real.
+
+```c
+/* mutex.h: opaco pero instanciable por valor */
+typedef struct { alignas(void *) unsigned char _almacen[48]; } Mutex;
+```
+
+Es la técnica de `pthread_mutex_t` y de los tipos de `threads.h`. Conserva la opacidad para el usuario pero congela el tamaño en el ABI: ampliarlo rompe binarios ya compilados, así que se sobredimensiona desde el principio.
+
+## Envoltorios de un solo campo
+
+`typedef` no distingue `Metros` de `Segundos` porque no crea tipos. Una `struct` sí:
+
+```c
+typedef struct { int32_t v; } Metros;
+typedef struct { int32_t v; } Pies;
+
+static inline Metros metros(int32_t x) { return (Metros){ .v = x }; }
+static inline Metros metros_sumar(Metros a, Metros b) { return metros(a.v + b.v); }
+
+Metros d = metros(100);
+Pies   p = { .v = 30 };
+d = p;                    /* ERROR: tipos incompatibles. Justo lo que queriamos */
+```
+
+Dos structs con miembros idénticos son tipos **distintos e incompatibles** en C, y ninguna conversión implícita las une. Ese es todo el truco, y es suficiente para eliminar de raíz una familia entera de errores: mezclar metros con pies, milisegundos con segundos, identificadores de usuario con identificadores de pedido, bytes con elementos.
+
+El coste en ejecución es esencialmente nulo. En los ABI habituales de 64 bits, una struct de un solo entero se pasa en registro igual que el entero desnudo y el acceso `.v` se compila a nada. El coste real es de ergonomía: pierdes los operadores aritméticos y tienes que declarar `metros_sumar`, `metros_comparar` y las que uses. Esa fricción es, en parte, la funcionalidad: si sumar dos magnitudes exige escribir una función, sumar dos magnitudes incompatibles se vuelve un acto deliberado en vez de un descuido.
+
+<Callout type="tip" title="Combina el envoltorio con un constructor que valide">
+El envoltorio brilla cuando la única forma de fabricarlo es una función que comprueba el invariante: `puerto_desde(uint32_t)` que devuelve fallo si el valor excede 65535, `porcentaje_desde(float)` que rechaza fuera del rango. A partir de ahí, todo el código que reciba un `Puerto` sabe que es válido **por construcción** y no vuelve a comprobarlo. Es la versión en C del principio de validar en la frontera en lugar de comprobar en cada uso: la validación ocurre una vez, en el constructor, y el tipo transporta esa prueba por todo el programa. Combínalo con opacidad si quieres impedir también la inicialización directa con llaves.
+</Callout>
+
+## Handles con generación
+
+Hay un tercer instrumento, menos conocido y muy potente en sistemas con muchos objetos de vida corta: sustituir el puntero por un **handle**, un par de enteros que identifica una ranura y la encarnación concreta que la ocupa.
+
+```c
+typedef struct { uint32_t indice; uint32_t generacion; } IdEntidad;
+
+typedef struct {
+    Entidad   ranuras[MAX];
+    uint32_t  generacion[MAX];   /* se incrementa en cada liberacion */
+    bool      viva[MAX];
+} Pool;
+
+Entidad *pool_resolver(Pool *p, IdEntidad id) {
+    if (id.indice >= MAX) return nullptr;
+    if (!p->viva[id.indice]) return nullptr;
+    if (p->generacion[id.indice] != id.generacion) return nullptr;  /* handle rancio */
+    return &p->ranuras[id.indice];
+}
+```
+
+Lo que compra este diseño es notable. Un handle a un objeto ya liberado no es un puntero colgante que produce comportamiento indefinido: es un handle cuya generación no coincide, y resolverlo devuelve nulo de forma **determinista y detectable**. El pool puede crecer y reubicar su memoria sin invalidar nada, porque nadie guarda direcciones. Y el handle es un valor de 64 bits sin punteros dentro, lo que lo hace trivialmente serializable, comparable y transmisible entre procesos.
+
+El precio es una indirección por acceso y la disciplina de no filtrar jamás el puntero resuelto más allá de la operación en curso. Es el patrón dominante en motores de juego, en sistemas de entidades y en asignadores con arenas, y merece considerarse siempre que la vida de los objetos sea difícil de razonar.
+
+<Cards>
+  <Card icon="🚪" title="Tipo opaco">
+    Oculta la representación. Frontera de módulo y de ABI. Precio: indirección y heap.
+  </Card>
+  <Card icon="🏷️" title="Envoltorio de un campo">
+    Crea un tipo genuinamente distinto. Unidades e identificadores. Precio: ergonomía, no rendimiento.
+  </Card>
+  <Card icon="🎟️" title="Handle con generación">
+    Convierte el uso tras liberar en un fallo detectable. Precio: una comprobación por acceso.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TB
+  A[Handle con indice y generacion] --> B{Indice dentro de rango}
+  B -->|No| X[Devuelve nulo]
+  B -->|Si| C{Ranura viva}
+  C -->|No| X
+  C -->|Si| D{Generacion coincide}
+  D -->|No| X
+  D -->|Si| E[Puntero valido durante esta operacion]`} />
+
+## Lo que C no puede expresar
+
+Conviene ser honesto sobre el techo. C carece de tipos suma nativos: una unión etiquetada hay que construirla a mano con un `enum` de tipo fijo, una `union` y la disciplina de no leer nunca el miembro equivocado, y el lenguaje no verifica esa correspondencia —solo el `switch` sin `default` con `-Wall` te ayuda, y solo con la etiqueta.
+
+```c
+/* La aproximacion de C al tipo suma: union etiquetada */
+typedef struct {
+    enum : uint8_t { R_VALOR, R_ERROR } etiqueta;   /* enum anonimo con tipo fijo */
+    union {
+        Buffer *valor;    /* legible solo si etiqueta vale R_VALOR */
+        int     codigo;   /* legible solo si etiqueta vale R_ERROR */
+    };
+} Resultado;
+
+static inline Resultado resultado_ok(Buffer *b) {
+    return (Resultado){ .etiqueta = R_VALOR, .valor = b };
+}
+static inline Resultado resultado_error(int c) {
+    return (Resultado){ .etiqueta = R_ERROR, .codigo = c };
+}
+```
+
+Los dos constructores son la mitad que sí puedes hacer cumplir: si nadie construye un `Resultado` con llaves, la etiqueta y el miembro activo nunca se desincronizan. La otra mitad —que quien lo recibe consulte la etiqueta antes de leer— sigue siendo una regla social, y ninguna versión de C la convierte en un error de compilación.
+
+Tampoco hay un tipo de puntero no nulo, así que la nulabilidad se documenta pero no se comprueba. No hay propiedad ni tiempos de vida en el sistema de tipos: quién libera qué es un comentario, no un teorema. No hay destructores, de modo que la liberación automática al salir de ámbito solo llega mediante extensiones como el atributo `cleanup` de GCC y Clang. Y no hay exhaustividad garantizada: la que te da `-Wswitch` es una advertencia que cualquiera puede silenciar.
+
+De ahí sale el criterio práctico. Estas tres herramientas cuestan escritura, y aplicarlas a todo produce código ceremonioso que nadie mantiene. Gástalas donde el error es caro y probable: en la **frontera del módulo**, donde entran datos que no controlas; en las magnitudes que se confunden entre sí; y en los objetos cuya vida no puedes razonar de un vistazo. Dentro de una función de treinta líneas, un `int` sigue siendo un `int`.
+
+<Callout type="dios" title="Cada tipo es un teorema que ya no tienes que demostrar dos veces">
+Un sistema de tipos es, en el fondo, un demostrador automático muy limitado: cada declaración es una proposición sobre el programa y cada compilación exitosa es una prueba de que esas proposiciones se sostienen. Los lenguajes con sistemas ricos te regalan proposiciones potentes —esta referencia no sobrevive al dato que apunta, esta suma cubre todos sus casos, este valor no es nulo— y las demuestran por ti en cada compilación. C te regala poquísimo, y por eso el ejercicio de modelar el dominio con tipos se vuelve tan revelador: te obliga a decidir, invariante por invariante, cuáles vale la pena convertir en teoremas y cuáles vas a dejar como esperanzas. Un tipo opaco es el teorema "nadie fuera de este módulo depende de mi representación". Un envoltorio de un campo es "un valor de metros nunca llegará donde se esperan pies". Un handle con generación es "usar un objeto muerto será detectado, no será comportamiento indefinido". Ninguno de los tres es gratis, y ahí está la lección que trasciende a C: la seguridad de tipos no aparece porque el lenguaje sea moderno, aparece porque alguien decidió pagar por ella, y en los lenguajes modernos ese pago está incluido en el precio de entrada mientras que en C lo desembolsas a mano y a la vista. Programar C con esta conciencia cambia la naturaleza del trabajo: dejas de escribir código que funciona y empiezas a construir la estructura mínima de teoremas que hace que seguir funcionando no dependa de que todo el mundo recuerde las reglas. Y cuando después leas un lenguaje que te da esas garantías de serie, sabrás exactamente qué te está regalando y cuánto costaba fabricarlo.
+</Callout>
+
+<Reto title="Fabrica tus fronteras">
+1. Convierte un módulo tuyo a tipo opaco: header sin campos, implementación privada, `[[nodiscard]]` en el constructor y en las funciones que pueden fallar.
+2. Define `Metros` y `Pies` como envoltorios de un campo, escribe las operaciones mínimas y comprueba con el desensamblador que el envoltorio no cuesta instrucciones.
+3. Escribe un constructor validador para un tipo `Puerto` y argumenta por qué el resto del programa ya no necesita volver a comprobar el rango.
+4. Implementa un pool con handles de índice y generación, libera un objeto, resuelve el handle viejo y comprueba que obtienes nulo en lugar de un puntero colgante.
+5. Elige un invariante de tu código que hoy vive en un comentario y decide si puedes convertirlo en un tipo. Si no puedes, explica qué le falta a C para expresarlo.
+</Reto>

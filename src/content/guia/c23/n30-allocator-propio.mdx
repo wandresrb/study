@@ -1,0 +1,205 @@
+---
+title: "Proyecto: un allocator propio"
+description: "Diseñar e implementar un asignador de memoria completo —cabeceras empaquetadas, bins segregados, división y coalescing, frontera con el kernel— y después medirlo honestamente contra el `malloc` del sistema para descubrir por qué perder es exactamente la parte instructiva."
+subject: c23
+level: 30
+order: 2
+icon: "30.2"
+duracion: "24 min"
+---
+
+<Lead>
+Un asignador es el examen final del track porque no existe concepto que no aparezca en él: aritmética de punteros, alineación, representación de objetos, comportamiento indefinido, syscalls, concurrencia y medición. Aquí no vas a escribir el juguete de veinte líneas que sale en los tutoriales: vas a construir un asignador con estructura real y después lo vas a enfrentar a `glibc` con un banco de pruebas honesto. Vas a perder. Entender exactamente por qué pierdes vale más que la victoria.
+</Lead>
+
+<Objetivos>
+
+- Diseñar la representación de un bloque: cabecera empaquetada, alineación mínima y etiquetas de frontera.
+- Implementar bins segregados con división de bloques y fusión bidireccional.
+- Negociar con el kernel: cuándo crecer el montón y cuándo delegar en `mmap`.
+- Medir contra `malloc` con cargas realistas y leer los resultados sin engañarte.
+
+</Objetivos>
+
+## La representación es el diseño
+
+Todo lo demás se deduce de una decisión: qué metadatos guardas por bloque y dónde. En x86-64 la alineación fundamental es de 16 bytes, así que el tamaño de cualquier bloque es múltiplo de 16 y sus cuatro bits bajos valen cero siempre. Esos cuatro bits son espacio libre regalado, y desperdiciarlos es el primer error de novato.
+
+```c
+#include <stddef.h>
+#include <stdint.h>
+
+#define ALINEACION   16u
+#define EN_USO       0x1u        // este bloque esta asignado
+#define ANTERIOR_USO 0x2u        // el bloque fisicamente anterior lo esta
+
+#define TAM(c)       ((c) & ~(size_t)(ALINEACION - 1))
+
+typedef struct BloqueLibre BloqueLibre;
+struct BloqueLibre {
+    size_t       cabecera;       // tamano total | banderas
+    BloqueLibre *sig, *ant;      // enlaces dentro de su bin
+    // ... carga util ...
+    // size_t pie;               // replica del tamano, SOLO si esta libre
+};
+
+#define MIN_BLOQUE   (sizeof(BloqueLibre) + sizeof(size_t))
+```
+
+Hay dos ideas densas aquí. La primera: los punteros `sig` y `ant` viven **dentro de la carga útil**. Un bloque libre no necesita sus bytes para nada, así que los reutilizas como nodos de lista; cuando lo asignas, esos mismos bytes vuelven a ser del usuario. Eso reduce el coste de metadatos a una sola palabra por bloque asignado.
+
+La segunda: el pie replicado, o etiqueta de frontera. Cuando liberas un bloque, saber si el bloque **siguiente** está libre es trivial —está a `TAM` bytes de distancia—, pero saber si el **anterior** lo está requeriría recorrer el montón desde el principio. La solución clásica de Knuth es que todo bloque libre escriba su tamaño también en su última palabra: el vecino de la derecha retrocede una palabra, lee ese tamaño y salta hacia atrás en tiempo constante. Y por eso existe la bandera `ANTERIOR_USO`: si el anterior está asignado no hay pie que leer, y leerlo sería interpretar datos del usuario como un tamaño.
+
+```c
+static inline size_t alinear_arriba(size_t n, size_t a) {
+    return (n + a - 1) & ~(a - 1);          // a potencia de dos
+}
+
+static inline size_t tamano_solicitado(size_t n) {
+    size_t t = alinear_arriba(n + sizeof(size_t), ALINEACION);
+    return t < MIN_BLOQUE ? MIN_BLOQUE : t;
+}
+```
+
+Fíjate en `n + sizeof(size_t)`: si `n` viene de una entrada externa cercana a `SIZE_MAX`, esa suma desborda silenciosamente y devuelves un bloque diminuto para una petición gigantesca. Es el patrón de bug que ha producido CVEs reales en asignadores de producción. Compruébalo antes de sumar, no después.
+
+## Bins, división y fusión
+
+Una única lista de bloques libres degenera en búsqueda lineal. La estructura que usa casi todo asignador serio es la misma: **bins segregados** por tamaño, exactos abajo y logarítmicos arriba.
+
+```c
+#define BINS_EXACTOS 64          // 16, 32, 48 ... 1024 bytes: un bin por talla
+#define BINS_TOTAL   (BINS_EXACTOS + 32)
+
+static BloqueLibre *bins[BINS_TOTAL];
+
+static int indice_bin(size_t n) {
+    if (n <= 1024) return (int)(n / ALINEACION);
+    int orden = 63 - __builtin_clzll(n);       // floor de log2
+    int idx = BINS_EXACTOS + orden - 10;
+    return idx < BINS_TOTAL ? idx : BINS_TOTAL - 1;
+}
+```
+
+Los bins pequeños son exactos: si hay algo dentro, encaja perfecto y la asignación es una sola desconexión de lista. Los grandes agrupan por orden de magnitud y exigen recorrer, así que dentro de ellos importa la política. Con **primer ajuste** entregas el primero que valga; con **mejor ajuste** recorres el bin entero buscando el desperdicio mínimo. La sabiduría convencional dice que mejor ajuste fragmenta menos; los datos de Wilson y compañía dicen que la diferencia es marginal y que el coste de recorrer no compensa. Mide antes de creer.
+
+Asignar es dividir, y dividir tiene un umbral que no puedes ignorar:
+
+```c
+static void *dividir(BloqueLibre *b, size_t pedido) {
+    size_t total = TAM(b->cabecera);
+    size_t resto = total - pedido;
+
+    if (resto >= MIN_BLOQUE) {                     // el resto vive por si mismo
+        poner_cabecera(b, pedido, EN_USO);
+        BloqueLibre *r = (BloqueLibre *)((unsigned char *)b + pedido);
+        poner_cabecera(r, resto, ANTERIOR_USO);
+        poner_pie(r, resto);
+        insertar_en_bin(r);
+    } else {
+        poner_cabecera(b, total, EN_USO);          // sobrante regalado al usuario
+        marcar_anterior_en_uso(siguiente_fisico(b));
+    }
+    return (unsigned char *)b + sizeof(size_t);
+}
+```
+
+Ese `else` es fragmentación interna deliberada: entregas hasta quince bytes de más porque un fragmento menor que `MIN_BLOQUE` no cabría ni siquiera sus propios metadatos. Un asignador que no lo contempla acaba con un montón lleno de huecos inservibles que no puede ni indexar.
+
+Liberar es fusionar, y hay que hacerlo en las dos direcciones o la fragmentación externa te mata en horas:
+
+```c
+static BloqueLibre *fusionar(BloqueLibre *b) {
+    size_t t = TAM(b->cabecera);
+
+    BloqueLibre *sig = (BloqueLibre *)((unsigned char *)b + t);
+    if (!(sig->cabecera & EN_USO)) {               // hacia delante
+        sacar_de_bin(sig);
+        t += TAM(sig->cabecera);
+    }
+    if (!(b->cabecera & ANTERIOR_USO)) {           // hacia atras, via pie
+        size_t tp = *((size_t *)b - 1);
+        b = (BloqueLibre *)((unsigned char *)b - tp);
+        sacar_de_bin(b);
+        t += tp;
+    }
+    poner_cabecera(b, t, b->cabecera & ANTERIOR_USO);
+    poner_pie(b, t);
+    return b;
+}
+```
+
+<Mermaid code={`flowchart LR
+  P[peticion de n bytes] --> R[redondear y anadir cabecera]
+  R --> G[tamano grande] --> M[mmap directo al kernel]
+  R --> N[tamano normal] --> B[bin exacto]
+  B --> H[hay bloque libre] --> D[dividir y entregar]
+  B --> V[bin vacio] --> S[subir a bins mayores o crecer]
+  S --> D
+  style M fill:#f38ba8,color:#11111b
+  style D fill:#a6e3a1,color:#11111b`} />
+
+## La frontera con el kernel
+
+Tu asignador no crea memoria: la pide. Y la política de esa petición decide más sobre tu rendimiento que toda la estructura de bins junta, porque cada fallo de página cuesta miles de ciclos.
+
+```c
+#include <sys/mman.h>
+
+#define UMBRAL_MMAP  (128u * 1024u)
+#define CRECIMIENTO  (1u * 1024u * 1024u)
+
+static void *pedir_al_sistema(size_t bytes) {
+    bytes = alinear_arriba(bytes, 4096);
+    void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+}
+```
+
+Tres decisiones de diseño se esconden en esas líneas. La primera: **los bloques enormes van directos al kernel**, con su propio mapeo, y se devuelven con `munmap` al liberarlos. No ensucian los bins, no fragmentan el montón y devuelven memoria física al sistema de verdad. La segunda: **el montón crece a saltos grandes**, nunca del tamaño exacto pedido, porque una syscall por asignación convertiría tu asignador en un juguete. La tercera, la que casi nadie implementa la primera vez: **devolver también hacia abajo**. Si acumulas cientos de megabytes de bloques libres y nunca llamas a `munmap` ni a `madvise` con `MADV_DONTNEED`, tu proceso crece monótonamente y el administrador de sistemas te odiará con razón.
+
+<Cards>
+  <Card icon="🔱" title="Umbral de mmap">
+    Por encima de él, un mapeo por asignación. Simplifica el montón y devuelve páginas al liberar.
+  </Card>
+  <Card icon="🧱" title="Crecimiento por lotes">
+    Pedir un mebibyte y repartirlo amortiza la syscall sobre miles de asignaciones.
+  </Card>
+  <Card icon="🧵" title="Arenas por hilo">
+    Un montón por hilo elimina la contención del cerrojo global, a costa de memoria duplicada.
+  </Card>
+  <Card icon="🪶" title="Cachés locales">
+    Listas por talla sin sincronización delante de los bins: es lo que hace rápidos a tcmalloc y jemalloc.
+  </Card>
+</Cards>
+
+## Medir sin mentirte
+
+Un microbenchmark que asigna y libera un millón de veces el mismo tamaño en el mismo hilo es una mentira preciosa: tu caché de una talla ganará siempre. La medición honesta usa el programa real, y la forma limpia de hacerlo es la interposición.
+
+```bash
+gcc -std=c23 -O2 -fPIC -shared -o mialloc.so mialloc.c
+LD_PRELOAD=./mialloc.so ./programa_real          # sin recompilar nada
+
+hyperfine --warmup 3 './programa_real' 'LD_PRELOAD=./mialloc.so ./programa_real'
+perf stat -e page-faults,cache-misses,dTLB-load-misses ./programa_real
+/usr/bin/time -v ./programa_real | grep 'Maximum resident'
+```
+
+Y las cuatro métricas que de verdad importan, en este orden: **latencia media**, **latencia del percentil 99** —el pico que arruina un servidor, y donde la coalescencia larga se paga—, **memoria residente máxima** frente a bytes vivos, que es tu factor de fragmentación real, y **escalado con hilos**, midiendo de uno a la cantidad de núcleos que tengas.
+
+Además, valida siempre bajo sanitizadores. Un asignador propio deja ciegos a AddressSanitizer y a Valgrind exactamente igual que una arena: para ellos, tu montón es un único bloque enorme y correctísimo. Envenena manualmente lo no repartido con `ASAN_POISON_MEMORY_REGION` y los desbordamientos entre bloques vecinos volverán a ser errores ruidosos.
+
+<Callout type="dios" title="Perder contra malloc es el resultado que buscabas">
+Tu asignador será entre dos y diez veces más lento que `glibc` en carga multihilo, y esa derrota contiene más información que cualquier victoria. Perderás porque `malloc` no es un algoritmo: es treinta años de decisiones acumuladas contra cargas reales. Tiene cachés por hilo sin cerrojos para las tallas pequeñas, arenas múltiples que se reparten los hilos según la contención observada, un bin no ordenado que actúa de caché de segunda oportunidad, un top chunk que crece con `brk` y se recorta al liberar, y rutas especializadas para `calloc` que aprovechan que el kernel ya entrega páginas a cero. Ninguna de esas piezas es brillante por separado; juntas son el resultado de que millones de programas hayan gritado durante décadas. Y esa es la lección que trasciende la memoria: **el código de infraestructura maduro rara vez es lento por ignorancia; es complejo porque el mundo es complejo**. Cada rama rara que te parece innecesaria al leerlo suele corresponder a un caso patológico que alguien sufrió en producción a las tres de la mañana. Escribir tu propio asignador no te da un `malloc` mejor —casi nunca lo necesitas—, te da algo más valioso: la capacidad de leer el fuente de uno y entender qué problema resuelve cada línea, la intuición para saber cuándo un asignador especializado sí gana, que es siempre que conoces algo del patrón de uso que el general no puede saber, y el respeto informado que separa al ingeniero del que solo opina. Has dejado de usar memoria y has empezado a gobernarla.
+</Callout>
+
+<Reto title="Un asignador que aguante producción">
+1. Implementa cabecera empaquetada, pie replicado y la bandera de anterior en uso. Verifica con `alignof(max_align_t)` que toda dirección devuelta está alineada.
+2. Añade bins segregados con división y fusión bidireccional. Escribe un verificador que recorra el montón entero y compruebe la coherencia de cabeceras y pies tras cada operación.
+3. Implementa el umbral de `mmap` y comprueba con `strace` que un bloque de un mebibyte produce un mapeo propio y su liberación un `munmap`.
+4. Compílalo como biblioteca compartida e interpónlo con `LD_PRELOAD` sobre un programa real —por ejemplo, `git log` o tu propio intérprete de la lección siguiente.
+5. Mide con `hyperfine` y `perf stat` frente a `glibc`: latencia media, percentil 99, residente máxima y escalado de uno a ocho hilos. Explica cada derrota.
+6. Provoca un desbordamiento de un bloque al vecino, comprueba que ningún sanitizador lo ve, añade el envenenado manual y verifica que ahora falla ruidosamente.
+</Reto>
