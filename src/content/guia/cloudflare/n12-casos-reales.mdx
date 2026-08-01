@@ -1,0 +1,151 @@
+---
+title: "Casos reales del cron"
+description: "Cuatro patrones canónicos donde el cron gana su sueldo: limpieza periódica de datos, sincronización con una API externa, informes por email y calentar caches. Y la lección de arquitectura que los une: el cron es un disparador que delega en Queues y guarda estado en D1, no un obrero que carga el trabajo pesado a solas."
+subject: cloudflare
+level: 12
+order: 5
+icon: "12.5"
+duracion: "15 min"
+---
+
+<Lead>
+Ya sabes qué es un `scheduled` handler, cómo se escribe su horario, cómo prolongas su vida con `ctx.waitUntil` y cómo lo pruebas y observas. Falta la pregunta que de verdad importa: ¿para qué sirve? El cron no es un fin en sí mismo, es un mecanismo que resuelve una familia acotada de problemas —los que se benefician de ocurrir según un reloj y no según la petición de un usuario—. Esta lección recorre los cuatro patrones donde aparece una y otra vez en producción, y termina con la idea que separa un cron frágil de uno robusto: casi nunca debe hacer el trabajo pesado él mismo.
+</Lead>
+
+<Objetivos>
+
+- Reconocer los cuatro patrones canónicos: limpieza, sincronización, informes y calentar caches.
+- Escribir una limpieza periódica idempotente sobre D1.
+- Combinar el cron con Queues para repartir trabajo pesado sin chocar con el límite de tiempo.
+- Decidir cuándo el cron basta y cuándo debe delegar en Queues o D1.
+
+</Objetivos>
+
+<Cards>
+  <Card icon="🧹" title="Limpieza">
+    Cadencia diaria. Borra lo caducado —sesiones, logs, temporales— con una operación idempotente.
+  </Card>
+  <Card icon="🔄" title="Sincronización">
+    Cada pocos minutos. Trae datos de una API externa a tu propio almacén y los deja frescos.
+  </Card>
+  <Card icon="📧" title="Informes">
+    Semanal o mensual. Agrega cifras de tu store y las envía por email a un equipo.
+  </Card>
+  <Card icon="🔥" title="Calentar cache">
+    Frecuente. Precalcula respuestas caras antes de que el primer usuario las pida.
+  </Card>
+</Cards>
+
+## Limpieza y mantenimiento
+
+El caso más puro: datos que caducan y hay que barrer. Sesiones expiradas, tokens vencidos, registros temporales, filas marcadas para borrado diferido. Un cron diario ejecuta un `DELETE` acotado por una marca de tiempo, y su virtud esencial es la idempotencia.
+
+```ts
+async scheduled(controller, env, ctx) {
+  const corte = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 dias
+  await env.DB.prepare(
+    "DELETE FROM sesiones WHERE ultima_actividad < ?",
+  ).bind(corte).run();
+}
+```
+
+Que sea idempotente significa que ejecutarlo dos veces no causa daño: borrar lo que ya no existe es una operación nula. Esta propiedad no es un lujo, es un requisito, porque el cron puede reintentarse y porque a veces querrás dispararlo a mano para ponerte al día. Un mantenimiento que solo es correcto si corre exactamente una vez es un mantenimiento roto. Y si la tabla es enorme, un único `DELETE` puede rozar los límites de una sola consulta: entonces borras por lotes acotados con `LIMIT` y dejas que disparos sucesivos rematen la faena, otra vez apoyándote en la idempotencia.
+
+Ese es, en miniatura, el principio que gobierna todo el nivel: el cron no tiene que terminarlo todo en una sola corrida, solo tiene que avanzar de forma segura y repetible.
+
+## Sincronizar con una API externa
+
+Aquí el cron mantiene tu almacén al día respecto a una fuente que no controlas: tarifas, inventario, un feed de terceros. El patrón es traer y fundir —un `fetch` a la API seguido de un `upsert` en D1 o KV— cada pocos minutos.
+
+```ts
+async scheduled(controller, env, ctx) {
+  const r = await fetch("https://api.ejemplo.com/tarifas", {
+    headers: { authorization: `Bearer ${env.API_KEY}` },
+  });
+  const tarifas = await r.json();
+  const stmt = env.DB.prepare(
+    "INSERT INTO tarifas (id, valor) VALUES (?, ?) " +
+      "ON CONFLICT(id) DO UPDATE SET valor = excluded.valor",
+  );
+  await env.DB.batch(tarifas.map((t) => stmt.bind(t.id, t.valor)));
+  ctx.waitUntil(registrarSync(env, tarifas.length));
+}
+```
+
+El `ON CONFLICT ... DO UPDATE` vuelve a hacer idempotente la escritura: sincronizar el mismo dato dos veces lo deja igual. Para fuentes grandes, guarda un cursor —el último identificador o marca de tiempo procesada— en KV, y reanuda desde ahí en la siguiente ejecución en vez de recorrerlo todo cada vez. Y contempla el fallo parcial: si la API responde a medias o te corta por cuota, registra hasta dónde llegaste y deja que el próximo disparo continúe, en lugar de dar el lote entero por perdido y reintentarlo desde el principio.
+
+## Informes y calentar caches
+
+Dos patrones que comparten una misma virtud: mover el cómputo caro fuera del camino crítico del usuario. El **informe** agrega cifras de tu store y las envía por email —con Email Workers o una API de correo— en una cadencia humana, como los lunes por la mañana.
+
+```ts
+async scheduled(controller, env, ctx) {
+  const filas = await env.DB.prepare(
+    "SELECT producto, SUM(total) AS ventas FROM pedidos " +
+      "WHERE creado > ? GROUP BY producto",
+  ).bind(inicioSemana()).all();
+  const cuerpo = componerInforme(filas.results);
+  await enviarEmail(env, "equipo@ejemplo.com", "Informe semanal", cuerpo);
+}
+```
+
+**Calentar la cache** es la otra cara: precalculas una respuesta cara y la depositas en KV o en la Cache API antes de que llegue nadie, de modo que la primera petición real ya la encuentre tibia.
+
+```ts
+async scheduled(controller, env, ctx) {
+  const destacados = await calcularDestacados(env); // costoso
+  await env.KV.put("home:destacados", JSON.stringify(destacados), {
+    expirationTtl: 600,
+  });
+}
+```
+
+En ambos, el cron desplaza la latencia: el trabajo pesado ocurre según un reloj tranquilo, no colgado de la petición de un usuario que espera. Precalcular a las horas muertas es comprar rapidez percibida con tiempo que a nadie le duele.
+
+El matiz que separa un calentado de cache útil de uno inútil es elegir bien qué precalcular: las respuestas caras y compartidas por muchos —la portada, el catálogo destacado, un ranking— rinden muchísimo; las respuestas personalizadas por usuario no caben en un cron y pertenecen a la petición. Calienta lo común, no lo individual.
+
+Un buen termómetro para decidir la cadencia es el coste de recomputar frente a la tolerancia a datos algo rancios: cuanto más caro el cálculo y más aguante el dato un poco viejo, más espaciado puede ir el cron.
+
+<Callout type="note" title="El TTL y la cadencia deben conversar">
+Al calentar una cache, el `expirationTtl` que fijas y cada cuánto corre el cron tienen que estar acordados: si el dato expira antes de que el siguiente disparo lo refresque, abres ventanas frías en las que la petición vuelve a pagar el cómputo caro que querías evitar. La regla prudente es que el cron refresque con margen antes de que caduque lo anterior.
+</Callout>
+
+## El cron como disparador, no como obrero
+
+Aquí está la lección de arquitectura que corona el nivel. Con un techo de reloj de unos quince minutos y una CPU modesta, el cron no debería cargar él solo con el trabajo pesado. El patrón maduro lo usa como **disparador**: enumera de forma rápida y acotada las unidades de trabajo, las encola en Queues, y deja que consumidores independientes las procesen con sus propios reintentos y su propia concurrencia. D1 sostiene el estado y los cursores que hacen el trabajo reanudable.
+
+```ts
+async scheduled(controller, env, ctx) {
+  const usuarios = await env.DB.prepare(
+    "SELECT id FROM usuarios WHERE requiere_sync = 1 LIMIT 1000",
+  ).all();
+  for (const u of usuarios.results) {
+    await env.COLA.send({ tipo: "sync-usuario", id: u.id });
+  }
+}
+```
+
+El cron enumera —barato y veloz— y entrega; el consumidor de la Queue hace el trabajo lento por elemento, reintenta los que fallan y escala en paralelo. Así el techo de quince minutos deja de ser una amenaza: ninguna invocación individual carga con el lote entero.
+
+Hay un beneficio extra: el consumidor de la Queue trae su propia política de reintentos y su propia concurrencia, de modo que un elemento que falla se reintenta por sí solo —sin arrastrar al resto ni obligar a repetir el barrido entero del cron—. El disparador enumera; la Queue administra el esfuerzo.
+
+<Callout type="tip" title="Cuidado con el solapamiento">
+Si un cron cada cinco minutos a veces tarda seis, dos ejecuciones se solapan y pueden pisarse: el cron no se serializa solo. Las defensas se combinan bien —hacer cada unidad idempotente para que el solapamiento sea inofensivo, o tomar un cerrojo breve, una marca en KV o D1 con expiración, que una segunda ejecución respete y ceda—. Diseñar como si dos corridas pudieran coincidir sale más barato que descubrir que coincidieron.
+</Callout>
+
+<Mermaid code={`flowchart LR
+  Cron[el cron dispara] --> Enum[scheduled enumera el trabajo]
+  Enum --> Cola[encola items en Queues]
+  Cola --> Consumidor[el consumidor procesa con reintentos]
+  Consumidor --> Estado[D1 guarda el estado y el cursor]`} />
+
+<Callout type="dios" title="El cron es un latido, no una bestia de carga">
+El error de principiante es meter un lote monolítico dentro del handler y rezar para que quepa en los quince minutos. Funciona en la demo, funciona el primer mes, y luego los datos crecen y el trabajo empieza a truncarse en silencio —sin un error visible, sin un usuario que se queje, solo filas que dejaron de procesarse—. El patrón robusto separa dos responsabilidades que el novato confunde: la **planificación** —el cuándo— y la **ejecución** —el qué y el cuánto—. El cron decide «ahora»; las Queues deciden «a qué ritmo y con cuántos reintentos»; D1 o KV guardan el estado durable y los cursores que hacen el trabajo reanudable e idempotente. Es la misma separación de intereses que distingue un pipeline distribuido serio de un script frágil. Y la idempotencia es la pieza que lo sostiene todo: como el cron reintenta y las Queues reintentan, cada unidad de trabajo tiene que ser segura de ejecutar dos veces. Diseñas para «al menos una vez», no para «exactamente una vez», porque lo segundo es una fantasía en sistemas distribuidos y perseguirla te deja con lo peor de ambos mundos. Cuando interiorizas que el cron solo enciende la música y que los músicos son otros, dejas de preguntar «¿cómo hago que mi cron dure más?» y empiezas a preguntar «¿cómo parto esto en unidades a las que no les importa cuánto tarda el conjunto?». Esa segunda pregunta construye sistemas que sobreviven al crecimiento; la primera solo aplaza el día del truncamiento silencioso.
+</Callout>
+
+<Reto title="Diseña un cron de producción">
+1. Escribe una limpieza idempotente que borre de D1 las filas con más de noventa días y explica por qué ejecutarla dos veces no causa daño.
+2. Diseña una sincronización con una API externa que guarde un cursor en KV para reanudar donde lo dejó.
+3. Un informe recorre doscientos mil pedidos y no cabe en quince minutos: reescríbelo para que el cron encole lotes en una Queue y un consumidor los procese.
+4. Justifica qué combinación de cron, Queues y D1 usarías para calentar la cache de las cien páginas más visitadas cada diez minutos.
+</Reto>

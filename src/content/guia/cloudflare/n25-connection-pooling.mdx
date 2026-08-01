@@ -1,0 +1,151 @@
+---
+title: "Connection pooling: por qué el edge tumba una base tradicional"
+description: "Una base relacional clásica nació para hablar con un puñado de servidores longevos, no con cientos de miles de isolates efímeros repartidos por el planeta. Abrir una conexión nueva a Postgres cuesta varios viajes de red completos, y cada conexión abierta consume un proceso y memoria en el origen, con un techo de conexiones que se agota enseguida. Aquí desmontamos el coste real del saludo de conexión, la tormenta de conexiones que el edge provoca, y las dos mitades con que Hyperdrive lo resuelve: establecer la conexión junto al Worker y mantener un pool caliente junto a la base, en modo transacción."
+subject: cloudflare
+level: 25
+order: 2
+icon: "25.2"
+duracion: "15 min"
+---
+
+<Lead>
+Postgres y MySQL fueron diseñados en un mundo donde el cliente era un servidor de aplicaciones longevo, en la misma red que la base, que abría diez o veinte conexiones al arrancar y las conservaba durante semanas. Ese contrato implícito —pocos clientes, muy cercanos, muy duraderos— es exactamente lo que el edge rompe: cientos de miles de isolates efímeros, repartidos por trescientas ubicaciones, que nacen para atender una petición y mueren. Entender por qué esa colisión es tan destructiva es entender por qué Hyperdrive existe, y por qué su pieza central no es la caché sino el pool de conexiones.
+</Lead>
+
+<Objetivos>
+
+- Medir el coste real de abrir una conexión nueva a una base relacional desde un Worker.
+- Explicar por qué el modelo efímero y masivamente paralelo agota una base tradicional.
+- Describir las dos mitades de la solución: establecimiento cercano al Worker y pool cercano al origen.
+- Conocer el modo transacción del pool y cómo condiciona el código que escribes.
+
+</Objetivos>
+
+## El coste de un saludo
+
+La primera intuición equivocada es pensar que una conexión a Postgres es como una petición HTTP: la abres y ya está. No lo es. Establecer una conexión a una base relacional es un protocolo conversacional con varias rondas obligatorias, cada una con su ida y su vuelta completas por la red.
+
+Primero el apretón de manos de TCP. Luego la negociación de TLS, que en el mejor caso son otro par de viajes. Después el mensaje de arranque del protocolo de Postgres, el desafío de autenticación, la respuesta con la credencial, la confirmación del servidor y los parámetros de sesión. Sumados, rondan los siete viajes de red completos antes de que puedas enviar la primera letra de tu primera consulta.
+
+Desde un servidor de aplicaciones pegado a la base, con un viaje de ida y vuelta de un milisegundo, ese saludo cuesta siete milisegundos y se paga una sola vez al arrancar el proceso. Desde un Worker en Sídney contra un Postgres en Virginia, con un viaje de ida y vuelta de ciento cincuenta milisegundos, el mismo saludo cuesta más de un segundo, y se paga otra vez en cada invocación porque no hay proceso longevo donde guardar nada.
+
+Conviene notar dónde está la trampa aritmética, porque no es el número de viajes: siete rondas son siete rondas en ambos casos. Lo que cambia es el multiplicador, y ese multiplicador aparece dos veces. Primero se multiplica por la distancia, que en el edge es grande por definición porque tu compute está cerca del usuario y no de la base. Y después se multiplica por la frecuencia, porque el amortizador que hacía tolerable ese coste —un proceso que vive semanas— simplemente no existe. Un coste fijo que se paga una vez es una nota al pie; el mismo coste pagado en cada petición es la arquitectura entera.
+
+```text
+saludo de conexion = TCP + TLS + arranque + autenticacion
+cerca de 7 viajes de red completos antes de la primera consulta
+
+origen a 1 ms   ->  unos 7 ms, pagados una vez al arrancar el servidor
+origen a 150 ms ->  mas de 1 s, pagado en CADA invocacion del Worker
+```
+
+<Callout type="tip" title="La consulta rara vez es lo lento">
+Cuando midas una petición lenta contra una base regional desde el edge, descompón el tiempo antes de optimizar SQL. Casi siempre el reparto es demoledor: el saludo de conexión se lleva la mayor parte, el viaje de la consulta una porción, y la ejecución real del SQL en el motor apenas unos milisegundos. Optimizar índices cuando tu cuello de botella es el establecimiento de la conexión es afilar el cuchillo equivocado. La regla práctica: si tu consulta tarda lo mismo con un `LIMIT 1` que con un `LIMIT 1000`, lo que estás midiendo no es la base.
+</Callout>
+
+## La tormenta de conexiones
+
+El segundo problema es más grave, porque no degrada el rendimiento: derriba la base. Cada conexión a Postgres se materializa en el servidor como un proceso del sistema operativo con su propia memoria reservada. Por eso el parámetro `max_connections` ronda las cien conexiones por defecto, y muchos proveedores gestionados imponen techos aún más bajos según el tamaño de la instancia. No es una limitación arbitraria: es el precio de un modelo donde una conexión es cara.
+
+Que ese coste sea un proceso del sistema, y no una entrada en una tabla, es lo que hace que el techo sea real y no negociable. Subir `max_connections` sin más no arregla nada: cada conexión adicional reserva memoria y añade contención, así que a partir de cierto punto la base va peor con más conexiones permitidas que con menos. Ese es el motivo de que la respuesta correcta nunca sea ampliar el cupo, sino reducir la demanda.
+
+Ahora superpón el modelo del edge. Un Worker no tiene un proceso longevo donde guardar un pool; cada isolate es independiente y no comparte memoria con los demás. Si tu Worker abre una conexión en cada invocación y recibe mil peticiones concurrentes desde cuarenta ubicaciones, intentas abrir mil conexiones simultáneas contra una base que admite cien. El resultado no es lentitud, es el error de conexiones agotadas y una caída que arrastra también al tráfico que no venía del edge.
+
+<Mermaid code={`flowchart LR
+  subgraph SIN [Sin Hyperdrive]
+    A1[Isolate 1] --> PG1[Postgres max 100]
+    A2[Isolate 2] --> PG1
+    A3[Isolate N] --> PG1
+  end
+  subgraph CON [Con Hyperdrive]
+    B1[Isolate 1] --> HD[Pool compartido]
+    B2[Isolate 2] --> HD
+    B3[Isolate N] --> HD
+    HD --> PG2[Postgres]
+  end
+  style PG1 fill:#f38ba8,color:#11111b
+  style HD fill:#89b4fa,color:#11111b
+  style PG2 fill:#a6e3a1,color:#11111b`} />
+
+La raíz del conflicto es que el edge multiplica la concurrencia por órdenes de magnitud mientras la base mantiene un techo pensado para otra época. Ninguna de las dos partes está mal diseñada; simplemente hablan modelos de recursos incompatibles. Hace falta un intermediario que traduzca muchos clientes efímeros en pocas conexiones duraderas.
+
+Quien venga del mundo tradicional pensará de inmediato en un pooler clásico como `PgBouncer`, y la intuición es correcta a medias. Un pooler resuelve la segunda mitad del problema —multiplexar muchos clientes sobre pocas conexiones al origen— y por eso es imprescindible desde hace décadas. Pero no resuelve la primera, porque vive en una región concreta: tu Worker de Sídney seguiría pagando el saludo completo contra un pooler alojado en Virginia, y habrías arreglado la contención sin tocar la latencia. Ese es exactamente el hueco que el edge abre y que un intermediario regional no puede cerrar por mucho que se afine.
+
+<Callout type="note" title="Un fallo que se propaga hacia fuera">
+El daño de una tormenta de conexiones no se queda dentro de tu Worker, y esa es la razón por la que este problema merece un nivel entero. Cuando la base agota su cupo, deja de aceptar conexiones para todo el mundo: tus trabajos por lotes, tus paneles internos, tus procesos administrativos y la aplicación heredada que lleva ocho años funcionando sin incidentes. Un despliegue nuevo en el edge se convierte así en una caída general cuya causa nadie relaciona con el edge. Es un fallo con radio de impacto invertido: el componente que escala bien tumba a los que nunca tuvieron problemas.
+</Callout>
+
+## Las dos mitades de la solución
+
+Hyperdrive no resuelve un problema, resuelve dos, y lo hace en dos lugares geográficos distintos. Esa asimetría es lo más elegante de su diseño y lo que más cuesta ver a primera vista.
+
+La primera mitad ocurre **junto a tu Worker**. Cuando tu driver abre una conexión, no la abre contra tu Postgres lejano: la abre contra Hyperdrive, que está en la misma ubicación del edge o muy cerca. Los siete viajes del saludo siguen existiendo, pero ahora cada uno cuesta un milisegundo en lugar de ciento cincuenta. El coste de establecer conexión colapsa sin cambiar el protocolo.
+
+La segunda mitad ocurre **junto a tu base**. Hyperdrive mantiene un pool de conexiones ya calientes en una o varias regiones cercanas al origen, y las reutiliza entre invocaciones y entre isolates distintos. Cuando llega una consulta, si hay una conexión libre en el pool la aprovecha; si no la hay, abre una nueva —pero desde muy cerca del origen, donde el saludo vuelve a ser barato—. El objetivo declarado del gestor es crear y mantener el mínimo número de conexiones posible.
+
+Lo interesante es que ninguna de las dos mitades habría bastado por separado. Un pool cercano a la base sin establecimiento cercano al Worker deja intacta la latencia de conexión desde el edge, que era el primer peaje. Un establecimiento rápido sin pool deja intacta la contención en el origen, que era el segundo y el que tumba sistemas. Solo aplicadas a la vez, y cada una en el extremo donde su coste se paga, la base regional se vuelve consumible desde una red global.
+
+<Cards>
+  <Card icon="🤝" title="Junto al Worker">
+    El saludo de conexión se completa en el edge, a milisegundos del isolate. El protocolo no cambia; cambia la distancia que recorre cada viaje.
+  </Card>
+  <Card icon="🚄" title="Junto a la base">
+    Un pool de conexiones calientes compartido entre todos los isolates. Miles de clientes efímeros se traducen en unas pocas conexiones duraderas al origen.
+  </Card>
+</Cards>
+
+La consecuencia combinada es la que importa: el número de conexiones que tu base ve deja de depender de tu tráfico y pasa a depender del tamaño del pool, que es un número que tú decides. Diez mil peticiones concurrentes desde cuarenta ubicaciones se convierten en las mismas veinte conexiones que tenías antes, y la base ni se entera de que ahora la consume el planeta entero.
+
+El pool tiene un tamaño gobernable. Toda configuración parte de un mínimo de cinco conexiones al origen, y el máximo depende de tu plan de Workers. Si tu base es pequeña y quieres protegerla, o si es grande y quieres dejar respirar al pool, se ajusta sin tocar código.
+
+```bash
+# ajustar el numero maximo de conexiones al origen
+npx wrangler hyperdrive update TU_ID_DE_HYPERDRIVE --origin-connection-limit=20
+```
+
+Ajustar ese número es un ejercicio de equilibrio entre dos presiones opuestas. Un pool demasiado pequeño produce clientes en espera: hay conexiones libres en la base pero no en el pool, y tus peticiones hacen cola sin motivo. Un pool demasiado grande traslada la presión al origen, que vuelve a acercarse a su techo y a competir con el resto de sus clientes. El punto correcto no se adivina, se observa: se sube mientras los clientes en espera caigan y la base no se resienta, y se para en cuanto una de las dos cosas deje de cumplirse.
+
+<Callout type="info" title="El pool se puede observar, no solo suponer">
+La plataforma expone métricas específicas del pool —clientes en espera, conexiones abiertas, huecos disponibles y tamaño máximo— tanto en el panel como en el conjunto de datos `hyperdrivePoolSizesAdaptiveGroups` de la API de analítica. La contención tiene una firma inconfundible: un pico de clientes en espera, o conexiones abiertas rozando de forma sostenida el máximo configurado. Diagnosticar con esos números, y no con la intuición, es lo que distingue subir el límite porque toca de subirlo porque los datos lo piden.
+</Callout>
+
+## Modo transacción: la letra pequeña
+
+El pool opera en **modo transacción**, y esa decisión tiene consecuencias directas sobre el código que escribes. Un cliente no posee una conexión mientras dura su vida, sino solo mientras dura una transacción: al terminarla, la conexión vuelve al pool y queda disponible para otro isolate. Por eso una sola invocación de tu Worker puede acabar usando varias conexiones distintas para sus operaciones.
+
+Ese detalle rompe un supuesto tan interiorizado que casi nadie lo formula en voz alta: que una conexión es una sesión, un contexto estable donde lo que configuras al principio sigue vigente al final. En modo transacción esa equivalencia desaparece. La conexión pasa a ser un recurso prestado por el tiempo mínimo imprescindible, y el estado de sesión —zona horaria, rol activo, tiempos de espera, tablas temporales— deja de ser un lugar fiable donde apoyarse.
+
+De ahí se deriva la trampa más común. Al devolver una conexión al pool se ejecuta un `RESET`, de modo que cualquier `SET` que hubieras aplicado desaparece. Los `SET` funcionan dentro de una transacción explícita con `BEGIN` y `COMMIT`, o acompañando a una consulta en la misma sentencia, pero no persisten entre operaciones sueltas. Si tu código configura una zona horaria o un rol al principio y da por hecho que sigue vigente diez líneas después, se llevará una sorpresa silenciosa.
+
+La tentación entonces es envolverlo todo en una transacción larga para conservar el estado. Es justo lo contrario de lo que conviene: mientras esa transacción vive, la conexión queda secuestrada y ningún otro isolate puede reutilizarla, así que degradas el rendimiento y el escalado de todo el sistema para ahorrarte repetir un `SET`.
+
+```ts
+// CORRECTO: la configuracion viaja con la transaccion que la necesita
+await sql.begin(async (tx) => {
+  await tx`SET LOCAL statement_timeout = 5000`;
+  await tx`UPDATE pedidos SET estado = 'enviado' WHERE id = ${id}`;
+});
+
+// ANTIPATRON: transaccion larga solo para conservar un SET
+// secuestra una conexion del pool y frena a los demas isolates
+```
+
+Un detalle final que conviene conocer: las sentencias preparadas con nombre están soportadas tal y como las implementan `postgres.js` y `node-postgres`, los dos drivers de referencia. En otros drivers pueden rendir peor o no funcionar, así que la elección de driver no es indiferente cuando el pool está de por medio.
+
+Todo esto dibuja una regla de diseño que conviene adoptar deliberadamente: en el edge, las transacciones deben ser **cortas y con propósito único**. No porque una transacción larga sea incorrecta —en un backend clásico es una herramienta legítima—, sino porque aquí su coste ya no lo paga solo quien la abre. Cada segundo que una transacción retiene una conexión es un segundo que esa conexión no está disponible para los demás isolates, y en un sistema donde el pool es un recurso compartido y deliberadamente pequeño, esa retención se traduce en clientes en espera para todo el mundo. La transacción sigue existiendo, sigue siendo atómica y sigue siendo la forma correcta de agrupar operaciones que deben ocurrir juntas; lo que cambia es que ahora su duración es un asunto colectivo.
+
+<Callout type="warn" title="El pool acerca la conexión, no la consulta">
+Hyperdrive elimina el coste de establecer conexión, pero cada consulta no cacheada sigue viajando hasta tu base. Si tu Worker lanza varias consultas secuenciales por petición, esos viajes se acumulan: veinte o treinta milisegundos cada uno desde una región lejana. Ahí la herramienta complementaria es `Smart Placement`, que ejecuta tu Worker cerca de la base y baja ese coste por consulta a uno o tres milisegundos. Si tu Worker hace una sola consulta, el emplazamiento no mejora nada, porque el viaje total es el mismo lo hagas desde donde lo hagas. La regla es limpia: varias consultas secuenciales piden emplazamiento; una sola, no.
+</Callout>
+
+<Callout type="dios" title="Un pool es un traductor entre dos modelos de recurso incompatibles">
+Conviene mirar el connection pooling no como un truco de rendimiento sino como lo que de verdad es: un traductor entre dos filosofías opuestas sobre qué significa un recurso. Para una base relacional clásica, una conexión es cara, escasa y duradera —un proceso con memoria propia, un recurso que se administra con cuidado y del que hay cien—. Para el edge, una unidad de ejecución es baratísima, abundante y efímera —un isolate que nace, atiende y muere, y del que hay cientos de miles simultáneos—. Ninguno de los dos modelos está equivocado: cada uno es la respuesta óptima a las restricciones de su época y de su forma de ejecutar. El desastre nace de conectarlos directamente, porque la abundancia de un lado ataca a la escasez del otro con la eficacia de una denegación de servicio involuntaria, y la ironía es que cuanto mejor escale tu capa de compute, más deprisa tumbarás tu base. Un pool resuelve esa colisión porque introduce un punto donde la abundancia se convierte en escasez de forma ordenada: miles de clientes efímeros se multiplexan sobre unas pocas conexiones duraderas, y cada lado sigue viendo el mundo que espera ver. Pero el detalle que eleva el diseño de Hyperdrive por encima de un pooler corriente es que reparte esa traducción en dos lugares en vez de uno. Situar el establecimiento de conexión junto al Worker y el pool junto a la base no es una optimización más: es reconocer que los dos costes tienen naturalezas distintas —uno es latencia de protocolo, el otro es contención de recursos— y que cada uno solo se puede atacar donde vive. Esa lección trasciende a Cloudflare y es de las más rentables que se aprenden en sistemas distribuidos: cuando dos componentes con supuestos incompatibles deben hablarse, la solución rara vez es cambiar uno de los dos, y casi nunca es un intermediario colocado a mitad de camino por comodidad; es una capa fina que se sitúa exactamente donde cada coste se paga, y que absorbe la diferencia sin pedirle a ninguna de las dos partes que renuncie a su naturaleza.
+</Callout>
+
+<Reto title="Mide el coste de conectar">
+1. Enumera las fases del saludo de conexión a Postgres y estima su coste total para un origen a 20, 80 y 200 milisegundos de distancia.
+2. Calcula cuántas conexiones simultáneas intentaría abrir un Worker sin pool que recibe 500 peticiones concurrentes, y compáralo con un `max_connections` de 100.
+3. Explica dónde ocurre cada una de las dos mitades de la solución y qué coste concreto ataca cada una.
+4. Describe qué le pasa a un `SET` cuando la conexión vuelve al pool, y reescribe un fragmento que dependiera de ese estado para que sea correcto en modo transacción.
+5. Decide, para un Worker que lanza cinco consultas secuenciales por petición, si conviene emplazarlo cerca de la base y justifica la respuesta con números.
+</Reto>

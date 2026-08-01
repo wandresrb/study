@@ -1,0 +1,138 @@
+---
+title: "Qué NO hay: fs, sockets crudos, hilos"
+description: "Las ausencias que definen el modelo de Workers (sin sistema de archivos, sin sockets de escucha ni crudos arbitrarios, sin hilos): por qué existen esas restricciones y cómo adaptar código pensado para Node a un runtime efímero y multi-tenant del edge."
+subject: cloudflare
+level: 5
+order: 5
+icon: "5.5"
+duracion: "17 min"
+---
+
+<Lead>
+Aprender un runtime es tanto conocer lo que ofrece como interiorizar lo que niega. Workers no tiene sistema de archivos, no puede abrir sockets de escucha ni sockets crudos arbitrarios, y no expone hilos. Estas ausencias no son carencias a la espera de rellenarse: son consecuencias directas del modelo de isolates efímeros y multi-tenant. Entenderlas es lo que te permite adaptar código pensado para Node en lugar de estrellarte contra un muro sin saber por qué el muro está ahí.
+</Lead>
+
+<Objetivos>
+
+- Identificar las tres grandes ausencias: sistema de archivos, sockets de escucha e hilos.
+- Entender por qué faltan: el modelo efímero, aislado y multi-tenant.
+- Reconocer por qué el estado global entre peticiones no es fiable.
+- Mapear cada API de Node ausente a su alternativa en la plataforma.
+
+</Objetivos>
+
+## Tres ausencias que definen el modelo
+
+<Cards>
+  <Card icon="📁" title="Sin sistema de archivos">
+    No hay `fs` con disco persistente. Un isolate no posee un disco local propio; el estado vive en bindings de almacenamiento, no en archivos.
+  </Card>
+  <Card icon="🔌" title="Sin sockets de escucha">
+    No puedes hacer `listen` en un puerto ni abrir sockets crudos arbitrarios. Tu manejador de `fetch` es el servidor; no bindeas puertos.
+  </Card>
+  <Card icon="🧵" title="Sin hilos">
+    No hay `worker_threads` ni memoria compartida entre hilos. La concurrencia es el bucle de eventos y el paralelismo se da entre isolates.
+  </Card>
+</Cards>
+
+Hay que precisar el matiz de los sockets, porque no es un "no" absoluto. No hay sockets de escucha —no puedes bindear un puerto y esperar conexiones entrantes, porque en el edge tú no eres un servidor que arranca, eres una función que se invoca— ni control de sockets crudos de bajo nivel como UDP arbitrario. Pero sí existe una API de conexiones TCP salientes, `connect` del módulo `cloudflare:sockets`, mediada por la plataforma, que es la que usan por debajo los drivers de base de datos e Hyperdrive.
+
+La ausencia, por tanto, es de sockets arbitrarios y de escucha, no de toda salida TCP. Esta distinción es típica de todo el nivel: cada "no hay" es en realidad un "no de esta forma, sino a través de una capacidad concedida". El runtime no te quita el poder de hablar con una base de datos; te obliga a hacerlo por un canal que la plataforma puede supervisar, limitar y enrutar.
+
+## Por qué faltan: efímero, aislado, multi-tenant
+
+Estas restricciones no son pereza de implementación; se derivan de tres propiedades del modelo, y cada una explica una ausencia.
+
+- **Efímero.** Un isolate no es una máquina de larga vida. Se crea, atiende peticiones y puede ser reciclado en cualquier momento. Un archivo escrito en un disco local no sobreviviría y, peor aún, no sería visible desde otro isolate que atienda la siguiente petición del mismo usuario en otra ubicación. El disco local carece de semántica coherente en el edge.
+- **Aislado y sin autoridad ambiente.** El modelo de seguridad es de capacidades: un Worker solo puede tocar lo que se le concede mediante un binding. Un sistema de archivos o un socket crudo serían autoridad ambiente —poder que el código ejerce sin que nadie se lo otorgue explícitamente—, justo lo que el modelo elimina para poder ejecutar millones de tenants en el mismo proceso sin que se pisen.
+- **Multi-tenant.** Miles de isolates de clientes distintos comparten procesos y máquinas físicas. Hilos con memoria compartida y sockets crudos abrirían superficies de ataque y de interferencia inaceptables en ese contexto, además de complicar el aislamiento de recursos.
+
+Vistas juntas, las tres propiedades dibujan un runtime que es lo contrario de una máquina que administras: no hay disco tuyo, no hay puerto tuyo, no hay proceso tuyo. Hay un enjambre de contextos de ejecución que la plataforma crea y destruye por ti, y al que le concedes capacidades de forma explícita.
+
+Es el mismo razonamiento que ya aparecía con los bindings: el edge sustituye la autoridad ambiente —el poder implícito de leer cualquier archivo o abrir cualquier socket— por capacidades explícitas y otorgadas. Lo que en Node es un permiso del sistema operativo, aquí es una entrada declarada en tu configuración. Las ausencias de esta lección no son, por tanto, un capítulo aparte: son la otra cara de la seguridad por capacidades que vertebra toda la plataforma.
+
+Y hay una simetría elegante en ello: cada capacidad que el runtime te niega por defecto —tocar el disco, escuchar en un puerto, abrir un socket crudo— es exactamente una que podría usar código malicioso de otro tenant para atacarte a ti. Al eliminarlas del repertorio implícito y devolvértelas solo como bindings nominados y auditables, la plataforma protege a todos a la vez. La restricción no es un impuesto sobre tu comodidad; es la condición que hace seguro que tu código y el de un desconocido compartan el mismo proceso.
+
+<Mermaid code={`flowchart TD
+  A[necesitas persistir datos] --> B[usa R2 KV o D1 por binding]
+  C[necesitas un servidor] --> D[el manejador fetch ya lo es]
+  E[necesitas trabajo pesado o hilos] --> F[Queues Durable Objects WASM o Containers]
+  G[necesitas hablar TCP con una base de datos] --> H[cloudflare sockets o Hyperdrive]`} />
+
+## El ciclo de vida de un isolate
+
+La ausencia más traicionera no es el disco ni los hilos, sino una que no se ve: no puedes confiar en el estado global entre peticiones. El ámbito del módulo —lo que declaras fuera del manejador `fetch`— se conserva mientras el isolate viva, y eso tienta a usarlo como caché o como contador. Funciona en las pruebas y engaña en producción.
+
+```ts
+// ANTIPATRON: este contador no es fiable
+let visitas = 0;
+
+export default {
+  async fetch(): Promise<Response> {
+    visitas++; // se reinicia al reciclar el isolate y difiere entre ubicaciones
+    return new Response(String(visitas));
+  },
+};
+```
+
+El motivo es el ciclo de vida. Un isolate se crea bajo demanda, atiende una ráfaga de peticiones y Cloudflare lo recicla cuando quiere: por presión de memoria, por inactividad o por un despliegue nuevo. Además, dos peticiones seguidas del mismo usuario pueden caer en isolates distintos y en ubicaciones distintas de la red. No existe un proceso servidor único donde acumular estado; existe una nube de isolates efímeros que van y vienen.
+
+La regla es nítida: el ámbito global sirve para constantes y para inicialización perezosa e idempotente, nunca para datos que deban ser correctos o compartidos. El patrón correcto es el inverso del antipatrón anterior:
+
+```ts
+// CORRECTO: solo estado recreable en el ambito global
+const patron = /^[a-z0-9]+$/i; // compilar una vez por isolate esta bien
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // el estado que debe ser correcto vive en un binding, no en una variable
+    const total = await env.KV.get("total");
+    return new Response(total ?? "0");
+  },
+};
+```
+
+Compilar una expresión regular, preparar un cliente sin estado o cachear una configuración de solo lectura son usos legítimos del ámbito global: si el isolate se recicla, se recrean sin que nadie lo note. La línea divisoria es sencilla: si perder ese valor tiene consecuencias observables, no va en una variable, va en un binding. KV para caché y lecturas globales, D1 para datos relacionales, y sobre todo Durable Objects cuando necesitas un contador o un estado con identidad única y coordinación fuerte.
+
+<Callout type="warn" title="El ámbito global no es tu servidor">
+Si guardas sesiones, contadores o caché mutable en variables del módulo, tu Worker parecerá correcto en local y en las primeras pruebas, y fallará de forma intermitente en producción: cada isolate ve su propia copia y la pierde al reciclarse. El síntoma —datos que "a veces" están y a veces no— es idéntico al de una caché mal invalidada, y por eso cuesta tanto diagnosticarlo. Ante cualquier estado que deba ser correcto, la respuesta es un binding, nunca una variable.
+</Callout>
+
+## Cómo adaptar código pensado para Node
+
+Adaptar no es portar línea a línea: es traducir cada supuesto de "máquina que controlo" a "función cerca del usuario". El mapeo es sistemático.
+
+| Lo que hacías en Node | En Workers |
+|---|---|
+| Leer y escribir con `fs` | Objetos en R2, claves en KV, filas en D1, o assets estáticos empaquetados |
+| `http.createServer` y `listen` | El manejador `fetch` es tu servidor; no bindeas puertos |
+| `worker_threads` para CPU | Repartir en peticiones, `Queues` para lo diferido, WebAssembly para cómputo intenso |
+| `child_process` | No disponible; replantear o mover a un Container |
+| Estado global entre peticiones | No fiable entre isolates; usar Durable Objects o KV |
+| Socket TCP crudo a una base de datos | `connect` de `cloudflare:sockets` o, mejor, Hyperdrive |
+
+El caso del socket TCP ilustra bien el patrón "capacidad, no autoridad ambiente". No abres un socket crudo contra cualquier destino; llamas a una API que la plataforma media:
+
+```ts
+import { connect } from "cloudflare:sockets";
+
+const socket = connect({ hostname: "db.ejemplo.com", port: 5432 });
+// TCP saliente supervisado por la plataforma, no un socket crudo arbitrario
+```
+
+El otro caso que merece énfasis es el trabajo verdaderamente pesado o de larga duración, que en Node resolverías con hilos o procesos. En el edge se reparte en `Queues`, se acelera con WebAssembly, o —si de verdad exige un entorno tipo POSIX con disco e hilos— se delega a un Container, la escotilla de escape que Cloudflare añadió para exactamente ese caso. La decisión no es "cómo replico un hilo", sino "a qué primitiva de la plataforma pertenece este trabajo".
+
+Los Containers merecen una nota, porque cambian el tono del capítulo. Que existan no contradice el modelo: son una admisión honesta de que cierto código —binarios pesados, dependencias nativas, herramientas de línea de comandos— no encaja en un isolate y no debe forzarse. La arquitectura recomendada los usa como excepción, orquestados desde un Worker que sigue siendo la puerta de entrada ligera y cercana al usuario. El isolate atiende la petición; el Container carga con el trabajo bruto solo cuando de verdad hace falta.
+
+Fíjate en el hilo común de toda la tabla: ninguna fila dice "no se puede", todas dicen "se hace de otra forma". El disco se vuelve almacenamiento por binding, el servidor se vuelve un manejador, los hilos se vuelven isolates y colas, el socket crudo se vuelve una API mediada. Adaptar es un ejercicio de traducción entre dos vocabularios, no de renuncia. Y quien domina esa traducción descubre que casi todo lo que hacía en Node tiene un equivalente en el edge, a menudo más simple, porque la plataforma ya resolvió por él la parte difícil: la distribución global.
+
+<Callout type="dios" title="Las restricciones son el modelo, no sus límites">
+El error de encuadre más común al llegar del backend tradicional es leer estas ausencias como una lista de cosas que a Workers "todavía le faltan", como si fuera un producto a medio hacer que algún día tendrá `fs` e hilos. No es así: son la definición misma del modelo. Un runtime que arranca en cero milisegundos, corre cerca de cada usuario del planeta y hospeda millones de tenants en procesos compartidos no puede, por construcción, ofrecer un disco local persistente, autoridad ambiente sobre sockets crudos, ni hilos con memoria compartida. Cada una de esas ausencias es el precio —y a la vez la causa— de una propiedad que sí quieres: sin disco local, tu cómputo es apátrida y se replica a cientos de ubicaciones sin sincronizar nada; sin autoridad ambiente, el modelo de capacidades por bindings hace seguro compartir proceso entre desconocidos; sin hilos, la unidad de escalado es el isolate y el sistema escala en horizontal sin las trampas de la concurrencia con memoria compartida. Adaptar código de Node al edge, por tanto, no consiste en buscar el polyfill que reponga lo que falta: consiste en rediseñar sobre un modelo distinto, moviendo el estado a bindings, el trabajo diferido a colas y el cómputo pesado a WebAssembly o Containers. Cuando dejas de preguntar "¿cómo replico mi servidor aquí?" y empiezas a preguntar "¿qué parte de esto es de verdad una función cercana al usuario y qué parte es estado que debe vivir en un binding?", has dado el salto mental que separa portar de diseñar para el edge.
+</Callout>
+
+<Reto title="Rediseña para el edge">
+1. Toma un script de Node que lea un archivo de configuración con `fs` y reescríbelo para leer ese dato desde KV o desde un asset estático empaquetado.
+2. Reproduce el antipatrón del contador en una variable global, despliégalo y explica por qué su valor no es fiable; propón la alternativa con Durable Objects.
+3. Identifica en un proyecto tuyo de Node una tarea que use hilos o `child_process` y decide si va a `Queues`, a WebAssembly o a un Container.
+4. Usa `connect` de `cloudflare:sockets` o Hyperdrive para hablar con una base de datos por TCP y contrasta con el socket crudo que usarías en Node.
+</Reto>

@@ -1,0 +1,163 @@
+---
+title: "Plugins de SPM: generar código sin perder la reproducibilidad"
+description: "Las dos capacidades de un plugin y sus dos momentos: el de construcción, que planifica comandos incrementales, y el de comando, que se invoca a mano y pide permiso para escribir. Diferencia entre `buildCommand` y `prebuildCommand`, el papel del aislamiento y por qué un plugin no debe hacer trabajo sino describirlo."
+subject: swift
+level: 28
+order: 4
+icon: "28.4"
+duracion: "20 min"
+---
+
+<Lead>
+Generar código durante la compilación es una de esas capacidades que resuelven un problema real y crean tres nuevos si se hacen mal. El problema real es genuino: hay información que vive fuera de Swift —un esquema, un contrato de red, un catálogo de cadenas traducidas— y transcribirla a mano es a la vez tedioso y una fuente permanente de desincronización. Los tres problemas nuevos son igual de genuinos: una construcción que depende de una herramienta externa deja de ser reproducible, un fichero generado no tiene autor al que preguntarle, y un paso de generación que se ejecuta siempre convierte una compilación incremental en una compilación completa disfrazada. El diseño de los plugins de SwiftPM es, casi entero, una respuesta a esos tres riesgos, y entenderlo como tal es lo que separa usarlos de sufrirlos.
+</Lead>
+
+<Objetivos>
+
+- Distinguir las dos capacidades de un plugin y el momento del ciclo en que actúa cada una.
+- Explicar por qué un plugin de construcción devuelve comandos en lugar de ejecutarlos.
+- Elegir entre `buildCommand` y `prebuildCommand` a partir de si los resultados son predecibles.
+- Razonar las garantías que da el aislamiento y qué permisos hay que pedir para romperlo.
+
+</Objetivos>
+
+## Dos capacidades, dos momentos
+
+Un plugin es un target más, con fuentes propias y con una capacidad declarada que determina cuándo se ejecuta y qué puede hacer.
+
+```swift
+.plugin(
+    name: "GeneraModelos",
+    capability: .buildTool(),
+    dependencies: [.target(name: "generador")]
+),
+.target(name: "Nucleo", plugins: [.plugin(name: "GeneraModelos")])
+```
+
+La capacidad `.buildTool` engancha el plugin a los targets que lo declaren y lo hace intervenir **en cada construcción**, antes de compilar. La capacidad `.command` produce en cambio un subcomando que solo se ejecuta cuando alguien lo pide desde la terminal, y que puede llevar un propósito reconocido —formatear código, generar documentación— o un verbo propio.
+
+```swift
+.plugin(
+    name: "Formatea",
+    capability: .command(
+        intent: .sourceCodeFormatting(),
+        permissions: [.writeToPackageDirectory(reason: "reescribe las fuentes ya formateadas")]
+    )
+)
+```
+
+Esa asimetría de permisos no es casual. Un plugin de construcción **jamás** puede escribir en el directorio del paquete: solo en un directorio de trabajo que se le entrega. Uno de comando puede pedirlo, pero tiene que declarar el motivo y quien lo ejecute debe autorizarlo explícitamente o pasar la bandera correspondiente. La lógica es sencilla de enunciar: lo que ocurre en cada construcción no debe modificar el árbol de fuentes, porque entonces construir dejaría de ser una operación idempotente.
+
+## Un plugin de construcción, por dentro
+
+La firma que hay que interiorizar dice algo importante en su tipo de retorno.
+
+```swift
+import PackagePlugin
+
+@main
+struct GeneraModelos: BuildToolPlugin {
+    func createBuildCommands(context: PluginContext, target: Target) async throws -> [Command] {
+        let esquemas = (target as? SourceModuleTarget)?
+            .sourceFiles(withSuffix: "esquema")
+            .map(\.url) ?? []
+
+        return esquemas.map { entrada in
+            let salida = context.pluginWorkDirectoryURL
+                .appending(path: entrada.deletingPathExtension().lastPathComponent + ".swift")
+            return .buildCommand(
+                displayName: "Generando modelo desde \(entrada.lastPathComponent)",
+                executable: try! context.tool(named: "generador").url,
+                arguments: [entrada.path(), salida.path()],
+                inputFiles: [entrada],
+                outputFiles: [salida]
+            )
+        }
+    }
+}
+```
+
+El plugin **no genera nada**. Devuelve una lista de comandos, y quien los ejecuta —o decide no ejecutarlos— es el sistema de construcción. Esa indirección es toda la clave: como cada comando declara sus entradas y sus salidas, el planificador puede compararlas por fecha y contenido y saltárselo cuando nada ha cambiado, paralelizarlo con otros que no dependan de él y ordenarlo correctamente respecto a la compilación. Los ficheros `.swift` que aparezcan en `outputFiles` se añaden solos a las fuentes del target.
+
+De ahí sale la única obligación seria de quien escribe uno: **declarar las entradas y las salidas con exactitud**. Una entrada que falta produce artefactos rancios que nadie sabe por qué no se regeneran; una salida que falta produce recompilaciones perpetuas o ficheros que el compilador nunca ve. El sistema de construcción no verifica tu declaración: confía en ella.
+
+La herramienta se localiza con `context.tool(named:)`, y ahí hay una decisión que determina si tu construcción es hermética. Si el nombre resuelve a un `executableTarget` del propio paquete o a un binario distribuido como paquete de artefactos, la herramienta viaja con las fuentes y su versión está fijada por el grafo. Si resuelve a algo instalado en la máquina, has introducido una entrada invisible: dos máquinas con versiones distintas de esa herramienta producirán código distinto a partir del mismo commit.
+
+<Callout type="tip" title="Sospecha de toda entrada que no esté en el repositorio">
+La prueba definitiva de un plugin bien escrito es que dos clones limpios del mismo commit, en máquinas distintas, produzcan ficheros generados idénticos byte a byte. Si eso falla, la causa está siempre en la misma lista corta: el reloj, una ruta absoluta, un orden de iteración no determinista, una variable de entorno o una herramienta del sistema.
+</Callout>
+
+## Prebuild: la escotilla de emergencia
+
+Existe un segundo tipo de comando para el caso en que no puedas saber de antemano qué ficheros vas a generar.
+
+```swift
+.prebuildCommand(
+    displayName: "Descarga y traduce el esquema remoto",
+    executable: try context.tool(named: "sincroniza").url,
+    arguments: [],
+    outputFilesDirectory: context.pluginWorkDirectoryURL.appending(path: "Generado")
+)
+```
+
+En vez de una lista de salidas declara un **directorio** de salidas, y el sistema recoge lo que encuentre dentro. El precio de esa flexibilidad es exactamente el que cabe esperar: sin salidas declaradas no hay forma de decidir si el comando está al día, así que se ejecuta **antes de cada construcción, siempre**. Si tarda dos segundos, has añadido dos segundos a cada compilación del día.
+
+La regla de elección es limpia. Si puedes enumerar las salidas a partir de las entradas, usa `buildCommand` aunque tengas que escribir algo más de código; ese esfuerzo se recupera en la primera semana de compilaciones incrementales. Reserva `prebuildCommand` para cuando el conjunto de ficheros generados dependa del **contenido** de una entrada de un modo que no puedas predecir sin leerla.
+
+<Mermaid code={`flowchart TD
+  A[Resolucion de dependencias] --> B[Planificacion de la construccion]
+  B --> C[Se ejecuta createBuildCommands del plugin]
+  C --> D[Lista de comandos con entradas y salidas]
+  D --> E[Prebuild: se ejecuta siempre]
+  D --> F[Build: solo si las entradas cambiaron]
+  E --> G[Ficheros generados en el directorio de trabajo]
+  F --> G
+  G --> H[Compilacion del target con fuentes propias mas generadas]
+  style F fill:#a6e3a1,color:#11111b
+  style E fill:#f9e2af,color:#11111b`} />
+
+## Aislamiento, comandos y las confusiones habituales
+
+Los plugins se ejecutan aislados: sin red, sin escritura fuera de su directorio de trabajo y sin acceso arbitrario al sistema de ficheros. Un plugin de comando puede pedir salir de esa caja declarando permisos —escritura en el paquete, o conexiones de red hacia destinos concretos— y esos permisos aparecen ante quien ejecuta, que debe concederlos. Es un modelo de consentimiento explícito, no de confianza implícita, y es la única defensa práctica frente al hecho de que instalar una dependencia significa aceptar ejecutar su código.
+
+Un plugin de comando implementa otro protocolo y recibe los argumentos de la terminal:
+
+```swift
+@main
+struct Formatea: CommandPlugin {
+    func performCommand(context: PluginContext, arguments: [String]) async throws {
+        var extractor = ArgumentExtractor(arguments)
+        let objetivos = extractor.extractOption(named: "target")
+        // puede tambien construir o probar mediante context.packageManager
+    }
+}
+// se invoca con:  swift package format
+```
+
+Quedan dos confusiones que conviene deshacer. La primera: un plugin de SwiftPM **no es una macro**. Una macro es un target `.macro`, se compila contra la biblioteca de sintaxis, la ejecuta el compilador durante la comprobación de tipos de cada fichero y su resultado es árbol sintáctico que nunca llega a disco. Un plugin lo ejecuta el gestor de paquetes, opera sobre ficheros y produce texto que sí se compila después. Distintos ciclos de vida, distintos aislamientos, distintos modos de fallar.
+
+La segunda: la generación de código no es gratis aunque funcione. El código generado no tiene autor, los diagnósticos apuntan a líneas que nadie escribió, el depurador se pasea por ellas y la revisión de cambios no las ve. Ese coste se paga entero el día que algo falla, y por eso la pregunta previa a escribir cualquier plugin es si el problema no se resolvía con un tipo genérico, una macro o simplemente escribiendo el código una vez.
+
+<Cards>
+  <Card icon="🗺️" title="Describe, no ejecutes">
+    El plugin devuelve un plan. Que ese plan sea un dato es lo que permite cachearlo, paralelizarlo y saltárselo cuando nada cambió.
+  </Card>
+  <Card icon="⚖️" title="Declara la verdad">
+    Entradas y salidas incompletas son la causa de casi todo fallo de incrementalidad. El planificador confía en tu declaración sin comprobarla.
+  </Card>
+  <Card icon="🔒" title="Permiso explícito">
+    Solo un plugin de comando puede escribir en el paquete, y únicamente si lo pide con un motivo que el usuario ve y autoriza.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="La hermeticidad es una propiedad del grafo, no de cada paso">
+Debajo de esta API hay una tesis que la industria tardó veinte años en formular con claridad: una construcción debe ser una **función pura** de un conjunto declarado de entradas, y todo lo que la haga dejar de serlo debe ser visible en la declaración y no en el comportamiento. Bazel la convirtió en doctrina con el nombre de hermeticidad, Nix la llevó al extremo haciendo que hasta el compilador sea una entrada con su hash, y el movimiento de construcciones reproducibles la elevó de virtud de ingeniería a propiedad de seguridad al observar lo que Thompson había advertido en 1984 en su conferencia sobre confiar en la confianza: si no puedes reconstruir bit a bit un artefacto a partir de sus fuentes, no tienes ninguna forma de saber qué hay dentro de él, porque la comparación con el original deja de ser posible y la auditoría del código fuente se vuelve una ceremonia. Que un plugin de SwiftPM devuelva comandos en lugar de ejecutarlos es la aplicación local y modesta de esa misma tesis, y se parece más de lo que parece a lo que hace el manifiesto: en ambos casos un programa se ejecuta pronto, en una caja, y su único legado es un dato inerte que otro sistema interpretará. La ganancia de esa indirección es inmensa y casi invisible, porque todo lo que un sistema de construcción sabe hacer bien —saltarse trabajo innecesario, ejecutar en paralelo, cachear entre máquinas, distribuir a una granja remota— exige conocer el grafo de dependencias **antes** de hacer nada, y solo puede conocerlo si los pasos se declaran en vez de ocurrir. Merece la pena ver también dónde se rompe: `prebuildCommand` es literalmente el agujero de la abstracción, el reconocimiento de que a veces no se puede saber qué se va a producir hasta haberlo producido, y por eso su precio es exactamente la pérdida de todas esas propiedades a la vez. Cada escotilla de este tipo convierte un fragmento del grafo en un script opaco, y la salud de un sistema de construcción se mide bastante bien por cuánta superficie ha quedado del lado opaco. La conclusión transferible es que la reproducibilidad no es una cualidad que cada paso pueda tener por su cuenta: es una propiedad del grafo entero y se rompe en su eslabón más débil, de modo que un solo plugin que lea el reloj, resuelva una herramienta desde la ruta del sistema o descargue un esquema por la red basta para que la palabra reproducible deje de aplicarse al proyecto completo, por impecable que sea todo lo demás.
+</Callout>
+
+<Reto title="Genera y verifica">
+1. Escribe un plugin de construcción que transforme ficheros de datos en Swift y comprueba que una segunda construcción no vuelve a ejecutarlo.
+2. Omite deliberadamente un fichero de `inputFiles`, modifícalo y observa cuánto tarda el sistema en darse cuenta.
+3. Convierte ese mismo plugin en `prebuildCommand` y mide la diferencia en tiempo de una construcción sin cambios.
+4. Sustituye una herramienta resuelta desde el sistema por un `executableTarget` del paquete y razona qué garantía has ganado.
+5. Escribe un plugin de comando que pida escritura en el paquete y ejecútalo sin conceder el permiso; anota el mensaje exacto.
+</Reto>

@@ -1,0 +1,156 @@
+---
+title: "Insertar y consultar: insert, upsert y topK"
+description: "La API de Vectorize desde el Worker cabe en tres verbos. Qué separa insert de upsert y por qué la diferencia importa al reindexar, cómo se estructura un vector con su identificador, sus valores y su metadata, por qué la metadata es el puente hacia el contenido real, cómo query recupera los topK más parecidos y qué límites gobiernan ese número, qué significan los modos de returnMetadata, y por qué toda escritura es asíncrona y tarda segundos en volverse consultable."
+subject: cloudflare
+level: 29
+order: 3
+icon: "29.3"
+duracion: "16 min"
+---
+
+<Lead>
+Con el índice creado y enlazado, la superficie de la API se revela mínima: escribes vectores con `insert` o `upsert` y los recuperas con `query`. Tres verbos, y en ellos cabe todo. Pero esa economía esconde decisiones que se pagan caras si se toman por inercia: cuál de los dos verbos de escritura usar cuando reindexas, qué guardas en la metadata y qué dejas fuera, cuántos vecinos pides y qué haces con los que vuelven. Aprender esta API es aprender a formular una pregunta que ninguna base de datos anterior sabía responder, y a interpretar honestamente lo que devuelve.
+</Lead>
+
+<Objetivos>
+
+- Escribir vectores con `insert` y `upsert` y distinguir cuándo corresponde cada uno.
+- Estructurar un vector con identificador, valores y metadata útil.
+- Recuperar los más parecidos con `query` y controlar `topK` y `returnMetadata`.
+- Asumir la asincronía de las escrituras y leer el `score` con criterio.
+
+</Objetivos>
+
+## insert y upsert: dos verbos y una diferencia
+
+Ambos métodos reciben un array de vectores y los escriben en el índice, pero se comportan de forma opuesta ante un identificador que ya existe. `insert` respeta lo que hay: si el identificador está presente, ese vector se ignora y solo entran los nuevos. `upsert` lo reemplaza sin contemplaciones.
+
+```ts
+// insert: solo entran los identificadores que no existian
+const escritos = await env.VECTORIZE.insert([
+  { id: "doc-1", values: vectorA },
+  { id: "doc-2", values: vectorB },
+]);
+
+// upsert: sobrescribe por completo los identificadores existentes
+const actualizados = await env.VECTORIZE.upsert([
+  { id: "doc-1", values: vectorRevisado, metadata: { idioma: "es" } },
+]);
+```
+
+El matiz que hay que grabar es que `upsert` no fusiona: reemplaza el vector entero. Si el registro anterior tenía metadata y el nuevo no la incluye, la metadata desaparece. No hay actualización parcial de un campo suelto, así que quien reindexa debe reconstruir el objeto completo cada vez, con sus valores y toda su metadata.
+
+En la práctica, `upsert` es el verbo por defecto de cualquier canalización seria. Reindexar un documento que cambió, reprocesar un lote tras corregir un error, recuperarse de una ejecución a medias: en todos esos casos quieres idempotencia, y `upsert` con identificadores deterministas te la da gratis. Reserva `insert` para cargas iniciales donde la duplicidad sería un síntoma de que algo va mal y prefieres que el sistema no la tape.
+
+## La metadata viaja con el vector
+
+Un vector admite cuatro campos y solo dos son obligatorios. El `id` es una cadena de hasta 64 bytes que debe apuntar de vuelta a tu fuente de verdad. Los `values` son el array denso, cuya longitud tiene que coincidir exactamente con las dimensiones del índice. El `namespace` es una partición opcional que veremos en la lección siguiente. Y la `metadata` es un objeto de pares clave-valor de hasta 10 KiB por vector.
+
+```ts
+// el identificador es el puente hacia el contenido real
+const vectores = [
+  {
+    id: "art-1042#3",
+    values: embedding,
+    metadata: {
+      doc_id: "art-1042",
+      idioma: "es",
+      actualizado_en: 1767225600,
+      titulo: "Bindings en Workers",
+    },
+  },
+];
+await env.VECTORIZE.upsert(vectores);
+```
+
+La metadata cumple dos funciones que conviene no confundir. La primera es acotar la búsqueda mediante filtros, terreno de la próxima lección. La segunda es evitar un viaje de vuelta: si guardas el título junto al vector, puedes pintar una lista de resultados sin consultar D1. Lo que no debe hacer la metadata es convertirse en el almacén del documento entero, tanto por el límite de 10 KiB como por el principio que ya viste: el índice es un directorio de punteros semánticos, no tu base de datos.
+
+Desde un Worker puedes escribir hasta 1000 vectores por llamada, y el payload total tiene su propio techo. Cuando indexes un corpus grande, trocea en lotes y encadena las escrituras; ese troceo es también tu unidad natural de reintento cuando una parte falla.
+
+```ts
+// escribir un corpus grande en lotes dentro del limite de 1000
+const LOTE = 500;
+for (let i = 0; i < vectores.length; i += LOTE) {
+  await env.VECTORIZE.upsert(vectores.slice(i, i + LOTE));
+}
+```
+
+Ese bucle es más robusto de lo que aparenta gracias a la combinación de `upsert` con identificadores deterministas: si el proceso muere a mitad, relanzarlo desde el principio no duplica nada ni corrompe el estado, simplemente reescribe lo que ya estaba. La idempotencia no es aquí una virtud teórica, es lo que te permite reintentar sin llevar la cuenta de por dónde ibas.
+
+## query y topK: los k más parecidos
+
+Consultar es entregar un vector y pedir sus vecinos. La respuesta trae un recuento y una lista de coincidencias ordenadas de más a menos parecida, cada una con su identificador y su `score`.
+
+```ts
+// embebe la pregunta con el mismo modelo del corpus
+const { data } = await env.AI.run("@cf/google/embeddinggemma-300m", {
+  text: [pregunta],
+});
+
+const resultados = await env.VECTORIZE.query(data[0], {
+  topK: 8,
+  returnMetadata: "indexed",
+});
+
+for (const m of resultados.matches) {
+  console.log(m.id, m.score, m.metadata?.titulo);
+}
+```
+
+El parámetro `topK` fija cuántos vecinos quieres y su valor por defecto es 5. Los límites de 2026 dependen de cuánto pidas de vuelta: hasta 100 resultados si no reclamas ni valores ni metadata completa, y hasta 50 si activas `returnValues` o pides `returnMetadata` en modo `all`. Ese acoplamiento no es arbitrario, refleja el volumen de datos que hay que mover desde el índice.
+
+| Modo de `returnMetadata` | Qué devuelve | Coste |
+| --- | --- | --- |
+| `none` | Solo identificador y `score` | Ninguno: es el valor por defecto |
+| `indexed` | Únicamente los campos con índice de metadata | Sin sobrecoste de latencia, pero trunca textos largos |
+| `all` | Toda la metadata asociada al vector | Consultas más lentas y `topK` limitado a 50 |
+
+Hay dos primos hermanos de `query` que ahorran trabajo. `queryById` consulta usando un vector que ya está en el índice, ideal para un "muéstrame más parecidos a este" sin recalcular el embedding. Y `getByIds` recupera vectores concretos con sus valores y su metadata, útil para inspeccionar o auditar sin buscar nada.
+
+```ts
+// mas parecidos a un documento que ya esta indexado
+const relacionados = await env.VECTORIZE.queryById("art-1042#3", { topK: 6 });
+
+// inspeccion directa por identificador, sin busqueda de por medio
+const crudos = await env.VECTORIZE.getByIds(["art-1042#3", "art-1042#4"]);
+```
+
+Una advertencia sobre `queryById`: el propio vector consultado suele volver como primera coincidencia con la puntuación máxima, porque es idéntico a sí mismo. Descartarlo es responsabilidad tuya, y conviene pedir un vecino de más para no quedarte corto tras filtrarlo.
+
+## Asincronía y lectura honesta del score
+
+Toda escritura en Vectorize es asíncrona. `insert` y `upsert` no devuelven los vectores escritos: devuelven un identificador de mutación, y la operación se aplica después. Suelen pasar unos segundos hasta que lo que escribiste aparece en una consulta, y ese retardo es una propiedad del sistema, no un fallo.
+
+```ts
+// la escritura devuelve una mutacion, no un resultado consultable aun
+const { mutationId } = await env.VECTORIZE.upsert(vectores);
+
+// describe informa hasta que mutacion se ha procesado el indice
+const estado = await env.VECTORIZE.describe();
+```
+
+<Callout type="warn" title="No escribas y consultes en la misma petición">
+El error clásico del primer día es indexar un documento y, en la misma invocación del Worker, consultar esperando encontrarlo. No estará. Diseña la escritura como un proceso desacoplado —una cola, un workflow, un cron— y nunca hagas que la respuesta a un usuario dependa de que una escritura recién enviada ya sea visible. Si necesitas confirmación, compara el `mutationId` que te devolvió la escritura con el estado que reporta `describe`.
+</Callout>
+
+<Mermaid code={`flowchart LR
+  P[pregunta del usuario] --> E[embedding con el mismo modelo]
+  E --> Q[query con topK]
+  Q --> M[matches con id y score]
+  M --> F[buscar contenido por id en D1 o R2]
+  F --> R[respuesta al usuario]
+  style Q fill:#89b4fa,color:#11111b
+  style F fill:#a6e3a1,color:#11111b`} />
+
+El `score` que acompaña a cada coincidencia merece una advertencia. Es la afinidad geométrica según la métrica del índice, no una probabilidad ni un porcentaje de acierto. Su escala depende del modelo y del dominio, así que un umbral absoluto copiado de un tutorial ajeno no significa nada en tu corpus: si quieres descartar resultados pobres, calibra el umbral observando tus propios datos. Y recuerda que `query` siempre devuelve algo mientras haya vectores: pedir los cinco más parecidos a una pregunta que tu corpus no cubre devuelve cinco resultados irrelevantes con toda naturalidad.
+
+<Callout type="dios" title="El identificador es el único puente entre la geometría y el mundo real">
+Hay una asimetría en el corazón de todo sistema vectorial que conviene mirar de frente. El índice sabe muchísimo sobre relaciones —qué se parece a qué, qué vive cerca de qué— y absolutamente nada sobre contenido. Un embedding es una compresión irreversible: de él no se recupera el texto que lo generó, ni una aproximación, ni una pista legible. Lo único que devuelve una consulta es una lista de identificadores con su grado de afinidad, y esos identificadores son la totalidad del vínculo entre el espacio geométrico y tu dominio. Toda la disciplina de diseño de este nivel se deriva de esa observación. Si el identificador es el puente, el identificador debe ser determinista y reconstruible, porque el día que reindexes con otro modelo tendrás que volver a generar cada vector y necesitarás que siga apuntando al mismo sitio. Debe ser estable, porque si cambia se rompe la correspondencia con la fuente de verdad y quedan vectores huérfanos que devuelven punteros a la nada. Y debe llevar codificada la estructura de tu contenido —qué documento, qué fragmento— porque esa información no está en el vector y nadie más la va a proporcionar. La consecuencia arquitectónica es que el índice vectorial nunca es la fuente de verdad de un sistema bien construido, sino una proyección derivada de ella: reconstruible por completo a partir de D1, de R2 o de donde vivan tus documentos, y por tanto desechable. Si perder el índice fuese perder datos, tendrías un problema de diseño, no un incidente. Esa desechabilidad es liberadora: convierte el reindexado en una operación rutinaria en lugar de una migración temida, permite experimentar con modelos y estrategias de troceado sin arriesgar nada, y deja el índice en su lugar correcto, que es el de una caché sofisticada de relaciones semánticas sobre unos datos que viven en otra parte.
+</Callout>
+
+<Reto title="Escribe y pregunta">
+1. Indexa diez fragmentos de texto con `upsert`, dándoles identificadores deterministas derivados de su documento de origen, y añade a cada uno metadata con el título y el idioma.
+2. Consulta con `query` y `topK` de 3, primero sin metadata y después con `returnMetadata` en modo `indexed`, y compara qué devuelve cada caso.
+3. Comprueba experimentalmente la asincronía: escribe un vector y consulta de inmediato; repite la consulta unos segundos después y observa la diferencia.
+4. Formula una pregunta que tu corpus no cubra en absoluto, observa los `score` que devuelve y razona qué umbral tendrías que aplicar para descartar esos resultados.
+</Reto>

@@ -1,0 +1,166 @@
+---
+title: "Trabajar sin conexión: cola de cambios, reintentos y una app que no habla de la red"
+description: "La conectividad no es un caso excepcional que haya que manejar, es el régimen normal de un dispositivo móvil, y una arquitectura que la trate como error produce apps que se detienen cada vez que el usuario entra en un ascensor. Esta lección construye el otro modelo: el almacén local como fuente de verdad, una cola de cambios duradera e idempotente, una taxonomía de errores que distingue lo que se reintenta de lo que no, y una interfaz que informa del estado sin pedir permiso a la red para funcionar."
+subject: ios
+level: 23
+order: 5
+icon: "23.5"
+duracion: "22 min"
+---
+
+<Lead>
+Existe una diferencia arquitectónica profunda entre una app que guarda en el servidor y muestra el resultado, y una que guarda localmente y propaga el cambio cuando puede. La primera hereda la disponibilidad de la red: cada operación tiene una latencia visible, cada pérdida de cobertura es un fallo que el usuario ve, y la interfaz se llena de indicadores de espera y de mensajes de reintento. La segunda tiene la disponibilidad del disco, que es total, y convierte la sincronización en una tarea de fondo cuyo único requisito es converger antes o después. Ambas usan las mismas APIs y se parecen en el diagrama; se distinguen en una decisión tomada al principio y muy difícil de revertir: dónde vive la verdad que la interfaz lee.
+</Lead>
+
+<Objetivos>
+
+- Construir una cola de cambios duradera con operaciones idempotentes y ordenadas por dependencia.
+- Clasificar los errores del servicio en reintentables con espera, reintentables tras reparación y terminales.
+- Diseñar la interfaz para que la escritura sea inmediata y el estado de sincronización resulte informativo sin ser ansioso.
+- Reproducir y medir el comportamiento sin conexión con condiciones adversas deliberadas y métricas de convergencia.
+
+</Objetivos>
+
+## El almacén local es la verdad
+
+La regla que ordena todo lo demás cabe en una frase: ninguna acción del usuario debe esperar a la red para considerarse realizada. Escribir en el almacén local y devolver el control de inmediato no es una optimización de percepción, es un cambio en la semántica de la operación. A partir de ahí la sincronización es un proceso independiente cuyo trabajo consiste en llevar el estado remoto hacia el local y viceversa, y cuyo fallo temporal no invalida nada de lo que el usuario hizo.
+
+Ese proceso necesita saber qué queda pendiente, y saberlo tras un reinicio, un cierre forzado o una actualización del sistema. La estructura que lo resuelve es una cola persistente de intenciones: no de resultados ni de peticiones de red, sino de operaciones de dominio con identidad propia. Guardarla en el mismo almacén que los datos, y dentro de la misma transacción que produce el cambio, elimina la ventana en la que un fallo dejaría el dato escrito sin nadie que lo suba.
+
+```swift
+@Model final class CambioPendiente {
+    var identidad: UUID = UUID()          // idempotencia: repetirlo no duplica nada
+    var tipo: String = ""                 // crear, actualizar, borrar
+    var objetivo: String = ""             // identificador estable del registro
+    var carga: Data = Data()
+    var creacion: Date = .now
+    var intentos: Int = 0
+    var proximoIntento: Date = .now       // gobernado por la espera exponencial
+    init() {}
+}
+
+// El cambio de dominio y su intencion de subida se guardan juntos o no se guardan
+func completar(_ tarea: Tarea) throws {
+    tarea.completada = true
+    contexto.insert(CambioPendiente(actualizando: tarea))
+    try contexto.save()
+}
+```
+
+Tres propiedades hacen que esa cola funcione y las tres se olvidan con facilidad. La primera es la **idempotencia**: cada entrada lleva un identificador que el servidor puede usar como nombre de registro, de modo que reenviar la misma creación dos veces produce una escritura, no dos. La segunda es el **orden por dependencia**: crear el hijo antes que el padre falla, así que la cola se drena respetando el grafo, no la marca de tiempo. La tercera es la **compactación**: cinco ediciones seguidas del mismo campo del mismo objeto deben colapsar en una sola subida antes de salir a la red.
+
+<Callout type="tip" title="Los identificadores se generan en el cliente">
+Cualquier diseño que espere a que el servidor asigne el identificador de un objeto nuevo impide crear sin conexión y obliga a reescribir referencias cuando la respuesta llega. Generar un identificador universal en el dispositivo y usarlo como nombre del registro elimina de un golpe ese acoplamiento, hace las creaciones idempotentes y permite construir jerarquías completas sin haber hablado nunca con el servidor.
+</Callout>
+
+## Qué error significa qué
+
+Un manejador que trate todos los fallos igual producirá reintentos infinitos ante errores permanentes y abandonos ante errores transitorios. La clasificación útil tiene tres categorías. La primera agrupa los fallos de disponibilidad —red caída, servicio ocupado, límite de peticiones, zona ocupada— y su tratamiento es esperar; cuando el servidor incluye un tiempo sugerido, ese valor manda sobre cualquier heurística propia. La segunda agrupa los fallos que exigen una reparación antes de reintentar: token caducado, zona inexistente, registro cambiado por otro. La tercera son los terminales: cuota agotada, sesión no iniciada, cuenta restringida o petición inválida, donde reintentar solo gasta batería.
+
+<Mermaid code={`flowchart TB
+  e[Error al subir un cambio] --> a[Es de disponibilidad]
+  a --> w[Esperar el tiempo sugerido por el servidor]
+  w --> q[Volver a la cola]
+  e --> b[Necesita reparacion previa]
+  b --> t[Token caducado: resincronizar la zona entera]
+  b --> z[Zona inexistente: crearla y reencolar]
+  b --> c[Registro cambiado: fusionar y reintentar]
+  e --> f[Es terminal]
+  f --> u[Informar al usuario y detener los intentos]
+  e --> p[Fallo parcial del lote]
+  p --> s[Separar por elemento y clasificar cada uno]`} />
+
+El fallo parcial merece atención propia porque es el que más código defectuoso genera. Cuando una operación con muchos registros falla, el error global no dice nada útil: el detalle está en el diccionario de errores por elemento, y ahí conviven éxitos, conflictos y rechazos permanentes en la misma respuesta. Tratar el lote como un todo y reencolarlo entero provoca ciclos infinitos, porque el elemento que falla siempre volverá a fallar. La única estrategia correcta es descomponer, clasificar cada elemento por separado y sacar de la cola lo que jamás va a entrar.
+
+```swift
+func clasificar(_ error: CKError) -> Accion {
+    switch error.code {
+    case .networkUnavailable, .networkFailure, .serviceUnavailable,
+         .requestRateLimited, .zoneBusy:
+        return .esperar(error.retryAfterSeconds ?? esperaExponencialConRuido())
+    case .changeTokenExpired:
+        return .resincronizarZonaCompleta
+    case .zoneNotFound, .userDeletedZone:
+        return .recrearZonaYReencolar
+    case .serverRecordChanged:
+        return .fusionarYReintentar
+    case .quotaExceeded, .notAuthenticated, .managedAccountRestricted,
+         .permissionFailure, .invalidArguments:
+        return .terminal
+    case .partialFailure:
+        return .descomponerLote(error.partialErrorsByItemID ?? [:])
+    default:
+        return .esperar(esperaExponencialConRuido())
+    }
+}
+```
+
+La espera exponencial necesita ruido y necesita techo. Sin ruido, todos los dispositivos afectados por una caída del servicio vuelven a intentarlo en el mismo instante y reproducen el pico que causó el problema. Sin techo, un error persistente lleva la espera a horas y la app parece rota cuando la red vuelve. Una progresión que duplique desde dos segundos, con una desviación aleatoria del veinte por ciento y un máximo de unos minutos, se comporta bien en casi todos los escenarios reales.
+
+<Callout type="warn" title="El token caducado no es un error raro">
+Cuando un dispositivo pasa mucho tiempo sin sincronizar, el servidor puede declarar su token demasiado antiguo para calcular el incremento. La respuesta correcta no es reintentar con el mismo token sino descartarlo y volver a bajar la zona completa, aceptando el coste. Una app que no contempla ese camino funciona durante meses y falla justo con los usuarios que vuelven después de unas vacaciones, que son los peores a los que fallar.
+</Callout>
+
+## Que la red no se note
+
+Las decisiones de interfaz derivadas de todo lo anterior son pocas y consistentes. La escritura se aplica de inmediato sobre el estado local y la vista se actualiza sin esperar confirmación. No hay indicadores de espera bloqueantes para operaciones que la app puede diferir. No hay mensajes de error por falta de conexión, porque la falta de conexión no impide nada. Y no hay diálogos que pidan reintentar, porque reintentar es trabajo del sistema y no una decisión que deba tomar el usuario.
+
+<Cards>
+  <Card icon="📥" title="Escritura optimista">
+    El cambio se ve al instante porque ya está guardado. La sincronización posterior puede corregirlo, y esa corrección se muestra como una actualización normal, no como un fallo.
+  </Card>
+  <Card icon="🔕" title="Estado discreto">
+    Un indicador pequeño y no modal que distinga tres situaciones: al día, con cambios pendientes o detenido por un problema que el usuario debe resolver.
+  </Card>
+  <Card icon="🪦" title="Borrado con lápida">
+    Eliminar marca en lugar de destruir, para que un dispositivo desconectado no resucite lo borrado al subir una edición antigua.
+  </Card>
+  <Card icon="🔋" title="Trabajo en segundo plano">
+    Avisos silenciosos para bajar cambios y una tarea programada de procesamiento para drenar la cola cuando el dispositivo esté cargando y en red no medida.
+  </Card>
+</Cards>
+
+Solo un puñado de casos justifica bloquear al usuario hasta confirmar en el servidor, y todos comparten un rasgo: la operación produce un efecto externo irreversible o requiere unicidad global. Un pago, la reserva de un nombre único, la aceptación de una invitación. Para todo lo demás, esperar es una elección de diseño perezosa que traslada al usuario la incertidumbre de la red. La disciplina consiste en tener una lista explícita y corta de operaciones síncronas, y tratar cualquier ampliación de esa lista como una decisión que hay que justificar.
+
+Queda un caso incómodo que conviene resolver con honestidad: la operación que se encoló, se reintentó y terminó siendo rechazada de forma permanente. Descartarla en silencio pierde trabajo del usuario, y reintentarla eternamente consume batería sin arreglar nada. La respuesta razonable es conservar el cambio en un estado visible de fallo, explicar en lenguaje llano qué ocurrió y ofrecer una acción concreta, ya sea liberar espacio en iCloud, iniciar sesión o descartar el cambio con conocimiento de causa.
+
+## Probar lo invisible
+
+Nada de esto es verificable con la red del despacho. El primer instrumento es el simulador de condiciones adversas, que permite imponer latencias altas, pérdida de paquetes y ancho de banda mínimo; el segundo, y más revelador, es el modo avión combinado con el cierre forzado de la app a mitad de una subida, porque es la prueba directa de que la cola sobrevive al proceso. El tercero es la ejecución con dos dispositivos desconectados que producen cambios contradictorios y se reconectan en orden inverso.
+
+```swift
+// El drenaje de la cola se prueba sin red usando un transporte falso
+protocol Transporte { func subir(_ lote: [CambioPendiente]) async throws }
+
+final class TransporteInestable: Transporte {
+    var guion: [Result<Void, CKError>] = []
+    func subir(_ lote: [CambioPendiente]) async throws {
+        guard !guion.isEmpty else { return }
+        if case .failure(let e) = guion.removeFirst() { throw e }
+    }
+}
+
+@Test func laColaSobreviveAlFalloYNoDuplica() async throws {
+    let transporte = TransporteInestable()
+    transporte.guion = [.failure(CKError(.networkUnavailable)), .success(())]
+    let motor = MotorDeSincronizacion(transporte: transporte, reloj: RelojFalso())
+    try await motor.drenar()
+    try await motor.drenar()
+    #expect(motor.pendientes.isEmpty)
+    #expect(transporte.subidasUnicasPorIdentidad == 1)
+}
+```
+
+Tres métricas convierten la sensación en dato. El **tiempo hasta la convergencia**, medido desde que un cambio se produce en un dispositivo hasta que es visible en otro, con la app en segundo plano y no en primer plano, que es el caso realista. El **tamaño de la cola** a lo largo del día, cuyo crecimiento sostenido delata que algo no drena. Y la **distribución de errores por tipo**, que dice si el problema está en la red del usuario, en tus lotes o en el modelo de datos. Sin esas tres, cualquier afirmación sobre la calidad de la sincronización es una impresión.
+
+<Callout type="dios" title="La red no es un caso de error: es el régimen normal, y la app que lo asume tiene otra arquitectura">
+Merece la pena detenerse en por qué la diferencia entre las dos arquitecturas del principio es tan difícil de corregir a mitad de camino, porque no se trata de reemplazar un módulo sino de cambiar una suposición repartida por todo el código. Cuando la verdad vive en el servidor, cada pantalla contiene implícitamente un estado de carga, cada acción contiene implícitamente un punto de fallo, y el modelo de datos se diseña alrededor de peticiones y respuestas: identificadores asignados por el servidor, listas paginadas que solo existen mientras dura la sesión, validaciones que ocurren remotamente. Migrar eso a un modelo local implica tocar todos esos puntos a la vez. Cuando la verdad vive en el disco, la red desaparece del vocabulario de la interfaz: no hay cargas porque el dato ya está, no hay fallos de acción porque la acción se completó al guardarse, y la sincronización se convierte en un componente único, aislado y probable sin red, cuya única obligación es converger. Lo que sostiene ese modelo no es la cola ni el reintento, que son mecánica, sino la aceptación de una propiedad más incómoda: la **consistencia eventual** como contrato con el usuario. Eso significa admitir que dos personas pueden ver cosas distintas durante un rato y que eso está bien; que un dato puede cambiar debajo de la vista sin que nadie lo haya pedido; que borrar es marcar y no destruir; y que la interfaz debe comunicar el estado de la réplica sin convertirlo en ansiedad. Los equipos que aceptan ese contrato acaban escribiendo menos código y con menos casos raros, porque han eliminado la fuente de la complejidad en lugar de gestionarla. Los que no lo aceptan terminan construyendo, error a error y diálogo a diálogo, una versión peor y sin diseño del mismo sistema.
+</Callout>
+
+<Reto title="Sobrevivir sin red">
+1. Implementa la cola persistente guardando el cambio de dominio y su intención de subida en la misma transacción, con identificadores generados en el cliente.
+2. Añade compactación de operaciones sobre el mismo objetivo y mide cuántas subidas ahorras en una sesión de edición intensa.
+3. Escribe el clasificador de errores completo y demuestra con un transporte falso que cada categoría produce el comportamiento previsto, incluido el fallo parcial.
+4. Cierra la app forzadamente a mitad de una subida en modo avión, reábrela con red y comprueba que no se pierde ni se duplica ningún cambio.
+5. Instrumenta el tiempo hasta la convergencia entre dos dispositivos con la app en segundo plano y publica ese número como métrica de calidad del equipo.
+</Reto>

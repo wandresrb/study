@@ -1,0 +1,166 @@
+---
+title: "Errores y reintentos: clasificar antes de insistir"
+subject: ios
+level: 13
+order: 3
+icon: "13.3"
+duracion: "20 min"
+description: "Por qué sin red, error del servidor y respuesta inválida son tres fracasos que exigen respuestas opuestas, cómo construir un error de red que la app pueda razonar en lugar de mostrar, qué peticiones se pueden reintentar sin causar daño, y cómo implementar un backoff exponencial con jitter que respete la cancelación y la cabecera del servidor."
+---
+
+<Lead>
+El código que llama a una API tiene dos caminos y casi todo el mundo escribe solo uno. El camino feliz devuelve datos; el otro devuelve un `Error` que se muestra en una alerta genérica y se olvida. Pero en red no existe *el* error: existen fracasos con causas, culpables y remedios completamente distintos, y tratarlos igual produce las dos patologías clásicas de una app móvil —la que muestra "Ha ocurrido un error" cuando lo único que pasa es que el usuario está en el metro, y la que machaca a un servidor caído con reintentos hasta agotar la batería—. Clasificar el fallo no es un refinamiento: es la condición previa para decidir si insistir, si rendirse o si avisar.
+</Lead>
+
+<Objetivos>
+
+- Distinguir fallo de conectividad, fallo del servidor y respuesta inválida.
+- Modelar un error de red con la información necesaria para decidir.
+- Determinar qué peticiones son seguras de reintentar y cuáles no.
+- Implementar backoff exponencial con jitter, tope y cancelación cooperativa.
+
+</Objetivos>
+
+## Tres fracasos que no se parecen en nada
+
+El primero es el **fallo de transporte**: la petición no llegó o la respuesta no volvió. No hay conexión, el DNS no resuelve, el TLS falla, el tiempo de espera vence. No hay culpa del servidor porque el servidor ni se enteró. Es el único fallo genuinamente transitorio y es el candidato natural al reintento; también es el único que tiene una respuesta de interfaz distinta —no es un error de la app, es un estado del mundo— y merece un mensaje honesto en lugar de una alerta.
+
+El segundo es el **fallo del servidor**, que llega con respuesta HTTP y con código. Aquí la familia importa más que el número. Un `5xx` significa que el servidor falló o está saturado y suele merecer reintento; un `429` es una petición explícita de que esperes; un `4xx` significa que la petición está mal formada, no autorizada o pide algo que no existe, y **reintentarla es garantía de fracaso**, porque el problema está en tu lado y no cambiará por insistir. Confundir estas dos familias es lo que convierte un error de autenticación en un bucle infinito.
+
+El tercero es la **respuesta inválida**: el servidor contestó con éxito y el cuerpo no es lo prometido. JSON malformado, un campo obligatorio ausente, un HTML de portal cautivo con código 200. Este fallo casi nunca se arregla reintentando —la misma petición produce el mismo cuerpo— y su valor es diagnóstico: indica una rotura de contrato o una red intermedia que se está entrometiendo, y por eso es el fallo que más urge registrar con detalle.
+
+<Callout type="info" title="Un 200 no significa que todo fue bien">
+Los portales cautivos de hoteles y aeropuertos responden a cualquier petición con un 200 y una página de login. Si tu cliente no valida el tipo de contenido ni la forma del cuerpo, interpretará esa página como una API rota. Validar la respuesta es parte del transporte, no un lujo.
+</Callout>
+
+## Un error que la app pueda razonar
+
+Un error útil no es un texto: es un dato con las propiedades que la decisión necesita. La pregunta que debe responder cada caso es doble —¿es transitorio? y ¿de quién es la culpa?— y conviene que el propio tipo la conteste.
+
+```swift
+enum ErrorRed: Error {
+    case sinConexion(URLError)
+    case tiempoAgotado
+    case servidor(codigo: Int, reintentarTras: TimeInterval?)
+    case cliente(codigo: Int, cuerpo: Data)
+    case respuestaInvalida(motivo: String)
+    case decodificacion(Error)
+
+    var esTransitorio: Bool {
+        switch self {
+        case .sinConexion, .tiempoAgotado: return true
+        case .servidor(let codigo, _): return codigo == 429 || (500...599).contains(codigo)
+        case .cliente, .respuestaInvalida, .decodificacion: return false
+        }
+    }
+}
+```
+
+La clasificación se hace una sola vez, en el transporte, traduciendo lo que el sistema entrega a este vocabulario. `URLError` ya distingue los casos de conectividad con precisión y conviene aprovecharla en lugar de inspeccionar cadenas:
+
+```swift
+func clasificar(_ error: Error) -> ErrorRed {
+    guard let url = error as? URLError else { return .respuestaInvalida(motivo: "\(error)") }
+    switch url.code {
+    case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed:
+        return .sinConexion(url)
+    case .timedOut:
+        return .tiempoAgotado
+    default:
+        return .respuestaInvalida(motivo: url.localizedDescription)
+    }
+}
+```
+
+## Qué se puede reintentar sin hacer daño
+
+La pregunta previa a cualquier política de reintento no es cuántas veces, sino si se debe. El criterio es la **idempotencia**: una petición es idempotente si ejecutarla varias veces deja el sistema en el mismo estado que ejecutarla una. `GET`, `PUT` y `DELETE` lo son por definición del protocolo; `POST` no lo es, y reintentar a ciegas un `POST` de pago o de mensaje produce cobros y mensajes duplicados que ningún log te perdonará.
+
+Esto no significa que un `POST` no se pueda reintentar nunca; significa que hace falta acordarlo con el servidor mediante una **clave de idempotencia**: un identificador único que el cliente genera por operación y envía en una cabecera, de modo que el servidor reconozca el segundo intento como el mismo y devuelva el resultado del primero. Sin esa clave, la única opción segura ante un `POST` fallido es preguntar al usuario.
+
+```swift
+extension Endpoint {
+    func idempotente(clave: UUID = UUID()) -> Endpoint {
+        var copia = self
+        copia.cabeceras["Idempotency-Key"] = clave.uuidString
+        return copia
+    }
+}
+```
+
+La clave debe generarse **una vez por operación de negocio** y reutilizarse en todos los reintentos de esa operación; si la regeneras en cada intento no has resuelto nada, solo has añadido una cabecera decorativa. En la práctica eso significa que la clave nace donde nace la intención del usuario —el momento en que pulsa "pagar"— y no dentro del bucle de reintento.
+
+<Cards>
+  <Card icon="📴" title="Sin conexión">
+    El servidor nunca vio la petición. Transitorio por definición y seguro de reintentar en cualquier método.
+  </Card>
+  <Card icon="🔥" title="Servidor caído">
+    Contestó con 5xx o 429. Transitorio, pero tu insistencia forma parte del problema: exige espera creciente.
+  </Card>
+  <Card icon="🙅" title="Petición inválida">
+    Un 4xx acusa a tu lado. Reintentar es perder tiempo y batería para obtener exactamente el mismo error.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TD
+  A[Fallo de la peticion] --> B[Clasificar el error]
+  B --> C[Sin conexion o tiempo agotado]
+  B --> D[Codigo 5xx o 429]
+  B --> E[Codigo 4xx]
+  B --> F[Respuesta invalida]
+  C --> G[Reintentar con backoff]
+  D --> H[Respetar Retry-After y reintentar]
+  E --> I[Fallar y avisar al usuario]
+  F --> J[Registrar y fallar]
+  G --> K[Peticion idempotente o con clave]
+  H --> K
+  style G fill:#a6e3a1,color:#11111b
+  style H fill:#a6e3a1,color:#11111b
+  style I fill:#f38ba8,color:#11111b
+  style J fill:#f38ba8,color:#11111b`} />
+
+## Backoff exponencial con jitter
+
+Reintentar de inmediato es la peor estrategia posible: cuando un servidor cae, todos los clientes fallan a la vez, y si todos reintentan a la vez lo rematan justo cuando intenta levantarse. El remedio tiene dos mitades. La primera es el **backoff exponencial**: cada intento espera el doble que el anterior, con un tope. La segunda, la que más se olvida, es el **jitter**: añadir aleatoriedad a esa espera para que la manada de clientes se disperse en el tiempo en lugar de sincronizarse en oleadas.
+
+```swift
+struct PoliticaReintento {
+    var maxIntentos = 3
+    var baseSegundos: Double = 0.5
+    var topeSegundos: Double = 8
+
+    func espera(intento: Int, sugerida: TimeInterval?) -> Duration {
+        if let sugerida { return .seconds(min(sugerida, topeSegundos)) }
+        let exponencial = min(baseSegundos * pow(2, Double(intento)), topeSegundos)
+        let conJitter = Double.random(in: (exponencial / 2)...exponencial)  // jitter completo
+        return .seconds(conJitter)
+    }
+}
+
+func conReintento<T>(_ p: PoliticaReintento, operacion: () async throws -> T) async throws -> T {
+    var intento = 0
+    while true {
+        do { return try await operacion() }
+        catch let error as ErrorRed where error.esTransitorio && intento < p.maxIntentos {
+            var sugerida: TimeInterval? = nil
+            if case .servidor(_, let tras) = error { sugerida = tras }
+            try await Task.sleep(for: p.espera(intento: intento, sugerida: sugerida))
+            intento += 1
+        }
+    }
+}
+```
+
+Tres detalles que separan una implementación correcta de una peligrosa. `Task.sleep` lanza si la tarea se cancela, de modo que el bucle respeta la cancelación cooperativa sin código extra: si el usuario abandona la pantalla, los reintentos mueren con ella. La cabecera `Retry-After` que acompaña a un `429` o a un `503` tiene prioridad sobre tu cálculo, porque el servidor sabe mejor que tú cuándo estará listo. Y el tope de intentos debe ser bajo —tres suele bastar—: más allá, lo honesto es rendirse y dejar que el usuario decida.
+
+<Callout type="dios" title="Un reintento es una afirmación sobre el mundo, no un parche sobre un error">
+Reintentar parece una técnica y es en realidad una hipótesis: al insistir estás afirmando que el fracaso fue accidental, que su causa ya no está actuando y que repetir la misma acción no altera nada que no debiera alterarse. Las tres partes de esa afirmación pueden ser falsas, y cuando lo son el reintento deja de ser una red de seguridad para convertirse en un amplificador de daños. Es falsa la primera cuando el fallo es un `401` o un `404`, porque la causa vive en tu petición y sobrevivirá a mil repeticiones. Es falsa la segunda cuando el servidor está saturado, porque tu insistencia es precisamente parte de la causa: la tormenta de reintentos es un fallo que los clientes se infligen entre sí, y el jitter no es un adorno estadístico sino el mecanismo que impide que miles de dispositivos, sincronizados por el mismo apagón, vuelvan a golpear a la vez. Y es falsa la tercera siempre que la operación no sea idempotente, momento en el que la robustez que creías estar añadiendo se manifiesta como un cobro duplicado. De ahí que el orden correcto sea inamovible: primero clasificar, después decidir si la hipótesis se sostiene, y solo entonces insistir —con tope, con espera creciente, con dispersión y respetando la cancelación—. La app que sabe distinguir "no hay red" de "no tienes permiso" no es solo más amable con el usuario: es la única que puede decidir con sentido, porque la robustez en sistemas distribuidos no nace de intentarlo más veces, sino de saber exactamente qué se rompió.
+</Callout>
+
+<Reto title="Insiste con criterio">
+1. Modela un error de red con los cinco casos y una propiedad que declare si es transitorio.
+2. Escribe la función que traduce `URLError` y códigos HTTP a ese error, incluyendo el caso del 200 con cuerpo inválido.
+3. Implementa la política con backoff exponencial, jitter y tope, y prueba que la espera crece y se dispersa.
+4. Añade el respeto a `Retry-After` y comprueba que gana sobre el cálculo local.
+5. Verifica que cancelar la tarea interrumpe el ciclo de reintentos, y razona qué harías con un `POST` sin clave de idempotencia.
+</Reto>

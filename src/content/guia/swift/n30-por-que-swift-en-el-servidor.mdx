@@ -1,0 +1,140 @@
+---
+title: "Por qué Swift en el servidor: el argumento honesto"
+description: "El caso técnico real de Swift fuera de Apple: compilación anticipada frente a máquinas virtuales, memoria residente frente a runtimes con recolector de basura, la latencia de cola que produce ARC, y el ahorro verdadero —con su coste de acoplamiento— de compartir el modelo de dominio entre cliente y servidor."
+subject: swift
+level: 30
+order: 1
+icon: "30.1"
+duracion: "18 min"
+---
+
+<Lead>
+El argumento a favor de Swift en el servidor casi nunca se enuncia bien. No es que sea más rápido que todo lo demás —no lo es—, ni que su ecosistema esté a la altura del de Java o Node —no lo está—. El argumento honesto es más estrecho y por eso más defendible: Swift ofrece un perfil de recursos que en 2026 solo comparten Rust, C++ y, con matices, Go; lo hace con una ergonomía de lenguaje de alto nivel; y en un equipo que ya escribe Swift para el cliente, permite que el modelo de dominio viva en un único sitio y se compile dos veces. Fuera de ese triángulo —densidad de despliegue, ergonomía, modelo compartido— la elección se sostiene mucho peor, y conviene saber decirlo antes de que lo diga la primera factura de infraestructura.
+</Lead>
+
+<Objetivos>
+
+- Cuantificar la diferencia de memoria residente entre un proceso Swift y un runtime con recolector, y traducirla a densidad de despliegue.
+- Explicar por qué ARC produce un perfil de latencia de cola distinto al de un recolector generacional, y dónde deja de ser una ventaja.
+- Evaluar el ahorro real de compartir modelos entre cliente y servidor frente al acoplamiento que introduce.
+- Decidir con criterio explícito cuándo Swift en el servidor es la elección correcta y cuándo es una apuesta cara.
+
+</Objetivos>
+
+## Compilación anticipada y ausencia de montón gestionado
+
+Un binario de Swift es código máquina nativo producido antes de arrancar. No hay intérprete, no hay compilación en caliente, no hay fase de calentamiento en la que los primeros miles de peticiones corren diez veces más lentas que las siguientes. El proceso arranca en decenas de milisegundos y su primera petición cuesta prácticamente lo mismo que la petición número un millón.
+
+```bash
+swift build -c release
+/usr/bin/time -v ./.build/release/Servidor
+ps -o rss=,vsz=,comm= -p $(pgrep Servidor)
+```
+
+La cifra que importa aquí es la memoria residente en reposo y bajo carga. Un servicio mínimo en `Hummingbird` se sitúa habitualmente entre 15 y 30 MB de RSS; el mismo servicio en Go ronda los 10 a 20 MB; en Node, entre 50 y 90 MB; y sobre una JVM con un framework convencional, entre 200 y 500 MB antes de atender nada interesante. La diferencia no viene de que el código Swift sea más listo, sino de que **no existe un montón gestionado que deba dimensionarse por encima del conjunto vivo** para que el recolector pueda trabajar sin ahogarse.
+
+Ese detalle es el que se convierte en dinero. Un recolector generacional necesita típicamente entre dos y cinco veces el tamaño de los objetos vivos para mantener su rendimiento; ARC necesita, en el límite, exactamente el tamaño de los objetos vivos más la fragmentación del asignador. En un nodo de 8 GB eso es la diferencia entre alojar seis réplicas o alojar cuarenta, y en despliegues donde cada réplica es pequeña —funciones, procesos por tenant, servicios en el borde— el factor se multiplica por todo el parque.
+
+El arranque cuenta la misma historia desde otro ángulo. Un proceso Swift está atendiendo peticiones en el orden de las decenas de milisegundos; una JVM con un framework de inyección de dependencias tarda segundos en estar lista y bastante más en alcanzar su rendimiento de régimen, porque el compilador en caliente necesita observar el código antes de optimizarlo. Mientras el servicio sea un proceso de larga vida detrás de un balanceador, esa diferencia es irrelevante y quien la esgrime está vendiendo humo. Deja de serlo en cuanto el número de arranques por día es alto: escalado reactivo a picos, despliegues frecuentes, ejecución sin servidor, arranque en frío en el borde, o simplemente un entorno de desarrollo donde alguien reinicia el servidor doscientas veces al día y cada reinicio le cuesta atención.
+
+<Callout type="tip" title="El coste que casi nadie contabiliza">
+Al perfil de recursos de Swift hay que restarle una partida honesta: el **tiempo de compilación**. Un proyecto mediano con genéricos densos y muchas dependencias puede tardar varios minutos en compilar en limpio, y eso se paga en cada rama de integración continua y en cada cambio de contexto del programador. Si lo comparas con Go, la balanza se invierte aquí de forma clara.
+</Callout>
+
+<Callout type="info" title="La comparación justa">
+Comparar lenguajes con un `hello world` es un deporte inútil. La medida que decide arquitecturas es el RSS **bajo carga sostenida y con el conjunto de trabajo real** —conexiones abiertas, pools de base de datos, cachés—, sostenido durante horas, no durante los treinta segundos de un benchmark. Si vas a defender Swift con números, mide eso.
+</Callout>
+
+## ARC y la forma de la latencia de cola
+
+La liberación de memoria en Swift es determinista: un objeto muere cuando su último dueño desaparece, y muere ahí, en esa línea. Eso reparte el coste de la gestión de memoria de forma uniforme por toda la ejecución en lugar de concentrarlo en pausas.
+
+<Mermaid code={`flowchart TB
+  A[Peticion entrante] --> B{Modelo de memoria}
+  B -->|ARC| C[Coste constante en cada retain y release]
+  C --> D[Latencia p99 cercana a la p50]
+  B -->|Recolector generacional| E[Asignacion casi gratuita]
+  E --> F[Pausas periodicas de recoleccion]
+  F --> G[Latencia p99 muy por encima de la p50]
+  style D fill:#a6e3a1,color:#11111b
+  style G fill:#f38ba8,color:#11111b`} />
+
+Conviene no idealizar el cuadro. ARC no es gratis: cada `retain` y cada `release` sobre un objeto compartido entre hilos es una operación atómica, y en código con mucho paso de referencias esas atómicas se acumulan y compiten por la misma línea de caché. Además, la destrucción determinista tiene su propia patología: liberar de golpe un grafo grande produce una cascada de destrucciones sincrónica en el hilo que soltó la última referencia, lo que es una pausa igual que la del recolector, solo que **predecible en su causa** aunque no siempre en su momento.
+
+La diferencia práctica es cualitativa más que cuantitativa. Un recolector moderno —ZGC, el recolector de Go— tiene pausas medidas en microsegundos, así que el argumento de las pausas ya no gana solo; lo que gana es la ausencia de un presupuesto de memoria que hay que sobredimensionar y la ausencia de un parámetro de ajuste que alguien tendrá que tocar a las tres de la mañana. Swift no te obliga a entender el recolector porque no hay recolector que entender: te obliga a entender la propiedad de los objetos, que es un problema que ya tenías.
+
+Merece la pena señalar además que el propio lenguaje te da herramientas para reducir el tráfico de ARC en el camino caliente, y usarlas es la diferencia entre una ventaja teórica y una ventaja medida.
+
+```swift
+// Los tipos de valor no participan en ARC salvo por su almacenamiento interno
+struct Metricas: Sendable {
+    var atendidas: Int
+    var fallidas: Int
+}
+
+// Los parametros prestados evitan retener y soltar en cada llamada
+func resumir(_ m: borrowing Metricas) -> Int {
+    m.atendidas + m.fallidas
+}
+```
+
+Un `struct` de campos triviales no cuesta ninguna operación atómica; una `class` compartida entre tareas cuesta una por cada paso de referencia. Diseñar el camino caliente con tipos de valor, y marcar con `borrowing` lo que solo se lee, convierte la ventaja de ARC en algo que aparece en el perfilador y no solo en la argumentación.
+
+## Un solo modelo para dos plataformas
+
+El tercer argumento es el menos técnico y el más decisivo en la práctica. Si el cliente es una aplicación de Apple escrita en Swift, el servidor puede compartir literalmente el mismo paquete de tipos.
+
+```swift
+// Paquete Modelo, compartido por la app y por el servidor
+public struct Reserva: Codable, Sendable, Equatable {
+    public let id: UUID
+    public let inicio: Date
+    public let plazas: Int
+
+    public enum Fallo: Error, Codable, Sendable {
+        case sinPlazas(disponibles: Int)
+        case fueraDePlazo
+    }
+
+    public func validar(aforo: Int) -> Fallo? {
+        guard plazas <= aforo else { return .sinPlazas(disponibles: aforo) }
+        return inicio > .now ? nil : .fueraDePlazo
+    }
+}
+```
+
+Lo que se comparte aquí no es solo la forma de los datos, que cualquier generador de código a partir de un esquema podría producir; es el **comportamiento**: la misma validación corre en el cliente para dar retroalimentación inmediata y en el servidor como frontera de confianza, y son el mismo código, así que no pueden divergir. Los errores del dominio viajan como valores tipados en lugar de como cadenas, y añadir un caso nuevo al `enum` rompe la compilación de ambos lados a la vez, que es exactamente lo que uno quiere que ocurra.
+
+La comparación justa aquí no es contra escribir dos modelos a mano, que casi nadie hace ya, sino contra generar código desde un esquema compartido como OpenAPI o Protobuf. Esa vía es perfectamente válida, funciona entre lenguajes distintos y en muchos equipos es la respuesta correcta. Lo que aporta el paquete compartido de Swift sobre ella es el segundo escalón: un esquema describe **datos**, no reglas, así que la validación, los invariantes y la lógica de transición de estados siguen escribiéndose dos veces y siguen pudiendo divergir. Compartir un módulo elimina esa segunda duplicación, a cambio de renunciar a la independencia de lenguaje entre las dos orillas.
+
+<Cards>
+  <Card icon="🧬" title="Una fuente de verdad">
+    El esquema deja de ser un documento que alguien mantiene y pasa a ser código que el compilador verifica en las dos orillas.
+  </Card>
+  <Card icon="⚖️" title="El coste es acoplamiento">
+    Un modelo compartido ata el ciclo de versiones del cliente al del servidor. Comparte tipos de transporte, no reglas de negocio internas.
+  </Card>
+  <Card icon="🚪" title="La frontera sigue existiendo">
+    Que el cliente valide no exime al servidor de validar. Compartir código no convierte al cliente en confiable.
+  </Card>
+</Cards>
+
+## Dónde el argumento se rompe
+
+Ser honesto exige enunciar también lo contrario. El ecosistema de bibliotecas es una fracción del de Java, Go o Python: los clientes oficiales de servicios en la nube suelen faltar o ir por detrás, la observabilidad requiere ensamblar piezas y no todos los motores de base de datos tienen un controlador nativo maduro. La disponibilidad de gente que ya sepa Swift del lado servidor es escasa, y el coste de formación recae en el equipo. Las diferencias de `Foundation` en Linux siguen produciendo sorpresas que no aparecen en macOS. Y para cargas dominadas por entrada y salida contra servicios externos —donde el proceso pasa el noventa por ciento del tiempo esperando— la ventaja de rendimiento del lenguaje es prácticamente invisible.
+
+Hay además una asimetría de plataforma que conviene no minimizar: el lugar donde Swift es más cómodo de escribir, con su depurador integrado y su instrumentación gráfica, es macOS, y el lugar donde tu servidor va a vivir es Linux. Esa distancia no existe para quien programa en Go o en Java, y produce una clase de fallo característica: código que pasa todas las pruebas locales y se rompe en el contenedor por una diferencia de biblioteca base que nadie anticipó. La mitigación es barata pero hay que decidirla el primer día, no el último, y consiste en ejecutar la suite completa en Linux desde la primera semana del proyecto.
+
+Puestas las dos columnas una al lado de la otra, la conclusión es incómoda para ambos bandos: el mérito técnico de Swift en el servidor es alto y su posición en el mercado es marginal, y esas dos cosas pueden ser ciertas a la vez porque miden cosas distintas. Quien decide una arquitectura tiene que ponderar las dos.
+
+<Callout type="dios" title="La elección de lenguaje es una elección sobre quién paga y cuándo">
+Detrás de esta comparación hay una idea que trasciende a Swift, y es que ningún lenguaje elimina el coste de gestionar memoria: solo decide **quién lo paga, cuándo y en qué moneda**. Un recolector de basura cobra en memoria sobredimensionada y en latencia impredecible, pero paga al programador una libertad enorme: puede crear grafos cíclicos sin pensar, no tiene que razonar sobre propiedad y su código es más corto. ARC cobra en atómicas repartidas por todo el programa y en la obligación de pensar en ciclos de retención, pero devuelve determinismo y un consumo que se puede predecir con una hoja de cálculo. Rust cobra por adelantado, en la forma de un verificador que rechaza programas que habrían funcionado, y devuelve ambas cosas a la vez. Ninguna de las tres es superior en abstracto; lo que existe es una correspondencia entre el perfil de costes del lenguaje y el perfil de restricciones del sistema, y la competencia de un ingeniero se mide en su capacidad de reconocer cuál domina en su caso concreto antes de tener una opinión. El error característico del debate sobre lenguajes en el servidor es discutir peticiones por segundo en un microbenchmark, cuando la variable que decide la arquitectura casi siempre es otra: la memoria residente por réplica, que fija la densidad; la latencia de cola, que fija la experiencia percibida; y el coste humano de mantener dos modelos de dominio en sincronía, que no aparece en ningún gráfico pero se cobra todos los meses en errores de serialización y en reuniones de coordinación. Swift en el servidor es una respuesta excelente cuando esas tres variables dominan a la vez, y una respuesta mediocre cuando lo que domina es la disponibilidad de bibliotecas o la facilidad para contratar. Saber en cuál de los dos mundos estás vale más que cualquier cifra de rendimiento.
+</Callout>
+
+<Reto title="Mide antes de opinar">
+1. Escribe el mismo servicio mínimo en Swift y en otro lenguaje que domines, y compara el RSS en reposo y tras diez minutos de carga sostenida.
+2. Traduce esa diferencia a réplicas por nodo y a coste mensual con los precios reales de tu proveedor.
+3. Instrumenta las latencias p50, p99 y p999 de ambos bajo la misma carga y explica la forma de cada distribución.
+4. Extrae los tipos de transporte de un proyecto tuyo a un paquete compartido y enumera qué acoplamientos acabas de crear.
+5. Redacta media página defendiendo la opción contraria a la que prefieres. Si no te sale convincente, aún no entiendes el problema.
+</Reto>

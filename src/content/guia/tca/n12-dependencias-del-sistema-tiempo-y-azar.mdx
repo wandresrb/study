@@ -1,0 +1,156 @@
+---
+title: "Las dependencias del sistema: controlar el tiempo y el azar"
+description: "El tiempo y el azar son las dos impurezas que parecen imposibles de domesticar y son, precisamente, las que la biblioteca resuelve mejor. Esta lección estudia el reloj como dependencia —continuousClock frente a suspendingClock, TestClock frente a ImmediateClock— y muestra cómo un test de un temporizador de treinta segundos se ejecuta en microsegundos sin perder una sola aserción. Después aborda la fecha y su cortejo de calendario, zona horaria y localización, el generador de UUID y el de números aleatorios con semilla, y finalmente mainQueue y los planificadores de Combine, la vía por la que el tiempo entra en el código heredado que aún no usa async."
+subject: tca
+level: 12
+order: 3
+icon: "12.3"
+duracion: "19 min"
+---
+
+<Lead>
+De todas las impurezas del inventario, el tiempo es la que más resistencia opone a la intuición: parece una condición del universo, no un parámetro. Y sin embargo, en cuanto el reloj entra por una dependencia, el tiempo se vuelve exactamente igual de manipulable que cualquier otro valor: puedes congelarlo, avanzarlo tres días de golpe, hacer que no exista. Un test que verifica un temporizador de treinta segundos termina en microsegundos, sin dormir, sin esperas y sin una sola aserción sacrificada. Lo mismo ocurre con el azar: un generador con semilla fija produce una secuencia aleatoria *y* reproducible, dos adjetivos que parecían excluirse. Esta lección recorre las cuatro dependencias del sistema que más cambian la vida —reloj, fecha, identificadores y planificadores— y muestra que dominar el tiempo y el azar es menos una hazaña que una consecuencia mecánica de haberlos declarado.
+</Lead>
+
+<Objetivos>
+
+- Sustituir toda espera real por un reloj inyectado y distinguir `continuousClock` de `suspendingClock`.
+- Manejar `TestClock` para avanzar el tiempo a voluntad e `ImmediateClock` para colapsarlo a cero.
+- Controlar la fecha junto con su cortejo de calendario, zona horaria y localización, que rompen tests silenciosamente.
+- Reproducir el azar con generadores de `UUID` incrementales y con semilla, y dominar `mainQueue` en código de Combine.
+
+</Objetivos>
+
+## El reloj: la espera como valor
+
+Un efecto que espera es el caso donde el mundo cableado duele más, porque el precio no es solo la fragilidad sino la *duración*. Un `Task.sleep` de dos segundos dentro de un efecto obliga a que el test espere dos segundos reales; multiplícalo por doscientos tests y la suite pasa de segundos a minutos, y una suite que tarda minutos deja de ejecutarse en cada guardado.
+
+```swift
+@Reducer
+struct Temporizador {
+  @Dependency(\.continuousClock) var clock
+
+  func reduce(into state: inout State, action: Action) -> Effect<Action> {
+    switch action {
+    case .iniciar:
+      return .run { send in
+        for await _ in clock.timer(interval: .seconds(1)) {
+          await send(.tick)
+        }
+      }
+      .cancellable(id: CancelID.temporizador)
+
+    case .tick:
+      state.segundos += 1
+      return .none
+    }
+  }
+}
+```
+
+El reducer no sabe cuánto dura un segundo: se lo dirá el reloj que reciba. En producción recibe el reloj continuo real y el temporizador late cada segundo. En un test recibe un `TestClock`, que no avanza por su cuenta y solo se mueve cuando tú se lo ordenas con `advance(by:)`; treinta segundos de comportamiento se verifican de forma instantánea y, lo que importa más, de forma *exacta*: cada avance libera exactamente los efectos que ese avance produce, ni uno más.
+
+```swift
+@Test
+func cuentaTresSegundos() async {
+  let clock = TestClock()
+  let store = TestStore(initialState: Temporizador.State()) {
+    Temporizador()
+  } withDependencies: {
+    $0.continuousClock = clock
+  }
+  await store.send(.iniciar)
+  await clock.advance(by: .seconds(3))
+  await store.receive(\.tick) { $0.segundos = 1 }
+  await store.receive(\.tick) { $0.segundos = 2 }
+  await store.receive(\.tick) { $0.segundos = 3 }
+  await store.send(.parar)
+}
+```
+
+Observa que el avance de tres segundos libera exactamente tres latidos, ni dos ni cuatro, y que el test entero termina en microsegundos. Esa precisión es lo que distingue al reloj de test de cualquier truco basado en esperar un poco y confiar: no hay margen de tolerancia, no hay tests intermitentes, no hay que ajustar constantes mágicas para que la máquina de integración continua, más lenta, no falle.
+
+La elección entre los dos relojes del sistema no es indiferente. `continuousClock` sigue contando mientras el dispositivo está suspendido; `suspendingClock` se detiene con él. Para un temporizador de cocina que debe seguir corriendo aunque bloquees la pantalla, el continuo es el correcto. Para un rebote de teclado o una animación, el suspendido evita que al despertar el dispositivo se disparen de golpe todos los intervalos acumulados. Elegir mal produce el tipo de bug que solo aparece en dispositivos reales y nunca en el simulador.
+
+| Reloj | Comportamiento | Uso típico |
+| --- | --- | --- |
+| `continuousClock` | Cuenta también con el dispositivo dormido | Cuentas atrás \| caducidad de sesión |
+| `suspendingClock` | Se detiene con el dispositivo | Rebote de teclado \| animaciones |
+| `TestClock` | Solo avanza si lo ordenas | Tests de comportamiento temporal |
+| `ImmediateClock` | Toda espera dura cero | Previews y tests donde el tiempo no importa |
+
+`ImmediateClock` merece una nota aparte. No sirve para verificar *cuándo* ocurre algo, porque colapsa toda espera; sirve para que un test que no está examinando el tiempo no pague por él, y para que una preview no se quede tres segundos en blanco antes de dibujar. Usar el reloj inmediato donde tocaba el reloj de test es el error clásico: el test pasa, pero ha dejado de comprobar la temporización que creías estar comprobando.
+
+## La fecha y su cortejo
+
+La fecha rara vez viaja sola. Un reducer que decide si una suscripción ha caducado necesita el instante actual; uno que agrupa registros por día necesita además el calendario y la zona horaria; uno que formatea para mostrar necesita también la localización. Las cuatro son dependencias, y las tres últimas son las que rompen tests de forma más desconcertante, porque el fallo aparece solo en la máquina de integración continua o solo el día que alguien viaja.
+
+```swift
+@Reducer
+struct Informe {
+  @Dependency(\.date.now) var ahora
+  @Dependency(\.calendar) var calendar
+  @Dependency(\.timeZone) var timeZone
+
+  // La lógica de agrupar por dia depende de las tres, no solo del instante
+}
+```
+
+Fijar el instante en un test es directo: `$0.date = .constant(fechaFija)` congela el reloj en un punto concreto, y a partir de ahí toda aserción sobre caducidades, antigüedades o cortes de medianoche es exacta y permanente. La lección menos evidente es que congelar solo la fecha no basta si tu lógica cruza medianoche: sin fijar también la zona horaria, el mismo instante pertenece a un día distinto según dónde corra el test.
+
+<Callout type="note" title="El calendario y la zona horaria son dependencias, aunque no lo parezcan">
+Un test que agrupa registros por día y pasa en tu máquina puede fallar en la integración continua sin que nadie haya tocado el código, simplemente porque el runner corre en horario universal y tu portátil no. El síntoma es desconcertante —falla un test de lógica de negocio por razones geográficas— y la causa es siempre la misma: una consulta al entorno que nadie declaró. Fijar `\.timeZone` y `\.calendar` junto a `\.date` cuesta dos líneas y elimina toda esa clase de fallos.
+</Callout>
+
+Hay un patrón que conviene interiorizar: **la fecha se inyecta, no se guarda**. Es tentador poner un campo con la fecha actual en el estado y actualizarlo periódicamente. Casi siempre es un error, porque duplica en el estado una información que ya es accesible como dependencia y obliga a mantenerla sincronizada. El estado guarda las fechas del dominio —cuándo se creó el elemento, cuándo caduca—; el *ahora* llega por dependencia en el instante en que hace falta.
+
+## El azar reproducible
+
+El segundo gran indomable es el azar, y la solución tiene la misma forma. `@Dependency(\.uuid)` entrega un generador de identificadores en lugar de llamar a `UUID()`, y ese generador es sustituible por versiones deterministas.
+
+```swift
+// En un test
+$0.uuid = .incrementing
+// El primer identificador termina en 0, el siguiente en 1, y asi sucesivamente
+```
+
+Con `.incrementing` los identificadores se vuelven predecibles y las aserciones pueden nombrarlos exactamente. Existe también `.constant`, útil cuando solo necesitas que no cambie, y siempre puedes construir el tuyo. El mismo razonamiento se aplica al azar numérico: `withRandomNumberGenerator` permite instalar un generador con semilla fija, de modo que la secuencia sigue siendo estadísticamente aleatoria pero idéntica en cada ejecución. Un juego de dados se vuelve testeable sin dejar de ser un juego de dados.
+
+El identificador determinista tiene además un beneficio que no es de testing sino de legibilidad del fallo. Cuando un test exhaustivo falla, el diagnóstico imprime el estado esperado frente al real; con identificadores aleatorios ese diagnóstico es una pared de caracteres hexadecimales indistinguibles, mientras que con identificadores incrementales se lee de un vistazo cuál es el primer elemento y cuál el tercero. Un mensaje de error legible vale tanto como el test que lo produce.
+
+Merece subrayarse la diferencia entre *eliminar* el azar y *fijarlo*. No estás haciendo que tu app sea determinista en producción —allí sigue habiendo azar real—; estás haciendo que sea determinista *bajo un contexto elegido*. La aleatoriedad no desaparece: se vuelve un parámetro con valor por defecto aleatorio y valor fijable a demanda.
+
+## `mainQueue` y el mundo de Combine
+
+No todo el código es async. Buena parte de las bases reales todavía usan Combine, y allí el tiempo entra por otra puerta: los planificadores. `@Dependency(\.mainQueue)` entrega un planificador para el hilo principal que puede sustituirse por uno de test con la misma semántica de avance manual que el `TestClock`.
+
+```swift
+@Dependency(\.mainQueue) var mainQueue
+
+return publicador
+  .debounce(for: .milliseconds(300), scheduler: mainQueue)
+  .eraseToEffect()
+```
+
+En un test instalas `DispatchQueue.test`, envías las entradas y avanzas el planificador a mano para comprobar que el rebote descartó lo que debía descartar. La lógica es idéntica a la del reloj y la conclusión también: cualquier operador que reciba un planificador está recibiendo el tiempo por parámetro, y por tanto ya es controlable, siempre que ese planificador venga de una dependencia y no de `DispatchQueue.main` escrito a mano.
+
+<Mermaid code={`flowchart TD
+  TS[Test] -->|advance de 1 segundo| TC[TestClock]
+  TC -->|libera exactamente un tick| EF[Efecto en vuelo]
+  EF -->|envia accion tick| RD[Reducer]
+  RD --> ST[Estado con segundos igual a 1]
+  ST --> AS[Asercion exacta sin espera real]
+  style TC fill:#89b4fa,color:#11111b
+  style AS fill:#a6e3a1,color:#11111b`} />
+
+<Callout type="dios" title="Controlar el tiempo no es un truco de testing: es convertir una dimension en un eje navegable">
+Vale la pena medir lo que realmente ocurre cuando el reloj entra por una dependencia, porque es más grande de lo que parece. En el modo cableado, el tiempo es una dirección de un solo sentido: para observar qué hace tu app a los treinta segundos, tienes que vivir esos treinta segundos, y para observar qué hace al caducar una sesión de treinta días, tienes que esperar treinta días o falsear el reloj del dispositivo. Al inyectarlo, el tiempo deja de ser una dirección y se convierte en un eje navegable: saltas a los treinta segundos, a los treinta días, al instante exacto anterior a la medianoche del cambio de horario. Comportamientos que antes eran *inobservables en la práctica* —la lógica de caducidad, la renovación de credenciales, el corte de fin de mes— pasan a ser verificables en un milisegundo, y con ellos toda una clase de bugs que antes solo se descubría en producción y en fechas señaladas. Es raro que una decisión de diseño tan pequeña abra tanto territorio. Y observa la simetría profunda entre las dos impurezas de esta lección: el tiempo y el azar parecían las más irreductibles porque parecían propiedades del universo y no del programa, pero en cuanto se declaran como argumentos resultan ser exactamente igual de sustituibles que un cliente de red. Eso sugiere una lección general que trasciende a TCA: la sensación de que algo *no se puede* controlar casi nunca es una propiedad del fenómeno; suele ser un artefacto de haberlo dejado implícito. Lo implícito es incontrolable por definición, porque no tiene un nombre por el que agarrarlo. Ponerle nombre —declararlo, darle una ruta de clave, un valor por defecto y un punto de sustitución— es todo lo que hace falta para que lo inevitable se vuelva elegible.
+</Callout>
+
+<Reto title="Domestica el tiempo y el azar de una feature real">
+1. Localiza en tu proyecto un `Task.sleep` o un temporizador dentro de un efecto. Sustitúyelo por `@Dependency(\.continuousClock)` y justifica por qué el reloj continuo o el suspendido es el correcto en ese caso concreto.
+2. Escribe el test con `TestClock`: avanza el reloj paso a paso y afirma cada acción recibida. Comprueba cuánto tarda la suite antes y después del cambio.
+3. Repite el test con `ImmediateClock` y describe exactamente qué garantía has perdido al hacerlo, aunque el test siga en verde.
+4. Congela la fecha con `.constant` en un test de caducidad y comprueba qué ocurre si no fijas también la zona horaria. Fuerza el fallo cambiando la zona a una que cruce el día.
+5. Instala un generador de identificadores incremental y otro de números aleatorios con semilla en una feature con azar, y verifica que dos ejecuciones consecutivas del test producen exactamente la misma secuencia.
+</Reto>

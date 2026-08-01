@@ -1,0 +1,162 @@
+---
+title: "Clústeres: la implementación de referencia, el descubrimiento y la vigilancia"
+description: "`swift-distributed-actors` es el sistema que Apple ofrece como implementación de referencia: membresía por gossip, detección de fallos con SWIM, un recepcionista para encontrar actores sin conocer su identidad y vigilancia de terminación para reaccionar cuando alguien desaparece."
+subject: swift
+level: 27
+order: 4
+icon: "27.4"
+duracion: "19 min"
+---
+
+<Lead>
+Con el protocolo del sistema en la mano, la pregunta pasa a ser práctica: quién ha escrito ya uno serio. La respuesta es `swift-distributed-actors`, el paquete de Apple que aporta `ClusterSystem`, un transporte sobre TCP y, sobre todo, las tres piezas que ningún transporte trae de fábrica y que todo despliegue real necesita: saber quiénes forman el grupo en cada momento, encontrar a un actor cuya identidad no conocías de antemano y enterarte de que alguien ha dejado de existir. Ese trío —membresía, descubrimiento y vigilancia— es lo que separa un canal de mensajes de un sistema distribuido, y merece estudiarse aunque nunca despliegues un clúster, porque son los mismos problemas que aparecen entre dos procesos de un mismo portátil.
+</Lead>
+
+<Objetivos>
+
+- Arrancar un `ClusterSystem`, unirse a un nodo semilla y esperar a que la unión sea efectiva.
+- Interpretar los estados de membresía y el papel de la detección de fallos y de la estrategia de bajada.
+- Publicar y descubrir actores con el recepcionista mediante claves tipadas.
+- Reaccionar a la desaparición de un actor con `LifecycleWatch` y diseñar la reposición correspondiente.
+
+</Objetivos>
+
+## Unirse al grupo y ser considerado vivo
+
+Un nodo es un proceso con un `ClusterSystem` escuchando en un puerto. Formar clúster consiste en decirle a uno la dirección de otro; a partir de ahí la información se propaga sola.
+
+```swift
+import DistributedCluster
+
+let sistema = await ClusterSystem("nodoA") { ajustes in
+    ajustes.endpoint = Cluster.Endpoint(host: "127.0.0.1", port: 7337)
+}
+
+sistema.cluster.join(endpoint: Cluster.Endpoint(host: "127.0.0.1", port: 7338))
+try await sistema.cluster.joined(endpoint: semilla, within: .seconds(10))
+```
+
+La propagación usa gossip: cada nodo comparte periódicamente con unos pocos vecinos lo que cree saber sobre todos, y esa creencia converge sin ningún coordinador central. Sobre ese sustrato corre SWIM, un detector de fallos que combina sondeo directo con sondeo indirecto a través de terceros, precisamente para no declarar muerto a quien solo era inalcanzable desde un vecino concreto.
+
+<Mermaid code={`stateDiagram-v2
+  [*] --> joining
+  joining --> up: aceptado por el grupo
+  up --> leaving: salida ordenada
+  leaving --> down: retirada confirmada
+  up --> down: declarado inalcanzable
+  down --> removed: expulsado del clan
+  removed --> [*]`} />
+
+Los estados no son decorativos: definen a quién se le envía y a quién no. Un nodo `up` recibe tráfico; uno `down` queda excluido y **no puede volver**, tiene que reiniciarse con una identidad nueva. Esa regla es dura a propósito, porque readmitir a un nodo que estuvo aislado significaría admitir su estado, que puede haber divergido.
+
+La membresía no es un dato que se consulta, es un flujo que se observa. El sistema publica los cambios como secuencia asíncrona, con lo que la reacción a la topología se escribe con las mismas herramientas del nivel anterior.
+
+```swift
+for await evento in sistema.cluster.events {
+    switch evento {
+    case .membershipChange(let cambio) where cambio.status == .up:
+        await repartidor.incorporar(nodo: cambio.member)
+    case .membershipChange(let cambio) where cambio.status == .down:
+        await repartidor.retirar(nodo: cambio.member)
+    default:
+        break
+    }
+}
+```
+
+Los tiempos que gobiernan ese flujo son parámetros, no constantes del universo, y elegirlos es una decisión de producto: un plazo de sospecha corto detecta caídas antes y produce más falsos positivos; uno largo es estable y deja peticiones colgando más tiempo. En una red local con latencias de microsegundos y en un despliegue entre regiones las cifras razonables difieren en un orden de magnitud.
+
+<Callout type="warn" title="La partición no se resuelve sola">
+Si la red se corta en dos mitades, cada una puede considerar muerta a la otra y seguir operando: es el cerebro dividido. La `downingStrategy` decide quién sobrevive, típicamente exigiendo mayoría. Sin una política explícita tendrás dos clústeres convencidos de ser el bueno.
+</Callout>
+
+## Encontrar sin conocer la identidad
+
+`resolve` sirve cuando ya tienes una identidad. El problema real es el anterior: quieres hablar con «algún operario disponible» y no sabes ni cuántos hay ni en qué nodo viven. Para eso está el recepcionista, un registro replicado por el clúster con claves tipadas.
+
+```swift
+extension DistributedReception.Key {
+    static var operarios: DistributedReception.Key<Operario> { "operarios" }
+}
+
+// En el nodo que lo aloja
+let operario = Operario(actorSystem: sistema)
+await sistema.receptionist.checkIn(operario, with: .operarios)
+
+// En cualquier otro nodo
+for await op in await sistema.receptionist.listing(of: .operarios) {
+    await balanceador.registrar(op)
+}
+```
+
+Dos rasgos hacen que esto sea más que un directorio. La clave está **tipada**, de modo que la búsqueda devuelve referencias del tipo correcto sin conversiones ni cadenas mágicas. Y el resultado es una secuencia asíncrona, no una consulta puntual: el listado sigue emitiendo a medida que aparecen nuevos actores y a medida que otros se retiran, lo que convierte el descubrimiento en un flujo que tu código puede consumir con las mismas herramientas del nivel anterior.
+
+## Vigilar la desaparición
+
+Aquí conviene ser preciso, porque el vocabulario de Erlang y de Akka genera expectativas que Swift no cumple. `swift-distributed-actors` **no** trae árboles de supervisión con políticas de reinicio automático heredadas por los hijos. Lo que trae es el ingrediente sobre el que aquello se construye: la notificación fiable de terminación.
+
+```swift
+distributed actor Coordinador: LifecycleWatch {
+    typealias ActorSystem = ClusterSystem
+    private var activos: Set<Operario> = []
+
+    distributed func incorporar(_ op: Operario) {
+        watchTermination(of: op)
+        activos.insert(op)
+    }
+
+    func terminated(actor id: ActorSystem.ActorID) async {
+        activos = activos.filter { $0.id != id }
+        await reponerCapacidad()
+    }
+}
+```
+
+`watchTermination(of:)` funciona tanto si el actor vigilado muere en tu proceso como si desaparece con su nodo entero, y esa uniformidad es la que hace que la política de recuperación se escriba una sola vez. El contrato incluye un detalle que rara vez se subraya: si el actor ya había terminado cuando lo vigilas, la notificación llega igualmente. Sin esa garantía existiría una carrera que dejaría al vigilante esperando para siempre.
+
+Con esa pieza, la supervisión se escribe a mano y en Swift ordinario: al recibir `terminated`, decides si reponer, si degradar el servicio, si propagar el fallo hacia arriba o si abrir un cortacircuitos. La ventaja de no tener un marco de políticas es que la decisión queda donde está el conocimiento del dominio; la desventaja es que hay que tomarla siempre, y omitirla produce sistemas que se vacían en silencio.
+
+Merece la pena distinguir dos preguntas que la notificación deja abiertas. La primera es qué se hace con el **actor**: reponerlo en otro nodo suele ser fácil, porque basta con crear uno nuevo y registrarlo. La segunda es qué se hace con su **estado**, y ahí no hay atajo: si el actor tenía información que solo vivía en su memoria, esa información se ha perdido, y la única salida es haberla persistido antes o poder reconstruirla desde otra fuente. La reposición ciega de actores con estado volátil produce un sistema que parece sano y sirve datos incompletos.
+
+```swift
+// Reponer no es restaurar: el estado hay que traerlo de algun sitio
+func terminated(actor id: ActorSystem.ActorID) async {
+    activos = activos.filter { $0.id != id }
+    guard let ultima = try? await instantaneas.ultima(de: id) else {
+        await alertar(.estadoPerdido(id))
+        return
+    }
+    let sustituto = Operario(actorSystem: actorSystem, restaurando: ultima)
+    await actorSystem.receptionist.checkIn(sustituto, with: .operarios)
+    watchTermination(of: sustituto)
+    activos.insert(sustituto)
+}
+```
+
+<Cards>
+  <Card icon="📡" title="Membresía">
+    Gossip para propagar la creencia y SWIM para sospechar con corroboración de terceros antes de declarar a nadie caído.
+  </Card>
+  <Card icon="🗂️" title="Recepcionista">
+    Claves tipadas y listados como secuencia asíncrona: el descubrimiento es un flujo, no una consulta.
+  </Card>
+  <Card icon="👁️" title="Vigilancia">
+    `LifecycleWatch` entrega `terminated` incluso si la terminación ya había ocurrido antes de vigilar.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="La detección de fallos no detecta fallos: los declara">
+El punto donde un clúster deja de parecerse a un programa y empieza a parecerse a una institución es este: nadie puede observar que un nodo ha muerto, solo puede observar que no ha contestado. La diferencia parece pedante y es el corazón de toda la teoría. En una red asíncrona —sin cotas conocidas de retardo de mensajes ni de velocidad de proceso— es formalmente imposible distinguir un nodo caído de uno lento, y de esa imposibilidad se deriva el resultado de Fischer, Lynch y Paterson: no existe algoritmo determinista que garantice consenso si un solo participante puede fallar. Los sistemas reales no derogan el teorema, lo esquivan por el único sitio posible, que es renunciar a la certeza y adoptar un **detector de fallos no fiable**: un componente que emite sospechas, que a veces se equivoca, y cuyo valor no está en acertar sino en que el resto del sistema esté diseñado para tolerar sus errores. Por eso SWIM sondea indirectamente antes de sospechar, por eso hay un periodo de sospecha antes de la declaración, y por eso `down` es irreversible: si la muerte es una decisión social del grupo y no un hecho observado, lo peor que puede pasar es que dos partes del sistema mantengan decisiones distintas sobre el mismo nodo, y la única defensa contra eso es que la decisión sea única, propagada y definitiva. Ahí se ve también por qué la partición de red no es un caso raro que se trata con un reintento sino la manifestación pura del teorema CAP: cuando la red se corta, o sigues respondiendo con datos que pueden ser incorrectos o dejas de responder, y no hay tercera opción; elegir mayoría como estrategia de bajada es simplemente decidir por adelantado que se sacrifica la disponibilidad de la minoría para conservar una única verdad. La lección transferible excede a Swift y a los clústeres: cualquier sistema en el que hables con algo que no controlas —un servicio, un dispositivo, un proceso hijo— necesita responder tres preguntas antes de escribir una línea de red, y son cuánto tiempo esperas antes de sospechar, quién decide la baja y qué haces con el trabajo que estaba en vuelo cuando decidiste. Un plazo por defecto y un reintento no son respuestas, son la ausencia de ellas.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+`ClusterSystem` aporta membresía por gossip, detección de fallos SWIM, recepcionista tipado y vigilancia de terminación. Un nodo `down` no vuelve. El descubrimiento es una secuencia asíncrona. La supervisión no viene hecha: `terminated` es el gancho y la política la escribes tú. El paquete sigue evolucionando, así que fija la versión.
+</Callout>
+
+<Reto title="Tres nodos y una caída">
+1. Arranca tres nodos en puertos distintos, únelos a través de una sola semilla y registra los eventos de clúster hasta que los tres estén `up`.
+2. Publica dos operarios en nodos distintos y consume el listado del recepcionista desde el tercero. Comprueba que el listado se actualiza al añadir un cuarto.
+3. Mata un nodo con una señal y mide cuánto tarda el resto en emitir `terminated`. Ajusta después los tiempos de sospecha y vuelve a medir.
+4. Implementa una política de reposición en `terminated` y demuestra que el sistema recupera capacidad sin intervención.
+5. Simula una partición bloqueando el tráfico entre dos grupos y describe qué ocurre con y sin una estrategia de bajada por mayoría.
+</Reto>

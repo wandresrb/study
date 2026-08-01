@@ -1,0 +1,149 @@
+---
+title: "Workflows durables: el mismo patrón a escala"
+description: "Persistir el snapshot y despertar el proceso cuando llega un evento no es una ocurrencia local: es exactamente lo que hacen Temporal, Cloudflare Workflows y AWS Step Functions, cada uno con su vocabulario y su modelo de ejecución. Esta lección compara las tres encarnaciones industriales del patrón, explica el mecanismo de replay determinista que sostiene a las que ejecutan código imperativo, y establece el criterio para decidir cuándo basta con una máquina propia sobre tu base de datos y cuándo conviene delegar la durabilidad en un motor dedicado."
+subject: maquinas
+level: 17
+order: 3
+icon: "17.3"
+duracion: "20 min"
+---
+
+<Lead>
+Quien haya llegado hasta aquí construyendo su propio bucle de leer, rehidratar, transitar y guardar tiene ya la experiencia necesaria para leer la documentación de un motor de workflows durables y reconocer, detrás de nombres muy distintos, la misma arquitectura. Lo que Temporal llama historia de eventos es tu tabla de transiciones; lo que Step Functions llama estado es tu posición en el grafo; lo que Cloudflare llama paso es tu par de estado y efecto. La convergencia no es casual ni imitativa: es que el problema tiene pocas soluciones correctas y todas se parecen. Este parecido es la mejor noticia del nivel, porque significa que la inversión conceptual hecha en statecharts se transfiere íntegra a la infraestructura de orquestación, y que la decisión de adoptar un motor deja de ser un salto al vacío para convertirse en una elección informada sobre quién guarda tu estado.
+</Lead>
+
+<Objetivos>
+
+- Reconocer el patrón común bajo Temporal, Cloudflare Workflows y AWS Step Functions.
+- Explicar el mecanismo de replay determinista y qué restricciones impone al código.
+- Contrastar el modelo declarativo por grafo con el modelo imperativo por reanudación.
+- Decidir con criterio entre una máquina propia persistida y un motor de workflows dedicado.
+
+</Objetivos>
+
+## Un problema, tres encarnaciones
+
+Los tres sistemas resuelven la misma tensión: ejecutar una lógica de larga duración sobre una infraestructura efímera, garantizando que ni una caída ni un despliegue ni un reinicio pierdan el avance. Difieren en dónde ponen la frontera entre lo que el programador escribe y lo que el motor recuerda.
+
+| Rasgo | Temporal | Cloudflare Workflows | AWS Step Functions |
+| --- | --- | --- | --- |
+| Forma de expresar la lógica | código imperativo en el lenguaje anfitrión | clase con pasos dentro de un método | grafo declarativo en documento de estados |
+| Cómo recuerda el avance | historia de eventos y replay | resultado de cada paso confirmado | estado actual del grafo en el servicio |
+| Unidad indivisible | actividad | paso | estado o tarea |
+| Espera larga | temporizador durable de meses | temporizador durable del paso | estado de espera o transición temporizada |
+| Señal externa | señales y consultas | eventos entrantes | patrón de continuación con testigo |
+| Dónde vive el estado | clúster propio o gestionado | plataforma de borde | servicio administrado del proveedor |
+| Coste de adopción | alto, exige infraestructura | bajo si ya se usa la plataforma | medio, con acoplamiento al proveedor |
+
+Antes de leer la tabla conviene fijar el vocabulario, porque cada producto rebautiza las mismas cosas y el ruido terminológico hace parecer distintas arquitecturas que no lo son. Llamaremos proceso a la instancia viva con identidad propia, paso a la unidad de trabajo cuyo resultado el motor recuerda, historia al registro ordenado de lo ya ocurrido, y señal al mensaje externo que hace avanzar al proceso dormido. Con esas cuatro palabras se puede leer la documentación de cualquiera de los tres sistemas y también la implementación propia del nivel anterior, que tenía las cuatro piezas aunque no las hubiéramos nombrado así.
+
+La fila decisiva es la primera. Temporal y Cloudflare permiten escribir el proceso como si fuera una función normal con `await` entre pasos, y logran la durabilidad reconstruyendo la ejecución desde su historia; Step Functions obliga a declarar el grafo por fuera del código, y por eso su parecido con un statechart es literal en vez de conceptual. Ninguna opción es superior en abstracto: la primera favorece la legibilidad lineal de procedimientos largos, la segunda favorece la inspección, la visualización y el razonamiento sobre transiciones ilegales.
+
+<Mermaid code={`flowchart TD
+  A[proceso de larga duracion] --> B[la infraestructura es efimera]
+  B --> C[hay que guardar el avance fuera del proceso]
+  C --> D[guardar la posicion del grafo]
+  C --> E[guardar la historia de eventos]
+  D --> F[Step Functions y tu maquina persistida]
+  E --> G[Temporal y Cloudflare Workflows]
+  F --> H[replay innecesario, transicion explicita]
+  G --> I[replay determinista al reanudar]
+  style F fill:#a6e3a1,color:#11111b
+  style G fill:#89dceb,color:#11111b`} />
+
+## El replay determinista y su disciplina
+
+En los motores que ejecutan código imperativo, reanudar un workflow significa volver a ejecutarlo desde la primera línea, sustituyendo cada operación ya completada por el resultado guardado en la historia en lugar de repetirla. Esa técnica es lo que permite que un `await` sobreviva a un reinicio, y a cambio impone una condición fuerte: el código debe producir siempre la misma secuencia de decisiones ante la misma historia.
+
+```ts
+export class ProcesarPedido extends WorkflowEntrypoint {
+  async run(event: { payload: { pedidoId: string } }, step: Step) {
+    const cobro = await step.do('cobrar', () => pasarela.cobrar(event.payload.pedidoId))
+    await step.sleep('espera-de-desistimiento', '14 days')
+    const envio = await step.do('preparar-envio', () => almacen.reservar(cobro.referencia))
+    return { cobro: cobro.referencia, envio: envio.guia }
+  }
+}
+```
+
+Al reanudarse, el motor vuelve a entrar por la primera línea, encuentra que el paso `cobrar` ya figura en la historia y devuelve su resultado sin llamar a la pasarela, hace lo propio con la espera si ya venció, y solo ejecuta de verdad el primer paso que aún no tiene resultado. De ahí se deduce toda la disciplina del replay: leer el reloj del sistema, generar un número aleatorio, consultar una variable de entorno mutable o iterar sobre un conjunto sin orden estable dentro del cuerpo del workflow son operaciones prohibidas, porque en la reejecución devolverían valores distintos y el motor perdería la correspondencia entre la historia y las decisiones. Todo lo no determinista debe encapsularse dentro de un paso, que es la unidad cuyo resultado se guarda.
+
+La comunicación con el exterior mientras el workflow duerme completa el cuadro y es donde el parecido con los actores se vuelve más nítido. Una señal es un mensaje que entra y despierta la ejecución; una consulta es una lectura del estado interno que no lo altera. Quien ha trabajado con actores reconoce de inmediato el par: enviar un evento y leer una instantánea. La única diferencia es que aquí el buzón sobrevive a los reinicios y el emisor puede estar en otra máquina, otro proceso o el día siguiente.
+
+<Callout type="info" title="Señal y consulta son enviar y leer, con durabilidad">
+El vocabulario cambia pero la semántica no: la señal exige que la reacción sea determinista y que el orden de llegada quede registrado en la historia, y la consulta exige que no produzca efectos ni modifique nada. Son exactamente las dos disciplinas que un statechart impone por construcción, porque el envío de eventos es la única entrada y el snapshot es una lectura sin poder. Quien haya interiorizado esa separación no tiene nada nuevo que aprender aquí, solo un nombre distinto para cada mitad.
+</Callout>
+
+<Callout type="warn" title="El determinismo se rompe también al editar el código">
+La restricción no afecta solo a lo que el workflow hace, sino a cómo cambia. Si se despliega una versión que inserta un paso nuevo antes de otro ya ejecutado, las instancias en curso reanudarán con una historia que ya no encaja con el código, y el motor abortará o se comportará de forma imprevisible. Por eso todos estos sistemas ofrecen mecanismos de versionado explícito, y por eso el problema es exactamente el mismo que aparecía al versionar snapshots de una máquina propia: los procesos vivos no se enteran de tus despliegues.
+</Callout>
+
+## El grafo declarativo y el parecido literal
+
+En el extremo opuesto, un documento de estados de Step Functions es un statechart escrito en otro formato. Tiene estados con tipo, transiciones nombradas, política de reintentos por estado, capturas de error que redirigen a un destino y estados terminales.
+
+```ts
+export const definicion = {
+  StartAt: 'Cobrar',
+  States: {
+    Cobrar: {
+      Type: 'Task',
+      Resource: 'arn:aws:lambda:eu-west-1:000:function:cobrar',
+      Retry: [{ ErrorEquals: ['Transitorio'], IntervalSeconds: 2, BackoffRate: 2, MaxAttempts: 4 }],
+      Catch: [{ ErrorEquals: ['States.ALL'], Next: 'Compensar' }],
+      Next: 'EsperaDesistimiento',
+    },
+    EsperaDesistimiento: { Type: 'Wait', Seconds: 1209600, Next: 'PrepararEnvio' },
+    PrepararEnvio: { Type: 'Task', Resource: 'arn:aws:states:::lambda:invoke', End: true },
+    Compensar: { Type: 'Task', Resource: 'arn:aws:lambda:eu-west-1:000:function:abonar', End: true },
+  },
+} as const
+
+```
+
+Hay además una diferencia de fondo que la sintaxis oculta y conviene enunciar: el documento declarativo describe el proceso completo antes de ejecutarlo, mientras que el workflow imperativo lo descubre a medida que avanza. De ahí se derivan sus virtudes opuestas. El primero se puede dibujar, validar y comparar entre versiones sin ejecutar nada, porque la totalidad de sus caminos es dato; el segundo permite escribir bucles, recursión y ramificaciones arbitrarias con la naturalidad de un lenguaje de propósito general, a cambio de que nadie pueda saber qué hará sin ejecutarlo. La elección entre ambos, en el fondo, repite el debate que atraviesa toda esta guía entre describir el comportamiento y programarlo.
+
+Este formato tiene además una virtud que ningún equipo aprecia hasta que le toca vivirla: al ser dato, se puede comparar entre versiones con una herramienta y no con la memoria de quien revisa. El cambio de un proceso deja de ser un diff de código imperativo, donde una línea movida altera el orden real de los acontecimientos sin que nadie lo note, y pasa a ser un cambio en un grafo cuyas aristas se pueden contar antes y después. Es la misma propiedad que hace revisable un statechart, y la razón por la que este nivel insiste en que el modelo del dominio sea un valor.
+
+La correspondencia con lo aprendido es punto por punto: `Task` es un estado con actor invocado, `Next` es la transición de finalización, `Retry` es la política de reintentos con backoff que en el nivel anterior se modelaba con estados de espera, `Catch` es la transición de error, y `Wait` es la transición temporizada. Incluso existen los estados paralelos y el equivalente de las guardas mediante estados de elección. Lo que el formato no ofrece es composición jerárquica profunda ni tipado del contexto, y por eso su legibilidad se degrada antes cuando el proceso crece.
+
+<Cards>
+  <Card icon="🧩" title="Actividad y efecto">
+    Lo que el motor llama actividad o paso es lo que el statechart llama actor invocado: la única parte del sistema a la que se permite tocar el mundo exterior.
+  </Card>
+  <Card icon="📜" title="Historia y transiciones">
+    La historia de eventos del motor es el mismo artefacto que el registro de transiciones de tu máquina, y sirve para lo mismo: reconstruir y auditar.
+  </Card>
+  <Card icon="⏳" title="Temporizador durable">
+    Un plazo de catorce días no es un temporizador de tu proceso: es una fila con vencimiento en algún sitio duradero. El motor te la esconde, tu máquina te obliga a escribirla.
+  </Card>
+  <Card icon="🔁" title="Compensación">
+    Ningún motor te da transacciones distribuidas. Todos te dan la misma salida que el statechart: modelar el deshacer como camino explícito del grafo.
+  </Card>
+</Cards>
+
+## El criterio para delegar la durabilidad
+
+<Callout type="tip" title="El statechart como definición, el motor como sustrato">
+La combinación que mejor envejece consiste en escribir el modelo del dominio como máquina pura y usar el motor solo para hospedarla: cada paso del workflow se limita a leer el snapshot, enviar el evento y guardar el resultado, mientras el motor aporta los temporizadores durables, los reintentos y la visibilidad operativa. Así el conocimiento del negocio permanece en un valor que se prueba en milisegundos sin infraestructura, y la dependencia del proveedor queda confinada a la capa que de verdad se puede sustituir.
+</Callout>
+
+La pregunta correcta no es cuál de los tres motores es mejor, sino si el proyecto necesita alguno. Una máquina persistida sobre la base de datos que ya se administra es suficiente, y notablemente más simple de operar, cuando el proceso avanza por eventos externos con esperas medidas en días, cuando las transiciones son pocas y bien tipadas, y cuando el volumen no exige planificación distribuida. Un motor dedicado empieza a compensar cuando aparecen tres necesidades concretas: temporizadores durables a gran escala que no se quieren implementar con tablas y planificadores propios, cientos de miles de instancias vivas cuyo estado convendría no alojar en la base de datos transaccional, y la exigencia de visibilidad operativa —reintentar una actividad concreta, inspeccionar una instancia atascada, terminarla a mano— que un equipo no debería construir desde cero. Conviene además contabilizar el coste que casi nunca aparece en la comparativa inicial y que decide la experiencia real del equipo: el coste de operar. Un motor dedicado añade un componente que hay que desplegar, vigilar, actualizar y depurar, con su propio modelo de fallos y su propia curva de aprendizaje para quien esté de guardia a las tres de la mañana. Una máquina persistida sobre la base de datos existente no añade nada que el equipo no supervise ya, y esa continuidad vale más de lo que sugiere cualquier tabla de funcionalidades cuando la plantilla es pequeña. La regla práctica es adoptar el motor cuando el problema que resuelve ya duele de forma medible, no cuando se anticipa que dolerá.
+
+Existe además una vía intermedia que suele ser la respuesta correcta: conservar el statechart como definición del dominio y usar el motor únicamente como sustrato de ejecución, de modo que la lógica siga siendo un valor puro que se prueba sin infraestructura.
+
+<Callout type="dios" title="La durabilidad no se programa, se delega; lo que se programa es el modelo">
+Al comparar estos sistemas se hace visible una división del trabajo que conviene interiorizar porque sobrevive a cualquier tecnología concreta. Hay dos preocupaciones dentro de todo proceso de larga vida y su naturaleza es radicalmente distinta. La primera es qué debe ocurrir y en qué orden es legal que ocurra: eso es conocimiento del dominio, cambia al ritmo del negocio, lo discuten personas que no programan y su expresión natural es un grafo de estados. La segunda es cómo sobrevive esa ejecución a las caídas, los despliegues, los reinicios y el paso del tiempo: eso es conocimiento de infraestructura, no dice nada sobre el negocio, y su expresión natural es un motor con historia, reintentos y temporizadores durables. Los equipos que fracasan en este terreno casi siempre lo hacen por mezclar ambas capas, y en las dos direcciones posibles: unos escriben las reglas del negocio dentro de reintentos y cronómetros hasta que nadie puede responder qué transiciones son legales, y otros construyen su propia durabilidad artesanal para descubrir cinco años después que han fabricado un motor de workflows peor, sin herramientas y mantenido por dos personas. La lección que estos tres sistemas enseñan al unísono es que la durabilidad es una propiedad comprable y el modelo del dominio no lo es. Nadie te va a vender tu ciclo de vida de pedidos; cualquiera te vende un temporizador que sobrevive a un reinicio. Escribe con el máximo cuidado lo que solo tú puedes escribir, y delega sin romanticismo lo que la industria ya resolvió mejor de lo que tú vas a resolverlo.
+</Callout>
+
+<Reto title="Traduce tu proceso a los tres dialectos">
+1. Toma tu statechart de negocio y escribe la tabla de correspondencias con actividades, pasos y estados de tarea.
+2. Redacta el mismo proceso como workflow imperativo con pasos y espera durable, y señala qué líneas serían no deterministas.
+3. Redacta el mismo proceso como documento declarativo de estados con reintentos y capturas de error.
+4. Estima cuántos temporizadores durables simultáneos necesitaría tu sistema en un año y qué costaría implementarlos con tablas propias.
+5. Enumera qué operaciones manuales pediría tu equipo de soporte y comprueba cuáles vienen de serie en cada motor.
+6. Decide de forma razonada si tu caso justifica delegar la durabilidad y escribe las tres razones que sostienen la decisión.
+7. Enumera las operaciones no deterministas de tu lógica actual y muévelas dentro de pasos con resultado guardado.
+8. Marca en tu grafo qué transiciones serían actividades y cuáles pura decisión, y comprueba que ninguna decisión toca el mundo exterior.
+9. Diseña la ruta de salida: qué haría falta para abandonar el motor elegido dentro de tres años conservando el modelo intacto.
+</Reto>

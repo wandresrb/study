@@ -1,0 +1,166 @@
+---
+title: "Streaming: devolver tokens según llegan"
+description: "Un modelo genera palabra a palabra, pero por defecto tú esperas a la última para entregar la primera. Activar `stream` invierte esa espera: la inferencia devuelve un flujo de eventos que tu Worker puede reenviar tal cual al navegador, de modo que el usuario ve texto apareciendo en cientos de milisegundos en vez de mirar un indicador de carga durante ocho segundos. El formato de esos eventos, cómo se devuelven sin tocarlos, cómo intervenir el flujo con un `TransformStream` sin arruinar la ganancia, y qué se rompe cuando lo haces mal."
+subject: cloudflare
+level: 28
+order: 4
+icon: "28.4"
+duracion: "17 min"
+---
+
+<Lead>
+Un modelo de lenguaje no fabrica su respuesta de golpe: la genera token a token, y ya tiene la primera palabra lista cuando aún le faltan seis segundos para la última. Sin streaming, esa primera palabra se queda esperando en el servidor a que termine todo, y el usuario mira una pantalla quieta durante el proceso entero. Activar `stream` es simplemente dejar de retener lo que ya está hecho. La ganancia no es marginal ni cosmética: es la diferencia entre una interfaz que parece rota y una que parece pensar.
+</Lead>
+
+<Objetivos>
+
+- Activar el streaming en `env.AI.run` y reconocer el formato de eventos que devuelve.
+- Reenviar el flujo al cliente sin bufferizarlo, encadenándolo con la respuesta del Worker.
+- Intervenir el flujo con un `TransformStream` cuando hace falta transformar o registrar.
+- Anticipar qué se rompe al transmitir: errores a medias, cancelaciones y trabajo posterior.
+
+</Objetivos>
+
+## La espera que el streaming elimina
+
+Conviene tener la aritmética delante, porque justifica todo lo demás. Un modelo mediano genera del orden de decenas de tokens por segundo. Una respuesta de trescientos tokens tarda, por tanto, varios segundos en estar completa. Sin streaming, el tiempo hasta el primer byte útil es ese total entero. Con streaming, el primer token sale en cuanto existe —típicamente unos pocos cientos de milisegundos— y el resto va llegando mientras el usuario ya está leyendo.
+
+<Mermaid code={`flowchart LR
+  subgraph sin [Sin streaming]
+    G1[Modelo genera 300 tokens] --> B1[Todo se acumula en el Worker]
+    B1 --> R1[Respuesta completa a los 8 segundos]
+  end
+  subgraph con [Con streaming]
+    G2[Primer token listo] --> R2[Sale ya hacia el cliente]
+    R2 --> L[Usuario empieza a leer]
+    G2 --> G3[El resto sigue generandose]
+    G3 --> L
+  end
+  style R2 fill:#a6e3a1,color:#11111b
+  style R1 fill:#f38ba8,color:#11111b`} />
+
+Hay una segunda ganancia menos visible y muy importante en el edge. Sin streaming, la respuesta entera se acumula en la memoria del isolate antes de salir; con streaming, los bytes lo atraviesan sin residir en él. Tu Worker deja de ser un depósito y pasa a ser una válvula, lo cual importa cuando el presupuesto de memoria es limitado y las invocaciones concurrentes son muchas. Y mientras el flujo avanza esperando al modelo, tu Worker no está quemando CPU: está bloqueado en entrada y salida, que es tiempo que no se factura como cómputo.
+
+## Activar stream y reenviarlo tal cual
+
+Basta con añadir `stream` a las entradas. Cuando lo haces, `env.AI.run` deja de devolver un objeto y devuelve un `ReadableStream` cuyo contenido ya viene con formato de Server-Sent Events: cada fragmento es una línea que empieza por `data:` seguida de un objeto JSON con la propiedad `response`, y el flujo se cierra con un evento final marcado como `[DONE]`.
+
+Y como ese flujo ya es exactamente lo que el navegador espera recibir, el camino más corto es el mejor: pásalo directamente como cuerpo de tu `Response` con las cabeceras adecuadas.
+
+```ts
+export default {
+  async fetch(request, env, ctx): Promise<Response> {
+    const flujo = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+      messages: [{ role: "user", content: "Explica el modelo de isolates" }],
+      max_tokens: 512,
+      stream: true,
+    });
+
+    return new Response(flujo, {
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        "connection": "keep-alive",
+      },
+    });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+Fíjate en que no hay `TransformStream`, ni bucle de lectura, ni `TextEncoder`. El `await` de la primera línea no espera a la generación completa: espera únicamente a que el flujo esté disponible, y a partir de ahí los bytes viajan del modelo al navegador atravesando tu Worker sin detenerse. Es la versión más rápida y la que menos código tiene, y por eso es la que deberías escribir salvo que necesites algo más.
+
+Del lado del cliente, la contraparte es igual de directa: se consume con `EventSource` cuando basta una petición `GET`, o leyendo el `body` de un `fetch` con su lector cuando necesitas enviar un cuerpo con `POST`.
+
+```ts
+const respuesta = await fetch("/api/chat", { method: "POST", body });
+const lector = respuesta.body.pipeThrough(new TextDecoderStream()).getReader();
+
+while (true) {
+  const { value, done } = await lector.read();
+  if (done) break;
+  for (const linea of value.split("\n")) {
+    if (!linea.startsWith("data: ")) continue;
+    const carga = linea.slice(6);
+    if (carga === "[DONE]") break;
+    salida.textContent += JSON.parse(carga).response;
+  }
+}
+```
+
+<Callout type="tip" title="Si vas a acumular la respuesta entera, no estabas necesitando streaming">
+El antipatrón más habitual es activar `stream`, recorrer el flujo con un bucle guardando cada fragmento en un array y devolver el texto unido al final. Eso reintroduce exactamente la espera que el streaming venía a eliminar, y además con más código. Si el destino de la respuesta es un proceso y no una persona —una cola, un resumen guardado en D1, una clasificación—, no actives `stream`: pide la respuesta completa, que es más simple. El streaming existe porque hay alguien mirando.
+</Callout>
+
+## Intervenir el flujo sin arruinarlo
+
+A veces reenviar tal cual no basta: quieres reformatear los eventos a tu propio protocolo, insertar metadatos al principio, o registrar la respuesta completa una vez terminada. La herramienta correcta es un `TransformStream` encadenado con `pipeThrough`, que actúa sobre cada fragmento al vuelo sin acumular nada.
+
+```ts
+const flujo = await env.AI.run(modelo, { messages, stream: true });
+
+let completo = "";
+const espia = new TransformStream({
+  transform(trozo, controller) {
+    completo += new TextDecoder().decode(trozo, { stream: true });
+    controller.enqueue(trozo);          // se reenvia intacto, sin retenerlo
+  },
+  flush() {
+    // el flujo ya se cerro para el cliente; el registro va en segundo plano
+    ctx.waitUntil(env.HISTORIAL.put(clave, completo));
+  },
+});
+
+return new Response(flujo.pipeThrough(espia), {
+  headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+});
+```
+
+La clave está en el `enqueue` inmediato dentro de `transform`: el fragmento sale hacia el cliente en el mismo instante en que llega, y la acumulación ocurre en paralelo sin retenerlo. El registro final va dentro de `ctx.waitUntil`, que mantiene viva la invocación para terminar un trabajo cuya latencia el usuario ya no debería pagar.
+
+Transmitir también cambia el manejo del error, y esta es la parte que más sorprende en producción. Una vez que has devuelto la `Response` con estado 200 y el primer byte ha salido, ya no puedes cambiar el código de estado: si el modelo falla a mitad de generación, no hay forma de convertir eso en un `500` limpio. Tienes dos salidas honestas: validar todo lo validable antes de iniciar el flujo, y emitir un evento de error dentro del propio protocolo para que el cliente lo interprete y lo muestre. La otra cara del mismo asunto es la cancelación: si el usuario cierra la pestaña, el flujo se cancela y conviene propagarlo en lugar de seguir generando tokens que ya no lee nadie y que sí pagas.
+
+## Componer tu propio flujo alrededor del modelo
+
+En una aplicación real, la respuesta que quieres enviar no es solo la del modelo. Suele haber algo que decir antes de que la generación empiece —las fuentes que has recuperado, el identificador de la conversación, un aviso de que la búsqueda no encontró nada— y algo que decir al terminar. La forma de hacerlo sin perder la ganancia del streaming es abrir tu propio `TransformStream`, devolver su `readable` de inmediato y escribir en su `writable` desde una función asíncrona que no esperas.
+
+```ts
+const { readable, writable } = new TransformStream();
+const writer = writable.getWriter();
+const enc = new TextEncoder();
+const evento = (tipo: string, datos: unknown) =>
+  enc.encode("event: " + tipo + "\ndata: " + JSON.stringify(datos) + "\n\n");
+
+(async () => {
+  try {
+    const fuentes = await buscarContexto(env, pregunta);   // recuperacion previa
+    await writer.write(evento("fuentes", fuentes));        // sale antes del modelo
+
+    const flujo = await env.AI.run(modelo, { messages, stream: true });
+    await flujo.pipeTo(writable, { preventClose: true });   // tokens del modelo
+
+    await writer.write(evento("fin", { ok: true }));
+  } catch (error) {
+    await writer.write(evento("error", { mensaje: String(error) }));
+  } finally {
+    await writer.close();
+  }
+})();
+
+return new Response(readable, {
+  headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+});
+```
+
+El patrón es el mismo que ya conoces del nivel de Request y Response, aplicado ahora a un productor que resulta ser un modelo. Lo importante es el orden temporal: las fuentes salen mientras el modelo aún no ha empezado, los tokens salen según se generan, y el evento final llega cuando ya no queda nada. El usuario ve la interfaz poblarse por capas en lugar de esperar a que todo esté listo, y el `preventClose` evita que el flujo del modelo cierre tu canal antes de que hayas dicho la última palabra.
+
+<Callout type="dios" title="El streaming no acelera nada, y ese es exactamente su poder">
+Hay una paradoja en el centro de esta técnica que merece la pena mirar de frente: activar `stream` no hace que el modelo genere ni un token más rápido. El trabajo total es idéntico, la última palabra llega al mismo instante, la factura es la misma. Lo único que cambia es cuándo empieza a haber algo. Y sin embargo la diferencia percibida es abismal, porque la espera no se experimenta como una magnitud sino como una categoría: ocho segundos con la pantalla quieta y ocho segundos con texto apareciendo no son el mismo tiempo con distinto adorno, son dos hechos psicológicos distintos, uno de los cuales se lee como un fallo y el otro como un proceso en marcha. Ahí hay una lección de ingeniería que trasciende con mucho a la IA. La latencia que importa no es la que mide tu panel de métricas, es la que el usuario siente, y esas dos magnitudes se pueden desacoplar deliberadamente. Casi todo lo que llamamos rendimiento percibido —el esqueleto de una interfaz antes de tener los datos, la actualización optimista que confía en que la escritura irá bien, el renderizado por partes de una página, el primer byte que sale antes de que el último exista— es la misma jugada repetida: reordenar el momento en que aparece la evidencia de progreso, sin tocar el trabajo. Y hay algo casi moral en esa reordenación, porque en el fondo es un acto de respeto. Retener lo que ya está listo hasta que todo esté listo es una comodidad del servidor a costa de la persona que espera; entregarlo en cuanto existe es asumir la incomodidad de un protocolo más complicado —errores que ya no caben en un código de estado, cancelaciones que hay que propagar, trabajo posterior que hay que diferir— para que quien mira la pantalla no tenga que preguntarse si algo se ha roto. Cuando interiorizas esa asimetría, dejas de ver el streaming como una opción avanzada que se activa al final si sobra tiempo, y empieza a parecer lo que es: el comportamiento por defecto de cualquier respuesta que tarde lo suficiente como para que alguien se pregunte si va a llegar.
+</Callout>
+
+<Reto title="Haz que la respuesta empiece antes de existir">
+1. Llama a un modelo de texto sin `stream` y mide el tiempo hasta el primer byte con `curl`; repítelo con `stream` activado y compara.
+2. Devuelve el flujo tal cual como cuerpo de la `Response` con `content-type` de `text/event-stream` y compruébalo desde `curl` sin buffer.
+3. Consume ese endpoint desde el navegador leyendo el `body` del `fetch` y pinta el texto según llega.
+4. Encadena un `TransformStream` que reenvíe cada fragmento intacto, acumule la respuesta completa y la guarde en KV con `ctx.waitUntil`.
+5. Provoca un fallo a mitad del flujo y diseña el evento de error dentro del protocolo, explicando por qué ya no puedes devolver un `500`.
+</Reto>

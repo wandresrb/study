@@ -1,0 +1,151 @@
+---
+title: "WebSocket Hibernation: dormir sin colgar a nadie"
+description: "Una sala llena de gente callada cuesta lo mismo que una sala llena de gente hablando, porque el objeto que sostiene los sockets con accept permanece en memoria y se factura por duracion. La hibernacion rompe ese lazo: la plataforma se queda con las conexiones mientras el objeto se descarga, y lo materializa de nuevo solo cuando llega un mensaje. Vemos acceptWebSocket frente a accept, los manejadores webSocketMessage, webSocketClose y webSocketError, como se retoma el estado con getWebSockets, etiquetas y serializeAttachment, y como setWebSocketAutoResponse contesta los latidos sin llegar a despertar al objeto."
+subject: cloudflare
+level: 23
+order: 3
+icon: "23.3"
+duracion: "22 min"
+---
+
+<Lead>
+Piensa en una sala de chat de un equipo a las tres de la madrugada: doscientas conexiones abiertas y ni un solo mensaje en seis horas. Con el modelo directo de la lección anterior, ese silencio cuesta dinero, porque el objeto tiene que seguir en memoria sosteniendo los sockets y se factura por el tiempo que está vivo. La hibernación deshace ese lazo con una idea preciosa: quien de verdad tiene que sostener las conexiones abiertas es la plataforma, no tu código. El objeto puede desaparecer de la memoria mientras los doscientos siguen conectados, y volver a existir en el milisegundo en que alguien escriba. Estar conectado y estar despierto dejan de ser lo mismo.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué `accept` mantiene el objeto en memoria y qué se paga exactamente por ello.
+- Sustituir `accept` por `acceptWebSocket` y mover la lógica a `webSocketMessage`, `webSocketClose` y `webSocketError`.
+- Reconstruir el estado tras despertar con `getWebSockets`, etiquetas y `serializeAttachment`.
+- Absorber latidos sin despertar al objeto usando `setWebSocketAutoResponse`.
+
+</Objetivos>
+
+## El precio de un objeto que no duerme
+
+Cuando aceptas un socket con `accept`, tú te quedas con el extremo servidor: vive en un campo de tu instancia y tus escuchadores dependen de que esa instancia siga existiendo. El runtime no tiene más remedio que mantener el objeto cargado mientras el canal esté abierto, porque descargarlo significaría tirar tus escuchadores y, con ellos, la conexión. La consecuencia es directa: la facturación por duración corre mientras haya sockets, hablen o no.
+
+El desperdicio no es marginal, es la norma. Casi todas las aplicaciones de tiempo real pasan la mayor parte del día en silencio: un documento abierto en una pestaña olvidada, una partida en pausa, un panel de métricas en una pantalla de la oficina, una sesión que sigue conectada porque el usuario no ha cerrado nada. La relación entre segundos de conexión y segundos de trabajo real puede ser de miles a uno, y con el modelo directo pagas por los primeros.
+
+La hibernación cambia quién es el dueño del socket. Con `acceptWebSocket` le entregas el extremo servidor al estado del objeto, es decir, a la plataforma. Ella sostiene la conexión TCP, mantiene vivo el canal frente al cliente y descarga tu objeto de la memoria cuando no hay actividad. El navegador no se entera de nada: para él la conexión nunca se interrumpió. Cuando por fin llega un mensaje, la plataforma materializa el objeto —vuelve a ejecutar el constructor— e invoca el manejador correspondiente.
+
+## La API: aceptar en el estado, no en el socket
+
+El cambio de código es pequeño y muy revelador. Los escuchadores anónimos desaparecen, porque una función registrada en tiempo de ejecución no puede sobrevivir a que el objeto se descargue de memoria. En su lugar, los manejadores se vuelven métodos de la clase: la plataforma sabe encontrarlos por su nombre después de reconstruir la instancia.
+
+```ts
+export class Sala extends DurableObject {
+  async fetch(request: Request): Promise<Response> {
+    const [cliente, servidor] = Object.values(new WebSocketPair());
+    const usuario = new URL(request.url).searchParams.get("usuario") ?? "anonimo";
+
+    // la plataforma se queda el socket; el objeto podra descargarse
+    this.ctx.acceptWebSocket(servidor, [`usuario:${usuario}`]);
+    servidor.serializeAttachment({ usuario, desde: Date.now() });
+
+    return new Response(null, { status: 101, webSocket: cliente });
+  }
+
+  async webSocketMessage(ws: WebSocket, mensaje: string | ArrayBuffer): Promise<void> {
+    const datos = ws.deserializeAttachment() as { usuario: string };
+    this.difundir({ tipo: "chat", de: datos.usuario, texto: String(mensaje) });
+  }
+
+  async webSocketClose(ws: WebSocket, codigo: number, razon: string): Promise<void> {
+    const datos = ws.deserializeAttachment() as { usuario: string };
+    this.difundir({ tipo: "sale", usuario: datos.usuario });
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    console.error("socket roto", error);
+  }
+}
+```
+
+Fíjate en lo que ya no hay: ningún `Map` de sesiones en un campo de la instancia. Sería una trampa, porque tras una hibernación el objeto se reconstruye desde cero y ese campo volvería vacío mientras las conexiones siguen abiertas. La regla es tajante: con hibernación, la memoria del objeto no es un lugar donde guardar nada que deba sobrevivir al silencio.
+
+## Retomar el estado al despertar
+
+Si el `Map` desaparece, ¿de dónde sale la lista de conectados? De la propia plataforma. El método `getWebSockets` del estado devuelve todos los sockets aceptados que siguen vivos, reconstruidos y listos para usar. Esa es tu sala, y siempre está actualizada, aunque tu objeto acabe de nacer hace un microsegundo.
+
+```ts
+private difundir(mensaje: unknown, excepto?: WebSocket): void {
+  const carga = JSON.stringify(mensaje);
+  for (const ws of this.ctx.getWebSockets()) {   // la sala vive en la plataforma
+    if (ws === excepto) continue;
+    try {
+      ws.send(carga);
+    } catch {
+      // el canal ya estaba roto; webSocketClose se encargara
+    }
+  }
+}
+```
+
+Para los datos de cada conexión hay dos herramientas complementarias. Las etiquetas se dan al aceptar —hasta diez por socket, cadenas cortas— y sirven para filtrar: `getWebSockets` admite una etiqueta y te devuelve solo los sockets que la llevan, con lo que puedes difundir a un subgrupo sin recorrer la sala entera. El attachment, en cambio, es una carga pequeña de datos estructurados —del orden de un par de kilobytes— que viaja pegada al socket y sobrevive a la hibernación: quién es el usuario, qué permisos tiene, desde cuándo está. Etiquetas para seleccionar, attachment para recordar.
+
+Cuando el estado a recordar es mayor que eso —el historial de mensajes, el documento, la posición de las piezas—, no forces el attachment: usa el almacén durable del objeto, que ya conoces. La combinación resultante es limpia y conviene grabarla: la plataforma guarda las conexiones, el attachment guarda lo mínimo de cada conexión, y el almacén guarda el estado de la sala. La memoria de la instancia no guarda nada.
+
+| Dónde vive | Qué guarda | Sobrevive a la hibernación |
+| --- | --- | --- |
+| Campo de la instancia | Cachés recalculables | No |
+| Etiqueta del socket | Claves de filtrado como `canal:general \| rol:admin` | Sí |
+| Attachment del socket | Identidad y permisos de esa conexión | Sí |
+| Almacén durable | Historial, documento, marcador | Sí |
+
+Hay además un detalle del ciclo de vida que sorprende la primera vez: el constructor vuelve a ejecutarse cada vez que el objeto se materializa. Eso es una ventaja, porque es el sitio natural para declarar lo que la plataforma necesita saber siempre —el esquema de la tabla, la pareja de latido—, pero también una trampa si haces trabajo caro ahí dentro: cada mensaje tras un silencio pagará ese coste. Mantén el constructor barato y síncrono, y deja las lecturas del almacén para el manejador que de verdad las necesite.
+
+<Mermaid code={`flowchart LR
+  A[cliente conectado] --> P[plataforma sostiene el socket]
+  P -.silencio.-> H[el objeto se descarga y no factura duracion]
+  A -->|llega un mensaje| W[la plataforma reconstruye el objeto]
+  W --> M[webSocketMessage y difusion]
+  M -.vuelve el silencio.-> H
+  style H fill:#a6e3a1,color:#11111b`} />
+
+## Latidos que no despiertan a nadie
+
+Queda un enemigo sutil del ahorro. Casi todo cliente de tiempo real manda un latido periódico para detectar cortes y para que ningún intermediario cierre la conexión por inactividad. Si cada latido despierta al objeto, has vuelto al principio: doscientos clientes con un latido cada treinta segundos son un objeto que jamás llega a dormirse del todo.
+
+La respuesta es declarar la pareja de latido a la plataforma, que responderá por ti sin materializar el objeto.
+
+```ts
+constructor(ctx: DurableObjectState, env: Env) {
+  super(ctx, env);
+  // la plataforma contesta pong a cada ping sin despertar al objeto
+  ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+}
+```
+
+Con esa única línea, los mensajes que coincidan exactamente con la petición declarada se contestan en el borde y no llegan a tu código. El objeto solo despierta cuando alguien dice algo que de verdad importa. Si necesitas saber cuándo fue el último latido de una conexión —para depurar o para expulsar zombis—, el socket expone la marca de tiempo de su última respuesta automática, sin coste alguno.
+
+<Cards>
+  <Card icon="🛌" title="Conectado no es despierto">
+    La plataforma sostiene el socket mientras el objeto se descarga. El cliente nunca percibe una interrupción.
+  </Card>
+  <Card icon="🏷️" title="Etiquetas para filtrar">
+    Hasta diez por socket. `getWebSockets` con etiqueta te da el subgrupo exacto sin recorrer la sala entera.
+  </Card>
+  <Card icon="📎" title="Attachment para recordar">
+    Un par de kilobytes pegados a la conexión que sobreviven a la hibernación. Para más estado, el almacén durable.
+  </Card>
+  <Card icon="💓" title="Latidos automáticos">
+    `setWebSocketAutoResponse` contesta los pings en el borde. El objeto duerme incluso mientras los clientes lo comprueban.
+  </Card>
+</Cards>
+
+<Callout type="tip" title="Migrar de accept a acceptWebSocket es casi mecánico">
+Cambia `accept` por `ctx.acceptWebSocket`, convierte cada escuchador anónimo en un método de la clase con el nombre que la plataforma espera, sustituye tu colección de sesiones por `getWebSockets` y mueve lo que guardabas por conexión al attachment. Si algo de tu lógica dependía de un campo en memoria que llevaba minutos vivo, esa es justo la pieza que hay que bajar al almacén durable.
+</Callout>
+
+<Callout type="dios" title="Cuando la conexión deja de ser un proceso y pasa a ser un dato">
+Durante treinta años, mantener una conexión abierta significó mantener un proceso vivo. Un socket era un descriptor de archivo dentro de un programa concreto, en una máquina concreta, y por eso la arquitectura del tiempo real fue siempre la arquitectura de los servidores que no se apagan: dimensionar por conexiones concurrentes, pagar por memoria ociosa, sufrir cada despliegue como una desconexión masiva. La hibernación disuelve esa identidad entre conexión y proceso, y ese es el salto conceptual que hay que llevarse de aquí. El socket deja de ser una propiedad de tu código y pasa a ser una entrada en una tabla de la plataforma; tu objeto deja de ser el guardián permanente del canal y pasa a ser un manejador de eventos que se materializa a demanda. La conexión, que era un proceso, se convierte en un dato. Las consecuencias son extensas. Deja de tener sentido pensar el coste en conexiones concurrentes y empieza a tener sentido pensarlo en mensajes procesados, que es donde de verdad está el trabajo. Deja de existir la tensión entre mantener a alguien conectado y ahorrar recursos, y con ella desaparece el patrón triste de desconectar por inactividad a usuarios que no molestaban a nadie. Y aparece una disciplina nueva, que es la única factura real de este regalo: todo lo que importa debe estar por escrito, en el attachment o en el almacén, porque la memoria de tu instancia es ahora una caché que la plataforma puede vaciar entre dos mensajes sin avisar. Esa disciplina —no confiar en la memoria del proceso, confiar en el estado durable— es precisamente la que ya exigía el resto de la plataforma, y aquí cierra el círculo. Un millón de conexiones dormidas dejan de ser un problema de capacidad y se vuelven lo que siempre debieron ser: un millón de filas esperando a que alguien tenga algo que decir.
+</Callout>
+
+<Reto title="Duerme la sala sin colgar a nadie">
+1. Migra tu objeto `Sala` de `accept` a `ctx.acceptWebSocket` y convierte los tres escuchadores en los métodos `webSocketMessage`, `webSocketClose` y `webSocketError`.
+2. Elimina el `Map` de sesiones y reconstruye la difusión sobre `getWebSockets`. Explica por qué ese campo en memoria era una bomba de relojería.
+3. Guarda el usuario con `serializeAttachment` al aceptar y recupéralo con `deserializeAttachment` en cada mensaje. Comprueba que sobrevive a un periodo largo de silencio.
+4. Etiqueta cada socket con su canal y escribe una difusión que use `getWebSockets` con etiqueta para hablar solo a un subgrupo.
+5. Declara la pareja de latido con `setWebSocketAutoResponse`, manda pings desde el cliente y razona qué habría pasado con la factura si cada ping despertara al objeto.
+</Reto>

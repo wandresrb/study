@@ -1,0 +1,154 @@
+---
+title: "Versionado y contratos"
+description: "Dos Workers cableados por un service binding forman un contrato: la interfaz RPC es la promesa que uno ofrece y el otro consume. Como se despliegan por separado, ese contrato puede divergir. Que cambios son compatibles y cuales rompen, en que orden desplegar productor y consumidor, como orquestar un despliegue gradual con wrangler versions sin partir a quienes llaman, y por que el acoplamiento fuerte entre Workers se mitiga con contratos versionados y tolerancia a los campos nuevos."
+subject: cloudflare
+level: 13
+order: 5
+icon: "13.5"
+duracion: "17 min"
+---
+
+<Lead>
+Cuando dos Workers se comunican por `RPC`, el que expone `WorkerEntrypoint` no publica solo unos métodos: publica una promesa. La firma de cada método, los tipos de sus argumentos y la forma serializada de lo que devuelve constituyen un contrato, y el Worker que llama construye su lógica sobre él. Mientras vivieran en el mismo despliegue, esa promesa se cumpliría siempre. Pero productor y consumidor se despliegan por separado, evolucionan por su cuenta y pueden divergir. Esta lección trata la disciplina que impide que esa divergencia rompa el sistema: qué cambios son seguros, en qué orden liberarlos y cómo mantener el contrato mientras el edificio se reforma en caliente.
+</Lead>
+
+<Objetivos>
+
+- Leer la interfaz `RPC` de un `WorkerEntrypoint` como el contrato que une productor y consumidor.
+- Distinguir un cambio compatible —aditivo— de uno que rompe la firma o la forma serializada.
+- Desplegar en el orden correcto: ofrecer antes de usar, dejar de usar antes de retirar.
+- Usar `wrangler versions` para un despliegue gradual y mitigar el acoplamiento con contratos versionados y tolerancia a los campos nuevos.
+
+</Objetivos>
+
+## La interfaz RPC es el contrato
+
+Cada método público de tu `WorkerEntrypoint` es una cláusula del contrato. `env.CATALOGO.ficha` promete recibir un `string` y devolver una forma concreta; el consumidor firma esa promesa al escribir la llamada. A diferencia de un `endpoint` HTTP con `JSON`, donde el contrato es implícito y sin tipo, aquí `wrangler types` deriva las definiciones a partir de la clase del productor y el compilador verifica que ambos lados encajan. Parece que el problema del versionado quedó resuelto por el sistema de tipos.
+
+No es así, y la sutileza es el corazón de la lección. Esa verificación ocurre sobre un único árbol de fuentes en el momento de compilar. En producción, el productor y el consumidor son dos artefactos que se despliegan por separado, en momentos distintos. El contrato que de verdad rige no es el que escribiste, sino la intersección de lo que hay desplegado a cada lado en cada instante. El compilador prueba que tu lado es coherente consigo mismo; nada más.
+
+<Callout type="note" title="Los tipos verifican el codigo, no el despliegue">
+Que `wrangler types` acepte la llamada solo garantiza que tu fuente concuerda con la fuente del productor tal como estaba al generar los tipos. Si el productor desplegado en producción es más viejo o más nuevo que esa foto, el compilador sigue en verde y la llamada falla en caliente. La red de seguridad del tipado termina exactamente en la frontera del despliegue.
+</Callout>
+
+## Cambios compatibles y cambios que rompen
+
+Un cambio es compatible cuando ningún consumidor existente lo nota. Son aditivos: un método nuevo, un argumento opcional nuevo, un campo nuevo en el objeto de retorno. El consumidor viejo pedía un subconjunto de la forma y ese subconjunto sigue intacto, así que sigue funcionando sin recompilar.
+
+```ts
+// PRODUCTOR v1: el contrato original
+export class Catalogo extends WorkerEntrypoint<Env> {
+  async ficha(id: string): Promise<{ nombre: string; precio: number }> {
+    return await cargar(this.env, id);
+  }
+}
+```
+
+```ts
+// PRODUCTOR v2: evolucion ADITIVA y compatible
+export class Catalogo extends WorkerEntrypoint<Env> {
+  // 'moneda' es un parametro nuevo, pero OPCIONAL
+  // 'stock' es un campo nuevo del retorno: el consumidor viejo lo ignora
+  async ficha(id: string, moneda?: string): Promise<{
+    nombre: string;
+    precio: number;
+    stock: number;
+  }> {
+    return await cargar(this.env, id, moneda);
+  }
+}
+```
+
+Un cambio rompe cuando altera lo que el consumidor ya daba por firmado: eliminar o renombrar un método, volver obligatorio un argumento que era opcional, cambiar el tipo de un parámetro o de un campo, retirar un campo del retorno. Cada uno deja a los consumidores existentes llamando a un fantasma.
+
+```ts
+// PRODUCTOR: cambios que ROMPEN el contrato
+//  - 'moneda' pasa de opcional a obligatoria
+//  - 'precio' se renombra a 'precioCentavos'
+//  - el tipo de 'id' cambia de string a number
+// Ninguno lo ve el compilador del consumidor hasta que ya es tarde.
+```
+
+La defensa del consumidor es el principio de robustez: pide solo lo que necesitas y sé indiferente a lo demás. Si desestructuras únicamente los campos que usas, el productor puede engordar la forma sin obligarte a recompilar en bloque.
+
+```ts
+// CONSUMIDOR tolerante: pide solo lo que necesita
+const { nombre, precio } = await env.CATALOGO.ficha("sku-42");
+// Si el productor agrega 'stock' u otros campos, este consumidor ni se entera.
+```
+
+<Callout type="warn" title="Los cambios que rompen se disfrazan de inocentes">
+Volver obligatorio un argumento opcional, o estrechar un tipo de `string` a una unión más pequeña, se siente como un ajuste menor y el `diff` apenas llama la atención. Pero desde la óptica del contrato es una ruptura tan grave como borrar el método: un consumidor que no pasaba ese argumento, o que pasaba un valor ahora inválido, deja de encajar. Reserva tu sospecha para los cambios que parecen triviales.
+</Callout>
+
+## El orden del despliegue
+
+De la asimetría entre añadir y quitar sale un único invariante que gobierna el orden: el productor debe ofrecer una capacidad antes de que el consumidor la use, y el consumidor debe dejar de usarla antes de que el productor la retire. Para un cambio aditivo, eso significa desplegar primero el productor y luego el consumidor; si inviertes el orden, el consumidor nuevo llama a algo que el productor viejo aún no ofrece.
+
+Un cambio que rompe nunca se libera de un tirón. Se descompone en una secuencia de pasos compatibles —el patrón de expandir y contraer—: primero el productor soporta la forma vieja y la nueva a la vez, después el consumidor migra a la nueva, y solo entonces el productor retira la vieja. Tres despliegues convierten una ruptura en tres transiciones, cada una de ellas segura por sí misma.
+
+Detrás de este ceremonial hay un hecho incómodo: no existe un despliegue atómico que toque los dos Workers en el mismo instante. Siempre hay una ventana, por breve que sea, en la que conviven una versión de cada lado, y el orden es la única herramienta que garantiza que todo par que llegue a coexistir durante esa ventana sea compatible.
+
+```bash
+# Cambio aditivo: primero el que ofrece, despues el que usa
+wrangler deploy   # productor: ya expone lo nuevo
+
+wrangler deploy   # consumidor: recien ahora lo invoca
+```
+
+<Mermaid code={`flowchart TD
+  subgraph aditivo
+    A1[productor ofrece lo nuevo] --> A2[consumidor lo empieza a usar]
+  end
+  subgraph rompe
+    B1[expandir productor con ambas formas] --> B2[migrar consumidor a la nueva forma]
+    B2 --> B3[contraer productor quita la vieja]
+  end
+  style A1 fill:#a6e3a1,color:#11111b
+  style B1 fill:#89b4fa,color:#11111b
+  style B3 fill:#f38ba8,color:#11111b`} />
+
+## Despliegue gradual con wrangler versions
+
+`wrangler versions` te deja separar subir una versión de dirigirle tráfico. Subes el nuevo código sin que reciba ni una llamada, y luego repartes el tráfico entre versiones por porcentaje, observando las métricas antes de comprometerte.
+
+```bash
+# 1. Sube la version nueva SIN darle trafico (queda al 0%)
+wrangler versions upload
+
+# 2. Reparte el trafico entre dos versiones por su id
+wrangler versions deploy <id-estable>@90% <id-nueva>@10%
+
+# 3. Si las metricas van bien, promueve al 100%
+wrangler versions deploy <id-nueva>@100%
+```
+
+Aquí el service binding añade un matiz decisivo. Durante el reparto, las llamadas del consumidor caen sobre ambas versiones del productor a la vez: una fracción golpea la vieja y otra la nueva. Por tanto, las dos deben honrar simultáneamente el contrato que el consumidor espera. Esto es justo lo que hace seguro un cambio aditivo —ambas versiones son compatibles— y lo que vuelve imposible canariar directamente uno que rompe: la fracción que pegue en la versión equivocada fallará sin remedio.
+
+<Callout type="tip" title="Primero seguro, despues gradual">
+El despliegue gradual no convierte un cambio que rompe en uno seguro; solo reparte el fallo. Haz primero la ruptura inofensiva con expandir y contraer, y reserva el reparto por porcentaje para vigilar rendimiento y errores de un cambio que ya era compatible de todos modos.
+</Callout>
+
+<Cards>
+  <Card icon="🔗" title="Contrato versionado">
+    Trata la interfaz como algo publicado. Agrega formas nuevas junto a las viejas y deprécialas con un ciclo de vida, en vez de mutar una firma en su sitio.
+  </Card>
+  <Card icon="🧩" title="Tolerancia a lo nuevo">
+    Principio de robustez: el consumidor lee solo los campos que usa e ignora los demás. Así el productor crece sin arrastrar a nadie a recompilar.
+  </Card>
+  <Card icon="🚦" title="Expandir y contraer">
+    Nunca rompas en un despliegue. Expande, migra y contrae. Ofrece antes de exigir; retira solo cuando ya nadie llame.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="La compatibilidad no es una propiedad del codigo, sino del tiempo">
+Un `service binding` con `RPC` te vende una ilusión deliciosa: que dos Workers son un solo programa, porque el compilador verifica que `env.CATALOGO.ficha` recibe un `string` y devuelve la forma exacta que esperas. Pero esa verificación es una fotografía tomada al compilar, sobre un árbol de fuentes único, y la producción es otra cosa: el productor y el consumidor son dos artefactos que se despliegan en líneas de tiempo distintas, por manos distintas, y el contrato que de verdad rige no es el que escribiste sino la intersección de lo que hay desplegado a cada lado en cada instante. Ningún compilador es dueño de esa intersección; vive en el tiempo, no en el código. Por eso la compatibilidad en sistemas acoplados no es una propiedad estática —esta firma encaja con aquella— sino temporal: es el conjunto de versiones que pueden coexistir durante la ventana de un despliegue gradual, cuando la mitad de las llamadas pega en la versión vieja y la otra mitad en la nueva. El ingeniero ingenuo ve los tipos en verde y despliega sin pensar en el orden; el maduro sabe que los tipos solo prueban que su lado es coherente consigo mismo, y que la verdadera disciplina es de proceso: publicar la interfaz como un contrato con ciclo de vida, agregar antes de exigir, retirar solo después de que nadie llame, ser liberal en lo que aceptas y conservador en lo que rompes. El acoplamiento fuerte que los bindings vuelven tan cómodo no se paga al cablearlo, se paga el día en que uno de los dos evoluciona; y la única forma de no pagarlo de golpe es tratar cada firma como una promesa versionada que se expande y se contrae por pasos, nunca de un tirón. La ergonomía de `RPC` te deja olvidar la frontera entre los dos Workers; el versionado es el arte de recordarla precisamente cuando más tienta olvidarla.
+</Callout>
+
+<Reto title="Evoluciona un contrato sin romper a quien llama">
+1. Parte de un productor `Catalogo` con `ficha(id)` y un consumidor que llama `await env.CATALOGO.ficha(id)`; genera los tipos con `wrangler types` y confirma que ambos lados encajan.
+2. Haz un cambio aditivo —agrega un campo `stock` al retorno y un argumento opcional `moneda`— y despliega en el orden correcto; razona por qué el consumidor viejo sigue vivo sin recompilar.
+3. Planifica ahora una ruptura: renombrar `precio` a `precioCentavos`. Escríbela como expandir, migrar y contraer, y anota qué se despliega en cada uno de los tres pasos.
+4. Simula un despliegue gradual del productor con `wrangler versions deploy` al 10% y explica por qué las dos versiones deben honrar el contrato a la vez durante el reparto.
+5. Argumenta en tres frases por qué el sistema de tipos, pese a estar en verde, no te protege de un productor y un consumidor que se despliegan por separado.
+</Reto>

@@ -1,0 +1,150 @@
+---
+title: "El camino de una petición: de la resolución DNS al último byte"
+description: "Seguimos un único request desde que el navegador resuelve el nombre hasta que se cierra el flujo de respuesta, sin saltarnos ninguna etapa. Antes de que exista tu código ya han ocurrido cinco cosas que no controlas del todo pero sí configuras: anycast, TLS, las reglas de la zona, la cache y el servidor de assets. Después empieza tu turno, y ahí el orden de los middlewares deja de ser estética para convertirse en la variable que decide el coste. Cerramos con el presupuesto real de una invocación y con la forma de instrumentar el camino sin encarecerlo."
+subject: cloudflare
+level: 39
+order: 3
+icon: "39.3"
+duracion: "23 min"
+---
+
+<Lead>
+Casi todos los problemas de rendimiento que un equipo atribuye a su código ocurren fuera de su código, y casi todos los que atribuye a la plataforma ocurren dentro. La única forma de dejar de confundirlos es tener en la cabeza el camino completo de una petición, etapa por etapa, sabiendo quién ejecuta cada una, qué coste tiene y qué palanca la gobierna. En una arquitectura regional ese camino era largo pero conceptualmente plano: un balanceador, un servidor, una base de datos. En el edge es corto en distancia y sorprendentemente rico en capas, porque la misma máquina que termina el TLS ejecuta tu lógica de negocio. Este recorrido es el que separa a quien optimiza por intuición de quien sabe exactamente en qué milímetro del trayecto se le está yendo el tiempo.
+</Lead>
+
+<Objetivos>
+
+- Enumerar las etapas que atraviesa una petición antes de llegar a tu `fetch` y qué configura cada una.
+- Ordenar los middlewares de forma que el trabajo caro solo se ejecute cuando ya es inevitable.
+- Presupuestar una invocación en CPU, subpeticiones y tiempo de pared, y saber cuál de los tres se agota antes.
+- Instrumentar el trayecto con trazas correlacionadas sin añadir latencia al camino crítico.
+
+</Objetivos>
+
+## Antes de que exista tu código
+
+Cuando el navegador resuelve tu dominio, la respuesta DNS no apunta a un servidor sino a una dirección anunciada simultáneamente desde cientos de ubicaciones. El enrutamiento del propio internet entrega el paquete al centro de datos más cercano en términos de red, que rara vez coincide con el más cercano en kilómetros. Ahí se termina el TLS, y ahí ocurre todo lo demás, incluida la ejecución de tu Worker: no hay un segundo salto hacia una región de origen salvo que tú lo provoques.
+
+| Etapa | Quién la ejecuta | Coste habitual | Palanca que tienes |
+| --- | --- | --- | --- |
+| Resolución anycast | La red, antes de cualquier código | Un ida y vuelta de DNS, cacheado | TTL del registro, uso del dominio propio |
+| Terminación TLS | El borde | Un apretón de manos, reutilizado por conexión | Versión mínima de TLS, reanudación |
+| Reglas de la zona | WAF, reglas de tráfico, límites | Microsegundos, antes de facturar invocación | Reglas declarativas, bloqueo temprano |
+| Cache de zona | El borde, por clave de cache | Cero código tuyo si acierta | Cabeceras, clave de cache, variación |
+| Servidor de assets | El runtime, sin invocar tu Worker | Cero CPU tuya | Directorio, modo de fallo, `run_worker_first` |
+| Tu `fetch` | Tu isolate | Lo que tú gastes | Todo lo que viene después |
+
+La lectura estratégica de esta tabla es que las cuatro primeras filas son gratis o casi, y la última es la única que se te factura por complejidad. Cada problema que consigas empujar hacia arriba en la tabla (bloquear un bot con una regla en vez de con un `if`, servir una portada como asset en vez de renderizarla, acertar en la cache en vez de recalcular) sale del presupuesto de tu código y desaparece de tu factura y de tus percentiles altos.
+
+<Mermaid code={`flowchart TD
+  A[navegador] --> B[anycast hasta el pop mas cercano]
+  B --> C[terminacion tls]
+  C --> D[waf y reglas de zona]
+  D --> E[cache de zona]
+  E -->|acierto| Z[respuesta al cliente]
+  E -->|fallo| F[servidor de assets]
+  F -->|no es fichero| G[worker fetch]
+  G --> H[middlewares en cadena]
+  H --> I[handler de ruta]
+  I --> J[bindings d1 kv r2 do]
+  J --> Z
+  style G fill:#89b4fa,color:#11111b
+  style Z fill:#a6e3a1,color:#11111b`} />
+
+## Dentro del Worker: el orden es el diseño
+
+A partir de aquí manda tu código, y lo primero que manda es la secuencia. Una cadena de middlewares no es una lista de adornos: es un embudo donde cada eslabón puede terminar la petición. Colocar la autenticación después de la deserialización del cuerpo significa parsear megabytes de JSON de peticiones que ibas a rechazar; colocar el límite de tasa después de consultar la base de datos significa pagar la consulta del abusador. La regla es simple y se olvida siempre: lo barato que descarta va antes que lo caro que construye.
+
+```ts
+import { Hono } from "hono";
+
+const app = new Hono<{ Bindings: Env; Variables: { traza: string; usuario?: Usuario } }>();
+
+app.use("*", async (c, next) => {
+  c.set("traza", c.req.header("cf-ray") ?? crypto.randomUUID());
+  const inicio = Date.now();
+  await next();
+  c.header("Server-Timing", `total;dur=${Date.now() - inicio}`);
+});
+
+app.use("/api/*", async (c, next) => {
+  const ip = c.req.header("cf-connecting-ip") ?? "desconocida";
+  const { success } = await c.env.LIMITE.limit({ key: ip });
+  if (!success) return c.text("Demasiadas peticiones", 429);
+  await next();
+});
+
+app.use("/api/privado/*", async (c, next) => {
+  const usuario = await sesionActual(c.req.raw, c.env);
+  if (!usuario) return c.json({ error: "no autenticado" }, 401);
+  c.set("usuario", usuario);
+  await next();
+});
+
+app.get("/api/privado/facturas", async (c) => {
+  const { results } = await c.env.DB.prepare(
+    "SELECT id, total FROM facturas WHERE usuario = ? ORDER BY creada DESC LIMIT 50",
+  ).bind(c.get("usuario")!.id).all();
+  return c.json(results);
+});
+```
+
+Observa que el cuerpo de la petición no se ha leído todavía en ningún punto de la cadena. En este runtime el cuerpo es un flujo, y no se materializa hasta que alguien llama a `json` o a `text`; esa pereza es un regalo que se desperdicia si el primer middleware lo consume por comodidad. Lo mismo ocurre con la respuesta: devolver un flujo permite que el primer byte salga hacia el cliente mientras la base de datos aún está entregando filas.
+
+## El presupuesto de una invocación
+
+Cada petición tiene tres presupuestos distintos que se agotan de forma independiente, y confundirlos lleva a optimizar lo que no toca. El de CPU cuenta solo el tiempo en el que tu código ejecuta instrucciones, no el que pasa esperando; el de subpeticiones cuenta cuántas llamadas salientes haces, incluidas las que hace un binding por debajo; el de tiempo de pared es generoso mientras haya actividad, pero el cliente tiene su propia paciencia.
+
+<Cards>
+  <Card icon="🧮" title="CPU">
+    Se gasta serializando, parseando, comprimiendo y criptografiando. Un `JSON.parse` de un megabyte cuesta más que diez consultas a `D1`.
+  </Card>
+  <Card icon="🔗" title="Subpeticiones">
+    Cada `fetch`, cada consulta y cada acceso a un `Durable Object` cuenta. El techo llega antes de lo que parece en rutas que agregan datos.
+  </Card>
+  <Card icon="⏳" title="Tiempo de espera">
+    No consume CPU, pero sí ocupa la petición. Encadenar cinco esperas de cien milisegundos es medio segundo que el usuario nota entero.
+  </Card>
+  <Card icon="📦" title="Memoria">
+    Materializar un fichero grande para reenviarlo es el error clásico. Pásalo como flujo y la memoria deja de ser un límite.
+  </Card>
+</Cards>
+
+<Callout type="tip" title="Paraleliza lo independiente, encadena solo lo dependiente">
+Tres esperas secuenciales de cien milisegundos son trescientos milisegundos; las mismas tres con `Promise.all` son ciento y pico. La mayoría de las rutas lentas que he visto no eran lentas por hacer demasiado, sino por hacerlo en fila india sin necesidad. Antes de optimizar una consulta, comprueba si podía haber salido a la vez que la de al lado.
+</Callout>
+
+## Instrumentar sin encarecer
+
+Un camino que no puedes ver no lo puedes arreglar, pero la instrumentación ingenua añade al camino crítico exactamente lo que pretende medir. La disciplina consiste en separar dos cosas: la correlación, que debe viajar con la petición, y la escritura de la traza, que no debe hacerla esperar.
+
+```ts
+app.use("*", async (c, next) => {
+  const traza = c.get("traza");
+  const inicio = Date.now();
+  await next();
+  c.executionCtx.waitUntil(
+    (async () => {
+      c.env.METRICAS.writeDataPoint({
+        blobs: [c.req.path, c.res.status.toString(), traza],
+        doubles: [Date.now() - inicio],
+        indexes: [c.req.path],
+      });
+    })(),
+  );
+});
+```
+
+La clave está en `waitUntil`: la respuesta ya ha salido cuando la métrica se escribe, así que el usuario no paga ni un milisegundo por tu observabilidad. El identificador `cf-ray` sirve como hilo conductor porque lo asigna el borde antes que tú y aparece también en los registros de la plataforma, de modo que una queja de un cliente se puede seguir desde la cabecera de su respuesta hasta la consulta concreta que se atascó.
+
+<Callout type="dios" title="El camino de una petición dejó de ser una tubería entre máquinas para convertirse en una cadena de decisiones dentro de una sola máquina, y ahí es donde se ganan o se pierden los percentiles altos">
+Hay una razón profunda por la que este recorrido merece un nivel entero y no un párrafo, y tiene que ver con dónde vivía tradicionalmente el arte del rendimiento web. Durante veinte años, optimizar una petición consistió en acortar distancias entre cajas: acercar la cache al usuario, acercar la base de datos al servidor, reducir saltos de red, apilar CDNs delante del origen. El tiempo se iba en los cables, y la arquitectura consistía en dibujar cables más cortos. En el edge esa batalla está ganada de salida y por diseño, y el efecto secundario es que el cuello de botella se ha mudado a un sitio que la mayoría de los equipos no tiene instrumentado: el interior de una sola invocación, donde la diferencia entre una ruta excelente y una mediocre ya no se mide en saltos de red sino en decisiones de secuenciación. Qué se descarta antes de construir nada. Qué se paraleliza porque era independiente y qué se encadena porque de verdad dependía. Qué se materializa en memoria y qué se deja fluir. Qué se resuelve con una regla declarativa que se ejecuta antes de que tu código exista y qué se resuelve con un condicional que ya te cuesta CPU. Esa mudanza tiene una consecuencia cultural incómoda: las herramientas heredadas del mundo regional miden justamente lo que ya no importa. Un panel lleno de latencias entre servicios es casi inútil cuando solo hay un servicio; lo que hace falta es visibilidad dentro del trayecto, atribución de CPU por ruta, recuento de subpeticiones por handler y percentiles por camino, no por máquina. Y tiene también una consecuencia técnica que es la lección central del nivel: en el edge, el rendimiento ya no es una propiedad de la topología, que se decide una vez y se hereda, sino una propiedad del código, que se decide en cada línea y se degrada silenciosamente con cada refactor. Nadie te va a avisar de que el middleware nuevo lee el cuerpo antes de autenticar. Simplemente, tres meses después, tu percentil noventa y nueve será el doble y nadie sabrá por qué.
+</Callout>
+
+<Reto title="Sigue un request hasta el final">
+1. Instrumenta una ruta con `Server-Timing` desglosando al menos tres fases y obsérvalas en el panel de red del navegador.
+2. Reordena deliberadamente tus middlewares para que la autenticación vaya después del parseo del cuerpo. Mide el daño con peticiones no autenticadas y grandes, y revierte.
+3. Localiza una ruta con esperas secuenciales que podían ser paralelas, aplica `Promise.all` y documenta la mejora en el percentil noventa y cinco.
+4. Convierte una respuesta que hoy se materializa en memoria en una respuesta en flujo, y compara el tiempo hasta el primer byte.
+5. Correlaciona una petición concreta desde su `cf-ray` hasta el registro de su consulta más lenta. Si no puedes hacerlo en menos de un minuto, tu instrumentación está incompleta.
+</Reto>

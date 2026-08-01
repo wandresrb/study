@@ -1,0 +1,153 @@
+---
+title: "Comportamiento indefinido: las reglas que Swift asume sin verificar"
+description: "Qué licencia exacta concede el comportamiento indefinido al optimizador, por qué la alineación es una obligación y no una recomendación, cómo funciona la ligadura de memoria y el aliasing estricto en el modelo de Swift, y qué herramientas comprueban de verdad lo que el compilador da por hecho."
+subject: swift
+level: 21
+order: 5
+icon: "21.5"
+duracion: "21 min"
+---
+
+<Lead>
+La expresión "comportamiento indefinido" se traduce popularmente por "puede pasar cualquier cosa", y esa lectura, además de vaga, hace pensar en un fenómeno aleatorio y por tanto ajeno. La definición técnica es más incómoda y mucho más útil: un programa con comportamiento indefinido no tiene *ningún* significado asignado por el lenguaje, lo que autoriza al compilador a suponer que ese caso nunca ocurre y a optimizar bajo esa suposición. La diferencia práctica es enorme. Un fallo aleatorio ocurre donde está el error; una suposición del optimizador se propaga hacia atrás y hacia adelante, borra comprobaciones que escribiste diez líneas antes, reordena accesos y produce un binario en el que la causa y el síntoma están separados por funciones enteras. Por eso el comportamiento indefinido no se depura como un fallo: se previene como una obligación contractual, y este nivel entero ha consistido en aprender qué firmaste al escribir la palabra `Unsafe`.
+</Lead>
+
+<Objetivos>
+
+- Distinguir comportamiento indefinido de fallo controlado y explicar qué licencia concede cada uno al compilador.
+- Enunciar la regla de alineación y decidir cuándo hace falta una carga desalineada.
+- Manejar la ligadura de memoria con `bindMemory`, `assumingMemoryBound` y `withMemoryRebound` sin mentirle al optimizador.
+- Elegir la herramienta de diagnóstico adecuada para cada familia de error de memoria.
+
+</Objetivos>
+
+## La licencia que concedes
+
+Swift define muchísimas cosas que en C quedan indefinidas, y conviene tener presente la lista porque delimita el territorio real del peligro. El desbordamiento de un entero con signo no es indefinido en Swift: detiene el programa. Salirse del rango de un `Array` no es indefinido: detiene el programa. Desenvolver un `Optional` vacío con el operador de fuerza no es indefinido: detiene el programa. Detener el programa es un comportamiento perfectamente definido, y esa es precisamente la razón de que un programa Swift ordinario no pueda entrar en este terreno por accidente.
+
+El comportamiento indefinido queda confinado a un conjunto pequeño y nombrado: las operaciones de las APIs con prefijo `Unsafe`, las violaciones de acceso exclusivo, las carreras de datos y ciertos usos de la interoperabilidad con C. Dentro de ese conjunto, la mecánica es la misma que en C, y el ejemplo clásico ilustra por qué asusta:
+
+```swift
+func leer(_ p: UnsafePointer<Int>?) -> Int {
+    let v = p!.pointee          // aqui el compilador aprende: p no es nil
+    if p == nil { return 0 }    // ...y por tanto puede borrar esta rama entera
+    return v
+}
+```
+
+Antes de seguir conviene tener la taxonomía completa a la vista, porque casi todos los errores reales caen en una de seis casillas. Leer memoria reservada pero sin inicializar. Acceder fuera de la región reservada. Usar una dirección después de haberla liberado, o liberarla dos veces. Acceder a memoria a través de un puntero de un tipo distinto al que está ligada. Acceder a una dirección que no cumple la alineación del tipo. Y solapar dos accesos cuando al menos uno escribe, ya sea por exclusividad violada dentro de un hilo o por carrera entre hilos. Cualquier auditoría útil de código inseguro recorre esas seis preguntas, una por una, sobre cada bloque marcado.
+
+Ninguna de las dos líneas está mal por separado. Lo que ocurre es que la primera **afirma** algo, y el optimizador tiene derecho a creerla; la comprobación posterior se vuelve código muerto y desaparece. Si tu razonamiento era "si acaso fuera nulo, lo capturo abajo", el binario no contiene ese abajo. La regla mental correcta es: cada operación insegura no solo actúa, también declara una precondición como cierta para el resto de la función.
+
+## Alineación
+
+Cada tipo tiene un requisito de alineación, accesible como `MemoryLayout<T>.alignment`, que expresa que la dirección de un valor debe ser múltiplo de ese número. Reservar con `allocate` lo respeta automáticamente; el problema aparece cuando la dirección la calculas tú, que es el caso normal al recorrer un formato binario con campos de tamaños dispares.
+
+```swift
+var paquete: [UInt8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06]
+
+paquete.withUnsafeBytes { bytes in
+    let a = bytes.load(as: UInt16.self)                        // desplazamiento 0: alineado
+    // let b = bytes.load(fromByteOffset: 1, as: UInt16.self)  // impar: viola la alineacion
+    let c = bytes.loadUnaligned(fromByteOffset: 1, as: UInt16.self)   // correcto
+    print(a, c)
+}
+```
+
+La alineación de un tipo compuesto es la mayor de las alineaciones de sus campos, y de ahí sale el relleno interno que separa `size` de `stride`. Comprobarlo con un caso concreto vale más que cualquier explicación:
+
+```swift
+struct Cabecera { let bandera: Bool; let sello: Int64 }
+
+print(MemoryLayout<Cabecera>.size)        // 9: un byte mas ocho
+print(MemoryLayout<Cabecera>.alignment)   // 8: la del campo mas exigente
+print(MemoryLayout<Cabecera>.stride)      // 16: nueve redondeado al multiplo de ocho
+```
+
+Esos tres números explican por qué reservar con `size` en vez de con `stride` produce un desbordamiento silencioso a partir del segundo elemento, y por qué serializar el `struct` copiando sus bytes en bruto transmite siete bytes de relleno cuyo contenido nadie ha definido.
+
+`loadUnaligned` llegó con SE-0349 en Swift 5.7 justamente porque el patrón anterior era omnipresente y la alternativa correcta —copiar byte a byte— era tediosa y lenta. Merece la pena entender por qué la regla existe si en muchas máquinas las cargas desalineadas funcionan igualmente. Primero, porque no en todas: hay arquitecturas donde una carga desalineada es una excepción de hardware, y en las que no lo es sigue costando ciclos extra. Segundo, y más importante, porque el compilador puede haber elegido una instrucción vectorial o atómica que sí exige alineación aunque la carga escalar equivalente la tolerase. La regla no describe el hardware de hoy: describe lo que el compilador tiene permitido emitir.
+
+## Ligadura de memoria y aliasing
+
+El modelo de memoria de Swift mantiene, para cada región, cuál es el tipo al que está *ligada*. Acceder a esa región con un puntero de otro tipo es comportamiento indefinido, y no por pedantería: el optimizador practica análisis de alias basado en tipos, es decir, supone que dos punteros de tipos ligados distintos no se refieren a la misma memoria, y con esa suposición mantiene un valor en un registro en vez de releerlo, o adelanta una escritura por encima de una lectura.
+
+Hay tres operaciones para hablar de la ligadura, y confundirlas es el error más sofisticado de este nivel:
+
+```swift
+let crudo = UnsafeMutableRawPointer.allocate(byteCount: 32, alignment: 8)
+
+// 1. bindMemory: ESTABLECE la ligadura de la region a un tipo
+let enteros = crudo.bindMemory(to: Int64.self, capacity: 4)
+enteros.initialize(repeating: 0, count: 4)
+
+// 2. withMemoryRebound: cambia la ligadura TEMPORALMENTE, dentro del bloque
+enteros.withMemoryRebound(to: UInt64.self, capacity: 4) { sinSigno in
+    sinSigno[0] = .max
+}
+
+// 3. assumingMemoryBound: NO cambia nada, solo AFIRMA que ya estaba ligada
+let otra = UnsafeRawPointer(crudo).assumingMemoryBound(to: Int64.self)
+print(otra[0])
+
+enteros.deinitialize(count: 4)
+crudo.deallocate()
+```
+
+La tercera es la peligrosa porque no genera ni una instrucción: es una promesa pura. Si la memoria no estaba ligada a ese tipo, has mentido, el compilador te ha creído y el resultado es indefinido en un punto del programa que puede estar muy lejos. `withMemoryRebound` es la forma honesta de mirar la misma memoria como otro tipo, y desde SE-0333 en Swift 5.7 admite tipos de zancada distinta —la capacidad se expresa en unidades del tipo destino— y también funciona sobre punteros crudos.
+
+Hay además un detalle temporal que se pasa por alto: `bindMemory` no es una anotación acumulativa sino un cambio de estado de la región. Ligar a `UInt64` una región previamente ligada a `Int64` invalida la primera ligadura, y cualquier puntero tipado que siguieras conservando del tipo anterior deja de ser utilizable aunque siga apuntando a la misma dirección. La ligadura describe la región, no el puntero, y esa es la frase que hay que interiorizar para no razonar mal sobre estas tres operaciones.
+
+Queda una vía de escape sancionada: el acceso crudo. `load` y `storeBytes` sobre punteros crudos son operaciones seguras respecto al aliasing para tipos triviales, porque no presuponen ninguna ligadura. Es la razón por la que serializar y deserializar formatos binarios se hace con buffers crudos y no reinterpretando punteros tipados.
+
+<Mermaid code={`flowchart TB
+  op[Una operacion insegura] --> pre[Declara sus precondiciones como ciertas]
+  pre --> opt[El optimizador razona con esa declaracion]
+  opt --> a1[Elimina comprobaciones que considera imposibles]
+  opt --> a2[Reordena cargas y escrituras entre tipos distintos]
+  opt --> a3[Emite instrucciones que exigen alineacion]
+  a1 --> res[Si mentiste el sintoma aparece lejos de la causa]
+  a2 --> res
+  a3 --> res
+  style op fill:#f38ba8,color:#11111b
+  style opt fill:#fab387,color:#11111b
+  style res fill:#cba6f7,color:#11111b`} />
+
+<Cards>
+  <Card icon="🎫" title="Indefinido es una licencia, no un fallo">
+    No significa resultado imprevisible: significa que el compilador puede suponer que el caso no ocurre y borrar el código que lo contemplaba.
+  </Card>
+  <Card icon="📐" title="La alineación describe al compilador">
+    No basta con que tu procesador tolere una carga desalineada: la instrucción emitida puede ser vectorial o atómica y no tolerarla.
+  </Card>
+  <Card icon="🤥" title="assumingMemoryBound no comprueba nada">
+    Es una afirmación sin coste ni verificación. Cuando no estés seguro de la ligadura, usa `withMemoryRebound` o el acceso crudo.
+  </Card>
+</Cards>
+
+## Lo que sí se puede comprobar
+
+Como el compilador ha renunciado a verificar, la verificación se traslada a la ejecución y a los avisos. Los instrumentos disponibles no son intercambiables: cada uno cubre una familia distinta de error y ninguno cubre todas.
+
+```bash
+swift test -Xswiftc -sanitize=address       # uso tras liberar, doble liberacion, desbordamientos
+swift test -Xswiftc -sanitize=thread        # carreras de datos reales en ejecucion
+swift build -Xswiftc -enforce-exclusivity=checked   # accesos solapados, tambien optimizado
+swift build -Xswiftc -strict-memory-safety  # exige marcar cada expresion insegura
+```
+
+El sanitizador de direcciones encuentra uso después de liberar, liberación doble y desbordamientos de montículo y pila, a cambio de multiplicar por dos o tres el tiempo de ejecución. El de hilos detecta carreras de datos que realmente se produjeron durante la corrida, no las que podrían producirse. La comprobación de exclusividad detiene el programa ante un acceso solapado en lugar de dejarlo pasar. Y el modo estricto de seguridad de memoria, incorporado en Swift 6.2 por SE-0458, opera en tiempo de compilación: obliga a marcar cada expresión insegura con la palabra `unsafe` y permite que un módulo declare que no contiene ninguna.
+
+La limitación común a los tres primeros es de naturaleza lógica y merece enunciarse sin adornos: **solo encuentran los errores que tus pruebas llegan a ejecutar**. Un sanitizador es un microscopio, no un teorema. Por eso la práctica correcta no consiste en pasarlos a mano cuando algo huele mal, sino en ejecutar la suite completa bajo ellos en integración continua, y en escribir pruebas que recorran deliberadamente los caminos de error del código inseguro, que son justamente los que nadie ejercita.
+
+<Callout type="dios" title="La ignorancia deliberada como recurso de ingeniería">
+Vale la pena preguntarse por qué existe siquiera el comportamiento indefinido, en lugar de exigir que todo caso tenga un significado. La respuesta señala un mecanismo de diseño que trasciende la programación de sistemas: hay propiedades que un compilador no puede verificar en un tiempo razonable, y ante ellas solo caben tres actitudes. Puede comprobarlas en ejecución, y entonces paga con rendimiento en cada acceso. Puede rechazar todo programa que no sepa demostrar seguro, y entonces paga con expresividad y con anotaciones —el camino de Rust—. O puede asumirlas ciertas y trasladar la obligación a quien programa, y entonces no paga nada en la máquina y lo paga todo en fiabilidad. El comportamiento indefinido es esa tercera opción, y la razón de que sobreviva a décadas de crítica es que sin ella no existirían ni las bibliotecas numéricas rápidas ni los núcleos de sistema operativo. Lo interesante de Swift es que se negó a elegir una sola de las tres. Eligió la primera por defecto —comprobaciones de rango y de desbordamiento que sobreviven a la optimización—, ofrece la segunda donde puede permitírselo —tipos no copiables, aislamiento de actores, `Sendable`—, y confina la tercera a una región del vocabulario que puedes buscar con una expresión regular. Ese confinamiento cambia la naturaleza epistemológica del problema. En C, la pregunta "¿es este programa seguro en memoria?" no tiene respuesta practicable, porque el riesgo está distribuido de manera uniforme en cada línea. En Swift, la pregunta se descompone en dos: una parte que el compilador responde por ti y otra parte, minúscula y nominal, que exige revisión humana. Swift 6.2 llevó el argumento hasta su conclusión natural con el modo estricto de seguridad de memoria, que obliga a marcar cada expresión insegura y permite a un módulo certificar que no contiene ninguna. La lección de fondo no es que el comportamiento indefinido sea malo: es que su verdadero coste nunca fue el error individual, sino la imposibilidad de saber dónde mirar.
+</Callout>
+
+<Reto title="Rompe cada regla y mírala romperse">
+1. Reproduce el ejemplo de la comprobación de nulidad eliminada; compila sin optimizar y optimizado, inspecciona el ensamblador y localiza la rama que desapareció.
+2. Lee un `UInt32` desde un desplazamiento impar de un array de bytes con `load` y con `loadUnaligned`; ejecuta bajo el sanitizador de comportamiento indefinido y compara.
+3. Liga una región a `Int64`, léela con un puntero a `Double` usando `assumingMemoryBound` y después reescribe el mismo acceso con `withMemoryRebound`; razona qué garantiza cada versión.
+4. Provoca un uso después de liberar guardando un puntero fuera de su bloque y diagnostícalo con el sanitizador de direcciones.
+5. Escribe una violación de acceso exclusivo con una propiedad global, ejecútala con la comprobación activada y sin ella, y anota la diferencia entre detención y silencio.
+</Reto>

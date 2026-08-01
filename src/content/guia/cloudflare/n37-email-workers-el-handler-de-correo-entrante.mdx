@@ -1,0 +1,147 @@
+---
+title: "Email Workers: el correo entrante como evento de código"
+description: "Durante cuarenta años recibir correo significó administrar un servidor de correo, un buzón y un demonio que lo vigilaba. Email Workers invierte esa arquitectura: un mensaje que llega a tu dominio deja de ser un fichero depositado en un buzón y se convierte en un evento que ejecuta tu código, con la misma forma mental que una petición HTTP. Vemos el tercer handler junto a fetch y scheduled, la anatomía del mensaje entrante con from, to, headers y el flujo crudo, las tres decisiones posibles de reenviar, rechazar o responder, cómo parsear el MIME sin ahogarse, y qué significa que cualquier desconocido del planeta pueda invocar tu código escribiendo un correo."
+subject: cloudflare
+level: 37
+order: 1
+icon: "37.1"
+duracion: "17 min"
+---
+
+<Lead>
+El correo electrónico es el protocolo más antiguo que sigue de pie, y también el más humillante de operar: recibirlo significaba levantar un `MTA`, defenderlo, vigilar un buzón y escribir un demonio que lo leyera cada pocos minutos. Los `Email Workers` disuelven esa liturgia entera. Cloudflare recibe el mensaje en su frontera, y en lugar de depositarlo en ningún sitio, invoca tu código con él en la mano. El correo entrante se convierte en lo que siempre debió ser en una plataforma de eventos: un evento. Y con eso, tu dominio deja de tener buzones para tener funciones.
+</Lead>
+
+<Objetivos>
+
+- Exportar el handler `email` y entender qué lo invoca y cuándo.
+- Manejar el mensaje entrante: `from`, `to`, `headers`, `raw` y `rawSize`.
+- Decidir entre reenviar, rechazar y responder, y parsear el `MIME` crudo.
+- Convertir un correo en el disparador de un sistema mayor, con sus riesgos.
+
+</Objetivos>
+
+## El tercer handler
+
+Conoces `fetch` para las peticiones y `scheduled` para el reloj. Este es el tercero. Un Worker que exporta `email` puede ser el destino de una regla de `Email Routing`: cuando un mensaje llega a una dirección de tu zona, en lugar de reenviarse a un buzón verificado, se entrega a tu código.
+
+```ts
+export default {
+  async email(message, env, ctx): Promise<void> {
+    console.log(`de ${message.from} para ${message.to}`);
+    await message.forward("soporte@ejemplo.com");
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+Fíjate en la firma: no devuelve una `Response`. Un handler de correo no contesta al remitente, decide el destino del mensaje. Y de ahí sale la primera trampa del nivel: si el handler termina sin haber llamado a `forward`, `reply` ni `setReject`, el mensaje se descarta en silencio. El fallo por omisión es la desaparición, no el rebote. Un `return` temprano mal colocado es un agujero negro de correo.
+
+Hay un detalle de flujo de trabajo que ahorra horas: este handler no se ejerce cómodamente esperando a que llegue correo de verdad. En desarrollo local, `wrangler` puede entregarle un fichero de correo crudo directamente, de modo que iteras sobre casos reales guardados —un mensaje con adjunto pesado, uno con codificación exótica, uno malicioso— sin depender de que alguien te escriba. Guardar una pequeña colección de mensajes crudos como material de prueba es la mejor inversión del nivel.
+
+<Mermaid code={`flowchart LR
+  R[remitente] --> MX[frontera de Cloudflare como MX]
+  MX --> RE[regla de Email Routing]
+  RE --> W[handler email del Worker]
+  W --> F[forward a buzon verificado]
+  W --> X[setReject rebote SMTP]
+  W --> Q[Queue o D1 disparan el sistema]
+  style W fill:#f9e2af,color:#11111b
+  style X fill:#f38ba8,color:#11111b`} />
+
+## La anatomía del mensaje
+
+El objeto que recibes es deliberadamente austero, y esa austeridad enseña. `message.from` y `message.to` son las direcciones del sobre `SMTP`, las que negociaron los servidores, no las cabeceras `From` y `To` que ve el usuario en su cliente. Casi siempre coinciden. Cuando no coinciden, esa discrepancia es la información más valiosa del mensaje: es la huella clásica de una suplantación o de un reenvío automático.
+
+`message.headers` es un `Headers` estándar, el mismo que usas en `fetch`. `message.rawSize` te da el tamaño en bytes antes de leer nada. Y `message.raw` es un `ReadableStream` con el mensaje completo en formato `RFC 5322`: cabeceras, cuerpo, partes `MIME` y adjuntos, tal cual viajaron.
+
+```ts
+export default {
+  async email(message, env, ctx): Promise<void> {
+    const permitidos = ["ejemplo.com", "socio.com"];
+    const dominio = message.from.split("@").at(-1) ?? "";
+
+    if (!permitidos.includes(dominio)) {
+      message.setReject("Remitente no autorizado");
+      return;
+    }
+    if (message.rawSize > 5_000_000) {
+      message.setReject("Mensaje demasiado grande");
+      return;
+    }
+    await message.forward("soporte@ejemplo.com");
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+Queda la tercera decisión, `reply`, que es la más acotada de las tres y conviene entender por qué. Permite contestar al remitente del mensaje que estás procesando, y solo a él: no es un canal de envío general sino la continuación de una conversación que alguien empezó. La respuesta debe encadenarse correctamente con las cabeceras de referencia para que el cliente del destinatario la muestre como hilo, y la plataforma limita cuántas veces puedes responder a un mismo mensaje. Esa estrechez no es una carencia, es lo que impide que un rebote automático contra otro rebote automático genere un bucle infinito entre dos servidores, un clásico del correo que ha tumbado sistemas enteros.
+
+<Callout type="warn" title="Reenviar no es libre y rechazar es una respuesta">
+`forward` solo entrega a direcciones de destino previamente verificadas en tu cuenta: no puedes convertir tu Worker en un relé hacia una dirección arbitraria, y esa restricción existe precisamente para que la plataforma no sea un motor de reenvío abierto. `setReject`, por su parte, no borra el mensaje: devuelve un error `SMTP` al servidor emisor, que informará al remitente. Rechazar es hablar. Descartar en silencio, en cambio, deja al humano del otro lado creyendo que su correo llegó.
+</Callout>
+
+## Parsear el crudo y disparar acciones
+
+El flujo `raw` se consume una sola vez, así que la decisión de leerlo es definitiva. Y leerlo a mano no es razonable: `MIME` es un formato con décadas de sedimento, codificaciones anidadas y casos límite. Usa una librería como `postal-mime`, pensada para el runtime de Workers.
+
+```ts
+import PostalMime from "postal-mime";
+
+export default {
+  async email(message, env, ctx): Promise<void> {
+    const correo = await new PostalMime().parse(message.raw);
+    const asunto = correo.subject ?? "sin asunto";
+    const cuerpo = correo.text ?? "";
+
+    const ticket = {
+      remitente: message.from,
+      asunto,
+      resumen: cuerpo.slice(0, 500),
+      adjuntos: correo.attachments.length,
+      recibido: new Date().toISOString(),
+    };
+
+    await env.TICKETS.send(ticket);
+    ctx.waitUntil(env.AUDITORIA.put(`correo:${crypto.randomUUID()}`, JSON.stringify(ticket)));
+    await message.forward("soporte@ejemplo.com");
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+Ahí está el patrón que justifica todo el nivel: el correo entra, se convierte en un objeto estructurado, ese objeto entra en una cola y el trabajo pesado ocurre después, en un consumidor que sí puede tardar. El handler de correo no es el lugar donde procesas: es el lugar donde traduces.
+
+<Cards>
+  <Card icon="🎫" title="Buzón de soporte">
+    Cada correo a `ayuda@` se convierte en un ticket con identificador, se encola y se reenvía al equipo. El buzón sigue existiendo para los humanos.
+  </Card>
+  <Card icon="🧹" title="Filtro con criterio propio">
+    Reglas que ningún proveedor te dará: rechazar por dominio, por tamaño, por ausencia de una cabecera interna o por horario.
+  </Card>
+  <Card icon="🔗" title="Correo como API">
+    Una dirección por cliente que ingiere facturas o pedidos adjuntos, los parsea y los deja en `R2` con su fila en `D1`.
+  </Card>
+  <Card icon="🔔" title="Disparador de flujos">
+    Un mensaje concreto arranca un `Workflow`: aprobar, publicar, desplegar. El correo es la interfaz que el usuario ya tiene abierta.
+  </Card>
+</Cards>
+
+## Cualquiera puede invocar tu código
+
+Esta es la diferencia sobria entre este handler y los demás. Un endpoint `HTTP` lo protege una clave, un `Turnstile` o `Access`. Una dirección de correo, por definición, es pública y cualquier persona del planeta puede empujar bytes hacia ella. Tu handler de correo es, literalmente, código ejecutable por desconocidos no autenticados.
+
+De ahí tres disciplinas. La primera: trata cada campo como entrada hostil, incluido el asunto, que acaba en registros, paneles y a veces en consultas. La segunda: no confíes nunca en la cabecera `From` para autorizar, porque es texto que el emisor escribe a su antojo; si necesitas certeza sobre el origen, mira los resultados de autenticación de `SPF`, `DKIM` y `DMARC` que la frontera ya anotó en las cabeceras. La tercera: presupuesta. Un adjunto grande consume `CPU` al parsearse, y una campaña de basura dirigida a tu dirección es una llamada masiva a tu código.
+
+<Callout type="tip" title="Mira el tamaño antes de mirar el contenido">
+`rawSize` está disponible sin consumir el flujo. Compruébalo primero y rechaza lo desmesurado antes de instanciar el parser: es la única decisión del handler que puedes tomar en tiempo constante, y te ahorra el peor caso de coste. Después parsea, y solo entonces decide.
+</Callout>
+
+<Callout type="dios" title="El buzón era un lugar; ahora es una función">
+Durante cuarenta años el correo fue un sustantivo antes que un verbo: existía un buzón, un archivo en un disco, un lugar donde los mensajes se acumulaban esperando a que alguien los mirase. Toda la arquitectura del correo se apoyó en esa metáfora física, la del casillero, y con ella heredamos el `MTA` que había que operar, la sincronización, los procesos que sondean cada minuto y la larga cadena de dolores de quien ha mantenido un servidor de correo en producción. Los `Email Workers` no mejoran ese modelo, lo sustituyen por otro: aquí no hay lugar donde el mensaje repose, hay una función que se invoca en el instante en que el mensaje existe. Y la consecuencia profunda no es de comodidad operativa sino de diseño, porque una dirección de correo pasa a ser un endpoint con una propiedad que ningún endpoint `HTTP` tuyo tiene: ya está en la agenda de todo el mundo, funciona desde cualquier cliente, atraviesa cualquier firewall corporativo y no exige que nadie instale nada ni aprenda nada. Es la interfaz de usuario más universal jamás desplegada, y ahora es programable. Esa universalidad es exactamente lo que la hace peligrosa, y el ingeniero maduro sostiene las dos caras a la vez. Una dirección pública es un endpoint sin autenticación expuesto a la humanidad entera, cuyo protocolo permite mentir sobre el remitente por diseño y cuyo formato de contenido es un fósil con capas de codificación pensadas para máquinas de los ochenta. Quien entiende esto no escribe el handler como quien lee un correo: lo escribe como quien atiende una petición anónima de internet, valida antes de confiar, mide antes de parsear, encola antes de trabajar y elige conscientemente entre rechazar con ruido o desaparecer en silencio. La elegancia del modelo está en que el correo por fin es un evento. La responsabilidad está en recordar que ese evento lo dispara cualquiera.
+</Callout>
+
+<Reto title="Convierte una dirección en un endpoint">
+1. Activa `Email Routing` en una zona y enruta una dirección hacia un Worker que exporte `email`. Registra `from`, `to` y `rawSize`, y reenvía el mensaje a un buzón verificado.
+2. Añade un filtro que rechace con `setReject` los mensajes cuyo dominio no esté en una lista permitida, y otro que rechace los que superen un tamaño. Comprueba qué recibe el remitente al ser rechazado.
+3. Parsea el mensaje con `postal-mime`, extrae asunto, cuerpo y número de adjuntos, y escribe una fila en `D1` con esos datos más un identificador de ticket.
+4. Compara la cabecera `From` con `message.from` en un mensaje reenviado desde otro proveedor. Explica por qué difieren y por qué autorizar con la cabecera sería un error.
+5. Argumenta qué parte del trabajo debe quedarse en el handler y cuál debe irse a una `Queue`, usando como criterio el peor caso de tamaño y de ráfaga.
+</Reto>

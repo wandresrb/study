@@ -1,0 +1,157 @@
+---
+title: "Desplegar en Linux: enlazado estático e imágenes mínimas"
+description: "El camino de macOS a producción: compilación cruzada con los SDK de Swift para Linux, enlazado estático de la biblioteca estándar frente a `musl` puro, imágenes Docker de dos etapas que bajan de cientos de megabytes a unas decenas, y el catálogo real de diferencias de `Foundation` en Linux que rompen en el despliegue y no en tu portátil."
+subject: swift
+level: 30
+order: 4
+icon: "30.4"
+duracion: "20 min"
+---
+
+<Lead>
+Escribir el servidor es la mitad fácil. La otra mitad es el trayecto desde un portátil con macOS y arquitectura ARM hasta un contenedor de producción sobre Linux, casi siempre x86, donde el binario debe encontrar sus bibliotecas, hablar con el sistema de certificados, entender la zona horaria y morir con elegancia cuando el orquestador le mande una señal. Ninguno de esos problemas es intelectualmente difícil, y todos han costado noches enteras a gente competente, porque comparten una propiedad desagradable: se manifiestan **solo** en el entorno donde no puedes depurar cómodamente, y el mensaje de error rara vez apunta a la causa.
+</Lead>
+
+<Objetivos>
+
+- Producir un binario para Linux desde macOS con compilación cruzada y saber cuándo esa vía no sirve.
+- Distinguir el enlazado estático de la biblioteca estándar del enlazado totalmente estático contra `musl`, con sus consecuencias.
+- Construir una imagen de contenedor de dos etapas que contenga el binario y lo mínimo imprescindible.
+- Enumerar y prever las diferencias de `Foundation` en Linux que aparecen solo en producción.
+
+</Objetivos>
+
+## De macOS a Linux sin salir del portátil
+
+Desde Swift 6 existen SDK de compilación cruzada instalables como artefactos, y son la manera rápida de obtener un binario de Linux sin arrancar un contenedor para cada compilación.
+
+```bash
+swift sdk install \
+  https://download.swift.org/swift-6.2-release/static-sdk/swift-6.2-RELEASE_static-linux-0.0.1.artifactbundle.tar.gz
+
+swift build -c release --swift-sdk x86_64-swift-linux-musl
+file .build/x86_64-swift-linux-musl/release/Servidor
+```
+
+El resultado es un ejecutable enlazado estáticamente contra `musl`: sin dependencias de bibliotecas dinámicas, ni siquiera de la `libc` del sistema. Funciona, y hay que conocer sus límites antes de enamorarse. Si tu proyecto depende de una biblioteca de C que solo existe como paquete de `apt` —un controlador de base de datos nativo, `libxml2`, ciertos motores criptográficos—, el SDK estático no la tiene y no la va a encontrar; en ese caso la compilación cruzada deja de ser viable y toca compilar dentro de un contenedor de Linux, que sigue siendo la vía más portátil y la que usan las integraciones continuas serias.
+
+La segunda trampa es la arquitectura. Compilar en un portátil ARM y desplegar en un nodo x86 exige elegir el SDK correcto o usar `--platform` en Docker, y la emulación con `qemu` para construir imágenes multiplataforma multiplica el tiempo de compilación por un factor incómodo. Si tu flota es homogénea, compila nativamente para esa arquitectura y ahórrate el problema entero.
+
+## Enlazado estático: tres niveles, no dos
+
+Aquí se confunden habitualmente tres cosas distintas.
+
+<Mermaid code={`flowchart TB
+  A[Binario Swift] --> B{Que se enlaza estaticamente}
+  B --> C[Nada: requiere runtime de Swift instalado]
+  B --> D[Solo la biblioteca estandar de Swift]
+  B --> E[Todo incluida la libc de musl]
+  C --> F[Imagen base con runtime, cientos de MB]
+  D --> G[Imagen base con glibc, decenas de MB]
+  E --> H[Imagen scratch o distroless, muy pequena]
+  style F fill:#f38ba8,color:#11111b
+  style H fill:#a6e3a1,color:#11111b`} />
+
+El nivel intermedio se activa con `--static-swift-stdlib` y es el más usado en la práctica: incrusta la biblioteca estándar y las bibliotecas de concurrencia y `Foundation` en el ejecutable, pero sigue enlazando dinámicamente contra la `glibc` del sistema, así que necesita una imagen base con esa `glibc` presente. El nivel completo es el SDK estático de `musl`, que produce un ejecutable que arranca sobre una imagen vacía.
+
+La elección tiene consecuencias que van más allá del tamaño. Con `musl` desaparecen el resolvedor de nombres de `glibc` y su mecanismo de módulos cargables, lo que en algunos entornos cambia sutilmente la resolución DNS; desaparece también la posibilidad de usar herramientas del sistema dentro del contenedor, lo que es una ventaja de seguridad y una desventaja cuando hay que diagnosticar algo. Y `musl` tiene un asignador de memoria distinto al de `glibc`, con un comportamiento bajo concurrencia alta que conviene medir en lugar de suponer.
+
+<Callout type="warn" title="Estático no significa sin dependencias del entorno">
+Aunque el binario sea estático, sigue necesitando cosas del sistema de archivos: los certificados raíz para TLS, la base de datos de zonas horarias si formateas fechas locales, y `/etc/resolv.conf`. Una imagen `scratch` sin certificados produce fallos de TLS que parecen problemas de red y no lo son.
+</Callout>
+
+## La imagen de contenedor en dos etapas
+
+El patrón es siempre el mismo: una etapa gorda que compila y una etapa flaca que solo contiene el resultado.
+
+```dockerfile
+FROM swift:6.2-noble AS build
+WORKDIR /src
+COPY Package.swift Package.resolved ./
+RUN swift package resolve
+COPY . .
+RUN swift build -c release --static-swift-stdlib \
+    -Xlinker -s
+RUN mkdir -p /out && cp "$(swift build -c release --show-bin-path)/Servidor" /out/
+
+FROM ubuntu:noble
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tzdata libcurl4 && rm -rf /var/lib/apt/lists/*
+RUN useradd --create-home --shell /usr/sbin/nologin app
+COPY --from=build /out/Servidor /usr/local/bin/Servidor
+USER app
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/Servidor"]
+CMD ["--hostname", "0.0.0.0", "--port", "8080"]
+```
+
+Tres detalles que la mayoría de los ejemplos omiten y que se pagan caros. El primero es copiar `Package.swift` y `Package.resolved` **antes** que el código: así la resolución de dependencias vive en su propia capa y no se rehace cada vez que tocas una línea. El segundo es no correr como `root`, que es la diferencia entre un contenedor comprometido y un nodo comprometido. El tercero es `ca-certificates` y `tzdata`, que resuelven de antemano dos de los tres fallos clásicos de producción.
+
+Con el SDK de `musl` la segunda etapa se reduce todavía más, y el resultado ronda las pocas decenas de megabytes frente a los cientos de la imagen oficial completa.
+
+```dockerfile
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=build /out/Servidor /Servidor
+ENTRYPOINT ["/Servidor"]
+```
+
+## Foundation en Linux: el catálogo de sorpresas
+
+Desde la reescritura de `swift-foundation` en Swift puro, la paridad entre plataformas es mucho mejor que en 2020, pero no es total y el resto de diferencias son precisamente las que no aparecen en las pruebas locales.
+
+<Cards>
+  <Card icon="🔤" title="Codificación y ordenación">
+    Las comparaciones sensibles a la configuración regional dependen de `ICU`. Si la imagen no la trae, la ordenación de cadenas cambia respecto a macOS.
+  </Card>
+  <Card icon="🕰️" title="Fechas y zonas horarias">
+    Sin `tzdata` en la imagen, toda zona que no sea `UTC` falla o se degrada en silencio. Formatea siempre en `UTC` en el servidor.
+  </Card>
+  <Card icon="🔐" title="Criptografía y TLS">
+    `CryptoKit` no existe en Linux. La ruta portátil es `swift-crypto`, que expone la misma interfaz sobre `BoringSSL`.
+  </Card>
+</Cards>
+
+A eso se añaden ausencias concretas que hay que conocer: no hay `NSKeyedArchiver` con paridad completa, el comportamiento de `Process` y de las señales difiere, `URLSession` en Linux tiene un backend distinto con matices en tiempos de espera y proxies, y las APIs específicas de Darwin —`os_log`, `Security`, `dispatch` en sus formas más exóticas— sencillamente no están. La disciplina que evita el noventa por ciento del dolor cabe en una frase: **compila y ejecuta las pruebas en Linux desde el primer día**, en la integración continua, aunque desarrolles en macOS.
+
+Cuando una diferencia es inevitable, la forma correcta de tratarla es aislarla tras una interfaz propia en lugar de esparcir condicionales de plataforma por todo el código.
+
+```swift
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+protocol RelojDeSistema: Sendable {
+    func ahora() -> Date
+}
+```
+
+La regla es que las condicionales de compilación vivan en un único fichero de adaptación, y que el resto del proyecto hable siempre con el tipo neutral. Un `#if` dentro de la lógica de negocio significa que tienes dos programas conviviendo en el mismo fichero y que solo pruebas uno de ellos cada vez.
+
+Y para el cliente HTTP conviene ser tajante: en el servidor, la opción por defecto no es `URLSession` sino `AsyncHTTPClient`, que se apoya en `SwiftNIO`, comparte el grupo de bucles de eventos con tu servidor, tiene un pool de conexiones pensado para carga y se comporta idénticamente en las dos plataformas. Usar `URLSession` en Linux es una fuente recurrente de diferencias sutiles que nadie quiere depurar dos veces.
+
+Y queda el ciclo de vida. Un contenedor recibe `SIGTERM` y tiene un plazo antes de `SIGKILL`; un servidor que ignora esa señal corta peticiones en curso en cada despliegue. Los frameworks modernos se apoyan en `ServiceLifecycle` para propagar el apagado ordenado por todo el árbol de servicios, y merece la pena usarlo en lugar de improvisar un manejador de señales.
+
+```swift
+let grupo = ServiceGroup(
+    services: [app, trabajadorDeColas],
+    gracefulShutdownSignals: [.sigterm, .sigint],
+    logger: logger
+)
+try await grupo.run()
+```
+
+<Callout type="dios" title="El binario es la parte pequeña del artefacto">
+Hay una lección que el despliegue enseña una vez y para siempre, y es que un programa no es su código: es su código **más el conjunto de suposiciones que hace sobre el mundo en el que se ejecuta**. Tu servidor supone que existen certificados raíz en una ruta concreta, que hay una base de datos de zonas horarias, que el resolvedor de nombres funciona de cierta manera, que la configuración regional está definida, que hay un sistema de archivos escribible en algún sitio, que las señales tienen el significado habitual y que alguien pondrá variables de entorno con las credenciales. En tu portátil todas esas suposiciones son ciertas por accidente histórico —macOS las trae puestas— y por eso son invisibles; en una imagen `scratch` no es cierta ninguna, y cada una se manifiesta como un fallo distinto, tardío y mal explicado. El enlazado estático y las imágenes mínimas son valiosos precisamente porque **hacen explícitas esas suposiciones**: al quitarlo todo, te obligan a volver a añadir, una por una y con nombre, las cosas de las que realmente dependes, y al final del proceso tienes por primera vez una lista completa de tu superficie de contacto con el sistema operativo. Ese es el verdadero producto del ejercicio, más que los megabytes ahorrados: la diferencia entre desplegar un programa que funciona y desplegar un programa del que sabes **por qué** funciona. La misma idea explica por qué los entornos reproducibles, los ficheros de bloqueo de dependencias y las imágenes inmutables ganaron la discusión frente a la configuración manual de servidores: no porque sean más cómodos, que no lo son, sino porque convierten un conjunto de suposiciones tácitas repartidas por la cabeza de varias personas en un artefacto único, versionado y legible que puede revisarse en un cambio de código. Cuando alguien te diga que en su máquina funciona, lo que está diciendo es que su lista de suposiciones nunca se escribió.
+</Callout>
+
+<Reto title="Del portátil al contenedor mínimo">
+1. Compila tu servicio con y sin `--static-swift-stdlib` y compara el tamaño del binario y el de la imagen final.
+2. Construye una imagen sobre `scratch` con el SDK de `musl` y averigua qué falla primero: TLS, zonas horarias o DNS.
+3. Añade una prueba en tu integración continua que ejecute la suite completa en Linux y observa cuántos fallos aparecen.
+4. Formatea una fecha con zona local en macOS y en el contenedor, y explica la diferencia de salida.
+5. Manda `SIGTERM` al contenedor durante una petición larga y verifica con `ServiceGroup` que se completa antes de salir.
+</Reto>

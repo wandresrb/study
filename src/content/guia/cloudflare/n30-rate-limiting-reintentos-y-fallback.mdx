@@ -1,0 +1,151 @@
+---
+title: "Rate limiting y reintentos: proteger presupuesto y disponibilidad"
+description: "Entre un bucle accidental y tu tarjeta no debería haber nada más que una política. Este capítulo instala esa política: límites de caudal con ventana fija o deslizante, presupuestos en dólares por modelo o por usuario, reintentos con backoff cuando el proveedor falla de forma pasajera, y el paso siguiente cuando el fallo no es pasajero: desviar la petición a otro modelo o a otro proveedor sin tocar el código de la aplicación."
+subject: cloudflare
+level: 30
+order: 3
+icon: "30.3"
+duracion: "17 min"
+---
+
+<Lead>
+Un sistema que llama a modelos tiene dos formas de arruinarte el día, y son opuestas. La primera es gastar demasiado: un bucle mal cerrado, un agente que reintenta sin freno, un usuario que descubre que tu demo pública paga sus tokens. La segunda es no gastar nada porque el proveedor está caído y tu producto entero deja de funcionar. Las dos se resuelven en el mismo sitio y con la misma idea —una política declarada en el punto de paso, no repartida por el código— pero tiran en direcciones contrarias: una dice que no, la otra insiste. Aprender a combinarlas es lo que separa un prototipo de un sistema en producción.
+</Lead>
+
+<Objetivos>
+
+- Configurar `rate limiting` por caudal y distinguir la ventana fija de la deslizante.
+- Imponer presupuestos en dinero por modelo, proveedor o usuario, y decidir qué ocurre al agotarlos.
+- Usar `cf-aig-request-timeout`, `cf-aig-max-attempts`, `cf-aig-retry-delay` y `cf-aig-backoff` con criterio.
+- Diseñar un `fallback` a otro modelo o proveedor y entender cuándo reintentar es peor que desviar.
+
+</Objetivos>
+
+## Poner un techo: caudal y presupuesto
+
+El límite más básico cuenta peticiones por unidad de tiempo. Se configura en el gateway con tres valores —el intervalo, el número máximo y la técnica— y se aplica de forma uniforme a todo el tráfico que lo atraviesa. Cuando se supera, la respuesta es un `429 Too Many Requests` y la petición no llega al proveedor: no se gasta nada.
+
+La elección de técnica no es cosmética. Con **ventana fija**, el tiempo se trocea en bloques y el contador se reinicia al empezar cada bloque: con un límite de diez peticiones cada diez minutos, diez a las 12:09 y otras diez a las 12:11 pasan las veinte, porque caen en bloques distintos. Con **ventana deslizante**, se mira siempre hacia atrás desde ahora, así que ese mismo patrón se rechaza: hubo veinte en los últimos diez minutos. La fija es más barata y permite ráfagas en la frontera; la deslizante es más justa y más estricta.
+
+Esa diferencia deja de ser teórica en cuanto tu tráfico tiene ritmo propio. Un trabajo programado que arranca en punto, un panel que refresca al cambiar de minuto o un cliente que reintenta a intervalos redondos son máquinas de fabricar exactamente el patrón que la ventana fija deja pasar y la deslizante frena. Si tu objetivo es proteger un presupuesto, la deslizante refleja mejor la intención; si lo que quieres es simplemente que nadie abuse, la fija basta y cuesta menos.
+
+<Callout type="tip" title="Contar peticiones no es contar dinero">
+El caudal es un mal `proxy` del coste, porque una petición puede costar mil veces más que otra según el modelo y la longitud del contexto. Diez llamadas a un modelo pequeño y diez a uno de razonamiento con cien mil tokens de entrada son el mismo caudal y facturas incomparables. Por eso el límite de caudal protege de la ráfaga, pero no del presupuesto.
+</Callout>
+
+Para el presupuesto existen los **límites de gasto**, que cuentan dólares acumulados en una ventana en lugar de peticiones. El gateway estima el coste de cada llamada a partir de los tokens y del precio del modelo, y bloquea con `429` cuando la regla se supera. Puedes definir hasta veinte reglas y acotar cada una por modelo, por proveedor o por cualquier dimensión de metadatos propios: doscientos dólares al día por usuario, diez mil al día para todo el gateway, cincuenta al día para el modelo caro. Ahí está también la respuesta a "limitar por usuario": el gateway no conoce a tus usuarios, así que se los tienes que contar tú etiquetando cada petición.
+
+```ts
+// el identificador de usuario viaja como metadato y habilita limites por persona
+const respuesta = await fetch(GATEWAY_URL, {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${env.CF_API_TOKEN}`,
+    "Content-Type": "application/json",
+    "cf-aig-metadata": JSON.stringify({ userId: usuario.id, plan: usuario.plan }),
+  },
+  body: JSON.stringify({ model: "openai/gpt-4.1-mini", messages }),
+});
+```
+
+Dos matices que hay que interiorizar. Primero: los límites de gasto son **eventualmente consistentes**, porque el coste real de una petición solo se conoce al terminarla, así que una ráfaga concurrente puede rebasar el techo antes de que la aplicación del límite lo alcance. Segundo: el coste es una estimación basada en tokens y tarifas; la verdad contable sigue estando en la factura del proveedor.
+
+Ninguno de los dos matices invalida la herramienta, pero sí determina cómo se usa. Un presupuesto eventualmente consistente no sirve para garantizar que jamás gastarás más de una cifra exacta; sirve para garantizar que un desbordamiento se detiene en segundos en lugar de en semanas, que es la diferencia entre un incidente y una quiebra. Fija el techo con margen, no al céntimo, y trátalo como un cortacircuitos y no como una caja registradora.
+
+## Sobrevivir al fallo pasajero
+
+Un proveedor de IA falla de maneras muy distintas y no todas merecen la misma reacción. Un `500` puntual o un `429` del propio proveedor son ruido: casi siempre desaparecen si vuelves a preguntar un instante después. Una petición que se queda colgada es otra cosa: no falla, simplemente no vuelve, y bloquea tu Worker consumiendo su tiempo de vida.
+
+Para lo segundo está `cf-aig-request-timeout`, que corta la espera en milisegundos y, muy importante, **convierte una lentitud en un evento accionable**: al vencer, dispara el reintento o el fallback en lugar de dejarte esperando. Para lo primero están los reintentos automáticos, con tres perillas: cuántos intentos como máximo —hasta cinco—, cuánto esperar entre ellos —hasta cinco segundos— y con qué forma crece esa espera.
+
+Elegir el tiempo de espera es donde más gente se equivoca, y casi siempre por lo mismo: se pone un número redondo en lugar de mirar los datos. El valor correcto sale de tu propia distribución de latencias, un poco por encima del percentil alto que consideras aceptable. Demasiado corto y cortarás respuestas legítimas que solo tardaban un poco más de lo normal, pagando la inferencia sin quedártela; demasiado largo y habrás construido un detector de problemas que avisa cuando el usuario ya se fue.
+
+```bash
+# reintenta hasta 3 veces con espera creciente y corta a los 4 segundos
+curl "https://gateway.ai.cloudflare.com/v1/$CF_ACCOUNT_ID/mi-gateway/workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast" \
+  --header "Authorization: Bearer $CF_API_TOKEN" \
+  --header "Content-Type: application/json" \
+  --header "cf-aig-request-timeout: 4000" \
+  --header "cf-aig-max-attempts: 3" \
+  --header "cf-aig-retry-delay: 500" \
+  --header "cf-aig-backoff: exponential" \
+  --data '{"prompt": "Explica el backoff exponencial"}'
+```
+
+La forma del `backoff` importa más de lo que parece cuando el fallo no es tuyo sino del proveedor. Con `constant` todos tus clientes reintentan al mismo ritmo y golpean a la vez un servicio ya tocado. Con `linear` la presión crece más despacio. Con `exponential` cada intento espera el doble que el anterior, que es la única de las tres que reduce activamente la carga sobre quien está sufriendo. En el último intento el gateway espera lo que haga falta, sin cortar.
+
+Estas políticas pueden vivir en el gateway, aplicándose a todo el tráfico sin que el cliente sepa nada, o venir por cabecera en cada petición. La combinación útil es dejar una política razonable por defecto en el gateway y afinarla solo donde la latencia percibida importe.
+
+Antes de configurar nada conviene clasificar los fallos, porque reintentar el error equivocado es a la vez inútil y caro.
+
+<Cards>
+  <Card icon="🔁" title="Reintenta">
+    Errores de servidor puntuales, cortes de conexión y saturación temporal del proveedor. Son ruido estadístico y desaparecen con una espera creciente.
+  </Card>
+  <Card icon="⏳" title="Corta y desvía">
+    Peticiones que no vuelven. No hay error que reintentar, solo espera; el tiempo de espera las convierte en un evento y el `fallback` las resuelve.
+  </Card>
+  <Card icon="🚫" title="No reintentes jamás">
+    Credenciales inválidas, modelo inexistente, petición mal formada o contenido rechazado por política. Reintentar reproduce el mismo fallo cinco veces más lento.
+  </Card>
+  <Card icon="💸" title="Ni reintentes ni desvíes">
+    Tu propio límite de gasto agotado. Es la política funcionando, no un fallo: insistir sería exactamente lo contrario de lo que pediste.
+  </Card>
+</Cards>
+
+Esa última tarjeta merece énfasis porque es el error de diseño más común al montar todo esto junto: tratar tu propio `429` como si fuera un problema del proveedor. Si tu cliente reintenta cuando el gateway le dice que se ha pasado de presupuesto, has construido un sistema que se pelea consigo mismo y que convierte un límite en una tormenta de peticiones rechazadas.
+
+## Cambiar de caballo: el fallback
+
+Reintentar solo tiene sentido si el fallo es pasajero. Si un proveedor está caído de verdad, cinco intentos son cinco esperas inútiles antes del mismo error, y encima has multiplicado por cinco la latencia de tu respuesta de fallo. Ahí la respuesta correcta no es insistir: es ir a otro sitio.
+
+Vale la pena decirlo con precisión, porque el matiz cambia el diseño: reintentar apuesta a que el mismo destino se recupere, y desviar apuesta a que el fallo esté correlacionado con ese destino concreto. La primera apuesta se paga en tiempo; la segunda, en una respuesta posiblemente distinta. Cuando el corte dura minutos, la primera es un desastre silencioso y la segunda es la única que mantiene el producto en pie.
+
+Eso es el **enrutamiento dinámico**: en lugar de fijar un modelo en el código, defines una ruta con nombre y versión —una especie de pequeño flujo— que evalúa condiciones, aplica cuotas y elige modelo con alternativas. Tu aplicación pide `dynamic/soporte` como si fuera un modelo, y la decisión real de a quién llamar vive en la configuración, versionada y con vuelta atrás inmediata.
+
+<Mermaid code={`flowchart TB
+  IN[Peticion con metadatos de usuario] --> COND{Plan del usuario}
+  COND -- de pago --> BUD{Presupuesto disponible}
+  COND -- gratuito --> SMALL[Modelo pequeno y barato]
+  BUD -- si --> BIG[Modelo grande del proveedor A]
+  BUD -- no --> SMALL
+  BIG -- error o timeout --> ALT[Modelo equivalente del proveedor B]
+  style BIG fill:#89b4fa,color:#11111b
+  style ALT fill:#a6e3a1,color:#11111b
+  style SMALL fill:#f9e2af,color:#11111b`} />
+
+Esa misma pieza resuelve el caso elegante del presupuesto agotado: en lugar de bloquear con `429`, la ruta desvía a un modelo más barato. El usuario nota una respuesta algo peor; no nota una caída. Cuando algo se desvía, la cabecera de respuesta `cf-aig-step` te dice qué paso del flujo acabó atendiendo la petición, que es tu única forma de saber en producción si estás sirviendo desde el plan A o desde el plan C.
+
+Hay una advertencia que suele descubrirse tarde: **el fallback no es transparente para la calidad**. Un modelo alternativo puede aceptar el mismo formato de petición y devolver algo bastante peor, o ignorar una instrucción del prompt de sistema que el principal respetaba. Si desvías sin medir, cambias una caída visible por una degradación invisible, que a veces es peor porque nadie la investiga. Por eso el paso que atendió cada petición debe acabar en tus métricas junto al coste y la latencia.
+
+## Dónde vive cada freno
+
+Las cinco piezas de este capítulo no son alternativas: forman una cadena que se recorre en orden, y cada eslabón existe porque el anterior no basta. Entender esa secuencia evita el error clásico de resolver con reintentos lo que era un problema de presupuesto, o con presupuesto lo que era un problema de caudal.
+
+| Eslabón | Pregunta que responde | Dónde se declara |
+| --- | --- | --- |
+| Caudal | Cuántas peticiones admito por ventana | Ajustes del gateway |
+| Presupuesto | Cuánto dinero admito por dimensión | Reglas de gasto, hasta veinte |
+| Tiempo de espera | Cuánto tolero que tarde una llamada | Ajustes o cabecera por petición |
+| Reintento | Qué hago si el fallo parece pasajero | Política del gateway o cabeceras |
+| Fallback | Qué hago si el fallo no lo es | Nodos de una ruta dinámica |
+
+El criterio para elegir el nivel donde declarar cada cosa es sencillo: lo que debe cumplirse siempre y para todos va en el gateway, porque así aplica también al tráfico que aún no has escrito; lo que depende de la petición concreta viaja en cabeceras, porque solo quien la emite conoce su urgencia; y lo que expresa una decisión de negocio con ramas y versiones vive en una ruta dinámica, porque necesita revisarse y revertirse sin desplegar.
+
+Un detalle de orden que ahorra sorpresas: los frenos se evalúan antes de llamar al proveedor y por eso una petición rechazada no cuesta inferencia, mientras que los reintentos y el desvío ocurren después, cuando ya has pagado el intento fallido. Eso significa que un tiempo de espera generoso combinado con cinco reintentos puede costarte cinco inferencias parciales antes de rendirte. Frenar es gratis; insistir no.
+
+<Callout type="note" title="Los reintentos se multiplican hacia arriba">
+Si tu cliente reintenta tres veces, el gateway otras tres y el proveedor internamente alguna más, un fallo aislado se convierte en nueve llamadas y tu latencia de error se dispara. Decide en qué capa vive el reintento y desactívalo en las demás. La regla práctica es ponerlo lo más cerca posible del fallo —el gateway— y dejar al cliente reaccionar solo a lo que ya viene rendido.
+</Callout>
+
+<Callout type="dios" title="Degradar con elegancia es una decisión de producto disfrazada de configuración">
+Lo que de verdad se aprende montando límites y alternativas no es una lista de cabeceras, sino a responder por adelantado una pregunta que casi ningún equipo se plantea hasta que la vive: qué debe pasar cuando no se puede hacer lo ideal. Un sistema sin esa respuesta solo tiene dos estados, funcionar o romperse, y por eso cualquier incidente del proveedor se convierte en una caída total del producto. Un sistema con la respuesta escrita tiene un gradiente: el modelo grande, el modelo mediano, el modelo pequeño, la respuesta cacheada de ayer, el mensaje honesto de que ahora mismo no. Ese gradiente no es infraestructura, es producto puro —alguien tiene que decidir si para tu negocio es peor una respuesta mediocre o ninguna respuesta, y esa decisión no la puede tomar el que escribe el `try` y el `catch`—. Lo notable de haberlo movido al punto de paso es que la decisión se vuelve explícita, legible y reversible: deja de estar enterrada en un `catch` de hace ocho meses que nadie recuerda haber escrito y pasa a ser una ruta versionada que puedes leer, discutir en equipo, desplegar y revertir en segundos sin tocar la aplicación. Y hay un segundo efecto, más sutil y más valioso a largo plazo: cuando degradar es barato y está declarado, dejas de tener miedo a usar el modelo caro. Puedes permitirte lo mejor precisamente porque tienes escrito qué ocurre cuando lo mejor no está disponible o cuando ya has gastado lo que decidiste gastar. La resiliencia, bien montada, no es una red bajo el trapecio: es lo que te deja saltar más alto.
+</Callout>
+
+<Reto title="Escribe tu política de degradación">
+1. Elige entre ventana fija y deslizante para tu caso y defiende la elección con el ejemplo de la ráfaga en la frontera de la ventana.
+2. Diseña dos reglas de gasto complementarias: una que proteja a la empresa del total y otra que proteja al total de un solo usuario.
+3. Justifica un valor concreto de `cf-aig-request-timeout` a partir de la latencia real de tu modelo, no de una cifra redonda.
+4. Explica por qué `exponential` es preferible a `constant` cuando el error viene del proveedor y no de tu red.
+5. Dibuja el gradiente completo de tu producto ante un fallo total del proveedor principal, desde la degradación más suave hasta el mensaje de error, y di quién en tu equipo debería aprobar ese orden.
+</Reto>

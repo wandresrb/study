@@ -1,0 +1,147 @@
+---
+title: "Componer defensas: Turnstile, rate limit y Access en capas"
+description: "Cada pieza de este nivel responde a una pregunta distinta y ninguna responde a la de otra: Turnstile pregunta si hay un navegador gobernado por una persona, el límite de tasa pregunta si alguien va demasiado rápido, y Access pregunta quién eres antes de dejarte llamar a la puerta. La ingeniería no está en elegir una sino en ordenarlas, porque el orden decide cuánto cuesta rechazar a quien no debería estar ahí. Vemos las tres preguntas, la disciplina de filtrar de lo barato a lo caro, un formulario público y un endpoint interno resueltos de principio a fin, y el diseño del falso positivo, que es donde casi todas las defensas fracasan de verdad."
+subject: cloudflare
+level: 37
+order: 5
+icon: "37.5"
+duracion: "18 min"
+---
+
+<Lead>
+Las tres piezas de este nivel se confunden con facilidad porque las tres terminan devolviendo un rechazo, y visto desde el error un `403` se parece mucho a otro. Pero responden a preguntas que no se solapan en absoluto: `Turnstile` pregunta si al otro lado hay un navegador gobernado por una persona, el límite de tasa pregunta si alguien va demasiado rápido, y `Access` pregunta quién eres antes siquiera de dejarte llamar a la puerta. Ninguna sustituye a las otras, y usar una donde tocaba otra produce sistemas que se sienten seguros y no lo están. La ingeniería del nivel no está en elegir: está en ordenarlas.
+</Lead>
+
+<Objetivos>
+
+- Separar las tres preguntas: humanidad, velocidad e identidad, y no confundirlas.
+- Ordenar las capas de lo barato a lo caro para que rechazar cueste lo mínimo.
+- Resolver un formulario público y un endpoint interno con la composición adecuada.
+- Diseñar el falso positivo y la degradación, que es donde fracasan las defensas.
+
+</Objetivos>
+
+## Tres preguntas que no se solapan
+
+| Capa | Pregunta que responde | Público natural | Coste de comprobar |
+| --- | --- | --- | --- |
+| `WAF` de zona | ¿Esto es tráfico obviamente malo? | Todo el mundo | Nulo, antes del Worker |
+| Límite de tasa | ¿Vas demasiado rápido? | Anónimos \| identificados | Microsegundos, local |
+| `Turnstile` | ¿Hay una persona con un navegador? | Anónimos del público | Una subpetición |
+| `Access` | ¿Quién eres y puedes entrar? | Empleados \| socios \| máquinas | Verificación de token |
+
+La tabla se lee mal si se interpreta como un menú del que se elige una fila. Se lee bien como cuatro filtros con radios distintos: uno descarta lo evidente, otro contiene el volumen, otro separa personas de programas y el último separa a los conocidos de todos los demás. Un formulario público necesita los tres primeros y no puede usar el cuarto, porque exigir identidad a quien viene a contactarte contigo es cerrar la puerta que querías abrir. Un panel interno necesita el cuarto y casi puede prescindir de los otros.
+
+Hay además una asimetría temporal entre ellas que conviene tener en la cabeza. `Access` decide una vez y su decisión dura toda una sesión, así que su coste se amortiza. `Turnstile` decide una vez por envío y su veredicto caduca en minutos. El límite de tasa no decide nunca del todo: reevalúa en cada petición porque su objeto de estudio es precisamente el ritmo, algo que no existe en un instante aislado. Preguntas con horizontes distintos exigen mecanismos distintos, y ese es el motivo profundo de que ninguna pueda absorber a las otras.
+
+## El orden importa: de lo barato a lo caro
+
+Este es el principio operativo del nivel y se enuncia en una línea: rechaza lo antes posible, con la comprobación más barata que sea capaz de rechazarlo. Ponerlo del revés, verificar `Turnstile` con su subpetición antes de mirar un límite de tasa que se resuelve en memoria, significa que cada petición de una ráfaga te cuesta una llamada externa. El atacante ha logrado que pagues por rechazarlo.
+
+<Mermaid code={`flowchart TD
+  P[peticion entrante] --> W[WAF de zona]
+  W --> RL[limite de tasa por clave]
+  RL --> ID{hay identidad}
+  ID -->|si| AC[verificar token de Access]
+  ID -->|no| TS[verificar token de Turnstile]
+  AC --> L[logica y escrituras]
+  TS --> L
+  RL -.rechazo 429.-> F[respuesta barata]
+  TS -.rechazo 403.-> F
+  style RL fill:#89b4fa,color:#11111b
+  style L fill:#a6e3a1,color:#11111b`} />
+
+```ts
+export default {
+  async fetch(request, env, ctx): Promise<Response> {
+    const ip = request.headers.get("CF-Connecting-IP") ?? "sin-ip";
+
+    // 1. barato y local: contiene el volumen antes de gastar nada
+    const tasa = await env.LIMITE_FORM.limit({ key: `form:${ip}` });
+    if (!tasa.success) {
+      return new Response("Demasiados envios", {
+        status: 429,
+        headers: { "Retry-After": "60" },
+      });
+    }
+
+    // 2. una subpeticion: solo para quien ya paso el filtro anterior
+    const form = await request.formData();
+    const veredicto = await verificarTurnstile(env, form, ip);
+    if (!veredicto.success || veredicto.action !== "contacto") {
+      return new Response("Verificacion fallida", { status: 403 });
+    }
+
+    // 3. lo caro: escrituras, correo, inferencia
+    ctx.waitUntil(env.COLA_CONTACTO.send(Object.fromEntries(form)));
+    return new Response("Recibido", { status: 202 });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+## Dos casos resueltos
+
+El formulario público de contacto es el caso canónico y ya está arriba: límite de tasa por `IP` y por operación, `Turnstile` con su `action` comprobada, y el trabajo caro desplazado a una cola. Nada de identidad, porque el visitante no tiene ninguna y exigírsela contradice el propósito del formulario.
+
+El endpoint interno es la imagen especular. Aquí `Access` va delante de todo y filtra en la frontera: quien no tenga una identidad válida de tu proveedor no llega ni a ejecutar tu Worker. Lo que sí debe hacer tu código es verificar el token que `Access` inyecta, en lugar de dar por hecho que la puerta hizo su trabajo.
+
+```ts
+async function identidadDeAccess(request: Request, env: Env) {
+  const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!jwt) return null;
+
+  // las claves publicas del equipo viven en el endpoint de certificados
+  const claves = await obtenerClaves(env.ACCESS_TEAM_DOMAIN);
+  const payload = await verificarJwt(jwt, claves, env.ACCESS_AUD);
+  return payload ? { correo: payload.email, sujeto: payload.sub } : null;
+}
+```
+
+Hay un tercer caso intermedio que conviene nombrar porque se resuelve mal con frecuencia: el endpoint que consume otra máquina. No hay navegador, así que `Turnstile` es imposible por definición y forzarlo solo produce integraciones rotas. Tampoco hay persona a la que enviar a un proveedor de identidad. Lo que encaja son los tokens de servicio de `Access`, un par de credenciales que el cliente presenta en cabeceras y que la frontera valida antes de tu código, combinados con un límite de tasa por identidad de cliente y no por dirección de red, porque un integrador serio saldrá desde direcciones que cambian.
+
+<Callout type="warn" title="Verifica el token aunque Access esté delante">
+Confiar en que una capa anterior ya filtró es el error clásico de la defensa en capas mal entendida. Si tu Worker también responde en un dominio de trabajo, o si alguien reconfigura una ruta, ese endpoint queda expuesto sin que nadie lo note. Verificar el `JWT` contra las claves públicas de tu equipo y comprobar su audiencia cuesta muy poco y convierte una suposición de configuración en una garantía de código. Para máquinas, los tokens de servicio de `Access` cumplen el mismo papel sin navegador ni persona.
+</Callout>
+
+<Cards>
+  <Card icon="🧱" title="Capas, no muros">
+    Cada filtro es imperfecto por separado. El valor no está en la fuerza de uno sino en que un atacante deba superar preguntas de naturaleza distinta.
+  </Card>
+  <Card icon="💸" title="Barato primero">
+    Ordena por coste de comprobación. Si rechazar cuesta más que atender, la defensa se ha convertido en el vector.
+  </Card>
+  <Card icon="🎚️" title="Adapta, no endurezcas">
+    Sube la exigencia con la señal: primer envío sin fricción, tercero en un minuto con comprobación visible, décimo con espera.
+  </Card>
+  <Card icon="🩹" title="Diseña el falso positivo">
+    El usuario legítimo rechazado es el coste real de toda defensa. Que pueda reintentar sin perder lo escrito no es cortesía, es diseño.
+  </Card>
+</Cards>
+
+## Fallar bien
+
+Queda la parte que casi nadie escribe y que decide si la composición sirve. Toda defensa probabilística produce falsos positivos, así que la pregunta no es si rechazarás a un cliente legítimo sino qué le ocurrirá cuando pase. Si su formulario se vacía, si el mensaje de error es un `403` desnudo o si no hay forma de reintentar, tu defensa está causando más pérdida que el abuso que evitaba.
+
+La forma madura de reducir ese coste no es aflojar los números, es escalonar la exigencia. El primer envío de un visitante puede pasar sin ninguna fricción visible; el tercero en un minuto ya justifica una comprobación con widget; el décimo merece una espera explícita. La señal que dispara cada escalón la tienes ya, porque es el propio contador de tasa: en lugar de usarlo solo para rechazar, úsalo para decidir cuánta prueba pedir.
+
+```ts
+const suave = await env.LIMITE_SUAVE.limit({ key: `form:${ip}` });
+const duro = await env.LIMITE_DURO.limit({ key: `form:${ip}` });
+
+if (!duro.success) return respuesta429();
+const exigirPrueba = !suave.success; // solo a partir del segundo escalon
+```
+
+Y queda la pregunta gemela: qué haces cuando la propia defensa no está disponible. Si el servicio de validación de `Turnstile` no responde, ¿rechazas a todo el mundo o dejas pasar sin comprobar? Ninguna respuesta es universalmente correcta, y esa es exactamente la razón por la que debe ser una decisión consciente y anotada, distinta para el formulario de contacto que para el endpoint que mueve dinero. Lo inaceptable no es elegir mal: es no haber elegido y descubrir tu política de fallo en producción.
+
+<Callout type="dios" title="Ninguna capa es la defensa; la defensa es el orden entre ellas">
+La seguridad de una aplicación pública rara vez se pierde por la debilidad de un mecanismo concreto, y por eso invertir todo el esfuerzo en fortalecer la pieza más visible produce tan poca mejora real. Se pierde en las costuras: en el endpoint que quedó fuera del alcance de la regla, en la capa que se saltó porque otra ya lo había comprobado, en la comprobación que se hizo después de la escritura que pretendía proteger. Componer defensas no es apilar productos, es responder con precisión a una pregunta por capa y no permitir jamás que una responda a la pregunta de otra, porque un límite de tasa no distingue a un humano de un programa, `Turnstile` no sabe quién eres y `Access` no tiene la menor opinión sobre si vas demasiado rápido. Cuando cada capa contesta exactamente lo suyo, el sistema adquiere una propiedad que ninguna pieza posee en solitario: un atacante ya no necesita romper una cosa sino satisfacer simultáneamente condiciones de naturaleza incompatible, comportarse como un navegador real, hacerlo despacio y además ser alguien conocido. Esa incompatibilidad es toda la fuerza del esquema, y depende por completo del orden, porque una capa colocada detrás de la que debía proteger no defiende nada y sí encarece cada rechazo. Pero hay una segunda mitad que se olvida más que la primera y que separa al ingeniero del entusiasta de la seguridad. Toda defensa impone un impuesto a los inocentes, y ese impuesto es real, medible y a menudo mayor que el daño que se estaba evitando: usuarios que abandonan un formulario, clientes que no completan una compra, personas legítimas que reciben un error que no entienden y no vuelven. La pregunta madura, entonces, nunca es cuánto abuso he detenido, sino cuánto abuso he detenido por cada usuario legítimo al que he estorbado, y si conozco la respuesta con números o solo con intuiciones. Quien mide las dos caras acaba construyendo defensas adaptativas, silenciosas para la inmensa mayoría y firmes solo donde hay señal. Quien mide una sola construye una fortaleza impecable, vacía por dentro.
+</Callout>
+
+<Reto title="Ordena las capas y mide el impuesto">
+1. Monta un formulario público con límite de tasa por `IP` y `Turnstile` con `action` comprobada, y coloca la escritura y el envío de correo después de ambos filtros, en una cola.
+2. Invierte deliberadamente el orden, verificando el token antes del límite, y mide el coste de una ráfaga de doscientas peticiones en cada disposición.
+3. Protege un endpoint interno con `Access` y verifica el `JWT` dentro del Worker. Comprueba qué ocurre si llegas al mismo Worker por una ruta que `Access` no cubre.
+4. Escribe una política de fallo explícita para cuando la validación de `Turnstile` no responda, distinta para el formulario de contacto y para un endpoint que cobra. Justifica cada elección.
+5. Instrumenta los rechazos con su capa y su motivo, y estima durante una semana cuántos usuarios legítimos estorbaste por cada abuso detenido.
+</Reto>

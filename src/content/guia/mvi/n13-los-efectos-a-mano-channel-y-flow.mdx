@@ -1,0 +1,145 @@
+---
+title: "Los efectos a mano: un canal privado expuesto como flujo"
+description: "El estado a mano fue sencillo; los efectos son donde se concentran las decisiones difíciles. Esta lección construye el canal de eventos de una sola vez sin librería: elección de capacidad y política de desbordamiento, exposición como flujo de solo lectura, el dilema entre enviar suspendiendo y enviar sin suspender, el cierre del canal cuando muere el componente y las tres trampas —consumo múltiple, emisión desde el hilo equivocado y efecto emitido antes de que exista consumidor— que separan una implementación correcta de una que parece correcta."
+subject: mvi
+level: 13
+order: 2
+icon: "13.2"
+duracion: "19 min"
+---
+
+<Lead>
+Si el estado a mano cabía en tres líneas honestas, los efectos exigen algo más de criterio, porque aquí toda decisión tiene un modo de fallo asociado y ninguno de esos modos se manifiesta en el camino feliz. Un canal mal dimensionado pierde el aviso justo cuando el usuario dejó la app en segundo plano; un canal mal expuesto permite que la interfaz emita órdenes que la lógica nunca dio; un canal mal cerrado deja corrutinas suspendidas indefinidamente sobre un componente muerto. La buena noticia es que el ecosistema de corrutinas ya trae una primitiva construida exactamente para esta semántica, y que las decisiones son pocas y enumerables. La mala es que hay que tomarlas conscientemente, porque ninguna librería las va a tomar por ti.
+</Lead>
+
+<Objetivos>
+
+- Construir un canal de efectos privado y exponerlo como flujo de solo lectura sin filtrar el extremo de escritura.
+- Elegir capacidad y política de desbordamiento razonando sobre el peor caso y no sobre el habitual.
+- Distinguir cuándo emitir suspendiendo y cuándo emitir sin suspender, y qué se pierde en cada caso.
+- Identificar las tres trampas clásicas: consumo múltiple, emisión sin corrutina y cierre del canal.
+
+</Objetivos>
+
+## El canal privado y su proyección pública
+
+La estructura repite la asimetría del estado, y no por simetría estética sino por la misma razón: el extremo de escritura debe quedar confinado. Un `Channel` expone métodos de envío y de cierre; si lo publicas tal cual, cualquier consumidor puede emitir una navegación falsa o cerrar el canal y dejar la pantalla sorda para siempre.
+
+```kotlin
+private val _efectos = Channel<CarritoEfecto>(capacity = Channel.BUFFERED)
+val efectos: Flow<CarritoEfecto> = _efectos.receiveAsFlow()
+```
+
+La función `receiveAsFlow` devuelve un flujo que consume del canal y que no ofrece ninguna vía para escribir en él. Conviene distinguirla de su hermana `consumeAsFlow`, que además cierra el canal cuando la recolección termina: usarla aquí sería un error grave, porque la primera rotación de pantalla cancelaría la recolección, cerraría el canal y todos los efectos posteriores morirían en silencio. Ese fallo es especialmente cruel porque no lanza excepción ni deja rastro en los registros: simplemente, a partir de la primera rotación, la aplicación deja de navegar.
+
+<Mermaid code={`flowchart LR
+  L[Logica emite efecto] --> C[Channel privado con bufer]
+  C -->|receiveAsFlow| F[Flow publico]
+  F --> U[Interfaz consume una vez]
+  C -.->|sin consumidor activo| B[Retiene en el bufer]
+  style C fill:#f9e2af,color:#11111b
+  style F fill:#a6e3a1,color:#11111b`} />
+
+La propiedad que hace idóneo al canal es que retiene mientras no hay nadie escuchando y entrega a exactamente un receptor cuando aparece. Un flujo difusor sin repetición, en cambio, emite al vacío si nadie se ha suscrito todavía y duplica la entrega si hay dos suscriptores. Ambas diferencias importan justo en los dos escenarios que más se dan en Android: el efecto emitido durante la inicialización y la breve ventana en que dos instancias de la interfaz coexisten durante una transición.
+
+<Callout type="warn" title="consumeAsFlow es una bomba de relojería en Android">
+La diferencia entre `receiveAsFlow` y `consumeAsFlow` cabe en una palabra y cuesta una tarde de depuración. La segunda marca el canal como consumido al terminar la recolección, y en Android la recolección termina cada vez que la pantalla pasa a segundo plano si usas la recolección consciente del ciclo de vida. El síntoma es siempre el mismo: todo funciona hasta que el usuario rota el dispositivo o vuelve de otra app, y a partir de ahí ningún efecto llega. Si ves ese patrón en un proyecto ajeno, mira esta línea antes que ninguna otra.
+</Callout>
+
+## Capacidad, desbordamiento y la forma de emitir
+
+Elegir capacidad es decidir qué ocurre cuando el productor va más rápido que el consumidor, y ese escenario no es teórico en Android: basta con que el usuario pulse el botón de inicio mientras una corrutina termina de emitir avisos.
+
+<Cards>
+  <Card icon="📦" title="Con búfer">
+    Cola de tamaño razonable que absorbe la ventana entre emitir y empezar a coleccionar. Elección por defecto salvo motivo escrito.
+  </Card>
+  <Card icon="🚦" title="Sin búfer">
+    El emisor se suspende hasta que alguien reciba. No pierde nada y puede dejar corrutinas esperando mientras la pantalla está oculta.
+  </Card>
+  <Card icon="♾️" title="Ilimitado">
+    Nunca suspende ni descarta, a cambio de que una fuga de emisiones se convierta en una fuga de memoria silenciosa.
+  </Card>
+</Cards>
+
+La política de desbordamiento es la segunda mitad de la decisión. Descartar el elemento más antiguo suele ser la peor opción para efectos, porque elimina justo el que llevaba más tiempo esperando y que casi siempre inicia una secuencia con sentido; descartar el más reciente pierde la reacción a lo último que hizo el usuario, que es lo que este está mirando. Suspender al emisor conserva todo y traslada la presión hacia atrás, hacia la corrutina que produce, que es donde suele poder gestionarse mejor.
+
+```kotlin
+private fun borrar(id: String) = viewModelScope.launch {
+    repo.borrar(id)
+    _efectos.send(CarritoEfecto.ConfirmarBorrado)
+}
+
+private fun avisarSinSuspender(efecto: CarritoEfecto) {
+    val resultado = _efectos.trySend(efecto)
+    if (resultado.isFailure) log.warn("efecto descartado: $efecto")
+}
+```
+
+Hay un tercer eje que casi nunca se discute y que determina si el canal se comporta bien bajo presión: desde dónde se emite. La versión suspendida solo puede llamarse dentro de una corrutina, y esa restricción es informativa, porque señala que el efecto forma parte de una secuencia con un antes y un después. La versión que no suspende puede llamarse desde cualquier sitio, incluida una devolución de llamada de la plataforma o un manejador de errores síncrono, y esa libertad es justamente lo que la vuelve peligrosa: nada te avisa de que estás emitiendo fuera de todo alcance estructurado y, por tanto, sin ninguna garantía de orden respecto de las reducciones que la rodean.
+
+Las dos formas de emitir responden a preguntas distintas. La función suspendida garantiza la entrega a costa de poder detener la corrutina emisora; es la correcta dentro de un flujo de trabajo donde el efecto forma parte de la secuencia. La versión que no suspende devuelve un resultado que indica si el envío tuvo éxito, y es la única disponible desde un contexto no suspendido. El pecado habitual es ignorar ese resultado, con lo que un efecto perdido se vuelve invisible; registrar el fallo, aunque sea con una advertencia, convierte un misterio futuro en una línea de registro.
+
+<Callout type="tip" title="El efecto emitido durante la inicializacion es el caso de prueba">
+Si quieres saber en treinta segundos si una implementación de efectos a mano es correcta, busca el caso del efecto emitido en el bloque de inicialización, antes de que la interfaz exista. Con búfer, ese efecto espera y se entrega en cuanto aparece el primer consumidor. Sin búfer, la corrutina de inicialización se queda suspendida hasta que alguien colecciona, lo cual funciona pero retrasa toda la carga inicial. Con un flujo difusor sin repetición, se pierde para siempre. Ese único caso discrimina las tres implementaciones mejor que cualquier test de camino feliz.
+</Callout>
+
+## Consumir una vez y morir limpiamente
+
+El extremo receptor tiene su propia trampa, y es la más frecuente de todas: coleccionar el mismo flujo de efectos desde dos sitios. Como el canal reparte en vez de difundir, dos recolectores activos no duplican los efectos sino que se los reparten de forma no determinista, y el síntoma es que aproximadamente la mitad de las navegaciones no ocurren. Es un fallo intermitente, dependiente de tiempos, y por eso especialmente caro de diagnosticar.
+
+```kotlin
+@Composable
+fun CarritoPantalla(vm: CarritoViewModel, nav: NavController) {
+    val estado by vm.estado.collectAsStateWithLifecycle()
+    val ciclo = LocalLifecycleOwner.current
+
+    LaunchedEffect(vm, ciclo) {
+        ciclo.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            vm.efectos.collect { efecto ->
+                when (efecto) {
+                    is CarritoEfecto.IrAlPago -> nav.navigate("pago")
+                    CarritoEfecto.ConfirmarBorrado -> Unit
+                }
+            }
+        }
+    }
+}
+```
+
+La regla es un consumidor por canal, situado en el punto más alto del árbol de la interfaz que tenga acceso a todo lo que los efectos necesitan. Si dos pantallas deben reaccionar al mismo suceso, entonces ese suceso no era un efecto de pantalla sino una notificación de aplicación, y su sitio natural es otro flujo, difusor y de ámbito superior.
+
+Queda el cierre. Un canal no cerrado mantiene vivos sus elementos en el búfer y puede dejar suspendida indefinidamente a una corrutina que intentaba enviar sin espacio. Cuando el componente muere, cerrarlo es una cortesía barata que convierte esa suspensión eterna en una excepción de canal cerrado, capturable y visible.
+
+```kotlin
+override fun onCleared() {
+    _efectos.close()
+    super.onCleared()
+}
+```
+
+Falta una garantía que el canal no da y que a menudo se supone: el orden entre una reducción y un efecto emitidos por la misma operación. Estado y efectos viajan por dos transportes independientes, así que la interfaz puede recibir el efecto antes de haber renderizado el estado que lo acompaña. En la práctica esto se manifiesta cuando un efecto de navegación llega antes de que la pantalla de destino tenga los datos que espera encontrar en el estado.
+
+```kotlin
+private fun pagar() = viewModelScope.launch {
+    val pedido = repo.confirmar(actual.lineas)
+    reducir { it.copy(pedido = pedido) }            // primero el estado
+    _efectos.send(CarritoEfecto.IrAlPago(pedido.id)) // despues el efecto
+}
+```
+
+La regla práctica es reducir antes de emitir y hacer que el efecto transporte todo lo que su destinatario necesite, de modo que no dependa de haber leído el estado. Escrito así, el orden deja de ser una suposición sobre transportes y pasa a ser una propiedad del propio efecto.
+
+Este es también el punto donde la implementación a mano empieza a mostrar su verdadero coste: nada de lo anterior es difícil, pero todo es fácil de olvidar, y olvidarlo produce fallos que no aparecen en desarrollo. Esa asimetría entre dificultad y fragilidad es el argumento central del debate que cierra este nivel.
+
+<Callout type="dios" title="El canal es una decision sobre que estas dispuesto a perder">
+Detrás de la elección de capacidad y política de desbordamiento hay una pregunta que casi nadie formula en voz alta y que define la seriedad de un sistema: ¿qué prefieres que ocurra cuando la realidad no colabora? Todo transporte de mensajes finito tiene que responderla, porque la memoria es finita y el consumidor puede desaparecer, y no responderla explícitamente significa haber respondido por omisión y sin saberlo. Un canal ilimitado responde *no pierdo nada y acepto crecer sin límite*, que en una pantalla es casi siempre una mentira cómoda: si tu productor puede emitir sin freno, la fuga llegará. Un canal conflado responde *solo importa lo último*, cierto para un indicador de progreso y catastrófico para una secuencia de navegaciones. Un canal con búfer y suspensión responde *no pierdo nada y traslado la presión al productor*, que es la respuesta más honesta porque hace visible el problema donde puede resolverse. Al usar una librería, esta respuesta viene dada por defecto y suele ser sensata, pero es una respuesta que alguien tomó por ti y que rara vez revisas. Escribir el canal a mano no te hace mejor ingeniero por escribir las líneas: te lo hace porque te obliga a mirar de frente la pregunta y a comprometerte con una respuesta que puedas defender en una revisión. La madurez arquitectónica no consiste en no perder nunca nada, cosa imposible, sino en saber exactamente qué pierdes y haberlo elegido.
+</Callout>
+
+<Reto title="Construye y rompe tu canal de efectos">
+1. Implementa el canal de efectos con búfer, exponlo con `receiveAsFlow` y comprueba que la interfaz no puede emitir ni cerrar.
+2. Cámbialo a `consumeAsFlow`, rota la pantalla y documenta el momento exacto en que los efectos dejan de llegar.
+3. Emite un efecto en el bloque de inicialización y verifica que llega. Repite el experimento con un flujo difusor sin repetición y explica la diferencia.
+4. Colecciona el flujo de efectos desde dos puntos de la interfaz a la vez y mide qué proporción de efectos recibe cada uno.
+5. Elige una capacidad y una política de desbordamiento para tu pantalla y escribe el párrafo que justificaría esa elección ante un revisor escéptico.
+</Reto>

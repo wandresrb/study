@@ -1,0 +1,150 @@
+---
+title: "R2 e Hyperdrive: los bytes grandes y la base que ya tienes"
+description: "Las dos ramas del árbol que se resuelven antes de deliberar, porque no responden a preferencias sino a restricciones. R2 existe porque hay bytes que ninguna otra pieza puede sostener —el techo de cada almacén dibuja la frontera— y porque sin cargos de egress cambia la economía de servir medios. Hyperdrive existe porque el mundo está lleno de bases relacionales que ya funcionan y no se van a mover. Cómo separar bytes de metadatos con R2 y D1 trabajando juntos, cuándo Hyperdrive gana a D1 sin discusión, y por qué acelerar lo que ya existe es una decisión arquitectónica tan legítima como reemplazarlo."
+subject: cloudflare
+level: 27
+order: 4
+icon: "27.4"
+duracion: "16 min"
+---
+
+<Lead>
+Las dos primeras preguntas del árbol de decisión tienen algo en común que las separa de las demás: no las contestas tú. El tamaño de un vídeo no admite negociación, y una base de datos con diez años de esquema, extensiones y migraciones no desaparece porque a ti te parezca más elegante otra arquitectura. `R2` e `Hyperdrive` son las hojas donde caen esas dos restricciones del mundo, y por eso conviene resolverlas antes de entrar en cualquier debate de diseño. Una responde dónde viven los bytes que no caben en ningún otro sitio; la otra, cómo alcanzar unos datos que ya viven donde viven.
+</Lead>
+
+<Objetivos>
+
+- Situar `R2` por el techo de tamaño que ninguna otra pieza alcanza y por su economía sin egress.
+- Aplicar la separación entre bytes y metadatos con `R2` y `D1` cooperando.
+- Reconocer los cuatro casos en que `Hyperdrive` gana a `D1` sin discusión posible.
+- Entender que `Hyperdrive` no es un almacén, sino una capa que cambia el camino y no el origen.
+
+</Objetivos>
+
+## R2: los bytes que ninguna otra pieza aguanta
+
+Empecemos por la que menos discusión admite. La forma más rápida de entender por qué `R2` no compite con nadie es mirar los techos del resto del catálogo. `KV` admite valores de hasta 25 MB. Una fila o un `BLOB` de `D1` se queda en unos 2 MB. El estado de un `Durable Object` está pensado para valores pequeños y frecuentes. `R2` acepta objetos de hasta cinco terabytes usando subida por partes. No hay discusión de diseño que resuelva esa diferencia de escala: si el dato es un vídeo, una imagen original, una copia de seguridad, un modelo entrenado o un volcado en bruto, ya sabes dónde va.
+
+| Pieza | Techo por elemento |
+| --- | --- |
+| `KV` | 25 MB por valor |
+| `D1` | unos 2 MB por fila o `BLOB` |
+| `Durable Objects` | valores de estado pequeños |
+| `R2` | hasta 5 TB por objeto con subida por partes |
+
+Esa tabla no es una lista de carencias de las otras piezas, sino la huella de para qué fue tallada cada una. `D1` limita el tamaño de fila porque su motor está pensado para responder consultas rápidas sobre muchas filas pequeñas, y una fila de un gigabyte destruiría esa propiedad para todas las demás. `KV` acota el valor porque lo replica a cientos de puntos de presencia y el coste de propagar objetos enormes por toda la red sería absurdo. Los límites, otra vez, están describiendo el modelo.
+
+Hay una segunda razón, menos técnica y más económica, que decide arquitecturas enteras: `R2` no cobra por el tráfico de salida. En la nube tradicional, servir medios es un impuesto proporcional al éxito —cuanto más te ven, más pagas por sacar los bytes—, y ese impuesto empuja a decisiones defensivas como reducir calidad, limitar descargas o encerrar los datos donde ya están para no pagar por moverlos. Quitar el egress de la ecuación no es un descuento, es la eliminación de una restricción que llevaba años deformando diseños.
+
+<Callout type="tip" title="Compatible con S3 no es un detalle menor">
+`R2` habla la API de S3, y eso significa que tus herramientas, tus SDK, tus scripts de migración y tu conocimiento acumulado siguen sirviendo. La decisión de adoptarlo deja de ser un salto al vacío y se convierte en un cambio de destino: el mismo cliente, el mismo vocabulario de cubos, claves y subidas por partes, otra factura y otra red delante.
+</Callout>
+
+## El patrón de los dos almacenes
+
+Un apunte que ahorra sorpresas: la clave de un objeto en `R2` es una cadena plana, no una ruta de un sistema de ficheros. Las barras que escribes son convención humana y sirven para listar por prefijo, pero no existen directorios ni operaciones de renombrar carpetas. Diseñar la clave pensando que hay un árbol detrás lleva a esquemas de nombres que después no se pueden reorganizar sin copiar todo el cubo.
+
+`R2` guarda bytes opacos: no sabe qué hay dentro ni puede responder preguntas sobre su contenido. Por eso casi nunca aparece solo. El patrón canónico —y probablemente el más repetido de toda la plataforma— separa los bytes de sus **metadatos**: el objeto vive en `R2` y la fila que lo describe vive en `D1`, con el propietario, el nombre visible, el tipo, el tamaño, las fechas y, sobre todo, la clave que apunta al objeto.
+
+```ts
+// 1. los bytes van a R2, sin pasar por ninguna fila
+const clave = `usuarios/${usuarioId}/${crypto.randomUUID()}.mp4`;
+await env.MEDIA.put(clave, request.body, {
+  httpMetadata: { contentType: 'video/mp4' },
+});
+
+// 2. la fila que lo describe, y por la que se podra buscar, va a D1
+await env.DB
+  .prepare('INSERT INTO adjuntos (usuario_id, clave, nombre, tipo, bytes) VALUES (?, ?, ?, ?, ?)')
+  .bind(usuarioId, clave, nombre, 'video/mp4', tamano)
+  .run();
+```
+
+Nótese el orden de las dos operaciones, que no es casual. Primero se suben los bytes y solo después se registra la fila. Si el proceso se interrumpe entre medias, el resultado es un objeto huérfano en el cubo —invisible para la aplicación, barato de recoger con una limpieza periódica— en lugar de una fila que promete un fichero inexistente, que es un error que el usuario sí ve. Cuando dos sistemas deben quedar de acuerdo y no hay transacción que los abarque, el orden de escritura decide qué clase de inconsistencia te toca gestionar, y siempre conviene elegir la que nadie nota.
+
+La virtud del patrón es que cada pieza hace lo que sabe. `D1` responde a las preguntas —los adjuntos de este usuario, ordenados por fecha, filtrados por tipo— porque tiene índices y SQL. `R2` sirve los bytes sin ocupar memoria ni tiempo de CPU de tu Worker. Y la regla que lo mantiene sano es que nunca se guarda un blob dentro de una fila: se guarda un puntero. En cuanto alguien mete el fichero en la base porque así hay una sola cosa que gestionar, empiezan los problemas de tamaño, de coste por fila leída y de memoria en el edge.
+
+Cuando los bytes sí deben pasar por el Worker —porque hay que autorizar cada descarga, registrar el acceso o servir un rango concreto—, el modo correcto es transmitirlos sin materializarlos en memoria:
+
+```ts
+const objeto = await env.MEDIA.get(clave);
+if (!objeto) return new Response('no encontrado', { status: 404 });
+
+const cabeceras = new Headers();
+objeto.writeHttpMetadata(cabeceras); // tipo, codificacion, cache
+cabeceras.set('etag', objeto.httpEtag);
+
+// el cuerpo se transmite: el Worker nunca sostiene el fichero entero
+return new Response(objeto.body, { headers: cabeceras });
+```
+
+Conviene además recordar que `R2` no es solo para medios. Las copias de seguridad, los artefactos de compilación, los volcados analíticos en formatos columnares, los modelos entrenados y los archivos históricos que hay que conservar por obligación legal comparten exactamente el mismo perfil: bytes voluminosos, escritos una vez, leídos de forma esporádica y jamás consultados por contenido. Que la salida no se facture convierte a `R2` en un destino razonable incluso para datos que casi nunca se leen, porque el día que haya que sacarlos —una auditoría, una migración, un reproceso completo— ese movimiento no llega acompañado de una factura sorpresa.
+
+<Callout type="warn" title="No hagas que los bytes atraviesen tu Worker sin necesidad">
+Un Worker tiene límites de memoria y de tiempo de CPU. Canalizar un vídeo de un gigabyte a través de él para subirlo o servirlo es gastar ambos recursos en algo que la plataforma resuelve mejor: un cubo público para lo que es público, y URL prefirmadas para que el navegador hable directamente con `R2` en las subidas y descargas privadas. El Worker autoriza y registra; los bytes viajan por su cuenta.
+</Callout>
+
+## Hyperdrive: no es dónde, es cómo llegar
+
+Si `R2` es la rama que resuelve una restricción física, `Hyperdrive` es la que resuelve una restricción histórica, y por eso funciona de un modo que descoloca a quien lo mete en la misma lista que los demás.
+
+`Hyperdrive` rompe la simetría del catálogo porque no guarda ni un byte. Tus datos siguen en el Postgres de Neon, en el MySQL gestionado o en la instancia que administras; lo que cambia es el camino que tu Worker recorre para llegar. Si mañana lo apagas, la información sigue intacta: pierdes la aceleración, no los datos. Meterlo en la misma frase que `KV`, `R2` o `D1` sin aclarar esto es la fuente de casi toda la confusión que arrastra el producto.
+
+Esa aclaración cambia hasta el lugar que ocupa en el árbol de decisión. `Hyperdrive` no es una hoja alternativa a `D1` para el mismo hecho, sino la respuesta a una pregunta previa: si el dato ya vive en un sistema que no se mueve, la elección de almacenamiento estaba tomada antes de que tú llegaras, y lo único que queda por decidir es el camino.
+
+El problema que resuelve nace del choque entre dos modelos. Un Worker se ejecuta en cientos de ubicaciones y es efímero; un Postgres vive en una sola región y espera conexiones longevas. Abrir una conexión nueva cuesta varios viajes de red para el saludo de TCP, TLS y autenticación, y cientos de isolates intentándolo a la vez desbordan el límite de conexiones del origen. `Hyperdrive` interpone un pool global de conexiones ya calientes y una caché de consultas, de modo que el saludo se paga una vez y las lecturas populares ni siquiera llegan a la base.
+
+```ts
+import postgres from 'postgres';
+
+// el driver de siempre; solo cambia la cadena de conexion
+const sql = postgres(env.HYPERDRIVE.connectionString);
+const filas = await sql`SELECT id, titulo FROM articulos ORDER BY creado DESC LIMIT 20`;
+```
+
+<Mermaid code={`flowchart LR
+  W[Workers en todo el mundo] --> HD[Hyperdrive pool y cache]
+  HD --> PG[Postgres o MySQL en una region]
+  U[navegador] --> R2[R2 objetos sin egress]
+  W -.autoriza y registra.-> R2
+  style HD fill:#89b4fa,color:#11111b
+  style R2 fill:#f9e2af,color:#11111b`} />
+
+La consecuencia práctica de que sea una capa y no un almacén es que la decisión de adoptarlo es reversible, y eso la vuelve barata de tomar. No hay migración de datos, no hay ventana de doble escritura, no hay periodo en que dos copias puedan divergir. Cambias la cadena de conexión, mides, y si no convence vuelves a apuntar al origen directo sin haber movido un solo byte. Muy pocas decisiones de almacenamiento tienen esa propiedad, y conviene aprovecharla cuando aparece.
+
+Los casos en que `Hyperdrive` gana a `D1` sin que haya debate son cuatro y se reconocen enseguida: la base ya existe y supera con holgura el techo de diez gigabytes por base de `D1`; el esquema depende de extensiones o tipos que solo ese motor tiene, como datos geoespaciales o vectores; la carga es de escritura intensa y sostenida, que un motor de un solo hilo no absorbe; o hay una obligación de que los datos permanezcan en un proveedor o una región concretos. En todos, la elección no la hace la elegancia sino la restricción.
+
+## Lo que ninguno de los dos borra
+
+`R2` no indexa el contenido de lo que guarda. Puede listar claves por prefijo, y esa capacidad tienta a usar el propio cubo como si fuera un catálogo, nombrando los objetos con rutas cada vez más elaboradas para poder filtrarlos después. Es la misma trampa que en `KV` y con el mismo desenlace: en cuanto necesitas un segundo criterio de búsqueda, ordenar por una fecha o contar cuántos hay de cada tipo, descubres que estabas construyendo a mano un índice que `D1` te daba hecho. La regla práctica es simple y no admite excepciones cómodas: **nunca listes un cubo para responder una pregunta de usuario**; la pregunta la responde la tabla de metadatos y el cubo solo entrega bytes por clave.
+
+Tampoco conviene leer la ausencia de cargos de egress como ausencia de coste. Las operaciones de clase A y B se facturan, el almacenamiento se factura, y un diseño que escribe y reescribe objetos pequeños millones de veces al día resulta caro incluso sin pagar la salida. Lo que desaparece es el impuesto sobre el éxito —servir más no cuesta más—, y eso basta para cambiar decisiones enteras de producto, pero no convierte a `R2` en un almacén gratuito para cualquier patrón.
+
+`Hyperdrive`, por su parte, no borra la física, la reorganiza. Tu Postgres sigue siendo una base regional con una única primaria de escritura, sus propios límites de conexiones y su latencia hasta el origen. Las escrituras viajan igual. Las lecturas que no estén cacheadas viajan igual. Lo que el acelerador elimina es el coste del saludo de conexión y la tormenta de conexiones efímeras, que es exactamente el daño que el edge le hacía a un motor pensado para clientes longevos; el resto de las leyes siguen vigentes.
+
+De ahí se sigue la consecuencia que más se olvida al elegirlo: con `Hyperdrive` conservas un origen que hay que operar. Alguien sigue dimensionando esa instancia, aplicando parches, vigilando copias de seguridad y respondiendo cuando la región se cae. Es un precio perfectamente razonable —a menudo el más razonable de todos, porque ese equipo y ese conocimiento ya existen—, pero es un precio, y elegirlo sin nombrarlo es lo que produce sorpresas seis meses después.
+
+<Callout type="note" title="Una caché de consultas también es un contrato con el tiempo">
+La caché de `Hyperdrive` sirve lecturas populares sin llegar al origen, lo que significa que puede devolver un resultado ligeramente anterior. Es el mismo compromiso que gobierna a `KV`, aplicado ahora a un motor relacional: excelente para catálogos y listados, inadecuado para la lectura que sigue inmediatamente a una escritura del propio usuario. Saber qué consultas pueden ir un poco por detrás y cuáles no vuelve a ser una decisión de producto, no de infraestructura.
+</Callout>
+
+<Cards>
+  <Card icon="📦" title="R2 cuando el dato es opaco">
+    Vídeo, imágenes, PDF, copias, artefactos y volcados: bytes que nadie va a consultar por contenido y que ninguna otra pieza puede sostener.
+  </Card>
+  <Card icon="🐘" title="Hyperdrive cuando la base ya existe">
+    Esquema heredado, extensiones concretas, escritura intensa o requisitos de ubicación: no eliges dónde viven los datos, eliges cómo alcanzarlos.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Aceptar el mundo tal como es también es una decisión de arquitectura">
+Hay una tentación muy común en quien acaba de entender bien una plataforma nueva, y es querer resolverlo todo dentro de ella. Aprendes `D1`, te enamoras del modelo de muchas bases pequeñas replicadas junto al usuario, y a partir de ahí cualquier Postgres heredado parece una deuda que hay que saldar cuanto antes. `R2` e `Hyperdrive` son, cada uno a su manera, la vacuna contra esa tentación, porque ambos encarnan la misma lección incómoda: buena parte de la arquitectura no consiste en elegir lo mejor, sino en reconocer con precisión qué no se puede cambiar y construir a partir de ahí. `R2` lo dice desde la física: hay bytes cuyo tamaño excede en varios órdenes de magnitud lo que cualquier otro almacén acepta, y ninguna cantidad de ingenio en el modelado esquiva un límite duro; la respuesta madura no es partir el vídeo en trozos de dos megabytes para que quepa en filas, sino aceptar que los bytes opacos tienen su propio hogar y que la única inteligencia que hay que aportar es la separación entre el byte y su descripción. `Hyperdrive` lo dice desde la sociología de los sistemas: las bases de datos son las piezas más pesadas y más longevas de cualquier organización, sobreviven a los equipos que las crearon y a las modas que las rodean, y la inmensa mayoría no se va a migrar por muy brillante que sea la alternativa. Reconocer eso no es resignación, es realismo con consecuencias técnicas concretas, porque una capa que se interpone sin reemplazar hereda gratis todo el ecosistema del origen —sus extensiones, sus tipos, sus ORM, sus herramientas de observación, su conocimiento acumulado— y elimina de golpe el riesgo más caro de todos, que es mantener dos copias de la verdad durante una migración que siempre dura más de lo previsto. Lo interesante es que ambas piezas enseñan la misma cosa desde extremos opuestos del árbol: hay problemas que no se resuelven eligiendo mejor sino aceptando antes. Y cuando esa aceptación llega pronto —en la primera y la segunda pregunta, antes de deliberar sobre consistencia o consultas—, el resto del diseño se vuelve más limpio, porque ya no arrastra el peso de intentar meter en un molde algo que nunca tuvo esa forma.
+</Callout>
+
+<Reto title="Resuelve las restricciones antes de diseñar">
+1. Recorre los datos de una aplicación real y separa los que son bytes opacos de los que son hechos consultables.
+2. Diseña la tabla de metadatos que acompañaría a un cubo de `R2` con adjuntos de usuario: qué columnas necesitas para no tener que listar el cubo nunca.
+3. Explica por qué canalizar una descarga grande a través del Worker es un error y qué dos mecanismos lo evitan.
+4. Toma una base Postgres existente e imagina su llegada al edge: qué parte de tu stack cambiaría con `Hyperdrive` y qué parte seguiría idéntica.
+5. Argumenta cuál de los cuatro casos de `Hyperdrive` es el más difícil de rebatir con `D1` y por qué.
+</Reto>

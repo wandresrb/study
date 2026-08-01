@@ -1,0 +1,150 @@
+---
+title: "El pipeline: del texto fuente al código máquina"
+description: "Recorrido completo por las fases del compilador de Swift: lexado y parseo, comprobación de tipos por restricciones, generación de SIL, transformaciones garantizadas, optimización de alto nivel, bajada a LLVM IR y emisión de objeto. Qué decide cada fase, qué diagnósticos solo puede dar cada una y cómo detener el compilador en cualquier punto para inspeccionar su trabajo."
+subject: swift
+level: 33
+order: 1
+icon: "33.1"
+duracion: "22 min"
+---
+
+<Lead>
+Un compilador no es una caja negra que traduce: es una secuencia de representaciones, cada una con un nivel de abstracción distinto y cada una capaz de responder preguntas que las demás no pueden. Swift tiene una peculiaridad que lo separa de casi todo lo construido sobre `LLVM`: entre el árbol sintáctico y `LLVM IR` insertó una representación intermedia propia, con conocimiento explícito de genéricos, protocolos, conteo de referencias y exclusividad. Entender dónde vive cada decisión —por qué un error de tipos aparece antes que un error de inicialización, por qué la especialización de genéricos ocurre en un sitio y la vectorización en otro— convierte el compilador de un oráculo caprichoso en una herramienta que puedes interrogar.
+</Lead>
+
+<Objetivos>
+
+- Enumerar las fases del compilador de Swift y saber qué representación produce cada una.
+- Explicar por qué ciertos diagnósticos solo pueden emitirse tras un análisis de flujo y no durante la comprobación de tipos.
+- Distinguir qué optimizaciones pertenecen al dominio de `SIL` y cuáles al de `LLVM IR`, y por qué.
+- Detener el compilador en una fase concreta e inspeccionar su salida con las banderas del frontend.
+
+</Objetivos>
+
+## El frente: de caracteres a un árbol con tipos
+
+El compilador de Swift se organiza en fases estrictamente ordenadas, cada una con una representación de entrada y otra de salida bien definidas. Esa disciplina es lo que permite detenerlo en cualquier punto e inspeccionar exactamente lo que había construido hasta ahí.
+
+La primera fase es la menos interesante y la más rápida. El lexer convierte el texto en un flujo de tokens; el parser construye a partir de él un árbol sintáctico abstracto que aún no sabe nada de significado. Un identificador es un identificador: el parser ignora si nombra un tipo, una variable o algo inexistente. Los únicos errores posibles aquí son estructurales, y por eso son los que el editor te muestra mientras escribes.
+
+La fase siguiente es donde se concentra el coste real del frente. El análisis semántico enlaza nombres a declaraciones y comprueba tipos mediante un **sistema de restricciones**: en lugar de propagar tipos en una sola dirección, el compilador genera un conjunto de restricciones sobre la expresión completa —esta llamada exige que su argumento sea convertible a aquello, este literal admite cualquier tipo que sea expresable por literal entero— y después busca una asignación consistente resolviendo disyunciones de sobrecargas con retroceso.
+
+```swift
+// Dos sobrecargas de + , dos literales sin tipo fijado, una anotacion al final.
+// El solucionador debe elegir simultaneamente el tipo de cada literal,
+// la sobrecarga de cada operador y la conversion final. El espacio de
+// busqueda crece de forma combinatoria con la longitud de la cadena.
+let x: Double = 1 + 2 * 3 - 4 / 5
+```
+
+Ese modelo es lo que hace posible la inferencia bidireccional de Swift —que el tipo fluya desde la anotación hacia dentro de la expresión y no solo desde las hojas hacia fuera— y también lo que hace que ciertas expresiones tarden segundos en comprobarse. Aquí se expanden además las macros: el compilador serializa el árbol, lo envía a un proceso plugin, recibe el código generado y lo vuelve a parsear y comprobar. La salida de toda esta fase es un árbol completamente tipado y validado.
+
+<Cards>
+  <Card icon="🧩" title="Parseo">
+    Tokens y árbol sintáctico. Errores de sintaxis. Sin ninguna noción de significado ni de tipos.
+  </Card>
+  <Card icon="🔍" title="Semántica">
+    Enlace de nombres, sistema de restricciones, resolución de sobrecargas y expansión de macros. Árbol tipado.
+  </Card>
+  <Card icon="⚙️" title="SILGen">
+    Bajada a `SIL` en bruto. Aparecen las copias, las retenciones y las convenciones de llamada que el fuente ocultaba.
+  </Card>
+  <Card icon="🏗️" title="IRGen">
+    De `SIL` a `LLVM IR`. Se materializan disposiciones en memoria, metadatos y nombres decorados.
+  </Card>
+</Cards>
+
+## El medio propio de Swift: SILGen y lo garantizado
+
+Con el árbol tipado en la mano, el compilador genera `SIL` en bruto. Esta traducción es donde el lenguaje deja de ser cortés: todo lo que el fuente ocultaba se vuelve una instrucción explícita. Una asignación de un struct pasa a ser una carga y un almacenamiento; una variable capturada por un cierre pasa a ser una caja asignada en el montón; un valor de clase que cruza una frontera pasa a llevar sus retenciones y liberaciones escritas una por una; una llamada a un requisito de protocolo pasa a ser un acceso a la tabla de testigos.
+
+Conviene detenerse en la magnitud del cambio: una línea de fuente puede convertirse en diez o quince instrucciones, y ninguna de ellas es gratuita ni inventada. Esa expansión no es un defecto de la generación sino su propósito, porque solo lo que está escrito puede analizarse, y solo lo que puede analizarse puede después borrarse por innecesario.
+
+Ese `SIL` en bruto no es todavía correcto en el sentido del lenguaje: puede contener usos de variables antes de su inicialización o rutas de retorno ausentes. A continuación corre un conjunto de pases llamados **transformaciones garantizadas**, que se ejecutan siempre, incluso en compilaciones sin optimizar. Hacen dos cosas a la vez: normalizan la representación y emiten los diagnósticos que exigen análisis de flujo de datos.
+
+```swift
+func ejemplo(_ cond: Bool) -> Int {
+    let n: Int
+    if cond { n = 1 }
+    return n   // error de inicializacion definitiva: emitido por un pase de SIL
+}
+```
+
+Ese error no puede darlo el comprobador de tipos, porque no es un problema de tipos: es una propiedad del grafo de flujo de control. Lo mismo vale para el aviso de código inalcanzable, para el diagnóstico estático de accesos exclusivos solapados y para la comprobación de que un `switch` es exhaustivo por sus caminos. El resultado de esta etapa se llama `SIL` canónico, y es la entrada de todo lo que viene después.
+
+Solo entonces, y **solo si se pidió optimización**, corre el pipeline de optimización de `SIL`: decenas de pases que trabajan con conocimiento semántico del lenguaje —especialización de genéricos, desvirtualización, inserción en línea, eliminación de conteo de referencias redundante, promoción de capturas, eliminación de comprobaciones de límites gracias a que el compilador conoce la semántica declarada de la biblioteca estándar—.
+
+<Mermaid code={`flowchart TB
+  A[Texto fuente] --> B[Lexado y parseo: arbol sintactico]
+  B --> C[Semantica: restricciones, sobrecargas, macros]
+  C --> D[SILGen: SIL en bruto]
+  D --> E[Transformaciones garantizadas]
+  E --> F[SIL canonico]
+  F -->|sin optimizacion| H[IRGen]
+  F -->|con optimizacion| G[Pases de optimizacion de SIL]
+  G --> H
+  H --> I[LLVM IR]
+  I --> J[Pipeline de LLVM y seleccion de instrucciones]
+  J --> K[Objeto y enlazado]
+  style E fill:#f9e2af,color:#11111b
+  style G fill:#a6e3a1,color:#11111b
+  style F fill:#89b4fa,color:#11111b`} />
+
+## El fondo prestado: LLVM IR y la emisión
+
+`IRGen` baja `SIL` a `LLVM IR`, y en ese salto Swift desaparece. Los tipos nominales se convierten en disposiciones concretas de memoria; los genéricos no especializados se convierten en punteros más argumentos implícitos de metadatos y tablas de testigos; las retenciones se convierten en llamadas a funciones del runtime; los nombres se decoran con un esquema que codifica módulo, contexto, tipos de parámetros y de retorno para garantizar unicidad y permitir reconstrucción.
+
+A partir de ahí el trabajo es el de cualquier lenguaje sobre `LLVM`: inserción en línea a bajo nivel, propagación de constantes, eliminación de subexpresiones comunes, desenrollado de bucles, vectorización, asignación de registros y selección de instrucciones para la arquitectura destino. Nada de esto entiende de protocolos ni de conteo de referencias, y precisamente por eso lo importante ya tuvo que ocurrir antes.
+
+La división del trabajo entre ambos niveles es limpia y conviene tenerla memorizada, porque determina dónde buscar cuando algo no se optimizó. Todo lo que depende de saber **qué es un valor en términos de Swift** —qué tipo concreto tiene un genérico, si una llamada es virtual o de protocolo, si una retención es necesaria, si un array puede compartirse— pertenece a `SIL` y es irrecuperable después. Todo lo que depende de saber **cómo funciona la máquina** —cuántos registros hay, qué instrucciones vectoriales existen, cómo se comporta la caché— pertenece a `LLVM` y sería absurdo intentarlo antes. Un fallo de rendimiento en Swift casi siempre se resuelve identificando en cuál de los dos lados faltaba información.
+
+Al final, el compilador emite archivos objeto y el enlazador los combina con las bibliotecas del sistema y con el runtime de Swift, que aporta lo que no puede resolverse estáticamente: metadatos de tipos, conteo de referencias, conversiones dinámicas y reflexión.
+
+<Callout type="warn" title="Las mediciones sin optimización no significan nada">
+Sin la bandera de optimización el compilador ejecuta las transformaciones garantizadas y salta directamente a `IRGen`. No hay especialización, no hay desvirtualización, no hay eliminación de retenciones y casi nada se inserta en línea. Cualquier conclusión sobre el coste de una abstracción de Swift extraída de una compilación de depuración describe el comportamiento de un compilador al que se le pidió explícitamente no pensar.
+</Callout>
+
+## Detener el compilador en cualquier fase
+
+Todas las fases son observables. El frontend acepta banderas que interrumpen el pipeline y vuelcan la representación intermedia del momento; el conductor las expone mediante un prefijo cuando invocas por proyecto.
+
+```bash
+# Arbol sintactico sin tipos, y arbol ya tipado tras la fase semantica
+swiftc -dump-parse Fuente.swift
+swiftc -dump-ast Fuente.swift
+
+# SIL en bruto recien generado, y SIL canonico tras lo garantizado
+swiftc -emit-silgen Fuente.swift
+swiftc -Onone -emit-sil Fuente.swift
+
+# SIL despues de todos los pases de optimizacion
+swiftc -O -emit-sil Fuente.swift
+
+# Representacion de LLVM y ensamblador final
+swiftc -O -emit-ir Fuente.swift
+swiftc -O -S Fuente.swift
+
+# Ver que pase concreto transforma una funcion, y desdecodificar nombres
+swiftc -O -emit-sil -Xllvm -sil-print-function=miFuncion Fuente.swift
+swiftc -O -emit-ir Fuente.swift | swift demangle
+```
+
+La disciplina útil es comparar dos volcados en lugar de leer uno. El `SIL` sin optimizar frente al optimizado te dice exactamente qué se llevó el optimizador; el `SIL` optimizado frente a `LLVM IR` te dice qué información se perdió al bajar de nivel. Casi todas las preguntas sobre rendimiento en Swift se responden con una de esas dos diferencias.
+
+<Callout type="note" title="El conductor y el frontend son dos programas distintos">
+Lo que invocas normalmente es el **conductor**: un planificador que decide qué archivos recompilar, lanza uno o varios procesos del **frontend** y llama después al enlazador. Casi todas las banderas de diagnóstico pertenecen al frontend, y por eso hay que reenviárselas explícitamente cuando compilas a través de un sistema de construcción. Confundir los dos niveles es el motivo más frecuente de que una bandera parezca no tener efecto.
+</Callout>
+
+Vale la pena interiorizar además una regla de orientación temporal. Lo que ocurre antes del `SIL` canónico determina si tu programa **compila**; lo que ocurre después determina si tu programa es **rápido**. Un problema de compilación lenta casi siempre vive en la primera mitad, típicamente en la resolución de restricciones; un problema de ejecución lenta casi siempre vive en la segunda, típicamente en una optimización que no pudo aplicarse por falta de información. Saber en qué mitad estás decide qué herramienta usar y ahorra la mayor parte del tiempo perdido en diagnósticos.
+
+<Callout type="dios" title="Por qué un lenguaje sobre LLVM se molestó en inventarse otra representación intermedia">
+La decisión de construir `SIL` no fue una excentricidad: fue el reconocimiento de un límite estructural. `LLVM IR` es una excelente representación para razonar sobre registros, memoria y flujo de control, y una representación pésima para razonar sobre lo que hace especial a Swift. Cuando un genérico llega a `LLVM IR` ya no es un genérico, es un puntero opaco con argumentos; cuando una retención llega a `LLVM IR` ya no es una retención, es una llamada a una función externa que el optimizador debe tratar como si pudiera hacer cualquier cosa. Optimizar ahí significa haber tirado antes justo la información que necesitabas. Pero el argumento más profundo no es el rendimiento: es el diagnóstico. Swift tomó la posición de que un error de inicialización definitiva, un solapamiento de accesos exclusivos o una rama inalcanzable son **propiedades de flujo de datos**, y que un compilador serio debe demostrarlas sobre una representación en forma de asignación única estática, no adivinarlas sobre un árbol sintáctico. De ahí sale una consecuencia que cambia cómo se lee todo el pipeline: en Swift los diagnósticos y las optimizaciones son la misma clase de objeto, pases sobre la misma estructura, distinguidos solo por si el pase emite un mensaje o reescribe instrucciones. Y de ahí sale también la asimetría que gobierna el resto de este nivel: las transformaciones garantizadas corren siempre porque la corrección no es negociable, mientras que las de rendimiento corren bajo petición porque la velocidad sí lo es. Cuando entiendes que la frontera entre `SIL` y `LLVM IR` es una frontera de conocimiento —lo que sabe de Swift a un lado, lo que sabe de máquinas al otro— dejas de preguntarte por qué el compilador no optimizó algo y empiezas a preguntar lo correcto: en qué lado de esa frontera estaba la información que hacía falta.
+</Callout>
+
+<Reto title="Sigue una función por todo el pipeline">
+1. Escribe una función que sume los elementos de un array de enteros y vuelca su árbol tipado; localiza dónde aparecen los tipos que no escribiste.
+2. Emite el `SIL` en bruto y cuenta cuántas instrucciones explícitas corresponden a una sola línea del fuente.
+3. Compara el `SIL` canónico sin optimizar con el `SIL` optimizado y anota tres transformaciones concretas que hayan ocurrido.
+4. Provoca un error de inicialización definitiva y argumenta por qué la fase semántica no podía detectarlo.
+5. Emite `LLVM IR` y localiza el nombre decorado de tu función; desdecodifícalo y explica qué codifica cada parte.
+</Reto>

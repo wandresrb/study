@@ -1,0 +1,171 @@
+---
+title: "Concurrencia mal entendida: tareas huérfanas, `@MainActor` de parche y colas heredadas"
+description: "Los tres antipatrones que produce migrar a async sin cambiar el modelo mental: lanzar `Task` como quien lanzaba bloques, anotar con `@MainActor` hasta que el compilador se calle, y conservar `DispatchQueue` bajo una fachada asíncrona. Qué falla en cada uno y cuál es el refactor honesto."
+subject: swift
+level: 37
+order: 4
+icon: "37.4"
+duracion: "20 min"
+---
+
+<Lead>
+La concurrencia estructurada de Swift no es una sintaxis más cómoda para lo que ya hacíamos: es un modelo distinto con reglas propias sobre quién es dueño del trabajo, quién espera su resultado y qué ocurre cuando alguien cancela. Migrar traduciendo mecánicamente cada bloque en una `Task`, cada acceso a la interfaz en un `@MainActor` y cada cola serie en un candado disfrazado produce un programa que compila, que parece moderno y que ha perdido todas las garantías que justificaban el cambio. Los tres antipatrones de esta lección aparecen juntos porque tienen una misma causa: se conservó el modelo mental de las devoluciones de llamada y se le puso encima un vocabulario nuevo. El refactor no consiste en anotar mejor, consiste en decidir de nuevo quién posee cada pieza de trabajo.
+</Lead>
+
+<Objetivos>
+
+- Distinguir tarea estructurada de tarea sin estructura, y saber qué garantías de cancelación y propagación pierde la segunda.
+- Diagnosticar el uso de `@MainActor` como silenciador de diagnósticos frente a su uso como decisión de aislamiento.
+- Evaluar cuándo una `DispatchQueue` heredada sigue siendo correcta y cuándo es una fuente de bloqueo de hilos cooperativos.
+- Rediseñar un componente migrado a la ligera aplicando propiedad explícita del trabajo, aislamiento por dominio y `Sendable` como contrato.
+
+</Objetivos>
+
+## Tareas huérfanas
+
+Una `Task` creada con el inicializador no es parte de ninguna jerarquía: hereda el contexto de aislamiento y las prioridades, pero nadie la espera y nadie la cancela salvo que alguien guarde el identificador. En código de interfaz aparece por decenas, una por cada acción del usuario, y cada una de ellas es una promesa de trabajo que sobrevive al objeto que la lanzó.
+
+```swift
+final class ListaVM {
+    func cargar() {
+        Task { self.items = await api.traer() }        // nadie la posee
+    }
+    func refrescar() {
+        Task { self.items = await api.traer() }        // ni esta
+    }
+}
+```
+
+Los tres fallos son acumulativos. Primero, la cancelación no llega: cerrar la pantalla no detiene la descarga y el usuario paga datos por una vista que ya no existe. Segundo, no hay orden: si `cargar` y `refrescar` se solapan, gana la que termine antes, que no tiene por qué ser la más reciente, y la lista muestra datos viejos de forma intermitente. Tercero, los errores desaparecen: una `Task` sin `await` sobre su valor se traga cualquier excepción sin dejar rastro.
+
+```swift
+@MainActor
+final class ListaVM {
+    private var tarea: Task<Void, Never>?
+
+    func recargar() {
+        tarea?.cancel()                                 // el trabajo tiene dueno
+        tarea = Task {
+            do { items = try await api.traer() }
+            catch is CancellationError { }
+            catch { self.error = error }                // los fallos existen
+        }
+    }
+    deinit { tarea?.cancel() }
+}
+```
+
+<Mermaid code={`flowchart TD
+  A[Evento del usuario] --> B{Quien posee el trabajo}
+  B -- Nadie --> C[Tarea huerfana]
+  C --> C1[Sin cancelacion]
+  C --> C2[Sin orden garantizado]
+  C --> C3[Errores tragados]
+  B -- Una propiedad o un grupo --> D[Trabajo cancelable y observable]
+  D --> D1[Se cancela al desaparecer la vista]
+  D --> D2[La ultima peticion gana siempre]`} />
+
+Cuando el trabajo es concurrente de verdad —varias descargas simultáneas— la respuesta no es lanzar varias tareas sueltas sino un grupo, que es estructurado por construcción: espera a todos sus hijos, propaga la cancelación hacia abajo y el primer error hacia arriba.
+
+```swift
+let imagenes = try await withThrowingTaskGroup(of: (Int, Imagen).self) { grupo in
+    for (i, url) in urls.enumerated() {
+        grupo.addTask {
+            let img = try await descargar(url)
+            return (i, img)
+        }
+    }
+    var salida = [Int: Imagen]()
+    for try await (i, img) in grupo { salida[i] = img }
+    return urls.indices.map { salida[$0]! }
+}
+```
+
+<Callout type="tip" title="La pregunta que evita el antipatrón">
+Antes de escribir `Task`, responde quién la cancela. Si la respuesta es «nadie» y el trabajo tiene efectos observables, la tarea está huérfana. Las únicas huérfanas legítimas son las que deben completarse pase lo que pase, y esas merecen un comentario que lo diga.
+</Callout>
+
+## `@MainActor` como analgésico
+
+El segundo antipatrón se reconoce por su trayectoria: el compilador señala un acceso no aislado, se añade `@MainActor` a la función, aparece otro diagnóstico más arriba, se añade a la clase, y al cabo de un mes el módulo entero está anotado. Ha desaparecido el error y también la concurrencia: todo el trabajo compite por un único ejecutor, el mismo que dibuja la pantalla.
+
+El síntoma clínico es una interfaz que se atasca al procesar datos, con el perfilador mostrando trabajo de cómputo puro en el hilo principal. La causa no es `@MainActor`, que hace exactamente lo que promete; es haberlo usado como respuesta a un diagnóstico en lugar de como decisión sobre qué pertenece a la interfaz.
+
+```swift
+// Parche: todo al hilo principal para que el compilador calle
+@MainActor
+final class Procesador {
+    func procesar(_ datos: [Registro]) -> Resumen { /* calculo pesado */ }
+}
+
+// Decision: el calculo no es interfaz, y lo dice su firma
+struct Procesador: Sendable {
+    func procesar(_ datos: [Registro]) async -> Resumen { /* ... */ }
+}
+
+@MainActor
+final class PantallaVM {
+    private(set) var resumen: Resumen?
+    func actualizar(_ d: [Registro]) async {
+        resumen = await Procesador().procesar(d)     // solo la escritura es UI
+    }
+}
+```
+
+La regla es de frontera: `@MainActor` marca lo que *debe* ocurrir en el hilo principal —estado observado por la vista, llamadas a la interfaz— y nada más. Todo lo demás debería ser `Sendable` y libre de aislamiento, para que el compilador pueda moverlo donde convenga. Cuando el diagnóstico persiste tras aplicar esa frontera, lo que está mal no es la anotación: es que un tipo mutable de referencia está cruzando dominios y hay que convertirlo en valor o encerrarlo en un actor.
+
+<Cards>
+  <Card icon="🚨" title="Anotación por diagnóstico">
+    Se añadió `@MainActor` porque salió un error, no porque el código sea interfaz. Se propaga hacia arriba y serializa el programa entero.
+  </Card>
+  <Card icon="🧩" title="Actor por moda">
+    Convertir en `actor` un tipo sin estado mutable. Añade suspensiones y reentrada sin proteger nada. Si no hay estado que custodiar, basta con `Sendable`.
+  </Card>
+  <Card icon="🚦" title="Cola bajo fachada">
+    Un método `async` que dentro llama a una `DispatchQueue` con semáforo. Bloquea un hilo del pool cooperativo y anula el modelo entero.
+  </Card>
+</Cards>
+
+## El `DispatchQueue` heredado
+
+La cola serie sigue siendo una herramienta correcta en muchos sitios, y no hay que migrarla por estética. Lo que no se puede es mezclarla con `async` de la manera en que suele hacerse: envolviendo la cola en una función asíncrona que espera con un semáforo, o llamando a `DispatchQueue.main.sync` desde código aislado.
+
+```swift
+// Antipatron: bloquea un hilo del pool cooperativo
+func leer() async -> Datos {
+    let sem = DispatchSemaphore(value: 0)
+    var r: Datos!
+    cola.async { r = self.leerInterno(); sem.signal() }
+    sem.wait()                                        // hilo bloqueado
+    return r
+}
+
+// Puente correcto: la suspension es real, no simulada
+func leer() async -> Datos {
+    await withCheckedContinuation { cont in
+        cola.async { cont.resume(returning: self.leerInterno()) }
+    }
+}
+```
+
+La diferencia importa porque el grupo de hilos cooperativos tiene tantos hilos como núcleos y da por supuesto que ninguna tarea los bloquea. Un semáforo dentro de una función `async` viola esa suposición; con suficientes llamadas simultáneas el sistema se queda sin hilos disponibles y se produce un interbloqueo por inanición que no aparece en desarrollo y sí con carga real.
+
+<Callout type="dios" title="El modelo cambió de unidad, no de sintaxis">
+Lo que hace difícil esta migración no es aprender palabras nuevas, es que la unidad de razonamiento se movió. Con colas y bloques, la unidad era el *hilo* y la pregunta constante era en cuál se estaba ejecutando cada línea; la corrección se conseguía a base de disciplina no verificable, y por eso los proyectos acumulaban comentarios como «llamar solo desde la cola de red» que nadie podía comprobar. Con concurrencia estructurada la unidad es el *dominio de aislamiento*, que es una propiedad del tipo y no del momento de ejecución, y la pregunta pasa a ser qué estado protege cada dominio y qué puede cruzar entre ellos. Ese desplazamiento tiene una consecuencia que explica los tres antipatrones a la vez: en el modelo antiguo la concurrencia era algo que se *hacía* —despachar, envolver, sincronizar— y en el nuevo es algo que se *declara*, y lo que se hace es más bien delimitar. Quien sigue programando con el verbo antiguo lanza `Task` porque antes lanzaba bloques, anota `@MainActor` porque antes hacía `dispatch_async` al principal, y conserva el semáforo porque necesita que una función parezca síncrona. Los tres gestos son la misma nostalgia. La prueba de que el modelo nuevo es más fuerte está en lo que cada uno destruye: la tarea huérfana destruye la cancelación, que es la única forma escalable de gestionar trabajo que ya no interesa; el `@MainActor` masivo destruye el paralelismo, que era el motivo de todo; el semáforo destruye la garantía de no bloqueo, sobre la que se dimensionó el pool. No son tres descuidos independientes, son tres formas de devolver el programa a un modelo del que Swift ya había salido, pagando además el coste sintáctico del nuevo sin cobrar ninguno de sus beneficios.
+</Callout>
+
+## Un criterio de migración
+
+Migrar bien un módulo se hace de dentro hacia fuera, no al revés. Primero se identifican los estados mutables y se decide, para cada uno, quién lo custodia: un actor si se comparte, `@MainActor` si es interfaz, nadie si se convierte en valor. Después se marcan como `Sendable` los tipos que cruzan fronteras, empezando por los que ya son `struct` de campos inmutables. Solo al final se tocan las firmas, y para entonces la mayoría de los `async` que hacían falta ya se han hecho evidentes.
+
+<Callout type="note" title="Señal de que vas bien">
+Si al activar la concurrencia estricta el número de diagnósticos baja al convertir tipos en valores y no al añadir anotaciones, la migración va por buen camino. Si baja solo a base de `@unchecked Sendable` y `@MainActor`, se está silenciando al compilador, no corrigiendo el diseño.
+</Callout>
+
+<Reto title="Auditar una migración a medias">
+1. Cuenta las `Task` sin propietario de un módulo tuyo. Para cada una escribe quién debería cancelarla y qué ocurre hoy si el usuario cierra la pantalla mientras corre.
+2. Convierte la peor de ellas en una tarea con dueño, con cancelación de la anterior, y escribe una prueba que dispare dos recargas seguidas y verifique que gana la segunda.
+3. Localiza el `@MainActor` más alto de tu jerarquía y averigua qué diagnóstico lo motivó. Intenta eliminarlo convirtiendo en valor el tipo que cruzaba la frontera.
+4. Busca cualquier `DispatchSemaphore` o `sync` dentro de código `async` y sustitúyelo por una continuación comprobada. Mide con carga concurrente antes y después.
+5. Sustituye un conjunto de descargas paralelas sueltas por un grupo de tareas y comprueba, cancelando a mitad, que todas las hijas se detienen. Explica por qué con tareas sueltas no ocurría.
+</Reto>

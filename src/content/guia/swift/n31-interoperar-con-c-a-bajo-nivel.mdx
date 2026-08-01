@@ -1,0 +1,174 @@
+---
+title: "Interoperar con C a bajo nivel: registros, interrupciones y tipos"
+description: "Importar el SDK del fabricante y sus macros, el problema real de que Swift no tenga `volatile` y cómo lo resuelven las macros de modelado de registros, escribir manejadores de interrupción con `@_cdecl` y sus restricciones, comunicar la interrupción con el bucle principal sin carreras, y envolver el periférico en tipos no copiables que conviertan la hoja de datos en una regla del compilador."
+subject: swift
+level: 31
+order: 4
+icon: "31.4"
+duracion: "22 min"
+---
+
+<Lead>
+Un microcontrolador es, visto desde el software, un conjunto de direcciones de memoria que no se comportan como memoria. Escribir un entero en una de ellas enciende un LED; leer dos veces la misma dirección puede dar dos valores distintos sin que nadie haya escrito nada entre medias; y una de ellas se lee sola, sin que tu programa la nombre, porque el temporizador ha desbordado y el procesador ha saltado a otra parte. Todo eso es lo que la hoja de datos del fabricante describe en tablas de bits, y todo eso llega a Swift a través de C. El objetivo de esta lección no es solo conseguir que funcione, que es lo fácil, sino conseguir que la hoja de datos deje de ser un documento que hay que recordar y se convierta en un conjunto de tipos que el compilador verifica.
+</Lead>
+
+<Objetivos>
+
+- Importar un SDK de C con mapa de módulos y sortear las macros que no cruzan la frontera.
+- Explicar por qué el acceso a registros no puede hacerse con un puntero corriente y qué lo resuelve.
+- Escribir un manejador de interrupción correcto y enumerar lo que está prohibido dentro de él.
+- Diseñar envoltorios con tipos no copiables que impidan estáticamente el uso indebido de un periférico.
+
+</Objetivos>
+
+## Traer el SDK del fabricante
+
+La importación de C funciona igual que en el Swift de siempre: un mapa de módulos declara qué cabeceras forman el módulo y Swift las ve como un `import` normal. En un proyecto de firmware ese módulo suele envolver el SDK del fabricante entero.
+
+```
+// include/module.modulemap
+module CSDK { header "sdk_hardware.h" export * }
+```
+
+Lo que cambia es qué sobrevive al cruce. Las macros que definen una constante entera se importan como constantes y funcionan sin ceremonia, de modo que una dirección base declarada como literal en la cabecera está disponible en Swift tal cual. Las macros **con parámetros**, en cambio, no se importan nunca: no son valores ni funciones, son sustitución de texto, y el importador no tiene nada que traducir. Como las hojas de datos y los SDK están llenos de ellas, el patrón universal es escribir una capa delgada de funciones en C que las envuelva.
+
+```c
+// shim.h  — lo que las macros del fabricante no dejan cruzar
+static inline uint32_t leer_reg(uintptr_t d) { return *(volatile uint32_t *)d; }
+static inline void escribir_reg(uintptr_t d, uint32_t v) { *(volatile uint32_t *)d = v; }
+static inline void irq_off(void) { __asm volatile ("cpsid i" ::: "memory"); }
+static inline void irq_on(void)  { __asm volatile ("cpsie i" ::: "memory"); }
+```
+
+Esa capa no es un parche temporal: es la frontera del proyecto. Todo lo que sea inseguro debería vivir en ella o justo detrás, y su tamaño debería ser un número que alguien pueda decir de memoria.
+
+## El problema de `volatile`
+
+Swift no tiene `volatile` y esa ausencia no es un olvido. El calificador de C significa que cada acceso escrito en el fuente debe producir exactamente un acceso en el binario, sin fusionar, sin reordenar y sin eliminar, y el modelo de memoria de Swift no ofrece esa garantía para el acceso a través de `UnsafeMutablePointer`. Un optimizador que ve dos lecturas consecutivas de la misma dirección sin escrituras entre medias está autorizado a quedarse con una, y en un registro de estado de un periférico eso es un fallo que aparece solo con optimizaciones activadas y desaparece al depurar. Hay dos salidas correctas y una tentadora que no lo es. La tentadora es leer con `pointee` y confiar en que el compilador no se ponga listo. La primera correcta es hacer el acceso en C, con `volatile`, tal como muestra el fragmento anterior. La segunda, y la que define el estilo del ecosistema, es usar las macros de modelado de registros: dado que las macros de Swift se ejecutan en tiempo de compilación, pueden generar accesos correctos y tipados sin coste alguno en ejecución.
+
+```swift
+@RegisterBlock
+struct GPIO {
+    @RegisterBlock(offset: 0x00) var control: Register<Control>
+    @Register(bitWidth: 32)
+    struct Control {
+        @ReadWrite(bits: 0..<1, as: Bool.self) var habilitado: HABILITADO
+        @ReadWrite(bits: 4..<7) var modo: MODO
+    }
+}
+
+let gpio = GPIO(unsafeAddress: 0x4001_4000)
+gpio.control.modify { r in
+    r.habilitado = true
+    r.modo = 0b010
+}
+```
+
+Lo que ocurre ahí merece atención porque es la mejor justificación de las macros que existe. El campo `modo` ocupa los bits 4 a 6; asignarle un valor que no cabe es un error de compilación, no un bit perdido. La operación `modify` hace una lectura, aplica los cambios y hace una escritura, con un único acceso volátil en cada extremo, que es exactamente el patrón que en C se escribe a mano con máscaras y desplazamientos y se equivoca una vez de cada veinte. Y todo el andamiaje desaparece en el binario: lo que queda es la misma pareja de instrucciones que habría emitido el C correcto.
+
+<Callout type="warn" title="Volátil y atómico no son lo mismo">
+Marcar un acceso como volátil garantiza que ocurra; no garantiza que ocurra de forma indivisible ni impone orden respecto a otros accesos a otras direcciones. Un registro de 32 bits leído y reescrito en dos instrucciones puede ser interrumpido en medio, y si la interrupción toca el mismo registro el resultado se pierde. Para eso hacen falta operaciones atómicas o una sección crítica, no `volatile`.
+</Callout>
+
+## Interrupciones
+
+Un manejador de interrupción no lo llama tu programa: lo llama el hardware, saltando a una dirección que está grabada en la tabla de vectores. Para que Swift pueda ocupar una de esas entradas, el símbolo debe existir con el nombre exacto que el arranque del fabricante espera y con la convención de llamada de C.
+
+```swift
+nonisolated(unsafe) var pulsos: UInt32 = 0
+
+@_cdecl("TIM2_IRQHandler")
+func manejadorTemporizador() {
+    limpiarBanderaTemporizador()
+    pulsos &+= 1
+}
+```
+
+Dentro de ese cuerpo rigen unas cuantas prohibiciones que no son estilo sino corrección. **No se asigna memoria**: el asignador no es reentrante, y si la interrupción cae mientras el bucle principal está dentro de él, la estructura del montículo queda corrupta de una forma que se manifestará mucho después y en otro sitio. **No se bloquea ni se espera**: mientras el manejador corre, las interrupciones de igual o menor prioridad no se atienden. **No se hace trabajo largo**: la disciplina es marcar y salir. Y conviene vigilar el tráfico de recuento de referencias, porque liberar el último dueño de un objeto acaba llamando al asignador por la puerta de atrás. La comunicación entre el manejador y el bucle principal es, además, el punto donde aparecen las carreras: una global mutable compartida entre dos contextos de ejecución es exactamente lo que la concurrencia estricta de Swift 6 está diseñada para señalar, y en firmware el compilador tiene razón aunque no exista ningún hilo, porque la interrupción es concurrencia real. Marcar la global como `nonisolated(unsafe)` silencia el diagnóstico y traslada la obligación a quien escribe; lo honesto es acompañarlo de un mecanismo que la justifique.
+
+```swift
+// Opcion 1: la seccion critica, para estado que no cabe en una palabra
+func conInterrupcionesDesactivadas<R>(_ cuerpo: () -> R) -> R {
+    irq_off()
+    defer { irq_on() }
+    return cuerpo()
+}
+let instantanea = conInterrupcionesDesactivadas { muestras }
+
+// Opcion 2: el atomico, cuando basta con una palabra
+let contador = Atomic<UInt32>(0)
+contador.wrappingAdd(1, ordering: .relaxed)
+```
+
+<Cards>
+  <Card icon="🔌" title="Frontera">
+    Un módulo de C delgado con las macros envueltas. Todo lo inseguro concentrado y contable.
+  </Card>
+  <Card icon="⚡" title="Manejador">
+    Símbolo con `@_cdecl`, sin asignación y lo más corto posible. Marcar y salir.
+  </Card>
+  <Card icon="🛡️" title="Envoltorio">
+    Tipos no copiables que poseen el periférico y lo liberan en su destructor.
+  </Card>
+</Cards>
+
+## Envolver el hardware en tipos
+
+Aquí es donde Swift deja de ser un C más cómodo y empieza a pagar por sí mismo. Una hoja de datos está llena de reglas que ningún compilador de C puede verificar: este periférico solo debe tener un dueño, este pin hay que configurarlo antes de leerlo, esta función solo es válida en modo salida. En C todo eso es documentación; en Swift puede ser el sistema de tipos. La primera herramienta es la propiedad única. Un periférico es un recurso físico del que no hay dos ejemplares, y un tipo no copiable expresa exactamente eso: si el valor no se puede duplicar, dos módulos no pueden creerse dueños del mismo bus.
+
+```swift
+struct Uart: ~Copyable {
+    private let base: UInt
+    init?(_ indice: Int) {
+        guard let b = habilitarUart(indice) else { return nil }
+        base = b
+    }
+    func escribir(_ byte: UInt8) {
+        while leer_reg(base + 0x18) & 0x20 != 0 { }
+        escribir_reg(base + 0x00, UInt32(byte))
+    }
+    deinit { deshabilitarUart(base) }
+}
+```
+
+La segunda herramienta es el estado en el tipo. Si el modo de un pin es un parámetro genérico y no un campo, intentar leer un pin configurado como salida deja de ser un error en ejecución y pasa a ser un error de compilación, con coste nulo porque el parámetro se borra por completo durante la especialización.
+
+```swift
+enum Entrada {}
+enum Salida {}
+
+struct Pin<Modo>: ~Copyable { let numero: UInt8 }
+
+extension Pin where Modo == Salida {
+    func alternar() { escribir_reg(0x4001_401C, 1 &<< UInt32(numero)) }
+}
+extension Pin where Modo == Entrada {
+    func nivel() -> Bool { leer_reg(0x4001_4010) & (1 &<< UInt32(numero)) != 0 }
+}
+```
+
+<Mermaid code={`flowchart TB
+  a[Hoja de datos del fabricante]
+  a --> b[Cabeceras C con macros y direcciones]
+  b --> c[Capa delgada de funciones volatiles]
+  c --> d[Macros de registro con campos tipados]
+  d --> e[Envoltorio no copiable del periferico]
+  e --> f[Estado del periferico en el tipo]
+  f --> g[Codigo de aplicacion sin punteros crudos]
+  c --> h[Superficie insegura auditable]`} />
+
+<Callout type="dios" title="Traducir documentación a demostraciones">
+El trabajo real de escribir firmware en un lenguaje con tipos no es evitar punteros: es una operación de traducción entre dos registros de conocimiento. La hoja de datos de un microcontrolador contiene cientos de invariantes verdaderos —el reloj del periférico debe estar activo antes de tocar sus registros, este campo solo admite tres de sus ocho codificaciones, este bit se limpia escribiendo un uno y no un cero, este canal de acceso directo a memoria pertenece a un solo periférico a la vez— y en un proyecto de C esos invariantes viven exclusivamente en la memoria de quien lo escribió y en comentarios que envejecen. No están ausentes: están en el sitio equivocado, en un soporte que no verifica nada y que no sobrevive a la rotación del equipo. Lo que hacen los tipos no copiables, los parámetros de estado y las macros de registro es mover cada uno de esos invariantes desde la prosa hasta un lugar donde una máquina los comprueba en cada compilación, y el rendimiento de esa mudanza es asimétrico de una forma poco común en ingeniería: se paga una vez, al escribir el envoltorio, y se cobra en cada línea que alguien escriba después, incluido el becario que llegue en dos años y nunca lea la hoja de datos. Por eso la pregunta correcta ante un envoltorio no es si añade abstracción sino cuántos párrafos del manual del fabricante ha dejado de ser necesario recordar, y por eso el mejor código de esta clase se reconoce en que resulta imposible escribir la llamada incorrecta, no en que la llamada incorrecta esté bien documentada.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+Las macros con parámetros no cruzan a Swift: se envuelven en funciones en línea de C. Swift no tiene `volatile`, así que el acceso a registros se hace desde C o con macros de modelado que generan accesos volátiles tipados sin coste. Los manejadores se exponen con `@_cdecl` y no deben asignar, bloquear ni tardar. La comunicación con el bucle principal exige sección crítica o atómicos. Los tipos no copiables dan propiedad única del periférico y los parámetros de estado convierten reglas de la hoja de datos en errores de compilación.
+</Callout>
+
+<Reto title="Convierte el manual en tipos">
+1. Escribe el mapa de módulos de un SDK real y localiza tres macros con parámetros que necesiten envoltorio.
+2. Modela un registro con campos de anchura distinta y comprueba qué error da asignar un valor que no cabe.
+3. Implementa un manejador de interrupción que solo incremente un atómico y desensambla su cuerpo para contar instrucciones.
+4. Envuelve un periférico en un tipo no copiable y demuestra que el compilador impide obtener dos instancias del mismo.
+5. Toma un invariante de la hoja de datos que hoy sea un comentario y conviértelo en una restricción de tipo.
+</Reto>

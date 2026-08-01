@@ -1,0 +1,107 @@
+---
+title: "RPC con WorkerEntrypoint"
+description: "La vía moderna de un service binding: en vez de empaquetar todo en un Request, extiendes WorkerEntrypoint, expones métodos públicos tipados y los invocas desde otro Worker como si fueran locales. Qué cruza la frontera de serialización, cómo se tipa la llamada y por qué RPC es una abstracción cómoda sobre un límite que sigue existiendo."
+subject: cloudflare
+level: 13
+order: 2
+icon: "13.2"
+duracion: "16 min"
+---
+
+<Lead>
+Reenviar un `Request` a otro Worker funciona, pero es una conversación de bajo nivel: serializas todo en una petición y descifras una respuesta, como si el otro Worker fuera un servidor anónimo. Los service bindings modernos ofrecen un registro mucho más expresivo: RPC. Extiendes una clase, `WorkerEntrypoint`, expones métodos públicos, y desde el otro Worker los llamas por su nombre —con argumentos tipados y valores de retorno tipados— como si invocaras un método local. La ceremonia de construir peticiones a mano desaparece.
+</Lead>
+
+<Objetivos>
+
+- Exponer métodos públicos de un Worker extendiendo `WorkerEntrypoint`.
+- Invocar esos métodos desde otro Worker con `env.BINDING.metodo(args)`, tipados.
+- Entender qué valores pueden cruzar la frontera de serialización de RPC.
+- Reconocer RPC como una abstracción cómoda sobre un límite de red que persiste.
+
+</Objetivos>
+
+## De hablar HTTP a llamar métodos
+
+El modelo `fetch` trata al otro Worker como una caja negra a la que le hablas HTTP: metes tus datos en la URL, las cabeceras o el cuerpo, y luego los sacas del `Response`. Ese empaquetado y desempaquetado manual es puro ruido cuando los dos Workers son tuyos y comparten el mismo lenguaje. RPC —llamada a procedimiento remoto— elimina el ruido: en lugar de una petición, invocas un método; en lugar de un `Response`, recibes el valor que el método devolvió, ya reconstruido como objeto de JavaScript.
+
+## Exponer métodos con `WorkerEntrypoint`
+
+El Worker que ofrece el servicio deja de exportar solo un `fetch`. Ahora exporta una clase que extiende `WorkerEntrypoint`, y cada método público de esa clase se vuelve invocable desde fuera. Dentro de la clase tienes `this.env` y `this.ctx`, igual que en un handler normal.
+
+```ts
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+export class AuthService extends WorkerEntrypoint<Env> {
+  async verificar(token: string): Promise<{ valido: boolean; usuario?: string }> {
+    const fila = await this.env.DB
+      .prepare("SELECT usuario FROM sesiones WHERE token = ?")
+      .bind(token)
+      .first<{ usuario: string }>();
+    return fila ? { valido: true, usuario: fila.usuario } : { valido: false };
+  }
+}
+
+export default {
+  fetch() {
+    return new Response("auth service");
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+En la configuración del Worker que llama, el service binding apunta ahora a esa clase concreta con el campo `entrypoint`, no solo al Worker:
+
+```jsonc
+{
+  "services": [
+    { "binding": "AUTH", "service": "auth-worker", "entrypoint": "AuthService" }
+  ]
+}
+```
+
+## Invocar como si fuera local
+
+Desde el Worker que consume, `env.AUTH` ya no es algo a lo que reenviar un `Request`: es un objeto cuyos métodos son los que declaraste en la clase. Los llamas y esperas su promesa como cualquier función asíncrona.
+
+```ts
+export default {
+  async fetch(request, env): Promise<Response> {
+    const token = request.headers.get("authorization") ?? "";
+    const { valido, usuario } = await env.AUTH.verificar(token);
+    if (!valido) return new Response("no autorizado", { status: 401 });
+    return Response.json({ hola: usuario });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+La firma del método viaja con los tipos: `wrangler types` genera la definición del binding a partir de la clase, de modo que `env.AUTH.verificar` sabe que espera un `string` y devuelve una forma concreta. Si cambias la firma en el servicio y no en la llamada, el compilador te avisa —una red de seguridad que una llamada por HTTP, donde todo es texto sin tipo, jamás te da—.
+
+## Qué puede cruzar la frontera
+
+La comodidad tiene un límite físico que conviene ver con claridad: aunque la llamada parezca local, los argumentos y el valor de retorno se serializan para cruzar de un isolate a otro. No pasa cualquier cosa. Cruzan sin problema los datos estructurados —números, cadenas, objetos, arrays, `Map`, `Set`, `Date`, `ArrayBuffer`— mediante el algoritmo de clonación estructurada.
+
+Pero RPC va más lejos que un simple clon. Puedes pasar funciones como *callbacks* y devolver objetos con métodos si extienden `RpcTarget`: en ese caso no se copia el objeto, sino que el otro lado recibe un *stub*, una referencia remota sobre la que seguir llamando métodos. Incluso puedes encadenar llamadas sin esperar cada salto —*promise pipelining*—, y la plataforma resuelve la cadena en un solo viaje.
+
+<Callout type="warn" title="Los stubs se cierran; ciérralos a tiempo">
+Cuando un método RPC devuelve un stub —una referencia viva al otro Worker— esa referencia consume recursos hasta que se libera. Si no la cierras, vive hasta el final de la petición. Usa `using` para disponerla en cuanto dejes de necesitarla, o llama a su método de liberación explícito. Un stub olvidado no es un error visible, sino una fuga silenciosa que solo notas bajo carga.
+</Callout>
+
+<Mermaid code={`flowchart LR
+  C[Worker consumidor] -->|verificar token| BND[binding AUTH]
+  BND --> S[WorkerEntrypoint AuthService]
+  S -->|consulta| DB[D1 sesiones]
+  S -->|valor tipado| C
+  style BND fill:#89b4fa,color:#11111b
+  style S fill:#a6e3a1,color:#11111b`} />
+
+<Callout type="dios" title="RPC no borra la red; la vuelve ergonómica">
+La llamada a procedimiento remoto es uno de los sueños más viejos y más peligrosos de los sistemas distribuidos. Desde Sun RPC en los ochenta hasta CORBA en los noventa, la promesa fue siempre la misma: haz que llamar a una máquina remota se parezca a llamar a una función local, para que el programador no tenga que pensar en la red. Y una y otra vez esa promesa se rompió por el mismo sitio —la llamada *parecía* local pero *era* remota, y esa mentira se filtraba en el peor momento: una latencia inesperada, un fallo parcial, una serialización que no cabía—. La célebre falacia de la computación distribuida es exactamente esta: creer que lo remoto puede disfrazarse de local sin consecuencias. El RPC de Workers es notable porque acierta donde aquellos fracasaron, y merece entender por qué. Primero, opera dentro de un único dominio de confianza y una sola plataforma: no cruza organizaciones ni redes hostiles, así que la clase de fallos se estrecha muchísimo. Segundo, no oculta la asincronía —todo método devuelve una promesa, y por tanto el programador nunca olvida que hay un viaje de por medio—. Y aun así, la lección profunda no es que RPC te libere de pensar en la frontera, sino lo contrario: la frontera sigue ahí, en la serialización de cada argumento, en el stub que hay que cerrar, en el hecho de que los dos lados se despliegan por separado y pueden divergir. Lo que RPC hace no es *borrar* ese límite, sino volverlo cómodo de cruzar. El ingeniero ingenuo lee `await env.AUTH.verificar(token)` y cree que llamó a una función; el ingeniero maduro lee la misma línea y ve un contrato serializado atravesando dos isolates que evolucionan por su cuenta. Esa diferencia —disfrutar de la ergonomía sin creerte la ilusión— es lo que separa usar RPC de entenderlo.
+</Callout>
+
+<Reto title="Convierte un fetch en RPC">
+1. Toma el `auth-worker` de la lección anterior y reescríbelo como una clase `AuthService` que extienda `WorkerEntrypoint` con un método `verificar(token)`.
+2. Actualiza la `wrangler.jsonc` del consumidor para que el binding `AUTH` apunte a esa clase con el campo `entrypoint`.
+3. Ejecuta `wrangler types` y comprueba que `env.AUTH.verificar` aparece tipado; cambia el tipo de retorno y observa cómo el compilador rompe la llamada.
+4. Haz que un método devuelva un objeto que extienda `RpcTarget` y llama a un método suyo desde el consumidor; libéralo con `using` y razona qué pasaría si no lo hicieras.
+5. Explica en dos frases por qué `await env.AUTH.verificar(token)`, pese a parecer local, sigue cruzando una frontera de serialización.
+</Reto>

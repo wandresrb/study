@@ -1,0 +1,155 @@
+---
+title: "Retenciones accidentales: el closure, el delegado y el timer inmortal"
+description: "Las tres fugas que aparecen en todos los proyectos de Swift tienen la misma forma: alguien sostiene a alguien que le sostiene. Cómo leer un ciclo de retención en el código antes de verlo en Instruments, por qué `[weak self]` en todas partes es un antipatrón, y cómo se rompe cada uno de los tres casos."
+subject: swift
+level: 37
+order: 3
+icon: "37.3"
+duracion: "19 min"
+---
+
+<Lead>
+ARC no recolecta basura: cuenta referencias fuertes y libera cuando la cuenta llega a cero. Es un mecanismo determinista, comprensible en su totalidad y con un único punto ciego, el ciclo: si A sostiene a B y B sostiene a A, ninguno de los dos contadores llega jamás a cero aunque nadie más los conozca. Ese punto ciego produce, en la práctica, exactamente tres bugs repetidos hasta el aburrimiento: el closure que captura `self` y vive dentro de `self`, el delegado declarado fuerte, y el temporizador que retiene a su destinatario mientras el bucle de eventos lo retiene a él. Los tres son estructuralmente idénticos y se detectan leyendo, no perfilando. Lo que sigue es la gramática de esa lectura y el refactor que corresponde a cada caso, incluyendo el que casi nadie hace: el que consiste en no tener el ciclo en absoluto.
+</Lead>
+
+<Objetivos>
+
+- Identificar un ciclo de retención dibujando el grafo de propiedad a partir del código, sin herramientas de diagnóstico.
+- Distinguir las capturas de `self` que crean ciclo de las que solo lo alargan, y saber por qué escribir `[weak self]` siempre es un error distinto.
+- Aplicar el refactor correcto a los tres casos canónicos: closure almacenado, delegado y temporizador.
+- Diseñar tipos cuya liberación sea verificable con `deinit` y con pruebas automáticas, no con inspección manual.
+
+</Objetivos>
+
+## El closure que se queda con `self`
+
+La primera distinción que hay que hacer es la que casi nadie hace, y de ella depende todo. Un closure captura `self` fuertemente por omisión; eso alarga la vida de `self` hasta que el closure muere. Si el closure es efímero —el cuerpo de un `map`, el bloque de una animación, la continuación de una llamada de red que termina— alargar la vida es correcto y deseable: el objeto debe seguir existiendo hasta que el trabajo acabe. **No hay ciclo.** El ciclo aparece solo cuando el closure se guarda *dentro del propio objeto que captura*.
+
+```swift
+final class Reproductor {
+    private var alTerminar: (() -> Void)?          // el objeto guarda el closure
+
+    func configurar() {
+        alTerminar = { self.limpiar() }            // el closure guarda el objeto
+    }                                              // ciclo cerrado
+    func limpiar() { }
+}
+```
+
+<Mermaid code={`flowchart LR
+  R[Reproductor] -- fuerte por la propiedad alTerminar --> C[Closure]
+  C -- fuerte por la captura de self --> R
+  X[Resto del programa] -. suelta su referencia .-> R
+  C --- N[Los dos contadores se quedan en uno]`} />
+
+La regla de lectura cabe en una línea: **busca un camino de referencias fuertes que salga de un objeto y vuelva a él**. Si el closure se pasa a otro y ese otro no pertenece a `self`, no hay camino de vuelta y no hay ciclo. Si el closure se almacena en una propiedad de `self`, o en algo que `self` posee, el camino existe.
+
+La consecuencia práctica incomoda a mucha gente: escribir `[weak self]` en todos los closures no es prudencia, es ruido con efectos secundarios. Introduce un `self` opcional que hay que desenvolver, y sobre todo permite que el objeto muera a mitad de una operación que debía completarse, convirtiendo un bug de memoria en un bug de lógica mucho más difícil de reproducir. Una descarga cuyo bloque de finalización no se ejecuta porque el modelo se liberó no falla: simplemente no hace nada, en un dispositivo, una vez de cada veinte.
+
+```swift
+// Correcto: efimero, debe mantener vivo al objeto hasta terminar
+Task { await self.sincronizar() }
+
+// Correcto: almacenado en self, hay que romper el ciclo
+alTerminar = { [weak self] in self?.limpiar() }
+
+// Correcto y mejor: no capturar self en absoluto
+alTerminar = { [cola] in cola.vaciar() }
+```
+
+<Callout type="tip" title="Captura lo que usas, no el objeto entero">
+La tercera forma es la que menos se enseña y la que más problemas evita. Si el closure solo necesita un colaborador, captúralo a él en la lista de captura. Sin `self` no hay ciclo, no hay opcional y el closure documenta exactamente de qué depende.
+</Callout>
+
+## El delegado y el temporizador
+
+El delegado fuerte es el mismo ciclo con otro vocabulario. El hijo declara `var delegado: MiProtocolo?` sin `weak`, el padre se asigna como delegado, y el padre posee al hijo. Camino de ida por la propiedad, camino de vuelta por el delegado.
+
+```swift
+protocol DescargaDelegado: AnyObject { func termino() }
+
+final class Descarga {
+    weak var delegado: DescargaDelegado?      // `weak` obligatorio, y por eso `AnyObject`
+}
+```
+
+El `AnyObject` no es decorativo: `weak` solo existe para referencias, así que el protocolo debe restringirse a clases para poder marcarlo. Un protocolo de delegado sin esa restricción es una invitación a que alguien lo conforme con un `struct` y descubra que no puede declararlo débil.
+
+El temporizador es el caso más traicionero porque el ciclo pasa por fuera del programa. `Timer.scheduledTimer` con un objetivo o un bloque que captura `self` produce esta configuración: el bucle de ejecución retiene el temporizador, el temporizador retiene el bloque, el bloque retiene a `self`. El programa suelta su referencia a `self` y no pasa nada, porque el bucle de ejecución —que vive mientras viva la aplicación— sigue sosteniendo la cadena entera. `deinit` no se llama nunca, así que el `invalidate` que estaba dentro de `deinit` tampoco.
+
+```swift
+final class Contador {
+    private var timer: Timer?
+
+    func arrancar() {
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }        // sin esto, inmortal
+            self.tic()
+        }
+    }
+    deinit { timer?.invalidate() }                // ahora si se ejecuta
+}
+```
+
+<Callout type="warn" title="El `deinit` que nunca se llama no puede limpiar nada">
+Es el error de razonamiento más costoso de los tres. Poner la limpieza en `deinit` es correcto, pero si el recurso a limpiar forma parte del ciclo, `deinit` es inalcanzable. La liberación tiene que poder ocurrir *antes* de que el objeto la necesite: por eso el `[weak self]` va en el bloque del temporizador y no basta con el `invalidate` final.
+</Callout>
+
+<Cards>
+  <Card icon="🚨" title="Closure almacenado en self">
+    Rompe con `[weak self]` o capturando solo el colaborador necesario. Nunca por costumbre en closures efímeros.
+  </Card>
+  <Card icon="🔗" title="Delegado fuerte">
+    `weak var` y protocolo restringido a `AnyObject`. Si el delegado debe sobrevivir, es que no era un delegado.
+  </Card>
+  <Card icon="⏰" title="Temporizador o suscripción">
+    El ciclo pasa por una raíz externa. Requiere un punto de parada explícito además de la captura débil.
+  </Card>
+</Cards>
+
+## El refactor que elimina el ciclo en vez de romperlo
+
+Romper un ciclo con `weak` es tratar el síntoma. La cura estructural es más satisfactoria: si el objeto no guarda un closure que le devuelva a sí mismo, no hay nada que romper. Y muchas veces ese closure almacenado existía solo porque el diseño era de devoluciones de llamada cuando podía ser de valores devueltos.
+
+```swift
+// Antes: el objeto se suscribe a si mismo y guarda el closure
+final class Modelo {
+    private var alCambiar: (() -> Void)?
+    func observar(_ f: @escaping () -> Void) { alCambiar = f }
+}
+
+// Despues: quien quiere saber, pregunta o consume una secuencia
+final class Modelo {
+    private(set) var estado: Estado = .inicial
+    func cambios() -> AsyncStream<Estado> { /* ... */ }
+}
+```
+
+La versión con `AsyncStream` traslada la propiedad del vínculo al consumidor: la tarea que itera la secuencia la posee, y cuando esa tarea se cancela el vínculo desaparece. El modelo ya no guarda a nadie. Lo mismo ocurre al sustituir un temporizador por un bucle dentro de una `Task`: la cancelación de la tarea, atada al ciclo de vida de la vista, sustituye a la pareja `invalidate` más `deinit`.
+
+<Callout type="dios" title="Por qué el ciclo es el precio exacto del determinismo">
+Merece la pena entender que el ciclo de retención no es un defecto de la implementación de ARC sino una consecuencia matemática de lo que ARC decidió ser. Contar referencias es un algoritmo *local*: cada operación mira un objeto y ajusta un número, sin conocer el resto del grafo. Esa localidad es la fuente de todas sus virtudes —liberación determinista en el punto exacto donde muere la última referencia, `deinit` predecible, ausencia de pausas, coste distribuido en lugar de concentrado— y también, inevitablemente, de su única incapacidad. Un ciclo es una propiedad *global* del grafo de objetos: para detectarlo hay que recorrer alcanzabilidad desde las raíces, que es precisamente lo que hace un recolector trazador y precisamente lo que ARC se negó a hacer. La literatura lo formalizó hace décadas: el conteo de referencias es incompleto respecto de la basura cíclica, y las técnicas que lo completan —recolección por prueba y borrado, detección de ciclos por ensayo— reintroducen el recorrido global y con él la impredecibilidad que se quería evitar. Swift eligió el otro lado del intercambio y compensó con tipos: `weak` y `unowned` no son parches, son la forma de que el programador declare, en el punto donde tiene la información, qué arista del grafo no cuenta para la propiedad. Es la misma filosofía que atraviesa todo el lenguaje: donde el compilador no puede inferir una propiedad global, ofrece una anotación local que la exprese y la verifique. Por eso pensar «Swift debería detectar mis ciclos» es pedir un lenguaje distinto, uno con pausas de recolección y con `deinit` no determinista; y por eso la disciplina de dibujar el grafo de propiedad antes de escribir una referencia no es folclore de veteranos, es la parte del trabajo que el diseño del lenguaje te reservó a cambio de darte destrucción determinista.
+</Callout>
+
+## Verificarlo sin abrir Instruments
+
+Las fugas se encuentran mucho antes si el proyecto tiene el hábito de comprobarlas automáticamente. Dos técnicas cubren casi todo. La primera es un `deinit` que registre, activo solo en compilaciones de depuración: si al cerrar una pantalla no aparece la traza, hay un ciclo y se sabe en el acto, no tres semanas después. La segunda es una prueba unitaria que crea el objeto, lo suelta y comprueba con una referencia débil que ha muerto.
+
+```swift
+func testModeloSeLibera() {
+    weak var testigo: Modelo?
+    do {
+        let m = Modelo(); testigo = m
+        m.arrancar()                       // registra timers, suscripciones, etc.
+    }
+    XCTAssertNil(testigo, "El modelo sigue vivo: hay un ciclo de retencion")
+}
+```
+
+<Reto title="Cazar los tres ciclos">
+1. Escribe los tres ejemplos canónicos —closure almacenado, delegado fuerte, temporizador— y añade a cada clase un `deinit` que imprima. Confirma que ninguno se ejecuta.
+2. Dibuja a mano el grafo de propiedad de cada caso y marca la arista que hay que debilitar. Justifica por qué esa y no otra.
+3. Aplica la corrección mínima a cada uno y comprueba que ahora los tres `deinit` imprimen. Para el temporizador, verifica también que el `invalidate` ocurre.
+4. Busca en tu código un `[weak self]` en un closure efímero y quítalo. Explica qué garantía ganas y comprueba que no aparece ningún ciclo.
+5. Sustituye el temporizador por una `Task` con bucle y cancelación atada al ciclo de vida. Compara ambas versiones en número de líneas y en número de formas distintas de fallar.
+</Reto>

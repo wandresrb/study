@@ -1,0 +1,149 @@
+---
+title: "Entornos múltiples: un manifiesto, varios Workers"
+description: "La sección `env` de `wrangler.jsonc` a fondo: qué claves se heredan y cuáles no, por qué cada entorno con nombre es un Worker físicamente distinto, cómo declarar bindings y variables propios para staging y production, y qué comandos exigen `--env` para no publicar en el sitio equivocado."
+subject: cloudflare
+level: 38
+order: 1
+icon: "38.1"
+duracion: "18 min"
+---
+
+<Lead>
+Un proyecto serio nunca tiene un solo destino. El mismo código debe correr contra una base de datos de juguete cuando lo estás probando y contra la real cuando atiende a clientes, y esa diferencia no puede depender de que alguien recuerde cambiar una variable antes de publicar. Wrangler resuelve el problema con entornos con nombre: una sección `env` dentro de `wrangler.jsonc` donde cada entrada describe una variante del mismo Worker. Lo que parece un simple mecanismo de sobreescritura esconde una decisión de diseño muy deliberada —qué se hereda y qué no— que determina si tu configuración es segura por construcción o solo por costumbre. Esta lección desmonta ese mecanismo pieza a pieza y lo lleva hasta donde importa: el día que operas cinco entornos y ninguno puede tocar los datos del otro.
+</Lead>
+
+<Objetivos>
+
+- Declarar entornos con nombre en `wrangler.jsonc` y entender el Worker que genera cada uno.
+- Distinguir claves heredables de no heredables y anticipar la configuración resultante.
+- Dar a staging y a production bindings, `vars` y secretos distintos sin duplicar código.
+- Operar con `--env` en toda la superficie de comandos, no solo en el despliegue.
+
+</Objetivos>
+
+## La anatomía de un entorno con nombre
+
+La clave `env` es un mapa: cada nombre apunta a un objeto de configuración parcial que se combina con el nivel superior del manifiesto. El nivel superior no es un molde abstracto, es también un entorno —el entorno por defecto, el que se despliega cuando no pasas ningún flag—, y esa simetría explica buena parte del comportamiento posterior.
+
+```jsonc
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pedidos-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-15",
+  "observability": { "enabled": true },
+  "env": {
+    "staging": {
+      "vars": { "ENTORNO": "staging", "NIVEL_LOG": "debug" },
+      "routes": [{ "pattern": "staging.pedidos.example/*", "zone_name": "pedidos.example" }]
+    },
+    "production": {
+      "vars": { "ENTORNO": "produccion", "NIVEL_LOG": "error" },
+      "routes": [{ "pattern": "pedidos.example/*", "zone_name": "pedidos.example" }]
+    }
+  }
+}
+```
+
+Al desplegar con `--env staging`, Wrangler no publica una configuración alternativa del mismo Worker: publica un Worker llamado `pedidos-api-staging`, con su propio identificador, sus propias métricas, su propio almacén de secretos y sus propios namespaces de Durable Objects. El sufijo es automático salvo que declares un `name` dentro del entorno, cosa que conviene hacer solo si tienes una razón fuerte, porque la convención de sufijo es lo que hace legible el panel cuando el proyecto crece.
+
+Esa separación física es la propiedad más valiosa del mecanismo y también la que más sorprende. No hay ningún punto del sistema donde el Worker de staging pueda leer, aunque quiera, un secreto de producción: no comparten almacén. La barrera no depende de tu disciplina ni de un condicional en el código; es estructural. El precio es igual de literal: configurar tres entornos es configurar tres Workers, y cada secreto nuevo hay que subirlo tres veces.
+
+<Mermaid code={`flowchart LR
+  M[wrangler jsonc] --> N[nivel superior]
+  N --> D[entorno por defecto]
+  N --> S[env staging]
+  N --> P[env production]
+  D --> W1[worker pedidos api]
+  S --> W2[worker pedidos api staging]
+  P --> W3[worker pedidos api production]
+  style W3 fill:#f38ba8,color:#11111b
+  style W2 fill:#89b4fa,color:#11111b`} />
+
+## La línea que parte el manifiesto en dos
+
+Wrangler divide las claves de configuración en dos familias, y esa división no es arbitraria: separa lo que define la identidad del código de lo que define su acceso a los datos.
+
+| Familia | Ejemplos | Comportamiento en un entorno |
+| --- | --- | --- |
+| Heredables | `main`, `compatibility_date`, `compatibility_flags`, `limits`, `rules`, `build` | Se propagan desde el nivel superior; si las redefines, reemplazan por completo el valor heredado |
+| No heredables | `vars`, `define`, y todos los bindings: `kv_namespaces`, `d1_databases`, `r2_buckets`, `queues`, `services`, `ai`, `hyperdrive` | No se propagan; si el entorno no las declara, quedan sencillamente ausentes |
+
+La lógica es defensiva: lo que describe cómo se compila el código se comparte, porque compartirlo es exactamente lo que garantiza la paridad entre entornos; lo que conecta con recursos concretos se aísla, porque heredar por descuido un binding a la base de datos real es el tipo de error que no se descubre hasta que ya ocurrió.
+
+<Callout type="warn" title="Ausente no es error: el fallo silencioso de la no herencia">
+Si defines `vars` en el nivel superior y declaras `env.production` sin repetirlas, el Worker de producción se despliega sin esas variables. Wrangler no aborta, porque desde su punto de vista el entorno está bien formado: simplemente no pediste esas variables ahí. El fallo aparece más tarde, en tiempo de ejecución, como una propiedad indefinida en `env`. La regla práctica es tratar cada entorno como autónomo y declarar en él, de forma explícita y completa, todas sus `vars` y todos sus bindings. La repetición que esto produce no es deuda: es la documentación exacta de con qué corre cada mundo.
+</Callout>
+
+Conviene además entender que la combinación no es una fusión profunda. Si un entorno declara `vars`, su objeto sustituye entero al del nivel superior; no se mezclan clave a clave. Lo mismo vale para las listas de bindings. Quien espera un merge recursivo acaba con configuraciones que parecen correctas en el diff y son incompletas en el despliegue.
+
+## Bindings distintos para el mismo código
+
+El caso interesante no son las variables de texto sino los bindings. El objetivo es que el código nombre siempre `env.DB` y `env.CACHE`, y que sea el entorno quien decida a qué recurso apuntan esos nombres. Así ninguna línea del Worker necesita saber en qué mundo corre.
+
+```jsonc
+{
+  "env": {
+    "staging": {
+      "vars": { "ENTORNO": "staging" },
+      "d1_databases": [
+        { "binding": "DB", "database_name": "pedidos-staging", "database_id": "1a2b-staging" }
+      ],
+      "kv_namespaces": [{ "binding": "CACHE", "id": "kv-staging-id" }]
+    },
+    "production": {
+      "vars": { "ENTORNO": "produccion" },
+      "d1_databases": [
+        { "binding": "DB", "database_name": "pedidos-prod", "database_id": "9z8y-prod" }
+      ],
+      "kv_namespaces": [{ "binding": "CACHE", "id": "kv-prod-id" }]
+    }
+  }
+}
+```
+
+Los nombres de binding coinciden; los recursos detrás no. Esta es la forma canónica y la que hace posible que el mismo artefacto compilado sea promocionable entre entornos sin recompilar. En cuanto un entorno introduce un binding que otro no tiene, o cambia un nombre, la promoción deja de ser segura porque el código empieza a ramificarse.
+
+Hay dos asimetrías que conviene tener presentes. La primera es que los Durable Objects son especialmente sensibles: sus migraciones se aplican por Worker, de modo que cada entorno lleva su propio historial de migraciones y su propio conjunto de objetos. La segunda es el desarrollo local: `wrangler dev --env staging` selecciona los bindings del entorno y lee `.dev.vars.staging`, lo que permite reproducir un entorno concreto sin tocar la nube.
+
+## Operar con entornos, no solo desplegar
+
+El error operativo más común no está en el manifiesto sino en la línea de comandos: casi toda la superficie de Wrangler acepta `--env`, y omitirlo significa actuar sobre el entorno por defecto.
+
+```bash
+# Cada uno de estos actua sobre un Worker distinto
+wrangler deploy --env production
+wrangler secret put STRIPE_KEY --env production
+wrangler tail --env production
+wrangler versions upload --env staging
+wrangler d1 execute pedidos-prod --env production --command "select 1"
+```
+
+<Cards>
+  <Card icon="🧩" title="Entornos con nombre">
+    Un manifiesto, varios Workers hermanos. Ideal cuando la forma es idéntica y solo cambian los valores. Es el mecanismo por defecto.
+  </Card>
+  <Card icon="📄" title="Manifiestos separados">
+    `wrangler deploy -c wrangler.prod.jsonc` cuando dos destinos difieren tanto que compartir un archivo genera más ruido que ahorro.
+  </Card>
+  <Card icon="🔀" title="Variable de entorno">
+    `CLOUDFLARE_ENV` selecciona el entorno sin flag, útil en CI y con el plugin de Vite para que cada job fije el suyo una vez.
+  </Card>
+  <Card icon="🏢" title="Cuentas separadas">
+    El aislamiento máximo: producción en otra cuenta de Cloudflare. Ninguna credencial de desarrollo alcanza nada real, ni por error de flag.
+  </Card>
+</Cards>
+
+En CI la disciplina se vuelve estructural: cada job fija su entorno una sola vez, mediante `CLOUDFLARE_ENV` o un flag explícito en un paso protegido, y el token que usa está acotado a lo que ese entorno necesita tocar. Un token capaz de desplegar producción no debería existir en el job que publica staging, por la misma razón por la que sus secretos tampoco viven juntos.
+
+<Callout type="dios" title="La configuración como frontera, no como preferencia">
+Hay dos maneras de entender la sección `env` y solo una sobrevive al contacto con un equipo real. La primera la ve como comodidad: un sitio donde guardar las diferencias para no editar el manifiesto antes de cada despliegue. La segunda la ve como lo que de verdad es: la declaración formal de una frontera de aislamiento. La diferencia entre ambas se nota en cómo respondes a la pregunta de por qué los bindings no se heredan. Si la ves como comodidad, la no herencia es una molestia que te obliga a repetir bloques y que combatirás con generadores, plantillas y trucos de merge. Si la ves como frontera, la no herencia es exactamente la garantía que querías: ningún entorno recibe acceso a un recurso sin que alguien lo haya escrito, con nombre y apellidos, en el bloque de ese entorno. Cloudflare eligió que el silencio signifique ausencia y no herencia, y esa elección convierte cada binding de producción en un acto deliberado que queda registrado en el diff de un commit. La verbosidad que tanto molesta es el precio de que la auditoría de qué toca producción se pueda hacer leyendo un archivo en lugar de razonando sobre reglas de propagación. Cuando alguien te proponga automatizar esa repetición, la pregunta correcta no es si el generador funciona: es si después de generarlo seguirá siendo posible mirar el manifiesto y saber, sin ejecutar nada, exactamente a qué datos accede el Worker que atiende a tus clientes.
+</Callout>
+
+<Reto title="Construye tres entornos que no puedan tocarse">
+1. Declara `env.staging` y `env.production` con `vars`, un binding a D1 y otro a KV cada uno, usando los mismos nombres de binding y recursos distintos. Despliega ambos y confirma que aparecen como dos Workers.
+2. Provoca deliberadamente la no herencia: define una `var` solo en el nivel superior, despliega `--env production` y observa que llega ausente. Corrígelo declarándola en el entorno.
+3. Sube el mismo secreto con valores distintos a cada entorno y verifica desde cada Worker que lee el suyo.
+4. Ejecuta `wrangler tail` sin `--env` y con él, y comprueba a qué Worker te conecta cada invocación.
+5. Escribe la matriz de tu proyecto: qué entorno accede a qué recurso, quién puede desplegar cada uno y qué token usa. Si alguna celda te incomoda, tienes una frontera mal puesta.
+</Reto>

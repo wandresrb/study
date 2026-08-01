@@ -1,0 +1,147 @@
+---
+title: "El plano completo: un despliegue, cinco superficies de estado"
+description: "Has estudiado cada primitiva por separado; este nivel las pone todas sobre la misma mesa. Un único Worker sirve el HTML, resuelve la API, consulta D1, guarda ficheros en R2, lee configuración en KV y delega el tiempo real en Durable Objects, bajo un solo dominio y un solo despliegue. Vemos por qué esa unidad no es una simplificación pedagógica sino la consecuencia directa del modelo de bindings, cómo se reparte el estado entre almacenes con propiedades deliberadamente incompatibles, y qué costuras aparecen cuando la frontera entre frontend y backend deja de existir como frontera de red."
+subject: cloudflare
+level: 39
+order: 1
+icon: "39.1"
+duracion: "22 min"
+---
+
+<Lead>
+La arquitectura full-stack clásica se dibuja como una pila de cajas separadas por redes: el navegador habla con un CDN, el CDN con un servidor de aplicación, el servidor con una base de datos que vive en otra región, y cada flecha de ese dibujo es una conexión que hay que abrir, autenticar, vigilar y pagar. En el edge ese dibujo se colapsa. El CDN, el enrutador y el servidor de aplicación son el mismo proceso, y los almacenes cuelgan de él como capacidades declaradas, no como servicios remotos con cadena de conexión. Este nivel no introduce ninguna primitiva nueva: introduce la vista de conjunto. El plano de una aplicación entera donde ya sabes leer cada símbolo por separado y donde lo difícil, a partir de aquí, es decidir qué pieza va en qué sitio y qué pagas por cada decisión.
+</Lead>
+
+<Objetivos>
+
+- Dibujar el plano de una aplicación full-stack completa sobre un único Worker y justificar cada arista.
+- Repartir el estado entre `D1`, `R2`, `KV`, `Durable Objects` y la cache según propiedades reales, no según costumbre.
+- Escribir el manifiesto que declara todas las superficies y saber qué implica cada binding en tiempo de ejecución.
+- Detectar las costuras del modelo unificado: acoplamiento del despliegue, presupuesto por petición y radio de fallo.
+
+</Objetivos>
+
+## El plano en una sola pieza
+
+El primer hecho estructural es que no hay dos despliegues. No existe un servicio de frontend y otro de backend con un contrato HTTP entre ambos: existe un `Worker` con un manifiesto que declara, además de su código, un directorio de assets estáticos. El runtime resuelve primero contra ese directorio y solo invoca tu código cuando la ruta no corresponde a ningún fichero, salvo que pidas explícitamente lo contrario. La consecuencia inmediata es que servir una portada estática cuesta cero invocaciones y cero milisegundos de CPU tuyos, mientras que servir `/api/facturas` entra en tu `fetch` con todos los bindings ya montados en `env`.
+
+El segundo hecho es que los almacenes no son endpoints. Cuando escribes `env.DB.prepare(...)` no estás abriendo un socket contra un servidor remoto con usuario y contraseña: estás invocando una capacidad que el runtime ha inyectado en tu isolate, resuelta por la infraestructura, sin DNS que resolver ni pool que mantener. Ese detalle, que parece de comodidad, es el que hace viable el plano completo: multiplicar almacenes no multiplica conexiones ni cold starts, así que dejas de economizar en número de sistemas y empiezas a elegirlos por sus propiedades.
+
+<Mermaid code={`flowchart TD
+  U[navegador] --> E[edge de cloudflare]
+  E --> A[assets estaticos]
+  E --> W[worker unico]
+  W --> KV[kv de configuracion]
+  W --> D1[d1 datos relacionales]
+  W --> R2[r2 ficheros]
+  W --> DO[durable objects tiempo real]
+  W --> Q[queues trabajo diferido]
+  style W fill:#89b4fa,color:#11111b
+  style E fill:#f9e2af,color:#11111b`} />
+
+Fíjate en que el diagrama no tiene una capa de balanceadores, ni una VPC, ni un bastión. No es que se hayan omitido por claridad: es que no existen. La superficie de red que tienes que diseñar, endurecer y monitorizar se ha reducido a una sola arista, la que va del navegador al edge, y todo lo demás es interno a una plataforma que ya resuelve el direccionamiento por ti.
+
+## El reparto del estado
+
+Tener cinco almacenes disponibles no es lujo ni indecisión arquitectónica: es reconocer que el estado de una aplicación no es homogéneo. Un registro de factura, un PDF de diez megas, un flag de producto y la lista de quién está escribiendo ahora mismo en un documento tienen requisitos de consistencia, tamaño, latencia y frecuencia de escritura que ningún sistema único satisface a la vez sin degradarse en algo. El error caro no es elegir mal una vez; es meter las cuatro cosas en el mismo sitio porque el equipo solo conoce uno.
+
+| Superficie | Qué guarda bien | Consistencia | Coste dominante |
+| --- | --- | --- | --- |
+| `D1` | Entidades relacionadas, consultas con `JOIN` y agregados | Fuerte en la primaria, replicas al día vía Sessions API | Filas leídas y escritas |
+| `R2` | Bytes opacos y grandes: adjuntos, imágenes, exportaciones | Fuerte por objeto, sin transacciones entre objetos | Almacenamiento y operaciones, sin egreso |
+| `KV` | Configuración, flags, mapeos de ruta, sesiones tolerantes | Eventual, propagación en el orden de segundos | Lecturas, muy baratas y muy rápidas en caliente |
+| `Durable Objects` | Un punto de coordinación por entidad viva: sala, documento, contador | Fuerte y serializada dentro del objeto | Duración de la instancia y peticiones |
+| `Cache API` | Respuestas derivadas y reconstruibles | Ninguna: es un acelerador con TTL | Prácticamente nada, salvo complejidad |
+
+La regla de decisión que conviene interiorizar no es una tabla de productos sino una pregunta en tres tiempos. Primero: ¿este dato tiene que ser correcto en el instante de leerlo, o basta con que sea reciente? Si basta con reciente, `KV` o la cache. Segundo: ¿la corrección exige ver varias filas a la vez y decidir sobre el conjunto? Entonces `D1`, porque eso es una transacción y no un `get`. Tercero: ¿la corrección exige que dos peticiones simultáneas no se pisen sobre la misma entidad? Entonces `Durable Objects`, porque el orden lo garantiza el hilo único, no tu código de reintentos.
+
+<Callout type="tip" title="El criterio del lector, no el del escritor">
+Casi todo el mundo elige el almacén pensando en cómo escribe el dato. Es al revés: elígelo por cómo se lee. Un flag se escribe una vez al mes y se lee un millón de veces al día, así que vive en `KV` aunque su escritura sea transaccional en tu cabeza. Una factura se escribe una vez y se lee en informes cruzados, así que vive en `D1` aunque su escritura sea trivial.
+</Callout>
+
+Queda una superficie que la tabla menciona de pasada y que conviene no tratar como almacén: la cache. No guarda nada que no puedas reconstruir, y esa es exactamente su definición operativa. En cuanto empiezas a depender de que una respuesta esté cacheada para que el sistema funcione, has convertido un acelerador en un almacén sin durabilidad, que es la peor combinación posible. La prueba es sencilla y vale la pena aplicarla antes de cada `put`: si mañana se vaciara la cache entera del planeta, ¿tu aplicación seguiría siendo correcta, aunque fuese más lenta? Si la respuesta es no, ese dato pertenece a otra fila de la tabla.
+
+## El manifiesto que lo declara
+
+Todo el plano cabe en un fichero y conviene leerlo como se lee un plano de instalación: cada bloque es una acometida que después aparecerá enchufada en `env`. Lo interesante del manifiesto es que es también el documento de auditoría; nada puede tocar tu Worker que no esté escrito aquí, y nada de aquí necesita una credencial embebida en tu código.
+
+```jsonc
+{
+  "name": "app-completa",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-01",
+  "assets": { "directory": "./dist", "binding": "ASSETS", "not_found_handling": "single-page-application" },
+  "kv_namespaces": [{ "binding": "CONFIG", "id": "..." }],
+  "d1_databases": [{ "binding": "DB", "database_name": "app", "database_id": "..." }],
+  "r2_buckets": [{ "binding": "FICHEROS", "bucket_name": "app-ficheros" }],
+  "durable_objects": { "bindings": [{ "name": "SALA", "class_name": "Sala" }] },
+  "queues": { "producers": [{ "binding": "TAREAS", "queue": "app-tareas" }] },
+  "observability": { "enabled": true }
+}
+```
+
+El código que lo consume es notablemente aburrido, y esa es la señal de que el reparto está bien hecho. Cada ruta toca exactamente una superficie, y las que tocan dos lo hacen porque el caso de uso realmente cruza dos naturalezas de dato: los metadatos del fichero en la base relacional, los bytes en el almacén de objetos.
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
+
+    if (url.pathname === "/api/config") {
+      const tema = await env.CONFIG.get("tema", { cacheTtl: 300 });
+      return Response.json({ tema });
+    }
+
+    if (url.pathname === "/api/facturas") {
+      const { results } = await env.DB.prepare(
+        "SELECT id, total, creada FROM facturas ORDER BY creada DESC LIMIT 50",
+      ).all();
+      return Response.json(results);
+    }
+
+    if (url.pathname.startsWith("/api/sala/")) {
+      const nombre = url.pathname.split("/").pop()!;
+      return env.SALA.get(env.SALA.idFromName(nombre)).fetch(request);
+    }
+
+    return new Response("No encontrado", { status: 404 });
+  },
+};
+```
+
+## Las costuras del modelo unificado
+
+Un plano tan compacto tiene virtudes evidentes y tres costuras que solo se ven cuando el sistema crece. Merece la pena nombrarlas antes de enamorarse de la simplicidad, porque cada una tiene un antídoto conocido y ninguna se resuelve improvisando en producción.
+
+<Cards>
+  <Card icon="🔗" title="Acoplamiento del despliegue">
+    Un cambio en el CSS y un cambio en la lógica de cobro comparten versión y ventana de despliegue. El antídoto son los service bindings: separar lo que tiene ritmos distintos, no lo que tiene nombres distintos.
+  </Card>
+  <Card icon="⏱️" title="Presupuesto por petición">
+    Cada invocación tiene un techo de CPU y un número máximo de subpeticiones. Tocar cinco almacenes en una sola ruta es tentador y es la vía más rápida a agotarlo.
+  </Card>
+  <Card icon="💥" title="Radio de fallo">
+    Si el Worker falla, no falla la API: falla también la portada. Servir los assets desde el mismo despliegue une la disponibilidad de lo estático a la de tu código.
+  </Card>
+  <Card icon="🧭" title="Deriva del reparto">
+    Sin una regla escrita, el estado migra al almacén más cómodo. En seis meses tienes sesiones en `D1`, informes en `KV` y nadie recuerda por qué.
+  </Card>
+</Cards>
+
+De las cuatro, la que más daño acumulado produce es la última, porque las otras tres duelen de golpe y esta duele en silencio. El acoplamiento del despliegue se nota el día que dos equipos se pisan; el presupuesto se nota cuando una ruta empieza a devolver errores bajo carga; el radio de fallo se nota en el primer incidente. La deriva del reparto, en cambio, no se nota nunca: simplemente, un día alguien pregunta por qué el listado de facturas tarda ochocientos milisegundos y la respuesta resulta ser que las últimas tres funcionalidades escribieron su estado donde les resultó más cómodo. Por eso la regla de reparto debe existir como texto, revisarse en cada incorporación al equipo y aplicarse en la revisión de código igual que se aplica el estilo.
+
+Conviene además fijar desde el principio una convención de nombres para las claves, porque en un plano con cinco superficies el prefijo es lo único que da estructura a lo que de otro modo es un espacio plano. Un objeto en `R2` que empieza por el identificador de la organización, una clave de `KV` que empieza por el tipo de dato y un `Durable Object` cuyo nombre codifica su ámbito son tres decisiones triviales el primer día y tres rescates enormes el día que hay que auditar, migrar o borrar por cliente.
+
+<Callout type="dios" title="La unificación no elimina la arquitectura distribuida: la esconde debajo de una llamada a método">
+Hay una lectura ingenua de todo esto que conviene desactivar ahora mismo, porque es la que produce los sistemas que se caen a los dieciocho meses. La lectura ingenua dice que el edge ha hecho desaparecer la complejidad distribuida: que como ya no hay VPC, ni pool de conexiones, ni service discovery, la aplicación ha vuelto a ser un monolito y podemos razonar sobre ella como razonábamos sobre un servidor único con su base de datos al lado. Es falso, y es falso de una manera especialmente peligrosa, porque lo que ha ocurrido no es que la complejidad se haya ido sino que ha cambiado de forma: se ha desplazado desde la capa de infraestructura, donde era ruidosa y visible y tenía su propio equipo vigilándola, hasta la capa de la semántica, donde es silenciosa y solo se manifiesta como un comportamiento raro bajo carga. Cuando escribes `await env.CONFIG.get("tema")` estás haciendo, con la ergonomía de un acceso a un diccionario en memoria, una lectura contra un sistema eventualmente consistente que puede devolverte un valor obsoleto durante segundos; y cuando escribes `env.SALA.get(id)` estás obteniendo un puntero a un actor que puede estar en Fráncfort mientras tú corres en Santiago, con toda la latencia transatlántica que eso implica, expresada como si fuera una llamada local. La sintaxis miente amablemente sobre la física, y esa mentira es precisamente lo que hace productiva a la plataforma. El arquitecto competente en el edge es, por tanto, el que mantiene dos modelos mentales simultáneos y no deja que el cómodo devore al verdadero: el modelo de ergonomía, en el que todo es un método sobre `env`, y el modelo de física, en el que cada uno de esos métodos tiene su propia consistencia, su propia latencia, su propio modo de fallar y su propia línea en la factura. El plano completo no es difícil de dibujar. Es difícil de mantener honesto, porque nada en el código te recuerda que las cinco flechas que salen del mismo recuadro no son en absoluto la misma flecha.
+</Callout>
+
+<Reto title="Dibuja tu propio plano">
+1. Toma una aplicación que ya conozcas y lista todos sus datos. Clasifica cada uno con la pregunta de tres tiempos: correcto ahora, correcto en conjunto, correcto bajo concurrencia.
+2. Escribe el manifiesto completo con las cinco superficies y comprueba con `wrangler types` que `env` refleja exactamente lo que declaraste.
+3. Implementa una ruta que toque dos almacenes a la vez, mide su CPU y compárala con las que tocan uno solo. Documenta la diferencia.
+4. Identifica en tu plano qué pieza tiene un ritmo de cambio distinto al resto y argumenta si merece salir a otro Worker mediante un service binding.
+5. Redacta en cinco líneas la regla de reparto de tu equipo y ponla en el repositorio. Sin ella, la deriva del estado es solo cuestión de tiempo.
+</Reto>

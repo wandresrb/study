@@ -1,0 +1,152 @@
+---
+title: "La Sessions API: leer tus propias escrituras"
+description: "Una réplica de lectura es rápida porque está cerca y, por eso mismo, va un instante atrasada. Ese replica lag crea la anomalía más desconcertante de los sistemas distribuidos: escribes un dato, lees justo después y no está. La Sessions API de D1 resuelve la tensión con withSession: encapsula las consultas de una sesión lógica y les garantiza consistencia secuencial. Cómo elegir el punto de partida entre first-unconstrained, first-primary y un bookmark, cómo toda escritura va a la primaria, y cómo encadenar sesiones entre peticiones con getBookmark para que el usuario nunca vea una versión anterior a la que ya vio."
+subject: cloudflare
+level: 20
+order: 2
+icon: "20.2"
+duracion: "17 min"
+---
+
+<Lead>
+Una réplica de lectura es rápida porque está cerca y, por eso mismo, va un instante atrasada. Ese atraso —el `replica lag`— produce la anomalía más desconcertante de los sistemas distribuidos: escribes un dato, lees inmediatamente después, y no está. No es un bug; es la física de la replicación asíncrona. La Sessions API de D1 existe para darte lo mejor de dos mundos: la baja latencia de leer de una réplica cercana y la garantía de no leer jamás una versión anterior a lo que tú mismo acabas de ver.
+</Lead>
+
+<Objetivos>
+
+- Nombrar la anomalía: por qué una réplica puede no contener lo que acabas de escribir.
+- Abrir una sesión lógica con `withSession` y entender la consistencia secuencial.
+- Elegir el punto de partida: `first-unconstrained`, `first-primary` o un `bookmark`.
+- Encadenar sesiones entre peticiones con `getBookmark` y una cabecera o cookie.
+
+</Objetivos>
+
+## Leer lo que acabas de escribir
+
+D1 solo tiene un escritor: la instancia primaria. Las réplicas reciben los cambios después, de forma asíncrona, así que en cualquier instante una réplica puede estar arbitrariamente atrasada respecto a la primaria. Si tu escritura va a la primaria y tu siguiente lectura cae en una réplica que aún no recibió ese cambio, obtienes un resultado que contradice algo que tú mismo acabas de hacer. Es la violación de leer las propias escrituras, y sin un marco que la evite es prácticamente inevitable en cuanto hay más de una copia.
+
+Aquí está la sutileza que define la lección: sin la Sessions API, D1 esquiva el problema del modo más tosco posible —mandando todo a la primaria—, y por eso, hasta que no adoptas sesiones, las réplicas no sirven una sola de tus lecturas. La consistencia se paga con latencia. La Sessions API es el instrumento que rebaja ese precio sin romper la garantía, y por eso conviene escribir con sesiones desde el primer día, incluso antes de activar réplicas: el código no cambia, y el día que las habilitas ya está preparado.
+
+## withSession y la sesión lógica
+
+Una sesión encapsula todas las consultas de una unidad lógica de tu aplicación —por ejemplo, todo lo que hace un usuario en una pestaña del navegador—. Dentro de ella, D1 garantiza consistencia secuencial: existe un orden global de operaciones, y ninguna consulta de la sesión ve una versión de la base anterior a la que ya vio una consulta previa.
+
+```ts
+// abrir la sesion es sincrono, no lleva await
+const session = env.DB.withSession("first-unconstrained");
+
+const { results } = await session
+  .prepare("SELECT * FROM pedidos WHERE usuario_id = ?")
+  .bind(usuarioId)
+  .run();
+```
+
+Todas las consultas se hacen sobre el objeto `session`, no sobre `env.DB` directamente. Ese objeto es quien arrastra, consulta a consulta, la marca que le dice a la réplica hasta dónde debe estar al día antes de responder. El caso canónico es escribir y leer dentro de la misma sesión:
+
+```ts
+const session = env.DB.withSession("first-primary");
+
+// escribe: siempre va a la primaria
+await session.prepare("INSERT INTO pedidos (usuario_id, total) VALUES (?, ?)")
+  .bind(usuarioId, 4200).run();
+
+// lee: aunque la sirva una replica, vera la insercion anterior
+const { results } = await session
+  .prepare("SELECT * FROM pedidos WHERE usuario_id = ?")
+  .bind(usuarioId).all();
+```
+
+## Los tres puntos de partida
+
+`withSession` recibe cómo debe arrancar la primera consulta, y de ahí en adelante la consistencia secuencial ya queda garantizada:
+
+```ts
+env.DB.withSession("first-unconstrained"); // por defecto
+env.DB.withSession("first-primary");
+env.DB.withSession(bookmarkPrevio);
+```
+
+`first-unconstrained` —el valor por defecto— manda la primera consulta a cualquier instancia, prima o réplica, priorizando la latencia mínima desde el inicio; sirve cuando no necesitas el dato más fresco al abrir. `first-primary` manda la primera consulta a la primaria, garantizando arrancar con la versión más reciente; es lo que quieres cuando lo primero que harás es leer algo que debe estar al día. Y un `bookmark` arranca desde un punto conocido: la sesión será al menos tan reciente como ese marcador.
+
+Sea cual sea el arranque, toda escritura se enruta siempre a la primaria. La elección solo afecta a las lecturas y a qué tan fresco es el suelo desde el que partes.
+
+<Cards>
+  <Card icon="⚡" title="first-unconstrained">
+    Primera consulta a cualquier instancia. Mínima latencia de arranque; ideal si no necesitas el último dato al abrir.
+  </Card>
+  <Card icon="🎯" title="first-primary">
+    Primera consulta a la primaria. Arrancas con la verdad más reciente; para cuando lo primero es leer algo crítico.
+  </Card>
+  <Card icon="🔖" title="bookmark">
+    Arranca desde un punto conocido de otra sesión. Garantiza continuidad al menos tan reciente como ese marcador.
+  </Card>
+</Cards>
+
+<Callout type="tip" title="La escritura fija el listón">
+Cuando escribes dentro de una sesión, el resultado lleva asociado un `bookmark` que representa el estado justo después de tu escritura. Las lecturas siguientes de esa misma sesión arrastran ese marcador, y la réplica que las atienda esperará a estar al menos así de al día antes de responder. Por eso lees tus propias escrituras aunque la lectura la sirva una réplica distinta de la primaria.
+</Callout>
+
+## Encadenar sesiones entre peticiones
+
+Una sesión vive dentro de una invocación del Worker. Pero la sesión lógica del usuario abarca muchas peticiones, y quieres preservar la consistencia entre ellas. El puente es el `bookmark`: al terminar, lo lees con `getBookmark` y lo devuelves al cliente; en la siguiente petición, lo recuperas y arrancas la sesión desde ahí.
+
+```ts
+export default {
+  async fetch(request, env) {
+    const previo = request.headers.get("x-d1-bookmark") ?? "first-unconstrained";
+    const session = env.DB.withSession(previo);
+
+    const respuesta = await manejar(request, session);
+
+    // devolver el marcador para la proxima peticion
+    respuesta.headers.set("x-d1-bookmark", session.getBookmark() ?? "");
+    return respuesta;
+  },
+};
+```
+
+El cliente guarda ese marcador —en una cabecera, en una cookie— y lo reenvía. Así la sesión lógica sobrevive a la naturaleza sin estado del Worker: cada petición nueva le dice a D1 que no le sirva nada anterior a lo ya visto, y la garantía de leer tus propias escrituras se extiende por toda la travesía del usuario.
+
+Hay un detalle de robustez que conviene no pasar por alto: bajo replicación, una lectura puede llegar a una réplica que aún no alcanzó tu `bookmark` y tardar un instante en ponerse al día, o excepcionalmente fallar por un pico de carga. Por eso el código de producción envuelve las consultas en un reintento breve; la sesión mantiene la consistencia y el reintento absorbe la variabilidad de la red.
+
+```ts
+async function conReintento(fn, intentos = 3) {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) { if (i >= intentos - 1) throw e; }
+  }
+}
+```
+
+<Callout type="tip" title="Sesiones y reintentos se complementan">
+La Sessions API te da consistencia lógica; no te exime de la naturaleza distribuida de la red. Un patrón sólido combina ambas: abres la sesión, y cada consulta se reintenta un par de veces ante errores transitorios. Como el `bookmark` viaja con la sesión, un reintento nunca retrocede en el tiempo: vuelve a pedir lo mismo, con la misma garantía de frescura mínima.
+</Callout>
+
+<Mermaid code={`sequenceDiagram
+  participant C as cliente
+  participant W as worker
+  participant P as primaria
+  participant R as replica
+  C->>W: peticion con bookmark previo
+  W->>P: escritura
+  P-->>W: ok mas bookmark 100
+  W->>R: lectura con bookmark 100
+  R-->>R: espera hasta estar al dia
+  R-->>W: datos consistentes
+  W-->>C: respuesta con bookmark nuevo`} />
+
+<Callout type="note" title="El bookmark es el mismo de Time Travel">
+El marcador que sincroniza tus lecturas no es un invento aparte: es el mismo `bookmark` que Time Travel usa para nombrar un punto del historial. Una sola idea —una posición en el orden global de operaciones— sirve a la vez para restaurar el pasado y para dar consistencia al presente. Verlos como lo mismo simplifica el modelo mental de toda la plataforma de datos.
+</Callout>
+
+<Callout type="dios" title="La consistencia no es del dato, es del observador">
+El error mental que vuelve incomprensible la replicación es creer que la consistencia es una propiedad del dato —que la base está o no está actualizada, en absoluto—. No lo es: la consistencia es una relación entre lo que un observador ya vio y lo que se le sirve a continuación. Una réplica atrasada no es incorrecta; simplemente vive en un instante anterior del tiempo global de la base, y para un observador que nunca vio nada más nuevo, ese instante es perfectamente consistente. El problema aparece solo cuando alguien que ya vio el futuro —porque acaba de escribirlo— es enviado al pasado. La Sessions API resuelve esto sin perseguir la quimera de mantener todas las réplicas idénticas al instante, que costaría la latencia que justamente vinimos a ganar. En su lugar hace algo más humilde y más hondo: adjunta a cada consulta un `bookmark`, una marca del punto del tiempo global que ese observador ya alcanzó, y obliga a la réplica a ponerse al menos así de al día antes de responder. La garantía no es que la réplica esté actualizada, sino que tú nunca retrocederás. Es consistencia secuencial: lecturas monótonas, escrituras monótonas y, sobre todo, leer las propias escrituras, todo ello relativo a cada sesión y no al reloj absoluto de la base. Por eso el `bookmark` tiene que viajar con el usuario, en una cabecera o una cookie, cruzando invocaciones sin estado del Worker: no es un detalle de implementación, es el hilo que cose la identidad temporal del observador a través de peticiones que, para la plataforma, no se conocen entre sí. Entender esto cambia cómo diseñas: dejas de preguntar si la base está al día —pregunta sin respuesta en un sistema replicado— y empiezas a preguntar qué ha visto ya este usuario y desde qué punto debe continuar. La primera persigue un absoluto imposible; la segunda es la única que un sistema global puede, y debe, responder.
+</Callout>
+
+<Reto title="Cose la sesión a lo largo del tiempo">
+1. Reescribe una ruta que use `env.DB` para que abra una sesión con `withSession` y ejecute todas sus consultas sobre ella.
+2. Escribe un endpoint que primero inserte un registro y luego lo lea dentro de la misma sesión, y razona por qué la lectura ve la escritura aunque la sirva una réplica.
+3. Propaga el `bookmark` con `getBookmark` en una cabecera de respuesta y consúmelo al abrir la sesión de la siguiente petición.
+4. Contrasta `first-unconstrained` y `first-primary`: describe un caso donde cada uno sea la elección correcta.
+5. Inspecciona `served_by_region` y `served_by_primary` del objeto `meta` y explica qué te dicen sobre dónde se atendió cada consulta.
+</Reto>

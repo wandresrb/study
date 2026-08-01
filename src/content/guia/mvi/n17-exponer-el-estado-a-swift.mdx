@@ -1,0 +1,154 @@
+---
+title: "Exponer el estado a Swift: flows, puentes y SKIE"
+description: "El punto donde Kotlin Multiplatform deja de ser cómodo es la frontera con Swift. El compilador nativo genera un encabezado de Objective-C, y ese formato intermedio no sabe nada de genéricos de Kotlin, de tipos sellados ni de flujos: las funciones suspendidas llegan como funciones con cierre de finalización, los flujos llegan como objetos opacos sin forma de recolectarlos, las clases selladas pierden su exhaustividad y los tipos con parámetros se aplanan. Esta lección explica con precisión qué se pierde en la traducción y por qué, construye a mano el puente mínimo que convierte un flujo en un observador cancelable utilizable desde SwiftUI, evalúa SKIE y los generadores de envoltorios como automatización de ese mismo puente, y delimita lo que ninguna herramienta resuelve: la cancelación, el hilo de entrega y la vida del objeto."
+subject: mvi
+level: 17
+order: 3
+icon: "17.3"
+duracion: "19 min"
+---
+
+<Lead>
+Todo va bien hasta que el estado tiene que cruzar a Swift. El compilador de Kotlin para plataformas nativas no habla directamente con Swift: produce un encabezado de Objective-C, un lenguaje anterior a casi todo lo que hace interesante a Kotlin, y Swift consume ese encabezado. La consecuencia es que el idioma se degrada dos veces por el camino. Lo que en el módulo común era un `StateFlow` de un estado inmutable, expuesto con una clase sellada de intenciones y un canal de efectos tipado, llega al otro lado convertido en objetos que Swift ve como cajas sin forma, funciones que solo aceptan un cierre de finalización y jerarquías que el compilador ya no puede comprobar exhaustivamente. Nada de esto impide construir la aplicación; todo esto determina cuánto código de pegamento acabarás escribiendo y quién lo mantiene.
+</Lead>
+
+<Objetivos>
+
+- Enumerar con precisión qué construcciones de Kotlin sobreviven al puente de Objective-C y cuáles se degradan.
+- Escribir a mano el envoltorio mínimo que convierte un flujo en un observador cancelable consumible desde SwiftUI.
+- Evaluar SKIE y los generadores de envoltorios como automatización del mismo puente, con sus límites.
+- Gestionar los tres problemas que ninguna herramienta elimina: cancelación, hilo de entrega y vida del objeto.
+
+</Objetivos>
+
+## Qué sobrevive al puente y qué no
+
+La degradación no es aleatoria: sigue las carencias del formato intermedio. Una función `suspend` se convierte en una función que recibe un cierre de finalización con resultado y error, lo cual es utilizable pero pierde la composicionalidad de las corrutinas. Un `Flow` no tiene traducción alguna: llega como un objeto cuya única operación relevante, la recolección, es a su vez una función suspendida, de modo que Swift recibe algo que no puede usar sin envolverlo antes. Los genéricos se aplanan en muchos casos y aparecen como tipos sin parámetros, obligando a conversiones explícitas del lado de Swift. Y una jerarquía sellada se convierte en clases relacionadas por herencia, con lo cual el `switch` de Swift pierde la exhaustividad y necesita una rama por defecto que el compilador ya no puede ayudarte a mantener.
+
+<Mermaid code={`flowchart LR
+  K[Kotlin comun con StateFlow y clases selladas] --> H[Encabezado de Objective C]
+  H --> S[Swift con cierres y tipos opacos]
+  H -.pierde.-> P[Genericos exhaustividad y flujos]
+  style K fill:#a6e3a1,color:#11111b
+  style H fill:#f9e2af,color:#11111b
+  style S fill:#89b4fa,color:#11111b`} />
+
+El caso de la jerarquía sellada merece detenerse, porque es el que más duele en la práctica. En Kotlin, añadir una variante nueva a un tipo sellado provoca un error de compilación en todos los sitios que la tratan, y ese error es justamente el valor del mecanismo: el compilador te lleva de la mano hasta cada punto que hay que actualizar. Al cruzar a Swift ese contrato desaparece, la variante nueva cae en la rama por defecto y la aplicación de iOS se comporta como si el caso no existiera, sin avisar a nadie.
+
+```kotlin
+// commonMain: exhaustivo y verificado por el compilador
+sealed interface PagoEfecto {
+    data object Confirmado : PagoEfecto
+    data class Rechazado(val motivo: String) : PagoEfecto
+    data class RequiereVerificacion(val url: String) : PagoEfecto
+}
+```
+
+```swift
+// Swift sin ayudas: la exhaustividad se convierte en disciplina
+switch efecto {
+case let confirmado as PagoEfectoConfirmado: mostrarExito()
+case let rechazado as PagoEfectoRechazado: mostrarError(rechazado.motivo)
+default: break  // aqui se pierden en silencio los casos nuevos
+}
+```
+
+Conviene entender que esto no es un defecto de implementación pendiente de corregir, sino una consecuencia del camino elegido. Mientras la interoperabilidad pase por Objective-C, ninguna herramienta podrá exponer a Swift construcciones que Objective-C no puede describir. Lo que las herramientas hacen —y hacen muy bien— es generar automáticamente el código de adaptación que de otro modo escribirías tú. La distinción importa porque fija expectativas: no esperes que el problema desaparezca, espera que se automatice.
+
+<Callout type="info" title="El nombre del problema no es iOS: es el formato intermedio">
+Nótese que del lado de Android no hay ninguna de estas fricciones, porque Kotlin y el código de Android comparten máquina virtual y sistema de tipos. Toda la asimetría de esfuerzo entre las dos plataformas nace de este punto, y es la razón por la que en un equipo mixto la parte de iOS siempre percibe KMP como más intrusivo que la parte de Android. Ignorar esa asimetría al presentar el enfoque al equipo es la forma más segura de generar resistencia.
+</Callout>
+
+## El puente escrito a mano
+
+Antes de delegar en una herramienta conviene haber escrito el puente una vez, porque es corto y porque explica exactamente qué hará la herramienta por ti. La idea es exponer, desde el módulo común, una función que reciba un cierre y devuelva un objeto capaz de cancelar la recolección.
+
+```kotlin
+// commonMain
+class Cancelable(private val job: Job) {
+    fun cancelar() = job.cancel()
+}
+
+fun <T : Any> Flow<T>.observar(
+    scope: CoroutineScope,
+    alEmitir: (T) -> Unit,
+): Cancelable {
+    val job = scope.launch { collect { alEmitir(it) } }
+    return Cancelable(job)
+}
+```
+
+Del lado de Swift, ese objeto se envuelve en algo observable para que SwiftUI lo consuma con naturalidad. El detalle crítico es cancelar la recolección cuando el objeto muere, porque de lo contrario la corrutina sigue viva reteniendo el cierre y, con él, la vista entera.
+
+```swift
+@MainActor
+final class EstadoObservado<T: AnyObject>: ObservableObject {
+    @Published private(set) var valor: T
+    private var cancelable: Cancelable?
+
+    init(inicial: T, flujo: (@escaping (T) -> Void) -> Cancelable) {
+        self.valor = inicial
+        self.cancelable = flujo { [weak self] nuevo in
+            Task { @MainActor in self?.valor = nuevo }
+        }
+    }
+
+    deinit { cancelable?.cancelar() }
+}
+```
+
+Tres decisiones de este código merecen atención. La referencia débil evita el ciclo entre la corrutina y el objeto observable. El salto explícito al actor principal es necesario porque nada garantiza que la emisión llegue en el hilo de interfaz. Y la cancelación en el destructor es lo único que impide una fuga silenciosa, que en iOS no se manifiesta como un fallo sino como consumo creciente y actualizaciones de vistas que ya no existen.
+
+## SKIE y los generadores de envoltorios
+
+`SKIE` es un complemento del compilador que se sitúa justo en esa junta y genera automáticamente el código de adaptación. Su aportación concreta es doble: convierte los flujos en secuencias asíncronas de Swift, de modo que se recolectan con un bucle `for await` sin envoltorio manual, y traduce las jerarquías selladas a enumeraciones de Swift, con lo que el `switch` recupera la exhaustividad y el compilador vuelve a avisar cuando añades un caso nuevo. También mejora el tratamiento de tipos opcionales y de valores por defecto. La alternativa clásica, basada en anotar las declaraciones para generar envoltorios de flujos y funciones suspendidas, resuelve el mismo problema con más ceremonia y menos alcance.
+
+<Cards>
+  <Card icon="🌊" title="Flujos como secuencias">
+    La recolección deja de necesitar envoltorio: se consume con un bucle asíncrono y la cancelación se ata a la tarea de Swift.
+  </Card>
+  <Card icon="🔒" title="Exhaustividad recuperada">
+    Las jerarquías selladas llegan como enumeraciones y el compilador de Swift vuelve a exigir que cubras todos los casos.
+  </Card>
+  <Card icon="🧰" title="Coste de adopción">
+    Es un complemento del compilador: añade tiempo de compilación y una dependencia de terceros en la ruta crítica de tu construcción.
+  </Card>
+  <Card icon="🧱" title="Lo que sigue siendo tuyo">
+    La forma del contrato. Ninguna herramienta decide por ti qué expones a Swift ni con qué granularidad.
+  </Card>
+</Cards>
+
+Con la herramienta activa, el mismo consumo se escribe del modo en que un programador de Swift lo escribiría si el otro lado también fuera Swift, y esa naturalidad no es cosmética: determina si el equipo de iOS percibe el módulo compartido como una biblioteca más o como un cuerpo extraño.
+
+```swift
+// Con SKIE: el flujo es una secuencia asincrona y la sellada una enumeracion
+func observarEfectos() async {
+    for await efecto in contenedor.efectos {
+        switch onEnum(of: efecto) {
+        case .confirmado: mostrarExito()
+        case .rechazado(let r): mostrarError(r.motivo)
+        case .requiereVerificacion(let v): abrir(v.url)
+        }
+    }
+}
+```
+
+Queda por decir lo que la herramienta no puede hacer, y es importante porque suele descubrirse tarde. No decide en qué hilo se entrega cada emisión, de modo que el salto al actor principal sigue siendo responsabilidad tuya. No alarga la vida del objeto de Kotlin cuando Swift deja de referenciarlo, ni la acorta cuando debería: la gestión de memoria sigue cruzando dos modelos distintos, recuento de referencias en un lado y recolector en el otro, y los ciclos entre ambos no los rompe nadie automáticamente. Y no impide que una tarea de Swift cancelada deje viva la corrutina que la alimentaba si el puente no se construyó atando ambas cancelaciones.
+
+<Callout type="warn" title="Los tres fallos que sobreviven a cualquier herramienta">
+Uno: actualizar la interfaz desde un hilo que no es el principal, con un resultado que va de la nada visible al fallo intermitente. Dos: no cancelar la recolección al destruirse la vista, con fuga de memoria y actualizaciones a objetos muertos. Tres: un ciclo de referencias entre el cierre de Swift y el objeto de Kotlin que lo retiene, que ningún lado libera. Los tres se previenen con las mismas tres líneas de disciplina, y los tres se manifiestan tarde.
+</Callout>
+
+Hay una consecuencia de diseño que estas herramientas hacen visible: cuanto más idiomática sea la interfaz que expones, menos pegamento hace falta. Un `container` que expone un único flujo de estado y un único método de entrada cruza la frontera casi sin fricción, porque hay exactamente dos cosas que traducir. Un contenedor que expone quince propiedades observables y treinta métodos multiplica por quince y por treinta el trabajo de adaptación. MVI, otra vez, resulta ser la disciplina que abarata el puente.
+
+<Callout type="dios" title="La frontera es el diseño, no el accidente">
+Se puede leer todo este capítulo como una lista de molestias técnicas de iOS, y sería la lectura pobre. La lectura útil es que este puente materializa una ley que gobierna cualquier sistema con más de un lenguaje o más de un proceso: el coste de una frontera no depende de la distancia entre los mundos que separa, sino del *tamaño y la riqueza de la superficie* que decides exponer a través de ella. Dos sistemas radicalmente distintos que se hablan por tres mensajes bien elegidos se integran casi sin dolor; dos sistemas casi idénticos que se exponen mutuamente cien tipos con genéricos anidados producen un pegamento imposible de mantener. Esto no es una particularidad de Kotlin y Swift: es lo mismo que hace que una interfaz de programación con pocos recursos sobreviva a una década, que un protocolo con pocos verbos sea implementable por terceros, que una biblioteca con una función de entrada se adopte y una con cuarenta se abandone. La degradación de tipos que sufres al cruzar a Objective-C es entonces menos un castigo que un *instrumento de medida*: cada construcción que se pierde en la traducción es una construcción que estabas exportando y quizá no debías. Un equipo que reacciona al problema buscando la herramienta que le permita exportarlo todo intacto está optimizando la respuesta equivocada; el que reacciona reduciendo lo que cruza —un flujo de estado, una función de entrada, un canal de efectos— descubre que la herramienta pasa a ser una comodidad y no una dependencia, y que su arquitectura ha mejorado en las dos plataformas por el simple hecho de haber tenido que justificar cada elemento de su superficie pública.
+</Callout>
+
+<Reto title="Cruza la frontera con las manos">
+1. Escribe la función `observar` y el objeto observable de Swift sin ayuda de ninguna herramienta, y comprueba con instrumentación que la recolección se cancela al destruirse la vista.
+2. Provoca a propósito la fuga: elimina la cancelación del destructor y describe qué observas exactamente en memoria y en la interfaz.
+3. Expón una jerarquía sellada a Swift sin SKIE, escribe el `switch` correspondiente y anota qué ocurre al añadir un caso nuevo en Kotlin.
+4. Repite el punto anterior con SKIE activado y compara el mensaje del compilador en ambos casos.
+5. Cuenta cuántos elementos públicos expone hoy tu módulo compartido a Swift y propón una reducción argumentada de esa superficie.
+</Reto>

@@ -1,0 +1,116 @@
+---
+title: "Bajo el capó: todo colapsa en un fetch handler"
+description: "Por muy grande que sea el framework, lo que Cloudflare ejecuta es siempre lo mismo: un único fetch handler. Cómo el adaptador funde routing, renderizado y middleware en ese punto de entrada, qué aspecto tiene el Worker generado y por qué poder bajar hasta el átomo es lo que te devuelve el control."
+subject: cloudflare
+level: 14
+order: 3
+icon: "14.3"
+duracion: "14 min"
+---
+
+<Lead>
+Un framework full-stack parece una máquina enorme: enrutado por archivos, renderizado de componentes, capas de datos, middleware, streaming. Pero Cloudflare no ejecuta ninguna de esas abstracciones directamente. Lo que el runtime invoca en producción es lo de siempre, el átomo del track: una sola función `fetch` que recibe una `Request` y devuelve una `Response`. Toda la maquinaria del framework se pliega, en tiempo de build, dentro de esa única puerta. Ver ese colapso con claridad es lo que separa a quien usa un framework de quien lo entiende.
+</Lead>
+
+<Objetivos>
+
+- Ver cómo el adaptador funde toda la app en un solo `fetch` handler.
+- Reconocer la anatomía del Worker generado y el flujo de una petición.
+- Entender por qué no hay servidor de larga vida ni `listen` en un puerto.
+- Usar el modelo "todo colapsa en fetch" como herramienta de depuración.
+
+</Objetivos>
+
+## Todo colapsa en fetch
+
+Cuando ejecutas el build de un framework con adaptador de Cloudflare, ocurre una fusión. El enrutado —esa tabla que asocia URLs con páginas o con handlers— se compila en una función de despacho. El motor de renderizado se empaqueta como una dependencia más del bundle. El middleware se encadena. Y todo eso se envuelve en una única función de entrada con la firma que ya conoces de memoria:
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    // aqui vive, comprimido, TODO el framework:
+    // 1. casa la URL con una ruta
+    // 2. ejecuta loaders o carga de datos
+    // 3. renderiza el componente a HTML
+    // 4. devuelve la Response
+    return await frameworkDispatch(request, env, ctx);
+  },
+};
+```
+
+Ese `frameworkDispatch` imaginario es la esencia: cualquiera que sea el framework, su servidor entero queda reducido a lógica que, dada una `Request`, elige qué `Response` fabricar. No hay una segunda naturaleza escondida. El framework es, tras el build, una función pura del edge con mucho código dentro.
+
+<Callout type="tip" title="Lo verás con tus propios ojos">
+No es una metáfora. En muchos frameworks el adaptador emite un archivo de entrada —a menudo llamado `_worker.js` o similar— que puedes abrir tras el build. Dentro encontrarás, entre el código minificado, un `export default` con un método `fetch`. Ábrelo alguna vez: nada convence tanto de que un framework es "solo" un Worker como leer el Worker que produce.
+</Callout>
+
+## Anatomía del Worker generado
+
+El artefacto de despliegue tiene dos mitades que conviene distinguir, porque el orden en que se consultan decide el flujo de cada petición. Por un lado, el **Worker**: el `fetch` handler con toda la lógica del servidor. Por otro, los **assets estáticos**: los archivos ya generados —CSS, JavaScript de cliente, imágenes, páginas prerenderizadas— que no necesitan cómputo.
+
+Ante una petición, la plataforma resuelve primero si corresponde a un asset estático; si existe, lo sirve directamente desde el edge sin despertar tu lógica. Si no, invoca el `fetch` handler, que enruta, carga datos y renderiza. Esa preferencia por el asset es lo que hace que servir lo estático sea prácticamente gratis y que el cómputo se reserve para lo dinámico.
+
+<Mermaid code={`flowchart TB
+  Req[Request entra] --> Q{es un asset estatico}
+  Q -->|si| AS[sirve el archivo desde el edge]
+  Q -->|no| FH[invoca el fetch handler]
+  FH --> RT[casa la ruta]
+  RT --> LD[carga datos con loaders]
+  LD --> RN[renderiza a HTML]
+  RN --> Res[Response sale]
+  style FH fill:#fab387,color:#11111b
+  style AS fill:#a6e3a1,color:#11111b`} />
+
+El manifiesto `wrangler.jsonc` refleja exactamente esas dos mitades: un `main` que apunta al Worker generado y un bloque `assets` que apunta al directorio de estáticos. Es la misma estructura de cualquier Worker con assets; el framework solo la rellena por ti:
+
+```jsonc
+{
+  "name": "mi-app",
+  "main": ".output/worker.js",
+  "compatibility_date": "2026-01-01",
+  "assets": { "directory": ".output/public" }
+}
+```
+
+## No hay servidor que mantener
+
+Aquí es donde el modelo del edge se separa con nitidez del despliegue tradicional. Un framework en un servidor de Node arranca un proceso que abre un puerto, se queda a la escucha con un `listen` y atiende peticiones en un bucle que vive indefinidamente. Ese proceso guarda estado en memoria entre peticiones y consume recursos aunque nadie llame.
+
+En Workers no hay nada de eso. No arrancas un proceso ni escuchas en un puerto: exportas una función y el runtime la invoca, una vez por petición, sobre un isolate que despierta en una fracción de milisegundo y se aparta cuando termina. El adaptador es precisamente quien traduce el modelo "servidor de larga vida" del framework al modelo "función efímera por petición" del edge.
+
+<Cards>
+  <Card icon="🖥️" title="Servidor tradicional">
+    Un proceso que abre un puerto, hace `listen` y vive indefinidamente. Guarda estado en memoria entre peticiones y consume recursos aunque nadie llame.
+  </Card>
+  <Card icon="✨" title="Worker efímero">
+    Una función que el runtime invoca por petición sobre un isolate que despierta sin cold start y se aparta al terminar. Sin puerto, sin bucle, sin proceso que vigilar.
+  </Card>
+</Cards>
+
+Esa diferencia no es un detalle de despliegue, sino un cambio en cómo escribes el código del servidor. Todo lo que un framework de Node daba por sentado —una conexión a base de datos abierta al arrancar y reutilizada durante horas, un caché en memoria que crece con el tiempo, un temporizador de fondo— deja de tener sentido cuando la unidad de ejecución vive lo que dura una petición. El adaptador salva la mayoría de esas distancias por ti, pero la responsabilidad de no escribir contra un modelo que ya no existe sigue siendo tuya.
+
+<Callout type="warn" title="El ámbito de módulo no es tu memoria de servidor">
+Como el framework ya no corre en un proceso persistente, cualquier estado que guardes en el ámbito de módulo —una variable global, un caché en memoria, un contador— se comparte entre peticiones de un mismo isolate y se pierde cuando ese isolate se recicla. Es la misma trampa que en un Worker crudo, pero más fácil de caer en ella porque el framework oculta la frontera. Los datos de una petición viven en el `context` de esa petición; nunca en el módulo.
+</Callout>
+
+## El átomo como herramienta de depuración
+
+Saber que todo colapsa en un `fetch` handler no es trivia arquitectónica: es una herramienta práctica que usarás a diario. Cuando una petición se comporta raro, el modelo te da un lugar concreto donde pensar. El framework, por muchas capas que tenga, recibió una `Request` y devolvió una `Response`; el fallo está en esa transformación, y puedes razonarla como razonarías cualquier Worker.
+
+Esa localización mental se traduce en gestos concretos, porque el punto de entrada es único y conocido. Ninguno de ellos exige entender las tripas del renderizador: bastan porque sabes exactamente dónde entra y sale cada petición.
+
+- Envolver el `fetch` handler generado con el tuyo para inspeccionar la `Request` antes de que el framework la despache.
+- Añadir cabeceras de diagnóstico a la `Response` de salida sin tocar el interior del framework.
+- Conectar `wrangler tail` y leer, en esa misma función, todo lo que el framework registra en producción.
+- Medir el tiempo dentro del handler para ubicar en qué capa —ruta, datos, render— se va la latencia.
+
+<Callout type="dios" title="La abstracción que nunca te encierra">
+La lección más valiosa de este nivel es que un framework en Workers es una abstracción de fuga controlada, y eso es una virtud, no un defecto. Una abstracción hermética te da comodidad hasta el día en que algo no encaja, y entonces te deja tirado frente a una caja negra que no puedes abrir. Un framework sobre Workers es lo contrario: te da toda la ergonomía de alto nivel —enrutado, renderizado, datos— pero descansa sobre un contrato que puedes tocar cuando lo necesites. Debajo del `loader` más sofisticado sigue habiendo una `Request`; detrás del componente renderizado más elegante sigue saliendo una `Response`; y el punto de entrada que Cloudflare ejecuta es el mismo `fetch` handler que escribirías a mano un martes cualquiera. Esto reconfigura tu relación con la herramienta. Dejas de depender de la magia y empiezas a razonar con un modelo: cada petición entra por una puerta que conoces, atraviesa capas que son código y no hechizos, y sale por la misma puerta convertida en respuesta. Cuando algo falla, no rezas ni recompilas al azar; localizas en qué capa de esa transformación se tuerce el flujo, porque sabes que todas las capas viven dentro de una sola función. Y cuando el framework no cubre un caso raro, puedes bajar un peldaño —interceptar la `Request` cruda, envolver el handler, añadir tu propio middleware— sin salir del sistema. Esa es la marca de una buena abstracción sobre una buena plataforma: te eleva sin secuestrarte, te da altura sin quitarte el suelo. El framework es el andamio; el `fetch` handler es la roca. Aprende a ver siempre la roca bajo el andamio y ningún framework volverá a ser una caja negra para ti.
+</Callout>
+
+<Reto title="Abre la caja">
+1. Haz el build de un proyecto full-stack con adaptador de Cloudflare y localiza el archivo de entrada del Worker generado; ábrelo y encuentra el `export default` con su método `fetch`.
+2. En el `wrangler.jsonc` resultante, identifica el `main` y el bloque `assets`, y explica qué mitad atiende cada tipo de petición.
+3. Provoca a propósito el error del estado en el ámbito de módulo: guarda un valor global en una petición e intenta leerlo en la siguiente; razona por qué no puedes fiarte de él.
+4. Describe en una frase, sin nombrar tu framework, qué hace su `fetch` handler ante una petición: casar ruta, cargar datos, renderizar, responder.
+</Reto>

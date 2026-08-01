@@ -1,0 +1,130 @@
+---
+title: "Cero cold start y coste por CPU"
+description: "Por qué un Worker arranca en torno a cero milisegundos y cómo Cloudflare esconde el arranque tras el handshake TLS. Seguimos el ciclo de vida de un isolate caliente, desmontamos el modelo de facturación por CPU real consumida frente al tiempo de pared, y deducimos cómo ese modelo de coste reeduca por completo la intuición de diseño heredada de las funciones lambda."
+subject: cloudflare
+level: 2
+order: 3
+icon: "2.3"
+duracion: "16 min"
+---
+
+<Lead>
+Un isolate barato de crear no basta por sí solo para prometer cero cold start: aún cuesta unos milisegundos preparar el `heap` y evaluar el script. La genialidad de Cloudflare está en dónde coloca ese trabajo. En lugar de hacerte esperar el arranque, lo solapa con latencia de red que ibas a pagar de todos modos. El resultado es un arranque que, para el usuario, es indistinguible de cero. Y una vez que el cómputo deja de tener arranque, la factura también cambia de forma.
+</Lead>
+
+<Objetivos>
+
+- Entender por qué crear un isolate es rápido y cómo se esconde ese coste tras el handshake TLS.
+- Ver el ciclo de vida de un isolate caliente: residencia, reutilización y evicción.
+- Comprender la facturación por CPU real consumida frente al tiempo de pared.
+- Deducir cómo el modelo de coste premia la espera ociosa y el fan-out barato.
+
+</Objetivos>
+
+## De pocos milisegundos a cero aparente
+
+Crear un isolate implica reservar un `heap`, cargar los objetos incorporados desde un `snapshot` y evaluar el código de nivel superior del Worker. Eso son unos pocos milisegundos, no cientos: no hay `microVM` que iniciar ni imagen que montar.
+
+Pero Cloudflare va un paso más allá y esconde incluso esos milisegundos. Cuando un cliente abre una conexión `HTTPS`, el handshake TLS gasta varias idas y vueltas de red antes de que llegue la petición útil.
+
+Cloudflare aprovecha ese hueco: en cuanto sabe a qué Worker va dirigida la conexión, empieza a crear y calentar su isolate **durante** el handshake. Para cuando el handshake termina y la petición aparece, el isolate ya está listo.
+
+El arranque no se eliminó: se solapó con trabajo de red inevitable.
+
+<Mermaid code={`flowchart LR
+  A[Cliente abre conexion HTTPS] --> B[Handshake TLS varias idas y vueltas]
+  B --> D[Llega la peticion util]
+  A --> C[Cloudflare crea y calienta el isolate en paralelo]
+  C --> E[Isolate listo]
+  E --> F[Servir sin espera de arranque]
+  D --> F
+  style C fill:#a6e3a1,color:#11111b
+  style E fill:#a6e3a1,color:#11111b
+  style F fill:#89b4fa,color:#11111b`} />
+
+Esta es la razón técnica precisa detrás del eslogan "cero cold start": no es magia ni una promesa de marketing, es solapamiento.
+
+El coste de arranque cabe entero dentro de la latencia de red que el usuario ya estaba pagando.
+
+Compáralo con el modelo anterior, donde el arranque en frío se sumaba a la latencia y se veía. Aquí el arranque no se suma a nada: se esconde en un hueco que ya existía de todos modos.
+
+## El ciclo de vida de un isolate caliente
+
+Una vez creado, el isolate no se tira tras una petición. Queda residente en memoria y atiende peticiones sucesivas del mismo Worker sin volver a arrancar.
+
+Solo cuando lleva un tiempo inactivo, o cuando hay presión de memoria en la máquina, el runtime lo evicta para liberar recursos. Si más tarde vuelve a llegar tráfico, se recrea, y como recrearlo es barato, el usuario apenas lo nota.
+
+El isolate vive en un ciclo perpetuo de nacer, servir y morir, gobernado por la demanda real y por la memoria disponible, no por una reserva fija que alguien paga por adelantado.
+
+Esto es lo contrario de la `provisioned concurrency`: nadie reserva capacidad de antemano para esquivar arranques. El sistema crea isolates cuando hay demanda y los libera cuando no la hay, y el usuario no nota la diferencia porque el arranque es invisible.
+
+Y no hay un solo isolate por Worker, sino potencialmente cientos repartidos por el mundo: uno o varios en cada ubicación que reciba tráfico. El ciclo de nacer, servir y morir ocurre en paralelo por toda la red, no en un servidor central.
+
+<Callout type="info" title="El estado global es una caché, no una verdad">
+Como el isolate persiste, las variables globales sobreviven entre peticiones y pueden servir de caché en memoria. Pero un isolate puede evictarse en cualquier momento, y existen muchos isolates del mismo Worker repartidos por el edge. Por eso el estado global es, como mucho, una caché best-effort: nunca una fuente de verdad. Para estado coordinado hacen falta otras piezas, que verás más adelante en el track.
+</Callout>
+
+## Facturación: CPU real, no tiempo de pared
+
+Aquí está la segunda consecuencia profunda de no tener máquina que mantener viva. En el modelo lambda pagas por tiempo de pared: la instancia existe mientras dura tu petición, y si esa petición espera 200 ms a una base de datos, pagas esos 200 ms aunque la CPU estuviera de brazos cruzados.
+
+En el modelo de isolates no hay una máquina dedicada esperando: cuando tu código hace `await` sobre una operación de entrada y salida, el isolate cede el hilo y ese mismo hilo atiende a otros isolates mientras tanto. Solo se te factura el **tiempo de CPU que de verdad consumes**.
+
+```js
+export default {
+  async fetch(request, env, ctx) {
+    // Estos 200 ms de espera de red NO cuentan como CPU facturable:
+    const datos = await fetch("https://api.ejemplo.com/lento");
+
+    // Solo esto, el trabajo real de CPU, entra en la factura:
+    const json = await datos.json();
+    return Response.json({ total: json.items.length });
+  },
+};
+```
+
+La diferencia no es cosmética. Un Worker que orquesta llamadas a servicios lentos puede pasar la mayor parte de su tiempo de pared esperando y, sin embargo, consumir poquísima CPU.
+
+En el modelo de pared eso es caro; en el modelo de CPU es casi gratis. La facturación deja de castigar la latencia inevitable de hablar con el mundo y pasa a medir únicamente el esfuerzo de cálculo que tu código aporta.
+
+Llevado al extremo, un Worker que solo enruta, autentica y reenvía —un proxy inteligente en el edge— consume tan poca CPU que su coste tiende a lo simbólico, por mucho tráfico que mueva. El gasto lo marca el cálculo, no el volumen de espera.
+
+El contraste se siente con números: una petición que espera 900 ms a servicios externos y calcula 5 ms factura, en el edge, esos 5 ms; en el modelo de pared, los 905. Es el mismo trabajo con dos órdenes de magnitud de diferencia en la factura.
+
+## Una petición no es un isolate
+
+Un corolario que sorprende a quien viene de lambdas: un isolate no atiende una sola petición a la vez.
+
+Como JavaScript es asíncrono y corre sobre un bucle de eventos, mientras una petición espera entrada y salida, el mismo isolate puede tener otras peticiones en vuelo avanzando. La relación "una instancia, una petición" del modelo anterior desaparece.
+
+Un isolate caliente es un servidor concurrente en miniatura.
+
+Esto trae un matiz que conviene recordar: como varias peticiones comparten el mismo `heap` mientras están en vuelo, el estado global mutable de un Worker no es privado por petición. Tratarlo como si lo fuera es una fuente clásica de errores sutiles de concurrencia.
+
+<Cards>
+  <Card icon="💤" title="La espera es gratis">
+    Esperar a una base de datos o a otra API no gasta CPU. El modelo premia el código que espera mucho y calcula poco.
+  </Card>
+  <Card icon="🕸️" title="Fan-out barato">
+    Lanzar muchas subpeticiones en paralelo y esperarlas cuesta CPU mínima. Orquestar servicios sale casi gratis.
+  </Card>
+  <Card icon="🔁" title="Concurrencia en el isolate">
+    Un isolate caliente sirve varias peticiones a la vez por el bucle de eventos. No hace falta una instancia por petición concurrente.
+  </Card>
+  <Card icon="🎯" title="El coste sigue al trabajo">
+    Pagas por CPU consumida. La factura mide tu cómputo real, no cuánto tiempo estuvo encendida una máquina que no controlabas.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Cuando el arranque desaparece, el modelo de coste se reordena">
+Fíjate en la cadena causal completa, porque es la tesis del nivel entero. Al mover la frontera de aislamiento del kernel al lenguaje, el arranque deja de requerir una máquina y baja a milisegundos. Al bajar a milisegundos, cabe dentro del handshake TLS y se vuelve cero aparente. Y al no haber una máquina dedicada que mantener viva por petición, la unidad natural de facturación deja de ser el tiempo de pared y pasa a ser la CPU realmente consumida. Cada eslabón habilita el siguiente: no son tres ventajas sueltas, son una sola idea desplegándose. Esto tiene una implicación de diseño que hay que grabar: en el edge, el enemigo del coste no es la latencia total de tu petición, sino el trabajo de CPU que hace tu código. Un Worker que tarda un segundo en responder porque espera a tres APIs lentas puede ser baratísimo; un Worker que responde en cien milisegundos pero quema CPU parseando y calculando puede salir caro. El instinto heredado de las lambdas —minimizar la duración total— es el instinto equivocado aquí. El instinto correcto es minimizar el cómputo y no temer la espera. Quien entiende esto diseña sistemas en el edge que son a la vez rápidos para el usuario y ridículamente baratos de operar.
+</Callout>
+
+<Reto title="Reeduca tu intuición de coste">
+1. Explica con precisión cómo el handshake TLS convierte unos milisegundos de arranque de isolate en cero aparente para el usuario.
+2. Toma un endpoint que espere 300 ms a una base de datos y compara qué se factura en el modelo de tiempo de pared frente al modelo de CPU real.
+3. Escribe un Worker que lance tres `fetch` en paralelo con `Promise.all` y razona por qué su coste de CPU es mínimo pese a su latencia total.
+4. Identifica un caso donde el instinto de "minimizar la duración total" te llevaría a la decisión equivocada en el edge.
+5. Explica por qué un solo isolate puede atender muchas peticiones concurrentes y qué propiedad de JavaScript lo hace posible.
+6. Razona por qué el estado global de un Worker no sirve como caché fiable entre dos peticiones cualesquiera de un mismo usuario.
+</Reto>

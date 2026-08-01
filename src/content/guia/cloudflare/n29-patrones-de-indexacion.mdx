@@ -1,0 +1,151 @@
+---
+title: "Patrones: chunks, sincronía y calidad de la recuperación"
+description: "Los tres problemas que separan un prototipo de un buscador semántico que aguanta en producción. Cómo trocear documentos para que el fragmento sea a la vez una unidad de significado y una unidad de respuesta, por qué los identificadores deterministas convierten el reindexado en una operación idempotente, cómo mantener sincronizado un índice que es una proyección derivada y no una fuente de verdad, incluidos los vectores huérfanos, y cómo medir de verdad la calidad de lo que recuperas con un conjunto de referencia y métricas como recall en k."
+subject: cloudflare
+level: 29
+order: 5
+icon: "29.5"
+duracion: "18 min"
+---
+
+<Lead>
+Insertar vectores y consultarlos es la parte fácil, y quien se queda ahí construye demostraciones que impresionan con veinte documentos y decepcionan con veinte mil. Lo que separa un juguete de un sistema es lo que ocurre alrededor del índice: cómo troceas los documentos antes de embeberlos, cómo mantienes el índice al día cuando la fuente cambia, y cómo sabes —con números, no con impresiones— si lo que recuperas es realmente lo que hacía falta. Estas tres disciplinas no son opcionales ni posteriores: son el diseño mismo del sistema, y de ellas depende que la búsqueda semántica cumpla su promesa.
+</Lead>
+
+<Objetivos>
+
+- Trocear documentos en fragmentos que sirvan a la vez de unidad semántica y de respuesta.
+- Usar identificadores deterministas para que el reindexado sea idempotente.
+- Sincronizar el índice con la fuente de verdad, incluidos los vectores huérfanos.
+- Medir la calidad de la recuperación con un conjunto de referencia y métricas explícitas.
+
+</Objetivos>
+
+## El chunk es la unidad de recuperación
+
+Un documento entero rara vez debe ser un solo vector. Los modelos tienen un límite de tokens de entrada y truncan en silencio lo que sobra, pero el problema de fondo es otro y más sutil: un embedding es un promedio del significado de lo que se le da: un manual completo produce un vector que no habla de nada en particular, porque cada tema tira de él en una dirección distinta y el resultado queda en un centro difuso que no está cerca de ninguna pregunta concreta.
+
+Trocear resuelve eso y, de paso, define lo que el sistema podrá devolver. Ese es el punto que hay que interiorizar: el fragmento no es solo la unidad que se embebe, es la unidad que se recupera y la que acabará mostrándose o pasándose a un modelo generativo. Si troceas por párrafos, tu sistema responderá con párrafos.
+
+<Cards>
+  <Card icon="🧩" title="Fragmentos grandes">
+    Conservan contexto y evitan cortar un argumento por la mitad, pero diluyen el vector y arrastran material irrelevante en cada respuesta.
+  </Card>
+  <Card icon="🔬" title="Fragmentos pequeños">
+    Producen vectores nítidos y muy precisos, pero pierden el hilo del discurso y devuelven trozos que por sí solos no se entienden.
+  </Card>
+</Cards>
+
+El punto de equilibrio habitual está entre doscientas y ochocientas palabras, con un solapamiento del diez o el quince por ciento entre fragmentos consecutivos para que una idea que cae justo en la frontera aparezca completa en al menos uno. Pero el criterio que más rendimiento da no es el tamaño sino el respeto por la estructura: corta en encabezados, en secciones, en párrafos, nunca a mitad de frase. Un troceado que sigue la arquitectura del documento produce fragmentos que ya eran unidades de sentido antes de que tú los definieras.
+
+Hay una técnica sencilla que mejora la recuperación más que casi cualquier otro ajuste y que casi nadie aplica al principio: enriquecer el texto antes de embeberlo. Un fragmento arrancado de la mitad de un manual pierde el contexto que lo hacía comprensible —de qué documento venía, bajo qué encabezado— y su vector queda flotando sin anclaje. Anteponer ese contexto al texto que embebes coloca el fragmento en la vecindad correcta del espacio.
+
+```ts
+// lo que se embebe lleva contexto; lo que se guarda y se muestra es el texto limpio
+const paraEmbeber = `${documento.titulo} — ${seccion}\n\n${texto}`;
+const { data } = await env.AI.run("@cf/google/embeddinggemma-300m", {
+  text: [paraEmbeber],
+});
+```
+
+Fíjate en la disociación: el texto enriquecido solo existe para generar el vector, mientras que el fragmento que guardas y acabas mostrando sigue siendo el original. Esa separación entre lo que se embebe y lo que se devuelve es una de las libertades más infrautilizadas del oficio.
+
+```ts
+// el identificador codifica documento y posicion: determinista y reconstruible
+const fragmentos = trocear(documento.texto, { palabras: 400, solape: 60 });
+
+const vectores = fragmentos.map((texto, i) => ({
+  id: `${documento.id}#${String(i).padStart(4, "0")}`,
+  values: embeddings[i],
+  namespace: documento.cliente,
+  metadata: {
+    doc_id: documento.id,
+    posicion: i,
+    idioma: documento.idioma,
+    actualizado_en: documento.actualizadoEn,
+  },
+}));
+```
+
+Fíjate en el identificador. Al derivarlo del documento y de la posición, obtienes gratis dos propiedades valiosísimas: reindexar el mismo documento sobrescribe exactamente los mismos vectores, y desde cualquier resultado puedes reconstruir a qué documento y a qué parte pertenece sin consultar nada. La metadata repite el `doc_id` porque un identificador no se puede filtrar, pero un campo indexado sí.
+
+## Mantener el índice sincronizado
+
+El índice es una proyección derivada de tus documentos, y toda proyección derivada tiende a divergir de su origen. Cada vez que un documento cambia hay que reembeber sus fragmentos y volver a escribirlos, y esa operación es idempotente gracias a los identificadores deterministas: `upsert` sobre los mismos identificadores deja el índice exactamente igual sin importar cuántas veces se ejecute.
+
+Lo que no resuelve `upsert` es el caso incómodo. Si un documento tenía doce fragmentos y tras la edición tiene nueve, los tres últimos siguen en el índice apuntando a texto que ya no existe. Son vectores huérfanos, y contaminan silenciosamente los resultados con contenido obsoleto que parece legítimo. Reindexar bien exige siempre dos pasos: escribir los fragmentos actuales y borrar la cola sobrante.
+
+```ts
+// 1. reescribir los fragmentos vigentes
+await env.VECTORIZE.upsert(vectores);
+
+// 2. eliminar la cola que quedo huerfana tras acortarse el documento
+const sobrantes = [];
+for (let i = fragmentos.length; i < conteoAnterior; i++) {
+  sobrantes.push(`${documento.id}#${String(i).padStart(4, "0")}`);
+}
+if (sobrantes.length) await env.VECTORIZE.deleteByIds(sobrantes);
+```
+
+<Mermaid code={`flowchart LR
+  SRC[documento en D1 o R2] --> EV[evento de cambio]
+  EV --> Q[cola o workflow]
+  Q --> CH[trocear]
+  CH --> EM[embeber por lotes]
+  EM --> UP[upsert de fragmentos]
+  UP --> DEL[borrar huerfanos]
+  style Q fill:#f9e2af,color:#11111b
+  style UP fill:#cba6f7,color:#11111b`} />
+
+La forma correcta de ejecutar esa canalización no es dentro de la petición que edita el documento. Embeber y escribir son operaciones lentas, susceptibles de fallar y sujetas a límites de lote, así que el patrón es publicar un evento de cambio en una cola o arrancar un workflow, y dejar que el proceso de indexación avance por su cuenta con reintentos. La asincronía de Vectorize encaja de forma natural con ese desacople: nadie está esperando el resultado.
+
+El borrado de un documento completo plantea el mismo problema en su versión extrema: hay que eliminar todos sus fragmentos, y el índice no ofrece un borrado por prefijo de identificador. La solución es guardar en tu fuente de verdad cuántos fragmentos generó cada documento, o llevar la lista de sus identificadores, de modo que el borrado sea una operación determinista y no una búsqueda a ciegas. Ese pequeño contador es una de esas piezas de contabilidad que parecen redundantes hasta que un día no la tienes.
+
+Para auditar la deriva tienes `list-vectors`, que pagina los identificadores del índice en páginas de hasta mil con consistencia de instantánea. Cruzar esa lista contra los identificadores que tu fuente de verdad debería tener es la única forma fiable de detectar huérfanos acumulados por ejecuciones fallidas, y merece la pena como tarea periódica en un cron.
+
+<Callout type="tip" title="Versiona el troceado en la metadata">
+Guarda en cada vector un campo con la versión de tu estrategia de troceado y el modelo con el que se embebió. Suena burocrático hasta el día que cambias el tamaño de fragmento o pruebas otro modelo: entonces ese campo te permite distinguir lo viejo de lo nuevo, migrar por lotes en lugar de todo a la vez y comparar la calidad de ambas estrategias sobre el mismo corpus antes de decidir. Sin ese campo, un cambio de estrategia obliga a vaciar el índice y cruzar los dedos.
+</Callout>
+
+## Medir la calidad de la recuperación
+
+Lo más habitual en sistemas de este tipo es que nadie mida nada. Se prueban cuatro preguntas a mano, los resultados parecen razonables y el sistema se da por bueno; meses después alguien nota que responde mal a un tipo de consulta y no hay forma de saber si eso empeoró o siempre fue así. La cura es barata: un conjunto de referencia con preguntas reales y, para cada una, los fragmentos que deberían recuperarse.
+
+Cincuenta preguntas bien elegidas bastan para empezar. Lo caro no es construirlo sino mantenerlo, y la disciplina consiste en añadir cada consulta que alguien reporta como fallida, de modo que el conjunto crezca justo donde el sistema flaquea.
+
+```ts
+// recall en k sobre un conjunto de referencia, en una docena de lineas
+let aciertos = 0;
+for (const caso of referencia) {
+  const { data } = await env.AI.run(MODELO, { text: [caso.pregunta] });
+  const { matches } = await env.VECTORIZE.query(data[0], { topK: 5 });
+  const ids = matches.map((m) => m.id);
+  if (caso.esperados.some((id) => ids.includes(id))) aciertos++;
+}
+const recall = aciertos / referencia.length;
+```
+
+Ese bucle, ejecutado como una tarea programada o como un paso previo a cada despliegue, es toda la infraestructura de evaluación que necesitas para empezar. Lo importante no es la sofisticación de la métrica sino que el número exista, quede registrado y pueda compararse con el de la semana pasada.
+
+| Métrica | Qué responde | Cuándo importa |
+| --- | --- | --- |
+| Recall en k | De los fragmentos relevantes, cuántos aparecen entre los `topK` | La métrica reina: si no se recupera, nada aguas abajo puede salvarlo |
+| Precisión en k | De los `topK` devueltos, cuántos eran relevantes | Cuando pasas los resultados a un modelo generativo y el ruido lo distrae |
+| Rango recíproco medio | En qué posición aparece el primer resultado bueno | Cuando el usuario ve una lista y solo mira los primeros |
+
+Con esos números en la mano, cada decisión de diseño se vuelve comprobable en lugar de opinable. Cambiar el tamaño de fragmento, subir el solapamiento, probar otro modelo de embeddings, ajustar el `topK` o introducir un umbral de `score`: todo pasa a ser un experimento con un resultado, y el conjunto de referencia es el árbitro. Vigila además la distribución de los `score`, porque un corpus sano muestra una separación clara entre los buenos resultados y el resto; cuando esa separación se aplana, suele ser síntoma de fragmentos demasiado largos o de un modelo que no entiende tu dominio.
+
+Y no midas solo la media. Un promedio saludable puede esconder que el sistema falla sistemáticamente en una familia entera de preguntas —las muy cortas, las que usan jerga interna, las de un idioma minoritario en tu corpus—, y ese patrón solo aparece si agrupas los casos del conjunto de referencia por tipo y miras cada grupo por separado.
+
+Una última advertencia sobre dónde poner el foco. Cuando el índice alimenta a un modelo generativo, la tentación es evaluar solo la respuesta final, y es un error de método: si la recuperación falla, ninguna cantidad de habilidad del generador lo arregla, porque el contexto correcto sencillamente no llegó. Mide la recuperación por separado y hazlo primero.
+
+<Callout type="dios" title="La calidad de un sistema de recuperación se decide en el troceado y se demuestra en la evaluación">
+Existe una fantasía tenaz alrededor de la búsqueda semántica según la cual el resultado depende del modelo, y por tanto mejorar consiste en esperar a que salga uno mejor. La experiencia dice otra cosa con bastante insistencia: entre dos sistemas construidos sobre el mismo modelo, el que trocea con criterio y evalúa con rigor supera al que no lo hace por un margen que ningún cambio de modelo compensa. La razón es que el troceado no es preprocesamiento, es el acto de decidir cuál es la unidad de conocimiento de tu dominio, y esa decisión determina todo lo que el sistema puede llegar a responder. Un fragmento es simultáneamente lo que se embebe, lo que se compara, lo que se recupera y lo que se muestra o se pasa a un generador; si eliges mal esa unidad, ningún componente posterior puede repararlo, porque el sistema ya no tiene forma de expresar la respuesta correcta. Nadie recupera un párrafo que nunca definió como fragmento. La segunda mitad de la tesis es la evaluación, y es donde se separan los oficios. Sin un conjunto de referencia, cualquier cambio en el sistema es un acto de fe: subes el solape porque suena mejor, bajas el `topK` porque parece más limpio, cambias de modelo porque su ficha promete más, y no tienes ni idea de si mejoraste o rompiste algo, porque tu única sonda son cuatro preguntas que ya sabes que funcionan. Un conjunto de cincuenta pares de pregunta y fragmento esperado, mantenido con la disciplina de incorporar cada fallo reportado, convierte ese caos en ingeniería: cada hipótesis se contrasta, cada regresión se detecta y cada mejora se puede defender con un número. Y hay una tercera idea que corona a las otras dos: la recuperación es una decisión de producto disfrazada de problema técnico. Qué se considera relevante para una pregunta no lo dice el modelo, lo dices tú al construir el conjunto de referencia, y ahí codificas qué espera tu usuario, qué es una buena respuesta en tu dominio y qué error es tolerable. Ese conjunto acaba siendo el activo más valioso del sistema —sobrevive a los modelos, a los troceados y a los índices— porque es lo único que contiene, escrito, qué significa funcionar bien.
+</Callout>
+
+<Reto title="Construye un índice que aguante">
+1. Trocea un documento largo respetando sus encabezados, con solapamiento, y asigna a cada fragmento un identificador determinista derivado del documento y su posición.
+2. Simula una edición que reduzca el número de fragmentos, ejecuta el reindexado completo y comprueba que borras los huérfanos con `deleteByIds`.
+3. Monta la canalización de indexación fuera de la petición usando una cola o un workflow, y añade un cron que audite el índice con `list-vectors`.
+4. Construye un conjunto de referencia de al menos veinte preguntas con su fragmento esperado, mide el recall en k actual y vuelve a medirlo tras cambiar el tamaño de fragmento.
+</Reto>

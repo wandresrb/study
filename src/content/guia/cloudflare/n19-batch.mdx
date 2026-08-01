@@ -1,0 +1,126 @@
+---
+title: "batch: varias sentencias en una sola ida y vuelta"
+description: "env.DB.batch ejecuta una lista de sentencias preparadas en una única llamada a la base, atómica y ordenada. Por qué las idas y vuelta importan tanto desde el edge, cómo el batch colapsa N viajes en uno, y qué significa que un batch sea una transacción SQL que se aplica entera o se revierte entera cuando una sentencia falla."
+subject: cloudflare
+level: 19
+order: 4
+icon: "19.4"
+duracion: "13 min"
+---
+
+<Lead>
+Cada vez que ejecutas una sentencia con `run` o `all`, tu Worker cruza la red hasta la base primaria y espera la respuesta. Una consulta suelta apenas lo nota; cinco escrituras encadenadas, una tras otra, multiplican esa espera por cinco. Desde el edge, donde tu Worker puede estar a miles de kilómetros de la primaria, ese coste se vuelve el factor dominante de la latencia. `batch` es la respuesta de D1 a ese problema: mete varias sentencias en una sola llamada, y de regalo te da algo que el edge suele hacer difícil —atomicidad—.
+</Lead>
+
+<Objetivos>
+
+- Medir el coste de las idas y vuelta a la primaria desde el edge.
+- Ejecutar varias sentencias con `env.DB.batch` en una sola llamada.
+- Entender la atomicidad: el batch se aplica entero o no se aplica nada.
+- Saber cuándo un `batch` es la herramienta correcta y cuándo no.
+
+</Objetivos>
+
+## El coste de una ida y vuelta desde el edge
+
+Una operación de base de datos no es gratis en tiempo: la mayor parte de lo que tarda no es ejecutar el SQL, sino el viaje de red hasta la primaria y de vuelta. Cuando encadenas escrituras con `await`, cada una espera a que la anterior complete su viaje antes de empezar el suyo. El resultado es aritmética simple y cruel: N sentencias, N viajes, N veces la latencia de ida y vuelta.
+
+```ts
+// cada await es un viaje completo: cinco idas y vuelta a la primaria
+for (const etiqueta of etiquetas) {
+  await env.DB.prepare('INSERT INTO etiquetas (nombre) VALUES (?)').bind(etiqueta).run();
+}
+```
+
+<Mermaid code={`sequenceDiagram
+  participant W as Worker en Sidney
+  participant P as Primaria en Frankfurt
+  W->>P: insert 1
+  P-->>W: ok
+  W->>P: insert 2
+  P-->>W: ok
+  W->>P: insert 3
+  P-->>W: ok`} />
+
+Si tu Worker corre en Sídney y la primaria está en Fráncfort, cada viaje puede costar cientos de milisegundos, y ese bucle de cinco inserciones tarda más de un segundo entero casi todo él esperando, no trabajando. En un backend regional, con la base a un milisegundo, el problema pasa desapercibido; en el edge, con la distancia de por medio, se convierte en la diferencia entre una respuesta ágil y una que arrastra.
+
+Y no es solo latencia percibida: mientras tu Worker espera cada viaje, sigue vivo, consumiendo su presupuesto de tiempo y sus subpeticiones. Cinco viajes secuenciales no solo tardan cinco veces más para el usuario, también mantienen al Worker atado cinco veces más. Comprimir esos viajes libera al Worker antes y deja margen para el resto de su trabajo.
+
+Quizá pienses en lanzar las cinco a la vez con `Promise.all` en lugar de una tras otra. Ayuda con la concurrencia, pero no es la respuesta: siguen siendo cinco operaciones independientes, sin garantía de atomicidad, que pueden tener éxito unas y fallar otras y dejar la base a medio escribir. El batch resuelve el número de viajes y la atomicidad de un solo golpe, y esa combinación es justo lo que `Promise.all` no te da.
+
+## batch: una llamada, varias sentencias
+
+`env.DB.batch` recibe una lista de sentencias preparadas y las envía todas juntas en una única llamada a la base. Preparas cada sentencia con su `bind` como siempre, pero en vez de ejecutarlas una a una, las reúnes en un array y las pasas a `batch`.
+
+```ts
+// una sola llamada para todas las inserciones
+const sentencias = etiquetas.map((etiqueta) =>
+  env.DB.prepare('INSERT INTO etiquetas (nombre) VALUES (?)').bind(etiqueta),
+);
+const resultados = await env.DB.batch(sentencias);
+```
+
+El ahorro es inmediato: donde antes había cinco viajes, ahora hay uno. `batch` devuelve un array de resultados en el mismo orden que las sentencias, de modo que puedes leer las filas o los metadatos de cada una por su posición.
+
+```ts
+// cada posicion corresponde a la sentencia del mismo indice
+const filas = resultados[0].results; // filas de la primera consulta
+const cambiadas = resultados[1].meta.changes; // filas que afecto la segunda
+```
+
+<Callout type="tip" title="Prepara una vez, vincula muchas">
+Como un statement preparado es reutilizable, el patrón idiomático de un batch de inserciones es preparar la sentencia una sola vez y llamar a `bind` con cada juego de valores, reuniendo los statements en la lista. No repites el texto del SQL ni el trabajo de prepararlo: describes la operación una vez y la aplicas a muchos datos. Es la economía del batch —decir mucho con una sola llamada— llevada también a la preparación.
+</Callout>
+
+<Mermaid code={`flowchart LR
+  N[cinco sentencias sueltas] --> NR[cinco idas y vuelta]
+  BA[un solo batch] --> BR[una sola ida y vuelta]
+  style NR fill:#f38ba8,color:#11111b
+  style BR fill:#a6e3a1,color:#11111b`} />
+
+## Atomicidad: todo o nada
+
+El batch no es solo una optimización de red: es una **transacción**. Las sentencias de un batch se ejecutan de forma secuencial y no concurrente, y —esto es lo decisivo— si una falla, se revierte la secuencia entera. No hay estados a medias: o se aplican todas, o no se aplica ninguna.
+
+```ts
+// si la segunda sentencia viola una restriccion, la primera tambien se revierte
+await env.DB.batch([
+  env.DB.prepare('UPDATE cuentas SET saldo = saldo - ? WHERE id = ?').bind(monto, origen),
+  env.DB.prepare('UPDATE cuentas SET saldo = saldo + ? WHERE id = ?').bind(monto, destino),
+]);
+```
+
+Ese ejemplo es el clásico de la transferencia: restar de una cuenta y sumar a otra tienen que ocurrir juntas o no ocurrir. Si el segundo `UPDATE` falla, sería un desastre que el primero hubiera quedado aplicado —el dinero se habría esfumado—. Con `batch`, D1 garantiza que un fallo en cualquier sentencia deshace todo lo anterior y te devuelve el error de la que falló. Consigues consistencia transaccional sin abrir y cerrar una transacción a mano.
+
+El mismo principio escala a operaciones más ricas. Crear un pedido con sus líneas es, conceptualmente, una sola unidad de trabajo: o queda el pedido con todas sus líneas, o no queda nada.
+
+```ts
+await env.DB.batch([
+  env.DB.prepare('INSERT INTO pedidos (id, usuario_id) VALUES (?, ?)').bind(pedidoId, usuarioId),
+  env.DB.prepare('INSERT INTO lineas (pedido_id, producto, cantidad) VALUES (?, ?, ?)').bind(pedidoId, 'cafe', 2),
+  env.DB.prepare('INSERT INTO lineas (pedido_id, producto, cantidad) VALUES (?, ?, ?)').bind(pedidoId, 'te', 1),
+]);
+```
+
+Bajo el capó, D1 opera en modo auto-commit y envuelve el batch en una transacción SQL: las sentencias se confirman juntas al final si todas tuvieron éxito, y un fallo dispara un rollback que deshace incluso las que ya se habían ejecutado dentro del lote. No existe un instante en el que un observador externo vea el batch a medias. Esa indivisibilidad es, exactamente, la atomicidad de las transacciones ACID, entregada sin que abras una transacción a mano.
+
+<Callout type="warn" title="batch es una transacción ordenada, no lecturas en paralelo">
+No uses `batch` para paralelizar lecturas independientes que quieres lanzar a la vez: sus sentencias se ejecutan en orden, no en paralelo, y comparten el destino transaccional —si una falla, caen todas—. Para lecturas sueltas que no dependen entre sí, lo tuyo es lanzar varias promesas y esperarlas juntas. `batch` es la herramienta cuando quieres una sola ida y vuelta y, además, la garantía de que ese grupo de operaciones se aplica como una unidad indivisible.
+</Callout>
+
+<Callout type="note" title="Un batch no es lo mismo que un INSERT de varias filas">
+Si solo quieres meter muchas filas en la misma tabla, la vía más eficiente no suele ser un batch de N inserciones, sino una única sentencia `INSERT` con varias tuplas de valores: una sentencia, un viaje, sin coordinar N statements. Reserva `batch` para cuando las sentencias son distintas entre sí —tablas diferentes, mezcla de `INSERT`, `UPDATE` y `DELETE`, o lecturas y escrituras juntas— o cuando ese grupo heterogéneo debe aplicarse de forma atómica. La pregunta guía es si tus operaciones son la misma repetida o varias distintas que deben viajar juntas.
+</Callout>
+
+## Por qué el batch importa tanto en el edge
+
+<Callout type="dios" title="El batch reconcilia dos verdades del edge: la distancia y la consistencia">
+El edge te da compute cerca del usuario, pero al hacerlo te aleja de tus datos, y esa es la tensión que gobierna todo el diseño de almacenamiento en esta plataforma. Cada ida y vuelta a la primaria paga el precio de la geografía, y ese precio, que en un backend regional era ruido de fondo, en el edge se vuelve la partida más cara del presupuesto de latencia. El batch ataca ese problema por la raíz al reconocer que el número de viajes, no el número de sentencias, es lo que duele: colapsar cinco, diez o cincuenta operaciones en un único viaje transforma una latencia que crecía linealmente con el trabajo en una constante que apenas se mueve. Pero lo verdaderamente elegante del batch es que resuelve un segundo problema con el mismo gesto. Los sistemas distribuidos suelen obligarte a elegir entre rendimiento y garantías: para ir rápido, renuncias a la atomicidad; para tener atomicidad, pagas coordinación. El batch de D1 se niega a esa disyuntiva porque una sola ida y vuelta es, a la vez, la forma más rápida de mover varias sentencias y el ámbito natural de una transacción —todo lo que va en el mismo viaje puede confirmarse o revertirse junto, sin protocolos de coordinación entre nodos, porque nunca sale del ámbito de la primaria—. Así, el batch te da lo que parecía incompatible: menos latencia y más garantías, en la misma llamada. Entender esto cambia cómo diseñas. Dejas de pensar en consultas individuales y empiezas a pensar en unidades de trabajo: qué operaciones tienen que viajar juntas porque comparten un destino atómico, y cómo agruparlas para pagar la distancia una sola vez. Esa mentalidad —agrupar por viaje y por transacción a la vez— es la que separa a quien usa D1 desde el edge como si estuviera en localhost de quien diseña para la geografía real en la que su código se ejecuta.
+</Callout>
+
+<Reto title="Piensa en viajes, no en sentencias">
+1. Escribe un bucle que inserte cinco filas con `await` sentencia a sentencia; cuenta cuántas idas y vuelta implica.
+2. Reescríbelo con `env.DB.batch` y una lista de sentencias preparadas; confirma que ahora es un solo viaje.
+3. Provoca a propósito el fallo de una sentencia del batch —por ejemplo, violando una restricción `UNIQUE`— y comprueba que ninguna de las demás quedó aplicada.
+4. Razona un caso de tu propia app en el que la atomicidad del batch sea imprescindible, y otro en el que prefieras lanzar lecturas en paralelo en su lugar.
+</Reto>

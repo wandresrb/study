@@ -1,0 +1,148 @@
+---
+title: "El modelo de precios: peticiones y tiempo de CPU"
+description: "La factura de Workers tiene exactamente dos contadores: cuántas veces se invocó tu código y cuántos milisegundos de procesador consumió al hacerlo. No hay una tercera columna por tiempo de pared, ni por instancia encendida, ni por ancho de banda de salida. Analizamos por qué esperar entrada y salida no se cobra, qué propiedad del runtime lo hace posible, dónde quedan los números de 2026 —100.000 peticiones diarias y 10 ms de CPU por petición en el plan gratuito, assets estáticos sin coste, plan de pago desde 5 dólares al mes— y qué decisiones de arquitectura premia y castiga esta aritmética."
+subject: cloudflare
+level: 40
+order: 1
+icon: "40.1"
+duracion: "17 min"
+---
+
+<Lead>
+Casi todo el mundo llega a Workers con una contabilidad heredada del servidor alquilado: pago por una máquina encendida, luego pago por tiempo. En el edge esa aritmética sencillamente no existe. No hay máquina, no hay hora de encendido, no hay instancia ociosa que siga cobrando mientras nadie la usa. Hay dos contadores, y solo dos: cuántas veces se invocó tu código y cuántos milisegundos de procesador consumió al ejecutarse. Todo lo demás —esperar a una base de datos, esperar a una API remota, esperar a que el cliente termine de descargar la respuesta— sale gratis. Entender esa contabilidad con precisión quirúrgica es lo que separa una factura que crece con el negocio de una que crece con el descuido.
+</Lead>
+
+<Objetivos>
+
+- Separar con rigor los dos contadores que factura la plataforma: peticiones y `CPU time`.
+- Explicar por qué la espera de entrada y salida no se cobra y qué propiedad del runtime lo permite.
+- Situar los números de 2026: qué entra en el plan gratuito y desde dónde empieza el de pago.
+- Deducir qué decisiones de diseño premia este modelo y cuáles castiga sin avisar.
+
+</Objetivos>
+
+## Dos contadores y ni uno más
+
+El primer contador es la **petición**: cada invocación de tu Worker suma uno. No importa si respondió en dos milisegundos o si estuvo un minuto entero esperando a un origen remoto; la unidad es la invocación, no su duración. El segundo contador es el **tiempo de CPU**: la suma de los instantes en que el procesador estuvo de verdad ejecutando tus instrucciones. No el tiempo transcurrido, no el tiempo de reloj de pared, no el tiempo que el usuario percibe. Solo trabajo efectivo.
+
+Conviene precisar qué cuenta como invocación, porque no todas entran por la puerta principal. Suma uno cada ejecución del manejador `fetch`, cada disparo del manejador `scheduled` de un cron, cada lote que recibe el consumidor de una cola y cada alarma que despierta a un `Durable Object`. Todas son invocaciones del mismo tipo a efectos de contabilidad, aunque ninguna venga de un navegador, y esa uniformidad es una virtud del modelo: no hay que aprender una tarifa distinta por cada forma de arrancar código.
+
+La distinción parece un tecnicismo contable y es en realidad el eje entero de la plataforma. Nada de esto significa que la latencia sea irrelevante, sino que se gestiona en otra conversación y con otras herramientas, tal como veremos en la lección siguiente. Un Worker que tarda ochocientos milisegundos en responder porque consultó tres servicios lentos puede haber gastado dos milisegundos de CPU. Otro que responde en cuarenta milisegundos porque comprime una imagen en memoria puede haber gastado treinta y ocho. El primero es rapidísimo desde el punto de vista de la factura y lento desde el del usuario; el segundo, exactamente al revés. Confundir ambas magnitudes es el error de razonamiento más caro que se comete en el edge, porque lleva a optimizar la métrica equivocada durante meses.
+
+Los números de 2026 fijan el terreno. El plan gratuito ofrece **100.000 peticiones al día** y **10 ms de CPU por petición**, un techo generoso para casi cualquier proyecto personal y sorprendentemente holgado incluso para servicios reales, porque diez milisegundos de procesador son muchísimo cuando el grueso del trabajo consiste en esperar. Las peticiones a **assets estáticos son gratis** y no consumen esa cuota: servir el HTML, el CSS, las fuentes y las imágenes de un sitio entero no cuesta ni una sola petición facturable mientras el Worker no intervenga. El plan de pago arranca en **5 dólares al mes** e incluye una cuota mensual de peticiones y de milisegundos de CPU; a partir de ahí se factura por consumo, y el límite por petición deja de ser de diez milisegundos para situarse en decenas de segundos, ajustable con `cpu_ms` en la configuración.
+
+Merece la pena detenerse en lo que significan diez milisegundos de procesador, porque la cifra suena diminuta a quien la lee como si fuera tiempo de respuesta y es en realidad muy holgada cuando se lee como lo que es. En diez milisegundos caben la resolución de una ruta, la verificación de una firma, la lectura de varias cabeceras, la composición de un objeto de respuesta y la serialización de unos cuantos kilobytes, con margen de sobra. No caben, en cambio, la deserialización de un documento de varios megabytes, el redimensionado de una fotografía ni el cifrado de un archivo entero. La frontera del plan gratuito no separa proyectos serios de proyectos de juguete: separa código que coordina de código que muele, y esa es una distinción de naturaleza, no de tamaño.
+
+<Mermaid code={`flowchart LR
+  A[entra la peticion] --> B[CPU analizar ruta y cabeceras]
+  B --> C[espera de red hacia el origen]
+  C --> D[CPU transformar y serializar]
+  D --> E[sale la respuesta]
+  C -.->|no se factura| F[tiempo libre del hilo]
+  style B fill:#f38ba8,color:#11111b
+  style D fill:#f38ba8,color:#11111b
+  style C fill:#a6e3a1,color:#11111b
+  style F fill:#a6e3a1,color:#11111b`} />
+
+Lo que el diagrama dice sin decirlo es que la parte roja —la única facturable— suele ser la más corta de la línea de tiempo, y que su tamaño depende de ti, mientras que la parte verde depende del mundo. Tienes control absoluto sobre el contador que pagas y control escaso sobre el que no.
+
+Hay una consecuencia del modelo que se nota antes en la arquitectura que en la factura: **lo que no se usa no cuesta nada**. Un servicio con tráfico cero paga cero, sin instancias mínimas ni reservas, y eso cambia la economía de dividir un sistema en piezas. Donde antes cada servicio nuevo implicaba una máquina más encendida las veinticuatro horas, aquí implica exactamente el trabajo que haga, de modo que separar responsabilidades deja de tener un precio fijo por el mero hecho de existir. Ese detalle explica buena parte de por qué en el edge proliferan las arquitecturas con muchos Workers pequeños sin que la factura se resienta.
+
+Hay una asimetría entre ambos contadores que conviene tener presente porque cambia la táctica. El número de peticiones lo decide el mundo exterior: cuánta gente visita, cuántos bots rastrean, cuántas veces recarga un cliente impaciente. Lo único que puedes hacer al respecto es interceptar antes —con caché, con assets estáticos, con respuestas condicionales— para que buena parte de ese tráfico no llegue a invocar código. El tiempo de CPU, en cambio, lo decide íntegramente tu programa, y por tanto se ataca leyendo funciones. Son dos disciplinas distintas con herramientas distintas, y confundirlas produce esfuerzos mal dirigidos: nadie arregla un exceso de peticiones optimizando un bucle.
+
+<Callout type="info" title="Que ocurre exactamente cuando se agota la cuota gratuita">
+El contador diario del plan gratuito se reinicia a medianoche en tiempo universal coordinado. Al alcanzar el tope, las invocaciones dejan de ejecutarse y la plataforma devuelve un error propio en lugar de tu respuesta, lo que en la práctica significa que el servicio se apaga hasta el reinicio. No hay sobrecoste sorpresa ni facturación silenciosa, que es exactamente el comportamiento que quieres en un plan gratuito, pero implica que un proyecto con tráfico real necesita saber de antemano cuál es su margen y vigilar la tendencia antes de acercarse al techo.
+</Callout>
+
+<Callout type="tip" title="El tiempo de pared no aparece en ninguna columna de la factura">
+Un Worker que espera cinco segundos a un `fetch` lento y otro que responde al instante consumen lo mismo si ejecutaron las mismas instrucciones. La lentitud es un problema de producto, de experiencia y de límites operativos, pero no es un problema de coste. Separar ambos análisis desde el principio evita esa clase de reunión en la que alguien propone recortar funciones para ahorrar dinero cuando lo que sobra es latencia ajena.
+</Callout>
+
+Con esas dos cifras y esa asimetría en la cabeza ya se puede leer cualquier factura del edge, porque no hay letra pequeña adicional: el resto de conceptos que puedan aparecer pertenecen a los almacenes y servicios que hayas conectado, cada uno con su propia tarifa, y se analizan por separado. El núcleo del modelo cabe en una frase que conviene memorizar: pagas por arrancar tu código y por el tiempo que ese código tenga ocupado el procesador, y nada más.
+
+## Por qué la espera sale gratis
+
+Que la espera no se cobre no es una promoción comercial ni un gesto de generosidad: es la consecuencia directa de cómo está construido el runtime. Un Worker no ocupa un proceso ni un contenedor propio, sino un **isolate** de V8 que comparte hilo con muchísimos otros. Cuando tu código llega a un `await` sobre una operación de red, el isolate no bloquea nada: devuelve el control al bucle de eventos y ese mismo hilo se dedica de inmediato a ejecutar el código de otro cliente. No hay ningún recurso reservado en tu nombre mientras esperas, y por eso no hay nada que facturarte.
+
+El corolario es elegante y estricto a la vez: **no se te puede cobrar por lo que no computaste**. En un modelo de contenedores ocurre lo contrario, porque la instancia sigue reservada durante la espera y alguien tiene que pagar esa reserva; de ahí que el mundo tradicional facture por duración. Ese detalle explica también por qué el modelo puede permitirse ser tan barato para el caso común: no está regalando capacidad, está cobrando exactamente el recurso que tu código ocupa en exclusiva y compartiendo todo lo demás entre millones de inquilinos. Cambiar de plataforma sin cambiar de intuición contable es traer una regla que ya no rige, y suele manifestarse en optimizaciones inútiles: reducir esperas que no cuestan nada mientras se ignora un bucle de serialización que se lleva el presupuesto entero.
+
+Hay tres matices que conviene tener claros antes de dar el modelo por entendido. El primero es que la deserialización sí cuesta: leer un cuerpo con `await response.json()` no es esperar, es **analizar bytes**, y el análisis es CPU pura que crece con el tamaño del documento. El segundo es que el trabajo diferido con `ctx.waitUntil` no es gratis: se ejecuta después de haber respondido al usuario, de modo que mejora la latencia percibida, pero su CPU se suma a la misma factura. El tercero es que gratis no significa ilimitado: aunque el reloj de pared no se cobre, sigue habiendo límites operativos sobre cuánto puede durar una invocación, cuántos `subrequests` admite y cuánta memoria puede retener.
+
+```ts
+export default {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext) {
+    const r = await fetch("https://api.interna/datos"); // esperar: 0 ms de CPU
+    const datos = await r.json();                        // analizar: CPU proporcional al tamano
+    const salida = datos.items.map(normalizar);          // transformar: CPU pura
+    ctx.waitUntil(env.LOGS.writeDataPoint({ doubles: [salida.length] })); // diferido, pero facturado
+    return Response.json(salida);
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+Hay un cuarto matiz que se aprecia sobre todo con clientes móviles o con conexiones malas: **el ritmo del cliente tampoco te cuesta nada**. Si un usuario descarga tu respuesta con lentitud, tu Worker no está reservando procesador mientras tanto; los bytes salen al ritmo que la red permita y la contabilidad ya se cerró en el momento en que terminaste de generar la respuesta. En un servidor tradicional ese mismo escenario mantiene ocupado un hilo o una conexión, y por eso existe toda una tradición de técnicas defensivas frente a clientes lentos que aquí simplemente no hace falta.
+
+El caso del intermediario ilustra bien hasta dónde llega la idea. Un Worker que recibe una petición, la reenvía a un origen y devuelve la respuesta tal cual puede atender cargas enormes con un consumo de procesador casi indistinguible de cero, porque los bytes atraviesan el sistema en flujo sin que tu código los toque nunca. En cuanto ese mismo Worker decide inspeccionar el contenido, el coste deja de depender del número de peticiones y pasa a depender del volumen de datos, que es una magnitud que crece por su cuenta y sin avisar.
+
+```ts
+// Casi cero CPU: los bytes fluyen y el Worker solo cambia cabeceras.
+const origen = await fetch(destino, req);
+const salida = new Response(origen.body, origen);
+salida.headers.set("x-servido-por", "edge");
+return salida;
+```
+
+<Callout type="warn" title="La trampa del cuerpo enorme que solo querias reenviar">
+Si tu Worker actúa de intermediario y no necesita mirar el contenido, no lo deserialices. Pasar el `body` de la respuesta original directamente al constructor de `Response` conserva el flujo y cuesta prácticamente cero CPU, mientras que hacer `json()` y volver a serializar con `stringify` te cobra dos recorridos completos sobre cada byte. En cargas de cientos de kilobytes esa diferencia es el salto entre dos milisegundos y treinta.
+</Callout>
+
+## Qué premia y qué castiga esta aritmética
+
+Una vez interiorizado que solo se paga trabajo efectivo, las decisiones de arquitectura se reordenan solas. Lo que era caro en el modelo antiguo se vuelve barato y viceversa, y ese giro tiene consecuencias muy concretas.
+
+| Operación | Coste real |
+| --- | --- |
+| Esperar cualquier `fetch`, por lento que sea | Nulo |
+| Retransmitir un cuerpo en streaming sin tocarlo | Casi nulo |
+| Consultar tres servicios en paralelo | Casi el mismo que consultar uno |
+| Deserializar y volver a serializar `JSON` grande | Alto y proporcional al tamaño |
+| Criptografía, compresión o imágenes en JavaScript | Muy alto |
+| Ordenar o clonar en profundidad colecciones grandes | Alto y superlineal |
+
+Dos filas de esa tabla merecen un comentario porque sorprenden. Que consultar tres servicios en paralelo cueste casi lo mismo que consultar uno es consecuencia directa de que la espera sea gratuita: lo único que se paga es el trabajo de preparar las tres llamadas y procesar sus respuestas. Y que la retransmisión en flujo sea casi gratis es lo que convierte a un Worker en un intermediario viable para volúmenes de datos que jamás cabrían en su memoria, porque los bytes lo atraviesan sin detenerse.
+
+El patrón que emerge es nítido: la plataforma premia al Worker que **coordina** y castiga al Worker que **procesa**. Orquestar llamadas, decidir rutas, adjuntar cabeceras, verificar un token, elegir un origen y retransmitir bytes son operaciones cuyo coste es despreciable frente a lo que se paga por transformar cargas útiles grandes en memoria. Un frontal que reparte trabajo entre servicios y compone respuestas puede sostener volúmenes enormes en el plan gratuito; el mismo frontal, si además redimensiona imágenes en JavaScript, agota diez milisegundos con una sola petición.
+
+Ese sesgo no es un capricho de la tarifa, sino el reflejo económico de lo que la plataforma sabe hacer excepcionalmente bien. Un sistema que multiplexa millones de isolates sobre un número modesto de hilos rinde de forma extraordinaria mientras cada uno de ellos ocupe el procesador durante muy poco tiempo y libere enseguida; una carga que monopoliza el hilo durante segundos rompe esa premisa. El precio, por tanto, no está castigando el cómputo por gusto: está señalando con precisión qué clase de trabajo pertenece a este modelo de ejecución y cuál pertenece a otro.
+
+Ese giro tiene un efecto secundario poco discutido sobre cómo se razona al añadir funcionalidad. En un modelo por duración, el coste marginal de una función nueva es difuso, porque depende de cuánto alargue la vida de una instancia compartida y de cuántas peticiones concurrentes haya. Aquí es exacto y calculable antes de escribirla: la función nueva costará lo que cuesten sus instrucciones multiplicado por el número de peticiones que la ejecuten. Esa nitidez permite algo que en otras plataformas resulta casi imposible, que es discutir el coste de una propuesta en la fase de diseño y no cuando ya está desplegada.
+
+De ahí salen dos consecuencias operativas que conviene enunciar como reglas. La primera: **paralelizar es prácticamente gratis**, porque tres esperas simultáneas cuestan lo mismo que una y el usuario nota la diferencia. Es la única optimización que mejora la experiencia sin empeorar ninguna otra magnitud, y por eso debería ser el reflejo por defecto y no una técnica avanzada. La segunda: **lo que se puede calcular una vez no debe calcularse por petición**, porque el contador de CPU es lineal en el número de invocaciones y cualquier trabajo repetido se multiplica por el tráfico sin que nadie lo note hasta que llega la factura.
+
+Hay una tercera regla que no es de rendimiento sino de higiene mental, y es tratar los diez milisegundos como un **presupuesto por petición** en lugar de como un límite lejano. Un equipo que se pregunta en cada revisión de código cuánto de ese presupuesto consume la ruta que está tocando toma decisiones distintas de uno que solo mira el límite cuando aparece un error: elige formatos más baratos de analizar, evita clonar estructuras por comodidad, prefiere que la base filtre antes que filtrar en memoria. Ninguna de esas decisiones es heroica y todas son gratis en el momento de escribirlas; juntas son la diferencia entre un servicio que cabe holgadamente en el modelo y otro que pelea contra él.
+
+Queda una observación sobre cómo se comporta este modelo cuando el proyecto crece, porque ahí se aprecia su virtud menos evidente. El gasto es estrictamente proporcional al uso, sin escalones ni saltos: no hay un momento en que haya que aprovisionar el doble de máquinas ni una noche de migración a una instancia mayor. Un servicio que multiplica por diez su tráfico multiplica por diez su factura y no cambia ni una línea de configuración. Esa linealidad hace que la planificación de capacidad, que en otros modelos es un ejercicio recurrente y angustioso, se reduzca aquí a una multiplicación que cualquiera puede hacer en una servilleta.
+
+<Cards>
+  <Card icon="⚖️" title="Dos contadores, dos disciplinas">
+    Las peticiones se controlan con caché y con assets estáticos. La CPU se controla con algoritmos y con no tocar lo que no hace falta tocar.
+  </Card>
+  <Card icon="🧊" title="Esperar es libre">
+    Un `await` sobre la red devuelve el hilo al bucle de eventos. Nadie reserva nada en tu nombre mientras esperas, y por eso nadie te lo cobra.
+  </Card>
+  <Card icon="🧮" title="Analizar no es esperar">
+    `json()`, `stringify`, comprimir y firmar son trabajo del procesador. El coste crece con los bytes, no con los segundos.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Un modelo de precios es una teoria sobre que es escaso, y por eso dicta la arquitectura">
+Todo modelo de facturación encierra una afirmación sobre qué recurso es verdaderamente escaso en el sistema, y esa afirmación acaba moldeando el software que se escribe encima con más fuerza que cualquier guía de estilo. Facturar por duración, como hacen los contenedores y las funciones tradicionales, declara escaso el tiempo de una máquina reservada, y de ahí nacen prácticas enteras: agrupar peticiones para amortizar el arranque, temer a las dependencias lentas porque su latencia se convierte en dinero, mantener instancias calientes para no pagar dos veces por lo mismo. Facturar por trabajo efectivo, como hace este modelo, declara escaso el ciclo de procesador, y en cuanto lo aceptas descubres que media docena de reflejos aprendidos ya no valen: temer a un `fetch` lento deja de tener sentido económico, y en cambio adquiere sentido pleno auditar cada línea que recorre bytes en memoria. La distinción entre tiempo de pared y tiempo de CPU no es contable, es ontológica: nombra dos recursos distintos que en el modelo antiguo estaban fundidos en una sola cifra y que aquí se separan de forma limpia, de modo que puedes optimizar cada uno con herramientas independientes y sin canjear el uno por el otro. Esa separación tiene un efecto secundario muy poco discutido y muy valioso: convierte el coste en una propiedad **local** del código. En un servidor, el gasto es una función difusa de todo lo que ocurre en la máquina y nadie puede atribuirlo a una ruta concreta sin instrumentación pesada; aquí, el gasto de una petición está determinado exclusivamente por las instrucciones que esa petición ejecutó, lo que significa que se puede razonar sobre él leyendo una función, y que una revisión de código puede detectar una regresión de coste antes de desplegarla. Cuando esa idea cala, deja de haber dos actividades separadas —programar y luego optimizar el gasto— y pasa a haber una sola: escribir código que no toca lo que no necesita tocar, que espera sin miedo porque esperar es libre, y que trata cada recorrido sobre un cuerpo grande como lo que realmente es, la única decisión de la petición que alguien va a pagar.
+</Callout>
+
+<Reto title="Audita la aritmetica de tu Worker">
+1. Toma una ruta real y clasifica cada línea en una de tres categorías: espera, análisis o transformación. Suma solo las dos últimas.
+2. Encuentra un lugar donde deserializas un cuerpo que solo ibas a reenviar, y reescríbelo en streaming.
+3. Calcula cuántas peticiones diarias soportaría tu proyecto en el plan gratuito si todo su tráfico de assets estáticos deja de pasar por el Worker.
+4. Explica con tus palabras por qué tres `fetch` en paralelo cuestan casi lo mismo que uno, y por qué tres `JSON.parse` no.
+5. Identifica el trabajo que hoy repites en cada invocación y que podrías calcular una sola vez fuera de la petición.
+</Reto>

@@ -1,0 +1,150 @@
+---
+title: "El constructor run: async y await dentro del efecto"
+description: "El constructor run es la única puerta legítima entre un reducer puro y el mundo. Abre un contexto asíncrono respaldado por una tarea que administra el store y te entrega un send invocable con el que empujas acciones de vuelta al sistema. Esta lección disecciona su firma, explica por qué send es realimentación y no valor de retorno, muestra cómo capturar estado antes de cruzar la frontera, cómo paralelizar dentro del efecto con async let y por qué la cancelación cooperativa importa desde la primera línea."
+subject: tca
+level: 10
+order: 2
+icon: "10.2"
+duracion: "19 min"
+---
+
+<Lead>
+Si el reducer solo puede devolver descripciones, alguien tiene que ofrecer un vocabulario para describir lo asíncrono. Ese vocabulario es, casi entero, un solo constructor: `.run`. Abre un contexto `async` respaldado por una `Task` que el store administra, y te entrega un `send` invocable con el que empujas acciones de vuelta al sistema. Dentro de él puedes esperar una petición, iterar un stream, paralelizar con `async let` o dormir un intervalo controlado; fuera de él, el reducer sigue siendo la función pura que era. Aprender `.run` a fondo no es aprender una API: es aprender dónde está exactamente la frontera entre tu lógica y el mundo, y qué se puede cruzar en cada dirección.
+</Lead>
+
+<Objetivos>
+
+- Leer la firma de `.run` y nombrar cada una de sus partes: la operación, el `send` y el manejador de fallo.
+- Explicar por qué `send` es realimentación al sistema y no el valor de retorno de una función.
+- Capturar del estado lo necesario antes de cruzar la frontera, y entender por qué no puedes leerlo dentro.
+- Paralelizar dentro de un efecto con `async let` y respetar la cancelación cooperativa.
+
+</Objetivos>
+
+## Anatomía de un efecto run
+
+El constructor recibe una closure asíncrona, `Sendable` y potencialmente lanzadora, cuyo único parámetro es un valor de tipo `Send<Action>`. Ese valor es *invocable*: se usa como si fuera una función, y cada invocación empuja una acción al store. Admite además una prioridad opcional y un manejador de fallo que veremos en la lección siguiente.
+
+```swift
+case .actualizarPulsado:
+  state.cargando = true
+  return .run { send in
+    let articulos = try await cliente.cargarArticulos()
+    await send(.datosRecibidos(articulos))
+  }
+```
+
+Tres detalles merecen atención inmediata. El `await send(...)` lleva `await` porque entregar una acción al store es una operación aislada al actor principal y puede suspender. El `try await` de la llamada al cliente es una llamada normal de Swift concurrency: dentro del efecto estás en Swift a secas, sin ceremonia de la librería. Y el efecto está *vivo* mientras la closure no retorne: cuando la última línea termina, el store da la tarea por concluida.
+
+<Cards>
+  <Card icon="🧵" title="La operación">
+    Una closure `@Sendable`, `async` y capaz de lanzar. Es el cuerpo del trabajo, y su único parámetro es el `send`. Que sea `Sendable` es lo que permite ejecutarla fuera del actor principal.
+  </Card>
+  <Card icon="📮" title="El send">
+    Un valor de tipo `Send<Action>` que se invoca como una función. Cada llamada empuja una acción al store y provoca una vuelta completa del ciclo, con su mutación y sus efectos derivados.
+  </Card>
+  <Card icon="🎚️" title="La prioridad">
+    El parámetro `priority` fija la prioridad de la `Task` subyacente. Úsalo con criterio: la mayoría de los efectos de interfaz no necesitan tocarlo, y bajar la prioridad de algo urgente se nota.
+  </Card>
+  <Card icon="🪤" title="El manejador de fallo">
+    El parámetro `catch` recibe el error y el `send` para traducir el fallo en una acción del dominio. Es el tema de la lección siguiente, y su ausencia produce un aviso en tiempo de ejecución.
+  </Card>
+</Cards>
+
+<Callout type="info" title="El efecto dura lo que dura la closure">
+No hay un final explícito que anunciar. Si tu closure hace una petición y envía una acción, el efecto vive unos milisegundos; si itera un stream con `for await`, vive hasta que el stream se agote o alguien cancele la tarea. Es la misma primitiva describiendo dos cosas que parecen muy distintas, y la diferencia está solo en si la closure retorna o se queda esperando.
+</Callout>
+
+## send es realimentación, no retorno
+
+La tentación del recién llegado es leer `await send(.datosRecibidos(articulos))` como si fuera un `return`. No lo es, y confundirlos lleva a diseños torcidos. Un `return` entrega un valor a quien te llamó y termina; `send` inyecta una acción por la misma puerta por la que entran los toques del usuario, y la vida de la closure continúa. De ahí se siguen dos libertades: puedes enviar *varias* acciones a lo largo de un mismo efecto, y puedes enviar *ninguna*.
+
+```swift
+return .run { send in
+  await send(.progreso(0))
+  let parcial = try await cliente.primeraPagina()
+  await send(.pagina(parcial))
+  await send(.progreso(50))
+  let resto = try await cliente.restoDePaginas()
+  await send(.pagina(resto))
+  await send(.progreso(100))
+}
+```
+
+Cada `send` provoca una vuelta completa del ciclo: el store recibe la acción, corre el reducer, aplica la mutación y —si ese reducer devuelve otro efecto— lo arranca también. Por eso enviar es un acto con consecuencias reales sobre el estado y no un simple aviso. Cuando el cambio resultante debe animarse, la propia llamada lo lleva: `await send(.pagina(resto), animation: .default)` envuelve la mutación en una animación, y existe la variante con `transaction` para control fino.
+
+<Mermaid code={`sequenceDiagram
+  participant R as Reducer
+  participant S as Store
+  participant T as Task del efecto
+  R->>S: devuelve un Effect run
+  S->>T: arranca la tarea fuera del reducer
+  T->>T: await de red o disco
+  T->>S: send de una accion
+  S->>R: corre el reducer con esa accion
+  T->>S: send de otra accion
+  S->>R: corre el reducer otra vez
+  T-->>S: la closure retorna y el efecto muere`} />
+
+Hay una consecuencia de esto que conviene tener presente. Si el reducer que atiende la acción enviada devuelve a su vez otro efecto, ese segundo efecto arranca mientras el primero sigue vivo: los efectos se encadenan en profundidad sin límite y el store los administra todos a la vez. Es exactamente lo que quieres en un flujo de varias etapas, y también la forma más fácil de escribir un bucle infinito perfectamente legal —un efecto que envía una acción cuyo reducer devuelve un efecto que envía la misma acción—. El síntoma es una traza que no para de crecer, y el diagnóstico se hace en dos minutos con el operador de impresión de cambios.
+
+## La frontera: qué cruza y qué se queda
+
+Dentro de `.run` no existe el estado. La closure escapa al reducer y un parámetro `inout` no puede escapar, así que Swift te lo impide en tiempo de compilación. Esa prohibición no es una molestia: es la garantía de que nadie mutará el estado desde una tarea de fondo. Lo que necesites del estado, lo copias *antes* de devolver el efecto, y lo capturas como valor.
+
+```swift
+case .guardarPulsado:
+  let borrador = state.borrador        // copia el valor antes de cruzar
+  state.guardando = true
+  return .run { send in
+    try await api.guardar(borrador)
+    await send(.guardado)
+  }
+```
+
+Si necesitas leer el estado *después*, no lo leas: envía una acción y deja que el reducer, que sí lo tiene, decida con él. Ese rodeo aparente es lo que mantiene una única línea temporal de mutaciones. Lo que sí cruza libremente son las dependencias, porque se resuelven al construir el reducer y son valores inyectados: dentro del efecto nunca aparece un singleton global, sino el `cliente` o el `clock` que `@Dependency` puso ahí y que un test puede sustituir.
+
+Dentro de la closure tienes toda la concurrencia estructurada de Swift a tu disposición. Dos peticiones independientes no deben esperarse la una a la otra: se lanzan con `async let` y se recogen juntas, de modo que el efecto tarda lo que la más lenta y no la suma de ambas.
+
+```swift
+return .run { send in
+  async let perfil = api.perfil()
+  async let ajustes = api.ajustes()
+  await send(.cargado(try await perfil, try await ajustes))
+}
+```
+
+Cuando el número de trabajos no se conoce en tiempo de compilación, `async let` no basta y el instrumento correcto es un grupo de tareas. Sigue siendo concurrencia estructurada: el grupo no puede sobrevivir al ámbito que lo creó, así que muere con el efecto.
+
+```swift
+return .run { send in
+  try await withThrowingTaskGroup(of: Void.self) { grupo in
+    for id in ids {
+      grupo.addTask {
+        await send(.detalle(id, try await api.detalle(id)))
+      }
+    }
+    try await grupo.waitForAll()
+  }
+}
+```
+
+Fíjate en que cada tarea del grupo hace su propio `send`, de modo que las acciones llegan según terminan y la interfaz se puebla progresivamente en vez de esperar a que estén todas. El orden de llegada no está garantizado, y eso obliga a que el reducer sea indiferente a él: si tu lógica necesitara el orden, no querrías un grupo sino una secuencia.
+
+Y como todo ocurre dentro de una `Task` que el store posee, la cancelación es cooperativa y real: cuando el store cancela el efecto, los `await` que estén suspendidos lanzan y la tarea se desmonta. Si tu closure hace un bucle largo sin puntos de suspensión, compruébalo tú con `try Task.checkCancellation()`; de lo contrario, seguirá girando después de que alguien haya pedido pararlo.
+
+<Callout type="warn" title="Nunca abras un Task suelto dentro del efecto">
+Escribir `Task { ... }` dentro de una closure de `.run` crea una tarea *no estructurada* que no es hija de la del store: no hereda su cancelación, no la espera el `TestStore` y sobrevive alegremente a la pantalla que la lanzó. Si necesitas concurrencia dentro del efecto, usa `async let` o un grupo de tareas, que sí son estructurados y mueren con su padre. La regla operativa es sencilla: dentro de un efecto, todo lo que arranques debe poder morir cuando el efecto muera.
+</Callout>
+
+<Callout type="dios" title="run es una frontera, y las fronteras se diseñan mirando qué se puede cruzar en cada sentido">
+Es fácil ver `.run` como una comodidad sintáctica para meter `async` y `await` en una arquitectura que no los tenía, y esa lectura se queda muy corta. `.run` es una aduana, y como toda aduana su valor no está en dejar pasar sino en lo que prohíbe. Hacia dentro deja pasar valores copiados y dependencias inyectadas, y prohíbe el estado mutable; por eso ninguna tarea de fondo puede escribir en tu modelo, y por eso no existe en TCA la categoría de bug más común de la programación concurrente, la escritura simultánea desde dos hilos sobre el mismo dato. Hacia fuera deja pasar acciones —hechos nombrados en tu dominio— y prohíbe todo lo demás; por eso el mundo exterior, que es infinito e imprevisible, solo puede hablarle a tu aplicación con las pocas palabras que tú aprobaste, y cualquier cosa que la red o el sistema te cuenten tiene que traducirse antes a una de ellas. Esa doble prohibición es lo que convierte la asincronía, que en otras arquitecturas es una fuente inagotable de estados imposibles, en una secuencia ordenada de acciones que llegan por la misma puerta que un toque en la pantalla. Y hay un tercer efecto, más silencioso: como la closure es un valor dentro de un valor, su ciclo de vida es de alguien —del store—, y tener dueño es lo que hace posible cancelarla, esperarla en un test y matarla cuando la feature que la pidió deja de existir. Un `Task` suelto no tiene dueño, y todo lo que no tiene dueño en un sistema concurrente acaba siendo una fuga. Cuando entiendes `.run` como frontera con dueño y no como azucarillo sintáctico, dejas de preguntarte cómo meto esto dentro del efecto y empiezas a preguntarte qué necesito capturar antes de cruzar y qué acción quiero pronunciar al volver; y esas dos preguntas, respondidas con cuidado, ya son el diseño entero de tu feature.
+</Callout>
+
+<Reto title="Cruza la frontera con intención">
+1. Escribe un `.run` que haga una petición y emita una sola acción. Explica por qué `await send(...)` no es un `return`.
+2. Amplíalo para que emita tres acciones de progreso a lo largo de la misma closure y razona qué ocurre en el store con cada una.
+3. Toma un caso donde necesites un dato del estado dentro del efecto y resuélvelo copiándolo antes. Intenta leer `state` dentro y anota el error del compilador.
+4. Convierte dos peticiones secuenciales en paralelas con `async let` y estima la latencia antes y después.
+5. Añade un bucle de cálculo sin puntos de suspensión dentro del efecto, cancélalo y observa que sigue girando; arréglalo con `try Task.checkCancellation()`.
+</Reto>

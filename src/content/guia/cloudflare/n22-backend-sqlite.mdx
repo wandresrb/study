@@ -1,0 +1,142 @@
+---
+title: "El backend SQLite: una base de datos dentro del objeto"
+description: "Los Durable Objects modernos guardan su estado sobre un motor SQLite embebido, y exponen ese motor entero al código con state.storage.sql. Cada objeto lleva su propia base de datos relacional, consultable con SQL sin salir a la red y fuertemente consistente. Vemos cómo se activa el backend SQLite, cómo se ejecutan consultas con el cursor de resultados, por qué la API clave-valor y la SQL conviven, y que todo esto está disponible en el plan gratuito."
+subject: cloudflare
+level: 22
+order: 2
+icon: "22.2"
+duracion: "20 min"
+---
+
+<Lead>
+La API de clave-valor te lleva lejos, pero llega un punto en que quieres preguntar de verdad: filtrar, ordenar por una columna que no es la clave, agregar, unir dos conjuntos. Los Durable Objects modernos responden a eso de una forma que cuesta creer la primera vez: cada objeto lleva dentro su propia base de datos SQLite, y te entrega el motor completo a través de `state.storage.sql`. No es una base de datos a la que te conectas; es una base de datos que vive dentro del objeto, en su mismo disco y su mismo hilo. Y desde 2025 viene incluida hasta en el plan gratuito.
+</Lead>
+
+<Objetivos>
+
+- Entender que un Durable Object moderno persiste su estado sobre un motor SQLite embebido.
+- Ejecutar consultas dentro del objeto con `state.storage.sql.exec` y leer el cursor de resultados.
+- Explicar por qué la API de clave-valor y la SQL comparten el mismo almacén y conviven.
+- Situar los límites y la disponibilidad del backend SQLite, incluido el plan gratuito.
+
+</Objetivos>
+
+## SQLite dentro de cada objeto
+
+Un Durable Object clásico guardaba su estado sobre un almacén de clave-valor. Los modernos lo guardan sobre SQLite: cada objeto tiene una base de datos relacional propia, embebida, y la plataforma la persiste con las mismas garantías de durabilidad y consistencia que ya viste. La novedad es que ese motor no queda oculto: lo tienes a mano en `state.storage.sql`, con `CREATE TABLE`, `INSERT`, `SELECT` y todo el SQL que esperas de SQLite.
+
+Se activa al declarar la clase con una migración de tipo SQLite en `wrangler.jsonc`. Las clases nuevas deberían nacer así; es el camino recomendado para todo objeto que crees hoy.
+
+```jsonc
+{
+  "durable_objects": {
+    "bindings": [{ "name": "SALA", "class_name": "Sala" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Sala"] }
+  ]
+}
+```
+
+La palabra `new_sqlite_classes` es la que pide el backend SQLite en lugar del clave-valor heredado. A partir de ahí, cada instancia de `Sala` arranca con su propia base de datos vacía, lista para que le crees el esquema.
+
+Conviene saber que existió un backend anterior, el de clave-valor puro, y que el motor de almacenamiento es una propiedad que se fija al declarar la clase: las clases viejas no se convierten solas a SQLite. Para todo lo que empieces hoy, `new_sqlite_classes` es la elección por defecto y la única que te abre el motor SQL completo; el clave-valor heredado queda para el código que ya existía antes de esta era.
+
+## Consultar con state.storage.sql
+
+El método central es `state.storage.sql.exec`: recibe la sentencia SQL y, aparte, los parámetros —siempre por posición, nunca interpolados en la cadena, para no abrir la puerta a inyección—. Devuelve un cursor perezoso sobre las filas, que puedes iterar o materializar con `toArray`, o del que puedes exigir exactamente una fila con `one`.
+
+```ts
+export class Sala {
+  constructor(private state: DurableObjectState, private env: Env) {
+    // crea el esquema una sola vez, al construir el objeto
+    this.state.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS mensajes (
+        id INTEGER PRIMARY KEY,
+        autor TEXT NOT NULL,
+        texto TEXT NOT NULL,
+        creado INTEGER NOT NULL
+      )
+    `);
+  }
+
+  async publicar(autor: string, texto: string): Promise<void> {
+    // parametros por posicion: nunca concatenes valores en el SQL
+    this.state.storage.sql.exec(
+      "INSERT INTO mensajes (autor, texto, creado) VALUES (?, ?, ?)",
+      autor,
+      texto,
+      Date.now(),
+    );
+  }
+
+  async ultimos(n: number): Promise<Mensaje[]> {
+    return this.state.storage.sql
+      .exec<Mensaje>("SELECT * FROM mensajes ORDER BY creado DESC LIMIT ?", n)
+      .toArray();
+  }
+}
+```
+
+Fíjate en algo que no está: no hay `await` en las llamadas a `sql.exec`. El motor es local y síncrono; la consulta se ejecuta contra un disco que está en la misma máquina y el mismo hilo, así que no hay promesa que esperar. Esa ausencia de red es justo la que hace que un `SELECT` dentro de un objeto se mida en microsegundos.
+
+El cursor que devuelve `exec` es perezoso y rico. Lo iteras con `for...of`, lo materializas con `toArray`, exiges una única fila con `one`, y consultas `columnNames` para conocer el esquema del resultado. Como produce las filas a medida que las recorres, un `SELECT` grande no carga de golpe toda la tabla en memoria. Y como tienes SQL de verdad, agregas y agrupas sin traerte los datos al código:
+
+```ts
+async resumenPorAutor(): Promise<Resumen[]> {
+  return this.state.storage.sql
+    .exec<Resumen>(
+      "SELECT autor, COUNT(*) AS total FROM mensajes GROUP BY autor ORDER BY total DESC",
+    )
+    .toArray();
+}
+```
+
+<Mermaid code={`flowchart TB
+  APP[metodo del objeto] --> SQL[state.storage.sql.exec]
+  SQL --> DB[SQLite embebido en el objeto]
+  DB --> LOCAL[mismo hilo y mismo disco]
+  LOCAL --> RES[filas devueltas sin salir a la red]
+  style DB fill:#a6e3a1,color:#11111b`} />
+
+## Dos APIs sobre el mismo almacen
+
+Podría parecer que ahora tienes dos almacenes rivales, el clave-valor y el SQL, pero es uno solo. Bajo el backend SQLite, la vieja API `state.storage.get` y `put` está implementada sobre una tabla interna del propio SQLite. Por eso conviven sin fricción: la misma transacción, la misma durabilidad, el mismo disco. Puedes usar el clave-valor para banderas y contadores sueltos y el SQL para tus colecciones con estructura, y todo se confirma junto.
+
+Esa unidad tiene una consecuencia práctica cómoda: una escritura en el clave-valor y un `INSERT` en tu tabla, hechos en la misma invocación, se confirman en la misma transacción atómica. No hay que coordinar dos sistemas ni preocuparse de que uno se aplique y el otro no, porque por debajo son el mismo. Elegir entre una API y otra es, entonces, una cuestión de ergonomía —qué expresa mejor tu dato—, no de garantías.
+
+<Cards>
+  <Card icon="🔑" title="Clave-valor para lo suelto">
+    `get`, `put`, `delete` y `list` siguen siendo la vía más corta para valores individuales: una bandera, un contador, un pequeño documento JSON. Cero ceremonia de esquema.
+  </Card>
+  <Card icon="🗂️" title="SQL para lo estructurado">
+    Cuando necesitas filtrar, ordenar por columnas, agregar o unir, `state.storage.sql` te da el motor relacional completo dentro del mismo objeto.
+  </Card>
+  <Card icon="🤝" title="Un solo almacen">
+    Ambas viven sobre el mismo SQLite: comparten transacción, durabilidad y consistencia. No hay dos verdades que sincronizar, solo dos puertas a la misma.
+  </Card>
+</Cards>
+
+## Limites y disponibilidad
+
+El backend SQLite eleva de forma notable lo que cabe en un objeto: cada uno puede almacenar hasta 10 GB en su base de datos, órdenes de magnitud por encima del clave-valor heredado. El motor es SQLite auténtico, con sus tipos, sus índices y su planificador de consultas; lo que no tienes es una conexión de red hacia él, porque no la necesita.
+
+Sobre la disponibilidad, la noticia es que este backend dejó de ser un privilegio de pago. Desde 2025, los Durable Objects con SQLite están incluidos en el plan gratuito, con sus propios cupos de lectura, escritura y almacenamiento. Que una base de datos por objeto entre en el nivel sin coste no es un gesto comercial menor: señala que la plataforma ve este modelo como la forma por defecto de tener estado en el edge, y no como una función avanzada reservada a quien factura.
+
+La durabilidad, además, va más allá de sobrevivir a un reinicio. El backend SQLite ofrece recuperación a un punto en el tiempo: puedes restaurar la base de un objeto a cualquier instante dentro de una ventana de retención de días, lo que convierte un borrado accidental o un `UPDATE` desastroso en algo reversible sin que tú montes copias de seguridad a mano.
+
+<Callout type="tip" title="Cuenta lo que lee y lo que escribe cada consulta">
+El cursor que devuelve `exec` no solo trae filas: expone `rowsRead` y `rowsWritten`, las metricas con las que la plataforma factura el backend SQLite. Vigilarlas mientras desarrollas te ensena a escribir consultas con indices y limites en lugar de barridos de tabla completa, y te da una idea temprana del coste antes de que el objeto crezca.
+</Callout>
+
+<Callout type="dios" title="La base de datos deja de ser un lugar al que vas y pasa a ser algo que llevas contigo">
+Toda nuestra intuición sobre bases de datos supone distancia. La base de datos es un sitio: un servidor, un clúster, un endpoint al que la aplicación viaja por la red cada vez que quiere saber o cambiar algo. De esa distancia brotan casi todos los patrones que damos por obligatorios —el pool de conexiones para amortizar el coste de llegar, la caché para no ir tantas veces, el ORM para disimular el viaje, la réplica de lectura para acercar los datos a alguien—. El backend SQLite del Durable Object invierte la relación por completo: la base de datos ya no es un lugar al que vas, es algo que el objeto lleva consigo. Corre en el mismo hilo que tu lógica, sobre el mismo disco, sin una sola llamada de red entre la consulta y las filas. Y como cada objeto tiene la suya, no despliegas una base de datos gigante que todos comparten, sino millones de bases minúsculas, cada una del tamaño exacto de su entidad y coubicada con el código que la gobierna. Ese giro reordena el diseño. La pregunta deja de ser cómo escalar una base central que se vuelve el cuello de botella de todo el sistema, y pasa a ser cómo partir el dominio en entidades que merezcan cada una su propia base. La escala ya no se busca engordando un servidor, sino multiplicando objetos; y la consistencia, que en el mundo distribuido cuesta sangre, aquí es gratis, porque dentro de un objeto solo hay una base, un hilo y una verdad. Que todo esto quepa además en el plan gratuito no es un detalle comercial: es la señal de que la plataforma considera este modelo el modo por defecto de tener estado en el edge, no un lujo para quien paga.
+</Callout>
+
+<Reto title="Convierte un objeto en base de datos">
+1. Declara una clase `Sala` con una migración `new_sqlite_classes` y crea en su constructor una tabla `mensajes` con `CREATE TABLE IF NOT EXISTS`.
+2. Añade métodos `publicar` y `ultimos` que usen `state.storage.sql.exec` con parámetros por posición. Comprueba que nunca concatenas valores dentro de la cadena SQL.
+3. Inserta varias filas y recupéralas con un `SELECT ... ORDER BY creado DESC LIMIT ?`. Confirma que las llamadas a `exec` no llevan `await`.
+4. Lee `rowsRead` del cursor de una consulta con y sin un índice adecuado, y razona por qué el número cambia.
+5. Argumenta por qué "millones de bases de datos minúsculas" escala distinto a "una base de datos enorme compartida", y qué problema del mundo distribuido desaparece dentro de un objeto.
+</Reto>

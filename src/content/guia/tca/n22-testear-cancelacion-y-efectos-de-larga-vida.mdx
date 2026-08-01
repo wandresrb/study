@@ -1,0 +1,162 @@
+---
+title: "Testear cancelación y efectos de larga vida"
+description: "Los efectos que no terminan solos son el caso más exigente del testing asíncrono, y también donde el `TestStore` exhaustivo enseña su mejor carta: al exigir que toda acción recibida se reclame y que ningún efecto quede vivo al terminar, convierte el silencio en una aserción comprobable. Esta lección explica el detector de fugas y por qué su severidad es un regalo, muestra el patrón exacto para demostrar que una cancelación cancela de verdad —cancelar, avanzar el reloj y afirmar que no llegó nada—, conduce un stream de larga vida desde el test tomando su continuación en la mano para emitir eventos a voluntad, y cierra con la terminación observable: `finish`, la limpieza que dispara la cancelación y cómo verificar que el recurso se liberó."
+subject: tca
+level: 22
+order: 5
+icon: "22.5"
+duracion: "20 min"
+---
+
+<Lead>
+Un efecto que carga datos y termina es fácil de testear: se dispara, vuelve una acción, se afirma el estado. Un efecto que *no* termina —un temporizador, una suscripción a notificaciones, un stream de posiciones— plantea preguntas de otra naturaleza, y son justo las que más bugs esconden en producción: si la pantalla desaparece, ¿el bucle muere o sigue vivo consumiendo batería? Si la cancelación llega mientras el efecto duerme, ¿se limpia el recurso? Si el stream emite tres eventos, ¿llegan los tres, en orden y una sola vez? Ninguna de esas preguntas se contesta observando lo que ocurre, porque todas hablan de lo que debe *dejar* de ocurrir. Y ahí la combinación de reloj controlado y `TestStore` exhaustivo da su mejor resultado, porque entre ambos convierten la ausencia —el silencio después de cancelar, el bucle que ya no está— en algo que la máquina verifica.
+</Lead>
+
+<Objetivos>
+
+- Explicar el detector de efectos vivos del `TestStore` y por qué su severidad describe una fuga real.
+- Demostrar que una cancelación cancela: cancelar, avanzar el reloj y afirmar que no llegó nada.
+- Conducir un stream de larga vida desde el test tomando su continuación para emitir eventos a voluntad.
+- Verificar la terminación y la limpieza con `finish`, la finalización del stream y la reacción a la cancelación.
+
+</Objetivos>
+
+## El detector de fugas
+
+Cuando un test termina con un efecto todavía en marcha, el `TestStore` falla. La primera reacción de casi todo el mundo es tratarlo como una molestia del framework y buscar la manera de silenciarlo; la lectura correcta es la contraria, porque ese fallo describe una situación que en producción tiene nombre propio.
+
+```swift
+await store.send(.aparecer)          // arranca un temporizador
+// El test acaba aqui: el TestStore falla porque un efecto sigue vivo
+```
+
+Piensa qué representa ese efecto huérfano fuera del test. Un bucle que sigue latiendo después de que la pantalla se haya ido, un observador que continúa reaccionando a notificaciones de una feature que ya no existe, una tarea que mantiene vivo por retención todo el grafo de objetos de una pantalla cerrada. Son fugas de recursos con síntomas clásicos —batería, memoria, actualizaciones de estado sobre una vista invisible— y son especialmente difíciles de detectar a mano, porque no producen ningún error visible: simplemente el sistema se degrada. El `TestStore` las convierte en un fallo determinista y reproducible antes de que salgan del portátil.
+
+De ahí se sigue una consecuencia de diseño: todo efecto de larga vida necesita una historia de terminación explícita, y el test es donde esa historia queda escrita. O bien el reducer lo cancela ante una acción concreta, o bien el efecto termina solo cuando su fuente se agota. Un efecto sin historia de terminación es un defecto, no una comodidad.
+
+| Tipo de efecto | Cómo termina | Qué debe hacer el test |
+| --- | --- | --- |
+| Vida corta \| una petición | Al devolver su acción | Reclamarla con `receive` |
+| Temporizador \| bucle indefinido | Solo por cancelación | Enviar la acción que lo cancela |
+| Stream de eventos | Al finalizar la fuente \| por cancelación | Finalizar la continuación o cancelar |
+
+## Demostrar el silencio
+
+El patrón para verificar una cancelación tiene tres movimientos y el tercero es el que casi nadie escribe.
+
+```swift
+@Test
+func alDesaparecerElTemporizadorSeDetiene() async {
+  let clock = TestClock()
+  let store = TestStore(initialState: Panel.State()) {
+    Panel()
+  } withDependencies: {
+    $0.continuousClock = clock
+  }
+
+  await store.send(.aparecer)
+  await clock.advance(by: .seconds(1))
+  await store.receive(\.tick) { $0.segundos = 1 }
+
+  await store.send(.desaparecer)
+  await clock.advance(by: .seconds(5))   // el silencio se afirma no reclamando nada
+}
+```
+
+El primer movimiento establece que el efecto estaba vivo —sin ese latido inicial, el test pasaría también con un reducer que nunca arrancó nada, y estaría probando el vacío—. El segundo cancela. El tercero es el avance de cinco segundos que no va seguido de ningún `receive`, y es una aserción de pleno derecho aunque no tenga forma de tal: si el temporizador siguiera vivo, ese avance produciría cinco latidos, ninguno estaría reclamado y el test fallaría al terminar. La exhaustividad del `TestStore` es lo que da sentido a la línea; en un store permisivo, ese avance no diría nada.
+
+Conviene entender también dónde muere exactamente el efecto. La cancelación se hace efectiva en el punto de suspensión, es decir, dentro del sueño del reloj: la llamada lanza el error de cancelación, la closure se desenrolla y TCA descarta ese error sin convertirlo en ninguna acción. Por eso el silencio es total y no aparece un fallo espurio. Y por eso mismo un efecto que hiciera trabajo síncrono largo sin ningún punto de suspensión sería incancelable en la práctica: la cancelación cooperativa necesita que alguien coopere.
+
+<Mermaid code={`sequenceDiagram
+  participant T as Test
+  participant S as Store
+  participant E as Efecto de larga vida
+  T->>S: send aparecer
+  S->>E: arranca y se suscribe
+  T->>S: avance del reloj
+  E-->>S: tick
+  S-->>T: receive reclamado
+  T->>S: send desaparecer
+  S->>E: cancelacion por identidad
+  Note over E: el bucle termina y libera el recurso
+  T->>S: avance del reloj
+  Note over S: ninguna accion llega, el test acaba limpio`} />
+
+## Un stream con la continuación en la mano
+
+Los efectos de larga vida más interesantes no son temporizadores sino suscripciones: eventos del sistema, mensajes de un socket, cambios de una base de datos. La dependencia devuelve una secuencia asíncrona y el efecto la consume en un bucle.
+
+```swift
+@DependencyClient
+struct ClienteEventos {
+  var eventos: @Sendable () -> AsyncStream<Evento> = { .never }
+}
+
+case .aparecer:
+  return .run { send in
+    for await evento in cliente.eventos() {
+      await send(.evento(evento))
+    }
+  }
+  .cancellable(id: CancelID.suscripcion)
+```
+
+Para testearlo, el truco consiste en fabricar el stream en el propio test y quedarse con su continuación: la dependencia entrega el extremo de lectura y tú conservas el de escritura, con lo que pasas a decidir qué se emite y cuándo.
+
+```swift
+@Test
+func elStreamEntregaSusEventosEnOrden() async {
+  let (stream, continuacion) = AsyncStream.makeStream(of: Evento.self)
+  let store = TestStore(initialState: Panel.State()) {
+    Panel()
+  } withDependencies: {
+    $0.clienteEventos.eventos = { stream }
+  }
+
+  await store.send(.aparecer)
+
+  continuacion.yield(.conectado)
+  await store.receive(\.evento.conectado) { $0.estado = .conectado }
+
+  continuacion.yield(.mensaje("hola"))
+  await store.receive(\.evento.mensaje) { $0.mensajes = ["hola"] }
+
+  continuacion.finish()
+  await store.finish()
+}
+```
+
+El test lee como un guion y verifica más de lo que declara: que cada emisión produce exactamente una acción, que el orden se conserva y que ninguna se pierde ni se duplica. La llamada final a `finish` sobre la continuación agota la fuente, el bucle del efecto sale por sí solo y `store.finish()` espera a que esa terminación se complete antes de dar el test por bueno. Sin esas dos líneas volveríamos al fallo por efecto vivo, y con razón: un stream que nadie cierra es un stream que sigue abierto.
+
+Nota la asimetría entre las dos formas de terminar, porque es la que decide el diseño del reducer. Un stream que se agota por su cuenta comunica *se acabó la fuente*; una cancelación comunica *ya no me interesa*. La primera puede requerir que el reducer reaccione —reconectar, marcar la sesión como caída—; la segunda debe ser silenciosa. Si tu efecto no distingue ambos casos, tarde o temprano intentará reconectar justo cuando la pantalla se está cerrando.
+
+## Terminación observable y limpieza
+
+Queda la pregunta más fina: no si el bucle terminó, sino si el recurso que sostenía se liberó. El extremo de escritura de un stream permite observarlo, porque su terminación notifica la causa.
+
+```swift
+let limpiezas = LockIsolated(0)
+continuacion.onTermination = { _ in limpiezas.withValue { $0 += 1 } }
+// ...
+await store.send(.desaparecer)
+#expect(limpiezas.value == 1)
+```
+
+Con eso el test ya no afirma solo que dejaron de llegar acciones, sino que la cancelación llegó hasta el productor y este cerró lo que tuviera abierto: el socket, el observador, el fichero. Es la diferencia entre *el consumidor dejó de escuchar* y *la conexión se cerró*, y en un cliente de red esa diferencia se paga en conexiones colgadas.
+
+<Callout type="tip" title="finish con tiempo limite para efectos que tardan en cerrar">
+`await store.finish()` acepta un tiempo límite para los casos en que la terminación de un efecto implique un trabajo real de cierre. Si tu test lo necesita de forma sistemática, sospecha antes de subir el número: casi siempre significa que hay una espera que no pasó por el reloj inyectado, y la corrección es sustituirla, no concederle más margen.
+</Callout>
+
+<Callout type="dios" title="La exhaustividad convierte el silencio en una asercion, que es como se prueba un negativo">
+Casi todas las garantías caras de un sistema asíncrono son negativas. Cancelar es prometer que no llegarán más respuestas; rebotar es prometer que las pulsaciones intermedias no salen a la red; deduplicar es prometer que la segunda petición idéntica no se emite; desuscribirse es prometer que el bucle deja de girar. Y los enunciados negativos son notoriamente difíciles de establecer por observación, porque ninguna cantidad de mirar demuestra una ausencia: se puede esperar un minuto y concluir que probablemente no llegará nada, lo cual es una conjetura con un margen, no una prueba. Lo que hacen entre el reloj controlado y el store exhaustivo es reemplazar ese razonamiento probabilístico por uno deductivo, y merece explicitarse cómo. El reloj cierra el dominio temporal: si el modelo del tiempo es discreto y tú has avanzado hasta el último vencimiento pendiente, no queda ningún instante futuro donde algo pueda ocurrir, así que *no llegó nada todavía* pasa a significar *no llegará nada*. La exhaustividad cierra el dominio de los eventos: como toda acción no reclamada hace fallar el test, la ausencia de una línea `receive` es una afirmación de que no hubo nada que recibir, y por tanto el silencio deja de ser la falta de una prueba para convertirse en la prueba de una falta. Juntas, las dos clausuras transforman una imposibilidad epistemológica en una comprobación de rutina de tres líneas. Ese es, en el fondo, todo el nivel resumido en una idea: el tiempo dejó de ser el medio incontrolable en el que el programa transcurre y pasó a ser un eje que el test recorre; los efectos dejaron de ser disparos a ciegas y pasaron a ser valores con identidad, duración y terminación. En cuanto ambas cosas se cumplen, la asincronía —el territorio clásico de los bugs que no se reproducen, se cierran por no reproducibles y reaparecen en la siguiente versión— se vuelve tan verificable como una función pura, y la diferencia entre un sistema que crees correcto y uno que has demostrado correcto deja de ser una cuestión de disciplina personal para convertirse en una propiedad de la arquitectura.
+</Callout>
+
+<Reto title="Prueba lo que no debe ocurrir">
+1. Escribe un test que arranque un temporizador y termine sin cancelarlo. Lee el mensaje de fallo entero y explica qué fuga concreta describiría ese efecto en una pantalla real.
+2. Añade el tercer movimiento del patrón de cancelación: avanza el reloj varios segundos después de cancelar sin reclamar nada. Rompe después la cancelación en el reducer y comprueba que el test lo detecta.
+3. Convierte una suscripción de tu proyecto en una dependencia que devuelva una secuencia asíncrona y testéala con la continuación en la mano, emitiendo tres eventos y afirmando su orden.
+4. Distingue en ese mismo reducer los dos finales posibles: fuente agotada y cancelación. Escribe un test para cada uno y comprueba que el estado resultante difiere.
+5. Instala un observador de terminación sobre la continuación y afirma que la cancelación llegó al productor. Elimina el `.cancellable` y verifica que la aserción cae.
+6. Repasa tu suite en busca de tests que terminen sin haber cancelado nada porque el efecto en cuestión resultó ser de vida corta. Documenta cuáles de esos efectos deberían haber sido de larga vida y no lo son.
+</Reto>

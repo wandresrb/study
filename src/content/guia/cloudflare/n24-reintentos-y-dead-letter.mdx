@@ -1,0 +1,149 @@
+---
+title: "Reintentos y dead-letter: el destino de lo que falla"
+description: "Todo sistema asíncrono acaba tropezando con el mismo enemigo: el mensaje envenenado, ese que falla siempre y que sin una salida bloquea o multiplica el trabajo del resto. Recorremos el ciclo completo del fallo en Cloudflare Queues: los reintentos automáticos gobernados por max_retries, el retry con delaySeconds que te deja implementar tu propio backoff exponencial usando attempts, la distinción entre fallo transitorio y fallo permanente que decide si reintentar es útil o inútil, y la cola de mensajes fallidos como válvula de escape, con su propio consumidor, sus alertas de profundidad y el procedimiento de reinyección una vez corregido el defecto."
+subject: cloudflare
+level: 24
+order: 4
+icon: "24.4"
+duracion: "16 min"
+---
+
+<Lead>
+Una cola con entrega garantizada tiene una consecuencia incómoda que nadie menciona en la primera página de la documentación: si un mensaje no puede procesarse jamás, la garantía se vuelve en tu contra. El sistema, obediente, seguirá intentándolo, consumiendo invocaciones, llenando registros de error y —si lo has escrito mal— arrastrando a sus compañeros de lote en cada vuelta. A ese mensaje se le llama envenenado, y toda arquitectura de mensajería seria se define por lo que hace con él. Cloudflare Queues responde con dos mecanismos que hay que entender juntos: una política de reintentos que tú calibras, y una cola de mensajes fallidos que actúa como válvula de escape cuando reintentar deja de tener sentido.
+</Lead>
+
+<Objetivos>
+
+- Seguir el ciclo de vida de un mensaje que falla, desde el primer intento hasta su salida del sistema.
+- Distinguir el fallo transitorio del permanente y decidir cuándo reintentar es inútil.
+- Implementar un backoff exponencial propio combinando `attempts` con `retry` y su retraso.
+- Configurar, vigilar y operar una cola de mensajes fallidos, incluida la reinyección tras corregir el defecto.
+
+</Objetivos>
+
+## El ciclo de vida de un fallo
+
+Cuando un mensaje no se confirma —porque llamaste a `retry`, porque el manejador lanzó una excepción o porque la invocación excedió sus límites— vuelve a la cola y su contador `attempts` sube en uno. La plataforma lo entregará de nuevo, en un lote futuro, tantas veces como permita `max_retries`. Agotado ese presupuesto, el mensaje sale de la cola principal: si hay una cola de mensajes fallidos configurada va allí; si no la hay, se descarta para siempre.
+
+```jsonc
+{
+  "queues": {
+    "consumers": [
+      {
+        "queue": "tareas",
+        "max_retries": 5,
+        "retry_delay": 30,
+        "dead_letter_queue": "tareas-fallidas"
+      }
+    ]
+  }
+}
+```
+
+Esa configuración dice tres cosas. Que cada mensaje dispone de cinco intentos. Que entre uno y otro pasan al menos treinta segundos, en vez de reintentar de inmediato contra un servicio que probablemente siga caído. Y que cuando los cinco se agoten, el mensaje no muere: aterriza en `tareas-fallidas`.
+
+Conviene notar cómo interactúan esos números con la retención de la cola. Un mensaje se conserva unos días desde que se encoló, y ese reloj no se reinicia con los reintentos: si programas esperas muy largas y muchos intentos, puedes construir una política que teóricamente reintenta durante más tiempo del que el mensaje va a existir. La aritmética es sencilla y hay que hacerla al elegir los valores, porque el desenlace de equivocarse es que el mensaje caduque en silencio antes de llegar a la cola de fallidos, que es exactamente el escenario que querías evitar.
+
+<Callout type="warn" title="Sin dead-letter, agotar los reintentos significa borrar">
+Es el silencio más peligroso de todo el sistema. Si no declaras `dead_letter_queue`, el mensaje que agota sus intentos simplemente desaparece, sin excepción, sin alerta y sin rastro recuperable. Puedes estar perdiendo cobros, correos o eventos de facturación durante semanas y enterarte por un usuario. Declarar una cola de fallidos cuesta dos líneas y convierte una pérdida silenciosa en un problema visible y reparable.
+</Callout>
+
+## Transitorio o permanente: la pregunta que decide
+
+Reintentar solo tiene sentido si el fallo puede desaparecer por sí mismo con el tiempo. Un tiempo de espera agotado, un 503 de un servicio saturado, un límite de peticiones por minuto excedido, una conexión cortada: todos son transitorios, y esperar es exactamente la estrategia correcta. En cambio, un cuerpo de mensaje malformado, una referencia a un objeto de R2 que ya no existe, un 400 del servicio externo o un correo con dominio inválido no van a mejorar. Reintentarlos cinco veces es quemar cinco invocaciones para llegar a la misma conclusión.
+
+Por eso un consumidor maduro clasifica el error antes de decidir el destino del mensaje.
+
+```ts
+try {
+  await enviarCorreo(mensaje.body, env);
+  mensaje.ack();
+} catch (error) {
+  if (esPermanente(error)) {
+    // no mejorara con el tiempo: registralo y sacalo del sistema
+    await env.DB.prepare("INSERT INTO descartes VALUES (?, ?)")
+      .bind(mensaje.id, String(error))
+      .run();
+    mensaje.ack();
+  } else {
+    const espera = Math.min(2 ** mensaje.attempts * 10, 3600);
+    mensaje.retry({ delaySeconds: espera });
+  }
+}
+```
+
+Fíjate en las dos ramas. Ante un fallo permanente confirmamos el mensaje —sí, `ack` sobre algo que falló— después de dejar constancia del descarte en un sitio donde alguien pueda auditarlo. Es una decisión deliberada: sacamos el mensaje del ciclo porque sabemos que reintentarlo no cambia nada, pero no lo perdemos, porque la fila de la tabla queda. Ante un fallo transitorio calculamos la espera y devolvemos solo ese mensaje a la cola.
+
+Y hay una tercera categoría que se pasa por alto: el fallo permanente que es culpa **tuya**, no del mensaje. Un despliegue con un error de programación hace fallar todos los mensajes por igual, y una política de reintentos agresiva los mandará en masa a la cola de fallidos antes de que te dé tiempo a revertir. Si sospechas que el fallo es global —todo el lote revienta con el mismo error—, `batch.retryAll()` con una espera generosa es más sensato que dejar que cada mensaje consuma sus intentos contra un consumidor que sabes roto.
+
+Ese cálculo es un backoff exponencial escrito a mano, y `attempts` es lo que lo hace posible: diez segundos en el primer reintento, veinte en el segundo, cuarenta en el tercero, con un techo de una hora para que no se dispare. `retry_delay` en el manifiesto fija el suelo para todos; `retry` con `delaySeconds` te deja adaptarlo mensaje a mensaje, que es lo que necesitas cuando el error trae una cabecera diciéndote cuánto esperar.
+
+| Palanca | Dónde se define | Alcance |
+| --- | --- | --- |
+| `max_retries` | manifiesto del consumidor | Intentos totales antes de la cola de fallidos |
+| `retry_delay` | manifiesto del consumidor | Espera mínima aplicada a todos los reintentos |
+| `retry({ delaySeconds })` | código del consumidor | Espera calculada para este mensaje concreto |
+| `dead_letter_queue` | manifiesto del consumidor | Destino de lo que agota los intentos |
+
+<Mermaid code={`flowchart LR
+  Q[Cola principal] --> C[Consumidor]
+  C -->|ack| OK[Trabajo hecho]
+  C -->|retry con espera| Q
+  Q -->|agotados los intentos| DLQ[Cola de fallidos]
+  DLQ --> INS[Consumidor de inspeccion y alerta]
+  INS -->|tras corregir el defecto| Q
+  style OK fill:#a6e3a1,color:#11111b
+  style DLQ fill:#f38ba8,color:#11111b
+  style INS fill:#f9e2af,color:#11111b`} />
+
+## La cola de fallidos es una cola normal
+
+Aquí está el detalle que suele sorprender y que hace elegante el diseño: una cola de mensajes fallidos no es un producto distinto ni un cementerio especial. Es una cola corriente, con su nombre, su retención y su capacidad de tener productores y consumidores. Lo único que la convierte en cola de fallidos es que otra cola la nombra como destino de lo que agota sus intentos.
+
+Eso tiene una consecuencia práctica que mucha gente pasa por alto: **si nadie la consume, sus mensajes también caducan** al cumplirse el periodo de retención. Una cola de fallidos sin consumidor es una papelera con temporizador, no un archivo. La disciplina mínima es darle un consumidor que no procese el trabajo original, sino que lo persista y avise.
+
+```ts
+export default {
+  async queue(batch: MessageBatch, env: Env): Promise<void> {
+    for (const mensaje of batch.messages) {
+      await env.DB.prepare(
+        "INSERT INTO fallidos (id, cuerpo, encolado) VALUES (?, ?, ?)",
+      )
+        .bind(mensaje.id, JSON.stringify(mensaje.body), mensaje.timestamp.toISOString())
+        .run();
+      mensaje.ack();
+    }
+    await avisarAlEquipo(batch.messages.length, env);
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+<Cards>
+  <Card icon="🗄️" title="Persistir">
+    Guarda el cuerpo íntegro, el identificador y la marca de tiempo en D1 o R2. Es la evidencia con la que reproducirás el fallo.
+  </Card>
+  <Card icon="🚨" title="Alertar">
+    Una cola de fallidos que crece es siempre una señal. Cero mensajes es lo normal; cualquier otra cifra pide una mirada humana.
+  </Card>
+  <Card icon="🔁" title="Reinyectar">
+    Corregido el defecto, un pequeño Worker lee lo guardado y lo devuelve a la cola principal con `sendBatch`. La cola es reparable.
+  </Card>
+</Cards>
+
+<Callout type="tip" title="El consumidor de fallidos no debe poder fallar">
+Su única misión es persistir y avisar, así que escríbelo para que sea prácticamente infalible: nada de llamar al servicio externo que ya demostró estar roto, nada de deserializar el cuerpo asumiendo una forma concreta —guárdalo tal cual llegó—, y captura de errores alrededor de todo. Un consumidor de fallidos que a su vez falla te deja con mensajes rebotando en el último lugar donde podías rescatarlos, y ahí ya no hay red debajo.
+</Callout>
+
+Esa última pieza cierra el círculo y es la que convierte el mecanismo en algo verdaderamente útil. Los mensajes fallidos rara vez lo son por su culpa: casi siempre revelan un defecto en el consumidor o una integración rota. Arreglas el defecto, despliegas, y entonces reinyectas lo acumulado con un `sendBatch` desde la tabla de fallidos hacia la cola original. El trabajo que parecía perdido se completa con días de retraso, pero se completa, y ese es exactamente el nivel de resiliencia que justifica montar una cola.
+
+<Callout type="dios" title="La cola de fallidos no es donde muere el trabajo: es donde el sistema admite que no sabe">
+Hay una tentación muy humana al diseñar el manejo de errores, y es intentar que el sistema resuelva solo cualquier fallo concebible. Se manifiesta en reintentos infinitos, en capturas genéricas que se tragan la excepción y confirman el mensaje para que la cola siga fluyendo, en ramas de recuperación cada vez más barrocas que intentan adivinar qué quería decir un error que nadie ha leído. Todo eso comparte una premisa falsa: que un sistema automático puede decidir correctamente ante lo que no anticipó. No puede. Un fallo que sobrevive a cinco reintentos espaciados no es ruido, es información: te está diciendo que hay un supuesto roto que ningún reintento va a reparar, porque el problema no está en el intento sino en el modelo. La cola de fallidos es la institucionalización de ese límite. Su valor no es técnico sino epistemológico: separa con una línea nítida lo que el sistema sabe manejar de lo que necesita un juicio humano, y al hacerlo protege ambos lados. Protege el flujo principal, que deja de atascarse o de gastarse en un mensaje imposible, y protege el conocimiento, porque el mensaje no se evapora sino que queda íntegro con su cuerpo, su identificador y su historia de intentos, listo para ser leído por alguien que sí puede entender qué se rompió. Un sistema sin dead-letter no es más simple, es un sistema que ha decidido no enterarse de sus propios fallos. Y de ahí se sigue el criterio de operación que separa a los equipos que duermen tranquilos de los que no: la métrica que debes vigilar no es la profundidad de tu cola principal —esa sube y baja con el tráfico, es su trabajo— sino la profundidad de la de fallidos, cuyo valor esperado es cero. Cualquier mensaje ahí es una hipótesis rota sobre tu dominio esperando a ser leída. Trátala como se trata un incidente pequeño: mira el cuerpo, reproduce el fallo, corrige la causa, reinyecta. Ese bucle —fallar, aislar, entender, arreglar, reintentar— es lo que convierte una cola en un sistema que aprende, y es la diferencia entre tener mensajería asíncrona y tener una arquitectura fiable.
+</Callout>
+
+<Reto title="Diseña la salida de emergencia">
+1. Declara una cola de fallidos para una cola tuya y escribe el consumidor que persiste el cuerpo y avisa al equipo.
+2. Clasifica cinco errores reales de tu dominio en transitorios y permanentes, y decide qué hace tu consumidor con cada uno.
+3. Implementa un backoff exponencial con `attempts` y un techo, y explica por qué reintentar de inmediato empeora una caída.
+4. Provoca un mensaje envenenado a propósito, sigue su recorrido hasta la cola de fallidos y comprueba el valor final de `attempts`.
+5. Escribe el Worker de reinyección que lee la tabla de fallidos y devuelve el trabajo a la cola principal con `sendBatch`.
+</Reto>

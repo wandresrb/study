@@ -1,0 +1,153 @@
+---
+title: "Notificaciones locales: disparadores, hilos y reconciliación"
+description: "Una notificación local no es un mensaje que se envía sino una promesa que se deja registrada en el sistema y que sobrevive al cierre de la app. Esta lección estudia los tres disparadores disponibles, el modelo de agrupación por hilo, el límite duro de peticiones pendientes y —lo que casi nadie implementa bien— el algoritmo de reconciliación que mantiene esas promesas coherentes cuando los datos cambian."
+subject: ios
+level: 21
+order: 2
+icon: "21.2"
+duracion: "19 min"
+---
+
+<Lead>
+Una notificación local no se envía: se deposita. La app entrega a `UNUserNotificationCenter` una petición con contenido y disparador, el sistema la almacena fuera del proceso y la ejecuta aunque la app lleve semanas sin abrirse, aunque haya sido expulsada de memoria, aunque el dispositivo se haya reiniciado. Esa persistencia es justo lo que la hace potente y lo que la vuelve peligrosa: cada petición es una promesa hecha al usuario en nombre de un estado del modelo que puede cambiar minutos después. La ingeniería seria de notificaciones locales no consiste en saber programarlas, que es trivial, sino en mantener sincronizado un conjunto de promesas externas con una fuente de verdad que muta.
+</Lead>
+
+<Objetivos>
+
+- Elegir con criterio entre disparador por intervalo, por calendario y por región, conociendo las garantías reales de cada uno.
+- Modelar el contenido para que agrupe, resuma y se comporte bien bajo modos de concentración y resúmenes programados.
+- Implementar un algoritmo de reconciliación que derive las peticiones pendientes del estado del modelo en lugar de acumularlas.
+- Administrar el límite de sesenta y cuatro peticiones con una ventana deslizante y una estrategia de reposición.
+
+</Objetivos>
+
+## Los tres disparadores y sus garantías
+
+`UNNotificationTrigger` tiene tres subclases utilizables desde la app y cada una ofrece un contrato distinto. `UNTimeIntervalNotificationTrigger` dispara transcurridos unos segundos desde el registro, con repetición opcional que exige un mínimo de sesenta segundos. `UNCalendarNotificationTrigger` dispara cuando el reloj coincide con los componentes de fecha que declares, lo que permite expresar patrones —todos los martes a las nueve— sin recalcular fechas absolutas. `UNLocationNotificationTrigger` dispara al entrar o salir de una región geográfica y exige autorización de ubicación concedida de forma independiente.
+
+La distinción crítica entre las dos primeras no es de comodidad sino de semántica temporal. El disparador por intervalo cuenta tiempo absoluto y es indiferente a la zona horaria y al horario de verano; el de calendario evalúa componentes y, si no fijas `timeZone`, se reinterpreta cuando la persona viaja. Un recordatorio de medicación diaria debe ser de calendario y anclarse a la zona horaria del usuario para seguirle en un vuelo transatlántico; un temporizador de cocina debe ser de intervalo, porque siete minutos son siete minutos en cualquier meridiano.
+
+```swift
+var comp = DateComponents()
+comp.hour = 9
+comp.minute = 0
+comp.weekday = 3
+comp.timeZone = TimeZone.current
+
+let contenido = UNMutableNotificationContent()
+contenido.title = "Revisión semanal"
+contenido.body = "Tienes 4 tareas sin cerrar de la semana pasada"
+contenido.threadIdentifier = "revision-semanal"
+contenido.interruptionLevel = .timeSensitive
+contenido.relevanceScore = 0.8
+
+let peticion = UNNotificationRequest(
+    identifier: "revision-semanal",
+    content: contenido,
+    trigger: UNCalendarNotificationTrigger(dateMatching: comp, repeats: true)
+)
+try await UNUserNotificationCenter.current().add(peticion)
+```
+
+El disparador por región merece una advertencia que la documentación menciona de pasada: su precisión temporal es del orden de minutos, no de segundos, porque el sistema ahorra batería muestreando la posición de forma oportunista. Además compite con el presupuesto global de veinte regiones monitorizadas por app, compartido con `CoreLocation`. Diseñar sobre él una experiencia que exija inmediatez produce frustración; diseñar sobre él un recordatorio contextual —la lista de la compra al llegar al supermercado— funciona bien porque tolera holgura.
+
+<Callout type="tip" title="El identificador es tu clave primaria">
+El campo `identifier` de `UNNotificationRequest` no es un adorno: registrar una petición con un identificador ya existente **sustituye** la anterior en lugar de añadir una segunda. Derivarlo de la identidad del objeto del dominio —por ejemplo `recordatorio-` seguido del `UUID` de la tarea— convierte la reprogramación en una operación idempotente y elimina toda una clase de duplicados que de otro modo hay que perseguir borrando a mano.
+</Callout>
+
+## Contenido, hilos y presencia en el sistema
+
+El objeto `UNMutableNotificationContent` es más rico de lo que sugiere su uso habitual. Más allá de `title`, `subtitle` y `body`, hay tres campos que determinan cómo se comporta la notificación dentro del sistema y que suelen quedarse sin rellenar. `threadIdentifier` agrupa: todas las notificaciones que comparten hilo se apilan visualmente y se resumen juntas, lo que convierte doce avisos de una misma conversación en una pila plegada en lugar de doce interrupciones separadas. `categoryIdentifier` enlaza con una `UNNotificationCategory` previamente registrada, que aporta acciones directas y, en su caso, una interfaz personalizada. Y `relevanceScore`, un valor entre cero y uno, ordena las notificaciones dentro de una pila y decide cuál representa al grupo en el resumen programado.
+
+`userInfo` es el canal por el que viaja el contexto de dominio. Todo lo que la app necesite para llevar a la persona al lugar correcto cuando pulse debe estar ahí, y debe ser información estable: un identificador, no un índice de fila; una ruta, no un objeto serializado que quizá ya no exista cuando se toque el aviso tres días después.
+
+```swift
+let categoria = UNNotificationCategory(
+    identifier: "TAREA",
+    actions: [
+        UNNotificationAction(identifier: "COMPLETAR", title: "Completar",
+                             options: [.authenticationRequired]),
+        UNTextInputNotificationAction(identifier: "NOTA", title: "Añadir nota",
+                                      options: [], textInputButtonTitle: "Guardar",
+                                      textInputPlaceholder: "Escribe algo")
+    ],
+    intentIdentifiers: [],
+    options: [.customDismissAction]
+)
+UNUserNotificationCenter.current().setNotificationCategories([categoria])
+```
+
+Las acciones directas son la mejora de usabilidad con mejor relación entre coste e impacto de toda la superficie de notificaciones. Permiten resolver la tarea sin abrir la app, lo que reduce la fricción y, de forma medible, aumenta la tolerancia a recibir más avisos. La opción `customDismissAction` merece mención propia porque entrega a la app el evento de descarte, señal valiosísima: una notificación descartada sin acción es una unidad de ruido, y contarlas es la vía más honesta de medir si estás molestando.
+
+## Reconciliar en lugar de acumular
+
+Aquí está el error estructural que arrastra la mayoría de las apps. El código programa una notificación al crear un objeto del dominio y se olvida de ella. Después el objeto se edita, se pospone, se completa o se borra, y la promesa depositada en el sistema sigue viva. El resultado es el aviso fantasma: la app recuerda algo que ya no existe, y esa incoherencia destruye la confianza en el canal más deprisa que cualquier exceso de frecuencia.
+
+La solución no es añadir llamadas de borrado en cada ruta de mutación, porque siempre queda una ruta olvidada. La solución es tratar el conjunto de peticiones pendientes como un **estado derivado** y reconciliarlo íntegro contra el modelo, igual que un motor declarativo reconcilia un árbol de vistas. Se calcula el conjunto deseado, se lee el conjunto actual mediante `pendingNotificationRequests`, se borra la diferencia sobrante y se registra la faltante.
+
+```swift
+func reconciliar(tareas: [Tarea]) async {
+    let centro = UNUserNotificationCenter.current()
+    let deseadas = Dictionary(
+        uniqueKeysWithValues: tareas
+            .filter { !$0.completada && $0.vence > .now }
+            .map { ("tarea-\($0.id)", $0) }
+    )
+    let actuales = await centro.pendingNotificationRequests()
+        .filter { $0.identifier.hasPrefix("tarea-") }
+
+    let sobran = actuales.map(\.identifier).filter { deseadas[$0] == nil }
+    centro.removePendingNotificationRequests(withIdentifiers: sobran)
+
+    let vivos = Set(actuales.map(\.identifier))
+    for (id, tarea) in deseadas where !vivos.contains(id) {
+        try? await centro.add(peticion(para: tarea, id: id))
+    }
+}
+```
+
+El punto de invocación de esa función importa tanto como su cuerpo. Debe ejecutarse tras cada guardado del contexto de persistencia, al volver a primer plano y tras cada sincronización remota, y debe ser barata cuando no hay cambios. Un detalle que se olvida con frecuencia: las notificaciones **ya entregadas** viven en un conjunto distinto, y limpiar el centro de notificaciones de avisos obsoletos con `removeDeliveredNotifications` forma parte del mismo contrato de coherencia.
+
+<Mermaid code={`flowchart TB
+  a[Cambio en el modelo] --> b[Calcular conjunto deseado]
+  b --> c[Leer peticiones pendientes]
+  c --> d{Diferencia}
+  d -->|sobra| e[removePendingNotificationRequests]
+  d -->|falta| f[add con identificador estable]
+  d -->|coincide| g[No hacer nada]
+  e --> h[Limpiar entregadas obsoletas]
+  f --> h
+  g --> h
+  h --> i[Sistema y modelo coherentes]`} />
+
+## El límite duro y la ventana deslizante
+
+iOS conserva como máximo **sesenta y cuatro peticiones pendientes por app**. Superado ese número, el sistema descarta silenciosamente las que disparan más tarde. No hay error, no hay excepción, no hay registro: simplemente dejan de existir. Cualquier app que genere recordatorios a partir de datos del usuario alcanzará ese techo antes de lo que su autor imagina, y lo descubrirá por una queja en la App Store.
+
+La técnica correcta es la ventana deslizante. En lugar de programar todo el horizonte, se ordenan los eventos por fecha de disparo, se registran los N más próximos con N holgadamente por debajo del límite —cuarenta es un valor prudente que deja margen a otros subsistemas— y se repone la ventana cada vez que se reconcilia. Las series repetitivas son un caso especialmente traicionero, porque una regla como todos los días laborables a las ocho ocupa una sola petición si se expresa con `repeats: true` y componentes parciales, pero consume cinco si alguien la desarrolla ingenuamente en un bucle sobre los días de la semana.
+
+```swift
+let ventana = 40
+let candidatas = eventos
+    .filter { $0.dispara > .now }
+    .sorted { $0.dispara < $1.dispara }
+    .prefix(ventana)
+```
+
+Queda una dependencia incómoda que conviene enunciar: la reposición solo ocurre cuando la app se ejecuta. Si la ventana cubre dos semanas y la persona no abre la app en un mes, las notificaciones se agotan en silencio. Las mitigaciones disponibles son ampliar la ventana hasta el límite prudente, apoyarse en una tarea de refresco en segundo plano cuando el producto lo justifique, y reconciliar también desde cualquier extensión que se ejecute, ya que comparte contenedor y llavero con la app. Ninguna es completa, y por eso conviene reservar los horizontes largos para lo que de verdad los necesita.
+
+<Callout type="dios" title="Programar una notificación es publicar una promesa fuera de tu proceso">
+Merece la pena detenerse en la naturaleza de lo que ocurre al llamar a `add`. No se está encolando trabajo en la app: se está escribiendo en una base de datos que pertenece a otro proceso, que sobrevive a la muerte del tuyo, que persiste a través de reinicios y que ejecutará una acción visible al usuario en tu nombre cuando tú ya no existas en memoria. Es, en el sentido más literal, un efecto secundario duradero sobre un sistema externo, y la disciplina que le corresponde es la misma que se aplicaría a escribir en la base de datos de otro servicio: identificadores estables, operaciones idempotentes, reconciliación periódica y tolerancia a la divergencia. La razón por la que tantas apps producen recordatorios de reuniones canceladas y alarmas de tareas ya completadas es que su equipo trató la notificación como una llamada procedimental con efecto inmediato, cuando su semántica real es la de un registro replicado con consistencia eventual. Adoptar el vocabulario correcto reordena el diseño de inmediato: deja de existir la pregunta de dónde hay que acordarse de cancelar el aviso, porque la respuesta pasa a ser en ningún sitio y en todos, ya que el conjunto pendiente se recalcula entero desde la fuente de verdad. Es el mismo salto conceptual que separa manipular vistas a mano de describir una interfaz declarativa, aplicado a un almacén que vive fuera de tu binario.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+Elige el disparador por su semántica temporal: intervalo para duraciones absolutas, calendario con `timeZone` explícita para patrones de reloj, región para lo contextual que tolera holgura. Rellena `threadIdentifier`, `categoryIdentifier` y `relevanceScore`, y usa acciones directas para resolver sin abrir la app. Deriva el identificador de la identidad del dominio y reconcilia el conjunto pendiente completo contra el modelo tras cada guardado, en lugar de cancelar caso a caso. Respeta el techo de sesenta y cuatro con una ventana deslizante y expresa las repeticiones con `repeats` en lugar de desarrollarlas en un bucle.
+</Callout>
+
+<Reto title="Convertir una programación imperativa en una reconciliación">
+1. Inventaría todos los puntos de tu código que llaman a `add` o a `removePendingNotificationRequests` y dibuja el grafo de rutas de mutación que deberían haberlos invocado y no lo hacen.
+2. Sustituye ese conjunto disperso por una única función de reconciliación invocada tras cada guardado del contexto y en el retorno a primer plano.
+3. Introduce identificadores derivados del identificador de dominio y verifica que reprogramar dos veces la misma entidad no produce duplicados.
+4. Genera trescientos recordatorios de prueba, comprueba cuántos sobreviven en `pendingNotificationRequests` e implementa la ventana deslizante de cuarenta con reposición.
+5. Activa `customDismissAction`, registra los descartes sin acción durante una semana y calcula la proporción respecto a las aperturas.
+</Reto>

@@ -1,0 +1,147 @@
+---
+title: "Patrones y riesgos: aprobación, presupuesto y observación"
+description: "Un agente en producción no se juzga por lo bien que responde sino por cómo se comporta en su peor día. Los cuatro problemas que lo definen son siempre los mismos: acciones irreversibles que nadie autorizó, facturas que crecen sin que nadie mire, bucles que no convergen y un sistema del que no se puede reconstruir qué hizo ni por qué. Vemos la pausa humana antes de lo irreversible con needsApproval y por qué el Durable Object la hace duradera, los tres niveles de presupuesto que hay que declarar, las formas típicas de un bucle que no termina y qué hay que registrar para poder responder mañana a la pregunta de qué pasó."
+subject: cloudflare
+level: 32
+order: 5
+icon: "32.5"
+duracion: "20 min"
+---
+
+<Lead>
+Llega el momento incómodo del nivel. Todo lo anterior describe cómo se construye un agente; esta lección trata de cómo se comporta el que ya está desplegado, atendiendo a gente real, con herramientas que mueven dinero y una tarjeta corporativa detrás de cada token. Los sistemas agénticos rara vez fracasan por falta de inteligencia: fracasan por falta de límites. Ejecutan una acción irreversible que nadie autorizó, entran en un bucle que da cuarenta vueltas sobre sí mismo, acumulan en una noche el gasto de un trimestre, o hacen algo raro un martes y resulta que no hay forma de reconstruir qué hicieron ni por qué. Las cuatro cosas tienen remedio, las cuatro se resuelven en el diseño y no en el prompt, y las cuatro hay que decidirlas antes de la primera línea de producción.
+</Lead>
+
+<Objetivos>
+
+- Insertar una pausa de aprobación humana antes de cualquier acción irreversible.
+- Declarar los tres niveles de presupuesto: pasos, tokens y gasto acumulado.
+- Reconocer las formas típicas de un bucle que no converge y cortarlas por diseño.
+- Registrar la traza de decisiones para poder auditar y evaluar el agente después.
+
+</Objetivos>
+
+## La pausa antes de lo irreversible
+
+La primera regla de un agente con herramientas peligrosas es que no todas las acciones son iguales. Leer es reversible; escribir en un borrador es reversible; emitir un pago, enviar un correo a mil clientes o borrar un repositorio no lo son. Para esa frontera existe `needsApproval`, una propiedad de la herramienta —no del modelo, no del prompt— que decide, en función de los argumentos concretos, si la ejecución debe detenerse a esperar a un humano.
+
+```ts
+enviarCorreo: tool({
+  description: "Envia un correo a un segmento de clientes.",
+  inputSchema: z.object({ segmento: z.string(), asunto: z.string(), destinatarios: z.number() }),
+  needsApproval: async ({ destinatarios }) => destinatarios > 25,
+  execute: async ({ segmento, asunto }) => this.env.CORREO.enviar(segmento, asunto),
+});
+```
+
+Cuando esa función devuelve verdadero, la llamada no se ejecuta: viaja al cliente como una parte del mensaje en estado de espera, y la conversación se detiene ahí. El cliente pinta un botón, el usuario aprueba o rechaza, y la respuesta reanuda el bucle exactamente donde estaba. Un rechazo no tiene por qué ser mudo: puedes devolver un error con texto propio, del estilo de que el presupuesto del trimestre no da para eso, y el modelo lo lee como una observación y propone una alternativa.
+
+La aprobación tiene además un requisito de diseño que se incumple constantemente: lo que se muestra al humano debe ser la acción exacta que se va a ejecutar —nombre de la herramienta y argumentos ya validados—, nunca el resumen que el modelo hace de su propia intención. Aprobar un texto que dice que se enviará un aviso a unos pocos clientes, mientras la llamada real lleva cuatro mil destinatarios, es peor que no pedir aprobación, porque añade una firma humana a un acto que nadie revisó. La pantalla de confirmación es parte de la frontera de confianza, no de la conversación.
+
+Lo que hace viable este patrón es la arquitectura de la lección dos. La pausa puede durar horas porque el agente es un Durable Object: el estado de la conversación, la llamada pendiente y el contexto entero están persistidos. El usuario puede cerrar la pestaña, volver mañana desde otro dispositivo, y encontrarse la aprobación esperándole. En un servicio sin estado esa misma pausa exigiría inventar una cola, una tabla de pendientes y un mecanismo de reanudación; aquí es una propiedad del sitio donde el agente vive.
+
+<Mermaid code={`sequenceDiagram
+  participant U as usuario
+  participant A as agente durable
+  participant M as modelo
+  M->>A: quiere enviarCorreo a 4000 destinatarios
+  A->>A: needsApproval devuelve verdadero
+  A->>U: peticion de aprobacion por websocket
+  Note over A: el agente hiberna con el estado persistido
+  U-->>A: aprobado dos horas despues
+  A->>A: ejecuta la herramienta
+  A-->>M: resultado y continua el bucle`} />
+
+## Tres presupuestos, tres sitios
+
+El gasto de un agente es una variable aleatoria, y las variables aleatorias se gobiernan con topes. Conviene declararlos en tres planos distintos, porque cada uno corta un fallo diferente y ninguno sustituye a los otros.
+
+La razón de ponerlos en sitios separados es que cada uno falla de una manera. El tope de pasos lo puede saltar un despliegue que olvide configurarlo. El presupuesto por conversación no ve al usuario que abre trescientas conversaciones. Y el límite de la pasarela no sabe si una ejecución concreta era razonable, solo sabe cuánto lleva gastado el conjunto. Puestos en capas, lo que uno deja pasar lo detiene el siguiente.
+
+| Presupuesto | Dónde se declara | Qué corta |
+| --- | --- | --- |
+| Pasos del bucle | `stopWhen` con `stepCountIs` en la llamada | La ejecución que no converge |
+| Coste por conversación | El estado del agente, comprobado antes de cada paso | El usuario que agota el cupo del día |
+| Gasto acumulado | Los límites de gasto de AI Gateway | La factura, por modelo \| proveedor \| usuario |
+
+El primero es el más barato de poner y el que más disgustos evita, porque acota la ejecución individual. El segundo es el que protege al sistema del usuario incansable: como el agente ya guarda su propio estado, llevar la cuenta del gasto acumulado de la conversación y comprobarla antes de cada paso son dos líneas, y a cambio obtienes un cupo por conversación que se aplica solo, sin servicio de cuotas ni tabla compartida.
+
+```ts
+private permitirPaso(costeEstimado: number): boolean {
+  const total = this.state.euros + costeEstimado;
+  if (total > this.state.tope) {
+    this.broadcast(JSON.stringify({ aviso: "presupuesto de la conversacion agotado" }));
+    return false;
+  }
+  this.setState({ ...this.state, euros: total });
+  return true;
+}
+```
+
+El tercero merece atención porque es el único que funciona cuando el resto falla. AI Gateway permite reglas de gasto en dólares sobre una ventana de tiempo, con hasta veinte reglas por pasarela, y sabe distinguir por modelo, por proveedor o por cualquier dimensión que envíes como metadato propio; adjunta el identificador de usuario y tendrás un tope por persona. Al superarse, la pasarela responde con un `429`, y ahí tienes dos opciones: bloquear o degradar. La segunda es casi siempre la buena en producto: una ruta dinámica con un modelo caro como primario y uno barato de reserva convierte un servicio caído en un servicio más humilde.
+
+<Cards>
+  <Card icon="🔁" title="Bucle sin convergencia">
+    El modelo repite la misma herramienta con los mismos argumentos esperando otro resultado. Se corta con el tope de pasos y detectando la repetición.
+  </Card>
+  <Card icon="🪃" title="Oscilación">
+    Dos herramientas que se deshacen mutuamente. El agente activa, desactiva y vuelve a activar. Se evita no exponiendo el par simétrico.
+  </Card>
+  <Card icon="💸" title="Fuga de gasto">
+    Un contexto que crece en cada vuelta multiplica el coste por paso. Recorta el historial y resume lo viejo antes de reenviarlo.
+  </Card>
+  <Card icon="🕳️" title="Fallo silencioso">
+    Una herramienta que devuelve siempre el mismo error genérico deja al modelo sin información para corregir, y reintenta indefinidamente.
+  </Card>
+</Cards>
+
+Las cuatro tarjetas describen el mismo síntoma visto desde ángulos distintos: el bucle sigue dando vueltas porque cada paso individual le parece razonable al modelo. Nada de esto se arregla pidiéndole en el prompt que no se repita, del mismo modo que un desbordamiento de pila no se arregla pidiéndole a la función que se llame menos. Se arregla en el motor que envuelve al modelo, que es tuyo.
+
+## Bucles que no convergen
+
+El tope de pasos es la red de seguridad, no la solución. Un agente que llega al tope casi siempre está diciéndote algo concreto: que dos herramientas hacen lo mismo y compiten, que una devuelve errores indistinguibles entre sí, o que la tarea no era resoluble con el catálogo que le diste. Tratar el tope como el arreglo definitivo es como tapar una alarma con cinta aislante.
+
+Por eso, además del tope, conviene detectar el ciclo. Si la misma herramienta se llama dos veces seguidas con exactamente los mismos argumentos, el resultado no va a cambiar; devolver una observación explícita que lo diga es infinitamente mejor que dejarlo girar, porque le da al modelo la información que le falta para probar otra cosa.
+
+```ts
+private repetida(herramienta: string, argumentos: unknown): boolean {
+  const huella = `${herramienta}:${JSON.stringify(argumentos)}`;
+  const vistas = this.state.huellas ?? [];
+  if (vistas.includes(huella)) return true;
+  this.setState({ ...this.state, huellas: [...vistas.slice(-9), huella] });
+  return false;
+}
+```
+
+Con esa huella en el estado del agente puedes cortar la repetición y, sobre todo, contarla: si un porcentaje apreciable de las conversaciones dispara la detección, tienes un problema de diseño del catálogo, no un problema de modelo. Las mismas huellas revelan la oscilación —la pareja de herramientas que se deshacen mutuamente—, que es la forma más desconcertante del bucle porque cada paso individual parece perfectamente razonable.
+
+Queda un último consumidor silencioso, y es el contexto. Como cada vuelta reenvía el historial entero, un bucle largo no solo tarda más: cuesta más por paso que el anterior. Recortar el historial, resumir lo antiguo y devolver resultados de herramienta compactos —el dato, no el volcado completo del proveedor— es lo que convierte una curva de coste cuadrática en una casi lineal.
+
+## Ver lo que el agente hizo
+
+Todo lo anterior exige lo último y lo más descuidado: ver. Un agente sin traza es un sistema del que no puedes afirmar nada, ni bueno ni malo, y del que no podrás responder cuando alguien pregunte por qué hizo lo que hizo. Como cada agente tiene su propia SQLite pegada al cómputo, registrar la traza no cuesta ni una llamada de red.
+
+```ts
+private registrar(paso: number, herramienta: string, argumentos: unknown, ms: number) {
+  this.sql`INSERT INTO trazas (paso, herramienta, argumentos, ms, ts)
+           VALUES (${paso}, ${herramienta}, ${JSON.stringify(argumentos)}, ${ms}, ${Date.now()})`;
+}
+```
+
+Con esa tabla puedes responder a las preguntas que llegan de verdad: cuántos pasos da el agente por conversación en el percentil noventa y cinco, qué herramienta falla más, cuántas aprobaciones se rechazan y por qué. Al lado, los registros de AI Gateway te dan la otra mitad —tokens, coste, latencia, aciertos de caché y hasta el agente de usuario que originó cada petición—, y juntos forman la traza completa. Adjuntar metadatos propios en cada llamada, con el identificador de conversación y el de usuario, es lo que permite cruzar ambas mitades después.
+
+Hay una cuarta columna que casi nadie guarda y que resulta imprescindible en cuanto el sistema vive unos meses: la versión. Qué modelo se usó, qué versión del prompt del sistema y qué versión del catálogo de herramientas estaban activos en ese momento. Sin ese dato, cualquier comparación entre el comportamiento de la semana pasada y el de hoy es imposible, porque no sabrás si cambió el agente, cambió el proveedor o cambió la pregunta.
+
+Ese material no sirve solo para depurar: es el conjunto de evaluación. Cuando ajustes la descripción de una herramienta o subas de modelo, la única forma de saber si has mejorado algo es volver a pasar por encima las conversaciones reales que ya registraste y comparar métricas concretas —pasos por tarea, tasa de terminación, coste por conversación, aprobaciones rechazadas—. Sin ese banco, cada cambio en un agente es una apuesta contada como si fuera un progreso.
+
+<Callout type="dios" title="Un agente no se prueba, se acota: la corrección deja de ser demostrable y pasa a ser estadística">
+Aquí se cierra el nivel con la idea que reordena todo lo anterior, y que cuesta aceptar porque contradice el instinto de cualquiera que haya aprendido a programar en serio. Todo el aparato de calidad del software se construyó sobre una premisa silenciosa: el mismo programa con la misma entrada produce la misma salida, y por tanto un test que pasa hoy prueba algo sobre mañana. Un agente rompe esa premisa en su raíz, porque su plan lo escribe un proceso estadístico en tiempo de ejecución y ese plan puede ser distinto la próxima vez con la misma pregunta. No existe el conjunto de pruebas que demuestre que un agente hace lo correcto, del mismo modo que no existe el conjunto de pruebas que demuestre que un empleado nunca se equivocará. Lo que sí existe es otra disciplina, y es la que hay que aprender: la de acotar el daño en vez de demostrar la corrección. Verás que las cuatro técnicas de esta lección son la misma idea aplicada en cuatro planos. El tope de pasos acota el tiempo. El límite de gasto acota el dinero. La aprobación humana acota la irreversibilidad. La traza acota la ignorancia, que es la más peligrosa de las cuatro porque sin ella no puedes ni saber que las otras tres fallaron. Fíjate en que ninguna intenta hacer al agente más listo; todas dan por hecho que se equivocará y se ocupan de que el error sea barato, reversible y visible. Esto no es pesimismo, es exactamente cómo la ingeniería ha tratado siempre a los componentes no fiables —los fusibles no hacen mejor la electricidad, los disyuntores no mejoran el cableado, las tolerancias no mejoran el acero—, y la novedad del momento no es tener componentes no fiables, sino tenerlos por primera vez en el asiento del control de flujo. El ingeniero que asume esto deja de perseguir el prompt perfecto y empieza a construir la envolvente: qué es lo peor que puede hacer, cuánto puede costar, quién lo autoriza y cómo lo sabré. Un agente bien diseñado no es el que nunca se equivoca; es aquel cuyos errores caben, todos, dentro de límites que tú elegiste conscientemente.
+</Callout>
+
+<Reto title="Pon la envolvente a tu agente">
+1. Clasifica tus herramientas en reversibles e irreversibles. Añade `needsApproval` a las segundas con un umbral basado en los argumentos, no en el tipo.
+2. Prueba la pausa de verdad: aprueba dos horas después, desde otra pestaña. Explica qué pieza de la arquitectura hace posible esa espera.
+3. Declara los tres presupuestos. Fuerza el agotamiento del tope de gasto y comprueba la degradación a un modelo más barato en vez del bloqueo.
+4. Provoca un bucle sin convergencia con una herramienta que devuelva siempre el mismo error. Añade la detección de repetición y mide cuántos pasos ahorras.
+5. Registra la traza en la SQLite del agente y responde con ella a tres preguntas: pasos por conversación, herramienta que más falla y aprobaciones rechazadas.
+</Reto>

@@ -1,0 +1,161 @@
+---
+title: "Aceptar y difundir: la sala que habla a todos"
+description: "Un canal abierto todavia no es una sala. Para que lo escrito por uno aparezca en la pantalla de todos, el objeto debe hacer tres cosas que HTTP nunca le pidio: recordar quien esta conectado, recorrer esa lista cuando llega un mensaje y darse cuenta de que alguien se ha ido. Vemos como aceptar el extremo servidor y guardarlo en la coleccion de sesiones, como registrar los escuchadores de message, close y error, como difundir con una sola serializacion y por que el hilo unico convierte ese bucle en un acto atomico. Cerramos con la limpieza de desconexiones, la idempotencia del adios y el aviso de presencia que mantiene honesta a la sala."
+subject: cloudflare
+level: 23
+order: 2
+icon: "23.2"
+duracion: "21 min"
+---
+
+<Lead>
+Ya tienes el tubo abierto: un extremo en el navegador y otro dentro del objeto. Pero un canal solo no es una sala. Para que un mensaje escrito por alguien aparezca en la pantalla de todos hacen falta tres gestos que el modelo pedir-y-responder nunca tuvo que aprender: recordar quién está conectado, recorrer esa lista cuando llega algo, y enterarse de que alguien se ha ido. Esos tres gestos son, literalmente, todo el tiempo real; lo demás —el historial, los metadatos, la presencia— son variaciones sobre ellos. En esta lección montamos la sala entera: aceptar, guardar, difundir y limpiar.
+</Lead>
+
+<Objetivos>
+
+- Aceptar el extremo servidor y registrar la conexión en la colección de sesiones del objeto.
+- Escuchar `message`, `close` y `error` con `addEventListener` y decidir qué hace cada evento.
+- Difundir un mensaje a toda la sala con una sola serialización, excluyendo al emisor cuando convenga.
+- Gestionar desconexiones de forma idempotente y reconectar desde el cliente con retroceso exponencial.
+
+</Objetivos>
+
+## Aceptar y guardar la sesión
+
+Llamar a `accept` sobre el extremo servidor es decirle al runtime que el objeto se hace cargo de ese canal: desde ese instante, lo que el cliente envíe se entregará a los escuchadores que registres. Pero aceptar no basta. Si la única referencia al socket vive dentro del `fetch` que lo creó, en cuanto esa función retorne el objeto tendrá un canal abierto que no sabe que existe: nadie podrá enviarle nada, porque nadie lo tiene en la mano. Por eso el primer gesto, siempre, es guardarlo en un campo de la instancia.
+
+Esa colección de sockets es la sala. Un `Set` bastaría si solo quisieras difundir, pero en la práctica cada conexión lleva datos asociados —quién es, cuándo entró, a qué canal está suscrito—, y entonces un `Map` que va del socket a su sesión es el molde correcto. La clave es el socket mismo, que es único e identifica la conexión sin necesidad de inventar identificadores.
+
+```ts
+type Sesion = { usuario: string; desde: number };
+
+export class Sala extends DurableObject {
+  private sesiones = new Map<WebSocket, Sesion>();
+
+  async fetch(request: Request): Promise<Response> {
+    const [cliente, servidor] = Object.values(new WebSocketPair());
+    const usuario = new URL(request.url).searchParams.get("usuario") ?? "anonimo";
+
+    servidor.accept();
+    this.sesiones.set(servidor, { usuario, desde: Date.now() });
+
+    servidor.addEventListener("message", (evento) => {
+      this.difundir({ tipo: "chat", de: usuario, texto: String(evento.data) });
+    });
+    servidor.addEventListener("close", () => this.salir(servidor));
+    servidor.addEventListener("error", () => this.salir(servidor));
+
+    this.difundir({ tipo: "entra", usuario }, servidor);
+    return new Response(null, { status: 101, webSocket: cliente });
+  }
+}
+```
+
+Los tres eventos cubren el ciclo entero. El de `message` trae lo que dice el cliente en `evento.data`, que será texto o binario según lo que enviara el navegador. El de `close` avisa de una despedida ordenada, la del usuario que cierra la pestaña. El de `error` cubre la despedida sucia: un túnel que se rompe, una red móvil que cambia de celda, un portátil que se duerme. Los dos últimos terminan en el mismo sitio, porque para la sala no hay diferencia entre irse y desaparecer.
+
+## Difundir: un mensaje, muchas pantallas
+
+Difundir es un bucle, y conviene decirlo sin ceremonia: no hay ninguna primitiva mágica de multidifusión debajo. El objeto recorre sus sockets y llama a `send` en cada uno. Lo que sí hay son tres detalles que separan un bucle ingenuo de uno correcto. Serializa una sola vez fuera del bucle, porque convertir el mismo objeto a texto mil veces es mil veces el mismo trabajo. Envuelve cada envío, porque un socket puede haber muerto sin que su evento de cierre haya llegado todavía. Y permite excluir a alguien, porque el emisor casi siempre pintó su propio mensaje antes de mandarlo.
+
+```ts
+private difundir(mensaje: unknown, excepto?: WebSocket): void {
+  const carga = JSON.stringify(mensaje);           // se serializa una sola vez
+  for (const socket of this.sesiones.keys()) {
+    if (socket === excepto) continue;
+    try {
+      socket.send(carga);
+    } catch {
+      this.salir(socket);                          // el canal ya estaba roto
+    }
+  }
+}
+```
+
+Aquí aparece, callada, la propiedad que hace fiable todo esto. El objeto es de un solo hilo: mientras el bucle recorre las sesiones, nadie entra ni sale de la sala, y ningún otro mensaje se cuela por la mitad. La difusión es atómica sin que hayas escrito un solo cerrojo, y de ahí se sigue algo más profundo: todos los clientes reciben los mensajes en el mismo orden, el orden en que el objeto los procesó. Ese orden compartido es lo que convierte a un puñado de pantallas en una sola realidad, y es exactamente lo que ningún grupo de servidores sin coordinar puede prometer.
+
+<Mermaid code={`flowchart LR
+  A[cliente A envia] --> DO[objeto sala]
+  DO --> B[cliente B]
+  DO --> C[cliente C]
+  DO --> D[cliente D]
+  style DO fill:#a6e3a1,color:#11111b`} />
+
+Conviene además darle forma al mensaje desde el primer día. Un campo `tipo` que discrimine entre charla, entrada, salida y presencia te permite crecer sin romper a los clientes viejos, y hace que el manejador del navegador sea un `switch` legible en vez de una adivinanza sobre la forma de cada carga.
+
+## Desconexiones: la sala también olvida
+
+El gesto que más se olvida es el último. Un socket que se va y no se retira del `Map` deja dos daños: uno de memoria, porque la colección crece sin límite mientras el objeto vive, y otro peor, de verdad, porque la lista de presentes empieza a mentir. Retirar es tan parte del protocolo como aceptar.
+
+```ts
+private salir(socket: WebSocket): void {
+  const sesion = this.sesiones.get(socket);
+  if (!sesion) return;                       // ya lo habiamos retirado antes
+  this.sesiones.delete(socket);
+  try {
+    socket.close(1000, "adios");
+  } catch {
+    // ya estaba cerrado por el otro extremo
+  }
+  this.difundir({ tipo: "sale", usuario: sesion.usuario });
+}
+```
+
+La guarda de la primera línea es lo que hace `salir` idempotente, y no es paranoia: un canal que se rompe puede disparar `error` y luego `close`, o solo uno de los dos, y en cualquier orden. Si el método no tolerase repetirse, difundirías dos avisos de salida por el mismo usuario. Escribe siempre la limpieza como una operación que se puede invocar de más sin consecuencias, porque la red se encargará de invocarla de más.
+
+Conviene además distinguir dos maneras de morir que el código trata igual pero el producto no. La salida ordenada llega con un código de cierre normal y significa que alguien decidió irse; la sucia llega como error, o no llega en absoluto, y significa que la red falló. Para la colección de sockets ambas son un borrado, pero para la interfaz no: al usuario que cerró la pestaña se le anuncia una salida, mientras que al que perdió cobertura conviene concederle una gracia de unos segundos antes de declararlo ausente, porque su cliente probablemente esté ya intentando volver.
+
+## El otro extremo: reconectar sin perder la sala
+
+Una sala sólida no se construye solo en el servidor. Las conexiones persistentes se rompen constantemente por causas que nada tienen que ver con tu código —un cambio de red, un túnel intermedio con tiempo de espera, un portátil que se suspende—, así que el cliente debe dar por hecho que se caerá y saber volver. La disciplina mínima son tres piezas: reconectar con retroceso exponencial para no martillear al objeto cuando algo va mal, añadir una pizca de azar al retraso para que mil clientes caídos a la vez no vuelvan todos en el mismo instante, y pedir al reconectar lo que se haya perdido durante el hueco.
+
+```ts
+function conectar(sala: string, espera = 500): void {
+  const ws = new WebSocket(`wss://ejemplo.dev/sala?sala=${sala}`);
+
+  ws.addEventListener("open", () => {
+    espera = 500;                                   // reinicia el retroceso
+    ws.send(JSON.stringify({ tipo: "sincronizar", desde: ultimoTs }));
+  });
+
+  ws.addEventListener("message", (e) => pintar(JSON.parse(e.data)));
+
+  ws.addEventListener("close", () => {
+    const azar = Math.random() * 300;               // evita la estampida
+    setTimeout(() => conectar(sala, Math.min(espera * 2, 15_000)), espera + azar);
+  });
+}
+```
+
+Ese mensaje de sincronización es la contrapartida natural del historial que el objeto guarda: el cliente dice hasta dónde llegó y la sala le devuelve lo que falta. Con esas dos piezas —reconexión con retroceso y recuperación por marca de tiempo— una caída de red deja de ser una pérdida de datos y pasa a ser un parpadeo.
+
+<Cards>
+  <Card icon="🗂️" title="La colección es la sala">
+    Guarda cada socket aceptado en un campo de la instancia. Lo que no está en esa colección no existe para la difusión.
+  </Card>
+  <Card icon="📣" title="Difundir es recorrer">
+    Serializa una vez, envía a cada socket y protege cada envío. No hay multidifusión debajo, solo un bucle bien escrito.
+  </Card>
+  <Card icon="🧵" title="El bucle es atómico">
+    Al ser de un hilo, nadie entra ni sale a mitad del recorrido. Todos ven los mismos mensajes en el mismo orden.
+  </Card>
+  <Card icon="🧹" title="Limpiar es parte del protocolo">
+    Retira el socket en `close` y en `error`, con una guarda que tolere repeticiones. Si no, la presencia miente.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="Con accept el objeto se queda despierto">
+Cuando aceptas el socket con `accept`, el objeto permanece cargado en memoria mientras haya conexiones vivas, y se factura por ese tiempo aunque nadie hable en horas. Una sala con cien personas calladas cuesta lo mismo que una sala con cien personas discutiendo. Es el precio del modelo directo, y es exactamente el problema que resuelve la hibernación de la próxima lección.
+</Callout>
+
+<Callout type="dios" title="Difundir es imponer un orden, no repartir copias">
+Es tentador leer el bucle de difusión como un simple reparto: llega un mensaje, se copia a todos, fin. Pero lo que de verdad ocurre ahí es más hondo y merece nombrarse. En el instante en que el objeto procesa un mensaje está haciendo algo que ningún sistema distribuido consigue gratis: está decidiendo la posición de ese evento en una única línea temporal que todos los participantes compartirán. Dos personas escriben a la vez desde dos continentes; sus paquetes viajan por rutas distintas y llegan al objeto en algún orden; ese orden, arbitrario pero único, se convierte en el orden de la realidad para toda la sala. Nadie verá A antes que B mientras otro ve B antes que A, porque solo hay un lugar donde el antes y el después se resuelven. A eso los sistemas distribuidos lo llaman un secuenciador, y construirlo sobre máquinas sin coordinar cuesta un algoritmo de consenso, con sus rondas, sus quórums y su liturgia de fallos. Aquí lo obtienes por el hecho geométrico de que existe un solo dueño y un solo hilo. Por eso el bucle de veinte líneas que acabas de escribir no es fontanería: es la pieza que hace posible el chat, el cursor compartido, el marcador en vivo y la partida sincronizada, y todos ellos son, en el fondo, el mismo truco. El día que necesites que dos usuarios estén de acuerdo sobre qué pasó primero, no busques un protocolo: busca el objeto cuyo nombre los reúne, y deja que su hilo único decida. La difusión es la consecuencia visible; el orden es el producto real.
+</Callout>
+
+<Reto title="Monta una sala que difunda de verdad">
+1. Amplía el objeto `Sala` con un `Map` de sesiones y comprueba, con dos pestañas abiertas, que lo que escribe una aparece en la otra.
+2. Añade el campo `tipo` a todos los mensajes y escribe en el cliente un `switch` que pinte distinto la charla, las entradas y las salidas.
+3. Difunde la entrada excluyendo al recién llegado y envíale a él, y solo a él, la lista de los que ya estaban. Explica por qué esos dos mensajes son distintos.
+4. Cierra una pestaña de golpe, sin cerrar el socket a mano, y verifica que `salir` se ejecuta una sola vez aunque lleguen `close` y `error`.
+5. Quita a propósito la línea que borra del `Map` y describe los dos daños que aparecen: el de memoria y el de la presencia que miente.
+</Reto>

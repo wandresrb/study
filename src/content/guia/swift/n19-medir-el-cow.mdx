@@ -1,0 +1,156 @@
+---
+title: "Medir: comprobar si tu tipo copia y si el COW merece la pena"
+description: "Instrumentar el almacenamiento para contar duplicaciones, contar asignaciones del heap con Instruments y con benchmarks, y el análisis coste-beneficio que decide si copy-on-write vale su complejidad en tu tipo concreto."
+subject: swift
+level: 19
+order: 5
+icon: "19.5"
+duracion: "18 min"
+---
+
+<Lead>
+Las cuatro lecciones anteriores se sostienen sobre un supuesto que ahora toca examinar: que copy-on-write es una buena idea. Lo es para `Array` y para `String`, cuyo tamaño no está acotado y cuyas copias son constantes en cualquier programa real. No lo es en absoluto para un `struct` de dos enteros, donde añadir un objeto del heap sustituiría una copia de dieciséis bytes por una asignación de memoria, un `retain` atómico, un `release` atómico y una indirección en cada lectura. Entre esos dos extremos hay una franja ancha de tipos donde la respuesta no es evidente y donde la intuición falla con notable regularidad. Esta lección va sobre cómo salir de la intuición: cómo comprobar empíricamente si tu tipo copia, cómo contar lo que realmente cuesta, y cómo decidir con números en la mano si la complejidad del patrón se paga sola.
+</Lead>
+
+<Objetivos>
+
+- Instrumentar un almacenamiento propio para contar duplicaciones sin alterar el comportamiento medido.
+- Detectar copias en tipos de la biblioteca estándar comparando direcciones base del búfer.
+- Contar asignaciones del heap y tráfico de retención con las herramientas disponibles.
+- Aplicar un criterio cuantitativo para decidir si copy-on-write compensa en un tipo concreto.
+
+</Objetivos>
+
+## Hacer visible la duplicación
+
+La instrumentación más útil es también la más simple: un contador en el único sitio donde el almacenamiento se duplica. Como ese sitio es el inicializador de copia que tú escribiste, la instrumentación es exacta por construcción.
+
+```swift
+final class Almacen {
+    static let copias = Atomic<Int>(0)
+    var bytes: [UInt8]
+
+    init(bytes: [UInt8]) { self.bytes = bytes }
+
+    init(copiando otro: Almacen) {
+        Self.copias.wrappingAdd(1, ordering: .relaxed)
+        self.bytes = otro.bytes
+    }
+}
+```
+
+Con eso, cualquier prueba puede afirmar algo verificable sobre el comportamiento del tipo, y no solo sobre su resultado. Esta es, de hecho, la única manera honesta de escribir pruebas de regresión sobre copy-on-write: el resultado de la función no cambia cuando el patrón se rompe, así que si no aseveras sobre el número de copias, no estás probando nada.
+
+```swift
+@Test func mutarUnValorUnicoNoCopia() {
+    let antes = Almacen.copias.load(ordering: .relaxed)
+    var b = Bufer([1, 2, 3])
+    b.append(4)
+    #expect(Almacen.copias.load(ordering: .relaxed) == antes)
+}
+
+@Test func mutarConCopiaVivaCopiaUnaVez() {
+    let antes = Almacen.copias.load(ordering: .relaxed)
+    var b = Bufer([1, 2, 3])
+    let vista = b
+    b.append(4); b.append(5)
+    _ = vista.count
+    #expect(Almacen.copias.load(ordering: .relaxed) == antes + 1)
+}
+```
+
+Para los tipos de la biblioteca estándar, donde no puedes instrumentar nada, el equivalente es comparar la dirección base del búfer antes y después de la operación sospechosa. Un cambio de dirección es una duplicación; la ausencia de cambio no garantiza que no haya habido ninguna, pero en la práctica basta para localizar el problema.
+
+```swift
+func direccion(_ a: [Int]) -> UnsafeRawPointer? {
+    a.withUnsafeBufferPointer { UnsafeRawPointer($0.baseAddress) }
+}
+```
+
+## Contar lo que cuesta
+
+Las copias son una parte del coste, y no siempre la mayor. Un tipo con copy-on-write paga tres cosas distintas y conviene medirlas por separado: asignaciones del heap, tráfico atómico de ARC, y ciclos de la copia propiamente dicha.
+
+Las **asignaciones** son lo más fácil de ver y lo más caro por unidad. En Instruments, la plantilla Allocations con la opción de anotar los eventos transitorios te da el recuento por pila de llamadas, y el paquete `swift-collections-benchmark` o el `Benchmark` de ordo-one exponen contadores de `malloc` por iteración, que es la métrica que de verdad quieres en una prueba automatizada. El orden de magnitud a retener: una asignación de tamaño pequeño ronda las decenas de nanosegundos, entre uno y dos órdenes de magnitud más que una copia de dieciséis bytes.
+
+El **tráfico de ARC** es el coste invisible del patrón y el que no desaparece nunca. Cada copia del `struct` es un `retain` atómico y cada destrucción un `release`. Sin contención rondan los pocos nanosegundos; con varios hilos tocando el mismo objeto, la línea de caché compartida puede degradar eso brutalmente. Para verlo, el instrumento correcto en plataformas Apple es el de recuentos de referencias de Instruments, y a bajo nivel siempre puedes inspeccionar el SIL con `swiftc -emit-sil -O` y contar literalmente cuántos `strong_retain` sobreviven a la optimización.
+
+```
+swiftc -O -emit-sil miTipo.swift | grep -c strong_retain
+```
+
+Y una advertencia que invalida la mitad de las mediciones que se publican: **mide siempre con optimizaciones**. Sin `-O`, no hay inlining, no hay eliminación de retenciones redundantes y no hay izado de las comprobaciones de unicidad fuera de los bucles. Un microbenchmark en depuración no mide tu código, mide la ausencia del optimizador.
+
+<Mermaid code={`flowchart TB
+  pregunta[Merece la pena copy on write en mi tipo] --> t[Cual es el tamano de la carga util]
+  t --> peq[Pocas palabras y tamano fijo]
+  t --> gra[Grande o de tamano no acotado]
+  peq --> no[Copiar directo gana casi siempre]
+  gra --> r[Cual es la proporcion entre copias y mutaciones]
+  r --> muchas[Muchas copias y pocas mutaciones]
+  r --> pocas[Casi toda copia acaba mutando]
+  muchas --> si[Copy on write compensa]
+  pocas --> alt[Considerar clase inmutable o tipo no copiable]
+  style no fill:#f9e2af,color:#11111b
+  style si fill:#a6e3a1,color:#11111b
+  style alt fill:#89b4fa,color:#11111b`} />
+
+## Un banco de pruebas que no te engañe
+
+Medir copy-on-write tiene una dificultad propia: el optimizador es perfectamente capaz de eliminar el código que intentas medir. Si construyes un valor, lo copias, lo mutas y no usas el resultado, `-O` puede borrar la secuencia entera y dejarte con un bucle vacío que corre en cero nanosegundos. La defensa estándar es un sumidero que el compilador no pueda atravesar.
+
+```swift
+@inline(never)
+func sumidero<T>(_ x: T) {
+    withExtendedLifetime(x) { }
+}
+
+func medir(_ iteraciones: Int) {
+    var b = Bufer(Array(repeating: 0, count: 4_096))
+    for _ in 0..<iteraciones {
+        var copia = b            // retain
+        copia.append(1)          // aqui deberia duplicar
+        sumidero(copia)
+        sumidero(b)
+        b = Bufer(Array(repeating: 0, count: 4_096))
+    }
+}
+```
+
+Tres precauciones más completan el banco de pruebas. Calienta antes de medir, porque la primera iteración paga fallos de caché y de página que no representan el estado estacionario. Repite y toma la mediana o el mínimo, no la media: los tiempos de un proceso son distribuciones con cola derecha larga por culpa del planificador, y la media mide el sistema operativo tanto como tu código. Y separa siempre la métrica de asignaciones de la métrica de tiempo, porque son estables de forma muy distinta: el recuento de `malloc` es determinista y sirve como prueba de regresión automatizable, mientras que el tiempo varía entre ejecuciones y solo sirve para comparaciones relativas dentro de la misma sesión.
+
+## El criterio de decisión
+
+Con los números encima de la mesa, la decisión se reduce a comparar dos costes esperados. Sin el patrón, cada copia cuesta duplicar la carga útil entera, y las mutaciones son gratis. Con el patrón, cada copia cuesta un `retain` y cada mutación cuesta una comprobación de unicidad más, con probabilidad `p`, una asignación y una duplicación. El patrón gana cuando el ahorro en las copias supera el peaje constante de ARC más las duplicaciones que sí ocurren.
+
+De ahí salen tres reglas prácticas. **Por debajo de unas pocas palabras, no lo hagas**: si tu tipo cabe en tres o cuatro registros, la copia directa es más rápida que una sola indirección, y además el compilador puede pasarlo en registros en lugar de por memoria. **Por encima de un tamaño no acotado, hazlo casi siempre**: si el tipo contiene una colección de tamaño arbitrario, el peor caso sin el patrón no tiene techo. **En medio, mide con tu carga real**, porque la variable decisiva no es el tamaño sino la proporción entre copias y mutaciones en tu programa concreto.
+
+Y antes de escribirlo, considera que hay alternativas que a menudo son mejores. Si el dato es inmutable tras su construcción, una `final class` con todas las propiedades `let` te da compartición gratuita sin comprobación alguna, y es indistinguible de la semántica de valor porque nadie puede observar un cambio que no puede ocurrir. Si el tipo ya envuelve colecciones de la biblioteca estándar, esas colecciones ya implementan el patrón y probablemente no necesites nada más: un `struct` con dos `Array` dentro ya se comporta como quieres. Y si lo que buscas es evitar toda copia y toda comprobación, el camino moderno del lenguaje no es copy-on-write sino los tipos no copiables con `~Copyable`, `consuming` y `borrowing`, que trasladan la garantía de unicidad al sistema de tipos y eliminan la comprobación dinámica por completo.
+
+<Cards>
+  <Card icon="🔢" title="Instrumenta el punto de copia">
+    Un contador atómico en el inicializador de copia del almacenamiento convierte el comportamiento en algo aseverable en pruebas. Sin eso, no estás probando el patrón.
+  </Card>
+  <Card icon="🧪" title="Mide siempre con optimizaciones">
+    Sin `-O` no hay inlining, ni eliminación de retenciones, ni izado de comprobaciones. Un microbenchmark en depuración mide la ausencia del optimizador.
+  </Card>
+  <Card icon="🧭" title="Considera antes las alternativas">
+    Clase `final` con propiedades `let` para datos inmutables, composición sobre colecciones que ya lo implementan, o tipos no copiables cuando quieras la garantía estática.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="El coste de una abstracción que no puedes desactivar">
+Hay una pregunta que este nivel entero deja implícita y que conviene formular sin rodeos: ¿cuánto cuesta, en agregado, la decisión de Swift de hacer que todo valor sea copiable y que las colecciones sean valores? La respuesta honesta es que cuesta bastante y que nadie ha logrado medirla del todo, porque el coste está repartido en millones de `retain` y `release` que ningún perfil atribuye a una línea concreta. Es la clase de sobrecoste que no aparece como un pico en el perfil sino como un impuesto plano sobre todo el programa —del orden de un porcentaje de dos cifras bajas en código con muchos objetos— y por eso es a la vez difícil de justificar y difícil de eliminar. Swift aceptó ese impuesto a cambio de algo concreto: un modelo mental en el que puedes pasar una colección a cualquier función sin preguntarte quién la posee, sin declarar préstamos y sin miedo a que alguien la mute a tus espaldas. Es exactamente el mismo trato que ofrecen los lenguajes con recolector de basura, ejecutado con un mecanismo distinto y con pausas deterministas en lugar de pausas impredecibles. Lo que hace fascinante el momento actual del lenguaje es que Swift ha empezado a ofrecer la salida sin retirar la entrada: `~Copyable` recupera el control de Rust para quien lo necesite, `borrowing` y `consuming` hacen explícita la propiedad, `InlineArray` y `Span` eliminan la indirección donde estorba. La apuesta ya no es "seguridad ergonómica para todos", sino "seguridad ergonómica por defecto, control total bajo demanda". Copy-on-write es la pieza central del primer término de esa frase, y entender exactamente qué cuesta es lo que te permitirá saber cuándo has llegado al punto en que necesitas el segundo.
+</Callout>
+
+<Callout type="note" title="Lo esencial de esta lección">
+Instrumenta el inicializador de copia con un contador atómico y aseverá sobre él en las pruebas; para tipos estándar, compara direcciones base. Mide asignaciones del heap, tráfico de ARC y ciclos por separado, y siempre con `-O`. Decide con el tamaño de la carga útil y la proporción copias-mutaciones: por debajo de unas pocas palabras no compensa, con tamaño no acotado casi siempre sí, y en medio hay que medir. Considera antes la clase inmutable, la composición y los tipos no copiables.
+</Callout>
+
+<Reto title="Pon números a tu tipo">
+1. Añade un contador atómico al almacenamiento de tu `Bufer` y escribe tres pruebas que aseveren el número exacto de copias en escenarios de valor único, copia viva y copia liberada.
+2. Escribe dos versiones del mismo tipo, una con copy-on-write y otra que copie la carga útil directamente, y mídelas con cargas útiles de dos, ocho, treinta y dos y mil palabras.
+3. Para cada tamaño, varía la proporción entre copias y mutaciones y localiza el punto de cruce en el que el patrón deja de compensar.
+4. Emite el SIL optimizado de un fragmento que copie y mute tu tipo, cuenta las retenciones y las comprobaciones de unicidad que sobreviven, y compáralo con el equivalente usando `Array`.
+5. Reescribe el tipo como `final class` con propiedades `let` y decide, con los datos de los puntos anteriores, cuál de las tres versiones se queda en tu proyecto y por qué.
+</Reto>

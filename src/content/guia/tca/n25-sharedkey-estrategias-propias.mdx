@@ -1,0 +1,174 @@
+---
+title: "Estrategias propias: escribir tu propio SharedKey"
+description: "Las tres claves de fábrica cubren la mayoría de los casos, pero no todos: un secreto pertenece al llavero, un catálogo mutable de decenas de miles de filas pertenece a una base de datos, y un documento colaborativo vive en un servidor. Esta lección desmonta el protocolo `SharedKey` obligación por obligación —identidad, carga, guardado con su contexto y suscripción con su desmontaje—, escribe una clave completa para el llavero, esboza la clave de consulta viva sobre SQLite y traza con precisión la frontera donde una estrategia de persistencia deja de ser adecuada y el trabajo vuelve a ser de un efecto."
+subject: tca
+level: 25
+order: 4
+icon: "25.4"
+duracion: "24 min"
+---
+
+<Lead>
+Hasta aquí la persistencia ha sido un catálogo: tres claves de fábrica, tres modos de duración, elegir la que corresponda. Ese catálogo se acaba en cuanto el dominio pide algo que ninguna de las tres hace bien —un secreto que debe estar cifrado por el sistema, una colección tan grande que reescribirla entera es inviable, un valor cuya fuente de verdad está en otra máquina— y entonces conviene descubrir que las tres claves no son casos especiales del framework sino conformidades corrientes a un protocolo público que tú también puedes conformar. Escribir una clave propia no es extender TCA por los bordes: es usar exactamente el mismo mecanismo que usa `fileStorage`, con las mismas obligaciones y las mismas garantías para quien la consuma.
+</Lead>
+
+<Objetivos>
+
+- Enumerar las obligaciones del protocolo `SharedKey`: identidad, carga, guardado y suscripción.
+- Entender por qué el identificador de la clave decide qué instancias comparten valor y cuáles no.
+- Escribir una clave completa contra un almacén real y aprovechar el contexto de guardado para agrupar escrituras.
+- Distinguir cuándo un dato remoto pertenece a una clave de solo lectura y cuándo sigue perteneciendo a un efecto.
+
+</Objetivos>
+
+## Las cuatro obligaciones de una clave
+
+El protocolo se divide en dos: la parte de lectura, que es la que exige el trabajo interesante, y el añadido de escritura.
+
+```swift
+protocol SharedReaderKey<Value>: Sendable {
+  associatedtype Value
+  associatedtype ID: Hashable = Self
+  var id: ID { get }
+  func load(context: LoadContext<Value>, continuation: LoadContinuation<Value>)
+  func subscribe(context: LoadContext<Value>, subscriber: SharedSubscriber<Value>)
+    -> SharedSubscription
+}
+
+protocol SharedKey<Value>: SharedReaderKey {
+  func save(_ value: Value, context: SaveContext, continuation: SaveContinuation)
+}
+```
+
+Cada miembro carga con una responsabilidad que conviene enunciar por separado, porque los fallos de las claves caseras casi siempre consisten en incumplir una sola de las cuatro.
+
+<Cards>
+  <Card icon="🪪" title="id: quién es la misma clave">
+    Dos claves con el mismo identificador comparten referencia. Un `id` demasiado grueso funde valores que debían ser distintos; uno demasiado fino los duplica en silencio.
+  </Card>
+  <Card icon="📥" title="load: traer el valor">
+    Se invoca al primer acceso y en cada recarga explícita. Debe terminar siempre: devolviendo valor, devolviendo el inicial si no hay nada, o lanzando.
+  </Card>
+  <Card icon="📤" title="save: llevar el valor">
+    Recibe además un contexto que distingue la mutación corriente de la petición explícita del usuario, y esa distinción es la que permite agrupar escrituras.
+  </Card>
+  <Card icon="📡" title="subscribe: escuchar al mundo">
+    Registra la observación del origen externo y devuelve la suscripción cuyo desmontaje debe cerrarla. Si no hay nada que observar, se devuelve una vacía.
+  </Card>
+</Cards>
+
+El identificador merece un párrafo propio porque su papel es más profundo de lo que aparenta. No sirve para nombrar la clave sino para decidir la identidad del valor compartido: dos declaraciones repartidas por la app cuyas claves compartan `id` obtienen la misma referencia y se ven mutuamente. De ahí que el `id` deba incluir todo lo que distingue a un almacén de otro —el servicio y la cuenta en el llavero, la ruta en un fichero, la consulta y sus parámetros en una base de datos— y nada que no lo distinga. Meter en el `id` un detalle irrelevante, como el codificador configurado, fragmenta el estado: dos features creerían compartir y en realidad tendrían cada una el suyo, con dos escrituras compitiendo por el mismo destino.
+
+## Una clave para el llavero, entera
+
+El llavero es el caso didáctico perfecto: tiene un almacén real, exige codificación, no notifica cambios y su identidad se compone de dos campos.
+
+```swift
+struct LlaveroKey<Value: Codable & Sendable>: SharedKey {
+  let servicio: String
+  let cuenta: String
+
+  struct ID: Hashable { let servicio: String; let cuenta: String }
+  var id: ID { ID(servicio: servicio, cuenta: cuenta) }
+
+  func load(context: LoadContext<Value>, continuation: LoadContinuation<Value>) {
+    do {
+      guard let datos = try Llavero.leer(servicio: servicio, cuenta: cuenta)
+      else { return continuation.resumeReturningInitialValue() }
+      continuation.resume(returning: try JSONDecoder().decode(Value.self, from: datos))
+    } catch {
+      continuation.resume(throwing: error)
+    }
+  }
+
+  func save(_ value: Value, context: SaveContext, continuation: SaveContinuation) {
+    do {
+      let datos = try JSONEncoder().encode(value)
+      switch context {
+      case .didSet:         // mutación corriente: se puede diferir y agrupar
+        programador.agrupar(durante: .seconds(1)) { escribir(datos) }
+      case .userInitiated:  // guardado explícito: hay que escribir ahora
+        try escribir(datos)
+      }
+      continuation.resume()
+    } catch {
+      continuation.resume(throwing: error)
+    }
+  }
+
+  // el llavero no emite notificaciones de cambio: suscripción vacía
+  func subscribe(context: LoadContext<Value>, subscriber: SharedSubscriber<Value>)
+    -> SharedSubscription { SharedSubscription {} }
+}
+
+extension SharedKey {
+  static func llavero<V: Codable & Sendable>(servicio: String, cuenta: String) -> Self
+  where Self == LlaveroKey<V> { LlaveroKey(servicio: servicio, cuenta: cuenta) }
+}
+```
+
+Cuatro detalles concentran casi toda la enseñanza. El primero es la diferencia entre ausencia y error: cuando no hay nada guardado la clave no lanza, llama a la continuación que devuelve el valor inicial, y así el valor por defecto de la declaración cumple su papel de fondo sin convertir la ausencia en un fallo. El segundo es que lanzar sí está permitido y es lo correcto cuando algo va mal de verdad, porque el error queda disponible en la proyección del valor compartido en lugar de desaparecer. El tercero es el contexto del guardado: la agrupación de escrituras que en `fileStorage` venía de fábrica aquí se implementa a mano, difiriendo la mutación corriente y atendiendo de inmediato la petición explícita. El cuarto es la suscripción vacía: no hay observación que montar, pero el desmontaje debe existir igualmente para que el contrato del protocolo se cumpla.
+
+<Callout type="tip" title="Escribe una clave falsa antes que la verdadera">
+Toda clave casera debería tener una hermana en memoria con el mismo `id` y el mismo comportamiento observable, registrada como valor de prueba en el sistema de dependencias. Con ella, los tests de las features que la usan no tocan el llavero, la red ni la base de datos, y siguen ejercitando exactamente el mismo camino de código. La lección que cierra este nivel se apoya por completo en esta costumbre.
+</Callout>
+
+## Consultas vivas: el caso de solo lectura
+
+La segunda lección dejó pendiente el problema de las colecciones grandes: reescribir un fichero entero para cambiar una fila deja de ser aceptable pasado cierto tamaño. La respuesta no es una clave de escritura sobre SQLite sino algo más sutil y más limpio: una clave de **solo lectura** que represente una consulta viva.
+
+```swift
+struct ConsultaKey<Value: Sendable>: SharedReaderKey {
+  let sql: String
+  let parametros: [Parametro]
+  var id: ID { ID(sql: sql, parametros: parametros) }
+
+  func load(context: LoadContext<Value>, continuation: LoadContinuation<Value>) {
+    continuation.resume(with: Result { try baseDeDatos.ejecutar(sql, parametros) })
+  }
+
+  func subscribe(context: LoadContext<Value>, subscriber: SharedSubscriber<Value>)
+    -> SharedSubscription {
+    let observador = baseDeDatos.observar(sql, parametros) { subscriber.yield(with: $0) }
+    return SharedSubscription { observador.cancelar() }
+  }
+}
+```
+
+La asimetría es deliberada: se lee por la clave y se escribe por la base de datos. Las mutaciones van como siempre —dentro de una transacción, desde un efecto, con la dependencia de base de datos inyectada— y la clave se entera porque está observando, no porque alguien le haya pasado el valor nuevo. Con eso desaparecen de golpe los tres problemas de `fileStorage` a gran escala: la escritura es incremental, es transaccional y es concurrente. Y aparece una propiedad que ningún fichero puede ofrecer: si dos features observan consultas distintas sobre la misma tabla, una escritura las actualiza a ambas de forma consistente.
+
+<Mermaid code={`flowchart TD
+  R[Reducer muta] --> E[Efecto abre transaccion]
+  E --> DB[Base de datos]
+  DB --> O[Observador de la consulta]
+  O --> K[SharedReaderKey emite valor nuevo]
+  K --> S1[Feature A]
+  K --> S2[Feature B]
+  style DB fill:#89b4fa,color:#11111b
+  style K fill:#a6e3a1,color:#11111b`} />
+
+## Dónde acaba una clave y dónde empieza un efecto
+
+La tentación siguiente es escribir una clave contra una API remota y dar por resuelta la red. Casi siempre es un error de categoría, y la tabla lo delimita.
+
+| Situación | Clave compartida | Efecto con dependencia |
+| --- | --- | --- |
+| Valor que existe siempre y cambia solo | sí, es su caso | no, sobra maquinaria |
+| Origen que emite cambios: flujo, socket, observador | sí, `subscribe` es exactamente eso | no, obligaría a reinventar la suscripción |
+| Operación con petición y respuesta puntual | no | sí, es literalmente su definición |
+| Necesitas modelar cargando, cargado y fallido | no, la clave no tiene estados intermedios | sí, con acciones y estado explícitos |
+| Necesitas cancelar, reintentar o poner tiempo límite | no, el ciclo de vida no es tuyo | sí, con identificador de cancelación |
+
+La cuarta fila es la decisiva. Una clave compartida entrega un valor, no una narración: no sabe decir todavía no, ni fallé, ni lo estoy intentando otra vez. Cuando el usuario debe ver un indicador de carga, un mensaje de error o un botón de reintento, esa información es estado de la feature y su llegada es un acontecimiento del dominio, y ambos pertenecen al ciclo de acciones y efectos que llevas usando desde el Nivel 10. La combinación acertada, y la que se ve en las bases de código maduras, es usar ambas cosas a la vez: la clave sostiene el valor que persiste entre ejecuciones, y el efecto sostiene el episodio concreto de sincronización, con su comienzo, su desenlace y su rastro en las acciones.
+
+<Callout type="dios" title="Una clave no abstrae un almacén: define qué cuenta como fuente de verdad">
+Es fácil leer `SharedKey` como una interfaz de almacenamiento más, la enésima capa que oculta si debajo hay un fichero, una tabla o un servidor. Pero fíjate en qué es lo que el protocolo exige y qué es lo que no. No pide crear, ni actualizar, ni borrar, ni consultar; no tiene el vocabulario de una base de datos. Pide otra cosa: saber traer el valor actual, saber devolverlo y —esta es la que lo cambia todo— saber avisar cuando cambió por su cuenta. Ese tercer verbo es una declaración metafísica encubierta: presupone que el valor tiene una existencia propia fuera del programa, que puede cambiar sin que el programa lo haya pedido, y que la app no es su dueña sino su observadora. Por eso una clave bien escrita se parece más a un sensor que a un repositorio. Y por eso la frontera con el efecto es tan nítida en cuanto se enuncia bien: un efecto modela algo que la app hace y que ocurre una vez —con su duración, su fallo posible y su cancelación—, mientras que una clave modela algo que la app mira y que está siempre ahí. Confundirlos produce las dos patologías simétricas que uno encuentra en el mundo real: la clave que intenta narrar una petición de red y acaba sin poder expresar el fallo, y el efecto que intenta mantener sincronizado un valor perpetuo y acaba reimplementando, mal, una suscripción. Elegir bien entre ambos no es una cuestión de estilo: es decidir si lo que tienes entre manos es un acontecimiento o una presencia.
+</Callout>
+
+<Reto title="Escribe una clave y demuestra que su identidad es correcta">
+1. Elige un almacén que hoy manejes con un cliente inyectado y que en realidad contenga un valor perpetuo. El llavero es el mejor candidato para empezar.
+2. Implementa la clave completa: `id` con todos los campos que distinguen almacenes, `load` que separe ausencia de error, `save` que use el contexto para agrupar y `subscribe` con desmontaje real o vacía si no hay nada que observar.
+3. Demuestra la identidad con dos pruebas: dos declaraciones con los mismos parámetros deben verse mutuamente al mutar; dos con parámetros distintos deben ser independientes.
+4. Añade una hermana en memoria con el mismo comportamiento y regístrala como valor de prueba. Comprueba que la suite entera deja de tocar el almacén real.
+5. Busca en tu app una petición de red que alguien haya intentado modelar como estado perpetuo, y sepárala en sus dos mitades: la clave que sostiene el valor y el efecto que narra la sincronización con su carga, su error y su reintento.
+</Reto>

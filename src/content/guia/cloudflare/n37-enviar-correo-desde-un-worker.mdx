@@ -1,0 +1,151 @@
+---
+title: "Enviar correo desde un Worker: el binding y el proveedor"
+description: "Recibir correo con código resultó ser lo fácil. Enviarlo abre una pregunta más incómoda, porque el envío no depende de tu API sino de la opinión que tenga de ti el servidor del destinatario. Hay dos puertas y no son intercambiables: el binding de envío de Cloudflare, restringido a direcciones verificadas de tu propia cuenta y perfecto para avisos internos, y el proveedor externo por API, el único camino cuando el destinatario es un usuario cualquiera. Vemos el binding con EmailMessage y mimetext, la llamada por fetch a un proveedor, la trinidad de SPF, DKIM y DMARC, y por qué enviar en el camino crítico de una respuesta es siempre un error de diseño."
+subject: cloudflare
+level: 37
+order: 2
+icon: "37.2"
+duracion: "17 min"
+---
+
+<Lead>
+Recibir correo con código era, al final, un problema de parseo. Enviarlo es un problema de reputación. Puedes emitir un mensaje impecable, con las cabeceras correctas y un cuerpo limpio, y que aterrice en la carpeta de basura de tu usuario porque un filtro que no controlas decidió que tu dominio todavía no se ha ganado el derecho a hablar. Por eso esta lección tiene dos mitades desiguales: la mecánica de emitir, que se resuelve en veinte líneas, y la disciplina de que llegue, que se gana con meses de comportarse bien.
+</Lead>
+
+<Objetivos>
+
+- Distinguir el `binding` de envío del proveedor externo y saber cuándo toca cada uno.
+- Emitir un mensaje con `EmailMessage` y construir el `MIME` con una librería.
+- Llamar a la `API` de un proveedor desde el Worker con la clave como secreto.
+- Aplicar las prácticas de entregabilidad, idempotencia y desacople del camino crítico.
+
+</Objetivos>
+
+## Dos puertas que no son intercambiables
+
+La primera decisión no es técnica, es de destinatario. Cloudflare ofrece un `binding` de envío que emite correo directamente desde el Worker, pero con una restricción deliberada: solo entrega a direcciones de destino verificadas en tu propia cuenta. No es una limitación que puedas sortear, es el diseño. Sirve para que tu sistema te hable a ti.
+
+El proveedor externo por `API` es la otra puerta. Una llamada `fetch` autenticada contra un servicio especializado que se encarga de la infraestructura de envío, la reputación de las direcciones `IP`, los rebotes y las bajas. Es el camino obligado cuando el destinatario es un usuario cualquiera, es decir, casi siempre que el correo forme parte del producto.
+
+| Dimensión | Binding de envío | Proveedor externo |
+| --- | --- | --- |
+| Destinatarios | Solo verificados en tu cuenta | Cualquiera |
+| Caso natural | Alertas, informes, avisos internos | Altas, recibos, notificaciones |
+| Dependencias | Ninguna fuera de la plataforma | Cuenta, clave y factura |
+| Rebotes y bajas | Los gestionas tú | Panel, webhooks y supresión |
+| Trazabilidad | Tus propios registros | Aperturas \| clics \| entregas |
+| Coste de arranque | Cero | Alta del dominio y verificación |
+
+<Callout type="info" title="La regla corta">
+Si el destinatario eres tú o tu equipo, usa el `binding`: es más simple, no añade proveedor y no tiene coste. Si el destinatario es un usuario de tu producto, usa un proveedor. Y no intentes forzar el primero al segundo caso, porque la restricción de direcciones verificadas no es un obstáculo a esquivar, es lo que impide que la plataforma se convierta en un motor de correo no solicitado.
+</Callout>
+
+## El binding de envío
+
+Se declara en el manifiesto como cualquier otro `binding`, y se ata a la dirección de destino que ya has verificado.
+
+```jsonc
+{
+  "send_email": [
+    { "name": "CORREO", "destination_address": "equipo@ejemplo.com" }
+  ]
+}
+```
+
+El objeto que se envía es un `EmailMessage` construido a partir del mensaje crudo en formato `RFC 5322`. Componer ese texto a mano es un ejercicio de precisión innecesario: una librería como `mimetext` lo ensambla bien, con sus cabeceras y su codificación.
+
+```ts
+import { EmailMessage } from "cloudflare:email";
+import { createMimeMessage } from "mimetext";
+
+export default {
+  async fetch(request, env, ctx): Promise<Response> {
+    const msg = createMimeMessage();
+    msg.setSender({ name: "Alertas", addr: "alertas@ejemplo.com" });
+    msg.setRecipient("equipo@ejemplo.com");
+    msg.setSubject("Umbral de errores superado");
+    msg.addMessage({
+      contentType: "text/plain",
+      data: "La tasa de 5xx lleva diez minutos por encima del dos por ciento.",
+    });
+
+    const aviso = new EmailMessage("alertas@ejemplo.com", "equipo@ejemplo.com", msg.asRaw());
+    ctx.waitUntil(env.CORREO.send(aviso));
+
+    return new Response("recibido", { status: 202 });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+La dirección remitente debe pertenecer a un dominio de tu cuenta, y la destinataria tiene que coincidir con la verificada. Fuera de eso, el envío es una llamada más al `env`, con la misma ergonomía que escribir en `KV`.
+
+## El proveedor externo por API
+
+Aquí no hay `binding`, hay una petición `HTTP` saliente y una clave que jamás debe vivir en el código. La clave es un secreto cifrado del Worker, y el patrón es el de cualquier subpetición.
+
+```ts
+async function enviar(env: Env, destino: string, asunto: string, html: string) {
+  const respuesta = await fetch("https://api.proveedor.com/v1/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.CLAVE_CORREO}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": await claveIdempotente(destino, asunto),
+    },
+    body: JSON.stringify({
+      from: "Producto <hola@ejemplo.com>",
+      to: destino,
+      subject: asunto,
+      html,
+    }),
+  });
+
+  if (!respuesta.ok) {
+    throw new Error(`envio fallido: ${respuesta.status}`);
+  }
+}
+```
+
+Dos detalles que separan un envío ingenuo de uno correcto. El primero es la cabecera de idempotencia: si el Worker reintenta, o si una cola vuelve a entregar el mensaje, el proveedor debe reconocer que ya emitió ese correo y no duplicarlo. El segundo es el manejo del fallo, porque una `API` de correo caída es una eventualidad ordinaria, no una excepción.
+
+<Mermaid code={`flowchart LR
+  H[handler HTTP] --> Q[Queue de correo]
+  Q --> C[consumidor con reintentos]
+  C --> B[binding de envio]
+  C --> P[API del proveedor]
+  C --> DLQ[cola de fallidos]
+  style Q fill:#89b4fa,color:#11111b
+  style DLQ fill:#f38ba8,color:#11111b`} />
+
+## Que salga y que además llegue
+
+Emitir es la mitad barata. La otra mitad se gana con cuatro disciplinas.
+
+<Cards>
+  <Card icon="🔐" title="La trinidad del dominio">
+    `SPF` declara quién puede enviar en tu nombre, `DKIM` firma el mensaje y `DMARC` dice qué hacer si algo no cuadra. Sin las tres, tu correo es sospechoso por defecto.
+  </Card>
+  <Card icon="🧭" title="Separa el tráfico">
+    Usa un subdominio para lo transaccional y otro para lo masivo. Una campaña con muchas quejas no debe arrastrar a los recibos de compra.
+  </Card>
+  <Card icon="🚪" title="Baja fácil y honesta">
+    La cabecera de baja con un clic y un enlace visible. Que alguien se dé de baja es infinitamente mejor que un botón de spam.
+  </Card>
+  <Card icon="📉" title="Escucha los rebotes">
+    Una dirección que rebota de forma permanente se suprime, no se reintenta. Insistir sobre buzones muertos es la vía más rápida a la lista negra.
+  </Card>
+</Cards>
+
+Y una disciplina más, esta puramente arquitectónica: el envío no va en el camino crítico. Si tu handler espera a que el proveedor responda antes de contestar al usuario, has atado la latencia de tu formulario a la disponibilidad de un tercero, y has convertido su caída en tu error `500`. Encola el envío o suéltalo con `waitUntil`, contesta al usuario de inmediato y deja que un consumidor con reintentos y cola de fallidos se ocupe de la entrega.
+
+<Callout type="dios" title="Enviar es fácil, ser creído es lo difícil">
+Hay una asimetría en el correo que sorprende a todo ingeniero la primera vez y que conviene mirar de frente, porque reordena las prioridades del diseño. La parte que se parece a programar, componer un mensaje y empujarlo por una `API`, se resuelve en una tarde y no vuelve a dar problemas. La parte que decide si tu producto funciona, que un servidor ajeno lea tu mensaje y decida ponerlo delante de un humano en lugar de enterrarlo, no depende de tu código en absoluto: depende de una reputación acumulada que se construye durante meses de comportamiento intachable y se destruye en una sola tarde con un envío masivo mal calibrado. Es, en el fondo, el único sistema distribuido de tu arquitectura en el que el nodo que decide no te pertenece, no publica sus reglas, no te da un código de error útil y no admite apelación. Nadie te dirá que tus mensajes están cayendo en la basura; simplemente los usuarios dejarán de responder, las altas dejarán de confirmarse y tú creerás durante semanas que el problema está en tu copy. Por eso la madurez en este territorio no se mide por lo elegante que sea tu función de envío sino por tres hábitos que parecen aburridos: firmar el dominio antes de mandar el primer correo, separar el tráfico transaccional del promocional para que un experimento no contamine los recibos, y respetar las señales negativas con más seriedad que las positivas, suprimiendo lo que rebota y honrando cada baja al instante. Quien interioriza esto deja de tratar el correo como una `API` que a veces falla y empieza a tratarlo como lo que es, una relación con desconocidos poderosos donde tu única moneda es la constancia, y donde la mejor decisión técnica que tomarás no es qué proveedor usar sino cuántos correos decides no enviar.
+</Callout>
+
+<Reto title="Emite, encola y gánate la entrega">
+1. Declara un `binding` de envío hacia una dirección verificada y emite un aviso desde un Worker con `EmailMessage` y `mimetext`. Comprueba que llega y mira sus cabeceras completas.
+2. Intenta enviar a una dirección no verificada y documenta el error exacto. Explica por qué esa restricción existe y qué la sustituye en producción.
+3. Sustituye el envío directo por un `Queue`: el handler encola y contesta con `202`, y un consumidor emite con reintentos y cola de fallidos. Mide la latencia antes y después.
+4. Añade una clave de idempotencia derivada del destinatario y del evento, y provoca una doble entrega de la cola para verificar que solo sale un correo.
+5. Publica `SPF`, `DKIM` y `DMARC` en un dominio de pruebas, envía a tres proveedores distintos y compara los resultados de autenticación que aparecen en las cabeceras recibidas.
+</Reto>

@@ -1,0 +1,150 @@
+---
+title: "La API de R2 desde el Worker"
+description: "El binding de R2 convierte un bucket en una capacidad viva sobre env, con cinco verbos que lo gobiernan todo: put, get, delete, head y list. Vemos cómo se escriben, por qué get devuelve un flujo perezoso y no una copia en memoria, cómo se leen los metadatos de un objeto, y cómo se recorre un bucket entero paginando con cursor sin agotar la memoria del isolate."
+subject: cloudflare
+level: 18
+order: 2
+icon: "18.2"
+duracion: "16 min"
+---
+
+<Lead>
+Desde tu Worker no hablas con R2 por HTTP ni con claves de acceso: hablas por un binding, `env.BUCKET`, una capacidad declarada que aparece cableada al desplegar. Y toda la potencia del almacén cabe en cinco verbos —`put`, `get`, `delete`, `head` y `list`—. Aprenderlos bien es aprender R2 entero, porque no hay una sexta operación escondida. Pero hay un matiz que separa a quien copia el ejemplo de quien entiende la máquina: `get` no te trae los bytes, te trae un asa a un flujo. Interiorizar esa diferencia es lo que te permite servir un vídeo de un gigabyte desde un isolate que apenas tiene memoria.
+</Lead>
+
+<Objetivos>
+
+- Declarar un binding de R2 y usar los cinco verbos: `put`, `get`, `delete`, `head` y `list`.
+- Entender que `get` devuelve un `R2ObjectBody` con un flujo perezoso, no los bytes cargados en memoria.
+- Leer los metadatos de un objeto con `head` y volcarlos a cabeceras con `writeHttpMetadata`.
+- Recorrer un bucket grande paginando con `cursor` y `truncated` sin agotar el isolate.
+
+</Objetivos>
+
+## El binding y los cinco verbos
+
+Un bucket llega a tu Worker como cualquier otra capacidad: lo declaras en la configuración y lo recibes en `env`. La lista de `r2_buckets` es, a la vez, el permiso y el mapa de qué almacenes toca este Worker.
+
+```jsonc
+{
+  "r2_buckets": [
+    { "binding": "BUCKET", "bucket_name": "mi-bucket" }
+  ]
+}
+```
+
+A partir de ahí, `env.BUCKET` es un objeto `R2Bucket` con cinco métodos. `put` escribe un objeto bajo una clave; acepta una cadena, un `ArrayBuffer`, un `Blob` o —clave para lo que viene— un `ReadableStream`. `delete` borra por clave, y admite un array para barrer varias de un golpe. `head` recupera los metadatos sin el cuerpo. `get` recupera metadatos y cuerpo. `list` enumera claves. Nada más.
+
+```ts
+// Escribir. put devuelve un R2Object con los metadatos resultantes.
+const subido = await env.BUCKET.put("informe.pdf", request.body, {
+  httpMetadata: { contentType: "application/pdf" },
+  customMetadata: { autor: "willy", version: "3" },
+});
+
+// Borrar una clave, o muchas de una vez.
+await env.BUCKET.delete("informe.pdf");
+await env.BUCKET.delete(["tmp/a.bin", "tmp/b.bin", "tmp/c.bin"]);
+```
+
+Fíjate en los dos tipos de metadatos que acepta `put`. El `httpMetadata` son cabeceras estándar —`contentType`, `cacheControl`, `contentDisposition`— que R2 guarda y sabe devolver. El `customMetadata` es un diccionario tuyo, de cadena a cadena, para lo que quieras anotar. Esa distinción importará al servir el objeto: uno se convierte en cabeceras HTTP de vuelta; el otro es contexto privado de tu aplicación.
+
+<Cards>
+  <Card icon="📥" title="put">
+    Escribe un objeto bajo una clave. Acepta cadena, `ArrayBuffer`, `Blob` o `ReadableStream`. Devuelve el `R2Object` con los metadatos resultantes.
+  </Card>
+  <Card icon="📤" title="get">
+    Lee metadatos y cuerpo. Devuelve un `R2ObjectBody` con un flujo perezoso, o `null` si la clave no existe.
+  </Card>
+  <Card icon="🔎" title="head">
+    Recupera solo los metadatos, sin mover el cuerpo. Barata y perfecta para comprobar tamaño, fecha o tipo.
+  </Card>
+  <Card icon="📇" title="delete y list">
+    `delete` borra una clave o un array de ellas; `list` enumera claves ordenadas, hasta mil por página, con cursor.
+  </Card>
+</Cards>
+
+## El objeto es un flujo, no una copia
+
+Aquí está la idea que de verdad hay que agarrar. Cuando llamas a `get`, lo que recibes —si la clave existe— es un `R2ObjectBody`: un objeto de metadatos cuyo campo `body` es un `ReadableStream`. No has descargado el fichero a la memoria del Worker; tienes un asa a un flujo que R2 empezará a bombear cuando alguien lo consuma. Si la clave no existe, `get` devuelve `null`, y ese chequeo es obligatorio.
+
+La forma canónica de servir un objeto encadena ese flujo directo a la respuesta. R2 lee del almacén y el cliente recibe los bytes en tránsito, sin que ni un solo megabyte se acumule en el isolate:
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const objeto = await env.BUCKET.get("video.mp4");
+    if (objeto === null) {
+      return new Response("no encontrado", { status: 404 });
+    }
+    const headers = new Headers();
+    objeto.writeHttpMetadata(headers);       // vuelca contentType, cacheControl...
+    headers.set("etag", objeto.httpEtag);    // el etag entrecomillado, listo para cabecera
+    return new Response(objeto.body, { headers });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+El método `writeHttpMetadata` es un detalle elegante: toma el `httpMetadata` que guardaste al subir y lo escribe como cabeceras sobre un objeto `Headers`. El objeto recuerda cómo debía servirse. Y si solo necesitas saber de un fichero —su tamaño, su fecha, su tipo— sin traerte los bytes, `head` te da el mismo `R2Object` de metadatos pagando una lectura barata en vez de mover el cuerpo entero.
+
+```ts
+const meta = await env.BUCKET.head("video.mp4");
+if (meta) {
+  console.log(meta.size, meta.uploaded, meta.httpMetadata.contentType);
+}
+```
+
+<Mermaid code={`flowchart LR
+  Cliente[cliente] --> Worker[worker]
+  Worker --> Get[get del binding]
+  Get --> Body[R2ObjectBody con body como stream]
+  Body --> Resp[Response en streaming]
+  Resp --> Cliente
+  style Body fill:#a6e3a1,color:#11111b`} />
+
+<Callout type="tip" title="Lee solo un trozo con range">
+`get` acepta una opción `range` para pedir solo un tramo de bytes —un desplazamiento y una longitud, o un sufijo—. Es lo que sostiene las peticiones de rango del vídeo: el navegador pide "dame del byte 2 000 000 al 3 000 000" para saltar a un punto de la reproducción, y R2 devuelve solo esa franja en lugar del fichero entero.
+</Callout>
+
+Tanto `get` como `put` aceptan además una condición, `onlyIf`, que hace la operación dependiente del estado del objeto: ejecútala solo si el `etag` coincide, o si no coincide, o según la fecha de subida. Es concurrencia optimista para objetos. Si la condición de un `get` falla, R2 te devuelve los metadatos sin el cuerpo —una lectura más rápida—; si la de un `put` falla, devuelve `null` en vez del `R2Object`, señal de que otro escritor se te adelantó.
+
+```ts
+// Escribe solo si el objeto no ha cambiado desde el etag que conoces.
+const resultado = await env.BUCKET.put(clave, cuerpo, {
+  onlyIf: { etagMatches: etagConocido },
+});
+if (resultado === null) {
+  return new Response("conflicto: alguien escribió antes", { status: 412 });
+}
+```
+
+## Listar: recorrer un catálogo perezoso
+
+`list` enumera las claves del bucket, ordenadas lexicográficamente, pero con una cautela deliberada: devuelve como mucho mil entradas por llamada, y a veces menos para no presionar la memoria del isolate. Un bucket puede tener millones de objetos; ninguna llamada te los dará todos. El recorrido completo es, por diseño, una paginación con cursor.
+
+```ts
+let cursor: string | undefined;
+do {
+  const pagina = await env.BUCKET.list({ prefix: "fotos/", cursor, limit: 1000 });
+  for (const obj of pagina.objects) {
+    console.log(obj.key, obj.size);
+  }
+  cursor = pagina.truncated ? pagina.cursor : undefined;
+} while (cursor);
+```
+
+Dos opciones gobiernan la forma del listado. El `prefix` acota a las claves que empiezan por una cadena —tu única herramienta para simular carpetas—. El `delimiter`, combinado con el prefijo, colapsa todo lo que hay bajo un nivel en `delimitedPrefixes`, devolviéndote algo parecido a "las subcarpetas de aquí" sin recorrer su contenido. Y el par `truncated`/`cursor` es el motor de la paginación: mientras `truncated` sea verdadero, hay más, y `cursor` es el marcador para reanudar.
+
+Hay un coste que conviene tener presente. Cada verbo cuenta como una operación facturable: `put`, `delete`, `list` y las escrituras son de clase A; `get` y `head`, lecturas, son de clase B, diez veces más baratas. Listar un bucket enorme página a página no es gratis, y por eso el patrón maduro guarda su propio índice de claves —en KV o en D1— cuando necesita consultarlo a menudo, y reserva `list` para barridos ocasionales o reconciliaciones.
+
+<Callout type="dios" title="Un R2Object es una promesa de bytes, no los bytes">
+El error del principiante es tratar `get` como si leyera un fichero a una variable, como haría `readFile` en un servidor tradicional. En un isolate del edge esa intuición es venenosa: si `get` te devolviera el fichero entero en memoria, servir un vídeo de un gigabyte reventaría los límites del Worker y bastarían unas pocas peticiones concurrentes para tumbarlo. La API está diseñada justo para impedir esa lectura ingenua. Lo que `get` te entrega es un asa —un `R2ObjectBody` cuyo `body` es un flujo perezoso que aún no ha movido un solo byte—. La transferencia real ocurre cuando conectas ese flujo a un consumidor, típicamente el cuerpo de una `Response`, y entonces los bytes viajan de R2 al cliente atravesando tu Worker sin posarse en él. El Worker deja de ser un cubo donde el fichero se vierte y pasa a ser una tubería por la que fluye: contiene el control —quién puede leer, qué cabeceras poner, qué rango servir— sin contener los datos. Esta es la misma lección que atraviesa toda la plataforma del edge, y merece grabarse: en un mundo de isolates con memoria mínima, el streaming no es una optimización avanzada que aplicas cuando algo va lento, es el modo por defecto de mover datos, y las APIs que importan están hechas para que separes el flujo del control. Cuando interiorizas que un `R2Object` es una promesa de bytes y no una copia de ellos, dejas de preguntarte cuánta memoria consumirá servir un fichero grande —la respuesta es casi ninguna— y empiezas a diseñar manejadores que serían imposibles en el modelo de "cárgalo todo y respóndelo".
+</Callout>
+
+<Reto title="Sirve y recorre un bucket">
+1. Declara un binding `BUCKET` y escribe un Worker que enrute por método: `PUT` sube el cuerpo de la petición, `GET` sirve el objeto en streaming, `DELETE` lo borra.
+2. En el `GET`, usa `writeHttpMetadata` y devuelve el `httpEtag`. Comprueba que el `contentType` que guardaste al subir vuelve intacto en la respuesta.
+3. Sube un objeto grande y sírvelo; verifica que la memoria del Worker no crece con el tamaño del fichero, y explica por qué gracias al flujo.
+4. Escribe un recorrido con `list` que pagine con `cursor` hasta agotar el bucket bajo un `prefix`, y razona por qué ninguna llamada devuelve más de mil claves.
+5. Justifica cuándo mantendrías un índice de claves aparte en KV o D1 en lugar de llamar a `list`, apoyándote en el coste de las operaciones de clase A.
+</Reto>

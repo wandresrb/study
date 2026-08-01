@@ -1,0 +1,154 @@
+---
+title: "Las funciones withUnsafe: un préstamo con fecha de caducidad"
+description: "Por qué el acceso a punteros se entrega mediante un bloque y no devolviendo un valor. La dirección como ficción fabricada bajo demanda, la ley de no escapar, el conflicto con el acceso exclusivo, la reserva temporal en pila y el camino que abre `Span`."
+subject: swift
+level: 21
+order: 4
+icon: "21.4"
+duracion: "19 min"
+---
+
+<Lead>
+La primera pregunta que hace todo el mundo al encontrarse con `withUnsafeBufferPointer` es por qué la biblioteca no ofrece simplemente una propiedad que devuelva el puntero. La respuesta obliga a desmontar una creencia heredada de C que en Swift es sencillamente falsa: la creencia de que todo valor tiene una dirección. En Swift no la tiene. Un `Int` puede vivir entero en un registro del procesador; un array puede compartir su almacenamiento con otros tres arrays y reubicarlo en cuanto alguien escriba en él; un valor pasado a una función puede ser un temporal que el optimizador decide no materializar nunca. La dirección no es una propiedad preexistente que se pueda consultar: es algo que el compilador **fabrica** cuando alguien la pide, y que solo se compromete a mantener durante un intervalo acotado. La forma de bloque no es una incomodidad de la API: es la única sintaxis capaz de nombrar ese intervalo.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué un valor de Swift no tiene dirección estable y qué implica eso para el diseño de la API.
+- Reconocer las cuatro familias de funciones de préstamo y elegir la adecuada en cada caso.
+- Identificar las tres formas de romper el contrato: escapar, mutar el origen y violar el acceso exclusivo.
+- Situar `withUnsafeTemporaryAllocation` y `Span` en la evolución del mecanismo.
+
+</Objetivos>
+
+## La dirección como ficción acotada
+
+Todas estas funciones comparten una misma forma: reciben el valor, fabrican una dirección válida, invocan tu bloque con ella y, al volver, dejan de garantizar nada. La firma es genérica en el resultado y propaga los errores, de modo que el bloque puede devolver lo que quiera y lanzar lo que quiera sin que la función intermedia estorbe.
+
+```swift
+var x = 42
+let doble = withUnsafePointer(to: &x) { p -> Int in
+    p.pointee * 2          // p vive exactamente hasta el cierre de esta llave
+}
+print(doble)               // 84
+```
+
+La firma completa merece leerse despacio, porque todo el diseño está condensado en ella:
+
+```swift
+func withUnsafePointer<T, Resultado>(
+    to valor: inout T,
+    _ cuerpo: (UnsafePointer<T>) throws -> Resultado
+) rethrows -> Resultado
+```
+
+El resultado es un parámetro genérico independiente, de modo que el bloque puede devolver cualquier cosa; y `rethrows` hace que la función lance solo si el bloque lanza, con lo que un `try` dentro del cuerpo no obliga a envolver la llamada entera cuando no hace falta. La consecuencia incómoda de esa generosidad la veremos enseguida: si el resultado puede ser cualquier cosa, también puede ser el propio puntero.
+
+Lo que el compilador hace por debajo se llama *materialización*: si `x` no tenía dirección, la crea copiándolo a una posición de pila; si la tenía, la usa. Y aquí aparece la primera consecuencia sorprendente. Para un valor sin dirección estable, escribir a través de `withUnsafeMutablePointer` opera sobre un temporal que se copia de vuelta al salir del bloque —el patrón que ya conoces de `inout`—, así que las escrituras se ven al final, no durante. Si dentro del bloque leyeras `x` por su nombre esperando ver el cambio, verías el valor antiguo. Por fortuna, esa lectura no está permitida, y por una razón independiente.
+
+## El catálogo de préstamos
+
+Hay cuatro familias, y elegir mal no da un error sino una copia inesperada. Para un valor suelto están `withUnsafePointer(to:)` y su versión mutable, más `withUnsafeBytes(of:)` cuando lo que quieres son los bytes en crudo. Para colecciones contiguas están `withUnsafeBufferPointer` y compañía, que prestan el almacenamiento real y no una copia. Para cadenas, `withCString` entrega una representación terminada en cero apta para C, y `withUTF8` presta directamente los bytes de la codificación interna sin conversión.
+
+```swift
+let nombres = ["ada", "grace"]
+
+nombres.withUnsafeBufferPointer { b in
+    print(b.count)                       // presta el almacenamiento real
+}
+
+var texto = "hola"
+texto.withUTF8 { bytes in
+    print(bytes.count)                   // 4, sin terminador
+}
+texto.withCString { c in
+    print(strlen(c))                     // 4, con terminador cero anadido
+}
+```
+
+La cuarta familia es la menos conocida y a menudo la más útil: `withUnsafeTemporaryAllocation(of:capacity:)`, incorporada por SE-0322 en Swift 5.6, reserva un bloque temporal —en pila cuando el tamaño lo permite— y lo presta con la misma disciplina de ámbito. Es la respuesta correcta al espacio de trabajo efímero que antes obligaba a reservar en el montículo y liberar a mano.
+
+```swift
+let suma = withUnsafeTemporaryAllocation(of: Int.self, capacity: 64) { bufer -> Int in
+    bufer.initialize(repeating: 1)
+    defer { bufer.deinitialize() }
+    return bufer.reduce(0, +)
+}
+print(suma)   // 64
+```
+
+<Mermaid code={`sequenceDiagram
+  participant C as Tu codigo
+  participant R as Runtime de Swift
+  participant M as Memoria
+  C->>R: withUnsafeBufferPointer
+  R->>M: fija el almacenamiento y fabrica la direccion
+  R->>C: entrega el puntero al bloque
+  C->>M: lecturas y escrituras validas
+  C->>R: el bloque devuelve un resultado
+  R->>M: libera la fijacion
+  Note over C,M: a partir de aqui el puntero apunta a nada garantizado`} />
+
+## Las tres formas de romper el contrato
+
+La primera es escapar el puntero. Compila, no avisa y es indefinido. La variante más frecuente consiste en devolver el propio parámetro del bloque, porque el resultado del bloque es genérico y un puntero es un valor perfectamente válido para devolver.
+
+```swift
+// TODAS estas lineas compilan y TODAS son incorrectas
+let fugado = nombres.withUnsafeBufferPointer { $0 }
+let base   = nombres.withUnsafeBufferPointer { $0.baseAddress }
+var guardado: UnsafePointer<Int>?
+withUnsafePointer(to: &x) { guardado = $0 }
+```
+
+La segunda es mutar el origen mientras el préstamo está vivo. Un array con copia al escribir puede reubicar su almacenamiento en el instante en que alguien le añade un elemento, y el puntero prestado quedaría apuntando al búfer viejo, ya liberado. Que el bloque no sea `async` no te salva: basta con llamar a una función que capture el array y lo modifique.
+
+```swift
+var xs = [1, 2, 3]
+xs.withUnsafeBufferPointer { b in
+    xs.append(4)          // puede reubicar: b queda colgando
+    print(b[0])           // indefinido
+}
+```
+
+La tercera es la violación de acceso exclusivo. Desde Swift 5, la ley de exclusividad se comprueba también en compilaciones optimizadas para propiedades globales y de clase, y prestar una variable con el operador de dirección abre un acceso de escritura durante todo el bloque; tocar esa misma variable por su nombre dentro del bloque es un acceso solapado.
+
+```swift
+var contador = 0
+withUnsafeMutablePointer(to: &contador) { p in
+    p.pointee += 1
+    // contador += 1     // acceso solapado: exclusividad violada
+}
+```
+
+Hay un cuarto peligro que no rompe el contrato pero lo roza, y es la concurrencia. Los bloques de esta familia son síncronos, así que dentro de ellos no puedes suspender la ejecución: el lenguaje te impide llevar un puntero prestado a través de un punto de suspensión, y esa prohibición es una protección, no una molestia. Entre la suspensión y la reanudación puede pasar cualquier cosa con el almacenamiento de origen, incluida su reubicación por otra tarea. Cuando necesites trabajo asíncrono sobre memoria contigua, copia primero a una reserva que poseas y cuyo ciclo de vida controles.
+
+El pariente cercano de estas funciones es `withExtendedLifetime`, que resuelve un problema distinto y complementario: no presta ninguna dirección, sino que impide que ARC libere un objeto antes de tiempo. Es la herramienta correcta cuando entregas a una API de C un puntero que pertenece a un objeto y necesitas garantizar que ese objeto sigue vivo mientras la API lo usa, un caso en el que el optimizador podría insertar la liberación antes de lo que la intuición sugiere.
+
+<Cards>
+  <Card icon="⏳" title="Validez de extensión dinámica">
+    El puntero vale desde la entrada al bloque hasta la salida. Ni un instante antes ni uno después, y nada en el tipo lo dice.
+  </Card>
+  <Card icon="🕳️" title="Escapar compila siempre">
+    El resultado del bloque es genérico, así que devolver el puntero es legal para el comprobador de tipos e inválido para el modelo de memoria.
+  </Card>
+  <Card icon="🔒" title="El préstamo es un acceso">
+    Prestar una variable mutable abre un acceso exclusivo mientras dura el bloque. Leerla por su nombre dentro es solapamiento.
+  </Card>
+</Cards>
+
+<Callout type="tip" title="Contra la pirámide de bloques anidados">
+Cuando necesitas tres punteros a la vez, anidar tres bloques produce código ilegible. La salida limpia casi nunca es aplanar con trucos, sino cambiar de forma: convierte el trabajo interno en una función que reciba los tres punteros como parámetros, y deja el anidamiento reducido a una sola llamada. Si los datos vienen de arrays, considera copiar a una única reserva temporal y trabajar con desplazamientos.
+</Callout>
+
+<Callout type="dios" title="Un sistema de tiempos de vida escrito con llaves">
+La forma de bloque es, si la miras con la distancia suficiente, un sistema de tiempos de vida implementado con la única herramienta que el lenguaje tenía disponible en el momento: el ámbito léxico. Rust resolvió el mismo problema anotando la duración en el tipo, de modo que el comprobador puede seguir la referencia allá donde vaya y rechazar el programa si sobrevive a su origen. Swift, que no quiso pagar ese precio de anotación en su superficie principal, eligió una aproximación radicalmente más simple: si el préstamo se entrega como argumento de una función, entonces su duración coincide exactamente con una llamada, y una llamada tiene principio y fin evidentes. La belleza de la solución es que no necesitó ningún mecanismo nuevo en el sistema de tipos; su límite es igual de evidente: la duración queda expresada en la **forma** del código y no en el tipo, así que el compilador puede ver dónde empieza y dónde acaba, pero no puede impedir que el valor salga de allí. De ahí que escapar un puntero sea el único error grave de esta familia que ninguna herramienta estática detecta de serie. La historia posterior del lenguaje es la de cerrar ese hueco sin perder la ergonomía: primero llegaron el modelo de propiedad y los tipos no copiables, después las dependencias de vida y `Span`, un tipo que es literalmente un buffer al que se le ha añadido la información de cuánto tiempo es válido, verificable por el compilador y por tanto seguro de devolver. Cuando `Span` pueda usarse en todas partes, la pirámide de bloques anidados dejará de ser el precio de la eficiencia y pasará a ser un vestigio, igual que hoy nos parece un vestigio pasar la longitud en un argumento aparte. Entretanto, la disciplina se enuncia en una sola frase que conviene memorizar: **lo que entra en el bloque puede salir; el puntero, no**.
+</Callout>
+
+<Reto title="Provoca y diagnostica el escape">
+1. Devuelve el buffer desde `withUnsafeBufferPointer`, úsalo después y ejecuta con el sanitizador de direcciones; describe la traza que obtienes.
+2. Dentro de un `withUnsafeBufferPointer` sobre un array, añade elementos al array y observa qué ocurre con capacidad justa y con capacidad reservada de sobra.
+3. Escribe la versión con `withUnsafeMutablePointer` de un intercambio de dos variables y explica por qué no puedes nombrar ninguna de las dos dentro del bloque.
+4. Sustituye una reserva manual de un espacio de trabajo temporal por `withUnsafeTemporaryAllocation` y compara los tiempos en un bucle de un millón de iteraciones.
+5. Compara `withCString` y `withUTF8` sobre una cadena con acentos y emoji: cuenta los bytes de cada uno y explica la diferencia.
+</Reto>

@@ -1,0 +1,132 @@
+---
+title: "El problema de contenedores y lambdas"
+description: "El coste oculto del modelo tradicional: arrancar una máquina o un proceso por petición. Diseccionamos la anatomía del cold start en máquinas virtuales, contenedores y funciones lambda, ponemos números al impuesto de densidad y facturación, y mostramos por qué ese coste no es un bug que alguien olvidó optimizar, sino la consecuencia lógica de haber elegido el sistema operativo como unidad de aislamiento."
+subject: cloudflare
+level: 2
+order: 1
+icon: "2.1"
+duracion: "16 min"
+---
+
+<Lead>
+Antes de entender por qué los isolates son revolucionarios hay que entender qué reemplazan. Durante dos décadas, la unidad de aislamiento en la nube fue el sistema operativo: un proceso, un contenedor o una máquina virtual por inquilino. Es un modelo sólido y seguro, pero cobra un impuesto que casi nadie mira de frente: para atender una petición, primero hay que arrancar algo. Ese arranque es el cold start, y su coste no es accidental, sino estructural.
+</Lead>
+
+<Objetivos>
+
+- Entender por qué cada petición necesitaba arrancar un proceso, un contenedor o una `microVM`.
+- Diseccionar la anatomía del cold start fase a fase: qué ocurre exactamente y cuánto cuesta.
+- Ver el modelo "una instancia, una petición" y su precio en memoria, densidad y facturación.
+- Reconocer el cold start como consecuencia de aislar en el sistema operativo, no como un defecto a parchear.
+
+</Objetivos>
+
+## La unidad de aislamiento es el sistema operativo
+
+En la arquitectura clásica, cuando dos inquilinos no deben verse entre sí, se les separa con una frontera que impone el hardware o el kernel. Esa frontera puede tomar tres formas, cada una más pesada que la anterior.
+
+Un proceso los separa en espacios de direcciones distintos, gobernados por el kernel. Un contenedor va un paso más allá: son procesos aislados con `namespaces` y `cgroups`, que fingen tener su propio sistema de ficheros y su propia red.
+
+Una máquina virtual llega al extremo: un kernel invitado completo corriendo sobre un hipervisor, con la ilusión de una máquina física entera para él solo.
+
+En los tres casos, la garantía de aislamiento la da una capa por debajo de tu código. Y en los tres, esa capa tiene peso: espacios de direcciones, tablas de páginas, a veces un kernel entero.
+
+Durante años la ingeniería empujó ese límite con brío: imágenes más finas, arranque perezoso, `microVMs` diseñadas desde cero para iniciar rápido, como Firecracker, que baja el arranque de una máquina virtual de segundos a una fracción de segundo.
+
+Cada avance recortó la latencia, pero ninguno la llevó a cero, porque el objeto que se arranca sigue siendo, en esencia, un sistema operativo en miniatura. Optimizar el arranque dentro de este paradigma es limar una piedra que nunca desaparece del todo.
+
+Conviene fijar el mejor caso de la generación anterior para medir bien el salto que viene: aun con Firecracker y una imagen mínima, hablamos de decenas de milisegundos en el mejor día y de segundos en el peor. Cero nunca estuvo sobre la mesa.
+
+<Mermaid code={`flowchart TB
+  HW[Hardware fisico] --> HV[Hipervisor]
+  HV --> G1[Kernel invitado tenant A]
+  HV --> G2[Kernel invitado tenant B]
+  G1 --> R1[Runtime Node o JVM]
+  G2 --> R2[Runtime Node o JVM]
+  R1 --> C1[Tu codigo A]
+  R2 --> C2[Tu codigo B]
+  style C1 fill:#a6e3a1,color:#11111b
+  style C2 fill:#89b4fa,color:#11111b`} />
+
+El detalle demoledor es este: cada petición que llega a un inquilino frío necesita que toda esa columna exista y esté viva antes de ejecutar una sola línea útil.
+
+Aislar en el sistema operativo significa pagar por arrancar el sistema operativo.
+
+## Anatomía de un cold start
+
+Un cold start no es un evento único: es una cadena de fases, cada una con su latencia. Cuando llega una petición y no hay una instancia caliente disponible, el proveedor recorre este camino:
+
+<Cards>
+  <Card icon="🧱" title="Arrancar la microVM">
+    Un `microVM` moderno como Firecracker arranca en torno a 125 ms: reservar recursos, iniciar el kernel invitado y montar el sistema de ficheros raíz. Es rápido para ser una VM, pero es tiempo muerto.
+  </Card>
+  <Card icon="📦" title="Traer y montar el código">
+    Descargar el artefacto o la imagen del contenedor, descomprimirlo y montarlo. Una imagen grande o un árbol de dependencias enorme inflan esta fase en cientos de milisegundos.
+  </Card>
+  <Card icon="⚙️" title="Iniciar el runtime">
+    Arrancar el intérprete o la máquina virtual del lenguaje. Node tarda decenas de milisegundos; una JVM o el CLR con mucho que cargar pueden irse a varios segundos.
+  </Card>
+  <Card icon="🚀" title="Ejecutar el init del usuario">
+    Todo el código de inicialización: abrir conexiones, leer configuración, cargar un modelo. Corre entero antes de tu primera respuesta.
+  </Card>
+</Cards>
+
+En el modelo lambda, lo que escribes fuera del handler es exactamente lo que se paga en cada arranque en frío:
+
+```js
+// Modelo lambda: el codigo fuera del handler corre en el arranque en frio
+const db = crearConexion();          // se ejecuta al arrancar la instancia
+const modelo = cargarModeloPesado(); // 300 ms extra en cada cold start
+
+export async function handler(evento) {
+  // esto ya corre con la instancia caliente
+  return await db.consulta(evento.id);
+}
+```
+
+La suma de fases va desde unos 100 ms para un Node mínimo hasta varios segundos para runtimes pesados.
+
+Y no es una latencia que pagues una sola vez: la pagas cada vez que el sistema tiene que crear una instancia nueva. Bajo un pico de tráfico, cuando llegan mil peticiones a la vez y no hay instancias calientes suficientes, ese impuesto se multiplica justo en el peor momento.
+
+<Callout type="note" title="El cold start envenena la cola, no la mediana">
+En régimen estable, la mayoría de las peticiones caen en instancias ya calientes y responden rápido: la mediana se ve sana. El cold start golpea a una fracción —las que llegan cuando el sistema escala tras un pico o tras un periodo de calma— y dispara la latencia del percentil 99. Por eso el problema es escurridizo: los paneles de la mediana lo esconden justo mientras arruina la experiencia de quien aterriza en el peor instante.
+</Callout>
+
+## El coste que no se ve: densidad y facturación
+
+El cold start es la cara visible del problema. Debajo hay dos costes estructurales más.
+
+El primero es la concurrencia. Una instancia lambda atiende una petición a la vez. Para servir mil peticiones simultáneas necesitas mil instancias, y cada una puede pasar por su propio arranque en frío.
+
+El segundo es la memoria: cada instancia carga una copia completa del runtime del lenguaje y tus dependencias, decenas o cientos de megabytes que existen aunque la instancia esté ociosa esperando trabajo.
+
+Eso limita cuántos inquilinos caben en una máquina: la densidad es baja, y la densidad baja es cara de operar.
+
+Los orquestadores como Kubernetes suavizan el arranque manteniendo pods calientes, pero el reverso es el de siempre: pagas por capacidad encendida a la espera, o aceptas la latencia de arrancar pods nuevos cuando el tráfico sube de golpe.
+
+Pon números al último coste. Una función facturada por gigabyte-segundo que reserva 512 MB y tarda 800 ms de reloj —de los cuales 600 son espera de red— paga por los 800, no por los 200 de CPU real.
+
+Tres cuartas partes de esa línea de la factura son tiempo en que la máquina existía sin calcular nada. Multiplícalo por millones de invocaciones y el aire se convierte en la partida dominante del gasto.
+
+Cold start y facturación por reloj parecen dos quejas distintas, pero comparten una sola raíz: existe una máquina dedicada que hay que arrancar y mantener viva por petición. Ataca esa raíz y las dos desaparecen a la vez.
+
+<Callout type="warn" title="Los parches no eliminan el impuesto, lo mueven">
+La industria inventó remedios: pools de instancias calientes, `provisioned concurrency`, `min instances`. Todos funcionan pagando por adelantado máquinas encendidas que quizá no atiendan ninguna petición. Cambias latencia por coste fijo, pero el impuesto sigue ahí: alguien mantiene procesos vivos las veinticuatro horas para que el primer usuario no espere el arranque.
+</Callout>
+
+## Por qué esto no es un bug
+
+<Callout type="dios" title="El cold start es el precio de elegir el sistema operativo como frontera">
+Aquí está la comprensión que hay que interiorizar antes de conocer los isolates. El cold start no es una ineficiencia que a algún proveedor se le olvidó optimizar: es la consecuencia lógica e inevitable de haber elegido el proceso, el contenedor o la máquina virtual como unidad de aislamiento. Si tu garantía de que el inquilino A no puede leer la memoria del inquilino B la impone el kernel o el hipervisor, entonces para servir al inquilino A tienes que instanciar esa frontera del kernel o del hipervisor, y esa frontera es pesada por diseño: incluye un espacio de direcciones, tablas de páginas, a veces un kernel invitado entero. Arrancarla cuesta tiempo y mantenerla cuesta memoria. No hay optimización que borre ese coste sin cambiar la premisa. Toda arquitectura serverless de la generación anterior vive atrapada en el mismo dilema: más aislamiento significa fronteras más gruesas y arranques más lentos; menos aislamiento significa arriesgar la seguridad entre inquilinos. Cloudflare no ganó ese juego optimizando el arranque de la VM. Lo ganó cambiando la pregunta: ¿y si la unidad de aislamiento no fuera el sistema operativo, sino el propio runtime del lenguaje? Ahí nace el isolate, y con él la posibilidad de un arranque de cero milisegundos. Pero solo se aprecia la magnitud del salto cuando entiendes, con precisión, el impuesto que deja de pagarse.
+</Callout>
+
+Guarda este mapa mental: aislar en el sistema operativo obliga a arrancar el sistema operativo. Todo el resto del nivel es la historia de cómo se rompe esa cadena.
+
+<Reto title="Mide el impuesto que vas a dejar atrás">
+1. Busca la latencia de cold start documentada de una función serverless en tu lenguaje favorito (Node, Python, una JVM) y anota el rango.
+2. Dibuja la columna de aislamiento de una lambda: hardware, hipervisor, `microVM`, runtime, tu código. Marca qué fase se paga en cada arranque en frío.
+3. Estima la facturación de una función que espera 500 ms a una base de datos por petición: cuánto de esa factura es CPU real y cuánto es espera pura.
+4. Explica en una frase por qué `provisioned concurrency` no elimina el problema, solo lo desplaza a un coste fijo.
+5. Razona por qué un pico repentino de tráfico es el peor escenario posible para el cold start, y cómo se relaciona con la latencia del autoescalado.
+6. Distingue mediana y percentil 99 en este contexto: por qué un panel que solo mira la mediana puede darte una falsa sensación de salud.
+</Reto>

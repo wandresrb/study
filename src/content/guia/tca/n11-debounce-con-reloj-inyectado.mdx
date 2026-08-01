@@ -1,0 +1,146 @@
+---
+title: "Debounce: esperar a que el usuario deje de escribir"
+description: "Un debounce no retrasa el trabajo: lo condiciona a que llegue el silencio. La implementacion idiomatica en TCA no necesita ningun operador especial, solo la composicion de dos piezas que ya conoces: dormir con el reloj inyectado al principio del efecto y marcarlo con cancelInFlight, de modo que cada pulsacion nueva mate al efecto anterior mientras aun duerme y ninguna peticion llegue a salir. Esta leccion explica por que el sueno va antes del trabajo y no despues, por que `Task.sleep` a pelo rompe el testing y la sustitucion por `continuousClock` no, como avanzar un TestClock convierte un test de 300 ms en instantaneo y determinista, en que se diferencia el debounce del throttle y como se implementa cada uno."
+subject: tca
+level: 11
+order: 4
+icon: "11.4"
+duracion: "18 min"
+---
+
+<Lead>
+Cancelar la petición obsoleta arregla la corrección, pero no el gasto: si cada pulsación lanza una petición que muere medio segundo después, sigues abriendo cinco conexiones para escribir cinco letras. Lo que quieres es más ambicioso —no salir a la red hasta que el usuario deje de escribir— y tiene nombre propio: *debounce*. Lo notable es que TCA no necesita un operador dedicado para ofrecerlo. Sale de componer dos cosas que ya tienes: un sueño al principio del efecto y la unicidad por identidad de la lección anterior. La pulsación siguiente mata al efecto anterior *mientras todavía duerme*, así que el trabajo caro nunca llega a empezar. La única condición para que esto funcione en producción y en los tests es que ese sueño no venga de un `Task.sleep` a pelo, sino de un reloj inyectado como dependencia.
+</Lead>
+
+<Objetivos>
+
+- Implementar un debounce componiendo `clock.sleep` con `.cancellable(id:cancelInFlight:)` y justificar el orden de las piezas.
+- Explicar por qué `Task.sleep` rompe el testing y qué gana el reloj al entrar por `@Dependency`.
+- Controlar el tiempo en los tests con `TestClock` y verificar el umbral exacto del debounce.
+- Distinguir debounce de throttle, y elegir con criterio entre esperar el silencio y limitar la frecuencia.
+
+</Objetivos>
+
+## Dormir primero, trabajar después
+
+El orden de las dos operaciones dentro del efecto no es una cuestión de estilo: es lo que hace que el debounce sea un debounce.
+
+```swift
+@Dependency(\.continuousClock) var clock
+@Dependency(\.clienteBusqueda) var cliente
+private enum CancelID { case busqueda }
+
+case let .consultaCambiada(texto):
+  state.consulta = texto
+  guard !texto.isEmpty else {
+    state.resultados = []
+    return .cancel(id: CancelID.busqueda)
+  }
+  return .run { [texto] send in
+    try await clock.sleep(for: .milliseconds(300))
+    await send(.respuesta(try await cliente.buscar(texto)))
+  }
+  .cancellable(id: CancelID.busqueda, cancelInFlight: true)
+```
+
+Cada pulsación crea un efecto que se echa a dormir 300 ms, y `cancelInFlight` mata al que estuviera durmiendo. Si el usuario teclea a menos de 300 ms por letra, ninguno llega a despertar: la sucesión completa de efectos muere sin haber tocado la red. Solo cuando pasan 300 ms sin pulsaciones, el último superviviente despierta y hace la petición. La red ve **una** llamada por ráfaga de escritura, no una por tecla.
+
+<Mermaid code={`sequenceDiagram
+  participant U as Usuario
+  participant E as Efectos
+  participant N as Red
+  U->>E: s en t0, duerme 300
+  U->>E: w en t0 mas 90, mata al anterior
+  U->>E: i en t0 mas 170, mata al anterior
+  U->>E: ft en t0 mas 260, mata al anterior
+  Note over E: silencio de 300 ms
+  E->>N: una sola busqueda de swift
+  N-->>E: resultados`} />
+
+Invierte el orden y el mecanismo se desmorona: si duermes *después* de la petición, la llamada ya salió y lo único que retrasas es la entrega del resultado. Tendrías el coste íntegro de una petición por tecla y encima la respuesta llegaría tarde. El sueño no está ahí para amortiguar la salida, sino para abrir una ventana durante la cual el efecto es barato de matar. Esa es la idea entera del debounce, y explica por qué el `.cancel(id:)` del `guard` de arriba también importa: si el usuario borra todo el campo, no basta con no lanzar nada nuevo, hay que matar al que esté durmiendo, o en 300 ms buscará un texto que ya no existe.
+
+La duración tampoco es un número arbitrario. El intervalo entre pulsaciones de un mecanógrafo medio ronda los 150 ms, así que por debajo de eso el debounce casi no filtra nada y pagas la latencia sin ganar el ahorro; por encima de medio segundo, el usuario percibe la interfaz como perezosa porque termina de escribir y no pasa nada. La franja de 250 a 400 ms es donde suele estar el compromiso, y conviene tratarla como un parámetro del dominio y no como una constante mágica: una búsqueda local sobre datos en memoria no necesita debounce en absoluto, y una consulta que dispara un trabajo caro en el servidor puede justificar bastante más espera.
+
+## Por qué el reloj entra por la puerta de las dependencias
+
+Escribir `try await Task.sleep(for: .milliseconds(300))` produce el mismo comportamiento en la app y arruina todo lo demás. El motivo es que `Task.sleep` es una llamada al reloj del sistema incrustada en tu código: no se puede sustituir, no se puede acelerar y no se puede consultar. Un test de esa feature tendría que esperar 300 ms reales, y un test que espera es un test que es lento y que además se vuelve inestable en cuanto la máquina de integración continua va cargada, porque el margen entre lo que el test asume y lo que el planificador concede se estrecha.
+
+```swift
+@Dependency(\.continuousClock) var clock
+```
+
+Con el reloj inyectado, el efecto pide el paso del tiempo a *algo* que en producción es el reloj real y en un test es un objeto que tú controlas. La elección entre los dos relojes de la biblioteca estándar tiene consecuencias observables: `continuousClock` sigue contando mientras el dispositivo está suspendido, y `suspendingClock` se detiene con él. Para un debounce de interfaz, `continuousClock` es la opción sensata —si el usuario bloquea la pantalla y vuelve un minuto después, la espera ya se cumplió—; `suspendingClock` tiene sentido cuando lo que mides es tiempo de trabajo efectivo y no tiempo de pared.
+
+Hay un matiz que separa la inyección bien hecha de la que solo lo parece. No basta con que el reloj sea una propiedad configurable de tu tipo: tiene que entrar por `@Dependency`, porque solo así viaja hasta los reducers hijos sin que nadie los cablee a mano y solo así lo sustituye el bloque `withDependencies` del `TestStore`. Un reloj pasado por el inicializador funciona en la feature donde lo pusiste y se pierde en la primera composición, que es justo donde más falta hace.
+
+En el test, la sustitución convierte la espera en un salto instantáneo y, mejor aún, en una aserción sobre el umbral.
+
+```swift
+@Test
+func debounceEsperaElSilencio() async {
+  let clock = TestClock()
+  let store = TestStore(initialState: Busqueda.State()) {
+    Busqueda()
+  } withDependencies: {
+    $0.continuousClock = clock
+    $0.clienteBusqueda.buscar = { _ in [.demo] }
+  }
+  await store.send(.consultaCambiada("sw")) { $0.consulta = "sw" }
+  await clock.advance(by: .milliseconds(299))
+  await store.send(.consultaCambiada("swift")) { $0.consulta = "swift" }
+  await clock.advance(by: .milliseconds(300))
+  await store.receive(\.respuesta) { $0.resultados = [.demo] }
+}
+```
+
+Lee lo que ese test *demuestra*, que es más de lo que aparenta. El avance de 299 ms y la segunda consulta prueban que la primera murió sin llegar a buscar: si hubiera buscado, el `TestStore` fallaría por una acción recibida que nadie afirmó. El avance de 300 ms prueba que la segunda sí despertó. Y el hecho de que solo haya un `receive` prueba que hubo exactamente una petición. Todo el contrato del debounce —cuántas llamadas, cuándo y con qué texto— queda fijado en diez líneas que corren en microsegundos. Ese es el dividendo de haber tratado el tiempo como una dependencia y no como una llamada al sistema.
+
+<Callout type="warn" title="ImmediateClock colapsa el tiempo y con él la prueba">
+`ImmediateClock` hace que todo `sleep` retorne al instante, y es cómodo para tests donde el *cuándo* da igual. Aquí no da igual: con un reloj inmediato, el sueño del debounce desaparece y el test pasaría también con una implementación sin debounce alguno. La regla es sencilla: usa `ImmediateClock` cuando el tiempo es un estorbo del que quieres deshacerte, y `TestClock` cuando el tiempo es exactamente lo que estás probando. Confundirlos produce tests verdes que no verifican nada.
+</Callout>
+
+Conviene además notar dónde muere el efecto descartado. Muere *dentro* del `clock.sleep`, porque es el punto de suspensión donde la cancelación se hace efectiva: el `try await` lanza `CancellationError`, la closure se desenrolla y —como viste en la lección 2— TCA descarta ese error sin ejecutar el `catch:`. El resultado es que el cliente de búsqueda ni siquiera se invoca. Esa es la diferencia entre el debounce y la simple cancelación de la lección 1: allí matabas una petición ya en curso, aquí impides que la petición llegue a existir.
+
+## Debounce, throttle y la elección entre ambos
+
+Se confunden porque ambos reducen la frecuencia de un trabajo, pero responden a preguntas distintas y producen comportamientos muy distintos ante una ráfaga larga.
+
+| | Debounce | Throttle |
+| --- | --- | --- |
+| Regla | Actúa cuando pasan N ms sin eventos nuevos | Actúa como mucho una vez cada N ms |
+| Ráfaga de 10 s | Una sola ejecución, al final | Una ejecución cada N ms, durante toda la ráfaga |
+| Riesgo | Con eventos continuos, no actúa nunca | Ejecuta aunque el usuario siga en mitad de la acción |
+| Encaja con | Buscar mientras se escribe, autoguardado, validación | Scroll, posición del mapa, telemetría, redimensionado |
+
+El debounce se implementa, como has visto, durmiendo antes de trabajar. El throttle es la otra cara: en vez de esperar el silencio, se pregunta si ha pasado bastante desde la última vez, y para eso hace falta recordar cuándo fue esa última vez.
+
+```swift
+@Dependency(\.continuousClock) var clock
+
+case .posicionCambiada:
+  let ahora = clock.now
+  if let ultimo = state.ultimoEnvio, ahora - ultimo < .seconds(1) {
+    return .none
+  }
+  state.ultimoEnvio = ahora
+  return .run { send in
+    await send(.enviarTelemetria)
+  }
+```
+
+La diferencia estructural salta a la vista y es instructiva: el debounce vive en el efecto, porque su lógica es *esperar*, y el throttle vive en el estado, porque su lógica es *recordar*. Versiones históricas de TCA ofrecieron operadores `debounce` y `throttle` construidos sobre los `Scheduler` de Combine, y hoy son piezas heredadas: la composición explícita con el reloj inyectado dice lo mismo, se lee mejor y no arrastra Combine. Que un patrón tan usado se exprese sin ninguna primitiva nueva es, en sí, una señal de que las piezas de base estaban bien elegidas.
+
+Queda una variante que la tabla no recoge y que a veces es la que el producto pide: el debounce *de flanco de entrada*, que actúa con el primer evento y luego calla durante la ventana. Sirve para botones que no deben dispararse dos veces por un doble toque accidental. Se obtiene combinando lo que ya tienes —una guarda en el estado que ignora mientras hay algo en curso, más un `.cancellable` sin `cancelInFlight`— y su sola existencia demuestra que estos nombres no son operadores cerrados sino políticas, y que lo importante no es memorizar cuál se llama cómo, sino saber qué pregunta contesta cada uno: *¿me interesa el primero o el último?* y *¿espero al silencio o limito la frecuencia?*.
+
+<Callout type="dios" title="El tiempo es una dependencia, y tratarlo como tal es lo que hace verificable la asincronía">
+Hay una asimetría curiosa en cómo tratamos las dependencias. Nadie discute ya que la red debe inyectarse: es evidente que un test no puede depender de un servidor. Pero el tiempo se cuela una y otra vez sin pedir permiso, escrito como `Task.sleep`, `DispatchQueue.asyncAfter` o `Date()`, porque parece una operación del lenguaje y no un recurso externo. Es exactamente igual de externo que la red, y bastante más traicionero: no falla nunca, así que nadie lo sospecha, y su única forma de castigarte es haciendo tus tests lentos y su verde poco fiable. La corrección conceptual es reconocer que *cuánto tarda algo* y *qué hora es* son entradas del sistema, no propiedades del código, y por tanto deben entrar por donde entran todas las entradas. Cuando lo haces, ocurre algo que no es una mejora incremental sino un cambio de categoría: el tiempo pasa de ser el eje incontrolable sobre el que sufres a ser un parámetro que empujas a mano. Puedes avanzar 299 ms y comprobar que no pasó nada; puedes avanzar uno más y comprobar que pasó exactamente una cosa; puedes ejecutar en un milisegundo una prueba de un temporizador de una hora. Comportamientos que en la mayoría de bases de código se verifican mirando la pantalla —o directamente no se verifican— se vuelven aserciones ordinarias. Y observa que este nivel entero converge aquí. Cancelar exigió que el efecto tuviera identidad; el debounce exige además que tenga *duración controlable*. Identidad y duración son las dos coordenadas de cualquier cosa que exista en el tiempo, y en cuanto ambas son datos que el reducer manipula y el test sustituye, la asincronía deja de ser el territorio salvaje donde viven los bugs que no se reproducen y pasa a ser una parte más del dominio: descrita en valores, ejercitada en microsegundos y verificada con la misma severidad que una suma.
+</Callout>
+
+<Reto title="Fija el contrato temporal de tu buscador">
+1. Implementa el debounce con `clock.sleep` y `cancelInFlight: true`. Cuenta las llamadas efectivas del cliente falso al escribir cinco letras deprisa: debe ser una.
+2. Mueve el `sleep` detrás de la llamada al cliente y repite la cuenta. Explica con precisión qué garantía se perdió y por qué el orden es constitutivo del patrón.
+3. Escribe el test con `TestClock` que avance 299 ms, envíe otra consulta, avance 300 y reciba una única respuesta. Luego cambia el reducer a 500 ms sin tocar el test y comprueba que falla: el test estaba fijando el umbral, no adornándolo.
+4. Sustituye `TestClock` por `ImmediateClock` y confirma que el test sigue verde aunque borres el debounce entero. Razona qué clase de prueba acabas de perder.
+5. Añade el `guard` de consulta vacía con su `.cancel(id:)` y comprueba que borrar el campo mientras un efecto duerme no dispara ninguna búsqueda tardía.
+6. Implementa el throttle de telemetría con `clock.now` en el estado y discute por qué esta política vive en el estado mientras el debounce vive en el efecto.
+</Reto>

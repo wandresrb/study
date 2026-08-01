@@ -1,0 +1,149 @@
+---
+title: "Fuente local con Room: consultas que devuelven Flow"
+description: "Una consulta de Room declarada con tipo de retorno Flow deja de ser una pregunta y se convierte en una suscripción: la librería registra qué tablas toca esa consulta y la reejecuta cada vez que alguien las modifica. Esta lección explica el mecanismo de invalidación por tabla que hay detrás, por qué las escrituras deben ser transaccionales para no emitir estados intermedios incoherentes, cómo se mapean entidades a modelos de dominio sin que el esquema se filtre hacia arriba, y qué coste tiene observar de más: granularidad de la consulta, emisiones redundantes y el hilo donde todo esto ocurre."
+subject: mvi
+level: 15
+order: 2
+icon: "15.2"
+duracion: "19 min"
+---
+
+<Lead>
+La diferencia entre una base de datos usada como almacén y una base de datos usada como fuente de verdad cabe en el tipo de retorno de una función. Si una consulta devuelve una lista, quien la llama obtiene una fotografía tomada en un instante y contrae de inmediato la obligación de volver a preguntar cuando sospeche que algo cambió; toda la coordinación de cuándo refrescar queda en sus manos, y ese es el origen de la mayoría de las pantallas que muestran datos viejos. Si esa misma consulta devuelve `Flow`, la relación se invierte: quien la llama declara una vez qué le interesa y la base de datos asume la responsabilidad de avisar cada vez que la respuesta deja de ser válida. No es azúcar sintáctico ni una comodidad reactiva de moda. Es un traslado de responsabilidad desde el consumidor, que no puede saber cuándo cambian los datos, hacia el único componente del sistema que lo sabe con certeza porque es quien ejecuta las escrituras.
+</Lead>
+
+<Objetivos>
+
+- Explicar el mecanismo de invalidación por tabla que convierte una consulta en un flujo vivo.
+- Escribir escrituras transaccionales que no publiquen estados intermedios incoherentes.
+- Mapear entidades de persistencia a modelos de dominio sin que el esquema cruce la frontera.
+- Medir el coste de observar y ajustar granularidad, emisiones redundantes e hilo de ejecución.
+
+</Objetivos>
+
+## Una consulta que no termina nunca
+
+Cuando un método de un objeto de acceso a datos declara `Flow` como tipo de retorno, la librería genera una implementación distinta de la habitual. En lugar de ejecutar la sentencia y devolver el resultado, registra un observador sobre las tablas que la consulta menciona y produce un flujo que emite el resultado inicial y, después, un resultado nuevo cada vez que alguna de esas tablas se modifica.
+
+```kotlin
+@Dao
+interface CatalogoDao {
+
+    @Query("SELECT * FROM producto WHERE categoria = :categoria ORDER BY nombre")
+    fun observar(categoria: String): Flow<List<ProductoEntity>>
+
+    @Query("SELECT * FROM producto WHERE id = :id")
+    fun observarUno(id: String): Flow<ProductoEntity?>
+}
+```
+
+Merece la pena entender la granularidad real de esa invalidación, porque casi todo el mundo la sobreestima. El disparo no ocurre por fila ni por consulta: ocurre *por tabla*. Cualquier inserción, actualización o borrado sobre `producto` reejecuta las dos consultas del ejemplo, incluidas aquellas cuyo resultado no ha cambiado en absoluto. La librería no compara resultados por ti; se limita a saber que algo pudo cambiar y a volver a preguntar. Esa elección es deliberada: comprobar si un cambio afecta a una consulta concreta exigiría interpretar la sentencia y mantener índices sobre los criterios, un coste desproporcionado frente al de reejecutar una consulta indexada sobre una base local.
+
+De ahí se sigue una consecuencia práctica que aparece en cuanto la aplicación crece. Si una pantalla observa una tabla que otro proceso escribe con frecuencia, recibirá emisiones que no le aportan nada, y cada una de ellas provocará mapeo, comparación y posiblemente recomposición. El primer remedio no es reactivo sino relacional: consulta solo las columnas que necesitas y filtra en la sentencia en vez de en Kotlin, de modo que dos resultados consecutivos sean idénticos con más frecuencia. El segundo, complementario, es `distinctUntilChanged`, que corta la emisión cuando el valor mapeado es igual al anterior; funciona porque los modelos de dominio son `data class` con igualdad estructural, y ese es uno de los motivos por los que interesa que lo sean.
+
+<Callout type="tip" title="Suspend para preguntar una vez, Flow para observar siempre">
+No toda lectura merece ser un flujo. Una consulta que alimenta una decisión puntual dentro de una operación, como comprobar si un identificador ya existe antes de insertar, debe declararse `suspend` y devolver el valor directamente. Convertirla en flujo obliga a tomar el primer elemento y cancelar, añade una suscripción efímera y confunde al lector sobre la intención. La regla es sencilla: `Flow` cuando el consumidor quiere seguir enterándose de los cambios, `suspend` cuando quiere una respuesta y seguir adelante.
+</Callout>
+
+## Escrituras que no publican incoherencias
+
+Que la base emita en cuanto una tabla cambia tiene una cara incómoda: si una operación lógica se compone de varias escrituras, cada una de ellas puede disparar una emisión intermedia que muestre un mundo a medio construir. Borrar el catálogo anterior e insertar el nuevo en dos llamadas separadas produce, entre ambas, un instante perfectamente observable en el que la pantalla dice que no hay productos.
+
+```kotlin
+@Transaction
+suspend fun reemplazarCategoria(categoria: String, nuevos: List<ProductoEntity>) {
+    borrarPorCategoria(categoria)
+    insertar(nuevos)
+}
+```
+
+La anotación transaccional resuelve las dos mitades del problema a la vez. Garantiza atomicidad frente a fallos, que es lo que todo el mundo espera de ella, y además agrupa la invalidación: los observadores no reciben nada hasta que la transacción confirma, y entonces reciben un único resultado ya coherente. Sin ella, la pantalla parpadea; con ella, transita de un estado válido a otro sin pasar por ninguno inválido.
+
+<Mermaid code={`sequenceDiagram
+  participant R as Repositorio
+  participant D as Room
+  participant O as Observador de la UI
+  R->>D: transaccion borrar mas insertar
+  D-->>O: sin emisiones durante la transaccion
+  R->>D: confirmar
+  D-->>O: unica emision con la lista final
+  Note over O: cero estados intermedios visibles`} />
+
+Conviene entender también el reverso de esa garantía, porque tiene un coste que se paga en escrituras masivas. Agrupar la invalidación significa que durante una transacción larga los observadores no reciben nada, de modo que una sincronización de diez mil filas ejecutada en una sola transacción deja la pantalla congelada en el estado anterior hasta que termina. Para importaciones grandes suele ser preferible trocear en transacciones por lote, aceptando emisiones intermedias que son coherentes aunque parciales, y mostrar el progreso. La elección entre una transacción grande y varias pequeñas no es de rendimiento sino de qué incoherencias resultan tolerables: las parciales sí, las inválidas nunca.
+
+Hay una segunda regla que evita la mitad de las incoherencias restantes: preferir la escritura idempotente a la secuencia de borrado e inserción. Una operación de inserción con reemplazo sobre la clave primaria, o un `upsert`, deja la tabla en el estado deseado sin destruir antes lo que ya era correcto, y por tanto no invalida filas que no cambiaron. Además sobrevive mejor a la repetición: si una sincronización se ejecuta dos veces por un reintento, el resultado es el mismo, mientras que un borrado seguido de inserción abre una ventana durante la cual un fallo deja la tabla vacía.
+
+## La entidad se queda dentro
+
+Una entidad de persistencia y un modelo de dominio se parecen lo suficiente como para que resulte tentador usar el mismo tipo para ambos, y son distintos en todo lo que importa. La entidad existe para satisfacer al motor de almacenamiento: tipos primitivos, columnas planas, claves foráneas, ausencia de jerarquías selladas, campos técnicos como marcas de tiempo de sincronización. El modelo existe para expresar el negocio: tipos propios, valores obligatorios, estados imposibles eliminados por construcción.
+
+```kotlin
+@Entity(tableName = "producto")
+data class ProductoEntity(
+    @PrimaryKey val id: String,
+    val nombre: String,
+    val precioCentimos: Long,
+    val categoria: String,
+    val actualizadoEn: Long,
+)
+
+fun ProductoEntity.aDominio() = Producto(
+    id = ProductoId(id),
+    nombre = nombre,
+    precio = Dinero(precioCentimos),
+    categoria = CategoriaId(categoria),
+)
+```
+
+El mapeador vive en la capa de datos y es una función pura, lo que lo hace comprobable con una tabla de casos y sin base de datos. Su presencia parece un impuesto hasta el primer cambio de esquema: cuando alguien añade una columna, divide un campo o renombra una tabla, todo el impacto queda contenido en esa función. Sin ella, la migración se propaga a cada `when` de cada reducer que mencionara el campo antiguo.
+
+La separación también protege en la dirección contraria, que se olvida con más frecuencia. El dominio quiere tipos que hagan imposibles los estados inválidos, y eso incluye jerarquías selladas, valores envueltos y colecciones no vacías; el motor de almacenamiento quiere columnas planas de tipos primitivos. Intentar satisfacer ambas exigencias con una sola clase termina siempre igual: el dominio se degrada a cadenas y enteros para que la persistencia funcione, y con esa degradación se pierden precisamente las garantías que justificaban tipar el dominio. Es el mismo modelo pobre de siempre, adoptado no por convicción sino por comodidad de almacenamiento.
+
+<Callout type="info" title="El campo tecnico que nunca debe subir">
+Fíjate en `actualizadoEn`. Es imprescindible para decidir si un dato está viejo y merece refresco, y no tiene ningún significado para la pantalla, que solo quiere saber el nombre y el precio. Ese es el arquetipo del campo que debe existir en la entidad y desaparecer en el mapeo. Cuando se deja subir por comodidad, aparece semanas después en una condición de la interfaz, y en ese momento la política de frescura de los datos, que era una decisión de la capa de datos, se ha convertido en una responsabilidad repartida por toda la aplicación.
+</Callout>
+
+## El coste real de observar
+
+Observar no es gratis, y conviene conocer la factura antes de suscribir media aplicación a la base de datos. Cada consulta observada mantiene una entrada en el registro de invalidación, y cada emisión implica ejecutar la sentencia, construir objetos, mapearlos y comparar.
+
+<Cards>
+  <Card icon="🎯" title="Consulta estrecha">
+    Selecciona columnas y filtra en la sentencia. Cuanto más específica es la consulta, menos veces cambia su resultado y menos trabajo genera cada invalidación.
+  </Card>
+  <Card icon="🧹" title="Sin emisiones repetidas">
+    Aplica `distinctUntilChanged` sobre el modelo mapeado. La igualdad estructural de las `data class` convierte el filtro en algo fiable y barato.
+  </Card>
+  <Card icon="🧵" title="Fuera del hilo principal">
+    Las consultas suspendidas y los flujos de Room ya se ejecutan en su propio ejecutor. El error habitual es mapear listas grandes en el hilo de la interfaz.
+  </Card>
+  <Card icon="⏱️" title="Con ciclo de vida">
+    Un flujo observado sin atender al ciclo de vida sigue ejecutando consultas con la pantalla en segundo plano. El consumo se paga aunque nadie mire.
+  </Card>
+</Cards>
+
+La última tarjeta merece un desarrollo, porque es la que más consumo silencioso provoca. Un flujo coleccionado en el `ViewModel` con un ámbito que vive mientras vive la pantalla sigue activo aunque la aplicación esté en segundo plano, y con ella siguen activas las consultas que la invalidación dispara. La combinación correcta consiste en publicar el estado con una política de compartición que se detenga tras un breve margen sin suscriptores y en coleccionar desde la interfaz atendiendo al ciclo de vida. Así, cuando nadie mira, la suscripción a la base se cancela y la consulta deja de ejecutarse; cuando la pantalla vuelve, la primera emisión llega inmediatamente con el contenido actual.
+
+Queda una decisión de diseño que se toma mal con frecuencia: dónde colocar la transformación. Mapear dentro del flujo, con `map` sobre el resultado del objeto de acceso a datos, mantiene el trabajo en el contexto de la corrutina que colecciona, que por defecto es el del `ViewModel`. Para listas cortas es irrelevante; para listas de miles de elementos conviene mover explícitamente la conversión al ejecutor de entrada y salida con `flowOn`, que reubica el trabajo de todo lo que está aguas arriba sin afectar a quien colecciona.
+
+```kotlin
+override fun observarProductos(categoria: CategoriaId): Flow<List<Producto>> =
+    dao.observar(categoria.valor)
+        .map { filas -> filas.map(ProductoEntity::aDominio) }
+        .distinctUntilChanged()
+        .flowOn(io)
+```
+
+Esas cuatro líneas son, en la práctica, la implementación entera de la lectura en una arquitectura orientada a la fuente local. No hay lógica de refresco, no hay decisión sobre la red, no hay caché manual: hay una suscripción a la tabla y una traducción. Toda la complejidad que la mayoría de las aplicaciones ponen en esta función se ha desplazado al camino de escritura, y esa es exactamente la reorganización que la cuarta lección de este nivel convertirá en principio.
+
+<Callout type="dios" title="Observar la base de datos convierte la coherencia en una propiedad del sistema, no en una tarea del programador">
+Lo verdaderamente decisivo de que una consulta devuelva `Flow` no es la comodidad de no volver a preguntar, sino lo que ocurre con la coherencia cuando hay más de un consumidor. En una aplicación que lee bajo demanda, cada pantalla mantiene su propia copia de los datos y su propio momento de lectura, de modo que el sistema puede sostener simultáneamente tres versiones distintas del mismo producto: la que vio la lista hace un minuto, la que cargó el detalle hace diez segundos y la que el widget guardó ayer. Nada en el código señala esa divergencia; simplemente sucede, y aparece más tarde como el error inexplicable de que el precio del carrito no coincide con el del catálogo. Cuando todas las lecturas son suscripciones a la misma tabla, esa clase entera de fallos deja de ser posible, no porque alguien recuerde sincronizar, sino porque no existe ningún lugar donde una copia divergente pueda alojarse. La coherencia pasa de ser una tarea que se ejecuta a ser una propiedad que se cumple. Y hay un segundo efecto, más silencioso, sobre la forma del código: al eliminar la pregunta cuándo debo recargar, desaparece con ella toda la maquinaria que esa pregunta arrastraba, es decir, las banderas de datos sucios, los observadores de eventos de actualización, las llamadas de refresco en cada punto de retorno a la pantalla y las condiciones de carrera entre dos recargas simultáneas. El código que gestiona esa maquinaria no se simplifica: se borra. Por eso conviene ser exigente con la regla y no admitir excepciones cómodas, porque una sola lectura puntual que se salte la suscripción reintroduce la posibilidad de divergencia, y con ella la obligación de volver a razonar sobre sincronización en toda la aplicación.
+</Callout>
+
+<Reto title="Convierte tu lectura en una suscripción">
+1. Localiza una consulta de tu proyecto que devuelva una lista y transfórmala en un flujo, eliminando después todas las llamadas manuales de recarga que existían por su causa.
+2. Provoca deliberadamente el parpadeo: ejecuta un borrado y una inserción sin transacción, observa la emisión intermedia y arréglalo con una operación transaccional.
+3. Cuenta cuántas emisiones recibe tu pantalla durante una sincronización completa, añade `distinctUntilChanged` sobre el modelo de dominio y vuelve a contarlas.
+4. Busca en tus modelos de dominio algún campo que solo exista por motivos de persistencia y elimínalo en el mapeo. Explica quién dependía de él y por qué no debía.
+5. Mide el tiempo de mapeo de una lista grande, muévelo con `flowOn` al ejecutor de entrada y salida y compara el resultado en el hilo principal.
+</Reto>

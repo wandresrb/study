@@ -1,0 +1,150 @@
+---
+title: "Envío y recuperación: el paso final y lo que viene después"
+description: "El último paso de un asistente es el único que produce efectos fuera y por eso obedece a reglas propias: no admite retroceso, no puede ejecutarse dos veces y tiene tres desenlaces en lugar de dos, porque una petición que no responde deja el resultado en un limbo que hay que resolver preguntando. Esta lección modela el punto de no retorno, la clave de idempotencia generada una sola vez, el estado de reconciliación que averigua qué ocurrió realmente, y la persistencia del progreso con el problema serio que arrastra: qué hacer cuando el flujo guardado pertenece a una versión del grafo que ya no existe."
+subject: maquinas
+level: 18
+order: 5
+icon: "18.5"
+duracion: "19 min"
+---
+
+<Lead>
+Todos los pasos anteriores del asistente comparten una propiedad tranquilizadora: no hacen nada. Recogen, validan, ramifican y guardan en memoria, pero el mundo exterior sigue igual y por eso se puede ir y volver sin consecuencias. El último paso rompe esa propiedad de golpe. Al pulsar confirmar se crea un pedido, se cobra una tarjeta, se firma un contrato o se envía una solicitud que alguien leerá, y a partir de ese instante deshacer ya no es navegar sino compensar. Esa asimetría explica por qué el envío no es un paso más con un actor invocado dentro: es una frontera, y todo lo que la rodea —que no se pueda cruzar dos veces, que no se pueda volver, que se pueda averiguar qué pasó cuando la red se calló— son propiedades que hay que declarar, porque ninguna se cumple sola.
+</Lead>
+
+<Objetivos>
+
+- Modelar el punto de no retorno y obtener la protección contra el doble envío por estructura.
+- Generar la clave de idempotencia una sola vez y reutilizarla en todos los reintentos.
+- Añadir el tercer desenlace, el resultado desconocido, y resolverlo con un estado que reconcilia.
+- Persistir y rehidratar el progreso decidiendo qué se guarda, qué se descarta y qué se versiona.
+
+</Objetivos>
+
+## El punto de no retorno
+
+La forma del final es siempre la misma: un estado que ejecuta, un estado final que devuelve la salida, y un estado de fallo que ofrece camino. Lo interesante no está en los tres nodos sino en las aristas que deliberadamente no se dibujan.
+
+```ts
+revision: {
+  entry: 'asegurarClaveIdempotencia',
+  on: { CONFIRMAR: 'enviando', ATRAS: 'pago.hist' },
+},
+enviando: {
+  invoke: {
+    src: 'enviarAlta',
+    input: ({ context }) => ({ datos: context.datos, clave: context.clave }),
+    onDone: { target: 'completado', actions: 'guardarRecibo' },
+    onError: [
+      { target: 'incierto', guard: 'fueTiempoDeEspera' },
+      { target: 'fallido', actions: 'guardarError' },
+    ],
+  },
+},
+fallido: { on: { REINTENTAR: 'enviando', CANCELAR: 'abandonado' } },
+completado: { type: 'final', output: ({ context }) => ({ recibo: context.recibo }) },
+```
+
+Desde `enviando` no sale ninguna arista de retroceso ni ninguna que responda a `CONFIRMAR`, y esas dos ausencias son las que hacen el trabajo. La primera declara que la revisión era el último sitio gratuito del flujo. La segunda elimina el doble envío sin una sola línea dedicada a ello: mientras la máquina esté enviando, un segundo clic produce un evento que ningún estado activo maneja, y un evento no manejado simplemente se descarta. La bandera de envío en curso que casi todo formulario del mundo mantiene a mano deja de existir, no porque se haya escondido mejor, sino porque la información que representaba ya está en la posición del grafo.
+
+<Callout type="tip" title="La clave se genera al entrar en revisión, no al enviar">
+Si la clave de idempotencia se creara dentro de la acción de envío, cada reintento traería una clave nueva y el servidor vería tres solicitudes distintas en vez de tres intentos de la misma. Generarla al entrar en la revisión —y solo si no existe ya, para que volver a entrar no la renueve— la ata a la intención del usuario y no a la ejecución técnica. Esa es la diferencia entre reintentar y duplicar.
+</Callout>
+
+## El tercer desenlace
+
+La estructura anterior asume dos resultados, y por eso todavía es ingenua. Una petición que falla con error del servidor es un fracaso conocido: no ocurrió nada y reintentar es seguro. Una petición que expira sin respuesta no es eso en absoluto: el mensaje pudo llegar y ejecutarse, y lo único que se perdió fue la confirmación de vuelta. Tratar ambos casos con el mismo estado es la causa del cobro duplicado, y también de su contrario, el pedido perdido que el usuario creyó fallido y nunca volvió a intentar.
+
+| Desenlace | Qué sabemos | Acción correcta |
+| --- | --- | --- |
+| éxito | el servidor confirmó y devolvió recibo | avanzar al final con la salida |
+| fallo conocido | el servidor rechazó de forma explícita | mostrar la causa y ofrecer reintento |
+| resultado desconocido | expiró la espera o cayó la conexión | preguntar por la clave antes de decidir |
+
+El tipo que describe esto es `exito \| fallo \| desconocido`, y el tercer habitante exige un estado propio que no envía nada sino que consulta. La consulta usa la misma clave de idempotencia como identificador de la operación, y su respuesta desambigua el limbo: si el servidor conoce esa clave, la operación se completó y el asistente termina como si nunca hubiera habido incidente; si no la conoce, no llegó a ejecutarse y reintentar vuelve a ser seguro.
+
+```ts
+incierto: {
+  invoke: {
+    src: 'consultarPorClave',
+    input: ({ context }) => ({ clave: context.clave }),
+    onDone: [
+      { target: 'completado', guard: ({ event }) => event.output.existe, actions: 'guardarRecibo' },
+      { target: 'enviando' },
+    ],
+    onError: { target: 'incierto', reenter: true },
+  },
+  after: { 3000: { target: 'irresoluble' } },
+},
+```
+
+Ese estado es el que separa un asistente serio de una demostración. Requiere que el servidor ofrezca una consulta por clave, y si no la ofrece, la conversación correcta no es con la máquina sino con quien diseñó la interfaz remota: sin esa consulta, ningún cliente puede distinguir el limbo, y la única salida honesta es no reintentar automáticamente y llevar al usuario a una pantalla que le diga que revise su historial antes de volver a intentarlo.
+
+<Mermaid code={`stateDiagram-v2
+  revision --> enviando: CONFIRMAR
+  enviando --> completado: recibo
+  enviando --> fallido: rechazo explicito
+  enviando --> incierto: expira la espera
+  incierto --> completado: la clave ya existe
+  incierto --> enviando: la clave no existe
+  incierto --> irresoluble: no se pudo consultar
+  fallido --> enviando: REINTENTAR
+  fallido --> abandonado: CANCELAR
+  completado --> [*]`} />
+
+## Guardar el progreso para retomarlo
+
+Un asistente largo se abandona a la mitad por motivos que no son culpa de nadie: la pestaña se cierra, la batería se agota, alguien llama. Retomarlo exige persistir el actor, y la librería lo ofrece de forma directa: el actor sabe serializar su instantánea completa y se puede crear uno nuevo restaurándola. Lo difícil no es la mecánica sino las tres decisiones que la rodean.
+
+```ts
+const guardado = localStorage.getItem('alta')
+const actor = createActor(alta, {
+  snapshot: guardado ? sanear(JSON.parse(guardado)) : undefined,
+})
+actor.subscribe(() => {
+  localStorage.setItem('alta', JSON.stringify(actor.getPersistedSnapshot()))
+})
+actor.start()
+```
+
+La primera decisión es qué no se guarda. Una instantánea tomada mientras había un actor invocado en vuelo describe una situación que no se puede reconstruir: al rehidratar no hay ninguna petición viajando, aunque el estado diga que sí. Lo mismo ocurre con los estados de error transitorios y con las esperas temporizadas, que reanudan su cuenta desde cero. La función que sanea antes de restaurar debe reescribir esas posiciones a un lugar seguro, y en un asistente el lugar seguro es casi siempre la revisión o, si el envío estaba en curso, el estado que consulta por clave: exactamente el mismo mecanismo que resolvía el limbo sirve para resolver la sesión interrumpida.
+
+La segunda decisión es qué no debe tocar el almacenamiento local jamás. Un número de tarjeta completo, un documento de identidad o un código de verificación no se guardan aunque el usuario agradezca la comodidad, y la política limpia es marcar esos campos como volátiles y excluirlos de la serialización, aceptando que al retomar habrá que volver a pedirlos.
+
+La tercera es dónde vive el borrador. El almacenamiento del navegador es inmediato y gratis, pero muere con el dispositivo y con el modo privado; guardar el progreso en el servidor permite empezar en el móvil y terminar en el escritorio, a costa de convertir el borrador en un recurso con dueño, con caducidad y con derecho al olvido. La elección no es técnica sino de producto, y casi siempre la respuesta correcta es la mixta: local en cada cambio para no perder nada entre pulsaciones, remoto al completar cada paso para no perder nada entre dispositivos.
+
+<Cards>
+  <Card icon="🚪" title="Sin retroceso desde el envío">
+    La ausencia de arista es la declaración del punto de no retorno. Lo que sale de ahí es cancelar y compensar, no volver.
+  </Card>
+  <Card icon="🔑" title="Una clave por intención">
+    Se genera al entrar en revisión y sobrevive a todos los reintentos. Es lo que permite preguntar después si aquello llegó a ocurrir.
+  </Card>
+  <Card icon="❓" title="El tercer desenlace">
+    Ni éxito ni fallo: desconocido. Merece estado propio porque su acción correcta no es reintentar sino averiguar.
+  </Card>
+  <Card icon="💾" title="Sanear antes de restaurar">
+    Ninguna instantánea con una petición en vuelo se puede reconstruir tal cual. Al rehidratar se reescribe esa posición a un lugar desde el que el flujo pueda continuar.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="La instantánea guardada pertenece a una versión del grafo">
+Una instantánea contiene nombres de estados, y esos nombres son un contrato con el código que la creó. Si despliegas un flujo donde el paso de dirección pasó a llamarse envío, o donde apareció una rama nueva, las instantáneas antiguas describen configuraciones que ya no existen y la restauración falla o, peor, tiene éxito en un sitio equivocado. Guarda siempre un número de versión junto a los datos y decide de antemano la política ante un desajuste: descartar y empezar limpio conservando el contexto, o migrar con una tabla de correspondencia. Lo que no puede pasar es que la decisión la tome un error en tiempo de ejecución delante del usuario.
+</Callout>
+
+<Callout type="info" title="Contexto persistido frente a instantánea persistida">
+Para muchos asistentes basta con guardar el contexto y el nombre del paso, y arrancar la máquina reconstruyendo desde ahí. Es más pobre que la instantánea completa —se pierde la memoria de historia y el estado de los hijos— pero es mucho más resistente a los cambios del grafo, porque el contexto es dato del dominio y sobrevive a los renombrados. La elección depende de cuánto dura el flujo: minutos favorece la instantánea completa, días favorece el contexto.
+</Callout>
+
+<Callout type="dios" title="El envío es donde el modelo deja de hablar solo y tiene que negociar con el mundo">
+Hasta el último paso, un asistente es un sistema cerrado y por eso sus garantías eran absolutas: los estados imposibles no existían porque nadie los había declarado, y la máquina era la autoridad única sobre su propia verdad. El envío rompe esa soberanía. Al otro lado hay otro sistema, con su propio estado, su propia noción de qué ha ocurrido y ninguna obligación de contártelo a tiempo. Desde ese momento tu grafo ya no describe la realidad: describe tu creencia sobre la realidad, y la diferencia entre ambas cosas es exactamente el estado que llamamos desconocido. Aceptar que ese estado existe es el paso intelectual que separa el modelado de juguete del modelado de producción, porque obliga a admitir que un sistema distribuido no tiene dos respuestas sino tres, y que la tercera no es un caso raro sino la situación normal cada vez que una red se degrada. De ahí se sigue lo que este nivel entero venía preparando. La idempotencia no es una técnica de backend que el cliente sufre: es la condición que hace que la creencia sea corregible, porque una clave estable convierte una pregunta imposible —ocurrió o no— en una pregunta contestable. Y la persistencia no es una comodidad: es reconocer que el proceso vive más que la pestaña que lo mostraba, que el flujo es un objeto con duración propia y que la interfaz era solo la ventana desde la que se le miraba. Cuando las tres piezas están en su sitio —una frontera que no se cruza dos veces, una identidad que sobrevive a los reintentos y una memoria que sobrevive al navegador—, el asistente deja de ser una secuencia de pantallas y se convierte en lo que siempre debió ser: un procedimiento que sabe dónde está, qué ha hecho y qué le queda por averiguar.
+</Callout>
+
+<Reto title="Cierra el flujo de verdad">
+1. Elimina del envío toda arista de retroceso y comprueba que un segundo clic en confirmar no produce ningún efecto sin necesidad de banderas.
+2. Genera la clave de idempotencia al entrar en la revisión, solo si no existe, y verifica que tres reintentos envían la misma.
+3. Separa el fallo explícito del resultado desconocido con una guarda sobre la clase de error y dales estados distintos.
+4. Implementa el estado que consulta por clave y prueba los dos desenlaces cortando la red justo después de enviar.
+5. Persiste la instantánea en cada cambio y escribe la función que sanea las posiciones no reconstruibles antes de restaurar.
+6. Añade un número de versión, cambia a propósito el nombre de un paso y comprueba que tu política de desajuste actúa sin romper la pantalla.
+</Reto>

@@ -1,0 +1,118 @@
+---
+title: "Containers: una imagen de contenedor junto al edge"
+description: "Cuando una carga no cabe en un isolate —un binario que ya tienes, un lenguaje sin runtime en Workers, mucha CPU, memoria o disco, o un sistema de ficheros completo— Cloudflare deja ejecutar una imagen de contenedor en su red, arrancada bajo demanda y gobernada desde un Worker. Diseccionamos su anatomía: la imagen linux/amd64, la clase Container, el Durable Object que le da identidad, los tipos de instancia y el ciclo de vida que escala a cero durmiendo tras la inactividad."
+subject: cloudflare
+level: 16
+order: 1
+icon: "16.1"
+duracion: "16 min"
+---
+
+<Lead>
+Un Worker es un isolate: arranca en cero milisegundos y sirve el 95 % de la web, pero vive dentro de fronteras estrictas —solo JavaScript y WebAssembly, sin sistema de ficheros persistente, con techos de CPU y memoria pensados para tareas cortas—. Hay cargas que sencillamente no caben ahí: transcodificar vídeo con `ffmpeg`, ejecutar un binario compilado en Go o Rust que ya tienes, correr una librería de Python que exige un sistema operativo entero. Para ellas Cloudflare añade Containers: una imagen de contenedor que corre en su red global, se arranca bajo demanda y se controla, no con un orquestador de Kubernetes, sino con el código de un Worker.
+</Lead>
+
+<Objetivos>
+
+- Reconocer qué cargas no caben en un isolate y por qué esa frontera existe.
+- Entender la anatomía de un Container: la imagen, `wrangler.jsonc`, la clase `Container` y su Durable Object.
+- Comprender el ciclo de vida bajo demanda: arranque, `sleepAfter` y el escalado a cero.
+- Situar el Container como una extensión del modelo del edge, no como un retorno al servidor.
+
+</Objetivos>
+
+## Lo que un isolate no puede contener
+
+El isolate ganó su velocidad renunciando al sistema operativo: no arranca una máquina ni un kernel, solo un espacio aislado dentro de un proceso ya caliente. Esa renuncia es precisamente lo que ciertas cargas necesitan recuperar. La frontera no es un capricho, es el reverso exacto de la ventaja.
+
+Cuatro clases de trabajo chocan contra ese muro. El primero es el lenguaje: un Worker ejecuta JavaScript o WebAssembly, así que un binario nativo de Go, un proceso de Python con dependencias de sistema o una herramienta escrita en C no tienen dónde correr. El segundo son los binarios que ya existen: `ffmpeg`, un navegador headless, un motor de renderizado; reescribirlos para el edge es inviable. El tercero son los recursos: un isolate está dimensionado para milisegundos de CPU, no para minutos de cómputo intenso ni para gigabytes de memoria o disco. El cuarto es el sistema de ficheros: muchas herramientas dan por sentado un `/tmp` real, rutas escribibles y un entorno Linux completo.
+
+La lectura correcta no es "el Worker se queda corto", sino "el isolate y el contenedor optimizan cosas opuestas". El isolate cambia el sistema operativo por arranque instantáneo; el Container hace el trueque inverso —acepta un arranque más lento a cambio de un sistema operativo entero—. Elegir uno u otro es elegir qué mitad del trueque necesita tu carga.
+
+## Anatomía de un Container
+
+Un Container en Cloudflare tiene tres piezas que se declaran juntas. La primera es la imagen: un `Dockerfile` que Wrangler construye y sube, o una referencia a un registro. Debe correr sobre `linux/amd64`, pero por lo demás es una imagen de contenedor normal y corriente.
+
+```dockerfile
+FROM node:22-slim
+WORKDIR /app
+COPY . .
+RUN npm ci && npm run build
+EXPOSE 8080
+CMD ["node", "server.js"]
+```
+
+La segunda pieza es la configuración en `wrangler.jsonc`. Aquí eliges el `instance_type` —desde `lite` hasta `standard-4`, o una instancia a medida con `vcpu`, `memory_mib` y `disk_mb`— y el tope de instancias simultáneas con `max_instances`:
+
+```jsonc
+{
+  "name": "render-service",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-08",
+  "containers": [
+    {
+      "class_name": "RenderContainer",
+      "image": "./Dockerfile",
+      "instance_type": "standard-2",
+      "max_instances": 20
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "RenderContainer", "name": "RENDER" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RenderContainer"] }
+  ]
+}
+```
+
+La tercera pieza —y el giro conceptual— es que un Container se controla a través de un Durable Object. Por eso la configuración exige un binding de Durable Object cuyo `class_name` coincide con el del contenedor, y una migración con `new_sqlite_classes`. En el código extiendes la clase `Container`, declaras el puerto que escucha tu imagen y cuánto espera antes de dormir:
+
+```ts
+import { Container, getContainer } from "@cloudflare/containers";
+
+export class RenderContainer extends Container {
+  defaultPort = 8080;   // el puerto que expone tu imagen
+  sleepAfter = "10m";   // dormir tras 10 min sin peticiones
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // una instancia por proyecto: enrutado pegajoso por id
+    const instancia = getContainer(env.RENDER, "proyecto-42");
+    return instancia.fetch(request);
+  },
+};
+```
+
+Ese Durable Object no es un detalle de fontanería: es lo que da a cada instancia una identidad estable. El `id` que pasas a `getContainer` decide qué instancia atiende, de modo que las peticiones de un mismo proyecto caen siempre en el mismo contenedor.
+
+## El ciclo de vida: bajo demanda y dormido
+
+Un Container no está encendido esperando: se arranca la primera vez que el Worker lo alcanza y se despliega en `Region:Earth`, es decir, cerca de la demanda, sin que tú elijas región. Tras `sleepAfter` sin tráfico, la instancia se duerme y deja de facturar: es un escalado a cero real, sin pagar por capacidad ociosa.
+
+<Mermaid code={`flowchart LR
+  U[Cliente] --> W[Worker isolate]
+  W -->|getContainer por id| DO[Durable Object]
+  DO --> C[Instancia de Container]
+  C --> IMG[Imagen linux amd64]
+  W -.decide y controla.-> DO
+  style W fill:#89b4fa,color:#11111b
+  style C fill:#fab387,color:#11111b
+  style IMG fill:#a6e3a1,color:#11111b`} />
+
+El coste de este modelo es honesto: despertar un contenedor dormido tarda segundos, no cero milisegundos, porque hay que traer la imagen y arrancar el proceso. A cambio, no gestionas nodos, ni pods, ni autoescalado; declaras una imagen y un tope, y la red hace el resto. Es el punto medio entre la ligereza del isolate y el control total de una máquina propia.
+
+<Callout type="dios" title="El Container no abandona el edge: lo completa">
+Es tentador leer los Containers como una rendición —"al final Cloudflare vuelve a los contenedores de siempre"—, y esa lectura es exactamente la equivocada. Lo que ocurre es más sutil y más profundo: la plataforma deja de imponer una única unidad de aislamiento y pasa a ofrecer la unidad adecuada para cada carga, con el Worker como plano de control que las orquesta a todas. El isolate sigue siendo la puerta: barato, instantáneo, global; y desde él, cuando y solo cuando una tarea exige un sistema operativo entero, el código invoca un contenedor por su identidad y le delega el trabajo pesado. Fíjate en la inversión respecto al mundo clásico. Antes, el contenedor era el ciudadano de primera clase y todo lo demás colgaba de él; orquestarlo requería un sistema aparte —Kubernetes, operadores, YAML— cuya complejidad rivalizaba con la de la aplicación. Aquí el ciudadano de primera clase es el Worker, y el contenedor es una capacidad que ese Worker invoca con una línea de JavaScript, con arranque bajo demanda y escalado a cero incluidos de fábrica. La pregunta de arquitectura deja de ser "¿cómo despliego y mantengo vivo mi contenedor?" y se convierte en "¿cuál es la porción mínima de mi sistema que de verdad necesita un sistema operativo, y puede todo lo demás vivir en el isolate?". Quien entiende esto no ve dos productos rivales, sino un continuo de aislamiento —del isolate al contenedor— gobernado por una sola mente programable en el edge.
+</Callout>
+
+<Reto title="Decide qué merece un contenedor">
+1. Enumera tres tareas de un sistema que conozcas y clasifícalas: ¿caben en un isolate o exigen un contenedor? Justifica cada una con una de las cuatro fronteras (lenguaje, binario, recursos, sistema de ficheros).
+2. Escribe un `wrangler.jsonc` mínimo con un `containers`, su binding de Durable Object y la migración `new_sqlite_classes`. Explica por qué las tres piezas son obligatorias.
+3. Razona qué `instance_type` elegirías para transcodificar vídeo y por qué, contrastando `lite` con `standard-4`.
+4. Explica con tus palabras qué significa que despertar un contenedor tarde segundos y por qué, aun así, el escalado a cero lo hace más barato que una máquina encendida las veinticuatro horas.
+5. Argumenta por qué el `id` que pasas a `getContainer` no es un mero identificador, sino la clave del enrutado pegajoso.
+</Reto>

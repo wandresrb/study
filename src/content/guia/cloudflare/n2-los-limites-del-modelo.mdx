@@ -1,0 +1,134 @@
+---
+title: "Los límites del modelo"
+description: "Lo que un Worker no puede hacer y por qué: sin sistema de archivos persistente, con CPU acotada por petición y memoria limitada por isolate. Recorremos cada límite, mostramos dónde vive entonces el estado y cómo se reparte el cómputo pesado, y defendemos la tesis incómoda de que estas restricciones no son el precio del modelo sino su causa: convertirlas en principios de diseño es lo que separa escribir servidores diminutos de componer sistemas distribuidos."
+subject: cloudflare
+level: 2
+order: 4
+icon: "2.4"
+duracion: "16 min"
+---
+
+<Lead>
+Cada elección arquitectónica tiene un reverso. El isolate compra arranque cero y densidad altísima a cambio de renunciar a cosas que en un servidor tradicional dabas por sentadas: un disco donde escribir, tiempo de CPU sin límite, memoria abundante. Conocer estos límites no es leer la letra pequeña: es entender la forma del modelo para diseñar con él a favor, no contra él. Un Worker no es un servidor recortado; es una pieza de cómputo puro que se acopla a otras piezas.
+</Lead>
+
+<Objetivos>
+
+- Entender por qué un isolate no tiene sistema de archivos persistente y dónde vive entonces el estado.
+- Conocer el límite de CPU por petición y cómo estructurar el trabajo pesado alrededor de él.
+- Ver el techo de memoria por isolate y por qué hay que transmitir en flujo en vez de acumular.
+- Convertir cada restricción en un principio de diseño edge-native.
+
+</Objetivos>
+
+## Sin sistema de archivos persistente
+
+Un isolate no tiene disco. El código que despliegas llega como un `bundle` de solo lectura, y no existe un `/tmp` donde escribir algo esperando encontrarlo en la siguiente petición.
+
+La razón es coherente con todo el modelo: hay miles de isolates repartidos por cientos de ubicaciones, creándose y evictándose sin cesar. Un archivo escrito en uno de ellos no tendría ningún sentido para los demás ni sobreviviría a la evicción.
+
+El estado, por tanto, no vive en el cómputo: vive en servicios de almacenamiento pensados para el edge, a los que el Worker accede por `bindings`.
+
+<Mermaid code={`flowchart TB
+  W[Worker computo puro sin disco] --> KV[KV lecturas globales]
+  W --> R2[R2 objetos y blobs]
+  W --> D1[D1 base SQL]
+  W --> DO[Durable Objects estado coordinado]
+  style W fill:#89b4fa,color:#11111b
+  style KV fill:#a6e3a1,color:#11111b
+  style R2 fill:#fab387,color:#11111b
+  style D1 fill:#cba6f7,color:#11111b
+  style DO fill:#f9e2af,color:#11111b`} />
+
+La regla mental es sencilla: el Worker calcula, el almacenamiento recuerda.
+
+Cada tipo de estado tiene su pieza —lecturas globales en KV, objetos grandes en R2, datos relacionales en D1, estado coordinado con identidad única en Durable Objects—, y elegir bien entre ellas es un tema entero más adelante en el track.
+
+Lo que importa ahora es interiorizar que la ausencia de disco no es una carencia, sino la condición que obliga a separar cómputo de estado de forma limpia.
+
+Un matiz importante: sí puedes usar memoria dentro de una petición, e incluso conservar algo en variables globales entre peticiones del mismo isolate. Lo que no existe es un disco duradero y compartido.
+
+La distinción entre memoria efímera y almacenamiento persistente deja de ser un detalle académico y pasa a ser una de las primeras decisiones de diseño de cualquier Worker.
+
+## CPU acotada por petición
+
+Un Worker tiene un límite de tiempo de **CPU** por invocación. Ojo: es CPU, no tiempo de pared. Esperar a una API lenta durante segundos no cuenta contra ese límite, como viste en el nivel anterior; lo que cuenta es el cómputo real.
+
+Si tu código se pone a calcular sin parar y supera el presupuesto de CPU, el runtime lo detiene. Esto descarta de raíz cierto tipo de trabajo dentro de una sola petición: bucles enormes de procesamiento, transformaciones pesadas de datos gigantes, cómputo científico prolongado.
+
+Una válvula de escape frecuente es diferir el trabajo no crítico más allá de la respuesta, para que el usuario no lo espere:
+
+```js
+export default {
+  async fetch(request, env, ctx) {
+    const respuesta = Response.json({ ok: true });
+    // El trabajo secundario corre tras responder, sin retrasar al usuario:
+    ctx.waitUntil(registrarMetrica(env, request));
+    return respuesta;
+  },
+};
+```
+
+<Callout type="warn" title="El trabajo pesado se reparte, no se aprieta">
+Si tienes una tarea intensiva en CPU, la respuesta no es pelear con el límite sino descomponer el trabajo. Se reparte en varias invocaciones, se delega a una cola que procesa por lotes, se coordina con un `Workflow` de pasos duraderos o se dispara con la alarma de un Durable Object. El modelo te empuja a trocear el cómputo largo en unidades cortas y componibles que, además, escalan mejor de forma horizontal.
+</Callout>
+
+## Memoria limitada por isolate
+
+Cada isolate dispone de un techo de memoria del orden de 128 MB. Es generoso para cómputo puro y respuestas normales, pero castiga un patrón muy común: cargar algo grande entero en memoria.
+
+Descargar un archivo de cientos de megabytes a una variable, acumular una respuesta enorme antes de enviarla o construir estructuras gigantescas provoca que el isolate se quede sin memoria y sea evictado.
+
+La solución idiomática es transmitir en flujo: procesar los datos a medida que pasan, sin retenerlos todos a la vez.
+
+```js
+export default {
+  async fetch(request, env, ctx) {
+    const origen = await fetch("https://ejemplo.com/archivo-grande");
+
+    // MAL: acumula todo el archivo en memoria del isolate
+    // const todo = await origen.arrayBuffer();
+
+    // BIEN: reenvia el cuerpo como flujo, sin retenerlo entero
+    return new Response(origen.body, {
+      headers: { "content-type": "application/octet-stream" },
+    });
+  },
+};
+```
+
+La `Streams API` es aquí la herramienta central: te deja leer, transformar y escribir datos por trozos, con una huella de memoria constante sin importar el tamaño total.
+
+Pensar en flujos en vez de en buffers es uno de los cambios de mentalidad más rentables al programar en el edge, y el que mejor escala cuando los datos crecen sin límite.
+
+## Otras fronteras y la mentalidad que imponen
+
+Más allá de disco, CPU y memoria, hay fronteras menores que conviene tener en el mapa desde el principio. Ninguna es un obstáculo si diseñas con ella; todas duelen si las descubres tarde.
+
+<Cards>
+  <Card icon="🧵" title="Un solo hilo">
+    Cada isolate es de un hilo. No hay paralelismo de CPU dentro de un Worker; la concurrencia viene del bucle de eventos y del asincronismo, no de hilos.
+  </Card>
+  <Card icon="🔌" title="Acceso al sistema acotado">
+    No hay llamadas al sistema arbitrarias ni binarios nativos. La salida al mundo es por `fetch` y por `connect` para TCP; las capacidades llegan por `bindings`.
+  </Card>
+  <Card icon="🟢" title="Node parcial">
+    Existe compatibilidad con un subconjunto de APIs de Node vía `nodejs_compat`, no la superficie entera. Comprueba siempre que lo que usas está soportado.
+  </Card>
+  <Card icon="🧩" title="Cómputo puro y componible">
+    El Worker rinde al máximo como función sin estado que se acopla a KV, R2, D1 o Durable Objects. Es una pieza, no un servidor monolítico.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Las restricciones no son el precio del modelo: son el modelo">
+El error de quien llega desde un servidor tradicional es leer esta lista como una tabla de carencias y preguntarse cómo sortearlas. Es justo al revés. La ausencia de disco es lo que obliga a separar cómputo de estado, y esa separación es exactamente lo que permite que tu código corra en cientos de ubicaciones a la vez sin coordinar ficheros locales imposibles. El límite de CPU es lo que impide que un inquilino monopolice una máquina compartida por miles, y de paso te empuja a un diseño de tareas cortas y componibles que escala mejor. El techo de memoria es lo que fuerza la mentalidad de flujo, que resulta ser la única que escala a datos de cualquier tamaño. Cada restricción, mirada de frente, es la causa de una virtud del sistema. Un Worker no es un servidor al que le quitaron cosas: es una unidad de cómputo puro, deliberadamente despojada de estado local, para que pueda multiplicarse por el planeta sin arrastrar equipaje. Diseñar bien en el edge es dejar de resentir los límites y empezar a apoyarse en ellos: tratar el Worker como función sin estado, delegar cada tipo de memoria en su pieza de almacenamiento, y pensar en flujos y en tareas cortas. Quien hace ese giro mental deja de escribir servidores diminutos y empieza a componer sistemas distribuidos.
+</Callout>
+
+<Reto title="Diseña con los límites a favor">
+1. Toma una tarea que en un servidor escribirías a disco (un archivo temporal, un log local) y decide a qué pieza de almacenamiento del edge la moverías y por qué.
+2. Coge un trabajo intensivo en CPU y describe cómo lo trocearías en colas, `Workflows` o alarmas de Durable Object para no chocar con el límite por petición.
+3. Reescribe mentalmente una descarga que hace `arrayBuffer` sobre un archivo grande para que use la `Streams API` con memoria constante.
+4. Formula, en una sola frase, la regla que resume todo el nivel: dónde vive el cómputo y dónde vive el estado.
+5. Explica qué problema resuelve `ctx.waitUntil` y por qué diferir trabajo no crítico mejora la latencia percibida sin violar el límite de CPU.
+6. Elige una de las cuatro restricciones y argumenta, al estilo del Callout, qué virtud del sistema causa esa aparente carencia.
+</Reto>
