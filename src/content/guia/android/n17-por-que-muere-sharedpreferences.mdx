@@ -1,0 +1,147 @@
+---
+title: "Por qué muere SharedPreferences: la API síncrona y el apply que engaña"
+description: "La API de preferencias más usada de la historia de Android es también la que más bloqueos del hilo principal ha producido, y casi ninguno aparece en el sitio donde se escribió el código culpable. Esta lección disecciona `SharedPreferences` como artefacto de ingeniería: el fichero XML que se carga entero en memoria y bloquea al primer lector, la diferencia real entre `commit` y `apply`, el trabajo encolado que se espera de forma síncrona al detener una actividad, la ausencia total de canal de errores, la imposibilidad de observar cambios con garantías y la fragilidad de los oyentes retenidos con referencias débiles. El objetivo no es odiar una API vieja sino entender qué propiedades le faltan, porque esas propiedades son exactamente las que justifican todo lo que viene después."
+subject: android
+level: 17
+order: 1
+icon: "17.1"
+duracion: "18 min"
+---
+
+<Lead>
+Hay APIs que envejecen mal y hay APIs que nacieron mal y sobrevivieron por inercia. `SharedPreferences` pertenece a la segunda categoría, y su longevidad se explica por una virtud aparente que resultó ser su defecto central: parece que no puede fallar. Se escribe un valor, se lee un valor, no hay callbacks, no hay excepciones comprobadas, no hay hilos, no hay estados intermedios. Esa aparente inocencia es una mentira sostenida por dos decisiones de implementación que la plataforma tomó hace más de quince años y que hoy pagan las aplicaciones en forma de bloqueos que aparecen a cuatro capas de distancia del código responsable. Antes de aprender la alternativa conviene entender con precisión qué está roto, porque `DataStore` no es una API más moderna con nombres más bonitos: es una respuesta punto por punto a una lista concreta de defectos.
+</Lead>
+
+<Objetivos>
+
+- Reconstruir la anatomía interna de `SharedPreferences` y por qué el primer acceso bloquea el hilo que lo pide.
+- Distinguir con rigor `commit` de `apply`, y localizar el punto exacto donde `apply` sí bloquea.
+- Enumerar las propiedades ausentes: sin señal de error, sin observación fiable, sin tipado, sin transaccionalidad.
+- Medir el daño real con `StrictMode` y con trazas, en lugar de discutirlo en abstracto.
+
+</Objetivos>
+
+## Un fichero XML que se carga entero y bloquea al primer lector
+
+La implementación es más simple de lo que su reputación sugiere. Cada nombre de preferencias corresponde a un fichero XML en el directorio privado de la aplicación. La primera vez que alguien pide una instancia, la plataforma lanza un hilo que lee ese fichero completo, lo parsea y construye un mapa en memoria. Ese mapa es la fuente de verdad durante toda la vida del proceso; las lecturas posteriores no tocan el disco.
+
+El detalle decisivo es qué ocurre si alguien intenta leer antes de que la carga termine. La respuesta es que el lector se queda esperando sobre un cerrojo hasta que el mapa está listo. No hay valor por defecto provisional, no hay excepción, no hay aviso: simplemente el hilo se detiene. Si ese hilo es el principal, y casi siempre lo es porque las preferencias se consultan al construir la primera pantalla, la aplicación se congela durante lo que tarde en leerse y parsearse un XML en un almacenamiento que puede estar saturado por otra aplicación que en ese momento está descargando una actualización.
+
+<Mermaid code={`flowchart TD
+  A[Primer acceso a las preferencias] --> B[Hilo de carga lee el XML completo]
+  A --> C[Hilo principal pide un valor]
+  C --> D{Mapa cargado}
+  D -->|no| E[Bloqueo sobre el cerrojo]
+  D -->|si| F[Lectura desde memoria]
+  E --> F
+  B --> D
+  style E fill:#f38ba8,color:#11111b
+  style F fill:#a6e3a1,color:#11111b`} />
+
+La consecuencia práctica es contraintuitiva y explica la mayoría de los informes desconcertantes: el coste no depende de cuántas veces leas sino de cuándo leas por primera vez, y ese momento suele coincidir con el arranque en frío, que es justamente el instante donde la latencia es más visible y donde el dispositivo está más ocupado. Un fichero de doscientas claves que en un terminal de gama alta se lee en dos milisegundos puede costar varios cientos en un dispositivo con memoria flash desgastada y con el sistema de ficheros bajo presión.
+
+Hay un segundo coste que se suele ignorar: el mapa se mantiene vivo mientras exista el proceso. Todas las preferencias de la aplicación, incluidas las que se usan una sola vez en un ajuste que nadie visita, ocupan memoria permanentemente. En bases de código grandes, donde cada módulo ha ido añadiendo sus banderas, ese mapa acaba conteniendo miles de entradas cuya única función es existir por si acaso.
+
+<Callout type="warn" title="El primer acceso rara vez está donde crees">
+La instancia se pide a menudo dentro de la construcción de un grafo de inyección de dependencias, o en un inicializador de aplicación, o dentro de una librería de terceros que decide leer una bandera de configuración durante su propio arranque. El resultado es que el bloqueo se atribuye al componente que estaba arriba en la pila y no al que causó la carga. Buscar `getSharedPreferences` con una búsqueda de texto rara vez encuentra al culpable real, porque suele estar detrás de un contenedor o de una dependencia compilada.
+</Callout>
+
+## `commit` bloquea de frente y `apply` bloquea por la espalda
+
+La escritura ofrece dos verbos y una elección aparentemente evidente. `commit` aplica los cambios al mapa en memoria y escribe el fichero de forma síncrona, devolviendo un valor booleano; el hilo que lo llama se detiene hasta que la escritura ha terminado. `apply` aplica los cambios al mapa en memoria de inmediato y encola la escritura en disco para un hilo de fondo, devolviendo el control al instante y sin resultado alguno. Toda la documentación desde hace una década recomienda `apply`, y la recomendación es correcta pero está incompleta de una manera que causa daño real.
+
+El trabajo que `apply` encola no puede quedar pendiente indefinidamente, porque el sistema necesita garantizar que si la aplicación se detiene o el proceso muere, lo que el usuario cambió está en disco. Para lograrlo, la plataforma instala una espera síncrona en los puntos de transición del ciclo de vida: al detener una actividad, al detener un servicio, al terminar de manejar una emisión. En esos momentos el hilo principal espera a que todo el trabajo encolado se haya vaciado.
+
+```kotlin
+// aparentemente asincrono
+prefs.edit().putString("ultimo_filtro", filtro).apply()
+
+// lo que ocurre despues, fuera de tu codigo:
+// al pausar la actividad el sistema espera a que la cola se vacie
+// y esa espera ocurre en el hilo principal
+```
+
+Dicho de otro modo: `apply` no elimina el bloqueo, lo aplaza y lo agrupa. Si una pantalla escribe treinta preferencias durante su uso, esas treinta escrituras no cuestan nada mientras el usuario navega y cuestan todas juntas en el momento exacto en que el usuario pulsa el botón de retroceso o cambia de aplicación. Ese patrón produce una familia entera de bloqueos de aplicación cuya traza señala al método de detención de la actividad y que resultan indescifrables para quien no conoce el mecanismo, porque el código de esa función está vacío.
+
+<Cards>
+  <Card icon="⛔" title="commit">
+    Bloquea donde se escribe. Es honesto: el coste es visible y atribuible. Devuelve un booleano que casi nadie comprueba.
+  </Card>
+  <Card icon="🕰️" title="apply">
+    Bloquea en la transición del ciclo de vida. Es deshonesto: el coste es invisible en el punto de llamada y aparece agregado en otro sitio.
+  </Card>
+</Cards>
+
+Existe una consecuencia todavía menos conocida de ese mecanismo de espera, y es que afecta también al arranque de componentes ajenos. La cola de trabajo pendiente es única por proceso, de modo que las escrituras encoladas por una librería de terceros se vacían en la misma espera que las tuyas. Un módulo de análisis que persiste una preferencia por cada evento puede así degradar las transiciones de una pantalla que ni siquiera lo utiliza, y el perfil de rendimiento no dará ninguna pista de dónde viene el trabajo.
+
+Conviene además desmontar la idea de que `commit` devuelve información útil sobre el fallo. Devuelve `false` cuando la escritura no se pudo completar, pero para entonces el mapa en memoria ya se actualizó, de modo que la aplicación seguirá leyendo el valor nuevo hasta que el proceso muera y descubra, en el siguiente arranque, que el disco tenía el valor viejo. No es un canal de errores: es un aviso a posteriori de una inconsistencia ya consumada.
+
+## Lo que sencillamente no existe
+
+Más allá del rendimiento, la lista de propiedades ausentes es lo que convierte esta API en un problema de corrección y no solo de latencia.
+
+No hay señal de error para `apply`. Si el disco está lleno, si el fichero se corrompió, si el proceso murió con la cola a medias, no ocurre nada observable. La aplicación continúa creyendo que guardó.
+
+No hay atomicidad entre claves. Escribir dos valores que solo tienen sentido juntos, un identificador de sesión y su fecha de caducidad, admite un estado intermedio donde uno se persistió y el otro no. El editor agrupa las escrituras en el fichero pero no ofrece ninguna garantía transaccional frente a lecturas concurrentes ni frente a la muerte del proceso a mitad de la operación.
+
+No hay tipado real. Las claves son cadenas y los tipos se deciden en el punto de lectura. Escribir un entero y leerlo como cadena produce una `ClassCastException` en tiempo de ejecución, y como la clave suele estar duplicada en dos módulos distintos, el fallo aparece meses después de introducirse.
+
+No hay observación fiable. Existe un oyente de cambios, pero la plataforma lo retiene con una referencia débil, de modo que si nadie más conserva una referencia fuerte el recolector de basura puede llevárselo y las notificaciones dejan de llegar sin ningún aviso. Es uno de los defectos más citados y más difíciles de reproducir, porque depende de cuándo decide actuar el recolector.
+
+```kotlin
+// bomba de relojeria clasica
+prefs.registerOnSharedPreferenceChangeListener { _, clave ->
+    if (clave == "tema") recargarTema()
+}   // nadie retiene el objeto: puede dejar de funcionar en cualquier momento
+```
+
+No hay concurrencia entre procesos. El modo que la permitía quedó obsoleto porque nunca funcionó de forma fiable: dos procesos con sus propios mapas en memoria sobre el mismo fichero producen pérdidas de escrituras. Cualquier aplicación con un servicio en proceso separado, con un widget de pantalla de inicio o con un receptor declarado en otro proceso está expuesta a ello, y el síntoma es una preferencia que vuelve espontáneamente a su valor anterior.
+
+No hay granularidad. La unidad de escritura es el fichero completo, de modo que cambiar un booleano reescribe el XML entero con todas sus claves. Ese coste crece linealmente con el número de preferencias acumuladas, lo que produce la situación perversa de que la aplicación se vuelve más lenta a medida que se le añaden ajustes, sin que ningún cambio concreto sea responsable del empeoramiento.
+
+<Mermaid code={`flowchart LR
+  A[Escritura de una sola clave] --> B[Se reconstruye el mapa completo]
+  B --> C[Se serializa el XML entero]
+  C --> D[Se escribe todo el fichero]
+  D --> E[Coste proporcional al total de claves]
+  style E fill:#f38ba8,color:#11111b`} />
+
+Ninguna de estas ausencias es un descuido: son consecuencias coherentes de una decisión de diseño tomada cuando el modelo dominante era síncrono, monohilo y sin corrutinas. Enumerarlas sirve para algo más que criticar el pasado, porque la lista funciona como especificación del sustituto. Cualquier alternativa que no ofrezca señal de error, atomicidad, tipado, observación fiable y ausencia de bloqueo estará resolviendo solo una parte del problema.
+
+<Callout type="info" title="Un `Set<String>` que se puede corromper solo">
+`getStringSet` devuelve una referencia al conjunto que vive dentro del mapa en memoria, no una copia. Modificar ese conjunto altera el estado interno de las preferencias sin pasar por el editor, y esa alteración no se persiste. La documentación advierte que no se debe modificar el objeto devuelto, lo cual es una forma elegante de decir que la API expone su estructura interna y confía en que nadie la toque.
+</Callout>
+
+## Medirlo antes de discutirlo
+
+La conversación sobre migrar suele quedarse en lo teórico porque nadie ha puesto un número encima. Hay dos instrumentos que lo resuelven en una tarde.
+
+El primero es `StrictMode`, que detecta lecturas y escrituras de disco en el hilo principal y puede configurarse para registrar la traza completa. Activado en compilaciones de depuración, convierte cada acceso indebido en una entrada de registro con el punto exacto de origen, incluidas las que provienen de dependencias de terceros.
+
+```kotlin
+if (BuildConfig.DEBUG) {
+    StrictMode.setThreadPolicy(
+        StrictMode.ThreadPolicy.Builder()
+            .detectDiskReads()
+            .detectDiskWrites()
+            .penaltyLog()
+            .build()
+    )
+}
+```
+
+Conviene ejecutarlo con el registro y no con la penalización que derriba el proceso, al menos al principio, porque la cantidad de infracciones en una base de código con años suele ser lo bastante alta como para hacer inutilizable la aplicación de depuración. La secuencia sana es medir primero, priorizar por frecuencia y solo después endurecer la política sobre los módulos ya limpios.
+
+El segundo instrumento es la traza del sistema durante un arranque en frío sobre un dispositivo modesto, con el almacenamiento deliberadamente ocupado. Ahí se ve el hueco donde el hilo principal está esperando y se puede atribuir a la carga del fichero. Ese hueco, expresado en milisegundos y comparado con el objetivo de arranque, es el único argumento que mueve una decisión de prioridades.
+
+<Callout type="dios" title="Una API sin canal de error enseña a programar sin pensar en el fallo">
+Lo verdaderamente instructivo de `SharedPreferences` no es ninguno de sus defectos por separado sino el efecto que su forma ha tenido sobre varias generaciones de código Android, y ese efecto es más profundo que cualquier bloqueo del hilo principal. Al ofrecer una firma que no puede fallar, la API comunicó implícitamente que persistir es una operación trivial, del mismo orden que asignar una variable. Y persistir no es trivial: es una operación de entrada y salida sobre un medio compartido, con latencia variable, con posibilidad de agotamiento del espacio, con corrupción posible y con una ventana en la que el proceso puede morir. Todas esas realidades siguieron existiendo después de que la API decidiera no mencionarlas; lo único que cambió es que dejaron de ser visibles en el punto donde se toman las decisiones. Esa es la definición exacta de una abstracción que miente, y su coste no se paga en el momento sino en la forma que adquiere el código escrito bajo su influencia. Miles de aplicaciones tratan la escritura de una preferencia como una sentencia sin consecuencias, colocada en medio de un manejador de pulsación, sin ninguna consideración sobre el orden, la agrupación o la posibilidad de que no ocurra. Cuando algo falla, no hay ningún sitio donde poner el manejo del error, porque la API nunca abrió esa puerta y añadirla después exige rediseñar el flujo entero. La lección general trasciende con mucho el asunto de las preferencias y merece formularse sin adornos: una API que oculta la posibilidad de fallo no elimina el fallo, elimina el lugar donde se podría haber tratado. Todo lo que verás en las lecciones siguientes (una lectura que es un flujo que puede emitir un error, una escritura que es una función suspendida que puede lanzar, una transformación que es atómica por construcción) no es sofisticación gratuita ni moda de corrutinas. Es la restitución sistemática de la información que la API anterior había decidido esconder, devuelta al único sitio donde sirve de algo, que es el punto donde se escribe la llamada.
+</Callout>
+
+<Reto title="Documenta el daño en tu propia aplicación">
+1. Activa `StrictMode` con detección de disco en el hilo principal y anota cada traza que aparezca durante un arranque en frío, separando las tuyas de las de terceros.
+2. Localiza el primer acceso real a las preferencias en tu grafo de arranque y mide cuánto tarda la carga sobre un dispositivo lento con el almacenamiento ocupado.
+3. Cuenta cuántas claves contiene hoy tu fichero principal y cuántas de ellas se leen en cada sesión. La proporción suele sorprender.
+4. Busca todas las llamadas a `apply` que ocurren durante la navegación y estima cuántas se acumulan antes de una transición de ciclo de vida.
+5. Encuentra un oyente de cambios registrado sin conservar referencia fuerte y demuestra su desaparición forzando la recolección de basura.
+</Reto>

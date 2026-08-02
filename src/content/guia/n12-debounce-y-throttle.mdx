@@ -1,0 +1,156 @@
+---
+title: "Debounce y throttle: no trabajar en cada pulsación"
+description: "Un autocmd sobre TextChanged se dispara en cada tecla, y un plugin ingenuo hace en cada tecla el mismo trabajo caro. Debounce y throttle son las dos respuestas clásicas, y ambas se implementan con un timer de vim.uv. Implementación completa de las dos, la diferencia entre borde de entrada y borde de salida, la elección correcta según la naturaleza del trabajo, y cómo cancelar y limpiar sin fugar handles."
+subject: neovim
+level: 12
+order: 4
+icon: "12.4"
+duracion: "19 min"
+---
+
+<Lead>
+Escribes seis caracteres por segundo. Si tu plugin recalcula un diagnóstico, lanza un `grep` o consulta un servidor en cada `TextChanged`, has pedido seis trabajos caros por segundo para tirar cinco de ellos a la basura. Las dos técnicas que corrigen esto son viejas, se llaman **debounce** y **throttle**, y en Neovim se construyen exactamente con lo aprendido en las lecciones anteriores: un `timer` de `vim.uv` y un salto de vuelta con `vim.schedule`. No son la misma técnica con distinto nombre; responden a preguntas distintas y elegir mal produce un plugin que se siente peor que sin optimizar.
+</Lead>
+
+<Objetivos>
+
+- Implementar un `debounce` correcto sobre un `timer` de `vim.uv`.
+- Implementar un `throttle` y distinguir su borde de entrada de su borde de salida.
+- Elegir entre ambas según si el trabajo es un resultado final o un caudal continuo.
+- Cancelar y limpiar los `handles` asociados sin dejar `timers` colgando.
+
+</Objetivos>
+
+## Dos respuestas a la misma avalancha
+
+Ante una ráfaga de eventos, hay exactamente dos cosas razonables que hacer: esperar a que la ráfaga termine, o dejar pasar uno cada tanto. Todo lo demás son variantes.
+
+<Cards>
+  <Card icon="🔄" title="Debounce">
+    Reinicia la cuenta atrás con cada evento y solo ejecuta cuando ha habido silencio durante N milisegundos. Durante una ráfaga larga no ejecuta nada. Ideal cuando solo importa el estado final.
+  </Card>
+  <Card icon="⏱️" title="Throttle">
+    Ejecuta de inmediato y después ignora todo durante N milisegundos. Garantiza un ritmo máximo pero no deja de trabajar durante la ráfaga. Ideal cuando el progreso intermedio sí es útil.
+  </Card>
+</Cards>
+
+Un buscador que consulta al escribir quiere `debounce`: los resultados de "neo" no le sirven a nadie si vas a escribir "neovim". Una barra de progreso que refleja una compilación quiere `throttle`: quedarse muda hasta el final sería inútil, pero redibujar mil veces por segundo también.
+
+<Mermaid code={`flowchart TB
+  subgraph Debounce
+    d1[Pulsaciones seguidas] --> d2[Cada una reinicia el timer]
+    d2 --> d3[Solo tras el silencio se ejecuta una vez]
+  end
+  subgraph Throttle
+    t1[Pulsaciones seguidas] --> t2[La primera ejecuta ya]
+    t2 --> t3[Las siguientes se descartan hasta cumplir el intervalo]
+  end
+  style d3 fill:#a6e3a1,color:#11111b
+  style t2 fill:#89b4fa,color:#11111b`} />
+
+## Debounce con vim.uv
+
+La implementación es directa si recuerdas que `t:start` sobre un `timer` ya activo reinicia su cuenta. Esa es toda la magia: cada llamada cancela la anterior.
+
+```lua
+local uv = vim.uv
+
+local function debounce(ms, fn)
+  local timer = uv.new_timer()
+  local envuelto = function(...)
+    local args = { ... }
+    timer:stop()
+    timer:start(ms, 0, function()
+      timer:stop()
+      vim.schedule(function() fn(unpack(args)) end)
+    end)
+  end
+  return envuelto, timer
+end
+```
+
+Tres detalles importan más de lo que parece. Primero, los argumentos se capturan en una tabla porque el `callback` del `timer` no los recibe. Segundo, `vim.schedule` es obligatorio: el cuerpo de `fn` casi siempre tocará la API del editor. Tercero, la función devuelve también el `timer`, para que quien la use pueda cerrarlo cuando el plugin se descargue.
+
+```lua
+local recalcular = debounce(250, function(bufnr)
+  vim.diagnostic.reset(nil, bufnr)
+  -- trabajo caro sobre el buffer, ya en contexto seguro
+end)
+
+vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+  callback = function(ev) recalcular(ev.buf) end,
+})
+```
+
+<Callout type="tip" title="Elige el retardo con la mano, no con la cabeza">
+Entre 100 y 200 milisegundos el usuario no percibe la espera; por encima de 400 la interfaz empieza a sentirse perezosa. Para trabajo local —resaltado, plegado— quédate en 50 o 100. Para consultas a un proceso externo, 250 o 300 es lo habitual. Y mide con `vim.uv.hrtime()` antes de discutir: el retardo correcto depende del coste real de `fn`, no de la intuición.
+</Callout>
+
+## Throttle y la limpieza de handles
+
+El `throttle` invierte la lógica: ejecuta primero y luego calla. La variante más simple es la de borde de entrada, que dispara inmediatamente y descarta lo que llegue durante el periodo de enfriamiento.
+
+```lua
+local function throttle(ms, fn)
+  local en_espera = false
+  local timer = uv.new_timer()
+  local envuelto = function(...)
+    if en_espera then return end
+    en_espera = true
+    fn(...)
+    timer:start(ms, 0, function()
+      timer:stop()
+      en_espera = false
+    end)
+  end
+  return envuelto, timer
+end
+```
+
+Su defecto conocido es que **pierde el último evento**: si la ráfaga termina justo dentro del periodo de enfriamiento, ese estado final nunca se procesa. La cura habitual es guardar los últimos argumentos y, al vencer el `timer`, ejecutar una vez más si hubo llamadas descartadas. Eso es un `throttle` con borde de salida, y en la práctica es lo que quieres casi siempre.
+
+```lua
+local function throttle_final(ms, fn)
+  local en_espera, pendiente = false, nil
+  local timer = uv.new_timer()
+  local function disparar(...)
+    fn(...)
+    en_espera = true
+    timer:start(ms, 0, function()
+      timer:stop()
+      en_espera = false
+      if pendiente then
+        local args = pendiente
+        pendiente = nil
+        vim.schedule(function() disparar(unpack(args)) end)
+      end
+    end)
+  end
+  return function(...)
+    if en_espera then pendiente = { ... } else disparar(...) end
+  end, timer
+end
+```
+
+Sea cual sea la variante, el `timer` que has creado sigue vivo. Un plugin serio lo cierra al desmontarse, y lo hace de forma defensiva porque cerrar dos veces es un error.
+
+```lua
+local function cerrar(timer)
+  if timer and not timer:is_closing() then
+    timer:stop()
+    timer:close()
+  end
+end
+```
+
+<Callout type="dios" title="Debounce y throttle no optimizan: cambian la semántica de tu plugin">
+El error de encuadre más común es tratar estas dos técnicas como un ajuste de rendimiento que se añade al final, cuando algo va lento. No lo son. Al aplicar un `debounce` estás afirmando algo fuerte sobre tu problema: que los estados intermedios **carecen de valor** y solo importa el último. Al aplicar un `throttle` afirmas lo contrario: que los intermedios sí valen, pero que existe una frecuencia por encima de la cual dejan de aportar información al usuario. Son decisiones de diseño sobre el significado de tu funcionalidad, y por eso elegir mal se nota aunque el código sea impecable. Un autocompletado con `throttle` parpadea con resultados obsoletos que nadie pidió; un indicador de progreso con `debounce` se queda mudo justo cuando el usuario necesitaba verlo moverse. La prueba para decidir es una sola pregunta: si el evento número siete cancela al seis, ¿he perdido algo? Si la respuesta es no, `debounce`. Si es sí, `throttle`. Hay además una consecuencia estructural que rara vez se enuncia: ambas técnicas introducen la posibilidad de que `fn` se ejecute **después** de que su contexto haya dejado de tener sentido —el buffer se cerró, la ventana desapareció, el usuario cambió de proyecto—. Un `debounce` de 300 milisegundos es una promesa de ejecutar en el futuro, y el futuro no está obligado a parecerse al presente. Por eso toda función diferida debe revalidar sus supuestos antes de actuar: comprobar `nvim_buf_is_valid`, verificar que el buffer sigue siendo el actual, confirmar que la petición no quedó obsoleta. El `timer` no es solo una optimización; es una máquina del tiempo pequeña, y como toda máquina del tiempo, exige comprobar dónde has aterrizado.
+</Callout>
+
+<Reto title="Construye las dos y compáralas">
+1. Implementa `debounce` y engánchalo a `TextChangedI` mostrando un `vim.notify` con un contador; escribe rápido y cuenta cuántas veces se ejecuta.
+2. Cambia el retardo entre 50, 250 y 800 milisegundos y describe cómo cambia la sensación de uso en cada caso.
+3. Implementa el `throttle` de borde de entrada y demuestra con una ráfaga corta que pierde el último evento.
+4. Amplíalo a `throttle_final` y verifica que ahora el estado final siempre se procesa exactamente una vez.
+5. Añade a tu `debounce` una revalidación con `nvim_buf_is_valid` y provoca el caso de borde cerrando el buffer antes de que venza el `timer`.
+</Reto>

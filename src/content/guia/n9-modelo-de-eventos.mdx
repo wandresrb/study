@@ -1,0 +1,159 @@
+---
+title: "El modelo de eventos: el editor que reacciona"
+description: "Qué es exactamente un autocomando, por qué Neovim es un bus de eventos síncrono que atraviesa toda su ejecución, el mapa de los eventos que de verdad sostienen una configuración moderna y la anatomía completa del objeto que recibe tu callback."
+subject: neovim
+level: 9
+order: 1
+icon: "9.1"
+duracion: "18 min"
+---
+
+<Lead>
+Casi todo lo que crees que hace Neovim por sí solo lo hace en realidad un autocomando. El resaltado de sintaxis que aparece al abrir un archivo, el formateo al guardar, los atajos del LSP que solo existen en los buffers donde hay servidor: nada de eso está cableado en el núcleo. Son reacciones registradas a eventos con nombre. Entender ese bus es dejar de configurar Neovim como una lista de ajustes y empezar a programarlo como un sistema reactivo.
+</Lead>
+
+<Objetivos>
+
+- Definir un autocomando como la tripleta evento, patrón y acción.
+- Situar los eventos en el ciclo de vida de un buffer y de la sesión.
+- Leer y explotar cada campo del objeto que recibe el callback.
+- Reconocer las consecuencias de que el bus sea síncrono y bloqueante.
+
+</Objetivos>
+
+## Un autocomando es una tripleta
+
+Un autocomando declara: *cuando ocurra este **evento**, si el contexto casa con este **patrón**, ejecuta esta **acción**.* El núcleo de Neovim emite eventos con nombre en puntos concretos de su ejecución —abrir un archivo, cambiar de buffer, salir del modo de inserción, adjuntar un servidor de lenguaje— y consulta la tabla de autocomandos registrados para ese nombre.
+
+```lua
+vim.api.nvim_create_autocmd("TextYankPost", {
+  desc = "Resalta brevemente el texto copiado",
+  callback = function()
+    vim.hl.on_yank({ higroup = "IncSearch", timeout = 150 })
+  end,
+})
+```
+
+Tres detalles importan desde el primer minuto. El primero: `callback` recibe una función Lua, no una cadena de Vimscript; la forma antigua con `command` sigue funcionando pero pierde tipado, cierre léxico y depuración. El segundo: `desc` no es decorativo, es lo que verás al listar autocomandos cuando algo falle dentro de seis meses. El tercero, y el más profundo: **si el callback devuelve `true`, el autocomando se borra a sí mismo**. Esa es la vía canónica para reacciones que se autodestruyen bajo una condición, distinta de `once`, que se borra siempre tras la primera ejecución.
+
+El bus es **síncrono**. Neovim no encola tu callback ni lo ejecuta en otro hilo: detiene lo que estaba haciendo, lo ejecuta hasta el final y continúa. Un callback lento en `BufWritePre` es latencia que sientes al pulsar guardar; un callback lento en `CursorMoved` es un editor que se arrastra. Todo el arte del nivel 9 vive en esa tensión entre reaccionar a todo y no pagar por ello.
+
+## El ciclo de vida de un buffer, evento a evento
+
+La mayoría de los eventos útiles no son sucesos aislados sino estaciones de un recorrido. Abrir un archivo dispara una secuencia ordenada, y saber en qué punto engancharse es la diferencia entre una configuración que funciona y una que funciona *a veces*.
+
+<Mermaid code={`flowchart TD
+  A[Usuario abre un archivo] --> B[BufReadPre]
+  B --> C[Se lee el contenido del disco]
+  C --> D[BufReadPost]
+  D --> E[Deteccion de tipo de archivo]
+  E --> F[FileType]
+  F --> G[Buffer visible y editable]
+  G --> H[BufWritePre]
+  H --> I[Se escribe al disco]
+  I --> J[BufWritePost]
+  G --> K[LspAttach cuando el servidor se adjunta]
+  style F fill:#a6e3a1,color:#11111b
+  style H fill:#f9e2af,color:#11111b
+  style K fill:#89b4fa,color:#11111b`} />
+
+`BufReadPre` ocurre antes de tener contenido: es el lugar para decidir cosas sobre el archivo por su nombre o su tamaño, no por su texto. `BufReadPost` ya tiene las líneas cargadas pero **todavía no hay tipo de archivo**; ese es el error clásico de quien intenta poner ajustes de Python ahí. La detección de tipo es un paso propio que culmina emitiendo `FileType`, y por eso `FileType` es el único punto legítimo para ajustes que dependen del lenguaje.
+
+En la escritura, `BufWritePre` es tu última oportunidad de modificar el buffer antes de que toque el disco: formateadores, borrado de espacios finales, ordenación de imports. `BufWritePost` ya no puede cambiar nada del archivo escrito, pero es perfecto para efectos externos: recargar un servicio, disparar un linter, notificar.
+
+```lua
+-- INCORRECTO: en BufReadPost el tipo de archivo aun no existe
+vim.api.nvim_create_autocmd("BufReadPost", {
+  callback = function(args)
+    if vim.bo[args.buf].filetype == "python" then   -- casi siempre cadena vacia
+      vim.bo[args.buf].shiftwidth = 4
+    end
+  end,
+})
+
+-- CORRECTO: FileType se emite justo despues de la deteccion
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "python",
+  callback = function(args)
+    vim.bo[args.buf].shiftwidth = 4
+    vim.bo[args.buf].expandtab = true
+  end,
+})
+```
+
+Fuera del ciclo del buffer hay una segunda familia, la de la sesión, con su propio orden estricto: `VimEnter` marca el final del arranque y el primer instante en que el editor ya responde al usuario; `VimLeavePre` es el último momento en que puedes guardar estado —una sesión, un registro, un archivo temporal— mientras los buffers siguen vivos; `VimLeave` llega cuando ya casi nada es seguro. Esa asimetría entre lo que existe antes y después de cada evento es el motivo por el que el orden de la secuencia importa más que la lista de nombres.
+
+## La anatomía del objeto del callback
+
+Neovim invoca tu callback con un único argumento: una tabla con el contexto completo del disparo. Ignorarla y usar variables globales como `vim.fn.expand` es el sello del principiante; leerla es lo que permite escribir autocomandos correctos bajo concurrencia de buffers.
+
+```lua
+vim.api.nvim_create_autocmd("BufWritePre", {
+  callback = function(args)
+    -- args.id     numero del autocomando, sirve para borrarse a si mismo
+    -- args.event  nombre del evento, util si registras varios a la vez
+    -- args.group  identificador numerico del grupo, o nil
+    -- args.match  el texto contra el que se compara el patron
+    -- args.buf    numero del buffer afectado
+    -- args.file   nombre de archivo expandido del buffer
+    -- args.data   carga util arbitraria, solo en ciertos eventos
+    vim.print(args)
+  end,
+})
+```
+
+El campo decisivo es `args.buf`. Un autocomando puede dispararse para un buffer que **no** es el actual, y cualquier operación que asuma el buffer visible introduce un fallo intermitente imposible de reproducir. La regla: usa siempre `args.buf` como destino explícito, nunca el cero implícito.
+
+La distinción entre `match` y `file` es la sutileza que separa a quien ha leído la documentación de quien la ha entendido. Para los eventos de buffer ambos coinciden con la ruta expandida. Pero en `FileType`, `match` es el **nombre del tipo de archivo** —la cadena `lua`, `rust`, `python`— mientras `file` sigue siendo la ruta. Y en el evento `User`, `match` es el nombre del evento propio que publicaste. El patrón siempre se compara contra `match`, jamás contra `file`: de ahí que un patrón que funciona en `BufWritePre` no signifique nada en `FileType`.
+
+<Callout type="tip" title="args.data es el canal de carga útil">
+Solo algunos eventos rellenan `args.data`, pero los que lo hacen son los que más importan hoy. `LspAttach` entrega ahí el identificador del cliente que se acaba de adjuntar; el evento `User` entrega lo que tú decidas publicar. Es el mecanismo por el que un autocomando deja de ser una notificación vacía y pasa a ser un mensaje con contenido.
+</Callout>
+
+## Los tres eventos que sostienen una configuración moderna
+
+Existen más de cien eventos, pero una configuración madura descansa sobre un puñado muy pequeño. Estos tres cubren la inmensa mayoría del trabajo real.
+
+<Cards>
+  <Card icon="⚡" title="BufWritePre">
+    El punto de intervención sobre el contenido antes de tocar el disco. Formateo, saneado, organización de imports. Síncrono por definición: lo que tarde aquí lo esperas tú.
+  </Card>
+  <Card icon="🧩" title="FileType">
+    El único lugar correcto para ajustes que dependen del lenguaje. Se dispara después de la detección, con el buffer ya identificado, y su patrón casa contra el nombre del tipo.
+  </Card>
+  <Card icon="🧵" title="LspAttach">
+    Sustituye a la vieja función `on_attach` por cliente. Se dispara cuando un servidor se adjunta a un buffer y entrega el identificador del cliente en `args.data`.
+  </Card>
+</Cards>
+
+```lua
+-- Atajos del LSP que solo existen donde hay servidor adjunto
+vim.api.nvim_create_autocmd("LspAttach", {
+  callback = function(args)
+    local cliente = vim.lsp.get_client_by_id(args.data.client_id)
+    if not cliente then
+      return
+    end
+    local opts = { buffer = args.buf, silent = true }
+    vim.keymap.set("n", "gd", vim.lsp.buf.definition, opts)
+    vim.keymap.set("n", "K", vim.lsp.buf.hover, opts)
+    if cliente:supports_method("textDocument/inlayHint") then
+      vim.lsp.inlay_hint.enable(true, { bufnr = args.buf })
+    end
+  end,
+})
+```
+
+Ese fragmento condensa la doctrina entera del nivel: reacciona a un hecho concreto, lee el contexto del argumento, comprueba la capacidad real antes de usarla y aplica el efecto acotado al buffer que corresponde. No hay ninguna variable global, ningún estado compartido y ninguna suposición sobre el orden de carga de los plugins.
+
+<Callout type="dios" title="Tu configuración no es un archivo de ajustes: es un programa reactivo">
+El salto conceptual de este nivel es abandonar la idea de que configurar Neovim consiste en asignar valores. Un archivo de opciones describe un estado *inicial*; los autocomandos describen una **función del tiempo**. En el momento en que registras el primero, tu configuración deja de ser una fotografía y pasa a ser un sistema de control con realimentación: el editor emite señales, tú declaras respuestas, y el comportamiento observable emerge de la composición de todas ellas. Esto trae exactamente los mismos problemas que cualquier arquitectura orientada a eventos —orden de suscripción no determinista, acoplamiento temporal invisible, efectos en cascada, dificultad para razonar sobre el estado global— y exige exactamente las mismas disciplinas: nombrar los espacios (los grupos, nivel 9.2), acotar el alcance (patrones y buffers, nivel 9.3), definir contratos explícitos entre partes (el evento `User`, nivel 9.4) y poder observar el sistema en marcha (depuración, nivel 9.5). Quien trata los autocomandos como trucos sueltos acumula una configuración que se rompe al recargarla y nadie sabe por qué. Quien los trata como lo que son —un bus de mensajes síncrono dentro de un editor programable— construye algo que sigue siendo comprensible después de tres años de crecimiento. El resto de este nivel es, sencillamente, ingeniería de software aplicada a tu propio editor.
+</Callout>
+
+<Reto title="Instrumenta el bus">
+1. Registra un autocomando sobre `BufReadPost` y otro sobre `FileType` que impriman `args.match` y `args.file`, abre un archivo Lua y explica por qué difieren.
+2. Escribe un autocomando en `BufWritePre` que use exclusivamente `args.buf` para contar las líneas del buffer, sin recurrir nunca al buffer actual implícito.
+3. Crea un autocomando que devuelva `true` desde su callback bajo una condición y comprueba con `:autocmd` que ha desaparecido de la tabla.
+4. Sustituye una función `on_attach` de tu configuración por un único autocomando sobre `LspAttach` que lea el cliente desde `args.data`.
+5. Mide el coste real del bus: pon un callback con un bucle de un millón de iteraciones en `CursorMoved` y describe qué le ocurre al editor y por qué.
+</Reto>

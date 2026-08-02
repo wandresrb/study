@@ -1,0 +1,145 @@
+---
+title: "Geofences y detección de actividad: reaccionar en vez de vigilar"
+description: "Cómo delegar en el sistema la vigilancia de zonas y de cambios de comportamiento: geometría y transiciones de un geofence, el retardo de permanencia como antídoto contra los falsos positivos, los límites y la reinscripción tras reinicio, la API de reconocimiento de actividad y sus transiciones, y el patrón que combina ambas para modular la cadencia de ubicación sin sondear."
+subject: android
+level: 27
+order: 3
+icon: "27.3"
+duracion: "19 min"
+---
+
+<Lead>
+Hay dos maneras de saber que el usuario ha llegado a un sitio. Una es preguntar dónde está cada treinta segundos y comparar con una lista de coordenadas: funciona, consume sin descanso y muere en cuanto el sistema estrangula el segundo plano. La otra es describir la zona una vez, entregársela al sistema operativo y esperar a que llame. La segunda no es una optimización de la primera: es un modelo de programación distinto, orientado a eventos, en el que el trabajo de vigilancia lo hace un hardware de bajísimo consumo que ya estaba encendido. Geofences y reconocimiento de actividad son las dos caras de ese modelo.
+</Lead>
+
+<Objetivos>
+
+- Definir un `geofence` con radio, transiciones y retardo de permanencia coherentes con la precisión real.
+- Recibir transiciones mediante `PendingIntent` y tratar sus errores y su reinscripción tras un reinicio.
+- Usar el reconocimiento de actividad y su API de transiciones para detectar cambios de comportamiento.
+- Combinar ambas señales para modular la cadencia de ubicación en lugar de sondear.
+
+</Objetivos>
+
+## Geometría, transiciones y falsos positivos
+
+Un `geofence` es un círculo definido por un centro, un radio en metros y un conjunto de transiciones que interesan. El sistema lo evalúa de forma continua contra la mejor estimación de posición disponible, apoyándose cuando puede en el hardware dedicado del terminal, de modo que el coste marginal de vigilar una zona es órdenes de magnitud inferior al de sondearla desde la aplicación.
+
+Las transiciones son tres. La entrada se dispara al cruzar hacia dentro, la salida al cruzar hacia fuera, y la permanencia cuando el dispositivo lleva dentro un tiempo configurable. Esta última es la más infravalorada y la que resuelve el problema central de la tecnología: el ruido. Como la posición llega con un radio de incertidumbre que en zona urbana ronda con facilidad las decenas de metros, un dispositivo parado justo en el borde produce una oscilación de entradas y salidas que en una aplicación de avisos se traduce en un bombardeo de notificaciones idénticas.
+
+```kotlin
+val zona = Geofence.Builder()
+    .setRequestId("almacen-central")
+    .setCircularRegion(latitud, longitud, 150f)
+    .setExpirationDuration(TimeUnit.DAYS.toMillis(30))
+    .setTransitionTypes(
+        Geofence.GEOFENCE_TRANSITION_ENTER or Geofence.GEOFENCE_TRANSITION_DWELL
+    )
+    .setLoiteringDelay(TimeUnit.MINUTES.toMillis(2).toInt())
+    .setNotificationResponsiveness(TimeUnit.MINUTES.toMillis(5).toInt())
+    .build()
+```
+
+Tres parámetros de ese fragmento gobiernan la calidad del resultado. El radio debe superar con holgura la incertidumbre típica de la zona: por debajo de unos cien metros en entorno urbano los falsos positivos se disparan, y un radio de veinte metros es sencillamente inviable en la práctica. El retardo de permanencia convierte el evento en una afirmación con sentido —el usuario está aquí, no ha pasado por aquí— y filtra a quien atraviesa la zona en coche. La capacidad de respuesta es una promesa a la inversa: al pedir una latencia relajada se autoriza al sistema a comprobar con menos frecuencia y a agrupar el trabajo, lo que reduce el consumo de forma directa.
+
+<Callout type="tip" title="Prefiere permanencia a entrada, y radios generosos">
+La combinación de entrada más permanencia con un retardo de uno o dos minutos y un radio holgado elimina la inmensa mayoría de los disparos espurios sin perder ningún evento real. Se puede afinar más aún ignorando en la lógica de negocio toda transición cuya posición asociada llegue con una `accuracy` mayor que el propio radio: en ese caso el sistema está afirmando algo que sus datos no sostienen, y actuar sobre ello es amplificar ruido. Un aviso que llega dos minutos tarde y es correcto vale infinitamente más que cinco avisos inmediatos de los que cuatro son falsos.
+</Callout>
+
+## Registro, entrega y el problema de la persistencia
+
+El registro exige el permiso de ubicación en segundo plano, porque el evento debe poder llegar con la aplicación cerrada. La entrega se hace mediante un `PendingIntent` mutable dirigido a un `BroadcastReceiver`, nunca a un `Service` que pueda ser abortado por las restricciones de arranque en segundo plano.
+
+```kotlin
+val peticion = GeofencingRequest.Builder()
+    .setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_DWELL)
+    .addGeofences(zonas)
+    .build()
+
+geofencingClient.addGeofences(peticion, pendingIntent)
+    .addOnFailureListener { error -> registrarFallo(error) }
+```
+
+El disparador inicial define qué ocurre si el dispositivo ya está dentro de la zona en el momento del registro, un detalle que decide si el usuario recibe un aviso nada más instalar la aplicación. En el receptor, la primera obligación es comprobar el error antes de leer nada: un `GeofencingEvent` con error indica típicamente que la ubicación del sistema está desactivada o que se ha excedido algún límite, y leer las transiciones en ese estado produce datos inventados.
+
+```kotlin
+class ZonasReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val evento = GeofencingEvent.fromIntent(intent) ?: return
+        if (evento.hasError()) return registrarError(evento.errorCode)
+
+        val ids = evento.triggeringGeofences.orEmpty().map { it.requestId }
+        when (evento.geofenceTransition) {
+            Geofence.GEOFENCE_TRANSITION_DWELL -> confirmarLlegada(ids)
+            Geofence.GEOFENCE_TRANSITION_EXIT -> confirmarSalida(ids)
+        }
+    }
+}
+```
+
+Hay tres realidades operativas que separan un prototipo de una implementación de producción. La primera es el límite: cada aplicación puede tener un número acotado de geofences activos por usuario, del orden de un centenar, lo que obliga a mantener solo las zonas relevantes cerca de la posición actual y a rotarlas conforme el usuario se desplaza. La segunda es la volatilidad: los geofences no sobreviven a un reinicio del dispositivo, ni a la desactivación y reactivación de la ubicación, ni a un borrado de datos de los servicios de Google Play; hay que persistir las definiciones y reinscribirlas al recibir el evento de arranque completado. La tercera es la latencia real: entre el cruce físico y la entrega pueden pasar minutos, y en modo de ahorro extremo bastante más, de modo que ninguna funcionalidad crítica en tiempo puede descansar sobre esta API.
+
+<Mermaid code={`flowchart TD
+  A[definiciones persistidas en base de datos] --> B[registro de geofences]
+  B --> C[vigilancia del sistema en bajo consumo]
+  C --> D{transicion detectada}
+  D -- entrada o permanencia --> E[BroadcastReceiver]
+  D -- salida --> E
+  E --> F[logica de negocio]
+  G[reinicio del dispositivo] --> A
+  style C fill:#89b4fa,color:#11111b
+  style F fill:#a6e3a1,color:#11111b`} />
+
+## Reconocimiento de actividad y la modulación de la cadencia
+
+El reconocimiento de actividad responde a una pregunta ortogonal a la ubicación: no dónde está el usuario, sino qué está haciendo. Un clasificador que consume los sensores inerciales en el coprocesador de bajo consumo infiere si el dispositivo está quieto, caminando, corriendo, en bicicleta o en un vehículo, con una confianza asociada. Requiere el permiso `ACTIVITY_RECOGNITION`, que se solicita en tiempo de ejecución como cualquier permiso peligroso.
+
+La API de transiciones es preferible a la de actualizaciones periódicas por la misma razón que un geofence es preferible a sondear: en lugar de recibir un flujo continuo de clasificaciones que hay que filtrar, se declaran los cambios de interés y el sistema entrega solo cuando ocurren.
+
+```kotlin
+val transiciones = listOf(
+    ActivityTransition.Builder()
+        .setActivityType(DetectedActivity.IN_VEHICLE)
+        .setActivityTransition(ActivityTransition.ACTIVITY_TRANSITION_ENTER)
+        .build(),
+    ActivityTransition.Builder()
+        .setActivityType(DetectedActivity.STILL)
+        .setActivityTransition(ActivityTransition.ACTIVITY_TRANSITION_ENTER)
+        .build(),
+)
+
+ActivityRecognition.getClient(context)
+    .requestActivityTransitionUpdates(
+        ActivityTransitionRequest(transiciones),
+        pendingIntent,
+    )
+```
+
+De aquí sale el patrón que redefine el consumo de una aplicación de movilidad. En lugar de una cadencia fija, la actividad detectada gobierna la política de ubicación: quieto significa suspender las actualizaciones por completo, porque una posición repetida no aporta información; caminando justifica una cadencia media con precisión equilibrada; en vehículo pide alta precisión y frecuencia porque la posición caduca en segundos. El resultado no es un ahorro marginal, sino la eliminación de la mayor parte del gasto, dado que en un día normal el dispositivo pasa la mayoría de las horas inmóvil.
+
+<Cards>
+  <Card icon="🛑" title="Quieto">
+    Suspender actualizaciones. La última posición sigue siendo válida y cada nueva medición repite información conocida.
+  </Card>
+  <Card icon="🚶" title="A pie">
+    Cadencia media con precisión equilibrada. La velocidad baja hace innecesaria la alta frecuencia.
+  </Card>
+  <Card icon="🚗" title="En vehículo">
+    Alta precisión y frecuencia. Es el único régimen que justifica el GNSS continuo, y suele coincidir con carga.
+  </Card>
+  <Card icon="🧭" title="Zonas">
+    Geofences para eventos discretos y rotación por proximidad, con la definición siempre persistida en almacenamiento local.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Delegar la vigilancia es cambiar de modelo, no ahorrar un poco">
+La diferencia entre sondear y suscribirse parece cuantitativa y es cualitativa. Cuando la aplicación sondea, asume la responsabilidad de estar despierta, y esa responsabilidad choca de frente con un sistema operativo cuyo objetivo declarado es que nada esté despierto sin motivo. La aplicación acaba peleando contra el planificador, contra el reposo profundo y contra las restricciones de segundo plano, y esa pelea se pierde siempre: el sistema no negocia, estrangula. Cuando la aplicación describe un evento y se retira, invierte por completo la relación. Ya no compite con el sistema por el procesador, sino que se apoya en una vigilancia que el hardware realiza de todos modos por debajo del umbral de consumo perceptible, y solo existe durante los milisegundos en los que hay algo que decidir. Ahí está la clave económica: el coste deja de ser proporcional al tiempo y pasa a ser proporcional a los eventos relevantes, que son pocos. Interiorizar esto reordena el diseño entero. La pregunta deja de ser cada cuánto necesito mirar y pasa a ser qué cambio del mundo me obliga a actuar. Casi todo requisito que suena a vigilancia continua —avisar al llegar, registrar la salida, detectar que el usuario ha empezado a conducir— es en realidad un requisito de eventos discretos mal formulado. Y una aplicación construida sobre eventos discretos no solo consume una fracción: sobrevive a los cambios de plataforma, porque cada versión de Android endurece el sondeo y refina, en cambio, las APIs de suscripción.
+</Callout>
+
+<Reto title="Sustituye el sondeo por eventos">
+1. Registra una zona con radio de cincuenta metros y otra de doscientos en el mismo punto y compara durante una semana el número de transiciones espurias.
+2. Añade permanencia con dos minutos de retardo y mide cuántos avisos falsos desaparecen frente a usar solo entrada.
+3. Persiste las definiciones y reinscríbelas al recibir el arranque completado; reinicia el terminal y verifica que las zonas siguen activas.
+4. Implementa la rotación por proximidad para respetar el límite de geofences activos con un catálogo de varios miles de puntos.
+5. Conecta las transiciones de actividad a la política de ubicación y compara el consumo diario frente a una cadencia fija.
+</Reto>

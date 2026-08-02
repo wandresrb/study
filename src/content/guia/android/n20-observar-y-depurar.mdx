@@ -1,0 +1,157 @@
+---
+title: "Observar y depurar: estados, progreso y la cola real"
+description: "Un sistema que ejecuta trabajo cuando le parece oportuno y en un proceso que puede no existir es, por construcción, un sistema opaco: cuando algo no ocurre no hay excepción, no hay traza y no hay nada que mirar. Esta lección cierra el nivel construyendo la observabilidad que faltaba: los seis estados de un trabajo y sus transiciones, la observación reactiva desde la interfaz por identificador, etiqueta o nombre único, la publicación de progreso desde dentro del trabajador, y el conjunto de herramientas externas —el inspector de tareas, el volcado del planificador del sistema y la emisión de diagnóstico— con los que se ve la cola desde fuera."
+subject: android
+level: 20
+order: 5
+icon: "20.5"
+duracion: "19 min"
+---
+
+<Lead>
+El modo de fallo característico de este sistema no es el error, es el silencio. Un trabajo mal restringido no se queja: espera. Un trabajo cuyo nombre único quedó atrapado en una cadena fallida no avisa: nunca se ejecuta. Un dispositivo con una capa agresiva de gestión de energía no informa de que ha matado tu trabajo: simplemente no aparece nada en el servidor. En los tres casos el síntoma es idéntico e igual de inútil: el usuario dice que su foto no se subió, tu panel de errores está limpio y tu registro no contiene una sola línea, porque el código que habría escrito esa línea no llegó a ejecutarse. Frente a esa opacidad estructural no valen las técnicas habituales de depuración, que asumen que el fallo deja huella. Hacen falta dos cosas distintas: un canal por el que el estado del trabajo suba hasta la interfaz mientras ocurre, y un conjunto de herramientas que permitan interrogar al planificador del sistema desde fuera del proceso, incluso cuando el proceso no existe.
+</Lead>
+
+<Objetivos>
+
+- Distinguir los seis estados de un trabajo y las transiciones legales entre ellos.
+- Observar el estado de forma reactiva por identificador, por etiqueta y por nombre único.
+- Publicar progreso desde el trabajador y consumirlo desde la interfaz con su ciclo de vida.
+- Interrogar la cola desde fuera con el inspector, el volcado del planificador y la emisión de diagnóstico.
+
+</Objetivos>
+
+## Los seis estados y sus transiciones
+
+Todo trabajo vive en uno de seis estados, tres de ellos transitorios y tres terminales. Bloqueado significa que tiene dependencias sin satisfacer dentro de una cadena. Encolado significa que las dependencias están resueltas y solo faltan las restricciones o el retraso. En ejecución significa que el trabajador está corriendo ahora mismo. Los terminales son terminado con éxito, fallido y cancelado.
+
+La primera propiedad importante es que los estados terminales son absorbentes: de ellos no se sale nunca. Un trabajo cancelado no se reanuda, y volver a encolar la misma petición crea un trabajo nuevo con un identificador nuevo. La segunda es que el reintento no es un estado: un trabajo que devolvió reintento vuelve a encolado, y la única evidencia de lo ocurrido es el contador de intentos.
+
+<Mermaid code={`stateDiagram-v2
+  [*] --> BLOQUEADO: encolado dentro de una cadena
+  [*] --> ENCOLADO: encolado sin dependencias
+  BLOQUEADO --> ENCOLADO: los padres terminan con exito
+  ENCOLADO --> EJECUTANDO: restricciones cumplidas
+  EJECUTANDO --> EXITO: Result success
+  EJECUTANDO --> ENCOLADO: Result retry con retroceso
+  EJECUTANDO --> FALLIDO: Result failure o excepcion
+  BLOQUEADO --> FALLIDO: un padre fallo
+  ENCOLADO --> CANCELADO: cancelacion explicita
+  EJECUTANDO --> CANCELADO: cancelacion explicita
+  EXITO --> [*]
+  FALLIDO --> [*]
+  CANCELADO --> [*]`} />
+
+La tercera propiedad es la que más desconcierta durante la depuración: la información de los trabajos terminados no se conserva indefinidamente. Pasados unos días, la librería poda de su base de datos los registros terminales para que no crezca sin límite, y existe además una operación explícita de poda. La consecuencia práctica es que no puedes usar esta base de datos como historial de tu aplicación, y que un trabajo que buscas y no aparece puede haber existido, haberse ejecutado correctamente y haber sido podado.
+
+## Observar desde la interfaz
+
+La observación se hace pidiendo flujos a la instancia de la librería, y hay tres formas de identificar lo que se quiere observar, cada una con su ámbito.
+
+```kotlin
+class SubidasViewModel(app: Application) : AndroidViewModel(app) {
+    private val wm = WorkManager.getInstance(app)
+
+    val estadoSincronizacion = wm
+        .getWorkInfosForUniqueWorkFlow("sincronizacion")
+        .map { infos -> infos.firstOrNull()?.state }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+}
+```
+
+Por identificador se observa una ejecución concreta y es lo adecuado cuando la interfaz encoló el trabajo y guardó su identificador. Por etiqueta se observan todos los trabajos que compartan una marca, lo que sirve para agregados: cuántas subidas hay pendientes en total. Por nombre único se observa la cadena o el trabajo que ocupa ese nombre, y es la forma más robusta porque no depende de que nadie haya guardado un identificador, cosa que en un arranque en frío no ha ocurrido.
+
+Cada elemento observado trae bastante más que el estado: el contenedor de salida cuando ha terminado, el de progreso cuando está corriendo, las etiquetas, el número de intento y, en las versiones recientes, el motivo por el que fue detenido la última vez. Ese último dato es especialmente valioso porque distingue una cancelación del usuario de un tiempo agotado o de una restricción que se rompió a mitad.
+
+En la capa de interfaz, el flujo se recoge respetando el ciclo de vida, para no seguir observando con la pantalla apagada.
+
+```kotlin
+val estado by viewModel.estadoSincronizacion.collectAsStateWithLifecycle()
+
+when (estado) {
+    WorkInfo.State.RUNNING -> IndicadorDeProgreso()
+    WorkInfo.State.FAILED -> MensajeDeError()
+    else -> Unit
+}
+```
+
+<Callout type="warn" title="No confundas el estado del trabajo con el estado de tus datos">
+Que un trabajo esté en éxito no significa que tu interfaz deba pintar la foto como subida leyendo esa señal. El trabajador debe escribir su efecto en tu base de datos, y la interfaz debe observar tu base de datos. El estado del trabajo sirve para mostrar actividad y errores, no para representar hechos del dominio: recuerda que se poda a los pocos días y que en un arranque en frío puede no existir aunque el efecto sí ocurriera.
+</Callout>
+
+## Publicar y consumir progreso
+
+Un trabajo de varios minutos que no informa de nada produce la peor interfaz posible: una rueda girando sin fin. Desde dentro del trabajador se puede publicar un contenedor de progreso tantas veces como haga falta, y ese contenedor llega a quien observe.
+
+```kotlin
+override suspend fun doWork(): Result {
+    val total = archivos.size
+    archivos.forEachIndexed { indice, archivo ->
+        if (isStopped) return Result.failure()
+        comprimir(archivo)
+        setProgress(workDataOf(PROGRESO to (indice + 1) * 100 / total))
+    }
+    return Result.success()
+}
+```
+
+Dos propiedades de este mecanismo conviene tenerlas claras. La primera es que el progreso es efímero: se borra en cuanto el trabajo alcanza un estado terminal, de modo que quien observe verá el último valor y después un contenedor vacío junto con el estado final. No sirve para almacenar el resultado, que es el papel del contenedor de salida. La segunda es que cada publicación es una escritura en la base de datos y una notificación a los observadores: publicar en cada iteración de un bucle de diez mil elementos convierte el progreso en el cuello de botella del trabajo. Limitar la frecuencia, publicando por porcentaje cambiado o cada cierto número de elementos, es obligatorio en cuanto el bucle es grande.
+
+Hay además un patrón que evita el problema entero y que conviene considerar antes: si el trabajo ya escribe su avance en tu propia base de datos —marcando cada archivo como procesado, por ejemplo—, la interfaz puede observar esa tabla y no necesita el canal de progreso en absoluto. El progreso de la librería es más cómodo, pero es telemetría; tu base de datos es la verdad.
+
+## Ver la cola desde fuera
+
+Cuando el problema es que algo no ocurre, la observación desde la interfaz no ayuda: hay que salir del proceso y preguntar al sistema. Cuatro herramientas, de la más cómoda a la más cruda.
+
+<Cards>
+  <Card icon="🔎" title="Inspector de tareas">
+    Integrado en el entorno de desarrollo, muestra en vivo cada trabajo con su estado, su cadena, su entrada y su salida, y dibuja el grafo de dependencias. Es el primer sitio donde mirar.
+  </Card>
+  <Card icon="🩺" title="Emisión de diagnóstico">
+    Una emisión que hace volcar al registro los trabajos completados en el último día, los que están en ejecución y los planificados. Funciona sin depurador y sirve en compilaciones de prueba.
+  </Card>
+  <Card icon="🗓️" title="Volcado del planificador">
+    Muestra la cola real del sistema, no la de la librería: qué tareas hay registradas, con qué restricciones y cuáles están listas. Es donde se ve por qué algo no arranca.
+  </Card>
+  <Card icon="🧪" title="Pruebas instrumentadas">
+    El ayudante de inicialización de pruebas expone un controlador que permite dar por cumplidas las restricciones, el retraso o el periodo, y ejecutar el trabajo de forma determinista.
+  </Card>
+</Cards>
+
+La emisión de diagnóstico es la más desconocida y la más útil en un dispositivo real donde el inspector no está disponible.
+
+```bash
+adb shell am broadcast \
+  -a "androidx.work.diagnostics.REQUEST_DIAGNOSTICS" \
+  -p com.ejemplo.miapp
+
+adb logcat -s WM-DiagnosticsWrkr
+```
+
+El volcado del planificador del sistema responde a la pregunta contraria: no qué cree la librería, sino qué sabe el sistema. Filtrando por el paquete se ven las tareas registradas con sus restricciones y con las banderas que indican cuáles están satisfechas, lo que permite identificar de un vistazo la condición que bloquea.
+
+```bash
+adb shell dumpsys jobscheduler | grep -A 30 com.ejemplo.miapp
+```
+
+Para reproducir condiciones que en la mesa no se dan nunca, el terminal permite además forzarlas: simular que el dispositivo se desconectó de la corriente, empujarlo al modo de reposo profundo o forzar la ejecución inmediata de una tarea concreta identificada en el volcado anterior. Sin estas herramientas, probar una restricción de reposo exige dejar el móvil quieto una hora.
+
+```bash
+adb shell dumpsys battery unplug
+adb shell dumpsys deviceidle force-idle
+adb shell cmd jobscheduler run -f com.ejemplo.miapp 12345
+```
+
+Por último, las pruebas. La inicialización de pruebas sustituye el ejecutor por uno síncrono y expone un controlador que permite declarar cumplidas las restricciones o vencido el retraso, con lo que un trabajo que en producción tardaría horas se ejecuta en el acto y de forma determinista. Es la única manera razonable de tener pruebas de cadenas completas, y su ausencia es la razón por la que tantos equipos descubren la semántica del corte transitivo en producción.
+
+<Callout type="dios" title="En un sistema asincrono y opaco, la observabilidad no es una herramienta: es parte del diseño">
+Hay una razón profunda por la que esta lección cierra el nivel y no se limita a listar utilidades de depuración, y es que la propiedad que hace valioso a este sistema es la misma que lo hace inauditable. Un sistema síncrono es fácil de depurar porque la causa y el efecto comparten pila, tiempo y proceso: cuando algo falla, hay un punto del programa donde estaba ocurriendo, hay una traza que lo demuestra y hay un instante concreto que examinar. Al desacoplar la invocación de la ejecución, se rompen las tres cosas a la vez. El fallo ya no tiene pila, porque quien encoló hace tres horas ya no existe. No tiene instante, porque la ejecución dependía de condiciones del entorno que nadie registró. Y muchas veces no tiene ni siquiera evento, porque el modo de fallo dominante no es que algo salga mal sino que algo no llegue a pasar, y la ausencia no genera trazas. Esta última asimetría es la clave y merece formularse con precisión: los sistemas síncronos fallan produciendo excepciones, y los sistemas diferidos fallan produciendo nada. Ninguna herramienta que espere una señal puede detectar la falta de señal. De ahí se sigue el corolario que separa a los equipos que operan estos sistemas con tranquilidad de los que viven con una ansiedad de fondo: la observabilidad del trabajo diferido no se añade cuando aparece el problema, porque cuando aparece el problema no hay nada que mirar. Se diseña antes, y consiste en tres decisiones que hay que tomar mientras se escribe el trabajador, no después. La primera es que todo efecto se escriba en tu propio almacenamiento persistente con marca de tiempo, de modo que la pregunta ocurrió esto y cuándo tenga respuesta local aunque la librería haya podado su registro. La segunda es que todo resultado terminal, especialmente el fallo, envíe una señal a tu sistema de telemetría con su motivo y su contador de intentos, porque el fallo definitivo de un trabajo es un incidente y hoy en la mayoría de las aplicaciones ni siquiera se cuenta. Y la tercera, la más olvidada, es medir el retraso: registrar el tiempo entre encolado y ejecución completada, y mirar su distribución, no su media. Un sistema en el que el percentil cincuenta es de dos minutos y el noventa y nueve de cuarenta horas es un sistema que funciona para ti en tu mesa y está roto para una fracción de usuarios que nunca te lo dirá, porque desde su punto de vista la aplicación no falló: simplemente no hizo nada.
+</Callout>
+
+<Reto title="Hazte visible el silencio">
+1. Observa un mismo trabajo por identificador, por etiqueta y por nombre único, y razona cuál de los tres sobrevive a un arranque en frío de la aplicación.
+2. Publica progreso en cada iteración de un bucle grande, mide el tiempo total y compáralo con una versión que publique cada cierto porcentaje.
+3. Encola un trabajo con una restricción imposible y localiza en el volcado del planificador la condición exacta que lo mantiene bloqueado.
+4. Lanza la emisión de diagnóstico en un dispositivo real y compara lo que informa con lo que muestra el inspector de tareas.
+5. Escribe una prueba instrumentada de una cadena de tres etapas forzando restricciones cumplidas, y verifica que un fallo en la segunda deja la tercera sin ejecutar.
+</Reto>

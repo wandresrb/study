@@ -1,0 +1,150 @@
+---
+title: "Cadenas: dependencias, datos y unicidad"
+description: "Casi ningún proceso real de segundo plano cabe en un solo trabajador: comprimir tres archivos, subirlos, avisar al servidor y limpiar el temporal son cuatro etapas con dependencias entre ellas y con paralelismo dentro. Esta lección construye grafos de trabajo con encadenamiento y paralelización, explica cómo viaja la salida de un trabajo a la entrada del siguiente y qué ocurre cuando varios padres escriben la misma clave, analiza la propagación de fallos y cancelaciones a lo largo del grafo, y cierra con el trabajo único y sus políticas de conflicto, que es el mecanismo que impide que la misma sincronización se lance quince veces."
+subject: android
+level: 20
+order: 4
+icon: "20.4"
+duracion: "20 min"
+---
+
+<Lead>
+Un trabajador que hace demasiado es frágil por una razón aritmética antes que estética: si una tarea de cuatro etapas vive en una sola función y falla en la cuarta, el reintento repite las cuatro, y si el trabajador excede el límite de diez minutos lo pierde todo. Partirla en etapas convierte cada una en una unidad reintentable por separado, con sus propias restricciones y su propio presupuesto de tiempo. Pero partir tiene un precio: aparecen dependencias, aparece la necesidad de pasar información de una etapa a la siguiente y aparece la pregunta de qué debe ocurrir con el resto cuando una etapa fracasa. La respuesta de esta librería es un grafo dirigido acíclico persistido en disco, lo que significa algo bastante notable: la topología completa de tu proceso —qué depende de qué, qué puede ir en paralelo, qué recibe la salida de quién— sobrevive a la muerte del proceso y al reinicio del dispositivo exactamente igual que sobrevive un trabajo suelto.
+</Lead>
+
+<Objetivos>
+
+- Construir grafos de trabajo combinando etapas secuenciales y etapas paralelas.
+- Pasar datos de una etapa a la siguiente y resolver la colisión de claves con un fusionador de entrada.
+- Predecir la propagación de fallos, reintentos y cancelaciones a lo largo del grafo.
+- Aplicar el trabajo único con la política de conflicto adecuada a cada caso.
+
+</Objetivos>
+
+## Encadenar y paralelizar
+
+La construcción de una cadena empieza con una llamada que devuelve un objeto de continuación en lugar de encolar directamente. Sobre esa continuación se añaden etapas, y solo al final se encola el conjunto. El paralelismo se expresa pasando una lista donde se esperaría un solo trabajo: todos los elementos de la lista arrancan a la vez y la etapa siguiente espera a que todos terminen con éxito.
+
+```kotlin
+WorkManager.getInstance(context)
+    .beginWith(listOf(comprimirFoto1, comprimirFoto2, comprimirFoto3))
+    .then(subirLote)
+    .then(limpiarTemporales)
+    .enqueue()
+```
+
+Ese fragmento describe un grafo de cinco nodos con una barrera de sincronización implícita. Las tres compresiones son independientes y el sistema puede ejecutarlas simultáneamente si tiene recursos; la subida no empezará hasta que las tres hayan devuelto éxito; la limpieza no empezará hasta que la subida haya terminado. Nada de eso hay que coordinarlo a mano, y nada de eso se pierde si el proceso muere entre la segunda compresión y la tercera.
+
+Cuando dos cadenas independientes deben confluir en una etapa común existe una operación de combinación que toma varias continuaciones y produce una sola.
+
+```kotlin
+val ramaLocal = wm.beginWith(exportarBaseDeDatos)
+val ramaRemota = wm.beginWith(descargarPlantilla)
+
+WorkContinuation.combine(listOf(ramaLocal, ramaRemota))
+    .then(generarInforme)
+    .enqueue()
+```
+
+Conviene entender qué es exactamente lo que se persiste, porque explica una propiedad valiosa. La base de datos interna no guarda solo las filas de cada trabajo: guarda también las aristas de dependencia entre ellos. Un trabajo con dependencias no satisfechas ni siquiera es candidato para el planificador del sistema; permanece bloqueado en la base de datos hasta que sus padres terminen, y en ese momento se le entrega al planificador con sus propias restricciones. Es decir, hay dos niveles de bloqueo independientes: las dependencias del grafo y las restricciones del entorno.
+
+Una última observación sobre granularidad. Partir en exceso también tiene coste: cada etapa implica una escritura en la base de datos, una entrega al planificador del sistema y, potencialmente, un despertar del proceso. Una cadena de veinte trabajos triviales es más lenta y más cara que un solo trabajador que haga lo mismo en un bucle. El criterio razonable es que cada etapa sea una unidad que tenga sentido reintentar por separado y que pueda tener restricciones distintas de sus vecinas.
+
+## Cómo viajan los datos
+
+La salida de un trabajo se convierte en la entrada del siguiente de forma automática, sin que haya que declarar nada. Un trabajo que devuelve éxito con un contenedor de datos hace que ese contenedor llegue al trabajo dependiente como su entrada, fusionado con lo que ya tuviera declarado.
+
+```kotlin
+// etapa uno
+return Result.success(workDataOf("rutaComprimida" to destino.path))
+
+// etapa dos
+val ruta = inputData.getString("rutaComprimida") ?: return Result.failure()
+```
+
+El problema aparece cuando una etapa tiene varios padres, que es exactamente el caso del ejemplo de las tres compresiones: los tres trabajos devuelven la misma clave con valores distintos, y hay que decidir qué llega a la subida. El comportamiento por defecto es la sobrescritura: se van aplicando las salidas y la última en llegar gana, lo que en presencia de paralelismo significa que el resultado depende del orden de finalización y es por tanto no determinista. Casi nunca es lo que quieres.
+
+La alternativa es el fusionador que crea arrays: ante la misma clave en varios padres, produce un array con todos los valores. Se declara en el constructor de la petición hija.
+
+```kotlin
+val subirLote = OneTimeWorkRequestBuilder<SubirLoteWorker>()
+    .setInputMerger(ArrayCreatingInputMerger::class)
+    .build()
+
+// dentro del trabajador hijo
+val rutas = inputData.getStringArray("rutaComprimida") ?: emptyArray()
+```
+
+<Callout type="warn" title="El fusionador de arrays cambia el tipo de todas las claves">
+Al declararlo, cualquier clave presente en más de un padre pasa a leerse como array, incluidas las que tú esperabas escalares. Y si una clave viene de un solo padre, sigue siendo escalar. Esa asimetría produce lecturas nulas silenciosas que no lanzan excepción: el captador devuelve el valor por defecto y el trabajador continúa con datos vacíos. Si la etapa hija depende de varios padres, escribe sus lecturas asumiendo array desde el principio.
+</Callout>
+
+Merece la pena insistir en el límite de diez kilobytes también aquí, porque en una cadena se acumula: la entrada efectiva de una etapa es la unión de su entrada declarada y las salidas de todos sus padres. Una cadena larga que va arrastrando datos etapa tras etapa acaba topando con el límite en un punto que depende de los datos reales, lo que produce fallos que solo aparecen con cierta clase de usuario. La disciplina de pasar identificadores y no contenidos resuelve el problema de raíz.
+
+<Mermaid code={`flowchart TD
+  C1[Comprimir foto 1] --> S[Subir lote]
+  C2[Comprimir foto 2] --> S
+  C3[Comprimir foto 3] --> S
+  S --> N[Notificar al servidor]
+  N --> L[Limpiar temporales]
+  C1 -.salida rutaComprimida.-> M[Fusionador de arrays]
+  C2 -.salida rutaComprimida.-> M
+  C3 -.salida rutaComprimida.-> M
+  M -.entrada como array.-> S
+  style S fill:#89b4fa,color:#11111b
+  style M fill:#f9e2af,color:#11111b`} />
+
+## Fallo, reintento y cancelación a lo largo del grafo
+
+Las tres reglas de propagación son cortas y hay que conocerlas de memoria porque determinan el comportamiento de todo lo que construyas.
+
+La primera: si una etapa devuelve reintento, no pasa nada aguas abajo. El trabajo vuelve a la cola con su retroceso, sus dependientes siguen simplemente bloqueados y la cadena continúa cuando esa etapa acabe teniendo éxito. Es el caso benigno.
+
+La segunda: si una etapa devuelve fallo definitivo, todos sus dependientes —directos e indirectos— pasan a estado fallido sin llegar a ejecutarse nunca. La cadena se corta y el corte es transitivo. Esto convierte la elección entre reintento y fallo, que en un trabajo suelto era una decisión local, en una decisión con alcance global sobre el grafo.
+
+La tercera: cancelar cualquier trabajo de la cadena cancela también a sus dependientes. Cancelar en cambio no afecta a los padres, que ya terminaron o siguen su curso.
+
+De estas reglas se deriva una consecuencia práctica sobre la limpieza. Si tu cadena crea archivos temporales en la primera etapa y los borra en la última, un fallo en la etapa intermedia deja los temporales para siempre, porque la etapa de limpieza nunca se ejecutará. El patrón robusto es no confiar la limpieza a la propia cadena, sino a un trabajo periódico independiente que barra los restos por antigüedad. Dicho de otro modo: en un grafo con corte transitivo, el bloque de limpieza al final no equivale a un bloque de finalización de una función.
+
+## Trabajo único y política de conflicto
+
+El problema que resuelve la unicidad es tan común que merece enunciarse: el usuario pulsa sincronizar cinco veces, o la aplicación encola una sincronización en cada arranque, y acabas con cinco copias del mismo trabajo compitiendo por la red y pisándose los resultados. La solución es dar nombre al trabajo y declarar qué debe ocurrir cuando ya existe otro con ese nombre sin terminar.
+
+```kotlin
+WorkManager.getInstance(context).enqueueUniqueWork(
+    uniqueWorkName = "sincronizacion",
+    existingWorkPolicy = ExistingWorkPolicy.KEEP,
+    request = sincronizar,
+)
+```
+
+<Cards>
+  <Card icon="🛡️" title="Mantener">
+    Si ya hay uno en curso o pendiente, la nueva petición se descarta en silencio. Es lo correcto para sincronizaciones idempotentes donde una ya en marcha hace el mismo trabajo.
+  </Card>
+  <Card icon="♻️" title="Reemplazar">
+    Cancela el existente y encola el nuevo. Correcto cuando la petición nueva invalida a la vieja, por ejemplo al cambiar los parámetros de una búsqueda.
+  </Card>
+  <Card icon="➕" title="Añadir">
+    Encola el nuevo como dependiente del existente, formando una cola secuencial con ese nombre. Correcto para operaciones que deben ocurrir todas y en orden.
+  </Card>
+  <Card icon="🧹" title="Añadir o reemplazar">
+    Como añadir, pero si el trabajo existente terminó en fallo o cancelación, empieza una cadena nueva en vez de heredar el estado inservible.
+  </Card>
+</Cards>
+
+La diferencia entre las dos últimas es más importante de lo que su nombre sugiere y ha causado bastantes incidentes. Con la política de añadir a secas, un fallo en cualquier eslabón deja el nombre en un estado del que ningún trabajo posterior podrá salir: todo lo que se añada después será dependiente de una cadena fallida y por tanto fallará sin ejecutarse. La variante que reemplaza ante estado terminal existe precisamente para eso y es, en la mayoría de los casos, la elección sensata.
+
+El trabajo periódico tiene su propio juego de políticas, más corto. Mantener conserva el existente con su configuración original, y actualizar aplica los cambios de intervalo o restricciones sin perder el ciclo en curso. Esta segunda es la que corresponde cuando publicas una versión que cambia la frecuencia de una sincronización ya instalada en millones de dispositivos; usar la de reemplazo agresivo en cada arranque produce un trabajo que reinicia su periodo continuamente y, en el caso extremo, no llega a ejecutarse nunca.
+
+<Callout type="dios" title="Una cadena es un plan de ejecución que sobrevive a su planificador">
+Conviene apreciar lo que se ha construido aquí, porque es más raro de lo que parece y porque encuadra todo el nivel. En cualquier programa convencional, la estructura de una computación compleja —esto antes que aquello, estas tres cosas a la vez, esta recibe el resultado de aquella— vive en la pila de llamadas y en las variables locales del proceso que la ejecuta. Esa estructura es real mientras el proceso vive y desaparece instantáneamente y sin residuo cuando el proceso muere; no existe en ningún sitio del que se pueda recuperar, porque nunca fue un dato, siempre fue una forma del control. Lo que hace una cadena de trabajo es exactamente lo contrario: reifica el control. Convierte las dependencias entre etapas en filas de una base de datos, el paso de resultados en registros serializados, y el orden de ejecución en un grafo consultable. A partir de ese momento el plan deja de ser una propiedad del proceso y pasa a ser una propiedad del dispositivo, con una consecuencia asombrosa que es fácil dar por sentada: puedes matar el proceso a mitad de la segunda etapa de un grafo de nueve, reiniciar el teléfono, actualizar la aplicación y al volver la cadena continúa por donde iba, porque nada de lo que se perdió era necesario para saber qué venía después. Es el mismo movimiento intelectual que hay detrás de un registro de transacciones en una base de datos, de un motor de flujos de trabajo en un servidor o de una cola durable en un sistema distribuido, y no es casual: en cuanto un sistema admite que sus ejecutores son mortales, la única salida es escribir el plan fuera de ellos. La contrapartida es igual de instructiva y explica todas las asperezas de esta API. Un plan externalizado solo puede hablar de lo que quepa en disco, y de ahí que los datos sean primitivos y limitados; solo puede referirse a código por su nombre, y de ahí la instanciación por reflexión y la incomodidad con la inyección de dependencias; y solo puede tener una semántica de fallo declarada de antemano, y de ahí que el corte transitivo y las políticas de conflicto tengan que elegirse al construir y no manejarse con un bloque de captura cuando ocurren. Nada de eso es torpeza de diseño: es el precio exacto de que tu plan siga existiendo cuando ya no queda nadie ejecutándolo.
+</Callout>
+
+<Reto title="Construye un grafo que sobreviva">
+1. Implementa la cadena de tres compresiones paralelas más subida más limpieza y comprueba en la base de datos interna que las aristas están persistidas.
+2. Ejecuta la cadena sin fusionador de arrays y observa que la subida solo recibe una de las tres rutas, y que cuál recibe varía entre ejecuciones.
+3. Fuerza un fallo definitivo en la etapa de subida y verifica que la limpieza queda en estado fallido sin haberse ejecutado nunca.
+4. Mata el proceso entre dos etapas y confirma que la cadena continúa por donde iba al volver a arrancar.
+5. Encola cinco veces el mismo trabajo único con cada una de las cuatro políticas y anota el número de ejecuciones reales de cada caso.
+</Reto>

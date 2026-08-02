@@ -1,0 +1,163 @@
+---
+title: "El ciclo de vida de un cliente"
+description: "Desde que abres un buffer hasta que un servidor responde: resolución de la raíz con root_dir y root_markers, reutilización de procesos, adjuntar y desadjuntar clientes, el evento LspAttach como único punto de enganche fiable y la convivencia de varios servidores sobre el mismo fichero."
+subject: neovim
+level: 20
+order: 2
+icon: "20.2"
+duracion: "25 min"
+---
+
+<Lead>
+Un cliente LSP no es una configuración: es un proceso vivo, con un momento de nacimiento, un conjunto de buffers a los que sirve y una muerte que puede ser ordenada o abrupta. Casi todos los problemas frustrantes del LSP —el servidor que no arranca, el que arranca dos veces, el atajo de teclado que existe en un fichero y no en otro, el formateo que se aplica desde el sitio equivocado— son problemas de ciclo de vida mal entendido. Este capítulo recorre ese ciclo entero, paso a paso, hasta que la pregunta "¿por qué aquí no funciona?" tenga siempre una respuesta que puedas comprobar en lugar de una conjetura que probar a ciegas.
+</Lead>
+
+<Objetivos>
+
+- Reconstruir la cadena completa desde abrir un buffer hasta tener un cliente adjunto y listo.
+- Entender cómo se resuelve la raíz del proyecto y por qué determina cuántos procesos se lanzan.
+- Usar `LspAttach` como único lugar fiable para keymaps y comportamiento dependiente del servidor.
+- Trabajar con varios clientes sobre un mismo buffer sin que se pisen entre ellos.
+
+</Objetivos>
+
+## De abrir un fichero a tener un proceso
+
+Cuando abres un buffer, Neovim recorre los servidores habilitados y descarta los que no declaran ese tipo de fichero. Con los que quedan, ejecuta el paso decisivo: **resolver la raíz**. Partiendo del directorio del fichero, asciende buscando alguno de los nombres de `root_markers` y se detiene en la primera coincidencia. Ese directorio será el `root_dir` del cliente, y es la información que el servidor necesita para saber qué considera "el proyecto": dónde buscar dependencias, qué indexar y a qué se refieren las rutas relativas.
+
+La resolución no siempre es una simple búsqueda ascendente. Cuando la necesitas asíncrona —porque hay que consultar un gestor de paquetes, leer un fichero o ejecutar un comando— puedes sustituir la lista por una función que recibe el número de buffer y una continuación a la que llamar con el resultado.
+
+```lua
+vim.lsp.config("gopls", {
+  cmd = { "gopls" },
+  filetypes = { "go", "gomod" },
+  root_dir = function(bufnr, on_dir)
+    local fname = vim.api.nvim_buf_get_name(bufnr)
+    -- El modulo manda; si no hay modulo, cae al repositorio
+    local mod = vim.fs.root(fname, { "go.mod" })
+    on_dir(mod or vim.fs.root(fname, { ".git" }))
+  end,
+})
+```
+
+Aquí aparece la regla que gobierna cuántos procesos acaban corriendo en tu máquina: **un cliente se identifica por el par formado por su nombre y su raíz**. Si abres treinta ficheros del mismo proyecto, comparten un único proceso, porque los treinta resuelven la misma raíz. Si abres un fichero de otro proyecto, nace un segundo proceso independiente. Y si la resolución falla y devuelve un valor nulo, muchos servidores arrancan igualmente en modo de fichero suelto, con capacidades reducidas y sin visión del conjunto. Ese último caso explica la mayoría de los "el completado funciona a medias": el servidor está vivo, pero no sabe dónde está.
+
+Con la raíz decidida, el cliente lanza el proceso, negocia capacidades con él —un intercambio en el que ambos lados declaran qué saben hacer— y, cuando el servidor confirma que está listo, se adjunta al buffer. A partir de ahí el buffer tiene una lista de clientes asociados que puedes consultar en cualquier momento.
+
+```lua
+for _, c in ipairs(vim.lsp.get_clients({ bufnr = 0 })) do
+  print(c.name, c.id, c.root_dir)
+end
+```
+
+## LspAttach, el único enganche fiable
+
+La secuencia anterior es asíncrona de principio a fin, y esa es la causa del error más extendido de todo el nivel: definir los atajos de teclado del LSP en el mismo lugar donde se declara el servidor. Cuando esa línea se ejecuta no hay cliente, no hay buffer y no hay capacidades negociadas; el atajo acaba siendo global, se aplica a buffers sin servidor y falla silenciosamente. El punto correcto es el evento que el editor dispara exactamente cuando un cliente termina de adjuntarse a un buffer concreto.
+
+```lua
+vim.api.nvim_create_autocmd("LspAttach", {
+  callback = function(args)
+    local bufnr = args.buf
+    local client = vim.lsp.get_client_by_id(args.data.client_id)
+    local function map(lhs, rhs, desc)
+      vim.keymap.set("n", lhs, rhs, { buffer = bufnr, desc = desc })
+    end
+
+    map("grr", vim.lsp.buf.references, "referencias")
+    map("gri", vim.lsp.buf.implementation, "implementaciones")
+    map("grn", vim.lsp.buf.rename, "renombrar")
+
+    -- Comportamiento condicionado a lo que ESTE servidor sabe hacer
+    if client and client:supports_method("textDocument/documentHighlight") then
+      local grupo = vim.api.nvim_create_augroup("resaltado_lsp", { clear = false })
+      vim.api.nvim_create_autocmd("CursorHold", {
+        group = grupo, buffer = bufnr, callback = vim.lsp.buf.document_highlight,
+      })
+      vim.api.nvim_create_autocmd("CursorMoved", {
+        group = grupo, buffer = bufnr, callback = vim.lsp.buf.clear_references,
+      })
+    end
+  end,
+})
+```
+
+Tres propiedades hacen de este evento el lugar correcto y no meramente uno posible. La primera es que llega con el buffer ya decidido, de modo que todo lo que definas puede ser local a él. La segunda es que trae el identificador del cliente, y con él acceso a las capacidades reales negociadas, lo que permite condicionar comportamiento en vez de suponerlo. La tercera es que se dispara **una vez por cada pareja de cliente y buffer**, lo cual es una virtud pero exige cuidado: con dos servidores en un mismo fichero, tu función corre dos veces sobre ese buffer, y cualquier efecto acumulativo se duplica. Su simétrico, `LspDetach`, es el sitio para deshacer lo que no muera con el buffer.
+
+<Mermaid code={`sequenceDiagram
+  participant B as Buffer
+  participant N as Cliente de Neovim
+  participant S as Proceso servidor
+  B->>N: se abre un fichero con filetype conocido
+  N->>N: resuelve la raiz con root markers o root dir
+  N->>S: arranca el proceso o reutiliza uno con la misma raiz
+  N->>S: initialize con las capacidades del cliente
+  S-->>N: initializeResult con sus propias capacidades
+  N->>B: adjunta el cliente y dispara LspAttach
+  B->>N: cambios de texto sincronizados de forma incremental
+  N->>B: LspDetach al cerrar el buffer o parar el cliente`} />
+
+## Varios servidores sobre el mismo fichero
+
+Que un buffer tenga un solo cliente es lo habitual, no lo obligatorio. La relación es de muchos a uno y hay escenarios donde eso es exactamente lo que quieres: un servidor de tipos junto a otro especializado en estilo, un servidor genérico de la plataforma junto a otro específico del framework, o un servidor completo acompañado de uno mínimo que aporta una única capacidad. El cliente reparte cada petición entre todos los que declaran soportarla y compone las respuestas.
+
+Los conflictos aparecen cuando dos servidores reclaman la misma capacidad, y el caso paradigmático es el formateo: dos formateadores discrepando sobre el mismo fichero producen resultados que oscilan según quién responda antes. La solución no es elegir un servidor menos capaz, sino **recortar quirúrgicamente** las capacidades que anuncia uno de ellos en el momento de adjuntarse.
+
+```lua
+vim.api.nvim_create_autocmd("LspAttach", {
+  callback = function(args)
+    local client = vim.lsp.get_client_by_id(args.data.client_id)
+    if client and client.name == "ts_ls" then
+      -- Que formatee el otro; este se queda con los tipos
+      client.server_capabilities.documentFormattingProvider = false
+      client.server_capabilities.documentRangeFormattingProvider = false
+    end
+  end,
+})
+```
+
+La consulta directa a los clientes adjuntos es también la primera herramienta de diagnóstico ante cualquier rareza. Antes de tocar la configuración, verifica el hecho: cuántos clientes hay en el buffer, con qué nombre, con qué raíz y si están vivos. `:checkhealth vim.lsp` presenta esa misma información resuelta, incluyendo la configuración efectiva tras la fusión y la ruta del registro de la sesión, que es donde acaban los mensajes de un servidor que muere al arrancar.
+
+El final del ciclo importa tanto como el principio. Un cliente muere cuando se cierra el último buffer al que servía, cuando lo paras explícitamente o cuando el proceso se cae por su cuenta. Los dos primeros casos son ordenados: se envía la despedida del protocolo, el servidor libera sus recursos y se dispara `LspDetach` en cada buffer afectado. El tercero no lo es, y su síntoma característico es un editor que deja de responder preguntas sin quejarse de nada. Reiniciar un servidor en caliente —parar y volver a adjuntar— es la maniobra que resuelve la mayoría de esos casos y merece un atajo propio, sobre todo cuando trabajas en proyectos cuya configuración cambia mientras están abiertos.
+
+```lua
+vim.api.nvim_create_user_command("LspReiniciar", function()
+  local buf = vim.api.nvim_get_current_buf()
+  local nombres = {}
+  for _, c in ipairs(vim.lsp.get_clients({ bufnr = buf })) do
+    nombres[#nombres + 1] = c.name
+    c:stop()
+  end
+  vim.defer_fn(function() vim.lsp.enable(nombres) end, 500)
+end, { desc = "reinicia los clientes del buffer" })
+```
+
+<Cards>
+<Card icon="🧠" title="Identidad compuesta">
+Un cliente se identifica por nombre y raíz. Mismo proyecto significa un proceso compartido; proyecto distinto significa proceso nuevo, aunque el servidor sea el mismo.
+</Card>
+<Card icon="🧠" title="Raíz nula no es error">
+Si ningún marcador aparece, muchos servidores arrancan en modo de fichero suelto. Están vivos pero ciegos al proyecto, y eso explica casi todo el completado a medias.
+</Card>
+<Card icon="🧠" title="Una vez por pareja">
+`LspAttach` se dispara para cada combinación de cliente y buffer. Con dos servidores tu función corre dos veces sobre el mismo fichero.
+</Card>
+<Card icon="🧠" title="Capacidades, no suposiciones">
+Consulta siempre lo que el servidor negoció antes de usar una función. Suponerlo produce errores que solo aparecen en la máquina de otro.
+</Card>
+</Cards>
+
+<Callout type="warn" title="Nunca definas keymaps de LSP fuera de LspAttach">
+Un atajo definido junto a la declaración del servidor es global: existe en buffers sin cliente, se aplica a ficheros de otro lenguaje y falla sin decir por qué. Además, no puede consultar capacidades, porque en ese instante no hay ningún cliente al que preguntar. Si un atajo depende del LSP, su sitio es el evento de adjuntado y su ámbito es el buffer.
+</Callout>
+
+<Callout type="dios" title="Un editor moderno es un orquestador de procesos ajenos que no controla">
+Detente en lo que realmente describe este capítulo, porque no es una API sino una arquitectura, y una bastante audaz. Tu editor no entiende ninguno de los lenguajes que edita. Ni uno. Lo que hace es lanzar programas escritos por terceros, en lenguajes que le son ajenos, que pueden tardar segundos en estar listos, consumir gigabytes indexando, morir sin avisar o responder tarde y mal, y aun así presentarte una experiencia que parece la de un sistema único y coherente. Todo lo que has visto —la resolución de la raíz, la identidad por nombre y raíz, la negociación de capacidades, el enganche por evento en lugar de por llamada directa, el recorte selectivo de lo que un servidor anuncia— son las costuras de esa ilusión, y ninguna es accidental. La resolución de la raíz existe porque el proceso externo necesita un contexto que el editor no puede inventar. La identidad compuesta existe porque lanzar un proceso por fichero sería insostenible y lanzar uno solo para todo sería incorrecto. El enganche por evento existe porque nada de esto es síncrono y fingir que lo es produce código que funciona en tu máquina y falla en la de otro. El recorte de capacidades existe porque en cuanto admites pluralidad admites conflicto. Esta es, en el fondo, la misma familia de problemas que resuelve un sistema distribuido: participantes heterogéneos, sin memoria compartida, con fallos parciales y latencias impredecibles, coordinados por un protocolo explícito. Que el resultado se sienta como una función local que devuelve la definición de un símbolo es un logro de ingeniería, no una obviedad. Y entender la maquinaria tiene una consecuencia práctica inmediata: cuando algo falla, dejas de tratarlo como magia rota y empiezas a preguntarte en qué eslabón concreto se cortó la cadena. Esa pregunta siempre tiene respuesta, y siempre es comprobable.
+</Callout>
+
+<Reto title="Instrumenta el ciclo de vida">
+1. Escribe un comando que imprima, para el buffer actual, cada cliente adjunto con su nombre, su identificador y su raíz resuelta.
+2. Abre dos ficheros de proyectos distintos del mismo lenguaje y comprueba cuántos procesos hay vivos. Repite con dos ficheros del mismo proyecto y explica la diferencia.
+3. Mueve todos tus atajos de LSP a un único `LspAttach` y verifica que ya no existen en buffers sin servidor.
+4. Añade un `LspDetach` que registre cuándo un cliente abandona un buffer, y provócalo parando el servidor a mano.
+5. Fuerza la convivencia de dos servidores sobre un mismo fichero, desactiva el formateo de uno de ellos al adjuntarse y confirma con las capacidades del cliente que el cambio se aplicó.
+</Reto>

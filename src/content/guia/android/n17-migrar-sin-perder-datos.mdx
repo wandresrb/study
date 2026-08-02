@@ -1,0 +1,149 @@
+---
+title: "Migrar de SharedPreferences a DataStore sin perder datos"
+description: "Cambiar de almacén en una aplicación instalada es una operación que solo se puede hacer bien una vez, porque el estado de partida está en dispositivos ajenos y no admite ensayo. Esta lección construye la migración completa: el mecanismo que la biblioteca ofrece y el momento exacto en que se ejecuta, la regla de no volver a tocar el fichero antiguo bajo ninguna circunstancia, la migración parcial por claves y el filtro de las que no deben viajar, el paso intermedio hacia un esquema tipado cuando el destino es `protobuf`, la estrategia de despliegue por fases con la ventana de convivencia y el momento seguro de borrar el origen, y el catálogo de fallos que solo aparecen en producción."
+subject: android
+level: 17
+order: 4
+icon: "17.4"
+duracion: "19 min"
+---
+
+<Lead>
+Una migración de almacenamiento no se parece a ninguna otra refactorización, y la diferencia es que aquí el estado inicial no lo controlas tú. Está en millones de dispositivos, escrito por versiones de tu propia aplicación que ya no existen, en dispositivos que llevan tres años sin actualizarse, con ficheros a medio escribir por procesos que murieron, con contenidos restaurados desde copias de seguridad de otro terminal y con claves que alguien introdujo en 2018 y cuyo significado ya no recuerda nadie. Todo eso tiene que llegar entero al otro lado, y si algo se pierde el usuario no verá un error: verá su sesión cerrada, sus ajustes reiniciados o su compra desaparecida. Por eso la migración se diseña antes de escribirse, y su primera regla es que solo se ejecuta una vez por instalación y nadie puede volver atrás.
+</Lead>
+
+<Objetivos>
+
+- Ejecutar la migración con el mecanismo de la biblioteca, sabiendo en qué momento exacto se dispara.
+- Cumplir la regla de acceso exclusivo al fichero antiguo y entender qué se rompe al incumplirla.
+- Migrar de forma selectiva, transformando o descartando claves en lugar de copiarlas ciegamente.
+- Planificar el despliegue por fases y decidir cuándo es seguro eliminar el origen.
+
+</Objetivos>
+
+## El mecanismo y el instante en que ocurre
+
+La biblioteca proporciona una migración lista para el caso más común, que copia el contenido de un fichero de preferencias clásico al nuevo almacén. Se declara al construir la instancia y no hace nada al declararse.
+
+```kotlin
+val Context.ajustes: DataStore<Preferences> by preferencesDataStore(
+    name = "ajustes",
+    produceMigrations = { ctx ->
+        listOf(SharedPreferencesMigration(ctx, "ajustes_antiguos"))
+    },
+)
+```
+
+El instante en que se ejecuta es la parte que hay que interiorizar: la migración corre antes de que se sirva el primer dato, es decir, en la primera lectura o escritura que alguien haga sobre el nuevo almacén. No ocurre al arrancar la aplicación, no ocurre al declarar la propiedad y no ocurre en segundo plano. Quien pida el primer valor se queda esperando a que la copia termine, y como es una función suspendida, esa espera no bloquea ningún hilo pero sí retrasa la primera emisión.
+
+Cada migración lleva asociada una condición de necesidad que la biblioteca consulta antes de ejecutarla, y una marca de terminación que se guarda tras completarla. Gracias a eso la operación es idempotente: en el segundo arranque ya no se ejecuta. La combinación de ambas propiedades, ejecución perezosa y marca persistente, garantiza que la copia ocurre exactamente una vez por instalación aunque el proceso muera a mitad, porque la marca solo se escribe cuando la transacción de destino se ha confirmado.
+
+<Mermaid code={`flowchart TD
+  A[Primer acceso al nuevo almacen] --> B{Migracion ya marcada}
+  B -->|si| F[Servir datos normalmente]
+  B -->|no| C[Leer el fichero antiguo completo]
+  C --> D[Escribir en destino dentro de una transaccion]
+  D --> E[Marcar la migracion como hecha]
+  E --> F
+  D -.->|fallo o muerte del proceso| G[Sin marca: se reintenta al siguiente arranque]
+  style G fill:#f9e2af,color:#11111b`} />
+
+## La regla que no admite excepciones
+
+Desde el momento en que la migración existe en el código, el fichero de preferencias antiguo pertenece exclusivamente a la migración. Ningún otro punto del programa puede leerlo ni escribirlo. La biblioteca lo dice de forma explícita y conviene entender por qué no es una recomendación sino una condición de corrección.
+
+Si un módulo sigue escribiendo en el fichero viejo después de que la migración se haya completado, ese valor no llegará nunca al nuevo almacén, porque la migración ya está marcada y no se volverá a ejecutar. El resultado es un dato fantasma: se escribe, se lee desde el mismo sitio antiguo por el módulo que lo escribió, y es invisible para todo lo demás. La aplicación se comporta como si tuviera dos verdades sobre el mismo asunto, y el síntoma que llega a soporte es que un ajuste cambia de valor según la pantalla desde la que se mire.
+
+<Callout type="warn" title="Las librerías de terceros también escriben ahí">
+El caso más difícil de detectar es el de una dependencia compilada que guarda su propia configuración en el fichero por defecto de la aplicación, que es precisamente el que muchos equipos eligen migrar. Antes de declarar la migración conviene inspeccionar el contenido real del XML en un dispositivo con la aplicación usada de verdad, y no fiarse del conjunto de claves que aparecen en tu código. Lo que encuentres ahí que no reconozcas probablemente pertenece a alguien que seguirá escribiéndolo.
+</Callout>
+
+La consecuencia operativa es que la migración debe introducirse en un mismo cambio que elimine todos los accesos antiguos, y que ese cambio debe protegerse. Una regla de análisis estático que prohíba `getSharedPreferences` en el módulo, o simplemente una prueba que falle si el símbolo aparece, cuesta diez minutos y evita que alguien lo reintroduzca dentro de seis meses con toda la buena intención del mundo.
+
+## Migrar selectivamente, no copiarlo todo
+
+La migración por defecto copia todas las claves, y eso casi nunca es lo que conviene. Un fichero de preferencias con años de historia contiene tres categorías de contenido: lo que debe viajar tal cual, lo que debe viajar transformado y lo que no debe viajar en absoluto. Distinguirlas convierte la migración en la única oportunidad realista de limpiar la casa.
+
+```kotlin
+SharedPreferencesMigration(
+    context = ctx,
+    sharedPreferencesName = "ajustes_antiguos",
+    keysToMigrate = setOf("tema", "notificaciones", "tamano_fuente"),
+)
+```
+
+Restringir el conjunto de claves deja fuera la caché acumulada, los testigos caducados, las banderas de experimentos ya cerrados y la docena de valores que ningún módulo lee desde hace tres versiones. Lo que no se migra desaparece cuando el fichero antiguo se borra, y esa es la forma correcta de retirar deuda: aprovechando un cambio que ya se estaba haciendo.
+
+Para lo que necesita transformación, la migración admite un bloque propio que recibe el contenido antiguo y el estado actual del destino, y devuelve el destino nuevo. Ahí caben los cambios de nombre, las conversiones de tipo y la corrección de valores heredados que no cumplen las invariantes de hoy.
+
+```kotlin
+SharedPreferencesMigration(ctx, "ajustes_antiguos") { antiguas, actuales ->
+    actuales.toMutablePreferences().apply {
+        // renombrado y cambio de representacion en un solo paso
+        antiguas.getString("dark_mode", null)?.let { valor ->
+            this[stringPreferencesKey("tema")] = if (valor == "1") "oscuro" else "claro"
+        }
+        // saneamiento de un valor que hoy tiene limites
+        val tam = antiguas.getInt("font_size", 16)
+        this[intPreferencesKey("tamano_fuente")] = tam.coerceIn(12, 28)
+    }.toPreferences()
+}
+```
+
+El bloque de transformación es además el único sitio del proyecto donde conviven la representación antigua y la nueva, y por tanto el único lugar donde se puede documentar la correspondencia entre ambas. Un comentario por clave transformada, explicando de dónde venía y por qué cambia, vale más que cualquier documento aparte, porque es lo primero que leerá quien dentro de dos años se pregunte qué significaba una clave que ya nadie recuerda.
+
+Cuando el destino es un esquema tipado la operación es la misma con otra forma: se implementa la interfaz de migración sobre el tipo generado y se construye el objeto nuevo a partir del contenido antiguo. La dificultad añadida no es técnica sino de modelado, porque hay que decidir qué hacer con las claves ausentes: el mapa antiguo admite que un valor no exista y el objeto nuevo no, así que cada ausencia debe resolverse en un valor por defecto de dominio elegido conscientemente.
+
+<Cards>
+  <Card icon="✅" title="Viaja tal cual">
+    Ajustes que el usuario eligió y que siguen significando lo mismo. Copia directa, sin pensar.
+  </Card>
+  <Card icon="🔧" title="Viaja transformado">
+    Nombres antiguos, tipos que cambiaron, valores fuera de los límites actuales. La migración es el sitio donde se corrigen.
+  </Card>
+  <Card icon="🗑️" title="No viaja">
+    Cachés, testigos caducados, banderas de experimentos terminados y todo lo que nadie lee. Se queda atrás y desaparece.
+  </Card>
+</Cards>
+
+## Desplegar por fases y borrar el origen al final
+
+La tentación de publicar la migración y el borrado del fichero antiguo en la misma versión es fuerte y es un error. Entre el momento en que se publica y el momento en que la base instalada la ha ejecutado pasan semanas, y durante ese intervalo hay usuarios en versiones anteriores, usuarios que actualizan y revierten, y usuarios cuya aplicación se actualiza sin abrirse hasta mucho después. Un despliegue en tres fases elimina casi todo el riesgo.
+
+La primera versión introduce la migración y retira todos los accesos al fichero antiguo, pero no lo borra. Si algo sale mal, revertir a la versión anterior devuelve al usuario a un estado consistente porque sus datos siguen intactos en el origen. La segunda versión, una vez que la telemetría confirma que la migración se completa sin incidencias en la práctica totalidad de los dispositivos, se limita a esperar. La tercera, meses después, borra el fichero antiguo.
+
+Ese borrado tampoco es trivial y conviene hacerlo con el método adecuado, que elimina el fichero y también la instancia en memoria que la plataforma pudiera estar cacheando. Borrar el XML a mano deja el mapa vivo en el proceso y produce resurrecciones desconcertantes.
+
+La telemetría de la fase intermedia es lo que convierte el plan en algo verificable en lugar de una esperanza. Basta con registrar tres eventos: migración iniciada, migración completada y migración fallida con el tipo de fallo. La diferencia entre el primero y el segundo, medida sobre la base instalada, es la cifra que autoriza el borrado.
+
+Conviene además fijar de antemano el criterio de reversión, porque decidirlo en caliente nunca sale bien. Una migración que falla en una fracción apreciable de los dispositivos no se arregla publicando un parche rápido: se detiene el despliegue por etapas, se retira la versión y se investiga con la certeza de que los datos originales siguen ahí. Esa tranquilidad es precisamente lo que compra la fase intermedia, y es la razón por la que renunciar a ella para ahorrarse un ciclo de publicación es un mal negocio incluso cuando todo sale bien.
+
+<Cards>
+  <Card icon="1️⃣" title="Copiar sin borrar">
+    Se introduce la migración y se retiran todos los accesos antiguos. El origen permanece intacto y revertir sigue siendo seguro.
+  </Card>
+  <Card icon="2️⃣" title="Observar y esperar">
+    Semanas de telemetría hasta que la práctica totalidad de la base instalada ha migrado. Ningún cambio de código.
+  </Card>
+  <Card icon="3️⃣" title="Borrar el origen">
+    Meses después, con la cifra sobre la mesa. A partir de aquí ya no hay vuelta atrás y por eso va la última.
+  </Card>
+</Cards>
+
+Hay un último detalle que decide la calidad percibida del cambio y que no aparece en ninguna documentación: qué ve el usuario mientras la migración ocurre. Como se dispara en el primer acceso y la primera pantalla suele depender de ella, existe una ventana en la que la interfaz no tiene datos que mostrar. Modelar ese instante como un estado explícito de carga, y no como un estado con los valores por defecto ya pintados, evita el parpadeo característico en el que el usuario ve durante un segundo la aplicación configurada de fábrica antes de que aparezcan sus propios ajustes. Ese parpadeo se interpreta como pérdida de datos aunque no haya pérdida alguna, y genera más informes de error que cualquier fallo real de la migración.
+
+<Callout type="info" title="Fallos que solo existen en dispositivos reales">
+El almacenamiento lleno durante la escritura de destino, el usuario que restaura una copia de seguridad hecha antes de la migración sobre una instalación que ya migró, el fichero antiguo corrupto que hace fallar el parseo del XML, el arranque en un contexto de dispositivo cifrado antes del primer desbloqueo, y el proceso que muere justo entre la escritura del destino y la marca. Ninguno se reproduce en el emulador y todos aparecen en cuanto la base instalada es suficientemente grande.
+</Callout>
+
+<Callout type="dios" title="La migración es la única parte de tu código que se ejecuta una sola vez y no admite corrección">
+Vale la pena aislar lo que hace de una migración de datos un artefacto distinto de todo lo demás que escribimos, porque el hábito profesional que se construye con el resto del código es aquí activamente peligroso. Todo el software que producimos habitualmente se ejecuta muchas veces y en condiciones que podemos reproducir; si algo va mal, se corrige y la siguiente ejecución ya es correcta, y el estado del mundo se repara solo con el uso. Una migración invierte las dos propiedades a la vez. Se ejecuta exactamente una vez en cada dispositivo, en un instante que no controlas, sobre un estado de partida que no has visto nunca y que fue producido por versiones de tu propio programa cuyo código quizá ya no existe en el repositorio. Y no se puede corregir después, porque la única entrada válida era el estado anterior y esa entrada ya no está: si copiaste mal, el original desapareció con la actualización, y ninguna versión posterior podrá reconstruir lo que se perdió porque no queda nada de donde reconstruirlo. Esa asimetría tiene una consecuencia metodológica que rara vez se enuncia: en una migración, el fallo por omisión es infinitamente preferible al fallo por corrupción. Una migración que no se ejecuta deja al usuario donde estaba y se puede reintentar mañana con el código arreglado; una migración que se ejecuta a medias produce un estado que nunca existió, indistinguible de un estado legítimo, y contra el que ya no hay reintento posible. De ahí se deriva todo lo que hemos visto: la marca que solo se escribe cuando la transacción de destino se confirmó, el acceso exclusivo al origen, el borrado diferido por meses y la resistencia a publicar la limpieza junto con la copia. Todo eso parece exceso de cautela y no lo es. Es el reconocimiento de que estás manipulando información que pertenece a otras personas, que no tienes copia, que no vas a poder pedirla otra vez y que ellos no van a entender qué pasó. En cualquier otro sitio del código, la respuesta correcta ante la duda es probar y medir. Aquí, ante la duda, la respuesta correcta es no borrar todavía.
+</Callout>
+
+<Reto title="Ensaya la migración antes de que la ensaye tu base instalada">
+1. Vuelca el XML real de un dispositivo con la aplicación usada durante meses y clasifica cada clave en las tres categorías, anotando quién la escribe.
+2. Escribe un test instrumentado que prepare un fichero antiguo con datos, ejecute la migración y verifique el contenido resultante clave por clave.
+3. Introduce deliberadamente una escritura al fichero antiguo después de migrar y observa el dato fantasma que produce. Después añade la regla que lo impide.
+4. Simula la muerte del proceso entre la escritura del destino y la marca, y comprueba que el siguiente arranque reintenta sin duplicar nada.
+5. Redacta el plan de tres fases con los eventos de telemetría concretos y el umbral numérico que autorizará el borrado del origen.
+</Reto>

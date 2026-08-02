@@ -1,0 +1,161 @@
+---
+title: "Estado y actualización: quién decide cuándo cambia el widget"
+description: "Un widget no tiene bucle de renderizado ni ciclo de vida propio, de modo que la pregunta de cuándo se actualiza no tiene respuesta automática y debe contestarla tu arquitectura. Esta lección desarrolla las tres piezas de esa respuesta: el estado del widget como almacenamiento persistente asociado a cada instancia y no a la clase, los mecanismos de invalidación explícita desde el dominio y desde WorkManager con sus mínimos y sus restricciones, y el análisis del coste real de cada refresco medido en despertares de proceso, transacciones de Binder y energía. Cierra con la disciplina de invalidación dirigida por eventos frente al sondeo periódico, que es la diferencia entre un widget que se siente vivo y uno que aparece en la lista de aplicaciones que consumen batería."
+subject: android
+level: 28
+order: 3
+icon: "28.3"
+duracion: "20 min"
+---
+
+<Lead>
+En una pantalla ordinaria nunca te has preguntado cuándo se actualiza la interfaz, porque la pregunta no tiene sentido: hay un bucle de fotogramas, hay un compositor observando estados y la respuesta es siempre en cuanto haga falta y como muy tarde dentro de dieciséis milisegundos. Un widget no tiene bucle de fotogramas. Lo que muestra es una fotografía que alguien envió en algún momento del pasado, y seguirá mostrándola hasta el fin de los tiempos si nadie envía otra. Puede llevar horas siendo falsa. Puede sobrevivir a un reinicio del dispositivo mostrando el saldo de ayer. Y ni el sistema, ni el anfitrión, ni el usuario van a corregirlo por ti, porque ninguno de los tres sabe que ha dejado de ser cierta. La actualización de un widget no es una optimización ni un detalle de rendimiento: es una responsabilidad arquitectónica completa que tienes que diseñar, y que se resuelve con dos preguntas encadenadas, dónde vive lo que el widget muestra y quién avisa de que ha cambiado.
+</Lead>
+
+<Objetivos>
+
+- Distinguir el estado del widget de la fuente de verdad de la aplicación y asignar a cada uno su papel.
+- Leer y escribir estado por instancia con `currentState` y `updateAppWidgetState`.
+- Invalidar desde el dominio, desde un trabajador de WorkManager y desde una emisión del sistema.
+- Cuantificar el coste de un refresco y elegir invalidación dirigida por eventos frente a sondeo.
+
+</Objetivos>
+
+## El estado del widget y la fuente de verdad
+
+Glance asocia a cada instancia colocada un almacén persistente, respaldado por defecto por un fichero de preferencias y accesible desde la composición mediante `currentState`. La palabra clave es instancia: si el usuario coloca tres copias del mismo widget configuradas para tres ciudades distintas, hay tres almacenes independientes identificados por su `GlanceId`. Ese estado sobrevive al reinicio del dispositivo y a la muerte del proceso, y es el único sitio donde algo puede sobrevivir entre composiciones.
+
+```kotlin
+object Claves {
+    val ciudad = stringPreferencesKey("ciudad")
+    val grados = intPreferencesKey("grados")
+}
+
+class TiempoWidget : GlanceAppWidget() {
+    override val stateDefinition = PreferencesGlanceStateDefinition
+
+    override suspend fun provideGlance(context: Context, id: GlanceId) {
+        provideContent {
+            val prefs = currentState<Preferences>()
+            val ciudad = prefs[Claves.ciudad] ?: "Sin configurar"
+            Text(text = ciudad + " " + (prefs[Claves.grados] ?: 0) + " grados")
+        }
+    }
+}
+```
+
+La escritura se hace desde fuera de la composición y termina siempre pidiendo una nueva traducción, porque cambiar el almacén sin avisar no repinta nada.
+
+```kotlin
+suspend fun refrescar(context: Context, id: GlanceId, grados: Int) {
+    updateAppWidgetState(context, id) { prefs ->
+        prefs[Claves.grados] = grados
+    }
+    TiempoWidget().update(context, id)
+}
+```
+
+<Callout type="tip" title="El estado del widget es una caché de presentación, no un almacén de dominio">
+Guarda ahí lo que el widget necesita para pintarse sin consultar a nadie: el valor ya formateado, la ciudad elegida, la marca de tiempo del último refresco. No guardes ahí el dominio. Tu base de datos sigue siendo la única fuente de verdad, y el estado del widget es una proyección suya, desechable y reconstruible. Esa separación permite además la propiedad que hace que un widget se sienta rápido: al recibir la orden de repintar, se muestra al instante lo último conocido y se dispara en paralelo la comprobación de si sigue siendo válido.
+</Callout>
+
+## Configuración por instancia y limpieza
+
+Si dos instancias del mismo widget pueden mostrar cosas distintas, alguien tiene que decidir cuál muestra qué, y ese alguien es una actividad de configuración que el anfitrión lanza en el momento de la colocación. Su trabajo consiste en escribir el estado inicial de esa instancia concreta y pedir el primer repintado antes de devolver el resultado.
+
+```kotlin
+class ConfigActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val widgetId = intent.getIntExtra(
+            AppWidgetManager.EXTRA_APPWIDGET_ID,
+            AppWidgetManager.INVALID_APPWIDGET_ID,
+        )
+        setResult(RESULT_CANCELED)
+        setContent {
+            SelectorDeCiudad { ciudad ->
+                lifecycleScope.launch {
+                    val id = GlanceAppWidgetManager(this@ConfigActivity)
+                        .getGlanceIdBy(widgetId)
+                    updateAppWidgetState(this@ConfigActivity, id) {
+                        it[Claves.ciudad] = ciudad
+                    }
+                    TiempoWidget().update(this@ConfigActivity, id)
+                    setResult(RESULT_OK, Intent().putExtra(
+                        AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId))
+                    finish()
+                }
+            }
+        }
+    }
+}
+```
+
+Fijar el resultado cancelado desde el principio es lo que hace que abandonar la configuración deje el escritorio como estaba. Y hay una obligación simétrica al final de la vida: cuando el usuario retira una instancia, Glance ofrece un punto donde borrar su estado y cancelar cualquier trabajo periódico registrado en su nombre. Omitirla produce ficheros de preferencias huérfanos y, mucho peor, trabajos que siguen despertando la aplicación para actualizar widgets que ya no existen.
+
+## Quién dispara la actualización
+
+Hay cuatro orígenes legítimos y conviene tener presente cuál corresponde a cada caso.
+
+<Mermaid code={`flowchart TD
+  A[Cambia el dominio] --> E[updateAll o update por id]
+  B[Trabajador periodico de WorkManager] --> E
+  C[Emision del sistema o push recibido] --> E
+  D[Interaccion del usuario en el widget] --> E
+  E --> F[Se escribe el estado del widget]
+  F --> G[Nueva composicion y traduccion]
+  G --> H[Transaccion hacia el anfitrion]
+  H --> I[El lanzador repinta]`} />
+
+El primero y mejor es el dominio: cuando tu repositorio escribe algo que el widget muestra, esa misma operación pide el repintado. Es inmediato, es exacto y no gasta nada cuando no hay cambios. El segundo es el trabajo periódico, adecuado solo cuando el dato depende del tiempo o de un servidor que no puede avisar. El tercero son las señales del sistema y los mensajes push, ideales para datos que cambian por decisión ajena. El cuarto lo verás en la lección siguiente.
+
+```kotlin
+class RefrescoWorker(ctx: Context, params: WorkerParameters) :
+    CoroutineWorker(ctx, params) {
+
+    override suspend fun doWork(): Result {
+        val datos = repositorio.sincronizar()
+        val manager = GlanceAppWidgetManager(applicationContext)
+        manager.getGlanceIds(TiempoWidget::class.java).forEach { id ->
+            updateAppWidgetState(applicationContext, id) { it[Claves.grados] = datos.grados }
+        }
+        TiempoWidget().updateAll(applicationContext)
+        return Result.success()
+    }
+}
+```
+
+El periodo mínimo de un trabajo periódico es de quince minutos y no es negociable; el ancho de la ventana de flexibilidad y el agrupamiento que hace el sistema pueden convertirlo en bastante más. Añadir la restricción de red conectada evita despertares inútiles, y encadenar el registro con la política de mantener el existente evita multiplicar trabajos cada vez que arranca la aplicación.
+
+## Lo que cuesta refrescar
+
+Conviene enumerar el coste real de un refresco, porque casi siempre se subestima y porque el usuario lo paga en una moneda que sí percibe. Despertar tu proceso si no estaba vivo implica cargar el entorno de ejecución, inicializar la inyección de dependencias y abrir la base de datos. Componer y traducir consume CPU. Serializar y cruzar `Binder` consume memoria del búfer compartido. Y el anfitrión, al recibir la descripción, infla vistas y repinta una porción de su jerarquía, gasto que el sistema atribuye a él pero que provocaste tú.
+
+<Cards>
+  <Card icon="🔋" title="Despertar no es gratis">
+    Un refresco con el proceso muerto cuesta órdenes de magnitud más que uno con el proceso vivo. Multiplícalo por el número de instancias colocadas y por las veinticuatro horas del día.
+  </Card>
+  <Card icon="🌙" title="El reposo profundo manda">
+    En reposo, los trabajos se agrupan en ventanas de mantenimiento cada vez más separadas. Un widget que necesita puntualidad al minuto no puede construirse sobre trabajo diferido.
+  </Card>
+  <Card icon="🎯" title="Dirigido por eventos">
+    Invalidar cuando cambia el dato consume cero cuando el dato no cambia. Sondear cada quince minutos consume lo mismo tanto si cambió como si no.
+  </Card>
+  <Card icon="🧮" title="Compara antes de escribir">
+    Si el valor calculado coincide con el que ya está en el estado, no escribas ni pidas repintado. Esa comprobación de una línea elimina la mayoría de las transacciones.
+  </Card>
+</Cards>
+
+Hay además una asimetría que conviene explotar: cuando el widget es visible y su sesión de composición sigue viva, observar un flujo dentro de la composición produce repintados sin coste de despertar. Cuando no lo es, cualquier intento de mantener observación continua es tiempo de CPU gastado para nada. La estrategia correcta combina las dos: reactividad fina mientras el sistema te la regala, invalidación explícita y espaciada cuando no.
+
+<Callout type="dios" title="Un widget no muestra datos: muestra una promesa sobre el pasado, y el diseño consiste en administrar esa mentira">
+El error conceptual que arruina la mayoría de los widgets es tan sutil que casi nunca se verbaliza: consiste en creer que lo que aparece en la pantalla de inicio es el estado actual del sistema. No lo es, y no puede serlo. Es el estado que era cierto en el instante de la última traducción, mostrado ahora, sin ninguna indicación de cuánto ha llovido desde entonces. Esa distancia temporal no es un fallo a corregir sino una propiedad permanente de la tecnología, y el trabajo de diseño no consiste en eliminarla —porque eliminarla exigiría refrescar continuamente, que es precisamente lo que la plataforma prohíbe— sino en administrarla con honestidad. Administrarla bien empieza por clasificar el dato según lo que cuesta que esté obsoleto, y esa clasificación es una decisión de producto, no de ingeniería. Hay datos cuya obsolescencia es inofensiva: la frase del día, la portada de un libro, el número de pasos aproximado. Hay datos cuya obsolescencia es molesta pero recuperable: el número de mensajes sin leer, el tiempo previsto. Y hay datos cuya obsolescencia es un daño real: un saldo bancario, la hora de salida de un tren, si la puerta de casa está cerrada. Para la primera categoría, refrescar mucho es puro derroche. Para la segunda, la respuesta correcta casi nunca es refrescar más, sino mostrar la marca temporal, de modo que el usuario sepa que está viendo una fotografía y de cuándo. Y para la tercera hay una conclusión incómoda que pocos equipos aceptan a tiempo: ese dato no debe estar en el widget, o debe estar acompañado de una señal explícita de que hay que abrir la aplicación para confirmarlo. Un widget que afirma con la misma tipografía y el mismo aplomo algo que sabe hace treinta segundos y algo que sabe hace nueve horas está mintiendo por omisión, y esa mentira erosiona la confianza mucho más rápido que un dato ausente. De ahí se deriva la regla que ordena toda la política de actualización de una aplicación seria: la frecuencia de refresco no se elige mirando lo que la plataforma permite, se elige mirando cuánto daña la obsolescencia de cada dato concreto; y cuando el daño es alto y la frecuencia posible es baja, la solución correcta no es forzar la plataforma sino cambiar lo que el widget muestra.
+</Callout>
+
+<Reto title="Mide el coste de tu propia impaciencia">
+1. Coloca tres instancias del mismo widget con configuraciones distintas y verifica que cada una tiene su propio estado leyendo los ficheros de preferencias generados.
+2. Registra un trabajo periódico de quince minutos y mide durante ocho horas el intervalo real entre ejecuciones con el dispositivo desconectado y quieto.
+3. Añade la comprobación de valor sin cambios antes de escribir el estado y cuenta cuántas transacciones desaparecen en un día normal.
+4. Compara el consumo de un widget que sondea cada quince minutos con otro que solo se invalida cuando el repositorio escribe, usando las estadísticas de batería del sistema.
+5. Muestra la marca de tiempo del último refresco en el propio widget durante una semana y anota cuántas veces te habría evitado abrir la aplicación por nada.
+</Reto>

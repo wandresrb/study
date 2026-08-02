@@ -1,0 +1,156 @@
+---
+title: "Leer el tráfico real: log, trazas y servidores mudos"
+description: "Activar el registro del cliente y elegir su nivel, seguir una petición concreta desde su emisión hasta su respuesta, instrumentar el protocolo con manejadores propios, y aplicar un procedimiento reproducible cuando un servidor arranca pero no contesta."
+subject: neovim
+level: 19
+order: 5
+icon: "19.5"
+duracion: "22 min"
+---
+
+<Lead>
+Todo lo anterior es teoría verificable, y la diferencia entre saberla y usarla está en si eres capaz de abrir el canal y mirar lo que realmente pasa por él. Un servidor de lenguaje es una caja negra solo mientras no enciendas la luz: en el momento en que registras el tráfico, cada síntoma difuso —el completado que a veces no aparece, el salto a definición que funciona en un fichero y no en otro, el servidor que arranca y luego calla— se convierte en una secuencia de mensajes con marcas de tiempo que se puede leer de principio a fin. Esta es la habilidad que separa a quien configura su editor copiando fragmentos de quien lo entiende, y es también la única forma honesta de reportar un fallo a un mantenedor. La instrumentación no es un recurso de última hora para emergencias: es el instrumento normal de trabajo cuando se opera un sistema distribuido, y una sesión LSP es exactamente eso.
+</Lead>
+
+<Objetivos>
+
+- Activar el registro del cliente con el nivel adecuado y localizar el fichero resultante sin adivinar rutas.
+- Seguir una petición concreta desde su emisión hasta su respuesta usando su identificador como hilo conductor.
+- Instrumentar el protocolo con manejadores propios para medir latencias y capturar cargas útiles.
+- Aplicar un procedimiento ordenado de diagnóstico ante un servidor que arranca y no responde.
+
+</Objetivos>
+
+## Encender la luz
+
+El cliente de Neovim escribe un registro propio cuyo nivel por defecto descarta casi todo. Subirlo a modo de depuración hace que cada mensaje enviado y recibido quede volcado íntegro; el coste es un fichero que crece deprisa y una sesión perceptiblemente más lenta, así que es un interruptor que se enciende para investigar y se apaga después. La ruta del fichero no hay que memorizarla porque el propio cliente la expone.
+
+```lua
+-- Nivel de detalle: "off", "error", "warn", "info", "debug", "trace".
+vim.lsp.set_log_level("debug")
+
+-- Donde escribe, sin adivinar rutas.
+print(vim.lsp.get_log_path())
+
+-- Abrirlo en una ventana sin salir del editor.
+vim.api.nvim_create_user_command("LspLog", function()
+  vim.cmd("tabnew " .. vim.lsp.get_log_path())
+  vim.opt_local.wrap = false
+end, {})
+```
+
+El registro del cliente cuenta la mitad de la historia: lo que el cliente envió y lo que le llegó. La otra mitad —qué hizo el servidor por dentro, por qué tardó, qué fichero no pudo abrir— vive en el registro del propio servidor, y ese se activa con las opciones de inicialización de cada uno, porque no forma parte del protocolo. Hay además un tercer canal, definido por la especificación y con frecuencia olvidado: la notificación de traza, que pide al servidor que envíe eventos legibles al cliente sobre lo que va procesando. Cuando existe, es la vista más útil de las tres, porque correlaciona ambos lados en un único hilo temporal.
+
+<Mermaid code={`flowchart TD
+  a[sintoma difuso] --> b[activar log en modo debug]
+  b --> c[reproducir la accion una sola vez]
+  c --> d[localizar el id de la peticion]
+  d --> e{llego respuesta}
+  e -->|si| f[revisar carga util y rangos]
+  e -->|no| g[revisar log del servidor y proceso]
+  style b fill:#89b4fa,color:#11111b
+  style e fill:#f9e2af,color:#11111b`} />
+
+## Seguir una petición de principio a fin
+
+Leer el registro entero es inútil. La técnica correcta consiste en reducir el ruido antes de generar los datos: cierra todos los buffers menos uno, borra el fichero de registro, sube el nivel, ejecuta **una sola vez** la acción que falla y vuelve a bajar el nivel. Lo que queda es una ventana de unas pocas decenas de mensajes en la que la petición que te interesa es identificable.
+
+A partir de ahí el hilo conductor es el identificador. Localiza la línea donde el cliente emite el método sospechoso, anota su identificador y busca la respuesta que lleva ese mismo número. Entre ambas hay tres desenlaces posibles y cada uno apunta a un lugar distinto: si hay respuesta con resultado, el problema está en cómo el cliente la interpreta o la presenta; si hay respuesta con error, el mensaje suele nombrar la causa; si no hay respuesta en absoluto, el problema está en el servidor o en el transporte, y ahí es donde hay que mirar a continuación.
+
+Conviene además comprobar dos cosas que casi nunca se miran y que explican una fracción sorprendente de los casos. La primera es la versión del documento que llevaba la última notificación de cambio antes de la petición: si el servidor respondió sobre una versión anterior a la que tienes delante, el desfase no es un fallo de la consulta sino de la sincronización. La segunda es la URI exacta: un servidor arrancado con una raíz de proyecto equivocada responde correctamente sobre ficheros que, desde su punto de vista, no pertenecen a ningún proyecto y por tanto no tienen contexto.
+
+<Cards>
+  <Card icon="🔍" title="Log del cliente">
+    Qué se envió y qué llegó, con marca de tiempo. Es la fuente de verdad sobre el transporte.
+  </Card>
+  <Card icon="🗒️" title="Log del servidor">
+    Qué ocurrió por dentro. Se activa con opciones propias de cada servidor, no con el protocolo.
+  </Card>
+  <Card icon="🧵" title="Traza">
+    Eventos del servidor enviados al cliente. Correlaciona ambos lados en un solo hilo temporal.
+  </Card>
+</Cards>
+
+## Instrumentar el protocolo desde dentro
+
+El registro es un fichero pasivo; para trabajo serio conviene interceptar el tráfico en vivo. Los manejadores de respuesta de Neovim son funciones sustituibles, así que envolver uno permite medir, contar y volcar exactamente lo que interesa sin tocar el resto de la configuración.
+
+```lua
+-- Medir la latencia real de un metodo, cliente arriba, sin tocar el resto.
+local function cronometrar(metodo)
+  local original = vim.lsp.handlers[metodo]
+  local emitido = {}
+
+  vim.lsp.handlers[metodo] = function(err, result, ctx, cfg)
+    local t0 = emitido[ctx.params and ctx.params.position and ctx.bufnr or 0]
+    if t0 then
+      vim.notify(("%s tardo %d ms"):format(metodo, (vim.uv.hrtime() - t0) / 1e6))
+    end
+    return original and original(err, result, ctx, cfg)
+  end
+
+  return function(bufnr) emitido[bufnr] = vim.uv.hrtime() end
+end
+
+local marcar = cronometrar("textDocument/hover")
+vim.keymap.set("n", "K", function()
+  marcar(vim.api.nvim_get_current_buf())
+  vim.lsp.buf.hover()
+end)
+```
+
+Para observar el tráfico completo sin filtrar hay un punto de enganche mejor: el evento que Neovim dispara cuando una petición cambia de estado. Permite ver cada petición al nacer, al completarse y al cancelarse, con su identificador y su método, sin ensuciar el registro ni sustituir manejadores.
+
+```lua
+vim.api.nvim_create_autocmd("LspRequest", {
+  callback = function(args)
+    local r = args.data.request
+    vim.print(("[%s] id=%s %s"):format(r.type, args.data.request_id, r.method))
+  end,
+})
+
+-- Y el vertido crudo de un unico metodo, cuando hace falta la carga util entera.
+local orig = vim.lsp.handlers["textDocument/publishDiagnostics"]
+vim.lsp.handlers["textDocument/publishDiagnostics"] = function(err, res, ctx, cfg)
+  vim.fn.writefile(vim.split(vim.json.encode(res), "\n"), "/tmp/diag.json")
+  return orig(err, res, ctx, cfg)
+end
+```
+
+## El servidor que no responde
+
+El síntoma más frustrante tiene un procedimiento reproducible, y seguirlo en orden ahorra horas. Primero comprueba que hay proceso: si la lista de clientes adjuntos está vacía, el problema es anterior al protocolo y está en la configuración de arranque, en el filtro de tipos de fichero o en el ejecutable ausente del camino de búsqueda. Segundo, si hay cliente pero ninguna función responde, mira si el acuerdo inicial llegó a completarse: un servidor que falló durante la inicialización queda vivo, adjunto y mudo. Tercero, si el acuerdo se completó, contrasta el inventario de capacidades antes de culpar al servidor de no hacer algo que nunca prometió.
+
+Cuarto, y solo llegados aquí, sospecha del propio servidor. Los modos de fallo típicos son tres: quedó bloqueado indexando un proyecto enorme y responderá dentro de un rato; escribió algo en su salida estándar que no era un mensaje del protocolo y corrompió el flujo de forma irrecuperable; o falló y murió, en cuyo caso su código de salida y su salida de error son el dato relevante.
+
+```lua
+-- Diagnostico en cuatro pasos, en el orden que importa.
+local cs = vim.lsp.get_clients({ bufnr = 0 })
+if #cs == 0 then
+  vim.print("sin cliente: revisa cmd, filetypes y root_markers")
+else
+  for _, c in ipairs(cs) do
+    vim.print({
+      nombre = c.name,
+      inicializado = c.initialized,
+      raiz = c.root_dir,
+      peticiones_vivas = vim.tbl_count(c.requests or {}),
+      metodos = vim.tbl_count(c.server_capabilities or {}),
+    })
+  end
+end
+```
+
+La tabla de peticiones vivas de cada cliente es el indicador más directo de un servidor bloqueado: si crece y nunca se vacía, hay consultas emitidas que jamás se contestaron. Una prueba definitiva y barata para descartar al cliente consiste en ejecutar el servidor a mano en una terminal y escribirle un `initialize` bien enmarcado: si tampoco contesta ahí, Neovim queda exonerado y el informe de fallo va al mantenedor del servidor con una reproducción mínima que no depende de ningún editor.
+
+<Callout type="dios" title="Depurar un protocolo es sustituir la creencia por la observación, y casi todo el tiempo perdido se gasta en no hacerlo">
+Fíjate en cuánto de lo que acabas de leer es técnica y cuánto es disciplina, porque la proporción sorprende. La técnica cabe en tres líneas: sube el nivel del registro, localiza el identificador, busca la respuesta. Todo lo demás es método: reducir el ruido antes de generar datos, ejecutar la acción una sola vez, comprobar en orden las hipótesis de más barata a más cara, y sobre todo resistir la tentación de arreglar cosas antes de haber observado nada. Esa tentación es enorme y es la principal fuente de horas perdidas con LSP, porque el sistema ofrece muchísimas perillas y girarlas produce la sensación reconfortante de estar avanzando. Cambiar el orden de los servidores, reinstalar el binario, copiar la configuración de otra persona, añadir un retardo: son intervenciones que a veces funcionan y que nunca enseñan nada, porque no distinguen entre haber resuelto el problema y haberlo ocultado. La alternativa profesional es aburrida y funciona siempre: no toques nada hasta poder describir, con mensajes concretos, qué se pidió, qué se respondió y qué falta. Hay además un beneficio secundario que justifica el esfuerzo por sí solo. Un sistema instrumentado deja de dar miedo. Cuando puedes ver el tráfico, la actualización de un servidor deja de ser una apuesta, la aparición de un comportamiento raro deja de ser un misterio y la lectura de la especificación deja de ser un ejercicio abstracto, porque cada párrafo que lees tiene su correspondencia observable en tu propio fichero de registro. Ese es el estado final al que apunta todo este nivel: no memorizar cien métodos, sino ser capaz de abrir el canal, mirar y entender lo que estás viendo. A partir de ahí la especificación se convierte en un manual de referencia consultable en lugar de un texto que hay que aprender, y tu editor deja de ser un sistema que a veces funciona para pasar a ser un sistema cuyo comportamiento puedes explicar.
+</Callout>
+
+<Reto title="Abrir el canal">
+1. Activa el registro en modo depuración, reproduce una única petición de definición y aísla su bloque completo en el fichero.
+2. Sigue un identificador desde su emisión hasta su respuesta y mide el intervalo entre ambas marcas de tiempo.
+3. Instrumenta el evento de peticiones y cuenta cuántas se emiten al escribir una línea con completado activo.
+4. Fuerza un desfase editando el buffer por vías externas y demuestra con el registro que la versión del servidor va retrasada.
+5. Ejecuta un servidor a mano en una terminal, envíale un mensaje de inicialización bien enmarcado y compara su respuesta con la del registro.
+</Reto>

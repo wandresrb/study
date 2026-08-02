@@ -1,0 +1,169 @@
+---
+title: "Testear la capa de datos: Room en memoria, MockWebServer y el repositorio completo"
+description: "La capa de datos es la parte de una aplicación donde más barato resulta probar de verdad y donde más se abusa de los dobles de prueba. Esta lección monta un banco hermético completo: una base de datos Room en memoria con ejecutores deterministas y verificación de migraciones contra los esquemas exportados, un servidor HTTP local que responde en el proceso de prueba y permite afirmar sobre la petición emitida además de sobre la respuesta consumida, y por encima de ambos el repositorio ejercitado entero con sus dos fuentes reales para verificar lo único que importa de él, que es la política de reconciliación entre caché y red. Termina delimitando cuándo un doble aporta y cuándo destruye la prueba."
+subject: android
+level: 30
+order: 2
+icon: "30.2"
+duracion: "22 min"
+---
+
+<Lead>
+La capa de datos tiene una propiedad que la distingue del resto de la aplicación: sus dependencias externas son sustituibles por implementaciones reales y rápidas. La base de datos puede vivir en memoria y comportarse exactamente igual que en disco porque es el mismo motor; el servidor puede vivir en el propio proceso de prueba y hablar el mismo protocolo que el de producción porque es un servidor de verdad. Eso significa que aquí no hace falta elegir entre fidelidad y velocidad, que es el compromiso que envenena las demás capas. Y sin embargo es la capa donde más se simula, donde más suites verifican que un método delegó en otro método y donde más equipos descubren en producción que su caché nunca se invalidaba. Esta lección construye el banco hermético que hace innecesarios casi todos esos dobles, y después delimita con precisión el puñado de sitios donde el doble sigue siendo la herramienta correcta.
+</Lead>
+
+<Objetivos>
+
+- Montar bases de datos `Room` en memoria con ejecutores deterministas y verificar migraciones contra los esquemas exportados.
+- Sustituir la red por un servidor local y afirmar tanto sobre la respuesta consumida como sobre la petición emitida.
+- Ejercitar el repositorio completo para verificar su política de reconciliación entre caché y red.
+- Decidir con criterio cuándo un doble de prueba aporta información y cuándo la destruye.
+
+</Objetivos>
+
+## Room en memoria: la base de datos real sin disco
+
+El constructor en memoria devuelve una base de datos que es el mismo SQLite con las mismas restricciones, los mismos disparadores y el mismo comportamiento transaccional, pero cuyo almacenamiento desaparece cuando se cierra el proceso. No es un doble: es la implementación auténtica sin persistencia. Eso convierte en verdaderas las afirmaciones sobre claves foráneas, sobre índices únicos, sobre reemplazo en conflicto y sobre el comportamiento de las consultas que devuelven flujos, que son precisamente las que un DAO falso escrito a mano nunca reproduce bien.
+
+Hay dos decisiones de configuración que separan una prueba fiable de una intermitente. La primera es no permitir consultas en el hilo principal aunque la API lo ofrezca, porque esa concesión oculta violaciones reales de hilo. La segunda es imponer ejecutores de consulta y de transacción deterministas: cuando `Room` usa su propio grupo de hilos, el momento en que un flujo emite depende de la planificación del sistema y la prueba se vuelve dependiente del reloj. Con un ejecutor que ejecuta en el mismo hilo, la emisión ocurre cuando el código de prueba dice que ocurra.
+
+```kotlin
+@RunWith(AndroidJUnit4::class)
+class NotaDaoTest {
+    private val db = Room
+        .inMemoryDatabaseBuilder(ApplicationProvider.getApplicationContext(), AppDatabase::class.java)
+        .setQueryExecutor(MoreExecutors.directExecutor())
+        .setTransactionExecutor(MoreExecutors.directExecutor())
+        .build()
+    private val dao = db.notaDao()
+
+    @After fun cerrar() = db.close()
+
+    @Test fun elFlujoEmiteDeNuevoTrasCadaEscritura() = runTest {
+        dao.observarTodas().test {
+            assertThat(awaitItem()).isEmpty()
+            dao.insertar(Nota(id = 1, titulo = "Primera"))
+            assertThat(awaitItem()).hasSize(1)
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+}
+```
+
+Las migraciones merecen párrafo aparte porque son el único defecto de esta capa que se manifiesta como pérdida de datos irreversible en dispositivos ajenos. Con la exportación de esquemas activada, el compilador deja en el repositorio un fichero JSON por versión, y la utilidad de migración sabe crear una base de datos con el esquema antiguo, aplicar las migraciones declaradas y comparar el resultado contra el esquema nuevo. La comparación detecta lo que la revisión humana no ve: una columna con el mismo nombre pero distinta nulabilidad, un índice que se perdió, un valor por defecto que no se replicó.
+
+```kotlin
+@get:Rule val ayudante = MigrationTestHelper(instrumentacion, AppDatabase::class.java)
+
+@Test fun migracion4a5ConservaLasNotasArchivadas() {
+    ayudante.createDatabase(NOMBRE, 4).apply {
+        execSQL("INSERT INTO nota VALUES (1, 'Vieja', 1)")
+        close()
+    }
+    val db = ayudante.runMigrationsAndValidate(NOMBRE, 5, true, MIGRACION_4_5)
+    db.query("SELECT titulo FROM nota WHERE archivada = 1").use { cursor ->
+        assertThat(cursor.moveToFirst()).isTrue()
+        assertThat(cursor.getString(0)).isEqualTo("Vieja")
+    }
+}
+```
+
+<Callout type="warn" title="Validar el esquema no valida los datos">
+La utilidad de migración comprueba que la estructura resultante coincide con la esperada, y ahí se detiene. Una migración que crea la columna correcta y deja todas las filas a nulo pasa esa validación sin protestar. Por eso toda prueba de migración debe insertar filas representativas antes y afirmar sobre su contenido después: la validación de esquema es la mitad barata, y la conservación de datos es la mitad que importa.
+</Callout>
+
+## La red como un servidor de verdad en el propio proceso
+
+Sustituir el cliente HTTP por un doble es la decisión que más información destruye en esta capa, porque elimina de la prueba todo lo que ocurre entre la interfaz y el socket: la serialización, los interceptores, las cabeceras de autenticación, el mapeo de códigos de estado, los reintentos y el comportamiento ante una respuesta truncada. Un servidor local resuelve esto sin coste apreciable: arranca en el proceso de prueba, escucha en un puerto efímero y entrega la URL base que se le pasa al cliente. Y lo que lo convierte en un instrumento y no solo en un sustituto es que graba lo que recibe: la prueba puede afirmar sobre la petición emitida —ruta, método, cabeceras, cuerpo, orden— y ahí es donde vive la mitad de los defectos reales: el parámetro de paginación que no se envía, el token que se manda en la cabecera equivocada, la segunda petición que nunca se hizo porque la caché mintió.
+
+```kotlin
+private val servidor = MockWebServer().apply { start() }
+private val api: NotasApi = Retrofit.Builder()
+    .baseUrl(servidor.url("/"))
+    .addConverterFactory(Json.asConverterFactory("application/json".toMediaType()))
+    .build()
+    .create(NotasApi::class.java)
+
+@After fun parar() = servidor.shutdown()
+
+@Test fun enviaElCursorYMapeaLaPagina() = runTest {
+    servidor.enqueue(MockResponse().setResponseCode(200).setBody(leerRecurso("notas_pagina1.json")))
+
+    val pagina = api.notas(cursor = "abc")
+
+    val peticion = servidor.takeRequest()
+    assertThat(peticion.path).isEqualTo("/notas?cursor=abc")
+    assertThat(peticion.getHeader("Accept")).contains("application/json")
+    assertThat(pagina.items).hasSize(20)
+}
+```
+
+Para escenarios con varias llamadas concurrentes, la cola por orden de llegada deja de ser suficiente y conviene instalar un despachador que responda según la ruta. Y para probar el camino desagradable, el servidor sabe hacer cosas que un doble no sabe imitar: devolver un cuerpo cortado a la mitad, aplicar un retardo mayor que el tiempo de espera del cliente o cerrar la conexión al inicio del cuerpo. Esas tres respuestas encuentran más defectos que veinte casos con código 200, porque el manejo de errores casi nunca se ejercita.
+
+<Callout type="tip" title="Guarda las respuestas como ficheros, no como cadenas">
+Un cuerpo JSON incrustado en el código de la prueba envejece mal y nadie lo compara nunca con lo que el servidor real devuelve. Colocado en los recursos del conjunto de prueba, puede regenerarse desde una captura auténtica, revisarse en el control de versiones como cualquier otro artefacto y compartirse entre pruebas. Cuando la respuesta real cambia, el fichero es el único sitio donde hay que tocar.
+</Callout>
+
+<Mermaid code={`flowchart LR
+  A[Test] --> B[Repositorio real]
+  B --> C[DAO real sobre Room en memoria]
+  B --> D[Cliente HTTP real]
+  D --> E[MockWebServer en el proceso]
+  E --> F[Ficheros de respuesta en recursos]
+  A --> G[Afirmaciones sobre el estado observable]
+  A --> H[Afirmaciones sobre la peticion grabada]
+  style C fill:#a6e3a1,color:#11111b
+  style E fill:#89b4fa,color:#11111b`} />
+
+## El repositorio completo: probar la política, no la delegación
+
+Con las dos fuentes reales y rápidas, el repositorio se puede ejercitar entero, y esa es la prueba que de verdad paga. Un repositorio no tiene lógica de negocio interesante; lo que tiene es una política de reconciliación entre una caché persistente y una red poco fiable, y esa política solo se observa cuando ambas participan. Las preguntas que hay que responder son siempre las mismas cuatro: qué se emite cuando hay caché y la red tarda, qué se emite cuando la red falla y la caché tiene datos viejos, qué queda escrito cuando la red responde, y cuántas peticiones se emiten cuando dos consumidores piden lo mismo a la vez.
+
+```kotlin
+@Test fun emiteLaCacheYLuegoLaRedYNoDuplicaPeticiones() = runTest {
+    dao.insertar(Nota(id = 1, titulo = "En cache"))
+    servidor.enqueue(MockResponse().setBodyDelay(50, MILLISECONDS).setBody(unaNota("Del servidor")))
+
+    repositorio.observarNotas().test {
+        assertThat(awaitItem().map { it.titulo }).containsExactly("En cache")
+        assertThat(awaitItem().map { it.titulo }).containsExactly("Del servidor")
+        cancelAndIgnoreRemainingEvents()
+    }
+
+    assertThat(dao.contar()).isEqualTo(1)
+    assertThat(servidor.requestCount).isEqualTo(1)
+}
+```
+
+Dos detalles hacen que esta prueba sea determinista y no una lotería. El primero es que el repositorio recibe su despachador por inyección en lugar de nombrarlo, de modo que la prueba le pasa el despachador del entorno de corrutinas y controla el avance del tiempo virtual. El segundo es que las afirmaciones se hacen sobre emisiones esperadas de forma explícita y no sobre el resultado de dormir un rato: la última cuenta de peticiones verifica una propiedad de diseño, la deduplicación, que ningún doble de la red podría revelar. Y la afirmación sobre la escritura merece énfasis aparte porque es la que más defectos captura y la que casi ninguna suite hace: comprobar que el flujo emitió los datos del servidor no dice nada sobre si quedaron guardados; comprobar el contenido del DAO después sí. La discrepancia entre ambas cosas es exactamente el defecto de la aplicación que funciona con red y aparece vacía en el arranque siguiente.
+
+## Dónde sigue siendo correcto un doble
+
+Nada de lo anterior implica que los dobles sobren. Implica que su lugar es más estrecho de lo que suele asumirse y que conviene enunciarlo con precisión. Un doble aporta cuando la dependencia es lenta de forma irreducible, cuando es no determinista por naturaleza —el reloj, el generador de aleatorios, el identificador del dispositivo—, cuando produce efectos que no se pueden observar desde la prueba, o cuando lo que se quiere provocar es un estado que la implementación real no permite alcanzar a voluntad. Conviene además distinguir dos figuras que se confunden y que se comportan de forma opuesta. Un falso es una implementación alternativa completa y correcta que mantiene su propio estado: se le pide algo y responde con coherencia, y por tanto puede sustituir a la real sin que la prueba tenga que saberlo. Un simulacro con expectativas verifica interacciones: afirma que se llamó a tal método con tales argumentos. Lo primero prueba comportamiento, lo segundo prueba implementación, y una suite construida sobre lo segundo se convierte en un molde de escayola que impide cualquier refactorización sin aportar ninguna garantía sobre el resultado observable.
+
+<Cards>
+  <Card icon="⏰" title="Reloj y aleatorio">
+    Inyecta una fuente de tiempo controlable. Toda expiración de caché probada con el reloj del sistema es una prueba que fallará una madrugada.
+  </Card>
+  <Card icon="🧱" title="Falso con estado">
+    Para una fuente sin implementación rápida disponible, escribe una implementación real y sencilla. Se comporta, no solo responde.
+  </Card>
+  <Card icon="🚫" title="Simulacro de la propia clase">
+    Simular una dependencia que ya tiene implementación en memoria y rápida no ahorra tiempo y elimina toda la información valiosa.
+  </Card>
+  <Card icon="🔍" title="Verificar llamadas">
+    Reserva la verificación de interacciones para efectos invisibles desde fuera, como una llamada de telemetría, no para el paso de datos.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Probar el contrato con el mundo, no el reflejo de tu propio código">
+Hay una razón estructural por la que la capa de datos es donde las suites fallan más silenciosamente, y merece formularse sin rodeos: es la única capa cuyo comportamiento correcto está definido por sistemas que no controlas. El motor de la base de datos decide qué significa un conflicto de clave única, el servidor decide qué devuelve cuando el cursor caducó, el protocolo decide qué pasa cuando la conexión se corta a mitad del cuerpo. Toda prueba que sustituya esos sistemas por una imitación escrita por el mismo equipo que escribió el código bajo prueba está verificando una hipótesis contra sí misma, y ese procedimiento no puede producir información nueva: si el desarrollador entendió mal el comportamiento del conflicto de clave única, escribirá el doble con el mismo malentendido y la prueba pasará con orgullo mientras el dispositivo del usuario lanza una excepción. Esta es la asimetría decisiva y la que justifica todo el aparato de esta lección: usar el motor real en memoria y un servidor real en el proceso no es una preferencia por la integración sobre la unidad, es la única forma de que la prueba pueda contradecirte. Y de ahí se sigue el criterio que conviene llevarse por encima de cualquier herramienta concreta: al elegir entre una implementación real rápida y un doble, la pregunta correcta no es cuál es más cómoda de montar sino cuál de las dos puede sorprenderte. Un doble nunca puede, porque solo sabe lo que ya sabías cuando lo escribiste; un motor real puede, y cada vez que lo hace acabas de comprar información que no tenías por el precio de un milisegundo. Cuando la implementación real es rápida y determinista, sustituirla por una imitación no es simplificar la prueba, es cambiar una prueba por una tautología cuidadosamente redactada.
+</Callout>
+
+<Reto title="Monta el banco hermético de tu capa de datos">
+1. Convierte tus pruebas de DAO a base de datos en memoria con ejecutores directos y añade una que afirme sobre reemisión de flujo tras una escritura.
+2. Activa la exportación de esquemas y escribe una prueba por cada migración pendiente que inserte filas antes y verifique su contenido después.
+3. Sustituye cualquier doble del cliente de red por un servidor local y añade tres pruebas del camino desagradable: cuerpo truncado, retardo mayor que el tiempo de espera y código 500.
+4. Escribe la prueba del repositorio completo que verifique caché primero, escritura posterior y una sola petición ante dos consumidores simultáneos.
+5. Inventaría tus simulacros con verificación de llamadas y elimina todos los que verifiquen paso de datos entre capas que ya puedes observar por su estado.
+</Reto>
