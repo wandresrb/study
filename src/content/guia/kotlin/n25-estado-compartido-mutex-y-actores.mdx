@@ -1,0 +1,148 @@
+---
+title: "Estado compartido: Mutex, confinamiento y actores"
+description: "Cuando varias corrutinas tocan el mismo estado hay cuatro respuestas posibles y solo una de ellas es la que casi todo el mundo escribe primero, que es además la equivocada. Esta lección contrasta bloquear un hilo con suspender una corrutina, explica por qué Mutex no es reentrante ni por descuido ni por omisión, presenta el confinamiento por paralelismo limitado como alternativa que serializa sin exclusión explícita, reconstruye el actor a partir de un canal y un tipo sellado de mensajes, y termina con un criterio de elección que no depende del gusto."
+subject: kotlin
+level: 25
+order: 5
+icon: "25.5"
+duracion: "24 min"
+---
+
+<Lead>
+Todo lo anterior de este nivel evitaba el problema en lugar de resolverlo: si el estado vive dentro de una corrutina y los demás le hablan por un canal, no hay estado compartido y no hay nada que proteger. Pero hay sistemas donde esa reorganización no es viable o no es honesta, y entonces hay que enfrentarse a la pregunta directamente. La respuesta refleja —tomar un cerrojo— es la peor de las disponibles en un programa de corrutinas, y no por una cuestión de estilo: un cerrojo bloquea un hilo, y en un modelo donde miles de corrutinas comparten un puñado de hilos, bloquear uno es apagar una fracción medible de la máquina. Kotlin ofrece tres alternativas que no bloquean nada, y elegir entre ellas es una decisión de diseño con criterios objetivos.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué un cerrojo tradicional es incompatible con la suspensión y qué diagnóstico emite el compilador.
+- Usar `Mutex` y `withLock` con corrección, sabiendo que no es reentrante y por qué se diseñó así.
+- Serializar el acceso a un estado por confinamiento con un despachador de paralelismo uno.
+- Construir un actor sobre un canal y un tipo sellado, y elegir entre las tres estrategias con criterio.
+
+</Objetivos>
+
+## Por qué bloquear es la respuesta equivocada
+
+Un cerrojo clásico protege una sección crítica haciendo que el hilo que no puede entrar se detenga. Ese contrato tiene dos premisas que las corrutinas rompen. La primera es que el hilo es la unidad de ejecución: si detenerlo cuesta poco es porque hay muchos, y en un despachador con tantos hilos como núcleos, cuatro corrutinas bloqueadas pueden dejar el proceso entero parado aunque haya diez mil corrutinas listas para avanzar. La segunda es más profunda: un monitor pertenece al hilo que lo adquirió, y una corrutina puede cambiar de hilo en cada punto de suspensión, así que suspenderse dentro de una sección crítica significa reanudarse en un hilo que no posee el cerrojo.
+
+Hay un tercer efecto que no se ve en el código y sí en las gráficas: los despachadores de la librería asumen que sus hilos no se detienen. Bloquear uno no solo resta capacidad, sino que puede provocar que trabajo perfectamente listo espere detrás de una barrera que el planificador no sabe que existe, porque para él ese hilo está ocupado ejecutando algo.
+
+El compilador conoce ese peligro y lo rechaza: llamar a una función suspendida dentro de un bloque sincronizado produce el diagnóstico `SUSPENSION_POINT_INSIDE_CRITICAL_SECTION`. No es una advertencia de estilo, es la prevención de un fallo que sería intermitente e irreproducible.
+
+```kotlin
+// No compila: el punto de suspensión está dentro de la sección crítica.
+synchronized(cerrojo) {
+    val dato = repositorio.leer(id)   // función suspendida
+    cache[id] = dato
+}
+```
+
+<Callout type="info" title="Los atómicos siguen siendo válidos">
+Nada de esto invalida las operaciones atómicas. Si el estado compartido es un contador, una referencia o algo que cabe en una operación de comparación e intercambio, un tipo atómico es más simple y más rápido que cualquier alternativa de esta lección. La discusión empieza cuando la invariante abarca varias variables o cuando dentro de la sección crítica hay que suspender.
+</Callout>
+
+## Mutex: exclusión que suspende
+
+`Mutex` es el equivalente que suspende en lugar de bloquear. Su uso normal es la función `withLock`, que adquiere, ejecuta y libera incluso ante excepciones o cancelación.
+
+```kotlin
+class Contador {
+    private val mutex = Mutex()
+    private var valor = 0
+
+    suspend fun incrementar() = mutex.withLock { valor++ }
+
+    suspend fun aplicar(id: String) = mutex.withLock {
+        val dato = repositorio.leer(id)   // suspender aquí sí es legal
+        valor += dato.peso
+    }
+}
+```
+
+Dos propiedades importan. La primera es la equidad: las corrutinas en espera se atienden en orden de llegada, lo que elimina la inanición pero también significa que la latencia del cerrojo crece con la contención de forma predecible y no aleatoria. La segunda es que **no es reentrante**: si una corrutina que ya posee el mutex intenta adquirirlo de nuevo, se queda esperando a sí misma para siempre, y el interbloqueo resultante no produce ningún error, solo una corrutina que nunca vuelve.
+
+Hay también una variante no suspendida, `tryLock`, y un parámetro de propietario que permite detectar el intento de liberar un cerrojo que no se posee. Ambos son herramientas de nicho: el primero para caminos donde esperar no es aceptable, el segundo para depurar código donde la adquisición y la liberación están separadas, que es exactamente el código que `withLock` existe para que no escribas.
+
+Esa omisión es deliberada. La reentrada exige saber quién posee el cerrojo, y en un mundo donde la unidad de ejecución es la corrutina y no el hilo, la identidad del poseedor no está disponible de forma barata ni bien definida. Pero hay un argumento de diseño mejor que el técnico: un cerrojo reentrante permite que una función pública protegida llame a otra función pública protegida, y eso convierte cualquier refactorización en una potencial ampliación silenciosa de la sección crítica. La regla que sobrevive es mantener las secciones críticas cortas, sin llamadas a código ajeno y sin invocar métodos públicos de la propia clase desde dentro.
+
+## Confinamiento por despachador
+
+Existe una tercera vía que no protege el estado sino que impide que dos corrutinas lo toquen a la vez, obligándolas a ejecutarse en serie. La forma moderna de conseguirlo es pedir a un despachador una vista con paralelismo uno.
+
+```kotlin
+private val serie = Dispatchers.Default.limitedParallelism(1)
+private var estado = Estado.inicial()
+
+suspend fun mutar(accion: Accion) = withContext(serie) {
+    estado = estado.aplicar(accion)   // nunca hay dos a la vez
+}
+```
+
+La comparación con la alternativa histórica es instructiva. Durante años el idioma para esto fue crear un despachador de un solo hilo dedicado, que funciona pero reserva un hilo del sistema operativo para siempre y obliga a cerrarlo a mano, con lo que el estado gana un ciclo de vida propio que alguien tiene que administrar. El paralelismo limitado ofrece la misma serialización sin poseer ningún hilo, y por eso el constructor antiguo quedó marcado como obsoleto.
+
+Conviene ser exacto sobre qué garantiza. No garantiza el mismo hilo: garantiza que no se ejecuten dos tareas simultáneamente, y por tanto no sirve para nada que dependa de variables locales al hilo. Lo que sí aporta, y es lo que importa, es que el propio acto de despachar establece la relación de precedencia necesaria para que lo que una tarea escribió sea visible para la siguiente. Y a diferencia de dedicar un hilo entero al estado, no inmoviliza ningún recurso: los hilos se toman prestados del despachador base solo mientras hay trabajo.
+
+<Mermaid code={`flowchart TD
+  A[Varias corrutinas tocan un estado] --> B[Cabe en una operacion atomica]
+  B -->|Si| C[Tipo atomico]
+  B -->|No| D[Hay suspension dentro de la seccion critica]
+  D -->|No y son muchas operaciones| E[Confinamiento con paralelismo uno]
+  D -->|Si| F[Mutex con withLock]
+  F --> G[El estado tiene protocolo y orden]
+  E --> G
+  G -->|Si| H[Actor sobre canal y mensajes sellados]`} />
+
+## El actor y el criterio de elección
+
+Un actor lleva la idea del confinamiento al extremo: el estado no se protege, se esconde dentro de una corrutina, y el resto del sistema solo puede enviarle mensajes por un canal. La exclusión mutua deja de existir como problema porque solo hay un ejecutor posible.
+
+```kotlin
+sealed interface Mensaje
+data class Sumar(val n: Int) : Mensaje
+data class Leer(val respuesta: CompletableDeferred<Int>) : Mensaje
+
+fun CoroutineScope.contador(): SendChannel<Mensaje> {
+    val buzon = Channel<Mensaje>(capacity = 64)
+    launch {
+        var valor = 0                       // estado privado de esta corrutina
+        for (m in buzon) when (m) {
+            is Sumar -> valor += m.n
+            is Leer -> m.respuesta.complete(valor)
+        }
+    }
+    return buzon
+}
+```
+
+La forma del tipo de mensajes no es un detalle de implementación: es la interfaz pública del componente y el sitio donde queda registrado, de manera exhaustiva y verificable por el compilador, todo lo que se puede hacer con ese estado. Un actor bien escrito se lee entero mirando su tipo sellado, y añadir una operación obliga a completar el `when`, lo cual es una garantía que ninguna de las otras estrategias ofrece.
+
+Ese código es todo el patrón: un canal, un bucle, un `when` exhaustivo y una variable local que nadie más puede ver. La librería tuvo un constructor `actor` dedicado que sigue existiendo marcado como obsoleto, y la recomendación oficial es exactamente lo de arriba, escrito a mano, porque compone mejor con la concurrencia estructurada y no oculta decisiones de ciclo de vida. Nótese además que el patrón de petición y respuesta necesita devolver un `CompletableDeferred` en el mensaje, y que la capacidad del buzón es la contrapresión del actor: si lo declaras ilimitado, has vuelto al problema de la primera lección.
+
+El coste del actor tampoco hay que esconderlo. Cada operación pasa a ser un objeto asignado, un envío por canal y un cambio de corrutina, lo que lo descarta para estados que se tocan un millón de veces por segundo. Las lecturas dejan de ser gratuitas: consultar el valor exige un viaje de ida y vuelta, y si esa consulta es frecuente casi siempre conviene publicar el estado además en un `StateFlow` que el actor actualice, dejando el buzón únicamente para las escrituras. Y el orden, que es su gran virtud, es también una restricción: dos operaciones independientes que podrían ejecutarse a la vez no lo harán nunca, porque el actor tiene un solo hilo lógico de ejecución por diseño.
+
+<Cards>
+  <Card icon="⚛️" title="Atómicos">
+    Para estado que cabe en una sola operación. Sin suspensión, sin espera, coste mínimo. Se rompe en cuanto la invariante abarca dos campos.
+  </Card>
+  <Card icon="🔐" title="Mutex">
+    Para secciones críticas cortas que necesitan suspender dentro. Sencillo y local, no reentrante, y la contención se paga en latencia de espera.
+  </Card>
+  <Card icon="🧭" title="Confinamiento">
+    Para estados con muchas operaciones donde poner un cerrojo en cada una sería ruido. Serializa por construcción y no necesita disciplina del programador.
+  </Card>
+  <Card icon="📬" title="Actor">
+    Para estado con protocolo, orden y necesidad de contrapresión. El mensaje es explícito y auditable, a cambio de un salto de indirección y de respuestas diferidas.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Las cuatro estrategias no compiten por eficiencia sino por dónde ponen la frontera del estado, y esa frontera es la única decisión arquitectónica real que tomas al escribir concurrencia">
+La tentación al llegar a este punto es ordenar las cuatro opciones por rendimiento y quedarse con la primera que sirva, y ese es exactamente el razonamiento que produce sistemas que funcionan durante seis meses. Lo que de verdad distingue a un atómico, un mutex, un despachador confinado y un actor no es su coste por operación —que difiere en un orden de magnitud, cuando la diferencia que importa suele estar en dos o tres— sino dónde queda dibujada la frontera entre lo que está protegido y lo que no, y sobre todo quién es responsable de mantener esa frontera intacta cuando el código cambie. Con un atómico, la frontera es la variable: es la más nítida que existe y también la más estrecha, y en el momento en que aparece una segunda variable que debe ser coherente con la primera, la frontera desaparece sin que nada avise, porque dos operaciones atómicas consecutivas no son una operación atómica y el código sigue compilando. Con un mutex, la frontera es cada bloque `withLock`, es decir, es una convención distribuida por todo el fichero que depende de que absolutamente todos los accesos recuerden pasar por ella; el compilador no verifica nada, la clase que expone una propiedad mutable sin protegerla no da ningún error, y basta un método público añadido con prisa para abrir un agujero que solo se manifestará bajo carga. Con el confinamiento, la frontera es el contexto de ejecución, un escalón más arriba y bastante más difícil de perforar por accidente, aunque tampoco es infalible: nada impide que alguien lea la propiedad desde fuera del despachador, y la garantía se pierde en silencio. Con un actor, la frontera es el tipo mismo: el estado es una variable local dentro de una lambda y no existe ninguna expresión sintáctica capaz de alcanzarla desde fuera, de modo que la protección deja de depender de la disciplina de nadie y pasa a ser una imposibilidad del lenguaje. Ordenadas así, las cuatro opciones forman una escala clarísima: cuanto más arriba, más difícil es equivocarse y más caro resulta cada acceso, porque lo que estás comprando con esos nanosegundos es la eliminación de una clase entera de errores futuros. El criterio de elección se sigue de ahí y no depende de gustos: mide cuántos sitios del código pueden tocar ese estado, cuántos programadores lo tocarán en el próximo año y qué ocurre exactamente el día que uno de ellos olvide la convención. Si la respuesta a la última pregunta es *nada grave, un test lo pilla*, quédate abajo en la escala. Si es *corrupción silenciosa que aparecerá bajo carga en producción*, sube hasta que el error se vuelva inexpresable.
+</Callout>
+
+<Reto title="Cuatro implementaciones del mismo estado">
+1. Implementa un contador compartido incrementado por mil corrutinas con las cuatro estrategias y comprueba que las cuatro dan mil. Mide el tiempo de cada una.
+2. Añade al estado una segunda variable que deba mantenerse coherente con la primera y repite. Observa cuál de las cuatro versiones deja de ser correcta sin dar ningún error.
+3. Provoca el interbloqueo del `Mutex` no reentrante llamando desde dentro de un `withLock` a otro método que también lo toma. Documenta cómo se manifiesta y cómo lo detectaste.
+4. Sustituye el confinamiento por un `ThreadLocal` y comprueba empíricamente que el paralelismo uno no garantiza el mismo hilo.
+5. Convierte tu actor en un componente con petición y respuesta usando `CompletableDeferred`, dale un buzón de capacidad pequeña y satúralo. Explica qué le ocurre al emisor y por qué eso es lo correcto.
+</Reto>

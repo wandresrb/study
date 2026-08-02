@@ -1,0 +1,150 @@
+---
+title: "El contexto arrastrado: media firma dedicada a la fontanería"
+description: "Un logger, una transacción, un ámbito de corrutina o un formateador de moneda tienen que llegar hasta el punto donde se usan, y hasta Kotlin 2.2 solo había tres formas de conseguirlo: propagar el parámetro por cada firma de la cadena, secuestrar el receptor de extensión o refugiarse en el estado global. Esta lección diagnostica el problema con precisión, mide el coste real de cada una de las tres respuestas clásicas y formula qué capacidad le faltaba exactamente al lenguaje."
+subject: kotlin
+level: 20
+order: 1
+icon: "20.1"
+duracion: "18 min"
+---
+
+<Lead>
+Abre cualquier proyecto de Kotlin con más de tres años de vida y busca la palabra `logger` en las firmas de sus funciones. Vas a encontrar decenas de parámetros que ninguna de esas funciones necesita realmente para hacer su trabajo: están ahí porque alguna función más abajo en la pila sí los necesita, y no había otra forma de hacérselos llegar. Lo mismo ocurre con la conexión de base de datos que atraviesa cinco capas para morir en un repositorio, con el formateador que se pasa a mano hasta la última plantilla y con el ámbito de corrutina que se propaga por media aplicación. A este fenómeno le vamos a poner nombre en esta lección, porque nombrarlo es el primer paso para entender por qué Kotlin dedicó cuatro versiones y dos diseños distintos a resolverlo. Se llama el problema del contexto arrastrado, y su síntoma es que la firma de una función deja de describir lo que la función hace para describir por dónde pasa.
+</Lead>
+
+<Objetivos>
+
+- Diagnosticar el contexto arrastrado y distinguirlo de una dependencia legítima de la operación.
+- Analizar las tres respuestas habituales anteriores a Kotlin 2.2 y el coste concreto de cada una.
+- Reconocer las cuatro familias de servicio transversal que provocan el problema casi siempre.
+- Formular con precisión qué capacidad le faltaba al lenguaje antes de los parámetros de contexto.
+
+</Objetivos>
+
+## La forma exacta del problema
+
+Conviene separar dos cosas que se parecen y no lo son. Cuando una función de conversión recibe una moneda de destino, ese argumento forma parte del significado de la operación: convertir a euros y convertir a dólares son cosas distintas, y quien llama tiene que decidir cuál quiere. Cuando esa misma función recibe un `Logger`, en cambio, el argumento no cambia el resultado ni forma parte de lo que la función significa; es un servicio ambiental que la función usa de paso. La primera es una dependencia legítima. La segunda es contexto, y el contexto tiene la mala costumbre de contagiarse hacia arriba.
+
+La prueba para distinguirlas es sencilla y conviene aplicarla siempre en el mismo orden. Pregúntate si dos llamadas con valores distintos de ese argumento producirían resultados que un usuario del sistema consideraría respuestas a preguntas distintas. Si la respuesta es sí, es una dependencia; si la respuesta es que producirían la misma respuesta contada de otra forma, o registrada en otro sitio, o guardada en otra transacción, entonces es contexto.
+
+El contagio es la clave del asunto y funciona con una mecánica implacable. Si la función más profunda de una cadena necesita el servicio, su llamadora tiene que tenerlo para pasárselo; si la llamadora no lo tiene, tiene que recibirlo; y así hasta la raíz. Una sola necesidad en la hoja del árbol de llamadas obliga a modificar todas las firmas del camino, aunque ninguna de las intermedias toque el objeto.
+
+```kotlin
+// El servicio solo se usa en la ultima linea de la ultima funcion
+fun manejarPeticion(id: String, log: Logger, fmt: Formateador): Respuesta =
+    procesar(cargar(id, log), log, fmt)
+
+fun cargar(id: String, log: Logger): Pedido {
+    log.debug("cargando $id")
+    return repositorio.buscar(id)
+}
+
+fun procesar(pedido: Pedido, log: Logger, fmt: Formateador): Respuesta {
+    log.info("procesando ${pedido.id}")
+    return Respuesta(fmt.moneda(pedido.total))
+}
+```
+
+Fíjate en que `manejarPeticion` no usa ni el logger ni el formateador: los recibe únicamente para reenviarlos. Esa función miente sobre sí misma, porque su firma anuncia una dependencia de dos servicios que en realidad no tiene. Multiplica el patrón por las cuarenta funciones de un módulo y tendrás una base de código donde la mitad de los parámetros son tránsito.
+
+<Mermaid code={`flowchart TD
+  A[Controlador HTTP] --> B[Servicio de aplicacion]
+  B --> C[Caso de uso]
+  C --> D[Repositorio]
+  D --> E[Serializador]
+  E --> F[Aqui se usa el logger de verdad]
+  A -. el objeto viaja por las cinco capas .-> F`} />
+
+Hay dos costes derivados que suelen pasar desapercibidos y que conviene contabilizar antes de juzgar la solución. El primero es que la firma pierde su valor como documentación: cuando la mitad de los parámetros son tránsito, leer una firma deja de decirte qué necesita la operación y pasa a decirte qué necesita el subárbol completo bajo ella, que es una información mucho menos útil y que además cambia cada vez que alguien toca una hoja. El segundo es que el arrastre destruye la componibilidad de las funciones de orden superior: una lambda que quiera llamar a `procesar` tiene que capturar el logger, y si esa lambda se pasa a una API que no sabe nada de loggers, el servicio viaja escondido dentro de una captura que nadie declaró.
+
+Las cuatro familias que producen esto son casi siempre las mismas y conviene tenerlas identificadas: los servicios de observabilidad, es decir, registro, métricas y trazas; los ámbitos de recurso, que agrupan transacciones de base de datos, sesiones y unidades de trabajo; los ámbitos de ejecución, que en Kotlin significa el `CoroutineScope` y sus derivados; y la configuración de presentación, que incluye la localización, el formateo de números y fechas y las zonas horarias. Todas comparten la misma estructura: son transversales, tienen ámbito de ejecución y son irrelevantes para el significado de casi todas las funciones que las tocan.
+
+## Las tres respuestas de antes de la versión 2.2
+
+La primera respuesta es la que acabamos de ver: **propagar el parámetro**. Su virtud es enorme y hay que reconocerla antes de criticarla, porque es totalmente explícita, el compilador la verifica y no hay ninguna magia que entender. Su defecto es el ruido acumulado y, sobre todo, la rigidez: añadir un servicio nuevo en una hoja del árbol es un cambio que toca decenas de archivos y rompe la compatibilidad binaria de todo lo público que haya en el camino.
+
+La segunda respuesta consiste en **secuestrar el receptor de extensión**, aprovechando que Kotlin ya sabe hacer implícito un valor. Como el receptor no aparece en la lista de argumentos y está disponible dentro del cuerpo, la tentación de meter ahí el servicio es fuerte.
+
+```kotlin
+// El logger ocupa el unico hueco implicito que ofrece el lenguaje
+fun Logger.procesar(pedido: Pedido): Respuesta {
+    info("procesando")
+    return Respuesta(pedido.total)
+}
+
+// Y ahora el pedido, que es el sujeto real, viaja como argumento
+with(logger) { procesar(pedido) }
+```
+
+Conviene reconocer que esta solución tuvo una versión sofisticada y respetable, que es la del ámbito con receptor de los DSL: declarar una interfaz de ámbito, hacerla receptora de un bloque y escribir dentro las operaciones que la necesitan. Ese patrón sostiene la biblioteca de corrutinas entera y funciona muy bien mientras haya un solo ámbito. Pero sigue siendo la misma apuesta, y por tanto tiene el mismo techo.
+
+El coste es evidente en cuanto lo miras dos veces: el hueco implícito es uno solo y ya estaba ocupado por el sujeto natural de la operación. Al meter el servicio ahí, el pedido se degrada a argumento y la función pasa a parecer una operación sobre loggers, que es exactamente lo contrario de lo que es. Y si hicieran falta dos servicios a la vez, el truco simplemente no escala, porque no hay dos receptores.
+
+La tercera respuesta es **refugiarse en el estado global**, ya sea con un `object` singleton, con un localizador de servicios o con una variable de hilo. Desaparece todo el ruido de las firmas, y esa es justo la razón de que sea la más peligrosa de las tres.
+
+```kotlin
+object Contexto {
+    lateinit var log: Logger      // quien garantiza la inicializacion
+    val transaccion = ThreadLocal<Transaccion?>()
+}
+
+fun procesar(pedido: Pedido): Respuesta {
+    Contexto.log.info("procesando")   // dependencia invisible en la firma
+    return Respuesta(pedido.total)
+}
+```
+
+Aquí la dependencia sigue existiendo pero ha dejado de estar en el sistema de tipos, y ese desplazamiento es la operación que hay que ver con claridad: no se ha eliminado nada, se ha movido de un lugar donde el compilador podía comprobarlo a otro donde no puede. Las consecuencias que se pagan siempre son tres. La primera es que el compilador ya no puede decirte que falta: el fallo se traslada a la ejecución. La segunda es que la sustitución en las pruebas se vuelve un ejercicio de mutación global, con el consiguiente acoplamiento entre tests que se ejecutan en paralelo. La tercera, y en Kotlin la más grave, es que una variable de hilo no sobrevive a un cambio de hilo, y una corrutina cambia de hilo cuando le apetece al despachador; ese es el origen de una clase entera de errores donde la transacción existe antes de un punto de suspensión y ha desaparecido después.
+
+<Cards>
+  <Card icon="🧵" title="Propagar el parámetro">
+    Explícito y verificado, pero el ruido crece con el cuadrado del tamaño y cada servicio nuevo es un cambio que atraviesa toda la aplicación.
+  </Card>
+  <Card icon="🎭" title="Secuestrar el receptor">
+    Elimina el argumento a costa de mentir sobre el sujeto de la operación, y se rompe en cuanto hacen falta dos servicios simultáneos.
+  </Card>
+  <Card icon="🌍" title="Estado global o variable de hilo">
+    Firmas limpias y dependencias invisibles. El compilador deja de ayudar y las corrutinas rompen la afinidad de hilo por diseño.
+  </Card>
+  <Card icon="🏗️" title="Inyección por constructor">
+    Resuelve el caso de las clases y no toca el de las funciones libres ni el de las extensiones, que en Kotlin idiomático son la mitad del código.
+  </Card>
+</Cards>
+
+## Qué faltaba realmente
+
+Merece la pena detenerse en la inyección por constructor, porque es la respuesta correcta a un problema vecino y por eso confunde. Convertir cada grupo de funciones en una clase con el servicio como campo funciona, y de hecho es lo que hace la mayoría del software empresarial. Pero paga un precio muy concreto en Kotlin: obliga a instanciar objetos para operaciones que no tienen estado, no sirve para funciones de extensión ni para funciones de nivel superior, y no expresa el ámbito, es decir, no puede decir que este servicio solo está disponible dentro de esta región del programa y no fuera.
+
+Conviene ser justos también aquí: el estado global tiene un caso legítimo, que es el de los valores verdaderamente únicos por proceso y fijados antes de que empiece nada, como la configuración de arranque. El problema no es la globalidad sino usarla para valores que cambian por región de ejecución, que es precisamente lo que hace un contexto.
+
+Merece la pena además una observación sobre la variable de hilo, porque es la respuesta que más veces sigue apareciendo en código nuevo y la que peor envejece en Kotlin concretamente. Una variable de hilo funciona sobre la premisa de que una unidad lógica de trabajo se ejecuta de principio a fin en el mismo hilo, y esa premisa era razonable en un servidor de un hilo por petición. Las corrutinas la invalidan por diseño: un punto de suspensión puede devolver la ejecución en un hilo distinto del que la dejó, así que el valor guardado desaparece sin previo aviso a mitad de una función que parece secuencial.
+
+```kotlin
+val actual = ThreadLocal<Transaccion?>()
+
+suspend fun confirmar(id: String) {
+    val antes = actual.get()      // hay transaccion
+    esperarConfirmacionExterna()  // punto de suspension
+    val despues = actual.get()    // puede ser nulo: otro hilo, otro valor
+}
+```
+
+Ese último punto es el que resume todo lo anterior. Lo que faltaba no era una forma de pasar valores, que sobraban, sino una forma de declarar que **una función solo puede llamarse dentro de un ámbito que provea ciertos servicios**, y de que ese ámbito viaje solo. Dicho en términos de tipos, faltaba un lugar en la firma para las dependencias que quien llama no tiene que mencionar, pero que el compilador sí tiene que comprobar.
+
+Formulada así, la carencia se vuelve familiar, porque es la misma que Kotlin ya había resuelto una vez con las funciones de extensión: allí faltaba un lugar en la firma para el sujeto de la operación, el valor que quien llama escribe delante del punto y no dentro de los paréntesis. Los parámetros de contexto son la extensión de esa idea al otro lado del problema, el de los valores que quien llama no escribe en ningún sitio porque ya están abiertos donde está. Con ambos mecanismos, una firma de Kotlin pasa a tener tres regiones bien diferenciadas y con significados distintos: lo que viene del ámbito, el sujeto sobre el que se opera y los argumentos que se deciden en la llamada.
+
+<Callout type="info" title="Nombres para lo mismo">
+Otros lenguajes atacan el mismo problema con herramientas distintas y merece la pena conocer el paralelismo: las clases de tipos de Haskell y los parámetros implícitos de Scala resuelven la propagación mediante inferencia sobre el tipo, y los efectos algebraicos de la investigación reciente lo hacen mediante manejadores de ámbito. La familia entera se conoce como paso implícito de argumentos, y su tensión permanente es siempre la misma: cuanto menos escribe quien llama, menos evidente resulta de dónde salió el valor.
+</Callout>
+
+<Callout type="dios" title="El contexto no es una dependencia más: es la forma que tiene el ámbito de entrar en el sistema de tipos">
+Todo lo que has leído hasta aquí describe un problema de fontanería, y sería fácil quedarse con la impresión de que lo que sigue en este nivel es una comodidad sintáctica para escribir menos. No lo es, y conviene entender por qué antes de ver la primera línea de sintaxis. Cuando una función recibe un parámetro ordinario, quien la llama decide qué valor pasarle en ese punto concreto, y esa decisión es local, visible y repetida en cada invocación. Cuando una función depende del contexto, lo que ocurre es de otra naturaleza: la decisión se toma una vez, arriba, al abrir una región del programa, y todo lo que se ejecute dentro de esa región hereda la decisión sin volver a mencionarla. Eso no es pasar un valor: es delimitar un ámbito, y el ámbito es una entidad que hasta ahora vivía fuera del sistema de tipos, en la documentación, en los comentarios y en la disciplina de quien escribe. Las tres malas soluciones de esta lección son tres formas de negarse a admitirlo. Propagar el parámetro convierte el ámbito en una convención de escritura repetida cientos de veces, con lo que el ámbito existe pero nadie lo declara. Secuestrar el receptor lo convierte en una mentira sobre el sujeto de la operación, y por eso escala tan mal. Y el estado global lo convierte en una verdad no comprobada, que es la peor de las tres porque funciona hasta que un despachador de corrutinas cambia de hilo en medio de una transacción. La pregunta de fondo, la que justifica el nivel entero, es si el sistema de tipos de un lenguaje debe poder expresar la frase esta función solo tiene sentido dentro de una transacción abierta, y si debe poder comprobarla sin obligar a nadie a escribir la transacción cuarenta veces. Kotlin decidió que sí, y esa decisión tiene el mismo peso conceptual que tuvo meter la nulabilidad en los tipos: en ambos casos se coge algo que era responsabilidad del programador, se le da una representación estática y se le pide al compilador que lo verifique. La diferencia es que la nulabilidad se resolvió a la primera y el contexto necesitó dos intentos, un diseño descartado por completo y cuatro años de experimentación, historia que ocupa la tercera lección de este nivel y que vale la pena leer como un ejemplo poco frecuente de un equipo de lenguaje admitiendo en público que su primera respuesta era mala.
+</Callout>
+
+<Reto title="Mide tu propio arrastre">
+1. Busca en un módulo tuyo cuántas funciones reciben un parámetro que no usan en su cuerpo y solo reenvían a otra llamada. Anota el porcentaje sobre el total de funciones.
+2. Elige la cadena más larga que encuentres y dibuja el árbol de llamadas marcando en qué nodo se usa de verdad el objeto arrastrado. Cuenta los nodos intermedios.
+3. Clasifica cada objeto arrastrado en una de las cuatro familias de la lección y decide si alguno es en realidad una dependencia legítima de la operación.
+4. Localiza un uso de variable de hilo en código que también use corrutinas y razona qué pasaría si hubiera un punto de suspensión antes de la lectura.
+5. Escribe en una sola frase, para cada servicio arrastrado, el ámbito dentro del cual debería estar disponible y fuera del cual no debería poder llamarse nada que lo use.
+</Reto>

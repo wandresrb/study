@@ -1,0 +1,155 @@
+---
+title: "Los arrays compactos de Lua 5.5"
+description: "El cambio de rendimiento más importante de Lua 5.5, publicada en diciembre de 2025, no toca ni la sintaxis ni la máquina virtual: reorganiza los bytes de la parte array de las tablas. Al eliminar el relleno de alineación que arrastraba cada valor etiquetado, la huella de memoria de una tabla grande cae a aproximadamente el sesenta por ciento de la que tenía. Esta lección explica de dónde salía el desperdicio, cómo funciona la representación de arrays reflejados que Ierusalimschy y Rodriguez propusieron y adoptaron, qué contrapartidas trae en localidad y en redimensionado, y qué significa todo esto para programas que manejan tablas de millones de elementos."
+subject: lua
+level: 6
+order: 4
+icon: "6.4"
+duracion: "22 min"
+---
+
+<Lead>
+Lua 5.5 salió en diciembre de 2025 con una lista de novedades visibles —declaraciones de variables globales, mejoras en el recolector, cadenas externas— y con una que no se ve en absoluto desde el lenguaje y que, sin embargo, es la que más va a cambiar el perfil de tus programas. La representación interna del vector de una tabla dejó de ser un array de valores etiquetados y pasó a ser un array reflejado: los valores crecen hacia un lado, las etiquetas de tipo hacia el otro, y un único puntero se sitúa en la juntura. El resultado es que cada hueco de la parte array pasó de costar dieciséis bytes a costar nueve. No es una mejora incremental de un pequeño porcentaje: es un tercio largo de la memoria de una tabla grande que simplemente deja de existir, sin que tengas que cambiar una sola línea de tu código.
+</Lead>
+
+<Objetivos>
+
+- Cuantificar el desperdicio por alineación del valor etiquetado clásico y por qué solo dolía en la parte array.
+- Describir la representación de arrays reflejados y las expresiones exactas de acceso a valor y a etiqueta.
+- Interpretar los datos reales de memoria y tiempo, distinguiendo acceso lineal de acceso aleatorio.
+- Traducir el cambio a decisiones concretas en programas con tablas de millones de elementos.
+
+</Objetivos>
+
+## El desperdicio: siete bytes de cada dieciséis
+
+Lua representa cada valor con una estructura de dos campos: una unión de ocho bytes que guarda el dato —un entero, un doble, un puntero— y un byte con la etiqueta de tipo. Nueve bytes de información. En cualquier máquina de 64 bits, las reglas de alineación de C obligan a que esa estructura ocupe dieciséis, porque la unión exige alineación a ocho y el compilador rellena hasta el siguiente múltiplo.
+
+```c
+typedef struct TValue {
+  Value value_;   /* 8 bytes utiles */
+  lu_byte tt_;    /* 1 byte de etiqueta */
+                  /* 7 bytes de relleno invisible */
+} TValue;         /* total: 16 bytes */
+```
+
+Siete bytes de cada dieciséis, es decir, más del cuarenta por ciento de la memoria, se van en relleno. En la pila del intérprete o en los upvalues de una closure eso es irrelevante: doscientos valores desperdician mil cuatrocientos bytes y nadie lo nota. En la parte hash tampoco es grave, porque desde Lua 5.4 el nodo está empaquetado a mano —se separan los componentes de la clave para que etiquetas y enlace compartan huecos— y solo desperdicia dos bytes de cada veinticuatro.
+
+```c
+/* Parte hash, empaquetada a mano desde 5.4 */
+struct NodeKey {
+  Value value_;     /* 8 */
+  lu_byte tt_;      /* 1 */
+  lu_byte key_tt;   /* 1 */
+  int next;         /* 4 */
+  Value key_val;    /* 8 */
+};                  /* 24 bytes, solo 2 de relleno */
+```
+
+El problema estaba en la parte array, que hasta 5.4 era literalmente un `TValue *`, un vector de esas estructuras. Una tabla con diez millones de números ocupaba ciento sesenta megabytes de los cuales setenta eran relleno. Y como la parte array es exactamente el sitio donde acaban los datos masivos de cualquier programa serio —mallas, matrices, buffers, estados de juego, tablas de configuración generadas—, ese cuarenta por ciento se traducía directamente en el consumo total del proceso.
+
+<Mermaid code={`flowchart TD
+  A[Lua 5.4 vector de valores etiquetados] --> B[8 bytes de dato mas 1 de etiqueta mas 7 de relleno]
+  B --> C[16 bytes por hueco]
+  C --> G[Un millon de huecos ocupan 16 MB]
+  D[Lua 5.5 vector reflejado] --> E[8 bytes de dato mas 1 de etiqueta sin relleno]
+  E --> F[9 bytes por hueco]
+  F --> H[Un millon de huecos ocupan 9 MB]`} />
+
+## Arrays reflejados: la representación que entró en 5.5
+
+Antes de ver la solución adoptada conviene descartar las tres que parecen obvias y no lo son. La primera es pedirle al compilador que empaquete la estructura: el atributo correspondiente de GCC reduce el valor etiquetado de dieciséis a nueve bytes sin penalización apreciable, pero es una extensión que no está en C estándar, no ofrece garantías ni siquiera dentro de GCC, y la portabilidad estricta es un principio innegociable del proyecto. La segunda es robar bits al propio valor, como hacen OCaml o Haskell con sus enteros nativos: eso sacrifica el rango completo del entero de 64 bits, y un lenguaje pensado para convivir con C no puede permitirse que sus enteros no sean los enteros de C. La tercera es el empaquetado en NaN que usa LuaJIT, que aprovecha los bits de carga útil de los dobles no numéricos; funciona bien cuando el único tipo numérico es el doble, pero Lua 5.3 introdujo enteros de 64 bits que sencillamente no caben ahí.
+
+Descartadas esas, queda reorganizar la memoria sin tocar la representación de ningún valor individual.
+
+La técnica clásica para eliminar relleno es la de arrays paralelos: un vector para los datos y otro para las etiquetas. Funciona, pero para Lua tiene un coste inaceptable, porque obliga a guardar dos punteros en la cabecera de **toda** tabla, incluidas las millones de tablas diminutas que un programa crea sin parte array; y además cada acceso necesita leer un puntero extra.
+
+La solución adoptada, bautizada **arrays reflejados**, evita ambas cosas con una idea muy simple: reservar un solo bloque, poner los valores en la primera mitad **en orden invertido**, las etiquetas en la segunda mitad en orden normal, y guardar un único puntero apuntando a la juntura entre ambas. Desde ese puntero, los índices negativos leen valores y los no negativos leen etiquetas.
+
+<Mermaid code={`flowchart LR
+  V[valor 4, valor 3, valor 2, valor 1] --> P[puntero unico en la juntura]
+  P --> T[tag 1, tag 2, tag 3, tag 4]`} />
+
+```c
+/* Con arr declarado como puntero a Value, situado en la juntura: */
+#define valor_en(arr, idx)  ((arr)[-(idx) - 1])
+#define etiqueta_en(arr, idx)  (((char *)(arr))[idx])
+```
+
+La alternativa que también se estudió y se descartó son las **celdas**: intercalar un bloque de ocho etiquetas cada ocho valores, de modo que cada etiqueta quede cerca de su dato. Localiza mejor en acceso aleatorio, pero el cálculo del desplazamiento dentro de la celda exige una división, un resto y un producto por cada acceso, y en los bancos de prueba eso se traduce en casi el doble de instrucciones ejecutadas. En un intérprete, donde el coste de despacho ya diluye buena parte de las diferencias, la simplicidad ganó.
+
+```c
+/* Reserva de un vector reflejado de n huecos.
+   Un solo bloque, un solo puntero, cero relleno. */
+size_t bytes = n * (sizeof(Value) + sizeof(char));
+char *bloque = luaM_newvector(L, bytes, char);
+Value *arr = (Value *)(bloque + n * sizeof(Value));  /* la juntura */
+
+/* Con arr situado ahi: */
+Value  v = arr[-idx - 1];          /* valor del hueco idx */
+char   e = ((char *)arr)[idx];     /* etiqueta del hueco idx */
+```
+
+Dos expresiones triviales, sin multiplicaciones ni divisiones, sin lecturas de punteros adicionales y sin ningún byte de sobrecarga fija. Un vector de un solo elemento ocupa las mismas dos palabras que antes; uno de dos elementos ya ahorra una palabra. No hay tamaño de tabla, por pequeño que sea, en el que la representación nueva sea peor que la vieja en memoria.
+
+<Cards>
+  <Card icon="🔬" title="Los números medidos">
+    En los bancos de prueba del trabajo original, una multiplicación de matrices de 600 por 600 baja de 32 a 19 megabytes; una criba de Eratóstenes hasta cinco por diez a la séptima baja de 1,0 a 0,59 gigabytes. La huella queda en torno a nueve dieciseisavos de la anterior.
+  </Card>
+  <Card icon="⚡" title="Recorrido lineal más rápido">
+    Un barrido lineal en C sobre un vector de 64 millones de elementos baja al 61 por ciento del tiempo original. Los datos ocupan menos, caben más por línea de caché y los fallos de página se reducen casi a la mitad.
+  </Card>
+  <Card icon="🎲" title="Acceso aleatorio, el matiz">
+    En acceso aleatorio la etiqueta puede estar a muchos kilobytes de su valor, así que cada lectura toca dos líneas de caché lejanas. En vectores muy grandes el reflejado llega a costar un dieciséis por ciento más que la representación clásica.
+  </Card>
+  <Card icon="🧩" title="Alternativas descartadas">
+    Se estudiaron también las celdas, que intercalan bloques de etiquetas entre bloques de valores para mejorar la localidad. Ahorran lo mismo y localizan mejor, pero ejecutan casi el doble de instrucciones por acceso, y esa complejidad no compensó.
+  </Card>
+</Cards>
+
+## Qué se paga
+
+Ninguna estructura de datos mejora en todo. El array reflejado tiene tres contrapartidas que conviene conocer, y todas son de implementación, no de semántica: tu código Lua se comporta exactamente igual.
+
+La primera es la localidad en acceso aleatorio, ya mencionada. La segunda es el redimensionado: un vector reflejado no se puede reajustar con una simple reasignación del bloque, porque al crecer hay que desplazar los valores para volver a centrar la juntura, y al encoger una reasignación destruiría datos que deben conservarse. Encoger obliga a reservar bloque nuevo, copiar y liberar el viejo. Como los redimensionados de tablas son escasos comparados con los accesos, y como ya eran caros de por sí —recuerda el rehash de la lección anterior—, el intercambio sale a cuenta.
+
+Sobre esa segunda contrapartida hay un matiz que la suaviza. Encoger un vector es una operación rara: ocurre solo dentro de un rehash, y un rehash solo se convoca cuando la dispersión se ha agotado. Crecer, que es el caso frecuente, sí admite reasignación seguida de un desplazamiento de los valores, y ese desplazamiento es un movimiento de memoria contiguo, exactamente el tipo de trabajo en el que el hardware es más rápido. El coste añadido queda diluido dentro de una operación que ya era, de largo, la más cara que le puede pasar a una tabla.
+
+La tercera es sutil y solo afecta a herramientas: el puntero de la tabla apunta al **interior** de un bloque reservado, no a su principio. Eso es perfectamente legal en C estándar y no molesta a Lua, cuyo recolector es preciso, pero puede confundir a recolectores conservadores y hace que herramientas como Valgrind cataloguen esos bloques como posiblemente perdidos. Si empotras Lua 5.5 en un sistema con gestión de memoria propia, es lo primero que debes verificar.
+
+## Qué cambia en tu código
+
+Literalmente nada, y ahí está el mérito: la semántica de la tabla es idéntica, `#t` responde lo mismo, `pairs` recorre igual y ningún programa correcto de 5.4 se comporta distinto en 5.5 por este motivo. Lo que cambia es la aritmética con la que decides el diseño de tus datos, porque el precio relativo de las dos partes de la tabla se ha movido de sitio.
+
+```lua
+-- Un millon de valores, misma informacion, tres diseños.
+-- Cifras aproximadas para una maquina de 64 bits.
+
+-- A) Secuencia densa en la parte array
+--    Lua 5.4:  1000000 * 16  =  ~16 MB
+--    Lua 5.5:  1000000 *  9  =   ~9 MB     <- baja al 56 por ciento
+
+-- B) Claves dispersas en la parte hash
+--    Lua 5.4:  1048576 * 24  =  ~25 MB
+--    Lua 5.5:  1048576 * 24  =  ~25 MB     <- no cambia nada
+
+-- C) Un millon de tablas de tres campos
+--    Lua 5.4:  1000000 * (56 + 4*24) + 16 MB  =  ~168 MB
+--    Lua 5.5:  1000000 * (56 + 4*24) +  9 MB  =  ~161 MB   <- apenas baja
+```
+
+Antes de 5.5, mover datos de la dispersión al vector ahorraba un tercio de la memoria; ahora ahorra casi dos tercios. La regla de siempre —indexa desde uno, mantén las secuencias densas, prefiere vectores paralelos a colecciones de tablitas— no ha cambiado de dirección, pero sí de magnitud: el premio por seguirla se ha duplicado, y el castigo por ignorarla es ahora relativamente mayor, porque la parte hash no ha adelgazado ni un byte.
+
+Hay un segundo efecto, indirecto y a menudo mayor que el primero: la presión sobre el recolector. Un barrido de marcado tiene que recorrer la parte array de cada tabla viva para encontrar referencias, y recorrer nueve megabytes es sensiblemente más rápido que recorrer dieciséis, tanto por ancho de banda como por fallos de página. En programas cuyo perfil está dominado por la recolección —los que mantienen estructuras grandes y vivas durante mucho tiempo, que es el caso típico de un servidor o de un motor de juego— la mejora observada en tiempo total puede superar a la que se mide en un banco de pruebas sintético de accesos.
+
+<Callout type="dios" title="La optimización más rentable de la década no cambió ni un algoritmo">
+Conviene detenerse en lo que este cambio no es, porque ahí está la lección de ingeniería. No hay un algoritmo nuevo: la parte array sigue siendo un vector indexado y el acceso sigue siendo una comparación y una lectura. No hay un compilador más listo, ni análisis de tipos, ni especialización, ni traza, ni ninguna de las técnicas que asociamos a hacer un intérprete más rápido. Lo único que se hizo fue mirar de frente un desperdicio estructural que llevaba veinte años a la vista de todo el mundo —siete bytes de relleno en una estructura de dieciséis— y reorganizar los bytes para que dejara de existir, con dos macros de una línea. Y sin embargo el efecto sobre programas reales es mayor que el de casi cualquier optimización algorítmica que se hubiera podido intentar sobre la misma base, porque en una máquina moderna la memoria no es solo un recurso que se agota: es el cuello de botella del tiempo. Los ciento sesenta megabytes que ocupaba una tabla de diez millones de números no eran únicamente ciento sesenta megabytes de RAM; eran el doble de líneas de caché por elemento recorrido, el doble de fallos de página, el doble de presión sobre el recolector, que tiene que barrer todo eso, y el doble de ancho de banda consumido en cada barrido. Compactar la representación no acelera ninguna operación individual y sin embargo acelera el programa entero, porque el programa entero estaba esperando a la memoria. Hay una moraleja transferible, y es la razón por la que esta lección existe en un nivel dedicado a las tripas de la tabla: cuando busques rendimiento en un sistema que manipula muchos datos, la pregunta más rentable casi nunca es cuántas operaciones haces, sino cuántos bytes tocas para hacerlas. Ierusalimschy y Rodriguez publicaron este trabajo en 2024 con un título modesto sobre representaciones compactas de arrays; su conclusión, verificable en la tabla de resultados, es que la estructura de datos correcta no es la que tiene la complejidad asintótica más bonita, sino la que cabe en la caché.
+</Callout>
+
+<Reto title="Mide el salto tú mismo">
+1. Si tienes acceso a un intérprete 5.4 y a uno 5.5, construye en ambos una tabla de cinco millones de enteros y compara la memoria residente máxima del proceso. Contrasta el cociente con los nueve dieciseisavos teóricos.
+2. Con `collectgarbage("count")` mide dentro de cada intérprete el coste de esa misma tabla y explica por qué la cifra que da Lua y la que da el sistema operativo no coinciden.
+3. Escribe una criba de Eratóstenes hasta diez millones y crea la tabla con `table.create`. Compara tiempo y memoria contra la versión sin preasignar, en 5.5.
+4. Diseña un banco de pruebas de acceso aleatorio sobre una tabla de veinte millones de elementos y comprueba si en tu máquina reproduces la penalización de localidad descrita en la lección.
+5. Calcula, para una tabla de un millón de entradas, cuánta memoria ocuparía si las claves fueran enteros densos desde 1 y cuánta si fueran identificadores dispersos. La diferencia es el precio real de sacar tus datos de la parte array.
+</Reto>

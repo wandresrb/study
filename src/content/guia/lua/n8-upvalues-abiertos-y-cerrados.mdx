@@ -1,0 +1,149 @@
+---
+title: "Upvalues abiertos y cerrados: la implementación real"
+description: "Cómo implementa Lua la captura de variables sin copiar entornos enteros: el objeto upvalue, la fase abierta en la que apunta a un hueco vivo de la pila, la lista ordenada de upvalues abiertos, y el momento exacto del cierre en el que el valor migra al montón. Con el matiz de los retornos, los saltos y el desenrollado por error."
+subject: lua
+level: 8
+order: 2
+icon: "8.2"
+duracion: "17 min"
+---
+
+<Lead>
+La definición de closure como función más entorno es correcta pero peligrosamente cómoda: sugiere que cada closure arrastra una copia del entorno donde nació, lo cual sería carísimo y además daría una semántica equivocada. Lo que Lua implementa es mucho más fino. Una variable capturada no se copia al crear el closure; sigue viviendo exactamente donde vivía, en su hueco de la pila de la máquina virtual, y el closure guarda un puntero indirecto hacia ella a través de un pequeño objeto llamado upvalue. Mientras la variable siga en la pila, el upvalue está abierto y no es más que una redirección. Solo cuando el bloque que declaró la variable termina y su hueco va a desaparecer, el intérprete copia el valor dentro del propio objeto upvalue y lo hace apuntar hacia sí mismo: es el cierre. Esta lección es la anatomía de ese mecanismo, porque casi todo el comportamiento que vas a estudiar después —el estado compartido, las trampas de los bucles, la introspección— es una consecuencia directa de él.
+</Lead>
+
+<Objetivos>
+
+- Describir el objeto upvalue como una indirección con dos estados posibles.
+- Entender la fase abierta y la lista ordenada de upvalues abiertos de cada pila.
+- Situar el momento exacto del cierre y qué eventos lo disparan.
+- Deducir de la implementación por qué se captura la variable y nunca su valor.
+
+</Objetivos>
+
+## La indirección: qué es realmente un upvalue
+
+Un closure no guarda variables: guarda un vector de punteros a objetos upvalue. Y un objeto upvalue, en el intérprete de referencia, es una estructura minúscula con un campo puntero, llamémoslo el apuntador, más un hueco propio donde cabe un valor de Lua.
+
+En el estado **abierto**, el apuntador señala a un registro vivo de la pila de la corrutina, justo el hueco donde reside la variable local original. Leer el upvalue es seguir el puntero y leer la pila; escribirlo es seguir el puntero y escribir en la pila. Es una redirección de un nivel, y su coste es despreciable.
+
+En el estado **cerrado**, el valor ha sido copiado al hueco interno del propio objeto y el apuntador se ha redirigido a ese hueco. El upvalue deja de depender de la pila y pasa a ser una celda autónoma en el montón, sujeta al recolector de basura como cualquier otro objeto.
+
+El detalle que hace elegante el diseño es que la transición entre ambos estados no exige tocar a nadie más. Cerrar un upvalue son dos escrituras: copiar el valor al hueco interno y reapuntar el apuntador a ese hueco. Los closures que lo referencian no se enteran, porque siguen teniendo el mismo puntero al mismo objeto; lo que cambió está dentro del objeto, no en quién lo señala. Si el cierre exigiera recorrer todos los closures que capturan la variable para actualizarlos, haría falta una lista inversa por variable y el coste dependería del número de capturadores. Con la indirección, el coste es constante y no hay que saber quién te apunta.
+
+Lo esencial es que el código compilado no distingue los dos casos. Las instrucciones de la máquina virtual que leen y escriben upvalues hacen siempre lo mismo: seguir el apuntador. El cierre cambia a dónde apunta, no cómo se accede. Por eso el cierre puede ocurrir en cualquier momento sin invalidar el bytecode ya generado, y por eso una función no tiene forma de saber si su upvalue está abierto o cerrado.
+
+## La fase abierta y la lista de la pila
+
+Mientras la variable capturada sigue viva en la pila, pueden existir varios closures que la referencian. Todos deben ver exactamente la misma celda: si uno la modifica, los demás tienen que observar el cambio. Eso obliga a que, para una misma variable, exista **un solo** objeto upvalue compartido, no uno por closure.
+
+Para garantizarlo, cada corrutina mantiene una lista enlazada de sus upvalues abiertos, ordenada por altura de pila. Cuando la máquina virtual va a crear un closure que captura una local del nivel actual, no fabrica un upvalue nuevo sin más: recorre esa lista buscando si ya existe uno que apunte a ese mismo hueco. Si lo encuentra, lo reutiliza; si no, crea uno y lo inserta en la posición que le corresponde. La unicidad por hueco de pila es una invariante del intérprete, y de ella se deriva todo el comportamiento de estado compartido de la lección siguiente.
+
+La reutilización no exige que los closures se creen a la vez ni en la misma línea. Basta con que la variable siga en la pila cuando se crea el segundo:
+
+```lua
+local function tarde()
+  local n = 0
+  local a = function() return n end
+  for _ = 1, 3 do end            -- pasa el tiempo, n sigue viva
+  local b = function() n = n + 1 end
+  return a, b
+end
+
+local leer, subir = tarde()
+subir()
+print(leer())                    --> 1, comparten la misma celda
+```
+
+Cuando se crea `b`, la búsqueda en la lista de abiertos encuentra el upvalue que ya se había creado para `a` y lo reutiliza. Si en lugar de reutilizarlo se fabricase uno nuevo, habría dos celdas apuntando al mismo hueco de pila y el cierre las separaría en dos copias divergentes: el programa imprimiría `0` y el patrón del contador sería imposible de escribir.
+
+Otro matiz de implementación que conviene fijar: la lista es **por corrutina**, no global, porque cada corrutina tiene su propia pila. Cerrar una corrutina de forma anticipada obliga por eso a cerrar todos sus upvalues abiertos aunque su función principal no haya retornado nunca, y esa es exactamente la operación que hace `coroutine.close` cuando abandonas un hilo suspendido a medio camino.
+
+<Callout type="note" title="Por qué la lista está ordenada">
+El orden por altura de pila no es un detalle de gusto. En el cierre hay que cerrar de golpe todos los upvalues que apuntan por encima de un nivel dado, y con la lista ordenada eso es recorrer un prefijo y parar en cuanto se baja del umbral: coste proporcional a lo que realmente se cierra y no al total de upvalues vivos. Es la misma idea que hace baratas las operaciones de desenrollado en cualquier runtime con disciplina de pila.
+</Callout>
+
+## El momento del cierre
+
+Aquí está la pregunta que separa el modelo mental correcto del aproximado: ¿cuándo se cierra un upvalue? La respuesta no es al retornar la función, aunque ese sea el caso más visible. La regla real es más general: **un upvalue se cierra cuando el hueco de pila al que apunta deja de ser válido**. Eso ocurre en cuatro situaciones.
+
+<Cards>
+  <Card icon="🚪" title="Al terminar el bloque">
+    No hace falta que la función retorne. Si un bloque interno declara una local capturada y el bloque acaba, el cierre se ejecuta ahí. El compilador solo emite la instrucción de cierre si detectó en ese bloque alguna local realmente capturada.
+  </Card>
+  <Card icon="↩️" title="Al retornar la función">
+    El retorno descarta el registro de activación completo, así que cierra todos los upvalues que apunten a esa porción de la pila. Es el caso de la función fábrica y por eso resulta el más intuitivo.
+  </Card>
+  <Card icon="🏃" title="Al saltar fuera con break o goto">
+    Salir de un bloque por un salto también invalida sus huecos. El compilador lo sabe y emite el cierre en el punto de salto, no solo en la salida natural del bloque.
+  </Card>
+  <Card icon="💥" title="Al desenrollar por un error">
+    Un error propagado recorta la pila hasta el punto protegido. El desenrollado cierra por el camino todos los upvalues afectados, igual que ejecuta las variables marcadas como cerrables.
+  </Card>
+</Cards>
+
+El diagrama resume el ciclo de vida completo del objeto:
+
+<Mermaid code={`stateDiagram-v2
+  [*] --> Abierto: se crea al capturar una local viva
+  Abierto --> Abierto: lectura y escritura via puntero a la pila
+  Abierto --> Cerrado: fin de bloque o retorno o salto o error
+  Cerrado --> Cerrado: lectura y escritura sobre celda propia
+  Cerrado --> [*]: lo recoge el recolector cuando nadie lo referencia`} />
+
+Conviene subrayar quién decide. El cierre no lo descubre el intérprete inspeccionando la lista en cada salida de bloque: lo emite el **compilador** como una instrucción explícita, y solo cuando durante el análisis del bloque marcó alguna local como capturada. Un bloque sin capturas no paga absolutamente nada, ni siquiera la comprobación. Cuando la salida es por un salto, el compilador inserta la misma instrucción en el punto del salto, porque un `break` que sale de dos niveles de anidamiento tiene que cerrar lo de los dos.
+
+```lua
+local guardadas = {}
+for i = 1, 5 do
+  local etiqueta = "vuelta " .. i
+  guardadas[#guardadas + 1] = function() return etiqueta end
+  if i == 2 then break end          -- salida por salto: cierra aqui
+end
+
+print(guardadas[1](), guardadas[2]())   --> vuelta 1   vuelta 2
+```
+
+En Lua 5.4 el objeto upvalue asumió además un segundo papel: sostener las variables marcadas como cerrables con el atributo `<close>`, cuyo metamétodo de cierre debe ejecutarse justo en ese mismo instante de salida de ámbito. Que el lenguaje reutilizara la maquinaria de upvalues para implementar el manejo determinista de recursos es la mejor prueba de que el punto de cierre estaba ya perfectamente definido en el diseño.
+
+<Callout type="warn" title="El cierre no es una copia del entorno">
+Cuidado con la imagen mental de que al retornar la función se copian sus locales a algún sitio. Solo migran al montón las variables efectivamente capturadas por algún closure vivo; el resto simplemente desaparecen al recortarse la pila. Un cuerpo de función con veinte locales de las que una está capturada paga el cierre de una, no de veinte. Esta selectividad es lo que hace que los closures de Lua sean baratos en la práctica.
+</Callout>
+
+## Lo que la implementación te enseña sobre la semántica
+
+Cuatro consecuencias caen solas una vez que ves el mecanismo, y las cuatro son preguntas de entrevista.
+
+**Se captura la variable, no el valor.** Como el upvalue apunta al hueco, y el hueco es la variable, cualquier escritura posterior a la creación del closure es visible desde dentro. No hay instante de captura en el que se congele nada.
+
+**La escritura desde dentro sale hacia afuera.** La indirección funciona en los dos sentidos. Un closure que asigna a su upvalue está escribiendo en la variable original mientras siga abierta, y en la celda compartida después del cierre. Este es el ingrediente del contador de la lección 3.
+
+**El cierre no rompe el compartir.** Si dos closures compartían el upvalue abierto, siguen compartiendo el mismo objeto cuando se cierra, porque lo que cambia es el destino del apuntador interno, no la identidad del objeto. La compartición sobrevive intacta a la salida de ámbito.
+
+**El ámbito decide, no el bucle.** Como el cierre se dispara por fin de bloque y como cada iteración de un bucle abre y cierra su propio bloque, las locales declaradas dentro del cuerpo son variables distintas en cada vuelta. Esa es la raíz de que Lua se comporte bien donde otros lenguajes tropiezan, y es el asunto entero de la lección 4. Añade el matiz de 2026: en Lua 5.5 las variables de control de un bucle `for` son inmutables, solo se pueden leer dentro del bucle, de modo que capturarlas es ya una operación de solo lectura por construcción.
+
+```lua
+local closures = {}
+do
+  local x = 1            -- local de un bloque interno
+  closures.leer    = function() return x end
+  closures.escribir = function(v) x = v end
+end                      -- aqui se cierra el upvalue x
+
+print(closures.leer())   --> 1
+closures.escribir(42)
+print(closures.leer())   --> 42
+```
+
+Las dos funciones se crearon mientras `x` estaba en la pila, así que comparten el mismo objeto upvalue abierto. Al cerrar el bloque, `x` migra al montón, pero ambas siguen apuntando al mismo sitio. El bloque `do` es el punto de cierre; nadie retornó de ninguna función.
+
+<Callout type="dios" title="La indirección perezosa es la idea completa">
+Detente en la elegancia del compromiso, porque es una lección de diseño de runtimes que trasciende a Lua. El problema es genuinamente difícil: quieres que las variables capturadas sobrevivan arbitrariamente a su ámbito, pero no quieres pagar el precio de asignar cada variable local en el montón, porque la inmensa mayoría de las locales de un programa jamás son capturadas y viven y mueren dentro de su registro de activación en unos pocos microsegundos. Las dos soluciones puras son malas. Asignarlo todo en el montón, como hacían algunos Lisp históricos, te da una semántica impecable y un rendimiento lamentable, porque conviertes cada declaración de variable en una petición al asignador y cada salida de función en trabajo para el recolector. Copiar el entorno al crear el closure es aún peor, porque además de costar es incorrecto: rompe la identidad de la variable y con ella toda posibilidad de compartir estado, que es justamente para lo que sirve el mecanismo. Lua elige un tercer camino que solo funciona porque el compilador y el runtime cooperan. El compilador, que sabe en tiempo de compilación qué locales quedan capturadas y por dónde puede salirse de cada bloque, se limita a insertar cierres exactamente donde hacen falta y en ningún otro sitio. El runtime mantiene una única indirección por variable y solo la resuelve, moviendo el valor al montón, en el instante preciso en que el hueco original va a dejar de existir. El resultado es que las locales no capturadas cuestan exactamente lo que cuesta un registro de pila, cero asignaciones, y las capturadas pagan una asignación pequeña y solo cuando se demuestra necesaria. Pagas por lo que usas, sin renunciar a la semántica, porque la información estática y la dinámica se reparten el trabajo. Ese patrón —dejar que el compilador decida los puntos y que el runtime mantenga la indirección mínima— reaparece intacto en la escritura diferida de los recolectores, en el copy on write del sistema operativo y en el registro perezoso de medio mundo de la infraestructura. Aquí lo tienes en cincuenta líneas de C que puedes leer en una tarde.
+</Callout>
+
+<Reto title="Observa el cierre desde fuera">
+1. Reproduce el ejemplo del bloque `do` y verifica que las dos funciones ven la misma variable después de que el bloque haya terminado.
+2. Modifícalo para que la captura ocurra dentro de un bucle numérico y observa que cada vuelta produce closures independientes. Anota tu explicación en términos de fin de bloque.
+3. Escribe una función que capture una local y que salga del bloque con `break` desde dentro de un bucle. Argumenta en qué instrucción se produce el cierre.
+4. Anticipa la lección 5: con `debug.upvalueid` podrás comprobar numéricamente si dos closures comparten el mismo objeto upvalue. Escribe ahora tu predicción para los tres casos anteriores y guárdala para contrastarla.
+</Reto>

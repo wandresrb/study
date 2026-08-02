@@ -1,0 +1,156 @@
+---
+title: "El internamiento: cadenas cortas y cadenas largas"
+description: "Lua interna las cadenas cortas en una tabla global y comparte una única copia; las largas no. Qué gana el lenguaje con eso —igualdad en tiempo constante y claves de tabla baratas— y qué precio paga en hash, memoria y latencia del recolector."
+subject: lua
+level: 4
+order: 2
+icon: "4.2"
+duracion: "17 min"
+---
+
+<Lead>
+Dentro del intérprete no hay un solo tipo de cadena, sino dos. Las **cortas** —hasta cuarenta bytes en la configuración por defecto— se registran en una tabla global de internamiento: si el valor ya existe, Lua no crea nada, devuelve el objeto que ya había. Las **largas** viven por su cuenta, sin registro y sin compartir. Esa frontera arbitraria, invisible desde el código Lua, es una de las decisiones de ingeniería más consecuentes del runtime: convierte la igualdad de cadenas cortas en una comparación de punteros, hace que las claves de tabla sean casi gratuitas, y a cambio impone un coste de hash en cada creación y una estructura global que el recolector debe barrer.
+</Lead>
+
+<Objetivos>
+
+- Distinguir cadena corta internada de cadena larga y localizar el umbral.
+- Explicar por qué la igualdad de cadenas cortas es de tiempo constante.
+- Entender el hash perezoso de las cadenas largas y cuándo se paga.
+- Anticipar el coste del internamiento en bucles que fabrican cadenas cortas.
+
+</Objetivos>
+
+## Dos representaciones bajo un mismo tipo
+
+Desde Lua todo es `string`. Dentro del intérprete, en cambio, el descriptor de cadena lleva una etiqueta que distingue dos variantes: cadena corta y cadena larga. El límite lo fija una constante de compilación del intérprete, cuarenta bytes en las distribuciones habituales, y no es un número mágico: es el punto en el que el coste de hashear íntegramente el contenido deja de compensar el ahorro de compartirlo.
+
+<Mermaid code={`flowchart TD
+  A[Se crea una cadena] --> B{Longitud menor o igual a 40}
+  B -- Si --> C[Hash del contenido completo]
+  C --> D[Busca en la tabla global de internamiento]
+  D -- Ya existe --> E[Devuelve el objeto existente]
+  D -- No existe --> F[Crea objeto y lo registra]
+  B -- No --> G[Crea objeto independiente]
+  G --> H[Hash diferido hasta que se use como clave]`} />
+
+Toda cadena corta que aparezca en tu programa —el literal `"nombre"`, el resultado de `s:sub(1, 5)`, la clave que llega deserializada de un JSON— pasa por la tabla global. Si el contenido ya estaba registrado, no se asigna memoria nueva: recibes exactamente el mismo objeto que ya existía. De ahí se sigue el invariante central del sistema: **dos cadenas cortas iguales son siempre el mismo objeto en memoria**.
+
+```lua
+local a = "identificador"
+local b = "identi" .. "ficador"     -- construida en tiempo de ejecución
+print(a == b)                       -- true: y ademas son el mismo objeto
+
+local largo1 = string.rep("x", 100)
+local largo2 = string.rep("x", 100)
+print(largo1 == largo2)             -- true, pero son dos objetos distintos
+```
+
+Desde el código Lua esta dualidad es **completamente transparente**: no hay función que te diga en qué variante vive una cadena, ni operación que se comporte distinto según la variante. La igualdad da el mismo resultado, el hash como clave funciona igual, la biblioteca `string` no distingue. Lo único que cambia es el **coste**, y el coste es precisamente lo que separa un programa que escala de uno que se arrastra cuando el volumen crece.
+
+Un detalle que refuerza el diseño: las palabras reservadas del lenguaje son cadenas cortas internadas desde el arranque del estado, y el propio analizador léxico las reconoce comparando punteros contra las entradas ya registradas. El mecanismo que acelera tu código es el mismo que acelera la compilación de tu código.
+
+```lua
+-- Una comprobacion indirecta del internamiento: las claves de tabla
+local t = {}
+t["clave_corta"] = 1
+-- La busqueda no compara bytes: el literal ya es el mismo objeto
+-- que se registro al compilar la linea anterior.
+print(t["clave" .. "_corta"])       --> 1
+```
+
+## Qué gana Lua y qué cuesta
+
+La ganancia inmediata es la **igualdad en tiempo constante**. Comparar dos cadenas cortas no recorre bytes: compara direcciones. Como el internamiento garantiza unicidad, punteros distintos implican contenidos distintos, y la comparación termina en una instrucción. Para un lenguaje cuyo tipo compuesto único es la tabla, y en el que casi toda clave es una cadena, esto no es una microoptimización: es lo que hace que el acceso a campos, la resolución de métodos por `__index` y la búsqueda en `_ENV` tengan el coste de un acceso a un array de dispersión y no el de un `memcmp`.
+
+La segunda ganancia es la **memoria compartida**. Un programa que deserializa cien mil objetos con el mismo esquema no almacena cien mil copias del nombre de cada campo: almacena una y cien mil referencias. En cargas de datos con claves repetidas el ahorro es sustancial.
+
+El precio se paga en tres monedas. La primera es el **hash obligatorio en la creación**: fabricar una cadena corta implica recorrer sus bytes, calcular el hash y buscar en la tabla global antes de poder devolverla. Un bucle que produce millones de subcadenas cortas está pagando ese peaje en cada vuelta, aunque el resultado sea un objeto ya existente. La segunda es la **tabla global misma**: es una estructura viva que crece, se redimensiona y debe ser recorrida por el recolector para eliminar las entradas cuyos objetos ya no referencia nadie. La tercera es la **contención conceptual**: al ser un recurso global por estado de Lua, condiciona el diseño de cualquier intento de paralelismo real dentro de un mismo estado.
+
+```lua
+-- Cada vuelta hashea la subcadena y consulta la tabla global,
+-- aunque el resultado ya estuviera internado.
+local total = 0
+for i = 1, #texto - 3 do
+  local trozo = texto:sub(i, i + 3)   -- corta: se interna
+  if trozo == "ERRO" then total = total + 1 end
+end
+```
+
+<Callout type="dios" title="El umbral de cuarenta bytes es una tesis sobre cómo se usa el texto">
+Ese número no salió de un microbenchmark caprichoso: codifica una observación empírica sobre la naturaleza del texto en programas reales. Las cadenas cortas son casi siempre **identificadores** —nombres de campo, claves, etiquetas, símbolos, rutas de módulo— y los identificadores se repiten obsesivamente y se comparan sin parar; internarlos convierte cada comparación en una instrucción y cada repetición en cero bytes adicionales. Las cadenas largas son casi siempre **datos** —el contenido de un fichero, un cuerpo HTTP, un buffer binario— y los datos rara vez se repiten byte a byte y rara vez se usan como clave; internarlos significaría recorrer megabytes para calcular un hash que nadie va a consultar, y mantener vivo en una tabla global algo que solo quieres leer y descartar. Por eso las cadenas largas no se internan, su hash se calcula **de forma perezosa** solo si alguien las usa como clave de tabla, y su igualdad compara primero longitudes y solo después bytes, un atajo que descarta la inmensa mayoría de los casos sin tocar el contenido. Entender esta frontera cambia cómo escribes: si vas a comparar millones de veces, procura estar del lado corto; si vas a mover megabytes, procura estar del lado largo y no forzar al runtime a tratarlos como símbolos. La misma lógica explica por qué las **cadenas externas** de Lua 5.5, que envuelven memoria ajena al asignador, son siempre cadenas largas: internarlas sería incompatible con no copiarlas.
+</Callout>
+
+## Cadenas largas: hash perezoso y comparación
+
+Una cadena larga se crea sin hashear y sin registrarse en ningún sitio: es un objeto suelto en el montón, con su longitud y sus bytes. El hash solo se calcula si alguien la usa como **clave de tabla**, y una vez calculado se guarda en el propio objeto junto a una marca que indica que ya está disponible. Esa pereza es la que hace viable leer un fichero de diez megabytes: si solo vas a imprimirlo o a recorrerlo, nadie recorre sus bytes para calcular un número que nadie consultará.
+
+```lua
+local contenido = io.open("datos.bin", "rb"):read("a")   -- cadena larga
+print(#contenido)                    -- gratis: la longitud esta almacenada
+local cache = {}
+cache[contenido] = true              -- aqui, y solo aqui, se hashea
+cache[contenido] = false             -- ya esta hasheado: no se repite
+```
+
+La comparación de igualdad entre cadenas largas también está optimizada, pero por otra vía. Primero compara las longitudes, que son dos enteros: si difieren, el resultado es negativo sin tocar un solo byte, y eso descarta la abrumadora mayoría de los casos reales. Solo cuando las longitudes coinciden se recurre a una comparación de contenido. Es una heurística modesta y extraordinariamente eficaz.
+
+El corolario práctico es que comparar dos buffers grandes **iguales** sí cuesta proporcionalmente a su tamaño, y ese es el escenario que conviene evitar en bucles. La solución idiomática es no comparar los datos sino un **resumen corto** calculado una vez, que además tiene la ventaja de ser una cadena corta y por tanto internada y comparable en tiempo constante.
+
+```lua
+-- En lugar de comparar buffers completos una y otra vez
+local function resumen(s)
+  -- huella barata a partir de longitud y extremos; para uso interno,
+  -- no criptografico
+  return string.format("%d:%s:%s", #s, s:sub(1, 8), s:sub(-8))
+end
+
+local firma = resumen(contenido)     -- corta: internada
+if firma == firma_anterior then      -- comparacion de punteros
+  print("sin cambios probables")
+end
+```
+
+Nada de esto es observable desde el lenguaje, pero sí es **medible**. El experimento canónico consiste en crear repetidamente la misma cadena a un lado y al otro del umbral y comparar tiempo y memoria: la variante corta se estabiliza porque devuelve siempre el mismo objeto ya registrado, mientras que la larga asigna memoria en cada vuelta y obliga al recolector a trabajar.
+
+```lua
+local function medir(n, longitud)
+  local base = string.rep("a", longitud)
+  collectgarbage()
+  local m0, t0 = collectgarbage("count"), os.clock()
+  for _ = 1, n do
+    local _ = base:sub(1, longitud)    -- fabrica una cadena de ese tamano
+  end
+  return os.clock() - t0, collectgarbage("count") - m0
+end
+
+print(medir(1000000, 30))              -- lado corto: se interna
+print(medir(1000000, 50))              -- lado largo: objeto nuevo cada vez
+```
+
+Conviene además saber que el umbral no es una constante universal del lenguaje sino un parámetro de compilación del intérprete. Una distribución que lo modifique cambia el punto en el que tus cadenas dejan de internarse, así que ninguna optimización debería depender del número exacto: depende de la **categoría** —símbolo o dato— y esa clasificación la decides tú al diseñar el formato.
+
+## Consecuencias prácticas
+
+<Cards>
+  <Card icon="🔑" title="Claves cortas, siempre">
+    Diseña tus esquemas con nombres de campo por debajo del umbral. Una clave de cuarenta y cinco bytes deja de internarse, obliga a hashear en el primer uso y a comparar contenido en las colisiones.
+  </Card>
+  <Card icon="✂️" title="Cuidado con sub en bucles calientes">
+    Cada subcadena corta que fabricas paga hash y consulta global. Cuando solo necesitas inspeccionar, `string.byte` sobre el original evita crear el objeto intermedio por completo.
+  </Card>
+  <Card icon="📦" title="Los datos grandes no se comparan">
+    Comparar dos cadenas largas iguales sí recorre bytes. Si necesitas comparar buffers grandes con frecuencia, guarda un resumen corto calculado una vez y compara ese.
+  </Card>
+  <Card icon="🧹" title="El internamiento no es caché infinita">
+    La tabla global solo retiene objetos alcanzables; el recolector elimina las entradas huérfanas. No la uses como mecanismo de memoización deliberada.
+  </Card>
+</Cards>
+
+<Reto title="Encuentra el umbral con tus propias manos">
+1. Escribe un bucle que cree un millón de veces la misma cadena de treinta bytes y mide el tiempo. Repite con una de cincuenta bytes y compara: estás midiendo la diferencia entre internar y no internar.
+2. Mide `collectgarbage("count")` en ambos casos. La versión corta debería mantenerse plana; la larga, crecer.
+3. Compara un millón de veces dos cadenas cortas idénticas y luego dos largas idénticas. Explica la diferencia en términos de comparación de punteros frente a comparación de bytes.
+4. Repite la comparación de cadenas largas usando dos de la misma longitud y dos de longitudes distintas: observa el atajo por longitud.
+5. Reescribe un bucle que use `s:sub(i, i + 3)` para buscar un patrón fijo empleando `string.byte` y cuantifica cuántas creaciones de objeto has eliminado.
+</Reto>

@@ -1,0 +1,153 @@
+---
+title: "Cancelación cooperativa: la excepción que no es un error"
+description: "Cancelar una corrutina no la detiene: le pide que se detenga. Esta lección explica por qué la cancelación se implementa como una excepción de una clase especial que el sistema trata de forma distinta, por qué un bucle de cómputo puro es inmune a ella, cómo devolverle la capacidad de responder con ensureActive y con yield, por qué capturar excepciones genéricas rompe el mecanismo entero, y cómo ejecutar la limpieza final en una corrutina que ya está muerta usando NonCancellable."
+subject: kotlin
+level: 23
+order: 4
+icon: "23.4"
+duracion: "20 min"
+---
+
+<Lead>
+Detener un cómputo ajeno por la fuerza es un problema clásico de la informática y tiene una solución conocida y una respuesta bien establecida sobre por qué esa solución es mala. Java ofreció durante años un método para matar un hilo, y acabó marcándolo como obsoleto porque interrumpir a alguien en un punto arbitrario deja los invariantes rotos: candados tomados que nadie soltará, ficheros a medio escribir, estructuras que quedan en un estado que ninguna línea del programa contempla. La alternativa razonable es que el trabajo no se mate sino que se le pida terminar, y que él elija en qué punto seguro obedecer. A eso se le llama cancelación cooperativa, y la palabra cooperativa es una advertencia disfrazada de tecnicismo: si el código no coopera, no se cancela. Kotlin implementa esa petición como una excepción, lo cual permite reutilizar toda la maquinaria de desenrollado de la pila que el lenguaje ya tenía, pero introduce una consecuencia con la que hay que convivir, y es que el mecanismo de limpieza y el mecanismo de captura de errores comparten sintaxis y se estorban.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué la cancelación es cooperativa y qué papel juega `CancellationException` en su implementación.
+- Reconocer el código que jamás podrá cancelarse y las tres razones por las que llega a escribirse.
+- Insertar puntos de cancelación con `ensureActive`, `yield` y la comprobación de `isActive`, eligiendo el adecuado.
+- Ejecutar limpieza fiable en una corrutina ya cancelada mediante `NonCancellable`.
+
+</Objetivos>
+
+## La cancelación es una excepción con estatuto especial
+
+Cancelar un `Job` no interrumpe nada de inmediato: cambia su estado a cancelándose y hace que, la próxima vez que la corrutina pase por un punto de suspensión, ese punto lance una `CancellationException` en lugar de continuar. A partir de ahí la excepción se comporta como cualquier otra: desenrolla la pila, dispara los bloques `finally` que encuentre y termina la corrutina. La diferencia está en cómo la trata el resto del sistema.
+
+```kotlin
+val trabajo = scope.launch {
+    try {
+        repeat(1_000) { i ->
+            delay(100)           // punto de suspension: aqui se puede cancelar
+            println("paso $i")
+        }
+    } finally {
+        println("limpieza")      // se ejecuta igualmente
+    }
+}
+
+delay(350)
+trabajo.cancelAndJoin()
+```
+
+Esa excepción es especial en un sentido preciso: cuando llega al padre, el padre no la interpreta como un fallo. Una corrutina cancelada no contamina a sus hermanos ni convierte al ámbito en fallido, porque la cancelación es la forma normal de terminar y no una anomalía. Por eso `CancellationException` es el único tipo de excepción que sube por el árbol sin activar la propagación de fallos, y por eso al inspeccionar un ámbito cancelado no aparece ningún error en el registro.
+
+<Callout type="warn" title="Capturar excepciones genéricas rompe la cancelación">
+Un bloque que capture `Exception` o `Throwable` dentro de una corrutina se tragará también la `CancellationException`, y con ella la orden de terminar. El resultado es una corrutina zombi que sigue ejecutándose después de que su ámbito la haya dado por muerta, a menudo dentro de un bucle de reintentos que ahora es infinito. Si hay que capturar de forma amplia, la disciplina es relanzar la cancelación antes de tratar el resto, comprobando el tipo o invocando `currentCoroutineContext().ensureActive()` dentro del propio bloque de captura.
+</Callout>
+
+## El código que no comprueba nunca se cancela
+
+De la explicación anterior se sigue el hecho más importante y menos intuitivo del mecanismo: la cancelación solo puede ocurrir en un punto de suspensión o en una comprobación explícita. Un bucle que solo hace aritmética no tiene ni una cosa ni la otra, así que ignora por completo la cancelación y sigue hasta el final, con el agravante de que su ámbito ya lo considera cancelado y por tanto nadie lo está esperando.
+
+```kotlin
+// Este bucle ignora la cancelacion por completo
+val incancelable = scope.launch(Dispatchers.Default) {
+    var i = 0L
+    while (i < 5_000_000_000) {
+        i += hash(i)          // ningun punto de suspension
+    }
+}
+incancelable.cancel()         // no detiene nada
+```
+
+Hay tres familias de código que caen en esta trampa y conviene identificarlas por separado, porque cada una tiene su propio remedio. La primera es el cómputo puro, bucles largos de cálculo sin suspensión alguna, y se arregla insertando comprobaciones. La segunda es la llamada bloqueante heredada, una lectura de socket o una consulta a base de datos que no sabe nada de corrutinas; ahí no hay comprobación que valga y la solución pasa por envolverla de modo que la cancelación se traduzca a la interrupción del hilo, con `runInterruptible`, o por cerrar el recurso desde fuera. La tercera es el bloque `finally` que quiere seguir trabajando tras la cancelación y descubre que ya no puede, y es el asunto de la última sección.
+
+<Mermaid code={`flowchart TD
+  A[Alguien invoca cancel] --> B[El Job pasa a cancelandose]
+  B --> C{El cuerpo alcanza un punto de cancelacion}
+  C -- Si --> D[Se lanza CancellationException]
+  C -- No --> E[El cuerpo sigue ejecutando hasta el final]
+  D --> F[Se ejecutan los bloques finally]
+  F --> G[El Job queda cancelado]`} />
+
+## Devolverle al código la capacidad de obedecer
+
+Hay tres formas de insertar un punto de cancelación en un cómputo y no son intercambiables. La primera es `ensureActive`, que comprueba el estado del contexto y lanza la cancelación si procede; es la elección por defecto porque es la más barata y la que expresa exactamente la intención. La segunda es `yield`, que además de comprobar cede el turno al planificador, permitiendo que otras corrutinas del mismo hilo avancen; se usa cuando el bucle podría monopolizar un despachador compartido. La tercera es leer `isActive` y salir del bucle por las buenas, que es la única adecuada cuando se quiere terminar de forma ordenada devolviendo un resultado parcial en lugar de propagar una excepción.
+
+```kotlin
+suspend fun sumarPesado(datos: List<Long>): Long {
+    var total = 0L
+    for ((i, d) in datos.withIndex()) {
+        if (i % 1_000 == 0) currentCoroutineContext().ensureActive()
+        total += transformar(d)
+    }
+    return total
+}
+
+// Variante que cede el turno en un despachador compartido
+suspend fun recorrer(datos: List<Long>) {
+    for (d in datos) {
+        yield()
+        procesar(d)
+    }
+}
+```
+
+La frecuencia de la comprobación es una decisión de ingeniería. Comprobar en cada vuelta de un bucle muy caliente añade un coste medible sin ganancia perceptible; comprobar cada mil o cada diez mil iteraciones acota la latencia de cancelación a una fracción de milisegundo, que es de sobra suficiente. El criterio correcto no es cuántas iteraciones sino cuánto tiempo puede tardar el trabajo en reaccionar sin que resulte molesto.
+
+El caso de la llamada bloqueante heredada tiene su propia herramienta y conviene conocerla, porque el remedio ingenuo de envolverla en un despachador de entrada y salida no cancela nada: solo traslada el bloqueo a otro hilo. La función `runInterruptible` traduce la cancelación de la corrutina a una interrupción del hilo que ejecuta el bloque, que es el único lenguaje que entienden las API antiguas.
+
+```kotlin
+suspend fun leerFichero(ruta: Ruta): ByteArray =
+    withContext(Dispatchers.IO) {
+        runInterruptible { apiHeredada.leerBloqueante(ruta) }
+    }
+```
+
+El tiempo límite es la otra cara de este mecanismo y funciona exactamente igual, porque `withTimeout` no hace nada mágico: lanza la cancelación sobre el bloque cuando expira el plazo. De ahí se sigue una consecuencia que sorprende a mucha gente y que ya está contenida en todo lo anterior, y es que un tiempo límite alrededor de código no cooperativo tampoco funciona. Ponerle un plazo a un bucle que nunca comprueba nada produce un plazo que se cumple en el papel y no interrumpe nada en la práctica.
+
+<Cards>
+  <Card icon="🌳" title="`ensureActive`">
+    Comprueba y lanza. Coste mínimo. La opción por defecto para bucles de cómputo dentro de una corrutina.
+  </Card>
+  <Card icon="🔁" title="`yield`">
+    Comprueba y además cede el turno. Se usa cuando el bucle podría acaparar un despachador con otras corrutinas esperando.
+  </Card>
+  <Card icon="🏳️" title="`isActive`">
+    Solo consulta. Permite salir del bucle sin excepción y devolver un resultado parcial cuando eso tiene sentido.
+  </Card>
+</Cards>
+
+## Limpiar cuando ya se está muerto
+
+Los bloques `finally` se ejecutan durante la cancelación, pero con una restricción importante: la corrutina ya está en estado cancelándose, así que cualquier función `suspend` invocada ahí dentro lanzará una `CancellationException` de inmediato. Esto significa que la limpieza sincrónica funciona y la limpieza que requiere suspensión, como cerrar una conexión remota o guardar un estado, no.
+
+```kotlin
+val trabajo = scope.launch {
+    val recurso = abrir()
+    try {
+        usar(recurso)
+    } finally {
+        recurso.cerrarLocal()                 // sincrono: funciona
+        withContext(NonCancellable) {
+            recurso.avisarAlServidor()        // suspende: necesita el permiso
+        }
+    }
+}
+```
+
+El elemento de contexto `NonCancellable` crea un `Job` que nunca se considera cancelado, de modo que dentro de ese bloque las funciones de suspensión vuelven a funcionar con normalidad. Es una excepción deliberada al modelo y hay que usarla con la disciplina que exige toda excepción a una regla: solo dentro de un `finally`, solo para limpieza y solo con operaciones acotadas en el tiempo, porque el código que hay dentro es, por definición, incancelable. Una llamada de red sin tiempo límite ahí dentro puede colgar indefinidamente un ámbito que el resto del programa cree ya terminado.
+
+<Callout type="dios" title="La cancelación se modela como excepción porque comparte estructura con el fallo, y ahí está su virtud y su precio">
+Merece la pena examinar por qué la biblioteca eligió representar una petición de terminación ordenada con el mismo mecanismo que representa un error, porque la decisión no es evidente y su comprensión ilumina todo lo que resulta incómodo del modelo. El argumento a favor es de una economía notable: cancelar y fallar necesitan exactamente lo mismo, a saber, abandonar el cómputo desde un punto arbitrario de profundidad arbitraria y ejecutar por el camino todos los bloques de liberación de recursos que haya en la pila. Ese desenrollado con limpieza es precisamente lo que las excepciones del lenguaje ya hacían, y reimplementarlo con banderas y retornos habría obligado a que cada función comprobara el estado en cada llamada y propagara manualmente la decisión, que es la clase de disciplina que ningún programa grande sostiene. Reutilizar el mecanismo dio gratis la corrección de los recursos, la interoperabilidad con el código Java existente y la ausencia de sintaxis nueva. El precio, y es real, es que dos conceptos ontológicamente distintos pasan a viajar por el mismo canal: la cancelación es el sistema funcionando según lo previsto y el fallo es el sistema encontrándose algo que no previó, pero ambos son excepciones y por tanto el mismo `catch` los atrapa. De ahí nacen los dos problemas prácticos que el programador debe tener siempre presentes, que son el bloque de captura amplia que convierte una corrutina en zombi y el bloque de limpieza que no puede limpiar porque ya está cancelado; y de ahí nacen también las dos piezas que existen para mitigarlos, el tratamiento especial que el árbol da a `CancellationException` y el permiso extraordinario que concede `NonCancellable`. La lectura que conviene llevarse es más general que las corrutinas: cuando un diseño reutiliza un mecanismo existente para un concepto nuevo por razones de economía, la deuda no se salda en el mecanismo sino en el discernimiento que después exige a cada usuario, y la única forma de pagarla bien es conocer con exactitud dónde los dos conceptos dejan de coincidir.
+</Callout>
+
+<Reto title="Haz cancelable lo incancelable">
+1. Escribe un bucle de cómputo puro dentro de una corrutina, cancélalo y comprueba con un contador que sigue ejecutándose. Después arréglalo con `ensureActive`.
+2. Mide el coste de comprobar en cada iteración frente a comprobar cada mil, y decide con datos qué frecuencia adoptarías.
+3. Introduce un `catch` de `Exception` dentro de un bucle de reintentos y demuestra que la corrutina deja de ser cancelable. Corrígelo relanzando la cancelación.
+4. Escribe un `finally` que necesite una llamada de suspensión, observa el fallo y resuélvelo con `NonCancellable` acotado por un tiempo límite.
+5. Explica con un ejemplo por qué una corrutina cancelada no hace fallar a sus hermanas, mientras que una que lanza otra excepción sí.
+</Reto>

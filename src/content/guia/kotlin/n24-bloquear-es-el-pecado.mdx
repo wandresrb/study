@@ -1,0 +1,148 @@
+---
+title: "Bloquear es el pecado: pools hambrientos y cómo evitarlos"
+description: "Una llamada bloqueante en un pool dimensionado por núcleos no ralentiza el programa: le quita una fracción entera de su capacidad y, en el caso límite, lo detiene por completo. Esta lección explica la aritmética de la inanición, las herramientas para detectar el bloqueo antes de que lo haga producción, los usos legítimos de runBlocking y la forma disciplinada de envolver una API bloqueante."
+subject: kotlin
+level: 24
+order: 4
+icon: "24.4"
+duracion: "22 min"
+---
+
+<Lead>
+La primera vez que alguien escribe una llamada bloqueante dentro de una corrutina no pasa nada malo, y ese es justamente el problema. El código funciona, las pruebas pasan, la revisión no dice nada y el defecto queda sembrado esperando a que la concurrencia real supere un umbral que nadie ha calculado. Entonces, un martes cualquiera, la latencia se multiplica por veinte sin que ninguna métrica de procesador, memoria o red muestre saturación, porque el recurso que se agotó no es ninguno de esos sino algo que no se estaba midiendo: los hilos disponibles para reanudar continuaciones. La suspensión existe precisamente para no consumir ese recurso mientras se espera, y una llamada bloqueante lo consume igualmente, anulando la única propiedad que hacía barata a toda la maquinaria. Esta lección trata ese fallo con la seriedad que merece, porque no es un defecto de rendimiento sino un defecto de disponibilidad.
+</Lead>
+
+<Objetivos>
+
+- Calcular qué fracción de capacidad se pierde al bloquear un hilo de un pool y en qué punto aparece la inanición total.
+- Distinguir bloquear de suspender en términos de lo que ocurre con el hilo y con la continuación.
+- Aplicar las técnicas de detección disponibles: instrumentación dedicada, volcados de hilos, modo de depuración y sondas.
+- Justificar los tres usos legítimos de `runBlocking` y descartar todos los demás con un argumento.
+
+</Objetivos>
+
+## La aritmética de la inanición
+
+Una suspensión libera el hilo: la continuación se guarda como objeto, el trabajador vuelve a la cola y recoge otra tarea. Un bloqueo hace lo contrario: el hilo entra en espera dentro del sistema operativo con la pila de la corrutina encima y no puede recoger nada más hasta que la espera termine. Sobre un pool con tantos hilos como núcleos, esa diferencia se traduce en una fracción exacta. En una máquina de ocho núcleos, una llamada bloqueante ocupa un octavo de toda la capacidad de cómputo del proceso durante el tiempo que dure; ocho llamadas simultáneas la ocupan entera y ninguna otra corrutina progresa, ni siquiera las que solo necesitaban un microsegundo de procesador.
+
+```kotlin
+// Cada una de estas corrutinas secuestra un hilo del pool de computo
+repeat(8) {
+    launch(Dispatchers.Default) {
+        Thread.sleep(5_000)      // bloquea: el hilo no puede hacer nada mas
+    }
+}
+
+// La siguiente no se ejecutara hasta que alguna de las anteriores termine
+launch(Dispatchers.Default) { println("tarea trivial") }
+```
+
+El caso patológico se alcanza cuando el trabajo bloqueado depende de trabajo que necesita el mismo pool para completarse. Ahí no hay lentitud sino interbloqueo: los hilos ocupados esperan un resultado que solo podría producir un hilo que ya no existe. Ocurre con más facilidad de la que parece cuando se combinan pools de un solo hilo, esperas sobre resultados diferidos y llamadas bloqueantes anidadas, y es especialmente cruel porque el volcado de hilos muestra trabajadores dormidos y una máquina completamente ociosa.
+
+<Mermaid code={`flowchart TD
+  A[Corrutina con llamada bloqueante] --> B[Hilo trabajador ocupado]
+  B --> C[Cola de tareas pendientes crece]
+  C --> D{Quedan hilos libres}
+  D -->|si| E[Latencia degradada]
+  D -->|no| F[Inanicion total del pool]
+  F --> G{El trabajo esperado necesita el pool}
+  G -->|no| H[Se recupera al terminar la espera]
+  G -->|si| I[Interbloqueo permanente]`} />
+
+La comparación con la suspensión aclara por qué la diferencia es cualitativa y no de grado. Suspender guarda el estado de la corrutina en un objeto del montículo, de unos pocos cientos de bytes, y libera un recurso caro. Bloquear retiene ese recurso caro y además mantiene viva una pila de un megabyte reservada por el sistema. Cien mil corrutinas suspendidas caben sin esfuerzo en un proceso normal; cien mil hilos bloqueados no caben en ninguno.
+
+Conviene tener presente que el pool de espera no es inmune, solo más tolerante. Su cuota por defecto es mucho mayor, así que absorbe un número de bloqueos que el pool de cómputo no absorbería, pero sigue siendo finita y comparte trabajadores con el otro. Bloquear allí es aceptable por diseño; bloquear allí sin acotar el paralelismo por recurso convierte una cola externa en una cola interna invisible.
+
+## Detectarlo antes que producción
+
+<Cards>
+  <Card icon="🔎" title="Instrumentación de bloqueo">
+    Un agente que instrumenta las llamadas bloqueantes de la plataforma y lanza un error cuando alguna se ejecuta en un hilo marcado como no bloqueante. Es la única técnica que convierte el defecto en un fallo reproducible en pruebas.
+  </Card>
+  <Card icon="🧵" title="Volcado de hilos">
+    Un volcado tomado durante el incidente muestra los trabajadores del pool y qué están esperando. Nombres de hilo repetidos en espera sobre entrada y salida son el diagnóstico casi inmediato.
+  </Card>
+  <Card icon="🐞" title="Modo de depuración">
+    Activado por propiedad de sistema, añade el identificador de la corrutina al nombre del hilo y hace legibles las trazas. Correlacionar corrutina y hilo es lo que permite atribuir el bloqueo a un punto del código.
+  </Card>
+  <Card icon="📊" title="Sondas y latencia de cola">
+    Las sondas de depuración enumeran las corrutinas vivas y su estado. Medir el tiempo entre encolar una tarea trivial y ejecutarla da una métrica directa de salud del pool.
+  </Card>
+</Cards>
+
+Ninguna de estas técnicas sustituye a las demás porque cada una actúa en un momento distinto del ciclo de vida. La instrumentación actúa en desarrollo y convierte el defecto en un fallo antes de que se integre; el modo de depuración actúa durante la investigación y hace legible lo que ocurrió; el volcado y la métrica de cola actúan en producción y son lo único disponible cuando el incidente ya está en curso. Un equipo maduro tiene las cuatro activas en el entorno que corresponde a cada una.
+
+La métrica de la última tarjeta merece implementarse en cualquier sistema serio porque es barata y detecta el problema desde el ángulo correcto. Consiste en lanzar periódicamente una corrutina que no hace nada, medir cuánto tarda desde que se encola hasta que empieza y publicar ese valor. Si el pool está sano, el número vive en las decenas de microsegundos. Si alguien bloquea, se dispara a cientos de milisegundos mucho antes de que la latencia de usuario se degrade lo bastante como para generar una alerta.
+
+```kotlin
+suspend fun latenciaDeCola(despacho: CoroutineDispatcher): Long = coroutineScope {
+    val inicio = System.nanoTime()
+    withContext(despacho) { /* no hace nada a proposito */ }
+    (System.nanoTime() - inicio) / 1_000
+}
+```
+
+## runBlocking y sus tres usos legítimos
+
+La función construye un puente en la dirección contraria a la habitual: crea una corrutina y bloquea el hilo actual hasta que termina, procesando mientras tanto las tareas de su propio despachador de eventos. Esa descripción ya contiene la advertencia, porque bloquear el hilo actual es exactamente lo que el resto de la lección desaconseja. Sus usos defendibles son tres y ninguno más.
+
+El primero es el punto de entrada de un programa, donde el hilo principal no tiene nada mejor que hacer que esperar. El segundo es la implementación de una interfaz bloqueante que no controlas, cuando tu código interno es suspendido y debes exponerlo con una firma síncrona en la frontera exacta del sistema. El tercero son ciertas pruebas antiguas, aunque hoy la herramienta correcta es el constructor de pruebas de la propia librería, que además controla el tiempo virtual y detecta corrutinas huérfanas.
+
+```kotlin
+fun main() = runBlocking {
+    servidor.arrancar()
+    esperarSenalDeParada()
+}
+
+// Frontera con una interfaz ajena que exige una firma sincrona
+class AdaptadorLegado(private val ambito: CoroutineScope) : ProcesadorSincrono {
+    override fun procesar(entrada: Entrada): Salida = runBlocking {
+        servicioSuspendido.procesar(entrada)
+    }
+}
+```
+
+Merece la pena entender por qué el interbloqueo con un solo hilo es inmediato y no probabilístico. La función bloquea el hilo actual y procesa entretanto las tareas encoladas en su propio despachador de eventos, no en el del dispatcher exterior. Si la corrutina interior necesita ese dispatcher exterior para progresar, y ese dispatcher tiene un único hilo que es precisamente el que está bloqueado, no queda nadie que pueda ejecutar la tarea que desbloquearía la espera. El ciclo se cierra en la primera ejecución y no depende de la carga ni del azar.
+
+```kotlin
+val unico = Dispatchers.Default.limitedParallelism(1)
+
+// Interbloqueo garantizado: el hilo unico esta bloqueado esperandose a si mismo
+suspend fun trampa() = withContext(unico) {
+    runBlocking { withContext(unico) { println("nunca llega") } }
+}
+```
+
+<Callout type="warn" title="Nunca dentro de una función suspendida ni en un hilo de un pool">
+Escribir `runBlocking` dentro de un cuerpo suspendido es el error más caro de este nivel: bloquea el hilo que la corrutina exterior estaba usando para hacer justo lo que la suspensión evitaba. Si el objetivo era esperar un resultado, ya existe la espera suspendida; si era ejecutar algo en otro dispatcher, ya existe el cambio de contexto. Y si además ocurre sobre un despachador de un solo hilo, el resultado no es lentitud sino un interbloqueo inmediato y perfectamente reproducible.
+</Callout>
+
+## Adaptar una API bloqueante con disciplina
+
+Cuando la biblioteca que hay al otro lado no ofrece versión suspendida, la adaptación correcta tiene tres partes y las tres son necesarias. La primera es aislar la llamada en un dispatcher de espera acotado al tamaño del recurso real, no al genérico, para que el número de bloqueos simultáneos sea una decisión explícita. La segunda es exponer una función suspendida cuyo contrato sea seguro desde cualquier sitio, de modo que ningún llamante herede el requisito. La tercera, y la que más se olvida, es respetar la cancelación: una llamada bloqueante no se entera de que la corrutina fue cancelada, así que hay que interrumpirla o cerrar el recurso desde fuera.
+
+```kotlin
+class ClienteHeredado(private val impl: ApiBloqueante) {
+    private val despacho = Dispatchers.IO.limitedParallelism(8)
+
+    suspend fun consultar(clave: String): Registro = withContext(despacho) {
+        runInterruptible { impl.consultarBloqueante(clave) }
+    }
+}
+```
+
+El tamaño del paralelismo no es un número decorativo y merece justificarse por escrito junto a la declaración. Si al otro lado hay un pool de ocho conexiones, permitir dieciséis llamadas simultáneas no dobla el rendimiento: pone ocho peticiones a esperar dentro del cliente, donde no hay métricas, en lugar de esperar en la cola del dispatcher, donde sí las hay. Si al otro lado hay una API con un límite de peticiones por segundo, el número debe derivarse de ese límite y de la latencia media. En ambos casos el criterio es el mismo: el dispatcher debe ser el punto donde se materializa la escasez del recurso externo, no un embudo colocado por costumbre.
+
+La función que aparece en el ejemplo anterior es la pieza clave y suele desconocerse: ejecuta el bloque de forma que la cancelación de la corrutina se traduzca en una interrupción del hilo, que es el único mecanismo que las bibliotecas bloqueantes de la plataforma entienden. Sin ella, cancelar la corrutina marca el trabajo como cancelado y devuelve el control al llamante, pero el hilo sigue secuestrado hasta que la llamada original termine por su cuenta, con lo que la cancelación deja de acotar el consumo de recursos y se convierte en una ficción contable.
+
+<Callout type="dios" title="La suspensión solo es barata mientras todo el mundo respete el trato, y una sola llamada bloqueante lo rompe para todos">
+El modelo entero de corrutinas descansa sobre un pacto tan simple que resulta fácil de olvidar: los hilos no son de nadie, se toman prestados durante el intervalo entre dos puntos de suspensión y se devuelven de inmediato. Ese préstamo permanente y rotatorio es lo que hace que cien mil corrutinas quepan sobre ocho hilos, que lanzar una tarea cueste lo que cuesta asignar un objeto pequeño y que la concurrencia deje de ser un recurso escaso del sistema operativo para volverse una construcción del lenguaje. Bloquear no es una infracción menor de ese pacto: es su negación exacta, porque retiene el hilo durante un intervalo arbitrario y con ello devuelve el sistema al modelo del que se quería salir, con el agravante de que los pools están dimensionados con la hipótesis contraria y son por tanto minúsculos comparados con los que un modelo bloqueante habría elegido. Y aquí aparece la propiedad que hace de esto un asunto grave y no una discusión de estilo: el daño no es local. Una función lenta perjudica a quien la llama; una función que bloquea un hilo compartido perjudica a todo el proceso, incluidas partes que no la conocen, que no dependen de ella y que se escribieron correctamente. Esa asimetría entre dónde se comete el error y dónde se sufre es la razón de que el diagnóstico sea tan difícil y de que las métricas habituales no lo vean: el procesador está ocioso, la memoria sobra, la red responde y sin embargo nada avanza, porque el recurso agotado no figura en ningún panel. La consecuencia práctica es que este defecto no se combate con revisiones de código ni con buenas intenciones sino con mecanismos: instrumentación que lo convierta en un fallo de prueba, dispatchers acotados por recurso que hagan explícito cuántos bloqueos se toleran, una métrica de latencia de cola que lo delate en minutos y un uso de `runBlocking` restringido a las tres fronteras donde es legítimo. Quien interioriza que la suspensión es un contrato colectivo, y no una optimización individual, deja de preguntarse si una llamada bloqueante concreta es aceptable y empieza a preguntarse en qué dispatcher acotado va a aislarla, que es la única pregunta con una respuesta útil.
+</Callout>
+
+<Reto title="Provoca y diagnostica la inanición">
+1. Lanza tantas corrutinas con espera bloqueante como núcleos tenga tu máquina sobre el pool de cómputo y mide cuánto tarda en ejecutarse una tarea trivial encolada después.
+2. Implementa la métrica de latencia de cola, publícala cada segundo y observa cómo se comporta durante el experimento anterior.
+3. Reproduce un interbloqueo con un dispatcher de un solo hilo y una llamada bloqueante anidada, y explica el ciclo con el volcado de hilos en la mano.
+4. Envuelve una API bloqueante con un dispatcher acotado y comprueba con trazas que la cancelación interrumpe realmente la llamada.
+5. Localiza en tu proyecto todos los usos de `runBlocking` y clasifícalos en los tres casos legítimos o justifica su eliminación.
+</Reto>

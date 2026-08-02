@@ -1,0 +1,145 @@
+---
+title: "La representación intermedia común y los cuatro backends"
+description: "Kotlin genera bytecode de la JVM, binario nativo por LLVM, JavaScript y WebAssembly, y lo hace desde una sola representación intermedia. Esta lección explica por qué esa decisión arquitectónica es la que sostiene realmente el multiplataforma, qué transformaciones ocurren dentro del IR cuando las corrutinas se convierten en máquinas de estados y las lambdas en línea desaparecen, cómo se reparten esas bajadas entre lo común y lo específico de cada destino, y por qué solo con ese diseño pudieron existir plugins de compilador que funcionan igual en los cuatro."
+subject: kotlin
+level: 28
+order: 3
+icon: "28.3"
+duracion: "25 min"
+---
+
+<Lead>
+La pregunta que separa a quien usa Kotlin multiplataforma de quien lo entiende es sencilla de formular y difícil de contestar: cuando escribes una función `suspend` y compilas para Android y para iOS, quién decide que en ambos casos se convierta en una máquina de estados equivalente. La respuesta no está en ninguna librería ni en ningún acuerdo entre equipos. Está en que existe una única representación intermedia por la que pasa todo el código, en que las transformaciones importantes se aplican ahí, antes de que ningún backend haya intervenido, y en que los cuatro generadores de código reciben un árbol al que ya se le ha quitado casi todo el lenguaje.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué una sola representación intermedia alimenta a los cuatro backends y qué gana el lenguaje con ello.
+- Enumerar las transformaciones principales que ocurren en el `IR` y distinguir las comunes de las específicas de cada destino.
+- Describir la relación entre el `IR`, los `klib` y la compilación multiplataforma.
+- Justificar por qué los plugins de compilador multiplataforma solo son viables sobre esta arquitectura.
+
+</Objetivos>
+
+## Un árbol, cuatro salidas
+
+Después de `Fir2Ir` el programa ya no está escrito en Kotlin. Está escrito en una representación intermedia con nodos deliberadamente pobres: declaraciones, cuerpos, llamadas, accesos, bloques y valores, donde cada referencia apunta a un **símbolo** resuelto en lugar de a un nombre. Esa pobreza es la que permite que las cuatro salidas compartan el mismo punto de partida.
+
+<Mermaid code={`flowchart TD
+  A[FIR resuelto] --> B[Fir2Ir]
+  B --> C[IR comun]
+  C --> D[Bajadas compartidas]
+  D --> E[Backend JVM: bytecode]
+  D --> F[Backend Native: LLVM]
+  D --> G[Backend JS]
+  D --> H[Backend Wasm]`} />
+
+La historia importa para entender el porqué. Hasta la versión 1.5 el backend de la JVM era independiente y generaba bytecode directamente desde los descriptores del frontend antiguo, mientras que los destinos nuevos ya usaban el `IR`. Eso significaba que cada característica del lenguaje se implementaba dos veces con dos semánticas potencialmente distintas, y era exactamente el mismo problema que la lección primera describía para el frontend y el IDE, pero en el otro extremo del tubo. La unificación en el `IR` común cerró esa brecha: hoy una transformación del lenguaje se escribe una vez, y los cuatro destinos la heredan porque ninguno de ellos ve el código antes de que se haya aplicado.
+
+Conviene ver qué aspecto tiene esa pobreza, porque es contraintuitiva. Una propiedad de Kotlin, que en el lenguaje es una sola cosa, en el `IR` es ya un conjunto de declaraciones separadas con una relación entre ellas.
+
+```kotlin
+// Lo que escribes
+class Punto(var x: Int)
+
+// Lo que el IR representa, expresado en pseudocodigo:
+//   clase Punto
+//     campo respaldo x
+//     funcion get-x devuelve Int
+//     funcion set-x recibe Int
+//     constructor primario que asigna el campo
+```
+
+Esa descomposición temprana es lo que permite que el backend de la JVM emita un par de métodos y el de JavaScript emita otra cosa, sin que ninguno de los dos tenga que saber qué es una propiedad de Kotlin. La regla general del `IR` es esa: si una construcción del lenguaje se puede expresar con piezas más simples, se expresa, y cuanto antes mejor.
+
+Los cuatro destinos no son variantes del mismo problema. La JVM ofrece un modelo de objetos muy cercano al de Kotlin, con clases, interfaces y borrado de genéricos; a cambio impone su vocabulario de bytecode y su compatibilidad binaria. El destino nativo delega en `LLVM` la generación final, con lo que hereda su optimizador y su tabla de arquitecturas, pero tiene que resolver por su cuenta la gestión de memoria y la interoperabilidad con C y Objective-C. JavaScript no tiene tipos ni enteros de 64 bits reales, así que exige emulaciones. WebAssembly, el más joven, aporta un modelo de tipos propio y depende de las propuestas de recolección de basura y de manejo de excepciones del estándar. Que un mismo `IR` sirva para los cuatro solo funciona porque las diferencias se empujan lo más tarde posible.
+
+## Las bajadas: dónde desaparece el lenguaje
+
+El trabajo interesante del backend no es generar código, es la secuencia de **bajadas**. Una bajada es una transformación que toma un `IR` con cierta construcción y devuelve otro `IR` equivalente pero sin ella, expresada en términos más primitivos. Encadenar decenas de bajadas es lo que convierte Kotlin en algo que un generador de bytecode o de `LLVM` puede recorrer sin saber qué es una corrutina.
+
+<Cards>
+  <Card icon="🔁" title="Suspensión a estados">
+    Una función `suspend` recibe un parámetro oculto de continuación y su cuerpo se reescribe como una máquina de estados con una etiqueta por punto de suspensión.
+  </Card>
+  <Card icon="✂️" title="Inserción de funciones inline">
+    El cuerpo de la lambda se copia en el punto de llamada y el objeto lambda deja de existir. De ahí que `forEach` no asigne y que el `return` no local funcione.
+  </Card>
+  <Card icon="📦" title="Value class y boxing">
+    La clase envolvente se sustituye por su valor subyacente donde se puede, y se reintroduce el boxing exactamente donde la firma lo exige.
+  </Card>
+  <Card icon="🎛️" title="Valores por defecto">
+    Los parámetros con valor por defecto generan una función sintética con una máscara de bits que decide qué argumentos se rellenan.
+  </Card>
+</Cards>
+
+La primera de ellas es la que más lejos lleva la idea de empobrecer para simplificar, y merece verse escrita. Una función suspendida es, tras la bajada, una función ordinaria con un argumento extra y un cuerpo convertido en autómata.
+
+```kotlin
+// Lo que escribes
+suspend fun cargar(id: Int): Dato {
+    val cabecera = pedirCabecera(id)
+    val cuerpo = pedirCuerpo(cabecera)
+    return unir(cabecera, cuerpo)
+}
+
+// Lo que la bajada produce, en pseudocodigo:
+//   fun cargar(id: Int, cont: Continuation): Any
+//     when (cont.label) {
+//       0 -> guardar id; label = 1; return pedirCabecera(id, cont)
+//       1 -> recuperar id; label = 2; return pedirCuerpo(cabecera, cont)
+//       2 -> recuperar todo; return unir(cabecera, cuerpo)
+//     }
+```
+
+Ahí están, a la vista, los tres hechos que explican todo lo que sabes de las corrutinas: que suspender no bloquea ningún hilo porque la función simplemente retorna; que el estado local sobrevive porque se guarda en el objeto de continuación y no en la pila; y que el coste de una corrutina es el de un objeto pequeño más un salto, que es la razón de que puedas tener cientos de miles.
+
+Estas cuatro son bajadas mayormente compartidas, y por eso su comportamiento es reconocible en cualquier destino. Junto a ellas hay una cola larga de transformaciones igualmente comunes: la elevación de clases y funciones locales al nivel superior con sus capturas convertidas en campos, la conversión de los objetos y compañeros en instancias únicas inicializadas de forma perezosa, la expansión de las clases `data` en sus métodos generados, el aplanado de los `when` a saltos, la traducción de los operadores de nulabilidad a comprobaciones explícitas y la inserción de las aserciones de no nulidad en la frontera con Java.
+
+Hay un criterio implícito en ese reparto que conviene enunciar: una transformación pertenece al `IR` común cuando su corrección depende de la semántica de Kotlin, y pertenece al backend cuando depende de las restricciones de la plataforma. La máquina de estados de las corrutinas es común porque su corrección la define el lenguaje. La forma exacta de representar un entero de 64 bits es del backend porque la define el destino. Cuando dudes de dónde vive algo, esa pregunta lo resuelve casi siempre.
+
+Cada backend añade después las suyas propias, y ahí es donde aparecen las diferencias que sí notas. En la JVM hay bajadas dedicadas a la interoperabilidad: nombres desfigurados, puentes de firma, anotaciones de metadatos, la representación de las propiedades como pares de métodos. En el destino nativo aparecen las bajadas relacionadas con el modelo de memoria y con la interoperabilidad con C. En JavaScript, las que sustituyen las operaciones de 64 bits y las que preparan la eliminación de código muerto. En WebAssembly, las que ajustan el modelo de tipos y las excepciones.
+
+<Callout type="warn" title="El orden de las bajadas no es un detalle">
+Las bajadas se aplican en una secuencia fijada, y su orden es semántico, no cosmético. La inserción de funciones `inline` tiene que ocurrir antes que la transformación de corrutinas, porque si no, una lambda suspendida insertada quedaría fuera de la máquina de estados de su función anfitriona. Cuando un plugin de compilador se comporta distinto según la versión del compilador, el motivo casi siempre es que su transformación se registró en un punto de esa secuencia que ha cambiado.
+</Callout>
+
+Hay una consecuencia práctica muy concreta de todo esto para quien escribe Kotlin multiplataforma. Cuando una característica del lenguaje se comporta igual en Android y en iOS, no es porque alguien lo haya verificado en ambos: es porque la bajada es común y para cuando el backend interviene ya no queda ninguna decisión que tomar. Y cuando algo se comporta distinto —el tamaño de un entero en JavaScript, la identidad de un objeto tras cruzar a Objective-C, el coste de una excepción en WebAssembly— casi siempre estás tocando precisamente una bajada específica del destino.
+
+Conviene además desmontar una intuición equivocada muy extendida: que el `IR` es un lenguaje intermedio optimizador al estilo del de `LLVM`. No lo es. Su trabajo no es hacer el código más rápido sino hacerlo más simple, eliminando construcciones del lenguaje hasta dejar algo traducible. La optimización real llega después y no la hace Kotlin: la hace `LLVM` en nativo, la máquina virtual en caliente en la JVM, y el empaquetador en JavaScript. Confundir ambos papeles lleva a buscar en el compilador optimizaciones que nunca estuvieron ahí.
+
+## El IR como formato y los plugins
+
+El `IR` no es solo una estructura en memoria: también se serializa. Los `klib`, las bibliotecas de Kotlin multiplataforma, contienen `IR` serializado junto con metadatos, y no bytecode ni binario. Esa decisión es la que permite que una dependencia común compilada una vez se pueda materializar después para cualquier destino, y también la que explica por qué los `klib` son sensibles a la versión del compilador: el formato acompaña a la evolución del `IR`.
+
+```bash
+# Compilar para dos destinos desde el mismo codigo comun.
+kotlinc-native src/nativeMain -o app
+kotlinc src/jvmMain -d build/classes
+```
+
+Ese formato aclara además una duda recurrente sobre `expect` y `actual`. Una declaración marcada como `expect` no es una interfaz ni un mecanismo de tiempo de ejecución: es un hueco que el compilador exige rellenar con una declaración `actual` del destino concreto, y la comprobación de que ambas encajan ocurre en una fase propia del frontend. Cuando el módulo común se materializa para un destino, la referencia al símbolo esperado se enlaza con el real. Si eso falla —porque la firma no coincide o porque falta la implementación— el error aparece en el enlazado del `IR`, que es exactamente el punto donde los dos mundos se juntan por primera vez.
+
+Y aquí llegamos a lo que probablemente sea el mayor rendimiento de la inversión. Un plugin de compilador de Kotlin se engancha en dos sitios: en el frontend, si necesita cambiar lo que el programa significa —declarar miembros nuevos, aportar diagnósticos, participar en la resolución—, y en el backend, mediante una extensión de generación que recibe el módulo en forma de `IR` y lo transforma antes de que ningún destino lo vea. Como esa transformación ocurre sobre el `IR` común, se aplica sola a los cuatro backends.
+
+Ese es literalmente el motivo por el que la serialización, Compose o las utilidades de atomicidad funcionan en JVM, Native, JS y Wasm sin cuatro implementaciones. El plugin no sabe para dónde compilas, y esa ignorancia es la característica, no la limitación.
+
+El caso de la serialización lo ilustra con precisión. Su plugin necesita las dos mitades: en el frontend declara un miembro que tú no escribiste —el serializador asociado a la clase— para que el resto de tu código pueda referirse a él y para que el IDE lo vea; en el `IR` genera el cuerpo de ese serializador, con su descriptor de campos y sus métodos de lectura y escritura. Si esa segunda mitad se escribiese contra el generador de bytecode, existiría solo en la JVM. Escrita contra el `IR` común, existe en los cuatro destinos sin una línea adicional.
+
+<Callout type="note" title="Dónde engancharse decide qué puedes hacer">
+Una extensión de frontend puede añadir declaraciones, aportar diagnósticos y participar en la resolución, pero no puede cambiar el código que se ejecuta. Una extensión de `IR` puede reescribir cualquier cuerpo, pero llega cuando la comprobación de tipos ya terminó y nadie va a revisar lo que produzca. Los plugins que hacen las dos cosas necesitan que ambas mitades cuenten la misma historia, y esa coherencia es responsabilidad suya: si el frontend promete un miembro que el `IR` no genera, el fallo aparece en tiempo de ejecución.
+</Callout>
+
+Queda una consecuencia práctica para quien no escribe plugins pero los consume. Como la transformación ocurre sobre el `IR`, un plugin queda acoplado a la versión del compilador y no a la de tu proyecto. Por eso los plugins declaran compatibilidad con versiones concretas y por eso actualizar Kotlin puede exigir actualizar el plugin antes. No es una molestia de empaquetado: es que la representación sobre la que operan es interna y evoluciona.
+
+<Callout type="dios" title="Un IR común no es una comodidad de implementación sino una decisión de gobierno del lenguaje, porque desplaza el poder de definir qué significa Kotlin desde los generadores de código hacia un único lugar en el que todos pierden autonomía a la vez">
+La lectura ingenua del `IR` común es que ahorra trabajo: en vez de escribir cuatro veces la transformación de corrutinas, se escribe una. Es cierto y es lo de menos. Lo que realmente decide un `IR` común es **dónde reside la autoridad sobre la semántica del lenguaje**, y ese desplazamiento tiene consecuencias que se notan durante años. Con backends independientes, cada generador de código es soberano: puede implementar una característica un poco antes o un poco después, con un matiz distinto, con una optimización que el otro no tiene, y ninguna de esas divergencias es un fallo aislado porque nadie ha escrito en ningún sitio cuál era la versión canónica. El resultado inevitable es que el lenguaje deja de ser uno y pasa a ser el conjunto de sus implementaciones, con la especificación degradada a un documento que describe la intersección aproximada de lo que hacen. Con un `IR` común ocurre lo contrario: cuando la bajada de una característica se escribe una sola vez y todos los destinos la reciben ya aplicada, el generador de código pierde la capacidad de opinar, y esa pérdida es exactamente el objetivo. Ningún backend puede adelantarse ni quedarse atrás, porque para cuando le llega el árbol la decisión ya está tomada; y cualquier plugin externo hereda esa misma disciplina por construcción, sin necesidad de que su autor entienda cuatro plataformas. Ahí está la respuesta a la pregunta que casi nadie formula bien: el multiplataforma de Kotlin no funciona porque exista una librería estándar común ni porque `expect` y `actual` permitan rellenar huecos. Eso es la superficie. Funciona porque el punto en el que el lenguaje se convierte en código está antes de la bifurcación entre plataformas y no después, de modo que compartir comportamiento es lo que ocurre por defecto y divergir requiere una bajada específica que alguien tiene que escribir a propósito. Invierte esa asimetría —haz que compartir requiera esfuerzo y divergir sea gratis— y tendrás lo que han sido históricamente casi todos los intentos de escribir una vez y ejecutar en todas partes: un conjunto de dialectos parecidos que se van separando en cuanto nadie los vigila.
+</Callout>
+
+<Reto title="Mira el IR desde fuera">
+1. Escribe una función `suspend` trivial con dos puntos de suspensión y dibuja a mano los estados de la máquina que la bajada tiene que producir.
+2. Declara la misma lambda pasada a una función `inline` y a una que no lo sea. Predice cuántos objetos se asignan en cada caso antes de comprobarlo.
+3. Coge una `value class` y colócala en tres posiciones distintas: parámetro, tipo genérico y valor nulable. Razona en cuáles sobrevive el desempaquetado.
+4. Compila el mismo módulo común para dos destinos distintos y comprueba que los `klib` intermedios son los mismos y que solo cambia la salida final.
+5. Elige un plugin de compilador que uses e identifica si su trabajo ocurre en el frontend, en el `IR` o en ambos, justificando la respuesta con lo que hace.
+</Reto>

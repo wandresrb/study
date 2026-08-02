@@ -1,0 +1,160 @@
+---
+title: "La representación dual: toda tabla son dos tablas"
+description: "Una tabla de Lua no es una estructura de datos: son dos pegadas bajo la misma cabecera. Un vector contiguo guarda las claves enteras densas desde 1; una tabla de dispersión encadenada guarda todo lo demás. Esta lección abre la estructura `Table`, sigue el camino exacto que recorre una clave hasta su celda, explica por qué un flotante con valor entero se normaliza antes de buscar y por qué una cadena corta llega con el hash ya calculado, y termina en la consecuencia de diseño que gobierna el nivel entero: Lua no tiene arrays, tiene una tabla que se comporta como uno cuando le conviene."
+subject: lua
+level: 6
+order: 1
+icon: "6.1"
+duracion: "18 min"
+---
+
+<Lead>
+Ya sabes que la tabla es el único tipo compuesto de Lua y que hace de array, de diccionario, de objeto y de módulo. Eso es cierto en la superficie del lenguaje y falso en la implementación: desde Lua 5.0 cada tabla lleva dentro dos estructuras de datos distintas, con costes distintos, y una única regla que decide en cuál acaba cada clave. Ningún programa Lua puede observar esa frontera —no existe función que te diga si `t[7]` vive en el vector o en la dispersión—, pero todo programa Lua la paga. La diferencia entre un bucle que recorre un millón de posiciones a velocidad de C y uno que hace un millón de búsquedas con hash está exactamente ahí, y no aparece en ninguna línea de tu código. Este nivel entero consiste en aprender a ver esa frontera invisible.
+</Lead>
+
+<Objetivos>
+
+- Leer la estructura `Table` de la implementación y saber qué guarda cada campo.
+- Enunciar con precisión la regla que asigna una clave a la parte array o a la parte hash.
+- Explicar la normalización de claves flotantes, el interning de cadenas cortas y las claves prohibidas.
+- Justificar en bytes y en instrucciones por qué la parte array es más rápida y más barata.
+
+</Objetivos>
+
+## Dos estructuras bajo una sola cabecera
+
+Una tabla en el intérprete de referencia es una cabecera pequeña que apunta a dos bloques de memoria independientes. La cabecera cabe holgadamente en una línea de caché y es lo único que existe siempre; los dos bloques pueden estar vacíos, y de hecho una tabla recién creada con `{}` no tiene ni parte array ni parte hash reales.
+
+```c
+typedef struct Table {
+  CommonHeader;
+  lu_byte flags;       /* cache de metametodos ausentes */
+  lu_byte lsizenode;   /* log2 del tamano de la parte hash */
+  unsigned int alimit; /* limite de la parte array */
+  TValue *array;       /* parte array: SOLO valores, sin claves */
+  Node *node;          /* parte hash: clave + valor + enlace */
+  Node *lastfree;      /* por debajo de aqui no quedan huecos libres */
+  struct Table *metatable;
+  GCObject *gclist;
+} Table;
+```
+
+Las dos asimetrías importantes están en los tipos. La parte array es un `TValue *`: una secuencia de valores desnudos, sin claves, porque la clave de la posición `i` es implícitamente `i`. La parte hash es un `Node *`: cada entrada guarda su clave completa (valor y etiqueta de tipo), su valor y un entero `next` para resolver colisiones. Guardar la clave no es opcional en una dispersión, y ahí nace toda la diferencia de coste.
+
+Los dos campos restantes de la cabecera merecen una nota, porque explican dos comportamientos que se atribuyen a magia. El puntero `metatable` es nulo mientras no le asignes una, y `flags` es una caché de un byte donde cada bit recuerda que un metamétodo concreto **no** existe en esa metatabla. Gracias a ese byte, una operación como sumar dos tablas sin metatabla no paga una búsqueda de `__add`: paga una comprobación de bit. Es el mismo principio que la parte array llevado al terreno de los metamétodos, y por eso el nivel de metatablas y este comparten más de lo que parece.
+
+Una tabla recién creada con `{}` tiene los dos punteros de datos apuntando a estructuras vacías. El vector es sencillamente nulo con tamaño cero; la dispersión apunta a un **nodo ficticio** compartido por todo el estado, de solo lectura, cuya única función es que el código de búsqueda no tenga que comprobar si existe parte hash antes de leerla. Crear una tabla vacía cuesta, por tanto, una cabecera y nada más.
+
+El tamaño de la parte hash es siempre una potencia de dos —se guarda su logaritmo en un solo byte, `lsizenode`— porque así el módulo de la función de dispersión se reduce a una operación de bits. El tamaño de la parte array no tiene esa restricción teórica, pero en la práctica el algoritmo que lo calcula produce potencias de dos, como verás en la lección siguiente.
+
+<Mermaid code={`flowchart TD
+  K[Clave k] --> N[Normalizar flotante a entero si su valor es integral]
+  N -->|entero entre 1 y el limite del array| A[Parte array]
+  N -->|cualquier otra clave| H[Parte hash]
+  A --> AV[Indice directo sin comparar claves]
+  H --> P[Posicion principal segun el hash de la clave]
+  P -->|libre| I[Ocupar esa posicion]
+  P -->|ocupada por un intruso| B[Mover al intruso y encadenar]`} />
+
+## La regla que decide, clave por clave
+
+La regla completa cabe en una frase: **una clave va a la parte array si y solo si es un entero `k` tal que `1 <= k <= N`, donde `N` es el tamaño actual de la parte array; cualquier otra clave va a la parte hash.** No hay excepciones, no hay heurísticas adicionales, no hay tipos privilegiados más allá del entero positivo pequeño.
+
+Antes de aplicar la regla, Lua normaliza. Un flotante cuyo valor es matemáticamente entero y cabe en un `lua_Integer` se convierte a entero, de modo que `t[2.0]` y `t[2]` son literalmente la misma clave. Esta normalización ocurre en la búsqueda y en la inserción, y es la razón de que una tabla nunca contenga dos entradas para el mismo número escrito de dos formas.
+
+```lua
+local t = {}
+t[2] = "a"
+t[2.0] = "b"          -- misma clave, sobrescribe
+print(t[2])           --> b
+
+t[0/0] = 1            -- error: table index is NaN
+t[nil] = 1            -- error: table index is nil
+t[2.5] = "c"          -- valido: clave flotante, va a la parte hash
+```
+
+Las dos claves prohibidas lo están por razones distintas. `nil` no puede ser clave porque el valor `nil` es precisamente la marca de ausencia: permitirlo haría indistinguible «no hay entrada» de «hay una entrada cuya clave es nada». `NaN` no puede ser clave porque no es igual a sí mismo, y una tabla de dispersión que no puede reencontrar una clave a partir de sí misma está rota por construcción. Ambos casos se aceptan en lectura —`t[nil]` devuelve `nil` sin error— y solo fallan al escribir.
+
+Para las claves de tipo cadena hay un detalle que explica por qué usar cadenas como claves es tan barato en Lua: las cadenas cortas están internadas. Solo existe una copia de cada cadena corta en todo el estado, con su hash calculado en el momento de crearla. Comparar dos claves de cadena corta es, por tanto, comparar dos punteros, y calcular su posición principal es leer un campo. Las cadenas largas —por encima del umbral de la implementación— no se internan y calculan su hash de forma perezosa, la primera vez que se usan como clave.
+
+Así queda un nodo de la parte hash, ya empaquetado a mano desde Lua 5.4 para que las dos etiquetas y el enlace compartan los huecos que dejaría la alineación:
+
+```c
+typedef union Node {
+  struct NodeKey {
+    Value value_;       /* 8 bytes: el valor */
+    lu_byte tt_;        /* 1 byte:  etiqueta del valor */
+    lu_byte key_tt;     /* 1 byte:  etiqueta de la clave */
+    int next;           /* 4 bytes: enlace de colision */
+    Value key_val;      /* 8 bytes: la clave */
+  } u;                  /* 24 bytes en total, solo 2 de relleno */
+  TValue i_val;         /* acceso al valor como TValue completo */
+} Node;
+```
+
+Veinticuatro bytes por entrada frente a los dieciséis —nueve desde Lua 5.5— que cuesta un hueco del vector. Y no es solo memoria: la clave hay que compararla, y el enlace hay que seguirlo.
+
+La parte hash resuelve colisiones con dispersión encadenada sobre el propio vector de nodos, usando la variación de Brent. Cada clave tiene una posición principal determinada por su hash. Si esa posición está libre, la ocupa. Si está ocupada por una clave cuya posición principal es esa misma, la nueva se coloca en un hueco libre cualquiera y se encadena mediante el campo `next`. Y si está ocupada por un intruso —una clave que colisionó desde otra posición principal—, es el intruso quien se muda, y la recién llegada se queda con la posición que le corresponde. El resultado es que la cadena de colisiones de una clave siempre empieza en su posición principal, lo que acorta las búsquedas fallidas.
+
+## Por qué el array es rápido sin que existan arrays
+
+El acceso a la parte array no es «más o menos» rápido: es una comparación y una indexación. La implementación usa un truco de aritmética sin signo para verificar las dos cotas con una sola comparación.
+
+```c
+const TValue *luaH_getint (Table *t, lua_Integer key) {
+  lua_Unsigned k = l_castS2U(key) - 1u;   /* desplaza el rango a 0 .. N-1 */
+  if (k < t->alimit)                      /* cubre k < 1 y k > N a la vez */
+    return &t->array[k];                  /* acceso directo, sin comparar claves */
+  /* ... camino lento: buscar en la parte hash ... */
+}
+```
+
+Si `key` es cero o negativa, la resta sin signo produce un número enorme que falla la comparación; si es mayor que el límite, falla igual. Una resta, una comparación y una lectura indexada. Ningún hash, ninguna comparación de claves, ninguna cadena de colisiones que recorrer.
+
+Compara eso con el camino de la dispersión, que en el mejor de los casos es: calcular o leer el hash, reducirlo módulo el tamaño, leer el nodo de esa posición, comparar la etiqueta de tipo de su clave con la buscada, comparar el valor de la clave, y —si no coincide— seguir el campo `next` hasta agotar la cadena. Media docena de operaciones y al menos un salto dependiente de datos en el mejor caso, frente a tres instrucciones sin ramificación. Esa es la razón, y la única, de que exista la parte array.
+
+<Cards>
+  <Card icon="🔬" title="Coste en memoria por entrada">
+    En la parte array cada hueco cuesta un valor etiquetado. En la parte hash cada entrada cuesta un nodo: valor etiquetado, clave etiquetada y un entero de enlace, veinticuatro bytes en una máquina de 64 bits. La parte hash es además una potencia de dos, así que puede estar medio vacía por diseño.
+  </Card>
+  <Card icon="🧭" title="Coste en localidad">
+    Recorrer la parte array es un barrido lineal de memoria contigua: el prefetcher del procesador acierta siempre. Recorrer la parte hash con `pairs` visita los nodos en orden de almacenamiento, que no guarda ninguna relación con el orden de inserción ni con el de las claves.
+  </Card>
+  <Card icon="⚖️" title="Coste en el peor caso">
+    Una búsqueda en la parte array es siempre O de uno. Una búsqueda en la parte hash es O de uno esperado, pero su peor caso depende de la longitud de la cadena de colisiones, que la variación de Brent mantiene corta a costa de mover nodos en la inserción.
+  </Card>
+  <Card icon="🕳️" title="El coste de los agujeros">
+    Un hueco vacío dentro de la parte array ocupa memoria igual que uno lleno. Una tabla con las claves 1 y 1000 no reserva mil huecos, pero una tabla que llegó a tener las mil y borró novecientas noventa y ocho sigue pagándolos hasta el próximo redimensionado.
+  </Card>
+</Cards>
+
+## La frontera se filtra en el recorrido
+
+Dijimos que ningún programa Lua puede observar la frontera, y es cierto en el sentido estricto: no existe consulta que la revele. Pero sí se filtra, y el sitio por donde lo hace es el recorrido genérico. La función `next` —el motor de `pairs`— está obligada a visitar todas las entradas de la tabla exactamente una vez, y para conseguirlo recorre primero el vector de principio a fin, saltándose los huecos vacíos, y después el vector de nodos en su orden de almacenamiento.
+
+```lua
+local t = {}
+t.zeta = 1
+t.alfa = 2
+t[1] = "uno"
+t[2] = "dos"
+
+for k, v in pairs(t) do print(k, v) end
+-- Imprime 1 y 2 antes que las claves de texto, casi siempre.
+-- Y el orden relativo de zeta y alfa depende de sus hashes,
+-- que dependen de la semilla aleatoria del estado de Lua.
+```
+
+De ahí salen tres consecuencias que conviene tener claras. La primera es que ver los índices numéricos aparecer en orden al principio de un `pairs` es un artefacto de la implementación, no una garantía: en cuanto una de esas claves viva en la dispersión, el orden se rompe. La segunda es que el orden de las claves no numéricas es genuinamente impredecible entre ejecuciones, porque las cadenas cortas se dispersan con una semilla que cambia en cada estado para dificultar ataques por colisiones; cualquier código que dependa de ese orden es incorrecto aunque funcione hoy. La tercera es la regla que el manual enuncia y que ahora entiendes: durante un recorrido con `next` puedes asignar `nil` a claves existentes, pero no puedes **añadir** claves nuevas, porque una clave nueva puede desencadenar un redimensionado que reubique todo y deje al iterador señalando a un sitio que ya no significa lo mismo.
+
+<Callout type="dios" title="Lua no optimiza los arrays: optimiza el caso en que una tabla parece uno">
+La tentación al descubrir la representación dual es leerla como una optimización oportunista, un parche pegado a la tabla para que los arrays no salgan caros. Es exactamente al revés, y entender la dirección de la flecha cambia cómo escribes Lua. La decisión de diseño fundacional fue tener un solo tipo compuesto, porque un lenguaje pensado para vivir empotrado en un motor de juego o en un servidor no puede permitirse un zoo de contenedores con sus propias sintaxis, sus propias bibliotecas y sus propias reglas de conversión. Esa decisión tenía un coste evidente: si todo es un diccionario, entonces recorrer un vector de un millón de números es un millón de operaciones de dispersión, y ningún programa serio se escribiría así. La representación dual no es un añadido, es la condición que hace viable la decisión original. Y por eso su regla es tan brutalmente simple —enteros de uno a `N` al vector, todo lo demás a la dispersión— en lugar de ser un sistema de heurísticas que intente adivinar tus intenciones: una regla simple es una regla que puedes tener en la cabeza mientras escribes, y por tanto es una regla con la que puedes cooperar. El programador que numera sus registros desde cero, o que usa identificadores dispersos como si fueran índices, o que borra el elemento intermedio de una secuencia y espera que el hueco desaparezca, no está cometiendo un error de estilo: está sacando sus datos del único camino rápido que existe, sin recibir ni un aviso del intérprete. En Lua no eliges entre estructuras de datos declarando un tipo; eliges dándole a la tabla claves con las que pueda trabajar bien. La estructura de datos la decides tú, pero la escribes con las claves, no con la sintaxis.
+</Callout>
+
+<Reto title="Localiza la frontera invisible">
+1. Crea `local t = {}` y asígnale las claves 1, 2 y 3 en orden. Después crea otra tabla y asígnale 3, 2 y 1 en ese orden. Las dos tablas son indistinguibles desde Lua; argumenta por escrito por qué su historia interna no lo es.
+2. Escribe dos bucles que sumen un millón de valores: uno sobre claves `1..1000000` y otro sobre claves `1000001..2000000` de otra tabla construida igual. Cronométralos con `os.clock` y explica por qué salen parecidos, pese a que los índices del segundo son enormes.
+3. Ahora construye la segunda tabla con claves `i * 1000` y vuelve a medir. Justifica la diferencia con la regla de esta lección, no con intuiciones sobre «números grandes».
+4. Comprueba que `t[3] = "a"` y `t[3.0] = "b"` dejan una sola entrada, y explica en qué momento exacto ocurre la normalización.
+5. Localiza en el manual de referencia la frase que prohíbe `nil` y `NaN` como claves, y escribe la razón distinta que hay detrás de cada prohibición.
+</Reto>

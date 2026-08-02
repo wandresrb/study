@@ -1,0 +1,158 @@
+---
+title: "El contrato de contexto"
+description: "Un flujo impone dos invariantes que no son consejos sino comprobaciones activas: el bloque productor debe emitir siempre desde la corrutina del recolector, y ningún tramo puede capturar excepciones que vengan de más abajo. Esta lección explica de dónde salen ambas reglas, qué construye realmente flowOn para cambiar el contexto de lo que está por encima sin violarlas, y por qué catch y retry solo son posibles gracias a la frialdad establecida en la primera lección."
+subject: kotlin
+level: 26
+order: 5
+icon: "26.5"
+duracion: "23 min"
+---
+
+<Lead>
+Los flujos son la parte de las corrutinas donde el lenguaje se pone estricto. En casi todo lo demás, escribir algo dudoso produce como mucho un aviso o un comportamiento discutible; aquí hay dos invariantes que la propia librería comprueba en tiempo de ejecución y cuyo incumplimiento aborta el programa con un mensaje explícito. La primera dice que el productor debe emitir desde la misma corrutina desde la que se le llamó. La segunda dice que ningún tramo de la cadena puede tragarse una excepción que venga de más abajo. Las dos parecen restricciones caprichosas hasta que se entiende que son la contrapartida exacta de las virtudes de las lecciones anteriores: son el precio de que la cadena entera sea una sola unidad de ejecución legible, y sin ellas nada de lo dicho hasta aquí sería cierto.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué un bloque productor no puede cambiar de contexto y qué comprueba la librería en cada emisión.
+- Describir qué construye `flowOn` y por qué solo afecta a los tramos situados por encima de él.
+- Enunciar la transparencia de excepciones y usar `catch` respetándola.
+- Justificar por qué `retry` solo es posible sobre un flujo frío y qué implica reintentar.
+
+</Objetivos>
+
+## La invariante de preservación del contexto
+
+Empecemos por el código que parece razonable y no lo es. Un productor que hace trabajo de disco quiere ejecutarlo en el despachador adecuado, y la forma habitual de conseguirlo en corrutinas es envolver ese trabajo.
+
+```kotlin
+// Falla en ejecucion con un mensaje sobre la invariante del flujo
+val roto = flow {
+    withContext(Dispatchers.IO) {
+        emit(leerFichero())
+    }
+}
+```
+
+El mecanismo de detección es sencillo y conviene conocerlo porque explica la regla mejor que cualquier justificación. El colector que la librería entrega al bloque productor no es el del usuario directamente, sino un envoltorio que guarda el contexto vigente en el instante en que empezó la recolección. En cada llamada a `emit`, ese envoltorio consulta el contexto actual y lo compara con el guardado; si el trabajo asociado no es el mismo, lanza. No hay análisis estático ni magia del compilador: hay una comparación por emisión, con el resultado memorizado para que el coste sea despreciable cuando nada cambia.
+
+La razón de fondo es la que sostiene las tres lecciones anteriores. `emit` es una llamada directa al cuerpo del recolector, sobre la misma pila. Si esa llamada ocurriera desde otra corrutina, el cuerpo del usuario se ejecutaría en un contexto que él no eligió, su cancelación colgaría de un trabajo que él no conoce y sus excepciones subirían por una cadena que no es la suya. Es decir, se perderían de golpe las cuatro propiedades que hacían que la cadena se leyera como una función ordinaria.
+
+<Callout type="warn" title="La regla vale tambien para lo que parece inocente">
+No solo falla `withContext`. Falla igualmente emitir desde un `launch` o un `async` creados dentro del bloque, aunque sea sobre el mismo despachador, porque lo que se compara es el trabajo y cada hijo tiene el suyo. Si necesitas emitir desde varias corrutinas de verdad, el constructor correcto es `channelFlow`, que sustituye `emit` por `send` y paga por ello con un canal y una frontera.
+</Callout>
+
+## flowOn y lo que construye
+
+Si el bloque no puede cambiar de contexto por dentro, alguien tiene que poder cambiarlo por fuera, y ese alguien es un operador que se coloca después del tramo al que afecta.
+
+```kotlin
+val bien = flow { emit(leerFichero()) }   // se ejecutara en IO
+    .map { parsear(it) }                   // esto tambien
+    .flowOn(Dispatchers.IO)                // afecta a todo lo de arriba
+    .map { presentar(it) }                 // esto ya no: va en el contexto del recolector
+```
+
+La dirección desconcierta la primera vez y es perfectamente coherente con todo lo anterior. Como una cadena se construye de abajo hacia arriba, cuando alguien recolecta el flujo devuelto por el operador, ese operador es quien decide en qué contexto va a recolectar lo que tiene encima. Sobre lo que está debajo no tiene ninguna autoridad, porque cuando se ejecutó ya existía y no lo conoce.
+
+Lo que construye por dentro es exactamente lo que la lección anterior describía. Lanza una corrutina nueva con el contexto pedido, recolecta allí todo el tramo superior, y transporta los valores hasta la corrutina del recolector a través de un canal. De ahí se siguen tres hechos prácticos: cambiar de contexto implica siempre un búfer, dos operadores adyacentes de esta familia se fusionan en un solo canal, y el coste de un cambio de contexto en una cadena no es despreciable, así que conviene tener uno y no cinco.
+
+<Mermaid code={`flowchart TD
+  A[Bloque productor] --> B[map de arriba]
+  B --> C[flowOn con el despachador pedido]
+  C --> D[Canal de transporte]
+  D --> E[map de abajo]
+  E --> F[Cuerpo del recolector]
+  C -.-> G[Todo lo de arriba corre en el contexto dado]
+  D -.-> H[Todo lo de abajo corre donde se llamo a collect]`} />
+
+Hay dos restricciones más que conviene recordar. La primera es que el contexto que se le pasa no puede contener un trabajo: si se intenta, el operador rechaza el argumento, porque la jerarquía de trabajos la decide la concurrencia estructurada y no un operador de flujo. La segunda es que este operador no puede en ningún caso cambiar dónde se ejecuta la operación terminal; eso lo decide quien recolecta, envolviendo su llamada o lanzándola en el ámbito que corresponda.
+
+```kotlin
+// Quien recolecta decide su propio contexto, no el flujo
+withContext(Dispatchers.Main) {
+    datos.collect { pintar(it) }
+}
+```
+
+## Transparencia de excepciones
+
+La segunda invariante es simétrica de la primera y suele explicarse mal. Dice que un flujo no puede capturar excepciones que provengan de tramos situados por debajo de él, es decir, del cuerpo del recolector o de los operadores posteriores. La razón es que un fallo del consumidor no es un fallo del flujo, y tragárselo convertiría un error del usuario en una emisión aparentemente normal.
+
+```kotlin
+// Viola la transparencia: captura tambien lo que falle abajo
+val opaco = flow {
+    try {
+        emit(1)                 // si el recolector lanza, cae aqui
+    } catch (e: Exception) {
+        emit(-1)                // emitir desde el catch es lo prohibido
+    }
+}
+```
+
+La herramienta que respeta la invariante es un operador dedicado. Captura únicamente lo que ocurre por encima de él en la cadena, distingue el origen del fallo y, como su bloque tiene el colector por receptor, permite emitir valores de reemplazo.
+
+```kotlin
+peticiones
+    .map { descargar(it) }
+    .catch { causa ->
+        registrar(causa)
+        emit(Respuesta.Vacia)     // valor de repuesto, legitimo aqui
+    }
+    .collect { mostrar(it) }
+```
+
+La posición en la cadena es la mitad del significado. Colocado ahí, cubre el bloque productor y el mapeo, pero no cubre lo que ocurra dentro del recolector final. Si se colocara justo después del constructor, no cubriría el mapeo. Y hay un tipo de excepción que nunca captura, deliberadamente: la de cancelación, porque cancelar no es fallar y tragarse esa señal rompería la concurrencia estructurada exactamente igual que en cualquier otra corrutina.
+
+<Cards>
+  <Card icon="🧭" title="flowOn">
+    Cambia el contexto de todo lo que está por encima. Implica canal, se fusiona con sus vecinos y no admite un trabajo en el contexto.
+  </Card>
+  <Card icon="🛡️" title="catch">
+    Captura solo lo de arriba, deja pasar la cancelación y puede emitir valores de reemplazo desde su bloque.
+  </Card>
+  <Card icon="🔄" title="retry">
+    Vuelve a recolectar el tramo superior desde cero. Solo tiene sentido porque el flujo es frío y no ha avanzado a ningún sitio.
+  </Card>
+  <Card icon="🏁" title="onCompletion">
+    Se ejecuta al terminar por éxito, por fallo o por cancelación, y ve la causa sin capturarla ni alterarla.
+  </Card>
+</Cards>
+
+Ese último operador merece una precisión porque se usa a menudo como si fuera un `finally` y no lo es del todo. Se ejecuta en los tres desenlaces y recibe la causa como parámetro nulo cuando todo fue bien, pero no la consume: la excepción sigue su camino hacia abajo después de que su bloque termine. Es el sitio correcto para registrar, medir o apagar un indicador de carga, y el sitio incorrecto para intentar recuperarse.
+
+## Reintentar es recolectar otra vez
+
+Aquí se cierra el círculo con la primera lección. Un flujo es una receta que no ha avanzado a ningún sitio, y por eso reintentarlo no requiere rebobinar nada ni recordar por dónde iba: basta con volver a llamar al único método que tiene.
+
+```kotlin
+descarga
+    .retry(3) { causa -> causa is IOException }
+    .catch { emit(Respuesta.Vacia) }
+    .collect { procesar(it) }
+```
+
+La variante general recibe la causa y el número de intento, permite decidir con ambos y, como su bloque es suspendido, permite esperar antes de volver a intentarlo. Esa combinación es todo lo que hace falta para escribir una espera creciente sin ninguna librería adicional.
+
+```kotlin
+descarga.retryWhen { causa, intento ->
+    if (causa is IOException && intento < 5) {
+        delay(200L * (intento + 1))   // espera creciente
+        true                          // reintentar
+    } else false
+}
+```
+
+Conviene tener claro qué se reintenta exactamente: todo el tramo situado por encima del operador, desde su primera línea. Si ese tramo tiene efectos secundarios, se repetirán; si abre recursos, los abrirá de nuevo. Por eso la posición del operador de reintento en la cadena es una decisión semántica y no estética, y por eso los flujos que envuelven una sola llamada suspendida, que en la segunda lección parecían gratuitos, resultan aquí perfectamente justificados: convierten una operación en algo que se puede repetir entera con una línea.
+
+<Callout type="dios" title="Las dos invariantes no limitan lo que puedes escribir sino que protegen la unica propiedad que hace comprensible el codigo asincrono que es que la cadena entera sea una sola unidad de ejecucion">
+Conviene resistir la lectura fácil de estas dos reglas, que es verlas como asperezas de una librería por lo demás cómoda, y entender en su lugar qué se está protegiendo con ellas. Todo lo que hace agradables a los flujos depende de un hecho estructural único: que desde que alguien llama a la operación terminal hasta que el último valor llega al cuerpo del recolector, hay una sola corrutina, una sola pila lógica, un solo trabajo del que colgar la cancelación y un solo camino por el que suben las excepciones. De ese hecho, y solo de él, se derivan que un `try` alrededor de la recolección capture lo que falla arriba, que un `finally` se ejecute al cancelar, que la traza de pila muestre la cadena completa, que la contrapresión sea automática porque suspender un eslabón detiene a todos, y que el consumidor sea quien decide el contexto en lugar de heredar el que le impuso quien escribió el flujo. Ahora obsérvese qué haría cada una de las dos violaciones. Emitir desde otra corrutina rompe la unicidad por el lado de la ejecución: introduce un trabajo distinto, y con él una cancelación que no se propaga como se esperaba, un contexto que el consumidor no eligió y un orden de emisión que ya no está garantizado, todo ello sin que el código fuente lo delate, porque un `withContext` dentro de un bloque tiene un aspecto perfectamente inocente. Capturar excepciones de abajo rompe la unicidad por el lado del error: convierte un fallo del consumidor en un evento del productor, con lo que la cadena deja de tener una única dirección de propagación y aparece la posibilidad de que un flujo siga emitiendo alegremente después de que quien lo recolectaba haya dejado de funcionar. Ambas violaciones tienen en común algo que las hace especialmente perniciosas: producen programas que funcionan bien en las pruebas y fallan de manera irreproducible en producción, porque el daño no está en el resultado sino en las garantías, y las garantías solo se echan de menos cuando algo sale mal. Por eso la librería no se limita a documentarlas y las comprueba en cada emisión, aceptando el coste de una comparación por valor. Es una decisión de diseño poco frecuente y muy defendible: cuando una propiedad es la base de todo lo demás, no puede quedar al criterio de quien escribe el código, porque su ausencia no se manifiesta como un error sino como una erosión silenciosa de las razones por las que el sistema era comprensible. Las dos invariantes no son el precio de usar flujos; son la razón de que usarlos sea distinto de encadenar devoluciones de llamada con mejor sintaxis.
+</Callout>
+
+<Reto title="Rompe las invariantes a proposito">
+1. Escribe un flujo con `withContext` dentro del bloque productor, provoca el fallo y lee el mensaje completo. Explica qué comparó exactamente la librería para detectarlo.
+2. Arregla ese mismo flujo con `flowOn` e imprime el nombre del hilo en cada tramo para confirmar qué mitad corre en cada contexto.
+3. Coloca dos operadores de cambio de contexto adyacentes y razona cuántos canales existen. Después separa uno con un `map` y vuelve a razonarlo.
+4. Sitúa un `catch` antes y después de un operador que falla, y documenta la diferencia. Después haz que falle el cuerpo del recolector y comprueba que no lo captura.
+5. Aplica `retryWhen` con espera creciente sobre un flujo cuyo productor imprima al arrancar. Cuenta las impresiones y explica qué relación tiene ese número con la frialdad.
+</Reto>
