@@ -24,7 +24,7 @@ const fileTitleTransformer = {
 
 // https://astro.build/config
 export default defineConfig({
-  site: 'https://neovim-nivel-dios.example',
+  site: 'https://wandres.dev',
   markdown: {
     // Resaltado con Shiki NATIVO (first-party, compatible con Astro 7 / Vite 8)
     shikiConfig: {
