@@ -1,0 +1,150 @@
+---
+title: "Patrones que lo hacen soportable: lotes, blobs, desnormalizar y Worker"
+description: "Escritura por lotes, almacenar bytes en lugar de grafos, desnormalizar para no recorrer y mover la capa de datos a un Worker: los cuatro movimientos que convierten IndexedDB en algo utilizable."
+subject: local-first
+level: 8
+order: 4
+icon: "8.4"
+duracion: "18 min"
+---
+
+<Lead>
+Los tres niveles anteriores diagnostican: el clonado cobra por nodo, la transacción cobra por confirmación, los índices cobran por escritura y el disco cobra por sincronización. Los cuatro patrones de esta lección son las respuestas, y todas son variaciones de un mismo movimiento —cruzar la frontera menos veces y con menos cosas encima—. Ninguno es un truco: los cuatro son decisiones de arquitectura que hay que tomar antes de escribir el esquema, porque después cuestan una migración.
+</Lead>
+
+<Objetivos>
+
+- Aplicar el patrón de lotes con progreso, cesión de hilo y fallo parcial recuperable.
+- Separar los campos indexables del cuerpo opaco y elegir el códec conscientemente.
+- Desnormalizar con criterio en una base sin operación de reunión, aceptando la amplificación de escritura.
+- Mover la capa de datos a un Worker sin pagar dos veces el clonado en el viaje de vuelta.
+
+</Objetivos>
+
+## Escribir por lotes, leer por bloques
+
+El patrón base ya está justificado en el nivel 8.2, pero la versión de producción tiene tres detalles que la versión de ejemplo no: cede el hilo entre lotes para que la interfaz siga viva, informa del progreso porque una importación larga sin retroalimentación se percibe como una aplicación colgada, y trata el fallo de un lote como recuperable en lugar de abortar la operación entera.
+
+```js
+async function importar(db, registros, { tam = 2000, onProgreso } = {}) {
+  const fallidos = [];
+  for (let i = 0; i < registros.length; i += tam) {
+    const lote = registros.slice(i, i + tam);
+    try {
+      const tx = db.transaction("docs", "readwrite", { durability: "relaxed" });
+      const store = tx.objectStore("docs");
+      for (const r of lote) store.put(r);   // sin await dentro del bucle
+      await esperar(tx);
+    } catch (e) {
+      fallidos.push({ desde: i, error: e }); // el lote revierte entero
+    }
+    onProgreso?.(i + lote.length, registros.length);
+    await new Promise(r => setTimeout(r));   // deja respirar al hilo
+  }
+  return fallidos;
+}
+```
+
+En el lado de la lectura, la simetría es exacta: `getAll` con un rango de claves y un límite trae un bloque en una sola petición, mientras que un cursor paga una vuelta al bucle de eventos por registro. El cursor sigue siendo la herramienta correcta cuando necesitas abortar a mitad del recorrido, cuando el conjunto no cabe en memoria o cuando quieres procesar en flujo; para traer una página que vas a pintar entera, `getAll` gana siempre.
+
+```js
+// Paginacion por clave: sin desplazamiento, sin recorrer lo ya visto.
+function pagina(store, ultimaClave, n = 200) {
+  const rango = ultimaClave === undefined
+    ? null
+    : IDBKeyRange.lowerBound(ultimaClave, true);
+  return esperar(store.getAll(rango, n));
+}
+```
+
+## Guardar bytes, no grafos
+
+Este es el patrón con mayor retorno y el que más cuesta aceptar, porque va contra el instinto de modelar. La idea: separar el registro en dos zonas. Arriba, unos pocos campos escalares —los que se indexan y por los que se consulta—. Abajo, un único campo binario con todo lo demás, codificado por ti. El clonado estructurado pasa de recorrer miles de nodos a recorrer media docena de escalares y un `ArrayBuffer` opaco.
+
+<Cards>
+  <Card icon="🧊" title="Lo que ganas">
+    El coste de marshalling deja de escalar con la complejidad interna del documento. Eliges el códec, y con él la relación entre tamaño y velocidad. El registro deja de ser sensible a que alguien añada una capa de anidamiento en el modelo de dominio.
+  </Card>
+  <Card icon="🔒" title="Lo que pierdes">
+    Todo lo que hay dentro del blob es invisible para los índices y para cualquier consulta. Ya no puedes filtrar por un campo interno sin decodificar. Y si el códec cambia, necesitas versionado explícito dentro del propio formato.
+  </Card>
+  <Card icon="📐" title="Dónde poner la frontera">
+    Sube a escalar todo campo por el que consultes o ordenes hoy, más aquello por lo que sepas con certeza que consultarás. Baja al blob lo que solo se lee cuando ya has seleccionado el registro concreto. La duda se resuelve subiendo: un escalar de más cuesta poco.
+  </Card>
+  <Card icon="🗂️" title="Blob frente a ArrayBuffer">
+    Un `ArrayBuffer` vive dentro del registro y se lee con él. Un `Blob` lo tratan los motores como una referencia a almacenamiento externo, lo que compensa en cargas útiles grandes y penaliza en muchas pequeñas. Para cuerpos de documento, el buffer suele ser la elección segura.
+  </Card>
+</Cards>
+
+```js
+// Esquema en dos zonas: escalares indexables arriba, carga util opaca abajo.
+const registro = {
+  id: doc.id,                     // clave primaria
+  autorId: doc.autor.id,          // indexado
+  actualizado: doc.actualizado,   // indexado, para ordenar
+  version: 3,                     // version del codec, imprescindible
+  cuerpo: codificar(doc.bloques), // ArrayBuffer: un solo nodo
+};
+```
+
+<Callout type="tip" title="Versiona el códec dentro del propio registro">
+El campo `version` no es opcional. El día que cambies el formato del cuerpo tendrás registros de las dos épocas conviviendo en el mismo almacén, y el decodificador tiene que saber cuál está leyendo. Migrar perezosamente —decodificar con el formato antiguo y reescribir con el nuevo la primera vez que se toca el registro— evita la migración masiva bloqueante y reparte el coste entre las sesiones del usuario.
+</Callout>
+
+## Desnormalizar: aquí no existe la reunión
+
+IndexedDB no tiene ninguna operación de reunión de tablas. Lo que en SQL sería una consulta con `JOIN` aquí es, literalmente, un bucle: para cada resultado del primer almacén, una petición al segundo. Ese patrón paga una vuelta al bucle de eventos y un clonado por elemento, y es la causa de la mayoría de listas que tardan un segundo en aparecer.
+
+La respuesta es la de cualquier sistema orientado a lectura: precalcular la forma en que vas a leer. Si la vista muestra el título del documento junto al nombre del autor, guarda el nombre del autor dentro del documento. Si la vista necesita el número de comentarios, guarda el contador. Duplicas datos y aceptas amplificación de escritura —cambiar un nombre de autor obliga a tocar todos sus documentos— a cambio de que la lectura sea una sola petición.
+
+La variante disciplinada de esta idea es mantener almacenes de **proyección** separados de los almacenes de verdad: uno guarda las entidades canónicas y otro guarda, ya montada, la forma exacta que consume cada vista. La proyección se reconstruye siempre desde la fuente y nunca se edita a mano, de modo que una incoherencia se arregla regenerándola en lugar de parcheándola. Es el mismo reparto entre escritura y lectura que la separación de responsabilidades de consulta y comando propone en el servidor, aplicado dentro de una pestaña.
+
+<Mermaid code={`flowchart LR
+  subgraph N [Normalizado]
+    N1[getAll docs] --> N2[por cada doc get autor]
+    N2 --> N3[N peticiones y N clonados]
+  end
+  subgraph D [Desnormalizado]
+    D1[getAll docs con nombre incrustado] --> D2[una peticion y un clonado]
+  end
+  N3 --> R[lista lenta]
+  D2 --> S[lista instantanea]`} />
+
+<Callout type="warn" title="La desnormalización es deuda de consistencia, no de espacio">
+El coste real no son los bytes duplicados: es que ahora existen dos copias de un mismo hecho y alguien tiene que mantenerlas de acuerdo. En una aplicación local-first eso se agrava, porque las dos copias pueden actualizarse en dispositivos distintos y converger a estados incoherentes aunque cada una converja bien por separado. La regla que salva: desnormaliza solo campos **derivados**, escribe siempre la copia derivada en la **misma transacción** que la fuente, y trata la fuente como la única autoridad para reconstruirla.
+</Callout>
+
+## Mover la capa de datos al Worker
+
+El cuarto movimiento saca del hilo principal todo lo que la lección 8.3 identificaba como bloqueo. La base se abre dentro de un Worker dedicado, que expone una interfaz de llamadas por mensajes; el hilo principal pide resultados y nunca toca IndexedDB. La deserialización de diez mil registros sigue costando lo mismo, pero ya no impide que el usuario haga clic.
+
+Hay una trampa que anula la ganancia si no se ve venir: `postMessage` **también** usa clonado estructurado. Devolver al hilo principal el mismo grafo enorme que acabas de deserializar en el Worker significa pagar el peaje dos veces, una en cada lado. El patrón solo funciona si el Worker reduce lo que cruza.
+
+Y hay una segunda trampa, más sutil: aunque el clonado del envío ocurra en el Worker, la **deserialización** del mensaje recibido ocurre en el hilo principal, dentro de su manejador. Mover la base al Worker elimina el bloqueo de la lectura del almacén, pero no el de reconstruir en el hilo principal lo que le mandas. Por eso la métrica que hay que vigilar no es cuánto trabajo se fue al Worker, sino cuántos nodos siguen atravesando la frontera de vuelta.
+
+<Cards>
+  <Card icon="✂️" title="Devuelve lo mínimo">
+    Filtra, ordena, agrega y proyecta dentro del Worker. Que cruce la frontera solo la lista de campos que la vista va a pintar, ya recortada a la página visible. La regla es que el Worker devuelva vistas, no entidades.
+  </Card>
+  <Card icon="🚀" title="Transfiere en lugar de copiar">
+    Un `ArrayBuffer` puede pasarse como objeto transferible: cambia de dueño sin copiarse, en tiempo constante. Empaquetar el resultado en un buffer binario y transferirlo convierte el viaje de vuelta en gratis, a costa de decodificar en el otro lado.
+  </Card>
+  <Card icon="🔁" title="No hagas un proxy ingenuo">
+    Exponer cada método de IndexedDB tal cual a través de mensajes multiplica los cruces en lugar de reducirlos. La interfaz del Worker debe hablar el lenguaje del dominio, con operaciones gruesas que resuelvan un caso de uso entero en una sola llamada.
+  </Card>
+  <Card icon="📣" title="Aprovecha que hay un dueño único">
+    Con toda la escritura concentrada en un Worker desaparecen las carreras entre pestañas y aparece un punto natural desde el que emitir notificaciones de cambio, que la API cruda no ofrece. Es la base de las consultas reactivas de los niveles siguientes.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Los cuatro patrones son el mismo patrón: dejar de tratar la frontera como si no existiera">
+Si vuelves a mirar los cuatro movimientos con distancia, no son cuatro técnicas: son cuatro caras de una sola decisión, que es reconocer que entre tu código y los datos hay una frontera con peaje y organizar el sistema alrededor de ese hecho en lugar de fingir que no está. Agrupar en lotes es cruzarla menos veces. Guardar bytes es cruzarla con menos nodos encima. Desnormalizar es no tener que cruzarla otra vez para completar lo que ya trajiste. Mover al Worker es cruzarla donde el bloqueo no le duele a nadie. Es exactamente la misma disciplina que llevó a los sistemas distribuidos de la llamada remota ingenua —donde cada acceso a una propiedad viajaba por la red— al objeto de transferencia de datos y a las interfaces de grano grueso, y la razón de que se repita es que la causa es la misma: cuando el coste dominante es cruzar y no calcular, el diseño correcto es el que minimiza los cruces, sin importar si la frontera es una red, un proceso o el algoritmo de clonado del navegador. Y llevado al extremo, este razonamiento tiene un final coherente que ya está en producción: si lo único que IndexedDB hace bien es guardar secuencias opacas de bytes, entonces úsalo solo para eso y pon encima un motor de base de datos de verdad —SQLite compilado a WebAssembly, por ejemplo— que gestione sus propias páginas, sus propios índices y sus propias transacciones sobre bloques que IndexedDB se limita a custodiar. Que existan implementaciones serias que hacen justamente eso no es una curiosidad: es la conclusión lógica de los cuatro patrones, llevada hasta el final.
+</Callout>
+
+<Reto title="Aplica los cuatro sobre el mismo caso">
+1. Coge una lista de tu aplicación que hoy haga una petición por elemento para completar datos y mide cuánto tarda con quinientos elementos.
+2. Desnormaliza los campos que esa lista necesita y vuelve a medir. Escribe la regla que mantendrá coherentes las copias.
+3. Parte un registro grande en escalares indexables más un cuerpo binario con versión, y compara el tiempo de escritura y de lectura.
+4. Mueve la capa de datos a un Worker devolviendo el grafo completo, mide, y después devuelve solo la proyección de la página visible. Compara las tres cifras.
+5. Empaqueta esa proyección en un `ArrayBuffer` y transfiérela. Comprueba qué parte del viaje de vuelta desaparece del perfil.
+</Reto>

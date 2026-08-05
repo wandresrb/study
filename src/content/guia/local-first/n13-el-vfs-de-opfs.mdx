@@ -1,0 +1,158 @@
+---
+title: "El VFS de OPFS: seis llamadas y un puente"
+description: "Cómo cada operación de fichero que SQLite pide se traduce en llamadas al sistema de archivos privado del origen, por qué esa traducción necesita la ruta síncrona del nivel 10 y qué precio tiene el puente que la hace posible."
+subject: local-first
+level: 13
+order: 1
+icon: "13.1"
+duracion: "17 min"
+---
+
+<Lead>
+El nivel anterior te dejó con un motor relacional completo compilado a WebAssembly y con una capa de abstracción, el VFS, cuyo único propósito es que ese motor no sepa nada del disco que hay debajo. Ahora toca enchufarle un disco de verdad. La operación parece trivial —hay un sistema de archivos en el navegador, hay una capa que pide operaciones de fichero, se conectan— y no lo es en absoluto, porque las dos mitades hablan idiomas incompatibles: el VFS pregunta y espera respuesta en la misma línea, y la mitad de la API de OPFS solo sabe responder con promesas. Todo lo que estudiarás en este nivel, incluidos los tres precios que pagarás en las lecciones siguientes, nace de cómo se resuelve esa incompatibilidad.
+</Lead>
+
+<Objetivos>
+
+- Reconocer el conjunto exacto de operaciones que SQLite exige de cualquier almacenamiento.
+- Trazar la correspondencia literal entre esas operaciones y el manejador síncrono del nivel 10.
+- Entender el puente entre la mitad síncrona y la mitad asíncrona, y por qué obliga a aislar el origen.
+- Distinguir los tres VFS de OPFS que la distribución oficial ofrece y con qué criterio se elige uno.
+
+</Objetivos>
+
+## El contrato: qué le pide SQLite a un disco
+
+Un VFS de SQLite no es una API pequeña, pero la parte que toca bytes sí lo es. Las funciones de entrada y salida por fichero —`xRead`, `xWrite`, `xTruncate`, `xSync`, `xFileSize`, `xClose`— son las mismas seis que el manejador síncrono de OPFS ofrece, y la coincidencia no es casualidad histórica: el manejador se diseñó, entre otras cosas, para poder sostener exactamente esto. Alrededor de ellas hay un anillo de funciones de nivel de sistema —abrir, borrar, comprobar existencia, resolver una ruta completa— y otro de bloqueo —`xLock`, `xUnlock`, `xCheckReservedLock`— que es donde empiezan los problemas de la lección siguiente.
+
+Hay además un cuarto grupo que conviene señalar ahora porque explicará media lección de durabilidad: las funciones de memoria compartida, las que un fichero necesita cuando la base entra en modo de escritura anticipada para coordinar a varios procesos sobre un mismo índice de páginas. La compilación a WebAssembly no las tiene. Ese hueco no es un descuido de la implementación de OPFS, es una propiedad del entorno, y lo pagarás en la lección tres.
+
+```js
+// La correspondencia que sostiene todo el nivel, en esencia
+const io = {
+  xRead:     (h, buf, off) => h.read(buf, { at: off }),
+  xWrite:    (h, buf, off) => h.write(buf, { at: off }),
+  xTruncate: (h, n)        => h.truncate(n),
+  xFileSize: (h)           => h.getSize(),
+  xSync:     (h)           => h.flush(),
+  xClose:    (h)           => h.close(),
+};
+```
+
+Si esa tabla te resulta familiar es porque la viste en el nivel 10 desde el otro lado, mirando el manejador y preguntándote para qué servía. Ahora ya lo sabes: servía para esto. Lo que aquella lección presentaba como una curiosidad de la plataforma —un objeto que rompe la regla de que todo en la web es asíncrono— era en realidad el requisito de entrada de un motor de base de datos entero, escrito en C hace veinticinco años, cuya pila de llamadas no se puede suspender a mitad de una consulta para atender una promesa.
+
+El anillo exterior, en cambio, no encaja tan bien y es donde se concentra el trabajo de la implementación. Resolver una ruta completa, comprobar si un fichero existe, borrarlo o crearlo son operaciones que en POSIX son llamadas al sistema y aquí devuelven promesas sin excepción. Una decisión de diseño de la implementación oficial ilustra bien la fricción: cuando abres una base con la bandera de creación, el VFS crea por su cuenta los directorios intermedios del nombre que le diste. Ningún VFS de escritorio hace eso; aquí se hizo para no obligar al código cliente a hablar con OPFS directamente y romper la abstracción, que era el propósito entero de la capa.
+
+## El puente entre dos mundos
+
+Y aquí aparece el problema que nadie anticipa la primera vez. El manejador es síncrono, sí, pero **obtenerlo no lo es**. Pedir el directorio raíz del origen, resolver un nombre de fichero, crear el manejador, borrar una entrada: todas esas operaciones devuelven promesas. Y SQLite las necesita desde dentro de la pila de WebAssembly, en el mismo punto en el que abre el fichero de journal a mitad de una transacción, sin posibilidad de ceder el control al bucle de eventos.
+
+El VFS llamado `opfs`, el primero que la distribución oficial publicó, resuelve esa incompatibilidad de la única forma que la plataforma permite: partiéndose en dos hebras. Una segunda hebra —un proxy asíncrono que viaja como fichero aparte en la distribución— posee los manejadores y ejecuta todo lo que devuelve promesas. La hebra donde vive SQLite deja su petición en un búfer de memoria compartida, se **duerme sobre ese búfer** con la primitiva de espera de `Atomics`, y despierta cuando el proxy ha escrito la respuesta. Desde dentro de WebAssembly la llamada parece síncrona; por debajo hubo un viaje entre hebras y un bloqueo real.
+
+<Mermaid code={`sequenceDiagram
+  participant S as Hebra de SQLite
+  participant B as Buffer compartido
+  participant P as Proxy asincrono
+  S->>B: escribe la peticion xRead
+  S->>S: Atomics espera y bloquea
+  P->>B: lee la peticion
+  P->>P: usa el manejador sincrono
+  P->>B: escribe bytes y codigo de retorno
+  P->>S: despierta la hebra
+  S->>B: lee el resultado y continua`} />
+
+Conviene detenerse en lo que ese diseño implica, porque es más raro de lo que parece. Estás usando una primitiva de bloqueo de hilos —dormir una hebra hasta que otra escriba en una posición de memoria compartida— dentro de una plataforma cuya regla número uno es que nada bloquea. Funciona precisamente porque la hebra que se duerme no es la que atiende al usuario: es un worker, y ahí bloquear es legítimo. Ese es el motivo profundo por el que el nivel 10 insistía tanto en que la base vive en su propio hilo. No era higiene de rendimiento; era el requisito sin el cual el puente no puede existir.
+
+Ese diseño tiene una consecuencia que condiciona el despliegue entero de tu aplicación: la memoria compartida entre hebras solo existe si el navegador considera que tu origen está **aislado**, y para eso el servidor tiene que emitir dos cabeceras de respuesta —una política de apertura de origen cruzado con valor `same-origin` y una política de incrustación con valor `require-corp`, o su variante sin credenciales—. Sin esas cabeceras no hay memoria compartida, sin memoria compartida no hay puente, y sin puente el VFS `opfs` sencillamente no se instala. No falla con un error de escritura: no aparece.
+
+<Callout type="warn" title="Comprueba la disponibilidad, no la supongas">
+Un despliegue en el que las cabeceras se pierden por un proxy intermedio, una CDN mal configurada o un entorno de previsualización distinto del de producción produce el fallo más desconcertante posible: el mismo código que funciona en tu máquina abre en el navegador del usuario una base de datos en memoria, sin persistencia, sin quejarse. Antes de abrir nada, pregunta por el VFS: el buscador de VFS del API de bajo nivel devuelve un puntero nulo si el nombre no está registrado, y la clase de conveniencia orientada a objetos ni siquiera existe en el espacio de nombres. Comprobar eso al arrancar es una línea, y es la diferencia entre un fallo ruidoso el primer día y una pérdida de datos silenciosa el tercer mes.
+</Callout>
+
+```js
+// Dentro del worker, antes de abrir nada
+function vfsDisponible(sqlite3) {
+  const disponibles = ["opfs", "opfs-wl", "opfs-sahpool"]
+    .filter((n) => !!sqlite3.capi.sqlite3_vfs_find(n));
+
+  if (disponibles.length === 0) {
+    throw new Error("SIN_PERSISTENCIA: revisa cabeceras, worker y navegador");
+  }
+  return disponibles;
+}
+```
+
+Fíjate en que el fallo se lanza en lugar de degradarse en silencio. Abrir una base sin VFS persistente funciona perfectamente —queda en memoria— y esa es exactamente la trampa: todo va bien hasta que el usuario recarga. Un arranque que no distingue entre persistir y no persistir no tiene una comprobación pendiente, tiene un error latente.
+
+## Los tres VFS que la distribución oficial ofrece
+
+El puente descrito no es la única salida, y la historia del proyecto se puede leer como una búsqueda de alternativas a ese compromiso. Hoy conviven tres implementaciones sobre OPFS, y elegir mal es la causa más frecuente de que un proyecto se atasque.
+
+<Cards>
+  <Card icon="🌉" title="opfs">
+    El original. Usa el puente de memoria compartida y por tanto exige las cabeceras de aislamiento del origen. A cambio, es el único junto con su variante que permite varias conexiones simultáneas sobre la misma base.
+  </Card>
+  <Card icon="🔒" title="opfs-wl">
+    Añadido en la versión 3.53. Idéntico al anterior salvo que usa la API de bloqueos del navegador en lugar de un protocolo propio, lo que reparte los turnos de forma estrictamente ordenada. Depende de la variante asíncrona de la espera de `Atomics`, disponible de forma amplia solo desde 2025.
+  </Card>
+  <Card icon="🏊" title="opfs-sahpool">
+    Reserva por adelantado un conjunto de manejadores síncronos y trabaja siempre dentro de la misma hebra. Sin puente, sin memoria compartida y sin cabeceras. Es con diferencia el más rápido, y no admite conexiones simultáneas.
+  </Card>
+  <Card icon="🗄️" title="kvvfs">
+    El caso límite: guarda cada página de la base en una entrada de `localStorage` o `sessionStorage`. Una sola base por almacén, unos pocos megabytes de techo y solo desde la hebra principal. Útil para estado diminuto, nunca para una aplicación.
+  </Card>
+</Cards>
+
+Los dos primeros comparten más del noventa por ciento de su código y solo se diferencian en la parte de bloqueo, hasta el punto de que la documentación no ha conseguido declarar un ganador claro de rendimiento entre ellos: las variaciones entre dispositivos y entre ejecuciones son mayores que la diferencia entre las dos implementaciones. Lo que sí aporta la variante con bloqueos del navegador es **equidad**: al delegar los turnos en un mecanismo que el navegador gestiona globalmente, las peticiones se resuelven en orden estricto de llegada, mientras que el protocolo propio del original puede, en teoría, dejar a una conexión esperando indefinidamente bajo mucha contención. Que ese escenario nunca se haya reportado en la práctica no lo hace imposible.
+
+La tercera opción merece un párrafo aparte porque su ventaja y su defecto son la misma decisión de diseño. Reserva sus manejadores **al instalarse**, de una vez, en la parte asíncrona del arranque; a partir de ahí ya no necesita preguntar nada al sistema de archivos y toda la entrada y salida ocurre sin salir de la hebra. Eso elimina el puente entero y explica que sea el más rápido de largo en operaciones por lotes. Pero reservar un manejador es tomar su bloqueo exclusivo, de modo que en el instante de instalarse se queda con todos sus ficheros: una segunda pestaña del mismo origen que intente instalarlo fracasará. Además mantiene un sistema de ficheros virtual propio, con nombres que no coinciden con los que verías en OPFS, y exige que las rutas que le des sean absolutas.
+
+<Mermaid code={`flowchart TD
+  A[Necesitas SQLite sobre OPFS] --> B[Puedes emitir las cabeceras de aislamiento]
+  B -->|no| C[opfs-sahpool y un solo escritor]
+  B -->|si| D[Necesitas varias conexiones a la vez]
+  D -->|no| C
+  D -->|si| E[opfs o su variante con bloqueos del navegador]
+  style C fill:#a6e3a1,color:#11111b
+  style E fill:#89b4fa,color:#11111b`} />
+
+## Lo que la traducción no te puede dar
+
+Un VFS traduce operaciones de fichero, no incorpora el sistema de archivos al lenguaje SQL. De ahí salen tres limitaciones que conviene conocer antes de chocar con ellas.
+
+Antes conviene señalar dos aperturas que la implementación oficial sí ofrece y que se pasan por alto porque viajan escondidas en el nombre del fichero. El VFS acepta nombres con forma de URI, y eso convierte una cadena en un panel de configuración por conexión: ahí viven la elección de VFS, la liberación temprana de bloqueos que verás en la lección siguiente y una bandera que borra el fichero antes de abrirlo, pensada para partir de un estado limpio o recuperarse de una base corrupta sin bajar a las API de OPFS. Y el VFS de manejadores reservados puede registrarse varias veces bajo nombres distintos, cada uno con su propio directorio y aislado de los demás, que es la forma prevista de que dos aplicaciones del mismo origen convivan sin pelearse por los bloqueos.
+
+```js
+// El nombre del fichero es tambien la configuracion de la conexion
+const limpio = new sqlite3.oo1.OpfsDb("file:app.db?delete-before-open=1");
+```
+
+La primera limitación: desde SQL no puedes listar los ficheros que hay en OPFS ni borrar una base. La razón es la misma incompatibilidad de siempre —las API que harían falta son asíncronas y no se pueden invocar desde el API en C—, y la solución pasa por tocar OPFS directamente desde JavaScript, fuera del motor. La segunda afecta solo al conjunto de manejadores reservados: como maneja su propio sistema de ficheros virtual, importar y exportar bases requiere sus utilidades específicas, y su capacidad —el número de ficheros que puede albergar— hay que dimensionarla a mano contando no solo tus bases sino también sus journals y sus temporales, que son ficheros como cualquier otro. La capacidad por defecto es deliberadamente pequeña y la biblioteca no puede adivinar la tuya.
+
+```js
+// Instalarlo es un paso explicito, y su capacidad es decision tuya
+const pool = await sqlite3.installOpfsSAHPoolVfs({
+  initialCapacity: 12,      // bases mas journals mas temporales
+  directory: ".mi-app",     // aisla esta instancia de otras del mismo origen
+});
+
+const db = new pool.OpfsSAHPoolDb("/datos.sqlite3");  // ruta absoluta
+```
+
+La tercera es la más traicionera: cuando el presupuesto de almacenamiento del origen se agota, SQLite no recibe un error de cuota. Recibe un error genérico de entrada y salida, porque un error de cuota no existe en el contrato del VFS. Todo lo que aprendiste en el nivel 11 sobre cuotas y desalojo sigue vigente aquí, solo que llega disfrazado, y la consecuencia práctica es que la vigilancia del presupuesto tiene que vivir **fuera** del motor: en la capa que estima el uso, pide persistencia y decide qué purgar. El motor nunca te va a avisar de que te estás quedando sin sitio, porque no tiene forma de saberlo.
+
+<Callout type="info" title="Todo lo anterior ocurre dentro de un worker, sin excepción">
+Conviene repetirlo porque es el requisito que más veces se olvida al integrar: OPFS solo expone su cara síncrona dentro de un contexto de trabajador, de modo que ninguno de los tres VFS de esta lección existe en la hebra principal. Cargar ahí la distribución no falla —el módulo se instancia, el motor funciona— pero solo te deja bases en memoria. Esa es la razón arquitectónica, y no una preferencia de estilo, por la que la base de una aplicación local-first vive en su propio worker y la interfaz habla con ella por mensajes. La restricción del nivel 10 no era un detalle de la API: era el plano de tu aplicación.
+</Callout>
+
+<Callout type="dios" title="El VFS es la frontera donde una idea de 1999 se encuentra con una plataforma que no la esperaba">
+Conviene detenerse en lo que esta lección describe, porque es un caso raro de ingeniería en el que dos diseños independientes, separados por dos décadas y por dominios que no se hablaban, encajan casi sin fricción. SQLite definió su capa de abstracción de ficheros por una razón puramente pragmática: quería correr sobre Windows, sobre POSIX y sobre sistemas empotrados sin duplicar el motor, así que redujo el disco al mínimo conjunto de verbos que una base de datos transaccional necesita y declaró todo lo demás asunto de la plataforma. Esa reducción —leer un rango, escribir un rango, recortar, sincronizar, medir, cerrar— resultó ser, veinte años después, exactamente lo que un grupo de trabajo de estándares web acabó exponiendo cuando aceptó que el navegador debía dejar de ofrecer bases de datos y empezar a ofrecer un disco. Ninguna de las dos partes diseñó pensando en la otra. Y sin embargo el resultado es que la traducción de esta lección cabe en seis líneas de JavaScript, mientras que la parte verdaderamente difícil, la que ha consumido años de trabajo del proyecto y tres implementaciones distintas, no es la entrada y salida sino la **coordinación**: el bloqueo, la concurrencia, el puente entre lo síncrono y lo asíncrono. Ese desequilibrio es la lección que conviene llevarse del nivel entero, y vale mucho más allá del navegador. Mover bytes es un problema resuelto desde hace medio siglo. Decidir quién puede moverlos, cuándo, y qué ocurre si dos partes lo intentan a la vez, sigue siendo el problema abierto de la informática distribuida, y no deja de serlo porque el sistema distribuido quepa dentro de una sola máquina y sus nodos sean pestañas.
+</Callout>
+
+<Reto title="Enchufa el motor al disco y mira las costuras">
+1. Carga la distribución oficial en un worker dedicado y comprueba, antes de abrir nada, cuáles de los VFS de esta lección están registrados en tu entorno. Explica cada ausencia.
+2. Sirve la misma aplicación con y sin las cabeceras de aislamiento del origen y documenta exactamente qué cambia en la lista anterior.
+3. Instala el VFS de conjunto de manejadores reservados, crea una base con dos tablas y localiza sus ficheros en OPFS desde las herramientas del navegador. Explica por qué los nombres no son los que tú diste.
+4. Provoca un error de cuota llenando una base más allá del presupuesto del origen y anota literalmente el error que SQLite te devuelve.
+5. Escribe de memoria la tabla de correspondencia entre las seis operaciones de entrada y salida del VFS y los métodos del manejador síncrono.
+</Reto>

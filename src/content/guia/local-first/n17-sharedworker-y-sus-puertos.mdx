@@ -1,0 +1,158 @@
+---
+title: "SharedWorker: una sola instancia y un puerto por pestaña"
+description: "El worker compartido es la respuesta elegante al problema de las pestañas, con una única instancia por origen y nombre a la que todas se conectan mediante puertos, y su punto débil es un soporte que todavía no puedes dar por sentado."
+subject: local-first
+level: 17
+order: 2
+icon: "17.2"
+duracion: "17 min"
+---
+
+<Lead>
+Si el problema es que hay cuatro clientes donde debería haber uno, la solución obvia es fabricar ese uno. Eso es exactamente un worker compartido: un contexto de ejecución que el navegador crea la primera vez que alguien lo pide y que reutiliza para todos los que lo pidan después, mientras coincidan el origen, la dirección del script y el nombre. Las pestañas dejan de ser dueñas de nada y pasan a ser clientes de una instancia común, cada una con su propio puerto de comunicación. Es una pieza elegante, muy anterior a este debate —está en la especificación desde los primeros borradores de los workers—, y arrastra una historia de soporte accidentada que condiciona por completo cómo debes usarla.
+</Lead>
+
+<Objetivos>
+
+- Construir un worker compartido y entender que su identidad la determinan la dirección del script y el nombre.
+- Manejar el evento de conexión y el modelo de puertos, incluida la trampa de arrancar el puerto a mano.
+- Conocer su ciclo de vida real y por qué no existe un evento fiable de desconexión.
+- Evaluar el estado del soporte y deducir la única regla de uso defendible en producción.
+
+</Objetivos>
+
+## Una instancia, muchos puertos
+
+Del lado de la pestaña, la construcción se parece a la de un worker dedicado, pero no devuelve un objeto con el que hablar directamente: devuelve un objeto cuyo campo `port` es tu extremo de un canal punto a punto con la instancia compartida. Del lado del worker no hay un `onmessage` global, sino un `onconnect` que se dispara una vez por cada cliente nuevo y entrega el puerto correspondiente.
+
+```js
+// pagina.js
+const compartido = new SharedWorker('/datos.js', { name: 'db', type: 'module' });
+
+compartido.port.addEventListener('message', (e) => aplicar(e.data));
+compartido.port.start();   // OBLIGATORIO al usar addEventListener
+
+compartido.port.postMessage({ tipo: 'consulta', id: 7 });
+compartido.onerror = (e) => reportar('fallo del worker compartido', e);
+```
+
+```js
+// datos.js  (una sola instancia para todo el origen)
+const clientes = new Set();
+const conexion = abrirWebSocketUnico();     // una sola, no una por pestana
+
+self.onconnect = (evento) => {
+  const port = evento.ports[0];
+  clientes.add(port);
+
+  port.onmessage = (e) => atender(port, e.data);   // asignar onmessage lo arranca
+  port.postMessage({ tipo: 'bienvenida', clientes: clientes.size });
+};
+
+function difundir(mensaje) {
+  for (const p of clientes) p.postMessage(mensaje);
+}
+```
+
+La asimetría de las dos formas de escuchar es la primera trampa y merece detenerse en ella, porque produce un fallo mudo. Un `MessagePort` nace en estado detenido y encola lo que le llegue sin entregarlo. Asignar la propiedad `onmessage` lo arranca de forma implícita; registrar el escuchador con `addEventListener` no lo arranca, y si olvidas la llamada explícita a `start` el canal parece muerto sin que se emita ningún error. No es un bug de tu código: es la semántica de los puertos, y quien no la conoce pierde una tarde.
+
+La segunda idea que conviene fijar es la de **identidad**. Dos pestañas obtienen la misma instancia si coinciden en origen, en dirección resuelta del script y en nombre. Cambia cualquiera de los tres y obtienes una instancia distinta, lo cual tiene un uso legítimo: el nombre te permite tener varios workers compartidos con el mismo código, por ejemplo uno por espacio de trabajo o por documento abierto. Y tiene una trampa correspondiente: si construyes la dirección con parámetros de consulta variables, cada pestaña creará su propia instancia y habrás reproducido el problema que venías a resolver, con la elegancia intacta y el efecto nulo.
+
+<Mermaid code={`flowchart LR
+  P1[Pestana 1] -->|puerto| SW[SharedWorker unico del origen]
+  P2[Pestana 2] -->|puerto| SW
+  P3[Pestana 3] -->|puerto| SW
+  SW --> DB[IndexedDB u OPFS]
+  SW --> NET[Una sola conexion persistente]
+  style SW fill:#cba6f7,color:#11111b
+  style DB fill:#a6e3a1,color:#11111b
+  style NET fill:#89b4fa,color:#11111b`} />
+
+## El ciclo de vida y la desconexión que no existe
+
+El worker compartido nace con la primera conexión y vive mientras quede al menos un documento conectado. Cuando la última pestaña se cierra, el navegador lo termina. No hay un método `terminate` en el objeto que recibe la pestaña, y eso es deliberado: matar una instancia que otros están usando sería un disparo indiscriminado. Desde dentro sí puede suicidarse con `self.close`, cosa que rara vez se quiere.
+
+El agujero está en el otro extremo. **No existe ningún evento que te avise de que un cliente se ha ido.** El puerto de una pestaña cerrada no emite nada, no cambia de estado observable y no falla al recibir un mensaje: lo acepta y lo tira. De modo que tu conjunto de clientes crece indefinidamente con puertos fantasma, y cualquier lógica que dependa de cuántas pestañas hay —cerrar la base cuando no quede ninguna, elegir a una como responsable de algo, contar suscriptores— trabaja con un censo falso.
+
+```js
+// Despedida explicita desde la pagina, que llegara casi siempre
+addEventListener('pagehide', () => {
+  compartido.port.postMessage({ tipo: 'adios' });
+});
+
+// Y latido en el worker, porque casi siempre no es siempre
+const vistos = new Map();                        // puerto -> instante
+
+setInterval(() => {
+  const limite = Date.now() - 15000;
+  for (const [p, t] of vistos) {
+    if (t < limite) { clientes.delete(p); vistos.delete(p); }
+  }
+  difundir({ tipo: 'ping' });
+}, 5000);
+```
+
+<Callout type="warn" title="El censo de clientes es una estimación, nunca un hecho">
+Cualquier decisión que tomes contando puertos hereda la fiabilidad de tu detector de fallos, que es baja. Una pestaña en la caché de retroceso está viva pero no responde al latido, así que la darás por muerta y volverá; una pestaña que el sistema mató por presión de memoria nunca envió su despedida, así que la darás por viva durante quince segundos. Diseña para que ninguna operación de corrección dependa del censo: úsalo para liberar recursos y para métricas, no para decidir quién tiene permiso de escritura. Cuando necesites esa clase de decisión, el mecanismo correcto no es contar, sino un bloqueo.
+</Callout>
+
+## Lo que resuelve de golpe
+
+Cuando está disponible, la lista de problemas que desaparecen es larga y conviene verla junta, porque explica por qué esta pieza sigue siendo la respuesta conceptualmente correcta pese a todo.
+
+<Cards>
+  <Card icon="🔌" title="Una sola conexión">
+    Un único websocket, un único bucle de sincronización y una única espera creciente. El servidor deja de ver a un usuario como cuatro clientes que reintentan a la vez.
+  </Card>
+  <Card icon="🗄️" title="Un solo dueño de la base">
+    Nadie más abre IndexedDB ni OPFS. Desaparecen la contención por el manejador exclusivo y buena parte del problema del cambio de versión, porque solo hay una conexión que cerrar.
+  </Card>
+  <Card icon="🧠" title="Una caché caliente compartida">
+    El coste de calentar índices, compilar consultas o materializar vistas se paga una vez para todas las pestañas, en lugar de multiplicarse por cada una.
+  </Card>
+  <Card icon="📣" title="Difusión con orden">
+    Como todos los cambios pasan por un mismo hilo, la notificación a las pestañas sale de un único punto y en un orden bien definido, que es justo lo que un bus entre iguales no puede darte.
+  </Card>
+</Cards>
+
+Ese último punto merece subrayarse porque es el que más se subestima. Tener un único emisor no solo evita conflictos: **establece un orden total** sobre los cambios sin necesidad de relojes, versiones ni consenso. Todas las pestañas reciben la misma secuencia de avisos en la misma secuencia, y cualquier estado derivado que construyan a partir de ella converge por construcción. Nada de eso es gratis en las alternativas.
+
+<Callout type="info" title="Qué puede y qué no puede hacer dentro">
+Un worker compartido no tiene acceso al DOM, pero sí a `fetch`, a los websockets, a IndexedDB, a Cache Storage y a la parte asíncrona de OPFS, que es donde vive tu capa de datos. Dos precisiones útiles: si tu motor necesita el manejador de acceso síncrono de OPFS, comprueba en tu navegador objetivo si lo admite desde un worker compartido, porque no todos lo permiten desde cualquier tipo de worker; y para depurarlo no basta con las herramientas de la pestaña, hay que abrir el inspector de workers del navegador, ya que ni sus mensajes de consola ni sus excepciones aparecen donde esperas.
+</Callout>
+
+## El soporte irregular y la regla que se deduce
+
+La historia importa porque explica la desconfianza. La pieza es antigua, pero Safari la retiró tras sus primeras versiones y no volvió a ofrecerla hasta 2022; durante más de una década, una parte enorme del parque de dispositivos simplemente no la tenía, y toda una generación de librerías se construyó dando por hecho que no existía. El punto verdaderamente doloroso hoy es Android: ni la vista web integrada del sistema ni el navegador dominante de esa plataforma la han ofrecido de forma estable, de modo que cualquier aplicación con usuarios móviles necesita un plan alternativo obligatorio. Y hay contextos donde tampoco está disponible o se comporta de forma dispar, como crearla desde dentro de otro worker.
+
+De ahí se deduce la única regla defendible: **detecta y degrada, nunca supongas**. Y la degradación no puede ser un mensaje de error, porque la mitad de tus usuarios caería en él.
+
+```js
+export function crearCanalDeDatos() {
+  if (typeof SharedWorker !== 'undefined') {
+    try {
+      const s = new SharedWorker('/datos.js', { name: 'db', type: 'module' });
+      s.port.start();
+      return envolverPuerto(s.port);
+    } catch {
+      // algunos entornos lo exponen y fallan al construirlo
+    }
+  }
+  return arrancarPatronDeLiderConWorkerDedicado();   // leccion 5 de este nivel
+}
+```
+
+Fíjate en la forma del retorno: ambas ramas devuelven **la misma interfaz**. Esa es la decisión de diseño que hace viable todo lo demás. Si el resto de tu aplicación sabe si hay o no un worker compartido, tendrás dos aplicaciones que mantener y solo probarás una. Si la única diferencia está encapsulada en una fábrica que devuelve algo con la misma forma —envía, escucha, cierra—, tu capa de datos se escribe una vez y la estrategia de transporte se convierte en un detalle sustituible y, sobre todo, comprobable en las dos configuraciones.
+
+<Callout type="dios" title="Lo que te regala la plataforma es identidad, y esa es la parte cara">
+Conviene entender qué es exactamente lo que un worker compartido te da, porque no es un hilo: hilos ya tenías. Lo que te da es una **identidad garantizada por el navegador**. La tupla formada por el origen, la dirección del script y el nombre designa a una entidad de la que no puede haber dos, y esa unicidad no la sostiene tu código ni un acuerdo entre tus pestañas: la sostiene el propio navegador, que sabe qué documentos existen porque los creó él, y que sabe cuándo desaparecen porque los destruye él. Fabricar esa misma propiedad desde JavaScript es un problema de otra magnitud, y no por falta de destreza, sino porque un programa que corre dentro de un documento no puede observar de forma fiable la muerte de otro documento; lo único que puede hacer es dejar de recibir respuestas, y no recibir respuesta es indistinguible de estar hablando con alguien lento, congelado o momentáneamente desconectado. Ese es, literalmente, el problema del detector de fallos, y es la razón por la que el consenso en sistemas asíncronos es difícil en un sentido demostrable y no anecdótico. Por eso las lecciones que siguen no son degradaciones tristes de esta: la lección 3 mostrará que un bus de mensajes no puede fabricar unicidad, y la lección 5 mostrará que solo se consigue apoyándose en un árbitro que sí ve morir a los participantes, que es la API de bloqueos. El worker compartido resuelve el problema declarándolo resuelto por decreto de la plataforma; cuando no lo tienes, descubres cuánta ingeniería había detrás de ese decreto.
+</Callout>
+
+<Reto title="Convierte tu capa de datos en un servicio compartido">
+1. Mueve tu conexión de red y tu apertura de base a un worker compartido y comprueba con tres pestañas que solo existe una conexión persistente.
+2. Registra el escuchador con `addEventListener` y omite a propósito la llamada a `start`. Observa el silencio y anota cómo lo diagnosticarías dentro de seis meses.
+3. Añade un parámetro variable a la dirección del script y verifica que se crean tantas instancias como pestañas: reproduce el fallo de identidad.
+4. Implementa despedida explícita y latido, y mide cuánto tarda tu censo en detectar una pestaña cerrada de golpe frente a una enviada a la caché de retroceso.
+5. Escribe la fábrica con detección de soporte y una rama alternativa que, de momento, solo registre un aviso. La rellenarás en la lección 5.
+6. Comprueba el comportamiento real en un dispositivo Android y documenta qué rama se toma. No lo deduzcas de una tabla: mídelo.
+</Reto>

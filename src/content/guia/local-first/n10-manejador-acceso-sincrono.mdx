@@ -1,0 +1,150 @@
+---
+title: "El manejador de acceso síncrono"
+description: "Qué devuelve createSyncAccessHandle, las operaciones que ofrece el manejador síncrono de OPFS —leer, escribir, truncar, consultar tamaño y volcar a disco— y por qué un motor de base de datos no puede vivir sin ellas."
+subject: local-first
+level: 10
+order: 1
+icon: "10.1"
+duracion: "14 min"
+---
+
+<Lead>
+Todo lo que OPFS te dio en el nivel anterior —un sistema de ficheros real, privado por origen y sin diálogos de permiso— culmina en un único objeto que no se parece a nada más de la plataforma web: un manejador que lee y escribe bytes **sin devolver promesas**. No es una comodidad ergonómica ni un atajo para escribir menos `await`: es la pieza sin la cual un motor de base de datos serio no puede existir dentro de un navegador. Entender con precisión qué ofrece es el requisito para entender, en las cuatro lecciones siguientes, todo lo que su existencia te va a costar.
+</Lead>
+
+<Objetivos>
+
+- Saber qué es un `FileSystemSyncAccessHandle` y cómo se obtiene.
+- Dominar sus operaciones: leer, escribir, truncar, consultar tamaño, volcar a disco y cerrar.
+- Entender por qué el acceso posicional por rangos de bytes es exactamente lo que pide un motor de base de datos.
+- Ver la correspondencia literal entre esas operaciones y la capa VFS de SQLite.
+
+</Objetivos>
+
+## El objeto que rompe la regla
+
+La plataforma web lleva quince años construida sobre una premisa: la entrada y salida es asíncrona. Todo devuelve una promesa, todo se espera, nada bloquea. El `FileSystemSyncAccessHandle` es la excepción deliberada a esa regla, y conviene mirar con cuidado dónde está exactamente la excepción.
+
+Obtenerlo es asíncrono. Usarlo no lo es.
+
+```js
+// Dentro de un Web Worker
+const raiz = await navigator.storage.getDirectory();
+const fichero = await raiz.getFileHandle('datos.sqlite3', { create: true });
+
+// La creacion del manejador SI devuelve una promesa
+const h = await fichero.createSyncAccessHandle();
+
+// A partir de aqui, ninguna operacion devuelve una promesa
+const cabecera = new Uint8Array(100);
+const leidos = h.read(cabecera, { at: 0 });   // devuelve un numero, ya
+h.write(cabecera, { at: 4096 });              // devuelve un numero, ya
+h.close();
+```
+
+Esa asimetría es intencionada. Abrir el fichero implica resolver rutas, comprobar permisos y tomar un bloqueo: trabajo que puede tardar y que se paga una sola vez. Leer la página 3 de un índice B-tree, en cambio, ocurre miles de veces por segundo dentro de una consulta, y no admite el sobrecoste de una promesa —ni el de ceder el control al bucle de eventos— entre una carga y la siguiente.
+
+El manejador trabaja siempre con vistas de `ArrayBuffer`: un `Uint8Array` que tú reservas y que la operación llena o vuelca. No hay serialización, no hay conversión, no hay copia oculta a otro contexto. Escribes bytes en un desplazamiento y los lees desde un desplazamiento. Es, literalmente, `pread` y `pwrite` de POSIX vestidos de JavaScript.
+
+## Las operaciones, una por una
+
+<Cards>
+  <Card icon="📖" title="read">
+    `read(buffer, { at })` copia bytes del fichero a tu vista desde el desplazamiento indicado y devuelve cuántos ha leído de verdad, que puede ser menos de lo que pediste si el fichero termina antes. Sin `at`, lee desde cero.
+  </Card>
+  <Card icon="✍️" title="write">
+    `write(buffer, { at })` vuelca tu vista en el fichero a partir de ese desplazamiento y devuelve los bytes escritos. Si el desplazamiento supera el tamaño actual, el fichero crece; el hueco intermedio queda relleno de ceros.
+  </Card>
+  <Card icon="✂️" title="truncate">
+    `truncate(nuevoTamano)` fija el tamaño exacto del fichero. Recorta si es menor y extiende con ceros si es mayor. Es la operación con la que una base de datos devuelve espacio tras un `VACUUM`.
+  </Card>
+  <Card icon="📏" title="getSize">
+    `getSize()` devuelve el tamaño en bytes, sin promesa y sin `stat`. Un motor lo consulta constantemente para saber cuántas páginas hay y dónde empieza la siguiente.
+  </Card>
+  <Card icon="💾" title="flush">
+    `flush()` empuja a disco lo que el sistema operativo pudiera tener en su caché. Es el punto en el que una escritura deja de ser una promesa del sistema y pasa a ser un hecho duradero.
+  </Card>
+  <Card icon="🔓" title="close">
+    `close()` cierra el manejador y libera el bloqueo exclusivo sobre el fichero. Cualquier operación posterior falla. Olvidarlo es el origen del problema entero de la lección 4.
+  </Card>
+</Cards>
+
+Dos detalles que separan un uso correcto de uno ingenuo. El primero: `read` devuelve los bytes efectivamente leídos, y ese número puede ser menor que la capacidad de tu vista si el fichero se acaba antes; ignorarlo significa interpretar como datos una cola de ceros que nadie escribió. El segundo: la vista la reservas tú, y reservar un `Uint8Array` nuevo en cada lectura genera basura a un ritmo brutal cuando hablas de miles de páginas por consulta. Un pager serio reserva sus búferes una vez y los reutiliza.
+
+```js
+// Un buffer por tamano de pagina, reutilizado durante toda la sesion
+const PAGINA = 4096;
+const scratch = new Uint8Array(PAGINA);
+
+function leerPagina(h, n) {
+  const leidos = h.read(scratch, { at: n * PAGINA });
+  if (leidos !== PAGINA) throw new Error('PAGINA_INCOMPLETA');
+  return scratch;                  // valido hasta la siguiente lectura
+}
+```
+
+<Callout type="note" title="Si encuentras `await handle.getSize()`, es código de museo">
+Las primeras implementaciones —Chrome 102 y las betas de Safari— devolvían promesas en todos estos métodos. La especificación se corrigió después y los motores convergieron en la versión síncrona que ves aquí. Todavía circulan tutoriales y respuestas con `await` delante de `read`, `write` o `getSize`: son de aquella época y hoy solo añaden un microtask inútil a cada llamada.
+</Callout>
+
+## Por qué un motor de base de datos lo exige
+
+Aquí está el argumento entero, y no es de rendimiento: es de forma.
+
+Un motor como SQLite se apoya en una capa de abstracción llamada VFS, un puñado de funciones en C que el motor invoca para tocar el disco. Esas funciones son **síncronas por firma**: devuelven un código de error, no un futuro. Cuando SQLite compilado a WebAssembly ejecuta una consulta, su pila de llamadas está a diez marcos de profundidad dentro del planificador, y en ese punto pide la página 47. No puede detenerse a esperar: una pila de WebAssembly no se suspende para atender una promesa, del mismo modo que una función en C no puede rendirse a mitad y volver después.
+
+La correspondencia con el manejador es literal, casi humillante de lo directa que resulta:
+
+```js
+// La capa VFS que sqlite-wasm implementa sobre OPFS, en esencia
+const vfs = {
+  xRead:     (h, buf, off) => h.read(buf, { at: off }),
+  xWrite:    (h, buf, off) => h.write(buf, { at: off }),
+  xTruncate: (h, n)        => h.truncate(n),
+  xFileSize: (h)           => h.getSize(),
+  xSync:     (h)           => h.flush(),
+  xClose:    (h)           => h.close(),
+};
+```
+
+Seis operaciones. Ni una más. Ese es todo el contrato que un motor relacional necesita del almacenamiento, y es exactamente el que OPFS entrega. Compáralo con IndexedDB, que ofrece almacenes de objetos, índices y transacciones —una abstracción mucho más rica— y que sin embargo resulta inservible como base de un motor: no puedes pedirle "los 4096 bytes que empiezan en el desplazamiento 192512" sin pasar por una transacción asíncrona, un `structuredClone` y un viaje al bucle de eventos.
+
+<Mermaid code={`flowchart LR
+  A[Consulta SQL] --> B[Planificador]
+  B --> C[Pager pide la pagina 47]
+  C --> D[xRead del VFS]
+  D --> E[read con at igual a 192512]
+  E --> F[Bytes en el buffer, ya]
+  F --> C
+  style E fill:#a6e3a1,color:#11111b
+  style F fill:#a6e3a1,color:#11111b`} />
+
+## El ciclo de vida y la durabilidad
+
+Un manejador no es una operación, es un estado que vive. Se abre una vez al arrancar, se mantiene abierto durante toda la sesión y se cierra al terminar. Un motor que abriera y cerrara el manejador en cada consulta pagaría el bloqueo y la resolución de ruta miles de veces, y perdería además cualquier suposición sobre su propia caché de páginas.
+
+<Mermaid code={`flowchart LR
+  A[getDirectory] --> B[getFileHandle con create]
+  B --> C[createSyncAccessHandle]
+  C --> D[read write truncate getSize]
+  D --> D
+  D --> E[flush]
+  E --> F[close libera el bloqueo]
+  style C fill:#a6e3a1,color:#11111b
+  style F fill:#f38ba8,color:#11111b`} />
+
+Hay una consecuencia inmediata de ese ciclo de vida largo que la lección 4 desarrollará entera: mientras el manejador vive, el fichero es tuyo y de nadie más. La apertura no es solo una resolución de ruta, es la toma de un bloqueo exclusivo que dura tanto como el objeto. Guárdalo en el ámbito del worker, ciérralo cuando la aplicación termine, y no lo trates jamás como un recurso de usar y tirar.
+
+La durabilidad merece una nota aparte. `write` no garantiza que los bytes estén en el disco físico: garantiza que están en el fichero desde el punto de vista del sistema. Entre ambas cosas hay una caché del sistema operativo que puede perderse en un corte de corriente. `flush` es lo que cierra esa distancia, y es también lo que cuesta caro: cada `flush` es una barrera real contra el hardware. Un motor transaccional lo llama en los puntos exactos donde su protocolo de recuperación lo exige —al cerrar el journal, al confirmar la transacción— y no una vez por escritura. Si diseñas una capa de persistencia propia sobre este manejador, la frecuencia de tus `flush` es la perilla que decide dónde te sitúas entre "rápido" y "no pierde datos".
+
+<Callout type="dios" title="La API más pequeña que hacía falta">
+Merece la pena detenerse en lo insólito de este objeto, porque explica media década de historia de la web. Durante años el navegador ofreció abstracciones cada vez más elaboradas para guardar datos —`localStorage` con su interfaz de diccionario, IndexedDB con sus almacenes, índices, cursores y transacciones, la Web SQL Database que murió por atarse a una implementación concreta— y todas fracasaron como cimiento de un motor real por la misma razón: eran demasiado altas. Ofrecían la abstracción equivocada. Un motor de base de datos no quiere que le gestionen los objetos ni los índices; ya sabe hacerlo, lleva veinticinco años haciéndolo mejor que nadie, y sus estructuras están afinadas hasta el byte. Lo único que pide del sistema de ficheros es lo que POSIX le ha dado siempre: leer un rango, escribir un rango, saber el tamaño, recortar, sincronizar, cerrar. Seis verbos. El `FileSystemSyncAccessHandle` es el reconocimiento explícito de ese error de diseño acumulado y su corrección: en lugar de inventar otra base de datos dentro del navegador, la plataforma decidió por fin exponer el sustrato y dejar que cada quien construyera encima la suya. Ese es el motivo real por el que SQLite corre hoy en una pestaña a velocidad casi nativa sobre bases de varios gigabytes, y por el que este nivel importa: no descubriste una optimización, descubriste que el navegador dejó de intentar ser tu base de datos y aceptó ser tu disco. El precio de esa decisión —una restricción de una sola línea en la especificación— es lo que estudiarás en la lección siguiente, y va a reorganizarte la aplicación entera.
+</Callout>
+
+<Reto title="Toca el manejador con las manos">
+1. Crea un worker dedicado, abre un fichero en OPFS y escribe en él una cabecera de 100 bytes en el desplazamiento 0. Cierra el manejador, vuelve a abrirlo y léela de vuelta.
+2. Escribe 4096 bytes en el desplazamiento 1048576 de un fichero vacío y comprueba con `getSize` qué tamaño ha quedado. Explica de dónde salen los bytes intermedios.
+3. Mide con `performance.now` cuánto cuestan diez mil llamadas a `read` de 4 KB seguidas. Compara con diez mil lecturas equivalentes desde IndexedDB y explica la diferencia por su origen, no por su magnitud.
+4. Añade un `flush` después de cada `write` en el experimento anterior y vuelve a medir. Razona qué te dice el resultado sobre el compromiso entre durabilidad y rendimiento.
+5. Escribe la tabla de correspondencia entre las seis operaciones del manejador y las funciones del VFS de SQLite, de memoria.
+</Reto>

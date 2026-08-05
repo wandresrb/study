@@ -1,0 +1,153 @@
+---
+title: "La compilación a WebAssembly"
+description: "Llevar un motor escrito en C al navegador conserva intacto el compilador de SQL, la máquina virtual y el árbol B, pero sacrifica los hilos, la memoria proyectada y la sincronización real a disco, y sustituye el sistema de ficheros por nada."
+subject: local-first
+level: 12
+order: 2
+icon: "12.2"
+duracion: "18 min"
+---
+
+<Lead>
+Un motor de bases de datos de veinticinco años, escrito en C89 portable, que asume un sistema operativo con ficheros, descriptores, bloqueos de rango, memoria proyectada y una llamada que fuerza los datos al disco. Y al otro lado, un entorno sin sistema de ficheros, sin procesos, sin señales, con un único hilo por contexto y una memoria que es un solo bloque contiguo de bytes dentro de un espacio aislado. La traducción entre ambos mundos no es magia ni es gratis, y entender exactamente qué sobrevive al viaje —y qué se queda en la aduana— es lo que te permitirá razonar sobre el rendimiento y sobre la durabilidad de lo que construyas encima.
+</Lead>
+
+<Objetivos>
+
+- Entender qué produce realmente un compilador de C a WebAssembly y qué papel juega la capa de pegamento en JavaScript.
+- Manejar el modelo de memoria lineal y la frontera de copia que impone a todo dato que cruza.
+- Enumerar con precisión lo que se pierde: hilos, memoria proyectada, sincronización real y el sistema de ficheros entero.
+- Reconocer lo que se conserva sin alteración y por qué eso es lo que da valor a la operación completa.
+
+</Objetivos>
+
+## Qué produce realmente el compilador
+
+El proceso no traduce C a JavaScript ni interpreta nada. Un compilador moderno de C toma el mismo árbol de fuentes que produce el binario de escritorio y emite código máquina para una arquitectura más: WebAssembly, un juego de instrucciones con enteros, flotantes, saltos, llamadas y accesos a memoria. El resultado es un módulo binario que el navegador compila a código nativo real, normalmente en varias etapas, con un compilador rápido primero y uno optimizador después.
+
+Lo que no puede traducirse son las llamadas al sistema. El código de SQLite invoca funciones de la biblioteca estándar de C que a su vez invocan al núcleo, y ahí no hay núcleo. La cadena de herramientas resuelve esto aportando una implementación de la biblioteca estándar compilada también a WebAssembly y una capa de **pegamento en JavaScript** que atiende lo que esa biblioteca no puede resolver sola. El artefacto que descargas, por tanto, son siempre dos piezas: un módulo binario y un cargador que lo instancia, le conecta las funciones importadas y expone una API utilizable desde JavaScript.
+
+<Mermaid code={`flowchart LR
+  A[Fuentes en C sin modificar] --> B[Compilador a WebAssembly]
+  B --> C[Modulo binario wasm]
+  B --> D[Pegamento en JavaScript]
+  D --> E[Emulacion de la biblioteca estandar]
+  C --> F[Instancia con memoria lineal]
+  D --> F
+  F --> G[API de estilo C uno a uno]
+  F --> H[API orientada a objetos por comodidad]
+  style C fill:#a6e3a1,color:#11111b
+  style D fill:#f9e2af,color:#11111b`} />
+
+La compilación oficial expone esas dos superficies deliberadamente. Una reproduce las funciones de C casi una a una, con punteros y códigos de retorno, y vive bajo `sqlite3.capi`; es la que necesitas cuando quieres control fino o cuando implementas extensiones. La otra, bajo `sqlite3.oo1`, ofrece clases como `DB` y `Stmt` que gestionan por ti la reserva y liberación de memoria y traducen errores en excepciones. La segunda está construida sobre la primera y no oculta nada que la primera no permita.
+
+El coste de arranque de todo esto no es despreciable y merece medirse por separado, porque cada etapa se optimiza de forma distinta. La descarga son cientos de kilobytes que el navegador puede cachear como cualquier otro recurso estático y que comprimen muy bien. La compilación del módulo la hacen los motores modernos en flujo, mientras llegan los bytes, si el recurso se sirve con el tipo de contenido correcto; servirlo mal desperdicia esa optimización entera y no avisa. La instanciación es rápida pero no instantánea, y a continuación viene lo que de verdad domina el arranque en frío de una aplicación real: abrir el almacenamiento y aplicar migraciones.
+
+<Callout type="tip" title="Mide las cuatro etapas por separado desde el primer día">
+Descarga, compilación, instanciación y apertura de la base tienen causas distintas y remedios distintos, y cuando alguien informa de que *la aplicación tarda en arrancar* la única respuesta útil es saber cuál de las cuatro creció. Instrumentarlas cuesta cuatro marcas de tiempo y evita meses de conjeturas. Añade una quinta si aplicas migraciones: es la única que crece con el historial de tu producto y no con el tamaño del binario, y por tanto la única que empeorará sola.
+</Callout>
+
+## La memoria lineal y la frontera de copia
+
+Aquí está el detalle que más consecuencias tiene en el día a día. Toda la memoria del módulo es un único `ArrayBuffer` gestionado por un objeto `WebAssembly.Memory`. Los punteros de C son simplemente desplazamientos enteros dentro de ese bloque. La consecuencia inmediata: **una cadena de JavaScript no es un puntero**, y un puntero no es un objeto de JavaScript. Para pasar una consulta al motor hay que reservar espacio en la memoria lineal, codificar la cadena en bytes, escribirla y pasar el desplazamiento; para recuperar un resultado hay que hacer el camino inverso.
+
+```js
+// El patron crudo, tal y como lo automatiza la capa de comodidad
+const ptr = sqlite3.wasm.allocCString("SELECT count(*) FROM notas");
+try {
+  const rc = sqlite3.capi.sqlite3_exec(dbPtr, ptr, 0, 0, 0);
+  if (rc) throw new Error(sqlite3.capi.sqlite3_errmsg(dbPtr));
+} finally {
+  sqlite3.wasm.dealloc(ptr); // sin recolector de basura al otro lado
+}
+```
+
+La capa de comodidad existe precisamente para que no escribas eso a mano, y conviene ver el contraste porque explica por qué casi nadie usa la superficie cruda salvo para extender el motor:
+
+```js
+// El mismo trabajo con la capa orientada a objetos: sin punteros a la vista
+const db = new sqlite3.oo1.DB("/notas.sqlite3", "c");
+const total = db.selectValue("SELECT count(*) FROM notas WHERE etiqueta = ?", "hoy");
+db.transaction(() => {
+  const st = db.prepare("INSERT INTO notas(texto, etiqueta) VALUES(?, ?)");
+  try {
+    for (const n of pendientes) { st.bind([n.texto, n.etiqueta]).stepReset(); }
+  } finally {
+    st.finalize(); // esto sigue siendo obligatorio: no hay recolector al otro lado
+  }
+});
+```
+
+Fíjate en que la liberación explícita de la sentencia no desaparece. La capa de comodidad te ahorra codificar cadenas y calcular desplazamientos, pero no puede inventar un recolector de basura para objetos que viven en la memoria lineal, y una sentencia no finalizada es a la vez una fuga de memoria y —como verás en la lección 4— un fichero bloqueado que otra pestaña no podrá abrir.
+
+Dos advertencias prácticas se derivan de este modelo. La primera es que dentro de la memoria lineal **no hay recolector de basura**: lo que reservas lo liberas tú, y una fuga aquí es una fuga clásica de C, con la diferencia de que se manifiesta como un consumo creciente de memoria de la pestaña. La segunda es más sutil: la memoria puede crecer, y al crecer el `ArrayBuffer` anterior queda desligado. Cualquier vista tipada que hubieras guardado apuntando al búfer viejo deja de ser válida, silenciosamente, y leerla produce ceros o una excepción según el caso. Por eso las capas serias obtienen la vista en el momento de usarla y nunca la almacenan entre operaciones.
+
+<Callout type="warn" title="El espacio de direcciones es de treinta y dos bits">
+Las compilaciones habituales usan punteros de treinta y dos bits, lo que impone un techo teórico de cuatro gibibytes para toda la memoria del módulo y un techo práctico bastante menor, porque el navegador impone sus propios límites por pestaña. Esto no limita el tamaño de tu base de datos cuando reside fuera de la memoria lineal —el pager solo mantiene una caché de páginas—, pero sí limita de forma severa cualquier uso que cargue la base entera en memoria, que es exactamente el modelo de las opciones clásicas sin persistencia propia. Diseñar contando con que la base vive fuera y solo pasan páginas por la memoria es lo que separa un juguete de una aplicación.
+</Callout>
+
+## Lo que se pierde por el camino
+
+Conviene ser inclemente con esta lista, porque cada omisión reaparece más adelante convertida en una restricción de arquitectura.
+
+<Cards>
+  <Card icon="🧵" title="Los hilos">
+    Las compilaciones canónicas son de un solo hilo y desactivan la protección interna de concurrencia, porque no hay hilos que proteger. El paralelismo real solo llega creando Workers, y cada Worker tiene su propia memoria lineal: son procesos, no hilos.
+  </Card>
+  <Card icon="🗺️" title="La memoria proyectada">
+    La ruta optimizada en la que el motor lee páginas directamente del fichero proyectado en memoria no existe. Toda página se copia del almacenamiento a la caché del pager, siempre, sin atajo posible.
+  </Card>
+  <Card icon="💾" title="La sincronización real">
+    No hay ninguna llamada que empuje bytes hasta el plato del disco. Lo máximo que puede hacer la capa inferior es pedir un vaciado al almacenamiento del navegador, que a su vez confía en el sistema operativo.
+  </Card>
+  <Card icon="📁" title="El sistema de ficheros">
+    Sin rutas, sin descriptores, sin bloqueos de rango del núcleo, sin directorio temporal, sin identificador de proceso. Todo eso hay que emularlo o declararlo inexistente.
+  </Card>
+</Cards>
+
+Hay una pérdida más que suele descubrirse tarde: no existe carga dinámica de bibliotecas, así que el mecanismo habitual de extensiones cargables en tiempo de ejecución no es aplicable. Cualquier extensión que necesites —búsqueda de texto completo, funciones geoespaciales, tus propias funciones escalares en C— tiene que estar compilada dentro del binario. Lo que sí puedes añadir en caliente son funciones definidas en JavaScript y registradas contra la conexión, que el motor invocará durante la ejecución de la consulta.
+
+<Mermaid code={`flowchart LR
+  A[Transaccion confirmada] --> B[Peticion de vaciado de la capa inferior]
+  B --> C[Almacenamiento del navegador]
+  C --> D[Cache del sistema operativo]
+  D --> E[Disco fisico]
+  B -.->|el motor solo ve hasta aqui| C
+  C -.->|y el modelo de cuota puede borrarlo todo| F[Desalojo]
+  style B fill:#f9e2af,color:#11111b
+  style F fill:#f38ba8,color:#11111b`} />
+
+La pérdida más grave, sin embargo, es la de la sincronización, y merece nombrarla sin eufemismos. En un sistema operativo, la promesa de durabilidad de una transacción confirmada es que sobrevive a un corte de corriente. En el navegador esa promesa se degrada a otra cosa: sobrevive a una recarga de página y probablemente a un cierre del navegador, pero la cadena hasta el hardware está mediada por capas que ni ves ni controlas, y por encima de todo ello sigue vigente el modelo de cuota del nivel 11, que autoriza al navegador a borrarlo todo. El motor te da atomicidad y aislamiento en su sentido pleno; la durabilidad que obtienes es la que el entorno esté dispuesto a conceder.
+
+## Lo que se conserva intacto
+
+Y ahora la otra cara, que es la que justifica la operación entera. Todo lo que está por encima de la capa de sistema sobrevive sin una sola modificación: el tokenizador, el analizador, el generador de código, la máquina virtual que ejecuta el bytecode, el árbol B, el planificador de consultas con sus estadísticas, la lógica de transacciones y de diario, la afinidad de tipos, las intercalaciones, el comportamiento exacto ante casos límite. No es una reimplementación compatible: es **el mismo código fuente**, compilado para otra arquitectura.
+
+<Cards>
+  <Card icon="🧠" title="El planificador y sus estadísticas">
+    El mismo algoritmo que reordena uniones y elige índices en un servidor de escritorio corre aquí. Los planes que estudies en tu máquina son los planes que se ejecutarán en el navegador de tu usuario.
+  </Card>
+  <Card icon="🔁" title="Atomicidad y aislamiento">
+    El diario de reversión y la máquina de estados de bloqueo funcionan igual. Una transacción abortada a mitad no deja rastro, y una caída del Worker deja la base recuperable en el siguiente arranque.
+  </Card>
+  <Card icon="📄" title="El formato de fichero">
+    Byte a byte idéntico. Una base escrita en la pestaña de un usuario se abre en la línea de órdenes de escritorio sin conversión ni herramienta intermedia.
+  </Card>
+  <Card icon="🎯" title="Las rarezas también">
+    Afinidad de tipos, comparación de cadenas, redondeo, orden de las intercalaciones: el comportamiento en los casos límite es el mismo, para bien y para mal. No hay una segunda semántica que aprender.
+  </Card>
+</Cards>
+
+De ahí se siguen tres garantías que valen más de lo que parecen. La primera es que una base creada en el navegador es un fichero SQLite legítimo, abrible con la herramienta de línea de órdenes o con cualquier biblioteca del ecosistema. La segunda es que la enorme batería de pruebas del proyecto ejerce exactamente el mismo código que corre en la pestaña de tu usuario. La tercera, la decisiva para el resto del nivel, es que el punto de extensión que el diseño original previó para portar el motor a sistemas operativos exóticos sigue ahí, intacto y accesible, esperando a que alguien escriba una implementación para un sistema operativo que resulta ser un navegador.
+
+<Callout type="dios" title="Compilar a WebAssembly no portó SQLite al navegador: portó el navegador a la lista de sistemas operativos de SQLite">
+La forma habitual de contar esta historia es que alguien logró meter una base de datos dentro de una página web, y esa forma de contarla oculta lo que de verdad ocurrió. SQLite no fue adaptado al navegador; el navegador fue tratado como un sistema operativo más, raro y limitado, del mismo modo que en su día se trataron VXWorks, OS/2 o los sistemas embebidos sin sistema de ficheros para los que existen implementaciones de ejemplo en el propio árbol de fuentes. La diferencia entre ambas descripciones no es retórica sino predictiva: si crees que hubo una adaptación, esperarás que las peculiaridades del navegador aparezcan repartidas por todo el motor y que cada versión nueva sea una negociación; si entiendes que hubo un puerto de plataforma, sabes de antemano que todas las peculiaridades están concentradas en una única capa de doscientas líneas conceptuales y que el resto del motor ni se entera de dónde está corriendo. Y esa concentración es una propiedad que se diseñó a propósito, hace veinticinco años, para un problema que no tenía nada que ver con este —hacer que un motor escrito en Unix corriera en Windows— y que resulta ser exactamente lo que hacía falta para un entorno que nadie había imaginado entonces. Es el argumento más contundente que conozco a favor de aislar las dependencias del entorno detrás de una interfaz estrecha y estable, porque el retorno de esa disciplina no se cobra en el sistema operativo siguiente sino en el que aún no existe. Quien diseñó esa frontera no estaba previendo el navegador: estaba negándose a asumir cualquier plataforma concreta, y esa negativa fue la que treinta años después convirtió un problema de investigación en un fichero de configuración. La lección 3 va precisamente sobre esa frontera.
+</Callout>
+
+<Reto title="Toca la frontera con las manos">
+1. Carga la compilación oficial en un Worker, abre una base en memoria y ejecuta una consulta trivial usando primero la API de estilo C con punteros y después la orientada a objetos. Anota cuántas líneas de gestión de memoria te ahorra la segunda.
+2. Provoca deliberadamente una fuga reservando cadenas en la memoria lineal dentro de un bucle sin liberarlas, y observa el consumo de memoria de la pestaña. Corrígela y confirma la diferencia.
+3. Mide por separado descarga, compilación e instanciación del módulo. Compara la compilación en flujo con la compilación desde un búfer ya descargado.
+4. Escribe una función escalar en JavaScript, regístrala contra la conexión e invócala desde una consulta. Mide qué cuesta cruzar la frontera una vez por fila.
+5. Redacta en tres líneas, para tu documentación interna, qué significa exactamente durabilidad en tu aplicación. Prohibido usar la palabra disco.
+</Reto>

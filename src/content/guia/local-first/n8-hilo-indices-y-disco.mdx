@@ -1,0 +1,148 @@
+---
+title: "Los otros costes: el hilo bloqueado, los índices y el disco"
+description: "Cuando ya has agrupado las transacciones quedan tres costes: la deserialización que bloquea el hilo principal, los índices que se reescriben en cada escritura y la latencia del medio físico."
+subject: local-first
+level: 8
+order: 3
+icon: "8.3"
+duracion: "17 min"
+---
+
+<Lead>
+Has agrupado las transacciones y has aplanado los registros, y la importación ya no tarda minutos. Pero la interfaz sigue congelándose al abrir una lista larga, las escrituras se han vuelto misteriosamente más lentas desde que añadiste dos índices, y en el portátil viejo del cliente todo va tres veces peor que en tu máquina. Son tres costes distintos, con tres causas independientes y tres remedios que no se parecen en nada. Confundirlos es la razón por la que tanta optimización de IndexedDB no mueve la aguja.
+</Lead>
+
+<Objetivos>
+
+- Ver por qué una API asíncrona bloquea el hilo principal y cómo eso destruye la respuesta a la interacción.
+- Calcular el coste de escritura como función del número de índices y no solo del número de registros.
+- Conocer los motores reales que hay debajo en cada navegador y qué comportamiento heredas de ellos.
+- Atribuir cada milisegundo a su capa antes de decidir qué optimizar.
+
+</Objetivos>
+
+## La asincronía que no te libra del bloqueo
+
+La API de IndexedDB es asíncrona de principio a fin y eso produce una expectativa falsa: que el trabajo ocurre en otro sitio. Lo que ocurre en otro sitio es la entrada y salida. La **deserialización** de cada valor que recibes se ejecuta de forma síncrona en el hilo que registró el manejador, dentro de la tarea que atiende el evento, y no se puede interrumpir a mitad.
+
+Es una distinción que la palabra "asíncrono" oculta activamente. Asíncrono significa que la llamada no bloquea mientras el motor busca en el disco; no significa que el resultado aparezca gratis. Cuando el resultado vuelve, hay que materializarlo, y materializarlo es trabajo de tu hilo.
+
+Un `getAll` que devuelve diez mil registros no entrega diez mil eventos repartidos: entrega uno solo, y en esa única tarea hay que reconstruir los diez mil grafos. El resultado es una **tarea larga**, con todo lo que arrastra: cualquier interacción del usuario que llegue mientras tanto se queda esperando a que el hilo se libere, el próximo fotograma se pierde, y la métrica de respuesta a la interacción se degrada exactamente en la duración de esa tarea. La aplicación no está calculando nada: está desempaquetando.
+
+<Mermaid code={`flowchart TB
+  A[hilo principal emite getAll] --> B[el motor lee del disco fuera del hilo]
+  B --> C[llega el evento success]
+  C --> D[TAREA LARGA: deserializar diez mil grafos]
+  D --> E[el usuario pulsa aqui y no pasa nada]
+  D --> F[fotograma perdido]
+  D --> G[al fin devuelve el control]`} />
+
+Que la lectura sea paginada no elimina el coste, lo reparte: diez páginas de mil registros producen diez tareas cortas en lugar de una larga, y entre ellas el navegador puede atender al usuario. Es el mismo total de trabajo con un perfil de bloqueo radicalmente distinto, y para la percepción de fluidez solo importa el perfil.
+
+```js
+// Misma cantidad de trabajo, dos perfiles de bloqueo incomparables.
+async function leerTodo(store) {              // una tarea larga
+  return esperar(store.getAll());
+}
+
+async function leerPorPaginas(store, n = 500, onPagina) {
+  let ultima;
+  for (;;) {
+    const rango = ultima === undefined ? null : IDBKeyRange.lowerBound(ultima, true);
+    const pagina = await esperar(store.getAll(rango, n));
+    if (pagina.length === 0) return;
+    onPagina(pagina);                          // pinta lo que ya tienes
+    ultima = clavePrimaria(pagina.at(-1));
+    await ceder();                             // el usuario entra aqui
+  }
+}
+```
+
+El detalle que hace que esto funcione es `ceder`: una cesión explícita del hilo entre páginas, con el planificador del navegador si está disponible o con un temporizador de cero milisegundos si no. Sin ella, un bucle de páginas encadenadas con `await` sobre peticiones de IndexedDB puede seguir monopolizando el hilo, porque cada resolución vuelve enseguida sin dar paso a las tareas de interacción pendientes. Paginar sin ceder resuelve el pico de memoria, no el de bloqueo.
+
+## Cada índice es una escritura más
+
+Un índice de IndexedDB no es metadato: es una estructura ordenada, persistente y separada, que asocia el valor de una ruta de clave con la clave primaria del registro. Mantenerlo coherente exige que **cada** escritura sobre el almacén lo actualice. El trabajo por índice y por registro es concreto: evaluar la ruta de clave sobre el valor, comprobar que el resultado es una clave válida —si no lo es, la entrada simplemente no se crea, lo que produce registros invisibles para ese índice—, y realizar la inserción ordenada en la estructura del índice. Si el índice es `unique`, hay además una búsqueda previa para detectar colisión. Si es `multiEntry` y la ruta apunta a un array, se crea **una entrada por elemento**, de modo que un registro con cien etiquetas genera cien inserciones en ese único índice.
+
+```js
+// Cada put sobre este almacen escribe en cuatro sitios: el almacen y tres indices.
+const store = db.createObjectStore("docs", { keyPath: "id" });
+store.createIndex("porAutor", "autorId");
+store.createIndex("porFecha", "actualizado");
+store.createIndex("porEtiqueta", "etiquetas", { multiEntry: true });
+
+// Y este registro genera 1 + 1 + 1 + 12 = 15 inserciones.
+store.put({ id: 7, autorId: 3, actualizado: Date.now(), etiquetas: docEtiquetas12 });
+```
+
+<Callout type="warn" title="Crear un índice sobre datos existentes recorre todo el almacén">
+Los índices solo pueden crearse dentro de una transacción de cambio de versión, y al crearlos el motor debe recorrer cada registro ya guardado, deserializarlo, evaluar la ruta de clave e insertar su entrada. Sobre un almacén grande eso significa una operación bloqueante en el arranque de la aplicación, con la base entera inaccesible mientras dura. Es el motivo por el que añadir un índice en una versión posterior es una migración de verdad, con su plan y su medición, y no un cambio de una línea.
+</Callout>
+
+Hay además un coste de índice que no se ve en el `put` sino en la consulta. Un índice de IndexedDB apunta a la clave primaria, no al registro, así que recorrerlo para obtener valores implica una segunda búsqueda por registro en el almacén principal. Es la misma indirección que en cualquier base con índices secundarios, y tiene la misma consecuencia: cuando la consulta selecciona una fracción grande del almacén, recorrer el índice y saltar registro a registro puede salir más caro que traerlo todo de una vez y filtrar en memoria. La API no tiene planificador, así que esa decisión la tomas tú, a mano, y conviene tomarla con una medición delante.
+
+El criterio, entonces, es el clásico de cualquier base de datos, solo que aquí nadie lo enseña: los índices convierten lecturas caras en lecturas baratas y escrituras baratas en escrituras caras. Un almacén con perfil de escritura intensiva y una sola consulta ocasional casi siempre está mejor sin índice, filtrando en memoria. Un almacén que se escribe una vez y se consulta miles justifica todos los índices que necesite. El error habitual es declarar índices "por si acaso" al definir el esquema, cuando el esquema es justo el momento en que menos se sabe sobre el patrón de acceso real.
+
+<Callout type="tip" title="Empieza sin índices y añádelos con una consulta lenta delante">
+La estrategia que mejor envejece es declarar el almacén con su clave primaria y nada más, filtrar en memoria mientras el volumen lo permita, y añadir cada índice solo cuando exista una consulta concreta y medida que lo justifique. Cuesta una migración por índice, pero evita el escenario contrario —un esquema con seis índices de los que se usan dos— que ya no se puede revertir sin otra migración y que penaliza cada escritura de la aplicación durante toda su vida.
+</Callout>
+
+## El motor que hay debajo
+
+IndexedDB es una interfaz, no una implementación, y cada navegador la construye sobre una base de datos distinta cuyo comportamiento heredas por completo. En los navegadores basados en Chromium, el respaldo es un almacén de clave-valor de tipo árbol de mezcla estructurado en logaritmos, lo que implica escrituras rápidas a un registro secuencial, **amplificación de escritura** y procesos de compactación en segundo plano que compiten por la entrada y salida justo cuando más escribes. En Firefox y en los navegadores de WebKit, el respaldo es SQLite, con su modelo de páginas, su diario y su propio patrón de sincronización.
+
+Que sean motores distintos importa porque sus perfiles no coinciden y a veces se invierten. Un patrón de muchas escrituras pequeñas favorece al árbol de mezcla, que las absorbe en memoria y las vuelca en secuencia, mientras que castiga a un motor de páginas que debe leer, modificar y reescribir la página afectada. Un patrón de lectura por rango estrecho favorece a las páginas ordenadas y castiga al árbol de mezcla, que puede tener que consultar varios niveles. Optimizar contra un solo navegador y dar por buena la cifra es, por tanto, un error metodológico: el mismo esquema puede tener perfiles distintos en cada motor, y la medición hay que repetirla en los tres.
+
+<Cards>
+  <Card icon="🧱" title="Amplificación de escritura">
+    Un byte lógico escrito puede traducirse en varios bytes físicos, ahora y más tarde, cuando la compactación reorganice los niveles. En una importación masiva, el trabajo no termina cuando termina tu bucle: sigue ocurriendo por detrás y afecta a lo que hagas después.
+  </Card>
+  <Card icon="💾" title="La sincronización al medio">
+    Una confirmación con durabilidad estricta pide al sistema operativo que vacíe sus búferes. En almacenamiento de estado sólido cuesta menos que en un disco mecánico, pero sigue siendo una operación de latencia visible frente a cualquier cosa que ocurra en memoria.
+  </Card>
+  <Card icon="📱" title="El dispositivo real">
+    El almacenamiento de un móvil de gama media, con memoria flash lenta, poca caché y limitación térmica, se comporta de forma cualitativamente distinta al de tu máquina de desarrollo. Es el dispositivo donde hay que medir, no aquel en el que resulta cómodo hacerlo.
+  </Card>
+  <Card icon="🔀" title="La frontera de proceso">
+    En Chromium el almacenamiento vive fuera del proceso de la página, así que cada petición atraviesa un canal entre procesos con una copia del valor ya serializado. Es un coste por petición que se amortiza agrupando y que no aparece en ningún perfil de JavaScript.
+  </Card>
+</Cards>
+
+## Atribuir antes de optimizar
+
+Los tres costes de esta lección más el clonado de la lección 8.1 se suman en el mismo número final, y por eso hay que separarlos experimentalmente antes de tocar nada. El procedimiento es de eliminación: mide el clonado aislado con `structuredClone` y ya sabes cuánto es marshalling; repite la escritura con el mismo volumen sobre un almacén sin índices y la diferencia es mantenimiento de índices; alterna `strict` y `relaxed` y la diferencia es sincronización al medio; ejecuta la misma prueba dentro de un Worker y lo que desaparezca del hilo principal era bloqueo, no trabajo.
+
+```js
+// Cuatro variantes de la MISMA carga. La diferencia entre dos de ellas
+// aisla exactamente una capa de coste.
+const variantes = {
+  soloClonado:  () => registros.forEach(r => structuredClone(r)),
+  sinIndices:   () => escribirEn(dbSinIndices, registros),
+  conIndices:   () => escribirEn(dbConIndices, registros),
+  estricta:     () => escribirEn(dbConIndices, registros, { durability: "strict" }),
+};
+// clonado = soloClonado
+// indices = conIndices - sinIndices
+// disco   = estricta - conIndices
+// resto   = sinIndices - soloClonado  (transaccion, IPC, motor)
+```
+
+Las dos precauciones que hacen fiable este procedimiento son partir siempre de una base recién creada —porque un almacén con historia arrastra el estado de compactaciones anteriores y contamina la comparación— y ejecutar cada variante varias veces descartando la primera, que paga la apertura de la base y el calentamiento del compilador. Con eso, las cuatro diferencias son estables y se pueden comparar entre navegadores.
+
+Un quinto factor conviene tenerlo presente aunque no se mida así: los `Blob` no viven necesariamente dentro del registro. Los motores tienden a guardarlos como archivos aparte y a dejar en el almacén solo una referencia, lo que abarata enormemente el clonado de cargas útiles grandes pero introduce una operación de sistema de archivos por cada uno. Muchos blobs diminutos pueden ser peor que un único buffer con todo dentro, y esa inversión no aparece en ninguna medición que solo mire el tiempo de la transacción.
+
+<Callout type="info" title="El perfilador de JavaScript solo ve una de las cuatro capas">
+En una grabación de rendimiento verás el clonado y la deserialización como tiempo de script atribuido a tu llamada, porque ocurren en tu hilo. El mantenimiento de índices, la compactación y la sincronización al disco ocurren fuera y aparecen, si acaso, como tiempo de espera sin explicación. Un perfil que muestra poco script y mucha espera no significa que tu código sea rápido: significa que el coste se ha ido a una capa que esa herramienta no instrumenta.
+</Callout>
+
+<Callout type="dios" title="No estás usando una API del navegador: estás administrando una base de datos">
+La lección incómoda de este nivel es que IndexedDB no falla por estar mal implementada, sino porque se presenta como una API web —algo que se aprende leyendo la firma de tres métodos— cuando en realidad es un sistema gestor de bases de datos transaccional completo, con su motor de almacenamiento, su gestor de bloqueos, su registro de recuperación y sus índices secundarios. Y todo sistema así impone las mismas tres leyes que la literatura lleva cincuenta años enunciando: que los índices trasladan coste de la lectura a la escritura y nunca lo eliminan; que la durabilidad se paga en latencia real contra un medio físico y no se puede negociar con ingenio; y que la unidad de trabajo eficiente la fija el motor, no la comodidad de quien escribe el bucle. La diferencia con un servidor de bases de datos es que allí hay un administrador que conoce esas leyes, herramientas que exponen cada capa por separado y un plan de consulta que se puede leer. Aquí no hay nada de eso: hay una interfaz de mil novecientos noventa y nueve sobre un motor moderno, sin observabilidad, sin planificador visible y con las decisiones de esquema tomadas por alguien que probablemente nunca oyó hablar de amplificación de escritura. El salto profesional no consiste en aprenderse más métodos de la API, sino en aceptar que el rol que estás desempeñando es el de administrador de bases de datos y en traer contigo las preguntas de ese oficio: cuál es el patrón de acceso, cuántos índices lo justifican, dónde está la frontera transaccional y contra qué medio físico se está confirmando.
+</Callout>
+
+<Reto title="Separa las cuatro capas">
+1. Lee diez mil registros con `getAll` en el hilo principal y grábalo con el perfilador. Localiza la tarea larga y anota su duración.
+2. Divide esa lectura en páginas y vuelve a grabar. Comprueba que el total apenas cambia y que el bloqueo máximo se desploma.
+3. Crea dos bases idénticas, una sin índices y otra con tres, y escribe el mismo volumen en ambas. Atribuye la diferencia.
+4. Añade un índice `multiEntry` sobre un campo con muchos elementos y vuelve a medir. Calcula el número real de entradas creadas.
+5. Repite la prueba completa en el dispositivo más lento al que tengas acceso y compara la forma del perfil, no solo los números.
+</Reto>

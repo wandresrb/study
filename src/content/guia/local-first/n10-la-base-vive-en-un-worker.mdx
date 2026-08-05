@@ -1,0 +1,156 @@
+---
+title: "Lo que se deriva: la base vive en un Worker"
+description: "La cadena de implicaciones de la restricción: si el motor necesita entrada y salida síncrona, el motor vive en un Worker, y desde ese momento todo tu acceso a datos es asíncrono aunque la base por dentro sea perfectamente síncrona."
+subject: local-first
+level: 10
+order: 3
+icon: "10.3"
+duracion: "16 min"
+---
+
+<Lead>
+Una restricción de una línea produce una arquitectura de tres capas. En la lección anterior aceptaste que el manejador síncrono solo existe dentro de un Worker; ahora toca seguir la deducción hasta el final, porque no se detiene ahí. Si el manejador vive en el Worker, el motor vive en el Worker; si el motor vive en el Worker, tu código de interfaz no puede llamarlo; y si no puede llamarlo, solo le queda enviarle mensajes. El resultado es la paradoja central de este nivel: acabas con una base de datos rigurosamente síncrona a la que solo puedes hablar de forma asíncrona.
+</Lead>
+
+<Objetivos>
+
+- Seguir la cadena de deducción completa, de la restricción a la arquitectura.
+- Construir la frontera: una capa de RPC sobre `postMessage` con correlación de peticiones.
+- Entender por qué la asincronía no es del motor sino del canal, y qué implica eso para tu interfaz.
+- Conocer la escapatoria de suspender la pila de WebAssembly y por qué no anula la restricción.
+
+</Objetivos>
+
+## La cadena de deducción
+
+Cada eslabón es trivial. El conjunto no lo es.
+
+<Mermaid code={`flowchart TB
+  A[El motor necesita entrada y salida sincrona] --> B[Necesita el manejador de acceso sincrono]
+  B --> C[El manejador solo existe en un Worker]
+  C --> D[El motor se instancia dentro del Worker]
+  D --> E[La memoria del motor es inaccesible desde el hilo principal]
+  E --> F[El unico canal es el paso de mensajes]
+  F --> G[El paso de mensajes es asincrono]
+  G --> H[Todo tu acceso a datos devuelve promesas]
+  style A fill:#89b4fa,color:#11111b
+  style H fill:#f9e2af,color:#11111b`} />
+
+El eslabón que la gente no ve venir es el quinto. Un Worker no comparte memoria con el hilo principal: comparte un canal. La instancia de WebAssembly, su memoria lineal, el pager, la caché de páginas y el manejador de fichero viven todos en un espacio de direcciones al que tu componente de interfaz no tiene acceso, ni siquiera de lectura. No hay puntero que pasar, no hay objeto que compartir, no hay forma de "asomarse". Lo único que cruza es una copia serializada por el algoritmo de clonado estructurado.
+
+De ahí sale la consecuencia que reorganiza el proyecto: **tu capa de datos deja de ser una biblioteca y pasa a ser un servicio**. Con todo lo que eso arrastra: un protocolo, versiones del protocolo, errores de transporte distintos de los errores de dominio, tiempos de espera, un estado de arranque en el que el servicio aún no está listo, y la disciplina de diseñar operaciones en lugar de invocar funciones.
+
+## La frontera: RPC sobre paso de mensajes
+
+`postMessage` no es una llamada, es un envío. Si mandas tres consultas seguidas, recibirás tres respuestas, y necesitas saber cuál corresponde a cuál. La solución canónica es un identificador por petición y un mapa de promesas pendientes.
+
+```js
+// hilo principal: cliente
+const worker = new Worker('/db.worker.js', { type: 'module' });
+const pendientes = new Map();
+let siguiente = 0;
+
+worker.onmessage = ({ data }) => {
+  const p = pendientes.get(data.id);
+  if (!p) return;
+  pendientes.delete(data.id);
+  data.error ? p.reject(new Error(data.error)) : p.resolve(data.filas);
+};
+
+export function consultar(sql, params = []) {
+  const id = ++siguiente;
+  return new Promise((resolve, reject) => {
+    pendientes.set(id, { resolve, reject });
+    worker.postMessage({ id, sql, params });
+  });
+}
+```
+
+```js
+// db.worker.js: servidor
+import { instanciar } from './sqlite-wasm.js';
+const db = await instanciar('datos.sqlite3'); // abre el manejador sincrono
+
+self.onmessage = ({ data }) => {
+  try {
+    const filas = db.exec(data.sql, data.params); // SINCRONO aqui dentro
+    self.postMessage({ id: data.id, filas });
+  } catch (e) {
+    self.postMessage({ id: data.id, error: e.message });
+  }
+};
+```
+
+Fíjate en la línea marcada: dentro del worker, `db.exec` es síncrono y devuelve las filas de inmediato. La promesa que ve tu componente no la crea la base de datos: la crea la frontera. Bibliotecas como Comlink automatizan este esqueleto y te dejan escribir `await db.consultar(...)` con tipos, pero no cambian nada del modelo; solo ocultan el mapa de identificadores.
+
+<Mermaid code={`sequenceDiagram
+  participant UI as Hilo principal
+  participant W as Worker de datos
+  participant O as OPFS
+  UI->>W: postMessage id 7 con SQL
+  W->>O: read sincrono de varias paginas
+  O-->>W: bytes en el buffer
+  W->>W: exec devuelve las filas, ya
+  W-->>UI: postMessage id 7 con filas
+  UI->>UI: resolve de la promesa pendiente`} />
+
+Falta una pieza que casi nadie pone el primer día y que después cuesta añadir: el saludo inicial. El worker no está listo en el instante en que lo construyes —tiene que descargar el WebAssembly, instanciarlo, abrir OPFS y aplicar migraciones—, así que las peticiones que lleguen antes hay que encolarlas, no perderlas. Y como una pestaña vieja puede seguir viva tras un despliegue, el saludo es también el sitio natural para acordar la versión del protocolo.
+
+```js
+// El worker anuncia que existe y con que version habla
+self.postMessage({ tipo: 'listo', protocolo: 3, esquema: 17 });
+
+// El cliente no envia nada hasta ese anuncio
+const listo = new Promise((resolve) => {
+  worker.addEventListener('message', function saludo({ data }) {
+    if (data.tipo !== 'listo') return;
+    worker.removeEventListener('message', saludo);
+    resolve(data);
+  });
+});
+```
+
+<Callout type="tip" title="Los errores no cruzan bien la frontera">
+El clonado estructurado sabe copiar un `Error` estándar, pero pierde el prototipo de tus clases propias: un `ErrorDeValidacion` llega al otro lado convertido en algo que ya no pasa tu `instanceof`. Serializa los errores a mano —un código, un mensaje y los datos que necesites— y reconstrúyelos en el cliente. Y no olvides `worker.onerror` y `onmessageerror`: si el worker muere, tus promesas pendientes se quedan colgadas para siempre a menos que las rechaces tú.
+</Callout>
+
+## Todo se vuelve asíncrono aunque nada lo sea
+
+Aquí es donde la arquitectura toca tu código de producto, y donde más proyectos se tuercen.
+
+<Cards>
+  <Card icon="🎨" title="No hay lectura durante el render">
+    Un componente no puede preguntar por un dato mientras se pinta: tiene que haberlo pedido antes. Toda la interfaz necesita estados de carga, incluso para datos que están a un milímetro, en el disco del propio usuario.
+  </Card>
+  <Card icon="🗃️" title="Aparece una segunda copia">
+    Para renderizar de forma síncrona necesitas un almacén en el hilo principal con el resultado ya materializado. Ahora tienes dos representaciones del mismo dato y un problema de invalidación entre ellas.
+  </Card>
+  <Card icon="🧊" title="El arranque en frío es visible">
+    Descargar el WebAssembly, compilarlo, instanciarlo, abrir OPFS y aplicar migraciones cuesta decenas o cientos de milisegundos. Hay una ventana real en la que el servicio no existe y tu interfaz tiene que decir algo.
+  </Card>
+  <Card icon="📐" title="El esquema es del Worker">
+    Las migraciones se ejecutan dentro del worker, antes de atender la primera petición. El hilo principal no debe suponer nada sobre el esquema: debe preguntarlo o esperar a un mensaje de listo.
+  </Card>
+</Cards>
+
+Hay una compensación que no es evidente y que conviene reclamar: como el worker corre en su propio hilo, una consulta pesada ya no congela la interfaz. En `sql.js`, un `SELECT` de trescientos milisegundos sobre el hilo principal es medio segundo de página muerta; en esta arquitectura, es medio segundo en el que la interfaz sigue animando, respondiendo al teclado y repintando. Has cambiado latencia de respuesta por fluidez garantizada, y para casi cualquier aplicación real ese cambio sale a favor.
+
+Una garantía útil del canal: los mensajes de un mismo puerto se entregan en orden, y como el worker los procesa uno detrás de otro, las respuestas salen en el orden en que entraron las peticiones. Eso te da causalidad gratis —una escritura enviada antes que una lectura se aplica antes— siempre que el manejador del worker no ceda el control a mitad con un `await` innecesario. Si lo hace, has reintroducido concurrencia dentro de tu propio servicio, y con ella una clase de fallos que creías haber dejado atrás.
+
+## La escapatoria que no lo es
+
+Existe una vía técnica para que una pila de WebAssembly se suspenda y espere una promesa: históricamente con la transformación `Asyncify` y hoy con la integración de promesas del propio motor. Con ella, un módulo puede llamar a una API asíncrona desde el fondo de su pila y continuar cuando resuelva, que es justo lo que parecía imposible en la lección anterior.
+
+No te salva de esta lección, y es importante saber por qué. Esa técnica no da acceso síncrono a OPFS desde el hilo principal: la restricción del manejador sigue intacta. Lo que hace es distinto —permitir que el motor use las APIs asíncronas de almacenamiento sin reescribirse—, y se paga en otra moneda: un binario notablemente mayor y más lento con `Asyncify`, o una dependencia de capacidades más recientes y menos uniformes con la integración nativa. Sigue siendo, además, entrada y salida asíncrona por debajo, con la latencia y el sobrecoste que eso implica en cada página que el pager necesita.
+
+<Callout type="dios" title="Has construido un sistema distribuido de dos nodos y aún no lo sabes">
+El error de comprensión más caro de este nivel es pensar que el worker es un detalle de implementación —un envoltorio, un lugar donde meter una biblioteca— cuando lo que has hecho es partir tu aplicación en dos procesos que solo se comunican por mensajes. Y en el momento en que eso ocurre, heredas de golpe el catálogo entero de problemas de los sistemas distribuidos, en miniatura pero completo: hay un protocolo entre las partes y por tanto habrá versiones incompatibles del protocolo cuando actualices una pestaña vieja; hay un estado en cada lado y por tanto habrá divergencia entre lo que el worker sabe y lo que la interfaz muestra; hay un canal y por tanto hay fallos de canal distintos de los fallos de negocio; hay un nodo que puede morir —un worker terminado por presión de memoria en un móvil— dejando peticiones huérfanas que nadie rechazará jamás; y hay latencia, que aunque sea de un milisegundo es latencia y se acumula. Reconocerlo cambia lo que escribes: dejas de exponer la base de datos y empiezas a diseñar una API de casos de uso, gruesa e intencionada, porque una interfaz remota se diseña distinto de una biblioteca local. Es exactamente el mismo salto mental que la industria hizo al pasar del monolito a los servicios, con la misma lección aprendida a base de golpes —los métodos finos y charlatanes no sobreviven a una frontera— solo que aquí la frontera no está en un centro de datos sino a cuatro milímetros, dentro de la misma pestaña. Y la ironía es completa: local-first nació para eliminar el viaje de ida y vuelta al servidor, y la restricción de OPFS te devuelve un viaje de ida y vuelta en miniatura que también hay que presupuestar. Cuánto cuesta exactamente y cómo se amortiza es la lección 5.
+</Callout>
+
+<Reto title="Levanta la frontera">
+1. Implementa el cliente y el servidor de RPC de esta lección y comprueba con tres consultas simultáneas que cada respuesta llega a su promesa correcta.
+2. Provoca una excepción de SQL dentro del worker y haz que llegue al cliente como un error con código y mensaje reconstruidos, no como una cadena suelta.
+3. Termina el worker a propósito con `worker.terminate()` mientras hay peticiones en vuelo. Escribe el código que rechaza todas las promesas pendientes en lugar de dejarlas colgadas.
+4. Mide el arranque en frío completo: descarga, compilación, instanciación, apertura de OPFS y migraciones. Decide qué muestra tu interfaz durante ese intervalo.
+5. Ejecuta una consulta deliberadamente cara y comprueba que una animación en el hilo principal sigue corriendo a la velocidad esperada. Compara con la misma consulta en `sql.js`.
+</Reto>

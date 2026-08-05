@@ -1,0 +1,150 @@
+---
+title: "Los backends posibles y su compromiso"
+description: "Memoria, almacén clave-valor, IndexedDB por bloques y OPFS resuelven de forma distinta el mismo compromiso entre durabilidad, velocidad y concurrencia, y la compilación oficial ya trae varias de esas implementaciones listas para usar."
+subject: local-first
+level: 12
+order: 4
+icon: "12.4"
+duracion: "19 min"
+---
+
+<Lead>
+Si la lección anterior te convenció de que el contrato admite cualquier medio capaz de persistir bytes, esta es la factura. Cada medio disponible en el navegador cumple ese contrato de una forma distinta, y ninguno lo cumple del todo bien: uno es rapidísimo y no persiste nada, otro persiste pero es asíncrono contra un contrato síncrono, otro es síncrono pero solo dentro de un Worker y bloqueando el fichero entero mientras lo lee. Elegir aquí no es escoger la mejor opción sino decidir qué propiedad estás dispuesto a sacrificar, y hacerlo con los ojos abiertos porque la decisión se filtra hasta la interfaz de usuario en forma de qué ocurre cuando alguien abre tu aplicación en dos pestañas.
+</Lead>
+
+<Objetivos>
+
+- Situar las cuatro familias de backend y qué ofrece exactamente cada una en durabilidad, velocidad y concurrencia.
+- Entender por qué un almacén asíncrono obliga a modificar el binario y qué cuesta esa modificación.
+- Conocer las implementaciones sobre OPFS que trae la compilación oficial y en qué se diferencian entre sí.
+- Elegir con criterio, sabiendo qué restricción de despliegue impone cada opción sobre tu servidor y tu producto.
+
+</Objetivos>
+
+## Memoria: la línea base sin durabilidad
+
+La opción más simple es no persistir. La base vive entera dentro de la memoria lineal del módulo, cada página es un fragmento de ese bloque contiguo y no hay contrato que cumplir más allá de copiar bytes de un sitio a otro del mismo `ArrayBuffer`. Es, con diferencia, la configuración más rápida que verás, y también la única que funciona sin condiciones en el hilo principal.
+
+Esta es la posición histórica de la opción clásica del ecosistema, la que popularizó la idea muchos años antes de que existiera una compilación oficial: corre en el hilo principal, no tiene persistencia propia y ofrece a cambio exportar la base entera como un vector de bytes que tú guardas donde quieras y vuelves a cargar al arrancar. Ese patrón sigue siendo perfectamente razonable para tres casos: conjuntos de datos de solo lectura que se descargan una vez, pruebas automatizadas, y aplicaciones donde la base cabe holgadamente en memoria y se guarda entera de tarde en tarde.
+
+```js
+// El patron clasico: la base vive en memoria y tu decides cuando y donde guardarla
+const bytes = db.export();                 // la base entera como vector de bytes
+await guardarEnOpfs("respaldo.sqlite3", bytes);
+// y al arrancar, el camino inverso
+const db2 = new SQL.Database(await leerDeOpfs("respaldo.sqlite3"));
+```
+
+Sus dos límites son duros, sin embargo. Uno es el techo de treinta y dos bits de la lección anterior, agravado porque aquí la base **entera** ocupa memoria, no solo la caché de páginas. El otro es que guardar significa serializar y escribir el fichero completo: una operación de coste proporcional al tamaño total, no al del cambio, que hace inviable el patrón de escrituras frecuentes en cuanto la base pasa de unos pocos megabytes.
+
+Y hay un tercer límite que no es de capacidad sino de comportamiento, y que el nivel 10 ya dejó claro: si el motor corre en el hilo principal, cada consulta cara congela la interfaz durante todo lo que dure. Una agregación de trescientos milisegundos es un tercio de segundo sin animaciones, sin respuesta al teclado y sin repintado. Que la opción en memoria sea la más rápida no impide que sea, para el usuario, la que peor se siente en cuanto los datos crecen.
+
+## El almacén clave-valor y el bloque como página
+
+La siguiente familia acepta la idea de que un fichero es una secuencia de bloques de tamaño fijo y guarda cada bloque como un registro independiente en un almacén de clave y valor. La clave es el nombre del fichero y el desplazamiento; el valor son los bytes. Leer una página es una búsqueda por clave; escribirla, una inserción o reemplazo. El fichero deja de existir como tal y pasa a ser una convención sobre un conjunto de registros.
+
+La compilación oficial trae una implementación de esta idea sobre `localStorage` y `sessionStorage`, y su interés es más didáctico que práctico. Guarda cada página de la base como una entrada separada del objeto de almacenamiento, codificada en una forma que el almacenamiento sepa retener, admite una única base por objeto y solo funciona en el hilo principal, porque esos objetos no existen en un Worker. Con un techo del orden de cinco megabytes que en la práctica es aún menor, sirve para configuraciones y prototipos, no para datos de usuario.
+
+```js
+// El almacen clave valor de la compilacion oficial, con su clase de comodidad
+const db = new sqlite3.oo1.JsStorageDb("local");
+db.exec("CREATE TABLE IF NOT EXISTS ajustes(clave TEXT PRIMARY KEY, valor TEXT)");
+const bytes = sqlite3.capi.sqlite3_js_kvvfs_size("local"); // estimacion de uso
+```
+
+Aun siendo un juguete, esta implementación enseña bien una técnica que sí usarás en serio: sembrar una base preparada en otro sitio. Como el motor sabe escribir una copia compacta de la base actual en cualquier destino, incluido uno servido por otra implementación, importar consiste en construir la base donde resulte cómodo y volcarla al almacén definitivo con una sola instrucción. Es el mismo mecanismo que emplearás para las copias de seguridad y para las exportaciones del usuario en la lección 5.
+
+```sql
+-- Construir en un sitio y volcar en otro, de forma consistente
+VACUUM INTO 'file:local?vfs=kvvfs';
+```
+
+Conviene entender la idea general por encima de esa implementación concreta, porque reaparece en todas partes. Trocear un fichero en bloques y guardarlos por clave es la misma técnica que emplean las capas intermedias de troceado que viste en la lección anterior, y tiene dos parámetros que lo deciden casi todo: el tamaño de bloque y la unidad de atomicidad. Si el bloque coincide con la página de la base, cada escritura del pager es un registro y no hay lectura previa; si es mayor, se ahorran registros pero cada escritura parcial obliga a leer, modificar y volver a escribir. Y si el almacén subyacente ofrece transacciones propias, la implementación puede apoyarse en ellas para que un grupo de bloques se aplique todo o nada, ahorrándose parte del trabajo de diario.
+
+La versión seria de esta idea es la que usa **IndexedDB** como almacén de bloques, y aquí llega la advertencia importante: la compilación oficial no la trae. Existe en implementaciones de la comunidad, siendo la más conocida la de wa-sqlite, que ofrece varias variantes según cómo agrupen las escrituras y cómo resuelvan la atomicidad. Y tienen todas el mismo problema de fondo: IndexedDB es asíncrono y el contrato del VFS es síncrono.
+
+<Callout type="warn" title="Un almacén asíncrono obliga a intervenir el binario">
+Hay dos formas de resolver esa contradicción y ninguna es gratis. La primera es transformar el módulo para que su pila pueda suspenderse a mitad de una llamada y reanudarse cuando la promesa resuelva; el precio es un binario notablemente mayor y más lento en todo, no solo en la entrada y salida. La segunda es apoyarse en la integración de promesas que ofrecen los motores modernos, mucho más eficiente pero con una disponibilidad menos uniforme. Sea cual sea, arrastras además todo lo aprendido en los niveles 7 y 8: coste por transacción, clonado estructurado de cada bloque y el autocierre de las transacciones inactivas. A cambio obtienes lo único que hoy no da fácilmente OPFS: acceso desde el hilo principal, soporte amplísimo y concurrencia entre pestañas gestionada por el propio almacén.
+</Callout>
+
+## OPFS: el destino natural
+
+El sistema de ficheros privado del origen es, conceptualmente, lo que este motor pedía desde el principio: ficheros reales, lectura y escritura por desplazamiento, y —a través del manejador de acceso síncrono del nivel 10— operaciones síncronas de verdad. La compilación oficial soporta escribir la base directamente sobre OPFS, lo que hace innecesario usar IndexedDB como intermediario para persistir. Ofrece para ello tres implementaciones que no son intercambiables.
+
+<Cards>
+  <Card icon="🗃️" title="La implementación base">
+    Registrada como `opfs` y accesible mediante `sqlite3.oo1.OpfsDb`. Escrita íntegramente en JavaScript, solo funciona dentro de un Worker y admite un grado razonable de concurrencia entre pestañas. Crea por su cuenta los directorios intermedios del nombre.
+  </Card>
+  <Card icon="🔐" title="La variante con Web Locks">
+    Registrada como `opfs-wl`, comparte casi todo el código con la anterior pero delega el bloqueo en la API de bloqueos del navegador, lo que reparte los turnos de forma estrictamente ordenada. Depende de capacidades más recientes del motor de JavaScript.
+  </Card>
+  <Card icon="⚡" title="El grupo de manejadores">
+    Registrada como `opfs-sahpool`, reserva por adelantado un conjunto de manejadores síncronos y reparte los ficheros entre ellos. Es la más rápida con diferencia y la única que no exige cabeceras especiales, pero no admite conexiones simultáneas.
+  </Card>
+  <Card icon="🧠" title="Solo en memoria">
+    Sin persistencia, dentro de la memoria lineal. Sigue siendo la referencia contra la que medir cualquiera de las anteriores, y la elección correcta para la mayoría de tus pruebas automatizadas.
+  </Card>
+</Cards>
+
+Las dos primeras comparten una exigencia que condiciona tu despliegue entero: necesitan `SharedArrayBuffer` para coordinar la parte síncrona con la parte asíncrona, y ese tipo solo está disponible si tu servidor emite las cabeceras de aislamiento de origen cruzado. Activarlas afecta a todo el sitio, no solo a la ruta de la base: recursos de terceros, iframes incrustados y anuncios pueden dejar de cargar. Ese es, en muchas organizaciones, el verdadero factor decisivo, y explica por qué la tercera opción es tan popular pese a sus limitaciones.
+
+```js
+// El grupo de manejadores hay que instalarlo explicitamente, y es asincrono
+const pool = await sqlite3.installOpfsSAHPoolVfs({ initialCapacity: 8 });
+const db = new pool.OpfsSAHPoolDb("/cuaderno.sqlite3"); // ruta absoluta obligatoria
+// El grupo trae utilidades propias de administracion
+pool.getFileNames();
+pool.importDb("/cuaderno.sqlite3", bytesDeUnaCopiaDeSeguridad);
+```
+
+Dos detalles de la implementación base ahorran horas de depuración. El primero es que, a diferencia de casi cualquier otra, crea por su cuenta los directorios intermedios del nombre cuando se abre con la bandera de creación, de modo que un nombre con varias partes funciona sin preparar nada. El segundo es que admite banderas propias en la URI: una fuerza a soltar los bloqueos implícitos en cuanto es posible, a costa de un impacto de rendimiento notable, y solo debe activarse si tienes un problema real de contención; otra borra el fichero antes de abrirlo, que es la vía limpia para recuperarse de una base corrupta sin bajar a las APIs del sistema de ficheros.
+
+```js
+// Solo si la contencion entre pestanas es un problema medido, no por si acaso
+const db = new sqlite3.oo1.OpfsDb("file:cuaderno.sqlite3?opfs-unlock-asap=1");
+// Y la salida de emergencia ante una base ilegible
+const limpia = new sqlite3.oo1.OpfsDb("file:cuaderno.sqlite3?delete-before-open=1");
+```
+
+Esa tercera opción paga su velocidad con dos renuncias concretas. La primera es que no admite conexiones simultáneas, porque bloquea de golpe todos los manejadores del grupo al instalarse; desde la versión que introdujo la pausa cooperativa es posible ceder el turno a otra pestaña, pero coordinarlo es trabajo tuyo. La segunda es que no hay transparencia de nombres: los ficheros que ves en OPFS no se llaman como tus bases, porque la implementación mantiene su propio mapa interno, y eso obliga a usar sus utilidades para importar, exportar y listar.
+
+<Callout type="note" title="Leer también bloquea">
+La restricción que más sorprende, y que hay que interiorizar antes de diseñar nada, es que en OPFS no existe la figura de varios lectores concurrentes. Adquirir el manejador síncrono bloquea el fichero en exclusiva, y el motor lo necesita también para leer. La consecuencia práctica es que dos pestañas del mismo origen se disputan el fichero incluso cuando ninguna escribe. Las implementaciones mitigan esto adquiriendo el bloqueo solo cuando hace falta y reintentando, pero el fallo acaba llegando a tu código como una condición de ocupado que tienes que tratar. Mantener las transacciones cortas y no dejar sentencias sin reiniciar deja de ser higiene y pasa a ser requisito.
+</Callout>
+
+## Cómo elegir
+
+Antes del diagrama, una advertencia sobre cómo se toma esta decisión en la práctica. Casi todo el mundo la toma leyendo comparativas de rendimiento, y casi todo el mundo se equivoca, porque las diferencias de rendimiento entre estas opciones son irrelevantes para la interacción humana típica —insertar una nota, marcar una tarea— y solo se vuelven visibles en operaciones por lotes: la carga inicial de datos, una migración grande, una importación. Si tu producto hace pocas de esas y muchas de las otras, el rendimiento no debería decidir nada; deben decidir la concurrencia entre pestañas y las cabeceras que puedes emitir.
+
+La recomendación de la propia documentación es sorprendentemente nítida y merece seguirla salvo que tengas un motivo mejor: si valoras el rendimiento por encima de la concurrencia, o si no puedes emitir las cabeceras de aislamiento, usa el grupo de manejadores; si necesitas de verdad varias pestañas trabajando a la vez sobre la misma base, usa la implementación base o su variante con bloqueos del navegador.
+
+<Mermaid code={`flowchart TB
+  A[Necesitas que los datos sobrevivan a la recarga] -->|no| M[Solo memoria]
+  A -->|si| B[Puedes ejecutar en un Worker]
+  B -->|no| I[Almacen clave valor o IndexedDB de la comunidad]
+  B -->|si| C[Necesitas varias pestanas a la vez sobre la misma base]
+  C -->|no| S[Grupo de manejadores sincronos]
+  C -->|si| D[Puedes emitir las cabeceras de aislamiento]
+  D -->|si| O[Implementacion base sobre OPFS]
+  D -->|no| I
+  style S fill:#a6e3a1,color:#11111b
+  style O fill:#89b4fa,color:#11111b
+  style M fill:#f9e2af,color:#11111b`} />
+
+Hay una noticia buena que suaviza el peso de la decisión: **cambiar de backend después es barato**. Como todos cumplen el mismo contrato y todos acaban produciendo el mismo formato de fichero, migrar consiste en exportar los bytes de uno e importarlos en otro, y las implementaciones traen utilidades para ambas direcciones. Lo que no es barato es cambiar la promesa de concurrencia que hayas hecho al usuario, ni retirar unas cabeceras de aislamiento que integraciones de terceros ya asumen. Elige, pues, mirando esas dos cosas y no la tabla de rendimiento.
+
+Al dimensionar el grupo de manejadores recuerda lo que la lección 3 anticipó: cada base en uso puede necesitar ficheros adicionales para el diario y para los temporales, de modo que la capacidad reservada tiene que ser holgadamente superior al número de bases, y el ajuste correcto depende de cómo configures el almacenamiento temporal. La biblioteca no puede adivinarlo por ti; es un número que aportas tú y que conviene validar con la carga real, no con el caso feliz.
+
+Dos matices finales que evitan sorpresas en producción. El primero es que el modo de registro anticipado, que en un servidor es la vía habitual para que lectores y escritor no se estorben, aquí está disponible pero exige poner la conexión en bloqueo exclusivo nada más abrirla y **no aporta ninguna ventaja de concurrencia**; puede dar algo de rendimiento con el grupo de manejadores y poco más. El segundo es que los modos de navegación privada o de invitado alteran o desactivan las capacidades de almacenamiento sin avisar y sin manera fiable de detectarlo, de modo que tu camino de degradación no es un adorno: es una rama que tus usuarios recorrerán.
+
+<Callout type="dios" title="No estás eligiendo un almacén: estás eligiendo qué modelo de concurrencia tendrá tu producto">
+La forma en que se presenta habitualmente esta decisión —una tabla comparativa con velocidad, soporte y tamaño— oculta que la única columna que de verdad importa no es técnica sino de producto. Todo lo demás se puede cambiar después: migrar de un almacén a otro es exportar bytes e importarlos, un trabajo de tarde. Lo que no se cambia después es la promesa que has hecho al usuario sobre qué ocurre cuando abre tu aplicación en una segunda pestaña, porque esa promesa se filtra a la interfaz, a la documentación, a los mensajes de error y a las expectativas de la gente. Y aquí el navegador te presenta una elección que en un servidor jamás tendrías que hacer, porque en un servidor la concurrencia es un problema resuelto por gente que no eres tú y que lleva décadas resolviéndolo. En una pestaña no lo es: OPFS te obliga a decidir entre velocidad y multiplicidad porque su primitiva de acceso síncrono es exclusiva por diseño, y esa exclusividad no es un defecto que vayan a arreglar sino la consecuencia de haber preferido un modelo simple y verificable a uno con bloqueo de rangos y semántica de fallo endiablada. De modo que la pregunta que debes responder antes de mirar ningún número es cuál de estas dos frases quieres poder decir: *tu trabajo está siempre disponible en cualquier pestaña que abras*, o *tu trabajo se edita en una pestaña cada vez, y esa es la más rápida que existe*. Ambas son respuestas legítimas y hay productos excelentes que han elegido cada una. Lo que no es legítimo es no haber elegido, descubrir la restricción cuando el primer usuario abre la segunda pestaña y confundir con un error lo que en realidad era una decisión de arquitectura que nadie tomó.
+</Callout>
+
+<Reto title="Mide el compromiso en tu máquina">
+1. Prepara el mismo conjunto de datos, del orden de decenas de miles de filas, sobre memoria, sobre el grupo de manejadores y sobre la implementación base de OPFS. Mide inserción por lotes, consulta con índice y arranque en frío.
+2. Abre tu página en dos pestañas contra la misma base con la implementación base y con el grupo de manejadores. Documenta exactamente qué error aparece en cada caso y en qué momento.
+3. Añade las cabeceras de aislamiento en tu servidor de desarrollo y comprueba qué recursos de terceros dejan de cargar. Esa lista es el coste real de la opción concurrente.
+4. Implementa el tratamiento de la condición de ocupado con reintento y espera creciente, y vuelve a repetir la prueba de dos pestañas midiendo cuántas operaciones sobreviven.
+5. Escribe la ruta de degradación completa para navegación privada: qué detectas, qué desactivas y qué le dices al usuario sin mencionar la palabra cuota.
+</Reto>

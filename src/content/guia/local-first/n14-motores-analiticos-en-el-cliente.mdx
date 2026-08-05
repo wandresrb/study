@@ -1,0 +1,157 @@
+---
+title: "Motores analíticos en el cliente: consultar columnas en el navegador"
+description: "Un motor columnar vectorizado compilado a WebAssembly convierte al navegador en un sitio donde agregar millones de filas es viable, y eso cambia qué clase de aplicación puedes construir sin servidor de análisis."
+subject: local-first
+level: 14
+order: 3
+icon: "14.3"
+duracion: "18 min"
+---
+
+<Lead>
+Todas las familias vistas hasta aquí comparten una suposición tan arraigada que rara vez se enuncia: que la unidad de trabajo es el registro. Guardas registros, lees registros, recorres registros. Esa suposición es correcta para la inmensa mayoría de las aplicaciones, porque la inmensa mayoría de las aplicaciones manipulan entidades una a una. Pero existe una clase de trabajo con datos donde el registro es la unidad equivocada y donde razonar así condena a un rendimiento pésimo: aquella en la que la pregunta no es *dame este documento* sino *cuánto suma esta columna agrupada por aquella otra*. Para esa clase de trabajo existe una familia entera de motores construidos sobre una representación distinta, y desde hace años uno de ellos vive dentro del navegador. Conviene entender qué hace diferente, qué cuesta y, sobre todo, para qué aplicación tiene sentido pagar ese coste.
+</Lead>
+
+<Objetivos>
+
+- Entender qué cambia al pasar de una representación orientada a registros a una orientada a columnas.
+- Conocer el modelo de ejecución vectorizado y por qué explica el rendimiento de las agregaciones.
+- Medir con honestidad el coste de entrada: descarga, arranque, memoria y travesía de los datos.
+- Reconocer el perfil de aplicación que justifica un motor analítico en el cliente y el que no.
+
+</Objetivos>
+
+## Qué cambia cuando el motor es columnar
+
+La diferencia empieza en el disco y termina en la caché del procesador. Un motor orientado a registros guarda juntos todos los campos de una fila, de modo que leer una fila entera es barato y leer un solo campo de un millón de filas obliga a tocar el millón de filas completas. Un motor columnar guarda juntos todos los valores de una misma columna, con lo que la segunda operación toca únicamente los bytes que necesita, y además esos bytes son homogéneos —mismo tipo, valores parecidos— lo que los hace comprimibles con técnicas que un montón de registros heterogéneos no admite.
+
+Encima de esa representación va un modelo de ejecución que la aprovecha. La documentación interna de DuckDB lo describe sin ambigüedad: el motor usa un modelo de ejecución vectorizado y todos sus operadores están optimizados para trabajar sobre vectores de tamaño fijo, con un tamaño estándar por defecto de 2048 tuplas. Los vectores admiten además varias representaciones físicas para los mismos datos lógicos —plana, constante, de diccionario, de secuencia— de manera que un valor repetido se almacena una sola vez y un segmento comprimido por diccionario puede seguir comprimido durante la ejecución de la consulta.
+
+<Mermaid code={`flowchart TB
+  A[Consulta con filtro y agregacion] --> B[Lectura solo de las columnas citadas]
+  B --> C[Vectores de tamano fijo]
+  C --> D[Operadores que procesan el vector entero]
+  D --> E[Resultado agregado]
+  B --> F[Columnas no citadas: nunca se tocan]
+  C --> G[Representaciones comprimidas que sobreviven a la ejecucion]
+  style C fill:#cba6f7,color:#11111b
+  style E fill:#a6e3a1,color:#11111b
+  style F fill:#89b4fa,color:#11111b`} />
+
+Ese último punto merece subrayarse porque es contraintuitivo y es donde se gana la mayor parte del rendimiento. En un sistema orientado a registros, la compresión es una técnica de almacenamiento: se comprime al escribir y se descomprime al leer, de modo que el motor siempre trabaja sobre datos expandidos. En un sistema columnar con representaciones físicas alternativas, un segmento comprimido por diccionario puede seguir comprimido mientras se ejecuta la consulta, con lo que la compresión deja de ser un ahorro de disco y pasa a ser un ahorro de trabajo: menos bytes que mover entre la memoria y el procesador, menos comparaciones que hacer, y una densidad de datos por línea de caché que un montón de registros heterogéneos no puede alcanzar. Es el mismo dato lógico, colocado de manera que la máquina real que lo procesa lo digiera mejor.
+
+La consecuencia práctica es una inversión completa del perfil de coste. Recuperar un documento entero por su clave, que en un motor de registros es la operación más barata que existe, aquí es relativamente cara porque hay que reconstruir la fila desde columnas dispersas. Y sumar una columna de varios millones de valores con un filtro por otra, que en un motor de registros es una tragedia, aquí es la operación para la que la máquina fue diseñada. No es que uno sea mejor: es que resuelven preguntas opuestas.
+
+<Callout type="warn" title="Un motor analítico no es un sustituto de tu base transaccional">
+La tentación al descubrir estas cifras es reemplazar el almacén de la aplicación por el motor analítico y quedarse con uno solo. Es un error de diseño previsible. Las escrituras pequeñas y frecuentes, la actualización de un campo de una fila concreta y las lecturas por clave primaria son exactamente el perfil que la representación columnar penaliza. La arquitectura sana es de dos piezas: tu base local sigue siendo la dueña del estado del usuario, y el motor analítico es un consumidor de solo lectura que se alimenta de ella o de ficheros externos, se usa para responder preguntas agregadas y puede reconstruirse desde cero cuando haga falta.
+</Callout>
+
+## El coste de entrada
+
+Nada de esto es gratis, y las cifras hay que ponerlas encima de la mesa antes de decidir. La primera partida es el tamaño: un motor analítico completo compilado a WebAssembly no es una librería pequeña, y su descarga y compilación se pagan en el arranque, no en la primera consulta. La segunda es la memoria, y aquí la propia documentación de DuckDB es explícita al enumerar las limitaciones de su cliente WebAssembly: por defecto usa un único hilo, y WebAssembly limita la memoria disponible a cuatro gigabytes, límite que los navegadores pueden restringir todavía más. La tercera partida es la travesía de los datos entre el mundo de JavaScript y el montón lineal del módulo, que ya conoces de niveles anteriores y que aquí importa especialmente porque el volumen que se mueve es grande por definición.
+
+Esa tercera partida es la que mejor se puede administrar, y la vía es no serializar. El cliente WebAssembly de DuckDB documenta un flujo en dos pasos: primero se registra el fichero en su sistema de ficheros virtual mediante funciones de registro, y después se importa con funciones de inserción o directamente desde una consulta.
+
+```js
+// Ingestion desde Arrow: representacion columnar a ambos lados,
+// sin convertir cada fila a objetos de JavaScript.
+const c = await db.connect();
+await c.insertArrowTable(tabla, { name: "eventos" });
+
+// Un fichero elegido por el usuario, sin cargarlo entero en memoria.
+await db.registerFileHandle(
+  "local.parquet",
+  ficheroElegido,
+  DuckDBDataProtocol.BROWSER_FILEREADER,
+  true,
+);
+
+await c.query(`CREATE TABLE hechos AS SELECT * FROM 'local.parquet'`);
+await c.close(); // cerrar la conexion libera memoria
+```
+
+<Callout type="note" title="El límite de memoria es un requisito de diseño, no una nota al pie">
+Que la memoria disponible esté acotada y que el cliente use por defecto un solo hilo tiene tres consecuencias que hay que incorporar al diseño desde el principio y no descubrir en producción. La primera es que el motor debe vivir en un *worker*, porque una consulta que tarda segundos en el hilo principal congela la interfaz entera y no hay forma de cancelarla desde fuera. La segunda es que hay que decidir de antemano qué se hace cuando una consulta agota la memoria, y la respuesta correcta casi nunca es dejar que el fallo suba sin traducir hasta la interfaz. Y la tercera es que liberar recursos es responsabilidad tuya: la propia documentación recuerda cerrar la conexión para liberar memoria, y en una aplicación de larga vida esa higiene es la diferencia entre una pestaña estable y una que se degrada a lo largo de la tarde.
+</Callout>
+
+Merece la pena detenerse en por qué Arrow aparece aquí. Cuando el motor es columnar y el formato de intercambio también lo es, la ingestión deja de ser una traducción registro a registro y pasa a ser un traspaso de bloques de columnas. La travesía sigue existiendo, pero su coste deja de ser proporcional al número de campos y pasa a serlo al número de bytes, que es una función mucho más benigna. Elegir bien el formato de entrada suele mover el tiempo de carga más que cualquier ajuste posterior de la consulta.
+
+## Consultar lo que no has descargado
+
+Hay una capacidad de esta familia que cambia la arquitectura más que el rendimiento, y es que la fuente de datos no tiene por qué estar en el dispositivo. La documentación del cliente WebAssembly describe una variante de su extensión de acceso por HTTP con la que se puede nombrar una dirección remota directamente en el texto de la consulta, y advierte de que si el fichero vive en un almacén de objetos habrá que configurar la cabecera de intercambio de recursos entre orígenes para que el navegador permita la lectura.
+
+```js
+// La tabla no esta en el dispositivo: se consulta donde vive.
+await c.query(`
+  CREATE TABLE directa AS
+    SELECT * FROM 'https://origen/remoto.parquet'
+`);
+
+// Y a partir de ahi, SQL analitico normal.
+const r = await c.query(`
+  SELECT categoria, count(*) AS n, sum(importe) AS total
+  FROM directa
+  WHERE fecha >= DATE '2026-01-01'
+  GROUP BY categoria
+  ORDER BY total DESC
+`);
+```
+
+Lo interesante no es el ahorro de una descarga previa, sino lo que implica para el reparto de responsabilidades. La capa de análisis deja de necesitar un servicio que exponga un extremo por cada pregunta posible; basta con publicar ficheros en un formato columnar y dejar que el cliente formule las preguntas que quiera. Eso convierte una superficie de API que crecía con cada nueva vista en un artefacto estático que se regenera por lotes, y traslada al navegador el trabajo de agregar. Es un cambio de arquitectura de primer orden, y como todos los de su clase, no es gratis: quien puede formular cualquier pregunta también puede formular una carísima, y el límite de memoria del módulo es real.
+
+<Callout type="tip" title="Publica ficheros, no extremos">
+Si tu panel de control tiene hoy quince rutas en el servidor que devuelven quince agregaciones distintas del mismo conjunto de datos, y cada nueva pregunta del negocio añade una ruta más, estás pagando en superficie de API lo que podría ser un único artefacto columnar publicado por lotes. Ese cambio no siempre compensa —depende de la frescura que necesites y de si los datos pueden salir del servidor—, pero cuando compensa, la reducción de código de servidor es de un orden de magnitud, y las preguntas nuevas dejan de requerir un despliegue.
+</Callout>
+
+## Para qué aplicación tiene sentido
+
+<Cards>
+  <Card icon="🔭" title="Sí: exploración interactiva">
+    Paneles donde la siguiente pregunta la decide una persona mirando la respuesta anterior. La latencia no es comodidad: por debajo de cierto umbral se explora y por encima se consulta, y son dos actividades cognitivas distintas. Aquí el motor local cambia el producto, no solo su velocidad.
+  </Card>
+  <Card icon="🔒" title="Sí: datos que no deben viajar">
+    Análisis sobre registros clínicos, financieros o de uso personal donde enviar el conjunto a un servidor es un problema legal o de confianza. Que el cálculo ocurra en el dispositivo convierte una restricción en una arquitectura, y es uno de los argumentos más sólidos de toda esta familia.
+  </Card>
+  <Card icon="🚫" title="No: gestión de entidades">
+    Altas, bajas y modificaciones de filas individuales, lecturas por clave primaria y escrituras frecuentes. Es el perfil que la representación columnar penaliza por construcción. Añadir aquí un motor analítico es pagar descarga y complejidad por acelerar consultas que no vas a hacer.
+  </Card>
+  <Card icon="🚫" title="No: volumen modesto">
+    Si tu conjunto son unos miles de filas, la agregación cabe en un bucle de JavaScript y termina antes de que el módulo haya acabado de compilarse. El motor analítico solo gana cuando el volumen es lo bastante grande como para que su coste fijo de arranque quede amortizado.
+  </Card>
+</Cards>
+
+El perfil que justifica esta familia es reconocible y estrecho. Son aplicaciones donde el usuario explora: paneles de control interactivos, herramientas de análisis de registros, cuadernos de datos, exploradores de conjuntos publicados, cualquier cosa donde la siguiente pregunta la decide una persona mirando el resultado de la anterior. En ese régimen, el ida y vuelta al servidor no es solo latencia: es la diferencia entre explorar y consultar, porque una espera de un segundo entre pregunta y respuesta rompe el hilo de pensamiento que hace productiva la exploración. También son aplicaciones donde los datos son grandes, homogéneos y de solo lectura, y donde la privacidad puede ser una razón adicional de peso: analizar en el dispositivo significa que el conjunto no viaja.
+
+El perfil que no lo justifica es todo lo demás, y en particular la aplicación de gestión que manipula entidades una a una, escribe con frecuencia y lee por clave. Ahí un motor analítico añade megabytes de descarga y una segunda copia del esquema a cambio de acelerar consultas que nunca vas a hacer.
+
+Cuando una aplicación necesita ambas cosas —y muchas las necesitan— la forma sana no es buscar un motor que haga las dos bien, porque no existe, sino declarar dos piezas con responsabilidades disjuntas y un flujo explícito entre ellas.
+
+```js
+// Pieza 1: el estado del usuario. Escrituras pequenas, lecturas por clave.
+await almacen.guardar("pedidos", pedido);
+
+// Pieza 2: el analisis. Solo lectura, reconstruible, vive en un worker.
+// Se alimenta por lotes desde la pieza 1, nunca al reves.
+async function refrescarAnalitica() {
+  const filas = await almacen.exportarColumnar("pedidos");
+  await analitica.reemplazarTabla("pedidos", filas);
+}
+
+// Y una propiedad de diseno que hay que preservar: si la pieza 2
+// desaparece, la aplicacion sigue funcionando con menos vistas.
+```
+
+Esa última línea es el criterio que distingue una arquitectura de dos piezas de un acoplamiento con pasos extra. Si al borrar el motor analítico la aplicación deja de arrancar, no tienes dos piezas: tienes una sola con dos motores dentro, y has perdido la capacidad de degradar cuando el dispositivo no da para más.
+
+<Callout type="dios" title="La representación no es un detalle de implementación: decide qué preguntas son baratas">
+La lección más transferible de esta familia no trata de ninguna herramienta concreta sino de una idea que reaparece en todos los niveles de la ingeniería de datos y que aquí se puede ver desnuda: la forma en que colocas los bytes determina qué preguntas son baratas, y ninguna cantidad de optimización posterior revierte esa decisión. Guardar juntos los campos de una entidad y guardar juntos los valores de un atributo son dos maneras de escribir exactamente la misma información, indistinguibles desde el modelo lógico, intercambiables sin perder un solo dato; y sin embargo producen máquinas con perfiles de coste opuestos, hasta el punto de que la operación más barata de una es de las más caras de la otra. Esto tiene tres consecuencias que conviene interiorizar juntas. La primera es que la pregunta correcta al evaluar un almacén no es *qué puede hacer* —casi todos pueden hacer casi todo si se les da tiempo suficiente— sino *qué hace barato*, porque lo que un sistema hace caro acaba desapareciendo del producto: nadie construye la vista que tarda ocho segundos, se cancela en el diseño y ni siquiera se registra como una limitación técnica. La segunda es que un sistema no puede optimizar simultáneamente para lecturas por clave y para agregaciones sobre millones de filas, y cualquiera que afirme lo contrario está ocultando en qué régimen mide; por eso la arquitectura honesta para una aplicación que necesita ambas cosas tiene dos motores con responsabilidades separadas y un flujo explícito entre ellos, y no un único almacén milagroso. Y la tercera, la que de verdad importa para local-first, es que llevar un motor analítico al navegador no es una proeza de rendimiento sino una redistribución de autoridad idéntica en su lógica a la que ya conoces: durante décadas, la capacidad de preguntar libremente sobre un conjunto de datos estuvo del lado del servidor, y el cliente solo podía consumir las respuestas que alguien había decidido de antemano ofrecerle. Que el cliente pueda ejecutar la consulta significa que puede formular preguntas que nadie anticipó, sobre datos que no tienen que salir de su dispositivo. Eso es exactamente el mismo movimiento que el resto de este track aplica al estado, aplicado esta vez a la capacidad de interrogarlo.
+</Callout>
+
+<Reto title="Decide con una medición, no con una intuición">
+1. Escribe las cinco preguntas más caras que tu aplicación responde hoy y clasifícalas en lectura por clave o agregación sobre muchas filas.
+2. Mide cuánto tarda hoy cada una de las agregaciones y cuánto de ese tiempo es red y cuánto es cálculo.
+3. Monta una prueba con un conjunto columnar real y compara el tiempo de arranque del motor con el tiempo de las consultas: comprueba cuál domina en tu caso.
+4. Repite la ingestión en dos formatos distintos y observa la diferencia en el tiempo de carga; explica el resultado con lo que sabes de la travesía.
+5. Fuerza deliberadamente una consulta que agote la memoria disponible y decide qué debe ver el usuario cuando eso ocurra.
+6. Escribe en un párrafo por qué tu aplicación pertenece o no pertenece al perfil que justifica esta familia, y sé honesto si la respuesta es que no.
+</Reto>

@@ -1,0 +1,152 @@
+---
+title: "Los envoltorios: qué aportan de verdad sobre la API cruda"
+description: "Qué añade cada envoltorio sobre IndexedDB —promesas, tipado, consultas y observabilidad— y en qué casos la dependencia no compensa, porque ninguno cambia la física de debajo."
+subject: local-first
+level: 8
+order: 5
+icon: "8.5"
+duracion: "16 min"
+---
+
+<Lead>
+La API de IndexedDB se diseñó cuando las promesas todavía no formaban parte del lenguaje, y se nota en cada línea: peticiones con manejadores de eventos, transacciones que se confirman solas por una regla implícita, cambios de versión que se declaran con código imperativo y cero notificación cuando los datos cambian. Los envoltorios existen para tapar eso. Conviene saber exactamente qué tapan, qué no pueden tapar y en qué punto la dependencia deja de compensar.
+</Lead>
+
+<Objetivos>
+
+- Enumerar los cuatro déficits reales de la API cruda: promesas, tipado, consultas y observabilidad.
+- Distinguir un envoltorio fino, que conserva la semántica nativa, de una capa gruesa que impone su propio modelo.
+- Conocer qué aportan `idb` y Dexie en concreto, y qué problema resuelve cada uno.
+- Decidir con criterio cuándo escribir cuarenta líneas propias es la respuesta correcta.
+
+</Objetivos>
+
+## Los cuatro déficits de la API cruda
+
+<Cards>
+  <Card icon="⛓️" title="Promesas">
+    Cada operación devuelve un `IDBRequest` con `onsuccess` y `onerror`. Encadenar tres lecturas produce una pirámide de manejadores anidados, y cualquier error dentro de un manejador se pierde si no se propaga a mano. Es el déficit más superficial y el que cualquier envoltorio resuelve.
+  </Card>
+  <Card icon="🏷️" title="Tipado">
+    El almacén devuelve `any`. No hay relación declarada entre el nombre de un almacén, la forma de sus registros y el tipo de su clave primaria, así que el compilador no puede verificar nada: ni que consultas un índice que existe, ni que el objeto que escribes tiene la forma que el esquema espera.
+  </Card>
+  <Card icon="🔎" title="Consultas">
+    Solo existen rangos sobre una única clave. Filtrar por dos campos, ordenar por uno distinto del que filtras o combinar condiciones exige índices compuestos declarados de antemano o recorrer y filtrar en memoria. No hay planificador que decida por ti, ni forma de expresar la intención sin decidir también la estrategia.
+  </Card>
+  <Card icon="📡" title="Observabilidad">
+    No hay eventos de cambio. Si otra pestaña, u otra parte de tu propio código, escribe en un almacén, nada te avisa. Mantener la interfaz sincronizada con la base exige que construyas tú la propagación, típicamente sobre `BroadcastChannel`, y que nadie escriba jamás sin pasar por tu capa.
+  </Card>
+</Cards>
+
+De los cuatro, el primero es cosmético y el cuarto es arquitectónico. Un proyecto puede vivir perfectamente sin promesas bonitas; ninguno vive bien sin saber cuándo han cambiado sus datos. Ese es el eje sobre el que conviene elegir.
+
+<Mermaid code={`flowchart TB
+  A[API cruda: eventos, sin tipos, sin consultas, sin avisos] --> B[Envoltorio de clave valor]
+  A --> C[Envoltorio fino con promesas]
+  A --> D[Capa gruesa con esquema y consultas]
+  B --> B1[cubre: promesas]
+  C --> C1[cubre: promesas y ergonomia nativa]
+  D --> D1[cubre: promesas, tipado, consultas, observabilidad]
+  B1 --> Z[ninguno cambia el coste fisico de debajo]
+  C1 --> Z
+  D1 --> Z`} />
+
+El diagrama tiene un final deliberado. La columna de lo que cada capa cubre crece hacia abajo, pero todas terminan en el mismo nodo, y ese nodo es el que decide el rendimiento de la aplicación.
+
+## El envoltorio fino: conservar la semántica
+
+La aproximación mínima consiste en envolver la API sin reinterpretarla: las peticiones se convierten en promesas, los cursores en iterables asíncronos, y todo lo demás —el modelo de transacciones, la regla de auto-confirmación, los índices, los rangos— sigue siendo exactamente el nativo. `idb` es el representante canónico de esta escuela, y su virtud es que no hay nada que desaprender: si conoces IndexedDB, ya lo conoces.
+
+```js
+import { openDB } from "idb";
+
+const db = await openDB("app", 3, {
+  upgrade(db, anterior, nueva, tx) {
+    if (anterior < 1) {
+      const s = db.createObjectStore("docs", { keyPath: "id" });
+      s.createIndex("porAutor", "autorId");
+    }
+    if (anterior < 3) tx.objectStore("docs").createIndex("porFecha", "actualizado");
+  },
+});
+
+// Atajos que abren su propia transaccion, para operaciones sueltas.
+const doc = await db.get("docs", 7);
+
+// Y la transaccion explicita para los lotes, con el patron correcto.
+const tx = db.transaction("docs", "readwrite", { durability: "relaxed" });
+for (const r of lote) tx.store.put(r);   // sin await dentro del bucle
+await tx.done;                            // una sola confirmacion
+```
+
+<Callout type="warn" title="Conservar la semántica incluye conservar las trampas">
+Que `tx.done` sea una promesa no cambia la regla de auto-confirmación: si dentro de la transacción esperas algo que no sea una petición de IndexedDB, la transacción se cierra igual y la siguiente operación lanza `TransactionInactiveError`. El envoltorio fino es transparente en lo bueno y en lo malo. Precisamente por eso es una buena elección para quien va a leer la especificación de todos modos: el conocimiento se transfiere entero en las dos direcciones.
+</Callout>
+
+Por debajo de este nivel existe todavía un escalón: los envoltorios de clave-valor puro, que exponen `get`, `set`, `del` y poco más sobre un único almacén. Resuelven el caso de "quiero persistir cuatro cosas" con una superficie mínima, y son la respuesta correcta a un problema que mucha gente ataca con una base de datos entera.
+
+## La capa gruesa: cambiar de modelo
+
+Dexie ocupa el otro extremo. No envuelve la API: propone un modelo distinto y traduce. El esquema se declara con una cadena por almacén en la que la primera posición es la clave primaria y el resto son índices, con marcas para el auto-incremento, la unicidad, la multi-entrada y las claves compuestas. Las versiones se declaran de forma acumulativa, cada una con su función de actualización opcional.
+
+```js
+import Dexie from "dexie";
+
+const db = new Dexie("app");
+db.version(3).stores({
+  docs: "id, autorId, actualizado, *etiquetas, [autorId+actualizado]",
+});
+
+// Consultas expresadas como intencion, no como recorrido de indice.
+const recientes = await db.docs
+  .where("[autorId+actualizado]")
+  .between([3, desde], [3, hasta])
+  .reverse()
+  .limit(50)
+  .toArray();
+
+// Escritura por lotes en una sola transaccion, sin escribir el bucle.
+await db.docs.bulkPut(lote);
+```
+
+Lo que aporta sobre los cuatro ejes es concreto. En **consultas**, un lenguaje encadenable con rangos, conjuntos de valores, ordenación y paginación, que se traduce a operaciones de índice cuando puede y cae a filtrado en memoria cuando no —conviene saber cuándo ocurre cada cosa, porque la sintaxis no lo distingue—. En **tipado**, tablas parametrizadas por el tipo del registro y el de su clave, de modo que el compilador verifica la forma de lo que escribes y de lo que lees. En **transacciones**, un bloque explícito que sobrevive a los `await` internos, resolviendo la trampa que el envoltorio fino conserva. En **observabilidad**, consultas vivas que se vuelven a ejecutar cuando cambia algo de lo que dependen, dentro de la pestaña y entre pestañas, más ganchos por operación para reaccionar a las escrituras.
+
+```js
+// Una consulta viva: se reevalua sola cuando alguien escribe lo que observa.
+const observable = Dexie.liveQuery(() => db.docs.where("autorId").equals(3).toArray());
+```
+
+<Callout type="info" title="Las consultas vivas son la razón real por la que se elige Dexie">
+Las promesas se pueden envolver en una tarde y el tipado se puede declarar a mano. Lo que no se improvisa es el seguimiento de dependencias que permite saber qué consultas se ven afectadas por una escritura concreta y reejecutar solo esas, propagándolo además a las demás pestañas del mismo origen. Construir eso bien —sin fugas, sin reejecutar de más y sin perder cambios— es un proyecto en sí mismo, y es la funcionalidad que de verdad justifica la dependencia. El resto se puede discutir.
+</Callout>
+
+## Cuándo no compensa
+
+Ningún envoltorio cambia la física de las cuatro lecciones anteriores. El clonado estructurado sigue recorriendo tu grafo nodo a nodo; la transacción sigue cobrando por confirmación; los índices siguen reescribiéndose en cada `put`; el disco sigue estando donde estaba. Un envoltorio puede empujarte a escribir el patrón correcto —`bulkPut` agrupa por ti, y eso ya vale mucho— pero jamás va a hacer rápido un esquema mal diseñado. Si tu problema es rendimiento, la solución está en el nivel 8.4, no en la lista de dependencias.
+
+<Cards>
+  <Card icon="🐢" title="Cuatro claves y un formulario">
+    Persistir preferencias o un borrador no necesita un motor de consultas. Un envoltorio de clave-valor, o incluso treinta líneas propias sobre la API cruda, resuelven el caso completo sin añadir un modelo que habrá que aprender y mantener.
+  </Card>
+  <Card icon="🧵" title="Ya tienes un Worker con su propia interfaz">
+    Si la capa de datos vive en un Worker y expone operaciones de dominio, la ergonomía de la API interna deja de importar: la escribes una vez, la lees casi nunca y nadie más la toca. Ahí el envoltorio aporta poco y su modelo puede estorbar al tuyo.
+  </Card>
+  <Card icon="🏗️" title="IndexedDB es solo el almacén de bloques">
+    Si por encima va a haber otro motor —SQLite en WebAssembly, un CRDT con su propio formato— lo único que se le pide a IndexedDB es guardar y devolver secuencias de bytes por clave. Cualquier capa de consultas encima es peso muerto.
+  </Card>
+  <Card icon="🔁" title="Necesitas más de lo que ofrece">
+    Si el requisito real es replicación y sincronización, el eje de decisión ya no es este: son bases locales completas con motor de réplica, que este track aborda más adelante. Elegir un envoltorio ahora para sustituirlo dentro de tres meses es el peor de los caminos.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Un envoltorio traslada el coste ergonómico; el coste físico no se subcontrata">
+La confusión que hay que deshacer antes de elegir es entre dos cosas que se parecen y no lo son: la dificultad de **usar** IndexedDB y la dificultad de **hacerlo rápido**. La primera es un problema de interfaz, nace de que la API se congeló en una época anterior a las promesas, y por definición se resuelve con una capa encima; es el único problema que un envoltorio puede resolver, y lo resuelve bien. La segunda es un problema de física del sistema: el algoritmo de clonado recorriendo un grafo, un motor transaccional confirmando lotes, árboles de índice reescribiéndose y un medio físico con su latencia. Nada de eso vive en la superficie, y por tanto nada de eso puede tapar una capa que solo toca la superficie. La consecuencia práctica es que la pregunta correcta al evaluar una dependencia no es cuál es mejor, sino cuál de los cuatro déficits te está costando dinero hoy: si la respuesta es "escribir manejadores es incómodo", el envoltorio más fino que exista es la respuesta completa y añadir más es aceptar un modelo que tendrás que aprender, versionar y depurar a cambio de nada; si la respuesta es "no sé cuándo cambian mis datos y mi interfaz se desincroniza", entonces estás comprando la única pieza que de verdad no se improvisa, y el peso está justificado. Y si la respuesta es "es lento", ningún punto de esa lista te sirve, porque el problema está tres capas por debajo de donde vive cualquier envoltorio, y lo que hay que rediseñar es el esquema.
+</Callout>
+
+<Reto title="Elige por déficit, no por popularidad">
+1. Escribe en una línea cuál de los cuatro déficits te está costando tiempo esta semana. Si no puedes, no necesitas ninguna dependencia todavía.
+2. Implementa el mismo caso de uso tres veces: sobre la API cruda, con un envoltorio fino y con una capa gruesa. Compara líneas escritas y errores cometidos.
+3. Mide las tres implementaciones con el mismo volumen. Comprueba que los tiempos son equivalentes y explica por qué tenían que serlo.
+4. Construye tú la propagación de cambios entre pestañas con `BroadcastChannel` y anota todo lo que se te olvidó la primera vez.
+5. Compara ese resultado con una consulta viva de Dexie y decide, con esa evidencia delante, si la dependencia compensa en tu proyecto.
+</Reto>

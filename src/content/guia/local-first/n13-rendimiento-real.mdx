@@ -1,0 +1,159 @@
+---
+title: "Rendimiento real: el cuello está en la travesía"
+description: "Los órdenes de magnitud reales de SQLite sobre OPFS, por qué el cuello de botella está en la travesía entre hilos y no en el motor, y cómo se comporta todo esto con bases de varios gigabytes."
+subject: local-first
+level: 13
+order: 4
+icon: "13.4"
+duracion: "17 min"
+---
+
+<Lead>
+La frase que circula sobre este montaje —SQLite sobre OPFS corre a velocidad casi nativa— es cierta y es engañosa a la vez, y la distancia entre ambas cosas es el contenido de esta lección. Es cierta porque el motor, compilado a WebAssembly y hablando con el manejador síncrono, hace su trabajo en el mismo orden de magnitud que haría sobre un disco de verdad. Y es engañosa porque casi nadie mide el motor: mide el tiempo que tarda una tabla en aparecer en la pantalla, que incluye un viaje de ida y vuelta entre hebras, una copia de cada fila del resultado y un ciclo de renderizado. Cuando alguien concluye que SQLite en el navegador es lento, en la enorme mayoría de los casos ha medido la travesía y le ha puesto el nombre del motor.
+</Lead>
+
+<Objetivos>
+
+- Separar los tres relojes que intervienen y saber cuál mide cada instrumento.
+- Situar el cuello de botella real y entender por qué no se arregla optimizando SQL.
+- Conocer las diferencias de rendimiento documentadas entre los VFS y qué las causa.
+- Anticipar el comportamiento con bases de varios gigabytes y el techo que impone la memoria.
+
+</Objetivos>
+
+## Tres relojes que no se pueden sumar
+
+Toda medición útil aquí empieza separando tres cosas que se confunden sistemáticamente.
+
+El primer reloj es el **motor**: planificar la consulta, recorrer el árbol, comparar claves. Es puro cálculo dentro de WebAssembly, sin entrada ni salida, y es la parte que corre a velocidad casi nativa —el sobrecoste frente al mismo binario compilado a código máquina es un factor pequeño, no un orden de magnitud—.
+
+El segundo es la **entrada y salida**: cada página que el pager no tiene en su caché se pide al manejador síncrono. Una lectura de una página está en el orden de las decenas de microsegundos, y no depende del tamaño de la base sino del número de páginas que la consulta toque. Aquí un índice ausente no cuesta un poco más: cuesta leer el fichero entero por el mismo canal.
+
+El tercero es la **travesía**: sacar el resultado del worker y llevarlo a la hebra que dibuja. Es un viaje de mensajes más el clonado estructurado de cada objeto que cruza, y su coste no tiene nada que ver con los dos anteriores. El nivel 10 ya lo midió; lo que cambia aquí es que ahora hay un motor detrás que puede producir cien mil filas en un abrir y cerrar de ojos y ahogar el canal con ellas.
+
+<Mermaid code={`flowchart LR
+  A[Consulta] --> B[Motor: planifica y recorre]
+  B --> C[Pager: pide paginas]
+  C --> D[Manejador sincrono en OPFS]
+  D --> C
+  B --> E[Resultado en el worker]
+  E --> F[Clonado estructurado]
+  F --> G[Hebra principal]
+  style B fill:#a6e3a1,color:#11111b
+  style D fill:#89b4fa,color:#11111b
+  style F fill:#f38ba8,color:#11111b`} />
+
+Sumar los tres relojes en una sola cifra es lo que produce diagnósticos falsos. Una consulta que el motor resuelve en un tiempo indistinguible de cero puede tardar decenas de milisegundos en llegar a la pantalla, y en ese caso reescribir el SQL no sirve absolutamente de nada.
+
+La proporción entre los tres es lo que hay que interiorizar, y es más desequilibrada de lo que la intuición sugiere. El primero y el segundo comparten orden de magnitud —microsegundos, decenas de microsegundos— porque ambos ocurren dentro de la misma hebra sin salir de ella. El tercero vive en otro régimen: hay un mensaje que atraviesa una frontera entre contextos de ejecución, un algoritmo de copia que recorre cada objeto del resultado y un turno del bucle de eventos que hay que esperar. No es que sea un poco más caro; es que se mide con otra unidad.
+
+## El cuello es la travesía, no el motor
+
+La regla operativa que se deriva de lo anterior cabe en una línea: **el coste no lo marca el tamaño del trabajo sino el número de cruces**. Una aplicación que ejecuta mil consultas pequeñas desde la hebra principal paga mil viajes; la misma aplicación que ejecuta una consulta que devuelve lo mismo agregado paga uno. La diferencia entre ambas versiones suele ser de dos órdenes de magnitud, y ninguna de las dos ha cambiado una coma del motor.
+
+De ahí salen tres patrones que valen más que cualquier ajuste.
+
+<Cards>
+  <Card icon="🧮" title="Agrega en el worker">
+    Si la interfaz muestra un total, un recuento o una página de veinte filas, que el SQL devuelva eso y no el conjunto entero. Cada fila que cruza se clona, y la que no cruza no cuesta nada.
+  </Card>
+  <Card icon="📦" title="Un cruce por interacción">
+    Diseña la capa de acceso en operaciones de negocio completas, no en primitivas. Una llamada que abre transacción, escribe, lee lo que la vista necesita y devuelve todo junto, en lugar de cinco llamadas encadenadas.
+  </Card>
+  <Card icon="📄" title="Pagina de verdad">
+    Un resultado grande no mejora troceándolo en muchos mensajes: mejora no pidiéndolo. Límite y desplazamiento por índice, o mejor, paginación por clave con la fila anterior como ancla.
+  </Card>
+  <Card icon="🔁" title="Escribe por lotes">
+    Miles de inserciones sueltas pagan miles de transacciones y miles de sincronizaciones. Envueltas en una sola transacción, el cambio de escala es brutal y además reduce la contención.
+  </Card>
+</Cards>
+
+El cuarto patrón merece una demostración porque el cambio de escala que produce no es incremental. Miles de inserciones sueltas ejecutan miles de transacciones, y cada transacción implica crear el journal, escribirlo, sincronizar, confirmar y borrarlo. Envueltas en una sola, todo ese protocolo se paga una vez.
+
+```js
+// La misma cantidad de datos, dos ordenes de magnitud de diferencia
+const stmt = db.prepare("insert into eventos (dia, tipo, carga) values (?,?,?)");
+db.exec("BEGIN");
+try {
+  for (const e of lote) stmt.bind([e.dia, e.tipo, e.carga]).stepReset();
+  db.exec("COMMIT");
+} catch (err) {
+  db.exec("ROLLBACK");
+  throw err;
+} finally {
+  stmt.finalize();
+}
+```
+
+Fíjate en que la sentencia se prepara una vez y se reutiliza reiniciándola, en lugar de compilarse en cada vuelta. Eso ahorra el trabajo del planificador por cada fila, que es pequeño pero real, y sobre todo mantiene el bloqueo del fichero tomado el mínimo tiempo posible, que es la otra mitad del problema. Reiniciar es además obligatorio por lo que viste en la lección anterior: una sentencia a medio consumir mantiene la base bloqueada.
+
+Sobre el motor propiamente dicho hay pocas diferencias que rascar entre los VFS, pero las que hay están documentadas y son coherentes con la lección uno. El VFS de conjunto de manejadores reservados es, con diferencia, el más rápido de los tres, y la razón es estructural: no tiene puente. Cada operación de fichero ocurre dentro de la misma hebra, sin dejar una petición en un búfer compartido ni dormirse esperando respuesta. La documentación es precisa sobre dónde se nota: en una interacción humana —modificar una entrada de una agenda— la diferencia es imperceptible; en operaciones por lotes es descarada. Entre el VFS con puente y su variante con bloqueos del navegador no hay ganador claro: las mediciones varían más entre dispositivos y entre ejecuciones que entre las dos implementaciones.
+
+<Callout type="warn" title="La perilla de concurrencia y la de rendimiento son la misma, girada al revés">
+Recuerda el dato de la lección anterior: liberar de inmediato los bloqueos implícitos puede multiplicar por cinco el tiempo de ejecución en cargas intensivas de entrada y salida. Esa cifra no es una curiosidad, es el mapa entero del compromiso de este nivel. Todo lo que mejora la convivencia entre pestañas —soltar antes, tomar más tarde, trocear más fino— empeora el rendimiento de una sola pestaña, y al revés. No existe una configuración óptima: existe una posición elegida en un eje, y conviene elegirla a sabiendas y anotarla en el código junto al motivo.
+</Callout>
+
+## Bases de varios gigabytes
+
+Aquí es donde el montaje deja de parecer un truco. Una base de varios gigabytes dentro del navegador es hoy un caso soportado, no una hazaña, y la razón es que el pager nunca lee el fichero entero: lee las páginas que la consulta toca. Una consulta por índice sobre una tabla de cincuenta millones de filas toca unas pocas decenas de páginas, y su coste es prácticamente independiente del tamaño total. El comportamiento a esa escala es exactamente el mismo que fuera del navegador, con las mismas reglas: el índice correcto lo cambia todo, el recorrido completo de tabla es proporcional al fichero, y las estadísticas del planificador merecen mantenerse.
+
+Lo que sí es distinto, y es el techo que conviene conocer antes de llegar a él, es la **memoria**. La compilación es de treinta y dos bits, de modo que el espacio de direcciones de su montón lineal está acotado en cuatro gigabytes, y en la práctica el navegador concede bastante menos. Esa limitación no afecta al tamaño del fichero, que vive en OPFS y se lee por páginas, pero sí afecta a todo lo que el motor necesite tener en memoria a la vez: la caché de páginas, los resultados intermedios de una ordenación, una tabla temporal, y por supuesto el conjunto de filas que estés a punto de hacer cruzar la frontera.
+
+```sql
+-- El tamano de pagina se fija al crear la base y no despues
+PRAGMA page_size = 8192;
+
+-- Cache en kibibytes cuando el valor es negativo. Elige a sabiendas
+PRAGMA cache_size = -32000;
+
+-- Que los temporales no salgan a fichero si no hace falta
+PRAGMA temp_store = MEMORY;
+```
+
+Ese último ajuste tiene un efecto lateral que enlaza con la lección uno: los ficheros temporales del motor ocupan plaza en el conjunto de manejadores reservados igual que las bases y los journals, y una ordenación grande que decida escribir a disco puede agotar la capacidad del pool. Si trabajas con ese VFS y con bases grandes, dimensionar la capacidad y decidir dónde viven los temporales dejan de ser detalles.
+
+A esa escala reaparecen además todas las herramientas clásicas del oficio, sin adaptación ninguna. El plan de ejecución sigue siendo la primera parada ante una consulta lenta, y sigue diciendo la verdad: si aparece un recorrido completo de tabla donde esperabas un índice, has encontrado el problema y no está en el navegador. Mantener actualizadas las estadísticas del planificador importa aquí más que en un servidor, porque cada página que decide leer de más pasa por el manejador síncrono y compite por el bloqueo con el resto de tu aplicación.
+
+```sql
+-- El diagnostico no cambia porque el disco sea un navegador
+EXPLAIN QUERY PLAN
+SELECT tipo, count(*) FROM eventos WHERE dia BETWEEN ? AND ? GROUP BY tipo;
+
+ANALYZE;  -- estadisticas frescas para el planificador
+```
+
+<Callout type="dios" title="El motor dejó de ser el problema hace veinte años y nadie actualizó el modelo mental">
+Hay algo desconcertante en la forma en que se discute el rendimiento de las bases de datos en el cliente, y esta lección lo deja al descubierto. La intuición dominante dice que el motor es la parte cara —es donde está el algoritmo, el árbol, el planificador, la palabra base de datos— y que el transporte es fontanería. Aquí ocurre lo contrario con una claridad que rara vez se puede observar tan limpiamente: el motor resuelve en microsegundos y la fontanería cuesta milisegundos, tres órdenes de magnitud de diferencia a favor de lo que creías caro. Y no es una anomalía del navegador. Es exactamente el mismo desplazamiento que ya ocurrió en el servidor cuando los discos se volvieron rápidos y la red no, cuando la latencia entre servicios pasó a dominar el tiempo de respuesta de sistemas cuyas consultas individuales eran instantáneas, cuando dejamos de optimizar consultas y empezamos a contar viajes. La travesía entre un worker y la hebra principal es, estructuralmente, una llamada de red muy corta: hay serialización, hay un canal, hay un coste fijo por mensaje que no depende de lo que transportes. Por eso todo lo que aprendiste sobre no hacer una consulta por elemento en un bucle sirve aquí sin traducir, y por eso la pregunta correcta al diseñar la capa de acceso a la base local no es qué SQL escribo, sino **cuántas veces cruzo la frontera por cada cosa que el usuario hace**. Quien interioriza eso construye aplicaciones locales que se sienten instantáneas con bases de gigabytes, y quien no lo hace acaba concluyendo que la web no está preparada, cuando lo que no estaba preparado era su modelo de dónde se va el tiempo.
+</Callout>
+
+## Medir en lugar de creer
+
+Ninguna de las cifras de esta lección debe entrar en tu proyecto sin comprobarse, porque dependen del dispositivo, del navegador y de la versión, y porque el reparto entre los tres relojes es distinto en cada aplicación. Lo que sí es transferible es el método: **instrumenta los tres tramos por separado y mira cuál domina antes de tocar nada**.
+
+```js
+// Dentro del worker: separa el motor de la travesia
+const t0 = performance.now();
+const filas = db.selectObjects("select * from eventos where dia = ?", [dia]);
+const t1 = performance.now();
+postMessage({ filas, motor: t1 - t0, enviado: performance.now() });
+
+// En la hebra principal: el tercer tramo se mide al recibir
+worker.onmessage = (e) => {
+  const travesia = performance.now() - e.data.enviado;
+  console.log("motor", e.data.motor, "travesia", travesia, "filas", e.data.filas.length);
+};
+```
+
+<Callout type="tip" title="Mide en el dispositivo malo, no en el tuyo">
+Las tres partes de esta lección escalan de forma distinta con la potencia del dispositivo, y esa es la razón por la que medir en una máquina de desarrollo produce conclusiones que no se sostienen. El cálculo del motor mejora con la frecuencia del procesador; la entrada y salida depende del almacenamiento del aparato, que en un teléfono modesto puede ser un orden de magnitud más lento; y el coste de la travesía crece con el número de objetos que se copian, es decir, con la memoria disponible y con lo ocupado que esté el bucle de eventos. Un cuello de botella que en tu portátil está en el motor puede estar en el disco en el teléfono del usuario, y la optimización correcta es la contraria en cada caso.
+</Callout>
+
+Dos cautelas más para que la medición valga algo. La primera: mide siempre en frío y en caliente por separado, porque la caché de páginas del pager cambia el resultado por completo entre la primera ejecución y la segunda, y ambos números son reales para casos distintos. La segunda: mide con el volumen de datos que vas a tener, no con el que tienes hoy. Casi todos los diseños que se caen a los cinco gigabytes se veían perfectos con cinco megabytes, y el punto en el que dejan de funcionar nunca es el que uno espera.
+
+<Reto title="Encuentra tu cuello de botella de verdad">
+1. Instrumenta los tres relojes por separado en una consulta real de tu aplicación y publica los tres números. Decide cuál domina antes de optimizar nada.
+2. Coge la pantalla más lenta que tengas y cuenta los cruces de frontera que hace por cada interacción del usuario. Redúcelos a uno y vuelve a medir.
+3. Compara el mismo lote de escrituras sobre el VFS con puente y sobre el de manejadores reservados. Explica la diferencia con la arquitectura, no con el resultado.
+4. Genera una base de al menos un gigabyte y mide una consulta por índice y un recorrido completo de tabla. Justifica por qué solo una de las dos depende del tamaño.
+5. Sube la caché de páginas hasta que el navegador se queje y anota dónde estaba el límite en tu dispositivo. Relaciónalo con el espacio de direcciones de treinta y dos bits.
+</Reto>

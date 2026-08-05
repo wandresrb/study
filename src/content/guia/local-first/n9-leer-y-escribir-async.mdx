@@ -1,0 +1,149 @@
+---
+title: "Leer y escribir: el flujo de escritura y el objeto de fichero"
+description: "Cómo se escribe con manejadores de escritura y su copia de trabajo oculta, cómo se lee sin cargar nada en memoria, y qué pasa con todo esto cuando el fichero pesa gigabytes."
+subject: local-first
+level: 9
+order: 3
+icon: "9.3"
+duracion: "16 min"
+---
+
+<Lead>
+Escribir en OPFS por el camino asíncrono no modifica el fichero: crea una copia de trabajo invisible, acumula ahí tus cambios y la publica de golpe cuando cierras. Esa indirección te regala atomicidad gratis —nadie verá jamás un fichero a medio escribir— y te cobra un precio que crece con el tamaño del fichero hasta hacerse insoportable. Entender exactamente dónde está la frontera es lo que separa usar OPFS de sufrirlo.
+</Lead>
+
+<Objetivos>
+
+- Dominar el ciclo de vida de un manejador de escritura y sus tres comandos.
+- Entender la copia de trabajo, la publicación atómica al cerrar y el papel de conservar los datos existentes.
+- Leer sin materializar en memoria mediante el objeto de fichero, los rangos y los flujos.
+- Reconocer el techo del camino asíncrono y por qué existe el nivel 10.
+
+</Objetivos>
+
+## Escribir: la copia de trabajo
+
+`createWritable()` devuelve un `FileSystemWritableFileStream`, que es un flujo de escritura estándar con tres comandos extra. Mientras esté abierto, el fichero visible no cambia ni un byte: todo va a una copia intermedia que el navegador mantiene aparte.
+
+<Mermaid code={`flowchart LR
+  A[createWritable] --> B[Copia de trabajo oculta]
+  B --> C[write y seek y truncate]
+  C --> D[close]
+  D --> E[Reemplazo atomico del fichero]
+  C --> F[abort]
+  F --> G[Se descarta todo y el fichero queda intacto]`} />
+
+```js
+const raiz = await navigator.storage.getDirectory();
+const h = await raiz.getFileHandle('nota.txt', { create: true });
+
+const w = await h.createWritable();
+await w.write('hola mundo');                            // escribe y avanza
+await w.write({ type: 'seek', position: 0 });           // reposiciona
+await w.write({ type: 'write', position: 5, data: 'MUNDO' });
+await w.truncate(10);                                   // recorta o rellena
+await w.close();                                        // aquí se publica
+```
+
+`write()` acepta texto, un `Blob`, un `ArrayBuffer`, una vista tipada o un objeto de comando con `type`, `position` y `data`. La forma con posición explícita es la que te da acceso aleatorio real, y es la que usarías para tocar la cabecera de un formato binario sin reescribir el resto.
+
+Ahora el detalle que arruina más datos en producción: **por defecto la copia de trabajo empieza vacía**. Si abres un fichero de un megabyte, escribes cuatro bytes y cierras, el fichero mide cuatro bytes. No has parcheado nada: lo has sustituido.
+
+```js
+// Destructivo: el contenido anterior desaparece al cerrar.
+const w1 = await h.createWritable();
+await w1.write('x');
+await w1.close();                       // el fichero mide 1 byte
+
+// Preservando: la copia parte del contenido actual.
+const w2 = await h.createWritable({ keepExistingData: true });
+await w2.write({ type: 'write', position: 1_000_000, data: 'y' });
+await w2.close();
+```
+
+<Callout type="warn" title="Conservar los datos existentes cuesta una copia entera">
+La opción que preserva el contenido no es una bandera de semántica: es una orden de copiar el fichero. Sobre dos gigabytes significa mover dos gigabytes de disco a disco antes de que tu primer `write` llegue a ejecutarse, y otra vez el espacio ocupado mientras dure la operación. Escribir un byte en el centro de un fichero grande por este camino cuesta el doble del fichero. No es un detalle de rendimiento: es el motivo de que exista el camino síncrono del nivel 10.
+</Callout>
+
+También hay exclusión mutua. Mientras un manejador de escritura esté abierto sobre una entrada de OPFS, otro intento de abrirlo falla con `NoModificationAllowedError`. Es un cerrojo real que atraviesa pestañas y workers del mismo origen, y por tanto es tu primera línea de defensa contra dos escritores concurrentes, aunque no sustituye a una coordinación explícita con Web Locks.
+
+## Leer: el objeto de fichero es perezoso
+
+`getFile()` devuelve un `File`, que es un `Blob` con nombre y fecha de modificación. La llamada **no lee nada**: te entrega una referencia con metadatos y la lectura ocurre cuando pides los bytes.
+
+```js
+const archivo = await h.getFile();
+archivo.size;           // bytes, sin haber leído ninguno
+archivo.lastModified;   // milisegundos desde epoch
+
+await archivo.text();          // AHORA sí: todo a memoria
+await archivo.arrayBuffer();   // ídem, y como copia binaria
+
+// Rango perezoso: slice no materializa nada.
+const cabecera = await archivo.slice(0, 100).arrayBuffer();
+```
+
+`slice()` es la herramienta central para trabajar con ficheros grandes: devuelve otro `Blob` que sigue siendo una referencia a un rango, y solo el `arrayBuffer()` final trae bytes a memoria. Con eso puedes leer la página 5000 de un fichero de dos gigabytes tocando cuatro kilobytes.
+
+Un objeto de fichero es además una **instantánea**. Si otra pestaña reescribe la entrada después de que lo obtuvieras, tu referencia queda obsoleta y leerla puede fallar:
+
+```js
+const viejo = await h.getFile();
+// ... otro escritor cierra un manejador de escritura sobre h ...
+await viejo.text();   // puede lanzar NotReadableError
+```
+
+La regla práctica es no guardar objetos de fichero: guarda el manejador, que es estable, y pide un fichero nuevo justo antes de cada lectura. Un objeto de fichero es un préstamo con fecha de caducidad desconocida; un manejador es una referencia.
+
+Esa misma caducidad explica una asimetría que sorprende al principio: el manejador no te dice el tamaño, ni la fecha de modificación, ni si la entrada sigue existiendo. Todo eso vive en el objeto de fichero, es decir, en la instantánea, precisamente porque son datos que pueden dejar de ser ciertos en cualquier momento. La API prefiere obligarte a pedirlos otra vez antes que dejarte creer que tienes un `stat` cacheado y correcto.
+
+## Datos grandes: flujos en las dos direcciones
+
+Para tamaños que no caben en memoria, ninguna de las dos puntas debe materializarse. Un `Blob` produce un flujo de lectura y un manejador de escritura *es* un flujo de escritura, así que se conectan directamente:
+
+```js
+// Descargar a disco sin pasar por memoria, con contrapresión incluida.
+const respuesta = await fetch('/modelo.bin');
+const destino = await raiz.getFileHandle('modelo.bin', { create: true });
+await respuesta.body.pipeTo(await destino.createWritable());
+```
+
+```js
+// Leer por trozos: nunca hay más de un fragmento vivo.
+const lector = (await h.getFile()).stream().getReader();
+let leidos = 0;
+while (true) {
+  const { done, value } = await lector.read();
+  if (done) break;
+  leidos += value.byteLength;   // value es un Uint8Array
+}
+```
+
+<Cards>
+  <Card icon="📥" title="Añadir al final">
+    Abre conservando los datos, sitúate en `size` y escribe. Correcto pero caro: cada anexión copia el fichero entero. Para un registro que crece sin parar, este camino no sirve.
+  </Card>
+  <Card icon="🧩" title="Trocear en vez de crecer">
+    El patrón que sí escala en el camino asíncrono es no tener ficheros grandes: segmentos de unos pocos megabytes, siempre escritos completos y nunca modificados, y una compactación periódica que fusiona los viejos.
+  </Card>
+  <Card icon="🔁" title="Una llamada, un viaje">
+    Cada `write` asíncrono cruza al hilo de almacenamiento. Mil escrituras de un kilobyte cuestan mucho más que una de un megabyte: agrupa en memoria y vuelca de una vez.
+  </Card>
+  <Card icon="🛡️" title="Cerrar es publicar">
+    Si el proceso muere entre la primera escritura y el cierre, el fichero queda como estaba. La copia de trabajo te da una transacción de todo o nada sin que la hayas pedido.
+  </Card>
+</Cards>
+
+## El techo del camino asíncrono
+
+<Callout type="dios" title="La atomicidad que te regalan es exactamente la que te impide construir una base de datos">
+Merece la pena mirar de frente la contradicción que gobierna esta lección. El manejador de escritura asíncrono está diseñado para un caso de uso muy concreto y muy razonable: guardar un documento. Un editor abre el fichero, vuelca su estado y cierra, y la copia intermedia garantiza que un corte de luz en mitad de la operación nunca deja un documento corrupto a medias, que es justo el fallo que más aterra en esa clase de aplicación. Para eso, copiar el fichero entero y publicarlo de golpe es la decisión correcta, porque el coste es proporcional al tamaño de algo que de todas formas se iba a reescribir completo. El problema es que una base de datos hace lo contrario en cada operación: modifica unos pocos kilobytes en el interior de un fichero enorme que no piensa reescribir, y necesita que ese cambio sea visible y duradero antes de continuar, porque el protocolo de recuperación depende del orden exacto en que las escrituras llegaron al disco. Un modelo que copia el fichero para tocarlo y que solo publica al cerrar hace ambas cosas imposibles a la vez: el coste deja de ser proporcional al cambio y pasa a ser proporcional al total, y la unidad de durabilidad deja de ser la escritura y pasa a ser la sesión entera. Por eso ninguna capa de persistencia seria se construye sobre este camino, y por eso la especificación añadió después una segunda puerta —los manejadores de acceso síncrono, disponibles solo dentro de un worker dedicado, que escriben en su sitio, leen en su sitio y ofrecen un vaciado explícito— que no es una optimización del camino que acabas de aprender, sino su negación deliberada. Todo el nivel 10 vive ahí. Lo que aprendes aquí sigue siendo lo correcto para adjuntos, exportaciones, cachés de recursos y descargas grandes, es decir, para todo lo que se escribe una vez y se lee muchas; en cuanto tu patrón sea modificar poco dentro de mucho, has salido del dominio de esta API y hay que cambiar de puerta.
+</Callout>
+
+<Reto title="Mide la copia de trabajo">
+1. Crea un fichero de doscientos megabytes y cronometra dos escrituras de un byte: una conservando los datos existentes y otra sin conservarlos. Explica el factor que obtienes.
+2. Abre dos manejadores de escritura sobre el mismo fichero desde dos pestañas y confirma que el segundo lanza `NoModificationAllowedError`.
+3. Escribe cinco megabytes con cinco mil llamadas de un kilobyte y luego con una sola llamada. Compara los tiempos.
+4. Descarga un fichero grande con `pipeTo` y comprueba en el monitor de memoria que la pestaña no crece.
+5. Obtén un objeto de fichero, sobrescribe la entrada desde otra pestaña y provoca el fallo al leer la instantánea vieja.
+</Reto>

@@ -1,0 +1,165 @@
+---
+title: "El paso de mensajes: la memoria que nadie comparte"
+description: "La web decidió no compartir memoria entre hilos y comunicarlos solo con mensajes, una elección que elimina de raíz las carreras de datos y traslada la concurrencia del modelo de memoria al protocolo."
+subject: local-first
+level: 16
+order: 2
+icon: "16.2"
+duracion: "17 min"
+---
+
+<Lead>
+Cuando se diseñaron los Web Workers, la decisión difícil no fue añadir hilos sino elegir cómo se hablarían entre sí. Había un camino trillado —memoria compartida más cerrojos, el modelo de C, Java y prácticamente todo lo que se enseñaba entonces— y otro minoritario, heredado de los actores de Hewitt y de los procesos secuenciales comunicantes de Hoare, que había madurado en Erlang bajo el lema de no compartir nada. La web tomó el segundo, y lo hizo por una razón de plataforma antes que de elegancia: no se puede pedir a millones de programadores de páginas que razonen correctamente sobre visibilidad de memoria y reordenación de instrucciones. El resultado es que en la web una clase entera de errores no es que sea difícil de cometer: es que resulta *inexpresable*.
+</Lead>
+
+<Objetivos>
+
+- Situar la elección de la web en la historia de los modelos de concurrencia y entender qué compró.
+- Nombrar con precisión los errores que desaparecen y los que siguen ahí con otro disfraz.
+- Construir topologías directas con `MessageChannel` sin hacer del hilo principal un cuello de botella.
+- Reconocer la atomicidad que regala la ejecución hasta el final y cómo un `await` la destruye.
+
+</Objetivos>
+
+## Una elección de plataforma, no de gusto
+
+Compartir memoria entre dos hilos suena inofensivo hasta que se mira de cerca. Dos hilos que leen y escriben las mismas direcciones sin coordinación producen *carreras de datos*, y una carrera de datos no es simplemente un valor equivocado: en los lenguajes con modelo de memoria relajado es directamente comportamiento indefinido, porque el compilador reordena instrucciones y el procesador tiene cachés por núcleo que no se sincronizan solas. El arsenal para domarlo —mutex, variables de condición, barreras, operaciones atómicas, anotaciones de volatilidad— es correcto y está bien estudiado, y aun así lleva cincuenta años produciendo fallos que solo aparecen en producción, en una máquina concreta, un martes.
+
+La alternativa que la web adoptó invierte el planteamiento. Cada agente es dueño absoluto de su memoria y ningún otro puede alcanzarla; lo único que cruza es una **copia** de un valor, depositada en la cola de mensajes del destinatario. No hay memoria común, luego no hay nada que proteger, luego no hacen falta cerrojos, luego no puede haber bloqueo mutuo por cerrojos. La cadena entera de problemas se corta en el primer eslabón.
+
+<Mermaid code={`flowchart TB
+  subgraph M[Modelo de memoria compartida]
+    A1[Hilo A] --> R[Region de memoria comun]
+    A2[Hilo B] --> R
+    R --> C1[Carreras de datos]
+    R --> C2[Cerrojos y bloqueos mutuos]
+    R --> C3[Visibilidad y reordenacion]
+  end
+  subgraph W[Modelo de la web]
+    B1[Agente A] -- copia --> Q[Cola de mensajes]
+    Q -- copia --> B2[Agente B]
+    B2 --> D1[Sin carreras de datos]
+    B2 --> D2[Sin cerrojos]
+  end
+  style R fill:#f38ba8,color:#11111b
+  style Q fill:#a6e3a1,color:#11111b`} />
+
+El precio de esa garantía es explícito y se paga en cada envío: hay que copiar. Una estructura que en un lenguaje con hilos se pasaría por puntero en cero nanosegundos aquí se recorre nodo a nodo y se reconstruye al otro lado. Ese peaje es el tema de la lección siguiente, y las dos escapatorias que existen —mover en vez de copiar, o abrir de nuevo la puerta de la memoria compartida— son el tema de la cuarta. Por ahora basta con nombrarlo: la ausencia de carreras no fue gratis, se compró con copias.
+
+## Lo que desaparece y lo que no
+
+Conviene ser quirúrgico, porque el entusiasmo lleva a creer que el paso de mensajes elimina *la concurrencia*, y no elimina nada de eso: elimina una familia concreta de errores y deja intacta otra, que además se vuelve más visible.
+
+<Cards>
+  <Card icon="✅" title="Se van las carreras de datos">
+    Dos agentes no pueden escribir la misma dirección, así que no hay lecturas rotas a medias, ni valores que se pierden entre un `leer` y un `escribir`, ni depender de que el procesador publique una caché.
+  </Card>
+  <Card icon="✅" title="Se van los cerrojos">
+    Sin memoria común no hay nada que proteger. Desaparecen el mutex olvidado, el orden de adquisición incoherente y el bloqueo mutuo clásico entre dos hilos que se esperan.
+  </Card>
+  <Card icon="⚠️" title="Quedan las carreras lógicas">
+    Dos mensajes que llegan en orden inesperado pueden dejar tu estado en un sitio incorrecto. No es un fallo de memoria: es un fallo de protocolo, y se razona y se prueba como tal.
+  </Card>
+  <Card icon="⚠️" title="Queda la divergencia">
+    Cada lado guarda su versión de la verdad. Que el Worker sepa una cosa y la interfaz muestre otra es el problema central de todo sistema distribuido, y ahora tienes uno de dos nodos.
+  </Card>
+</Cards>
+
+La diferencia entre las dos familias no es de gravedad sino de *tratabilidad*, y ahí está el verdadero beneficio. Una carrera de datos depende del planificador, de la microarquitectura y de la fase lunar; no se reproduce, no se registra bien y a menudo desaparece al añadir la instrumentación para observarla. Una carrera de mensajes, en cambio, es una secuencia concreta de eventos: se puede grabar, reproducir, reordenar a propósito en una prueba e incluso enumerar exhaustivamente si el protocolo es pequeño. Has cambiado un fallo no determinista de bajo nivel por un fallo determinista de alto nivel. Es exactamente el mismo canje que hace todo sistema distribuido, y es el que hace que la depuración deje de ser arqueología.
+
+## Canales, puertos y topologías
+
+El par `postMessage` y el evento `message` es la superficie mínima, pero no es la única. La abstracción general es el **puerto**: un extremo de un canal punto a punto que se puede crear a voluntad y —esto es lo importante— **transferir** dentro de un mensaje. Con eso puedes montar topologías arbitrarias en las que el hilo principal actúa de casamentero y después se aparta.
+
+```js
+// el hilo principal presenta a dos workers y se retira del camino
+const canal = new MessageChannel();
+const lector = new Worker('/lector.js', { type: 'module' });
+const indice = new Worker('/indice.js', { type: 'module' });
+
+lector.postMessage({ tipo: 'canal', puerto: canal.port1 }, [canal.port1]);
+indice.postMessage({ tipo: 'canal', puerto: canal.port2 }, [canal.port2]);
+// desde ahora los dos hablan directamente: la interfaz no ve ese trafico
+```
+
+```js
+// dentro de lector.js
+let par = null;
+
+self.onmessage = ({ data }) => {
+  if (data.tipo !== 'canal') return;
+  par = data.puerto;
+  par.onmessage = ({ data }) => procesar(data);  // asignar onmessage arranca el puerto
+  par.postMessage({ hola: true });
+};
+```
+
+Un detalle que muerde: un `MessagePort` empieza dormido. Si usas `addEventListener` en lugar de asignar `onmessage`, tienes que llamar a `port.start()` a mano o los mensajes se acumulan sin entregarse. Asignar la propiedad lo arranca implícitamente, y esa asimetría ha costado muchas horas de depuración a gente que juraba que su canal estaba roto.
+
+El canal ofrece además una garantía que casi nunca se enuncia y sobre la que se apoya mucho código: los mensajes de un mismo puerto se entregan **en orden**. No hay reordenación, no hay pérdida, no hay duplicados. Es un enlace fiable y ordenado, es decir, mucho más fuerte que una red, y por eso la analogía con los sistemas distribuidos hay que usarla con cuidado: aquí no necesitas números de secuencia ni reintentos idempotentes. Lo que sí necesitas es correlacionar peticiones con respuestas, porque un envío no es una llamada y nada te dice a cuál de tres consultas en vuelo corresponde la respuesta que acaba de llegar.
+
+```js
+// un identificador por peticion y un mapa de promesas pendientes
+const pendientes = new Map();
+let siguiente = 0;
+
+worker.onmessage = ({ data }) => {
+  const p = pendientes.get(data.id);
+  if (!p) return;
+  pendientes.delete(data.id);
+  data.error ? p.reject(new Error(data.error)) : p.resolve(data.valor);
+};
+
+export function preguntar(op) {
+  const id = ++siguiente;
+  return new Promise((resolve, reject) => {
+    pendientes.set(id, { resolve, reject });
+    worker.postMessage({ id, op });
+  });
+}
+```
+
+Ese esqueleto es el que automatizan bibliotecas como Comlink, que te dejan escribir `await api.buscar(...)` con tipos y sin ver el mapa de identificadores. Conviene recordar que la comodidad no cambia el modelo: por debajo sigue habiendo envíos, copias y turnos, y una API que parece local seguirá cobrando el precio de una remota. La abstracción oculta la mecánica, no la física.
+
+<Callout type="info" title="Tres canales, tres propósitos">
+`postMessage` sobre el objeto Worker es el canal implícito uno a uno. `MessageChannel` te da canales explícitos punto a punto que puedes repartir, encadenar y cerrar por separado, ideales para aislar subsistemas. Y `BroadcastChannel` difunde a todos los contextos del mismo origen suscritos a un nombre, sin saber quién escucha: perfecto para invalidar cachés entre pestañas y catastrófico como transporte de peticiones, porque no hay destinatario ni respuesta.
+</Callout>
+
+## La atomicidad que regalan los turnos
+
+Hay una propiedad del bucle de eventos que en un modelo con memoria compartida costaría un cerrojo y aquí sale gratis: la **ejecución hasta el final**. Un manejador de mensajes no puede ser interrumpido a mitad. Ningún otro mensaje, ningún temporizador, ninguna promesa se ejecutará entre dos líneas suyas. Mientras tu función corre, eres el dueño absoluto del estado del agente.
+
+```js
+let saldo = 0;
+
+// ATOMICO: nadie se cuela entre la lectura y la escritura
+self.onmessage = ({ data }) => {
+  const s = saldo;
+  saldo = s + data.importe;
+};
+```
+
+Esa garantía tiene un límite exacto y es el punto donde más código se rompe sin que nadie lo note: el turno acaba en el primer `await`. A partir de ahí el bucle de eventos recupera el control, procesa el siguiente mensaje de la cola con tu operación todavía a medias, y cuando tu promesa resuelve retomas el hilo con supuestos que ya no se cumplen.
+
+```js
+// YA NO ES ATOMICO: el await cede el turno
+self.onmessage = async ({ data }) => {
+  const s = saldo;                    // lees aqui
+  await registrarEnDisco(data);       // otro mensaje entra y modifica saldo
+  saldo = s + data.importe;           // escribes con un valor caducado
+};
+```
+
+El fallo es una actualización perdida de manual, la misma que estudiarías en un curso de bases de datos, y ha aparecido en un entorno donde nadie la buscaba porque *no hay hilos compitiendo*. La lección es incómoda y hay que decirla clara: la ausencia de memoria compartida elimina las carreras de datos, no la necesidad de razonar sobre secciones críticas. Si tu manejador cede el turno, has creado una sección crítica, y necesitarás lo de siempre: una cola serializadora, una operación de comparar e intercambiar sobre una versión, o un cerrojo lógico. Con la ventaja de que aquí los puntos de cesión son visibles, escasos y están marcados en el código con una palabra clave.
+
+<Callout type="dios" title="No compartir memoria no elimina la concurrencia: la hace visible">
+Merece la pena decir con precisión qué compró la web aquel día, porque el resumen popular —los Workers son seguros porque no comparten memoria— es cierto y es engañoso a partes iguales. Lo que se eliminó no fue la concurrencia sino su *invisibilidad*. En un modelo de memoria compartida los puntos de interacción entre hilos no están escritos en ningún sitio: cualquier acceso a cualquier campo puede ser un punto de sincronización mal protegido, el código se lee igual esté bien o mal, y el compilador y el procesador tienen permiso para reordenar lo que escribiste, de modo que el programa que se ejecuta no es exactamente el que leíste. Al prohibir compartir, la plataforma obligó a que toda interacción entre agentes pase por una construcción sintáctica explícita y localizable: un envío, una recepción, una cesión de turno. La concurrencia dejó de estar difusa por todo el programa y se concentró en una frontera que puedes señalar con el dedo, versionar, registrar, reproducir y probar. Ese es el canje real, y explica por qué la misma idea reaparece una y otra vez lejos de la web: los procesos de Erlang que fundamentan sistemas con nueve nueves de disponibilidad, los canales de Go, los actores de Akka, la propiedad exclusiva de Rust —que persigue la misma meta por el camino opuesto, permitiendo compartir pero solo cuando el compilador puede demostrar que es seguro—. Todos aceptan pagar copias, mensajes o anotaciones a cambio de que los puntos peligrosos sean nombrables. Y hay un corolario que se cobra más adelante y conviene anticipar: cuando en la lección cuarta recuperes memoria realmente compartida con `SharedArrayBuffer`, no estarás desbloqueando una optimización sin coste, estarás renunciando a esta propiedad y volviendo a un mundo donde el peligro es invisible. Que exista esa puerta es bueno; que casi nunca la abras, también.
+</Callout>
+
+<Reto title="Rompe y repara la atomicidad">
+1. Escribe el manejador síncrono del contador y lánzale mil mensajes seguidos. Comprueba que el resultado es exacto siempre.
+2. Convierte el manejador en `async` con un `await` en medio y repite. Mide cuántas actualizaciones se pierden.
+3. Arregla el fallo serializando las operaciones en una cola propia, sin cerrojos: encadena cada operación a la promesa de la anterior.
+4. Monta un `MessageChannel` entre dos Workers y comprueba con las herramientas del navegador que ese tráfico no pasa por el hilo principal.
+5. Usa `addEventListener` en un puerto sin llamar a `start()` y observa cómo los mensajes se acumulan sin entregarse. Después arréglalo.
+</Reto>

@@ -1,0 +1,152 @@
+---
+title: "Cuatro estrategias, de la fuerza bruta a la precisión"
+description: "Reconsultar todo, invalidar por tabla, invalidar por dependencia real de la consulta y mantener el resultado al día son cuatro puntos de una misma escalera donde cada peldaño compra precisión con memoria y con metadatos."
+subject: local-first
+level: 15
+order: 2
+icon: "15.2"
+duracion: "18 min"
+---
+
+<Lead>
+Entre no saber nada y saberlo todo hay exactamente cuatro paradas útiles, y conviene recorrerlas en orden porque cada una se entiende como la respuesta al defecto de la anterior. La primera no necesita saber nada de tus consultas y por eso las ejecuta todas. La segunda pregunta a la escritura qué tablas tocó y a la consulta qué tablas lee. La tercera se atreve a mirar dentro del predicado. La cuarta deja de reconsultar por completo y se dedica a mantener el resultado al día como quien lleva una contabilidad. No hay una ganadora: hay un eje donde a cada paso pagas más memoria y más metadatos por menos trabajo en cada escritura, y elegir posición en ese eje es la decisión de arquitectura de la que depende cómo se comporta tu aplicación cuando la base crece.
+</Lead>
+
+<Objetivos>
+
+- Implementar y medir el barrido total, y entender por qué su verdadero coste no está donde parece.
+- Aplicar la invalidación por tabla, calibrar sus falsos positivos y blindarse contra sus falsos negativos.
+- Registrar el conjunto de lectura de una consulta o evaluar su predicado contra la fila escrita, y saber qué garantiza cada opción.
+- Situar cualquier motor real sobre el eje de precisión frente a coste, en lugar de comparar por características.
+
+</Objetivos>
+
+## Reconsultar todo: el barrido
+
+La estrategia más tosca consiste en no razonar en absoluto: cada vez que una transacción se confirma, todas las consultas vivas se vuelven a ejecutar. Es correcta por construcción, y esa corrección vale mucho más de lo que la palabra tosca sugiere, porque garantiza la propiedad que ninguna de las otras tres garantiza gratis: **cero falsos negativos**. Ninguna pantalla se quedará jamás obsoleta por un caso que no previste.
+
+```js
+// El barrido: sin metadatos, sin analisis, sin sorpresas
+async function alConfirmar(version) {
+  for (const s of suscripciones.values()) {
+    const filas = await db.consultar(s.sql, s.params);
+    s.entregar(filas, version);
+  }
+}
+```
+
+Su coste se descompone en dos sumandos, y el que la gente calcula es el que menos importa. El primero es la ejecución: el número de consultas vivas multiplicado por el coste de cada una, que con veinte consultas indexadas y un motor local queda en unos pocos milisegundos y aguanta perfectamente. El segundo, el que duele, es que **cada ejecución produce un resultado nuevo aunque el contenido sea idéntico**, y un resultado nuevo hace trabajar a toda la interfaz que colgaba de él. Una escritura irrelevante para diecinueve de las veinte consultas termina repintando las veinte pantallas si no comparas nada antes de entregar.
+
+De ahí sale la primera regla práctica del nivel, que además es independiente de la estrategia que acabes eligiendo: entrega el resultado solo si difiere del anterior. Comparar dos vectores de filas por igualdad estructural cuesta bastante menos que repintar, y con identidades estables por fila la comparación se reduce a recorrer y contrastar referencias.
+
+Hay un segundo defecto del barrido que aparece antes de lo que se cree y que no tiene que ver con el coste. Como cada reejecución cruza la frontera del Worker de forma asíncrona, veinte consultas lanzadas a la vez devuelven veinte respuestas cuyo orden de llegada no controlas, y si mientras tanto se confirma otra transacción tendrás resultados de dos estados distintos aterrizando entremezclados en la misma pantalla. El remedio es el mismo número de versión que ya acompaña a cada resultado: descarta toda entrega cuya versión sea anterior a la que la proyección ya tiene. Sin esa comprobación, el barrido total —que era correcto por construcción— deja de serlo en cuanto las escrituras se solapan.
+
+El barrido se rompe por un sitio muy concreto y bastante brusco. Las escrituras no llegan de una en una: llegan en ráfagas, porque una importación, un lote de sincronización o una operación en cascada confirman decenas o cientos de transacciones seguidas. Multiplicar el coste del barrido por doscientas confirmaciones convierte unos pocos milisegundos en un bloqueo perfectamente visible. Antes de abandonar la estrategia conviene agrupar las confirmaciones en una ventana temporal breve y barrer una sola vez por ráfaga, porque ese arreglo de diez líneas suele posponer la necesidad de complicarse mucho más de lo que parece.
+
+## Invalidar por tabla: el grano grueso que funciona
+
+El siguiente peldaño introduce el mínimo metadato imaginable. Cada consulta declara de qué tablas lee, cada transacción informa de qué tablas escribió, y solo se reejecutan las consultas cuya declaración interseca con el informe. Es la estrategia que implementan de fábrica la mayoría de los envoltorios sobre SQLite en el navegador, y hay una razón excelente para ello: el informe de escritura sale del propio motor sin que tengas que analizar nada, y la declaración de lectura se extrae del plan de la sentencia o, en el peor caso, de la propia sentencia.
+
+```js
+// La escritura informa; el motor ya sabe que toco
+const tablasEscritas = new Set(['notas', 'etiquetas_nota']);
+
+// La consulta declara; se extrae del plan, no se escribe a mano
+suscripcion.tablasLeidas = new Set(['notas', 'proyectos']);
+
+const afectada = [...suscripcion.tablasLeidas].some((t) => tablasEscritas.has(t));
+if (afectada) reejecutar(suscripcion);
+```
+
+Su comportamiento es el de un filtro conservador: produce falsos positivos con toda naturalidad y, bien implementado, ningún falso negativo. Un falso positivo es una consulta sobre las notas del proyecto siete que se reejecuta porque alguien tocó una nota del proyecto trece; molesta, pero es inofensivo, y la comparación de resultados de la sección anterior lo absorbe sin repintar nada. La proporción de falsos positivos depende por completo de cómo hayas diseñado el esquema: una tabla ancha y muy escrita, del tipo registro de actividad, metadatos de sincronización o contador de accesos, se convierte en un invalidador universal si tus consultas la tocan.
+
+Antes de saltar al peldaño siguiente conviene agotar un peldaño intermedio que cuesta muy poco y rinde mucho: invalidar por tabla más clave de partición. Casi todas las aplicaciones tienen un eje natural por el que sus datos se reparten —el proyecto, el documento, el espacio de trabajo, el día— y casi todas sus consultas están acotadas por ese eje. Si la escritura informa de la partición que tocó y la suscripción declara la suya, la intersección se afina de golpe sin analizar ningún predicado, sin representar ninguna consulta de forma estructurada y sin dejar de tomar el informe del motor. Es la mejor relación entre precisión ganada y complejidad añadida de toda la escalera, y es también la que se salta más gente porque no aparece en la literatura con un nombre propio.
+
+<Callout type="warn" title="Los falsos negativos entran por las tablas que no ves">
+La invalidación por tabla solo es segura si el informe de escritura es completo, y hay cuatro vías clásicas por las que deja de serlo. Los disparadores que escriben en tablas que tu sentencia no nombra. Las claves foráneas con borrado o actualización en cascada, que modifican filas de otra tabla sin que aparezca en tu SQL. Las vistas, que leen de tablas que la declaración de la consulta no menciona si la extraes de la sentencia en lugar del plan. Y las tablas virtuales de búsqueda de texto completo, que se mantienen por su lado. La regla de supervivencia es tomar el informe del motor y nunca de tu propio análisis: los ganchos de fila del motor ven las cascadas y los disparadores, tu lectura del SQL no.
+</Callout>
+
+## Invalidar por dependencia: mirar dentro del predicado
+
+El tercer peldaño baja del grano de tabla al grano de fila, y admite dos implementaciones con propiedades distintas que conviene no confundir.
+
+La primera es **registrar el conjunto de lectura**. Mientras la consulta se ejecuta, el motor anota qué filas tocó de verdad, y esa colección de identificadores se guarda junto a la suscripción. Cuando llega una escritura, basta intersecar sus identificadores con los registrados. Es preciso, no requiere entender el predicado y funciona con cualquier sentencia. Tiene dos defectos serios. El primero es de coste: el conjunto de lectura de una consulta que recorre cien mil filas ocupa cien mil identificadores, y mantenerlo vivo para cada suscripción sale caro en memoria. El segundo es de fondo, y es el que descalifica la técnica por sí sola: **el conjunto de lectura solo describe lo que existía**, de modo que una fila nueva que debería entrar en el resultado no interseca con nada y pasa inadvertida. Es el problema de las lecturas fantasma de toda la vida, y su remedio en las bases de datos serias tiene nombre propio desde hace décadas: bloqueo por predicado.
+
+La segunda implementación es exactamente esa. En vez de recordar qué filas leíste, guardas el predicado de la consulta y lo **evalúas contra la fila escrita**: si la fila nueva satisface la condición, o si la fila vieja la satisfacía, la consulta está afectada. Detecta altas, bajas y filas que entran o salen del conjunto, y su coste no depende del tamaño del resultado sino del número de consultas vivas por el número de filas cambiadas. A cambio exige que el predicado sea inspeccionable, y por tanto que tu capa de consultas no acepte cadenas de SQL opacas sino una representación estructurada que puedas volver a evaluar en memoria.
+
+```js
+// Evaluar el predicado contra la fila, no contra el resultado guardado
+function afecta(suscripcion, cambio) {
+  const { antes, despues } = cambio;
+  const p = suscripcion.predicado;              // representacion estructurada, no una cadena
+  return (antes && p(antes)) || (despues && p(despues));
+}
+```
+
+Aquí aparece el límite duro de todo el peldaño, y conviene enunciarlo porque es el que empuja hacia la cuarta estrategia. El razonamiento por fila funciona impecablemente para filtros sobre una sola tabla y se vuelve resbaladizo en cuanto hay uniones o agregaciones. En una unión, una fila escrita en el lado derecho afecta al resultado solo si existe alguna fila del lado izquierdo que case con ella, y averiguarlo exige consultar. En una agregación, la fila que cambia el recuento puede no aparecer en el resultado en absoluto. Y con orden y límite, una fila que cae fuera de la ventana visible puede desplazar a otra que sí estaba dentro. Se pueden tratar todos esos casos, pero tratarlos consiste, literalmente, en implementar la cuarta estrategia.
+
+<Mermaid code={`flowchart TB
+  E[Una transaccion confirmada] --> A[Reconsultar todo]
+  E --> B[Invalidar por tabla]
+  E --> C[Invalidar por dependencia]
+  E --> D[Mantener el resultado al dia]
+  A --> A1[Correcto siempre y caro siempre]
+  B --> B1[Barato con falsos positivos abundantes]
+  C --> C1[Preciso a cambio de metadatos por consulta]
+  D --> D1[Coste minimo por escritura y estado que sostener]
+  style A1 fill:#f38ba8,color:#11111b
+  style B1 fill:#f9e2af,color:#11111b
+  style D1 fill:#a6e3a1,color:#11111b`} />
+
+## El eje: qué compras en cada peldaño
+
+<Cards>
+  <Card icon="🧹" title="Barrido total">
+    Sin metadatos y sin falsos negativos. El coste crece con el número de consultas vivas y con la frecuencia de escritura. Es la línea base correcta y la referencia contra la que se mide todo lo demás.
+  </Card>
+  <Card icon="🗂️" title="Por tabla">
+    Un conjunto de nombres por consulta y otro por transacción. Recorta la mayor parte del trabajo con diez líneas y sobrevive a casi cualquier aplicación real si el esquema separa lo volátil de lo estable.
+  </Card>
+  <Card icon="🔎" title="Por dependencia">
+    Predicados inspeccionables y evaluación contra la fila cambiada. Alta precisión sobre filtros simples, y una frontera clara en cuanto entran uniones, agregados o ventanas ordenadas.
+  </Card>
+  <Card icon="♻️" title="Mantenimiento incremental">
+    No reconsulta: propaga el cambio a través de los operadores. El coste por escritura deja de depender del tamaño de los datos, y a cambio hay que sostener estado intermedio en memoria.
+  </Card>
+</Cards>
+
+Merece la pena tener presente que este eje no lo inventó nadie del mundo del navegador. Es el mismo que recorrió la literatura de bases de datos al buscar aislamiento serializable, donde bloquear la tabla entera equivale al segundo peldaño, bloquear las filas leídas equivale al conjunto de lectura, y el bloqueo por predicado apareció exactamente para tapar el agujero de las lecturas fantasma que aquí acabamos de encontrar. Que un problema de refresco de interfaces reproduzca peldaño por peldaño la escalera del control de concurrencia no es una analogía forzada: en ambos casos la pregunta subyacente es si una escritura interfiere con una lectura ya realizada, y las respuestas posibles a esa pregunta son las que son.
+
+Las cuatro estrategias se combinan mucho mejor de lo que se sustituyen, y las implementaciones reales que funcionan suelen ser híbridas. Un diseño razonable filtra primero por tabla, porque es casi gratis y descarta la mayoría; evalúa el predicado solo sobre lo que sobrevive al primer filtro; y reserva el mantenimiento incremental para el puñado de consultas caras y permanentes que dominan el presupuesto. Todo lo demás se reconsulta sin más, porque reconsultar es barato y ya lo has medido.
+
+```js
+// Cascada hibrida: cada filtro descarta antes de que el siguiente trabaje
+function afectadas(aviso) {
+  return [...suscripciones.values()]
+    .filter((s) => intersecaTablas(s, aviso))       // casi gratis, descarta la mayoria
+    .filter((s) => intersecaParticion(s, aviso))    // barato, afina por el eje natural
+    .filter((s) => !s.predicado || evaluar(s, aviso)); // caro, solo sobre lo que sobrevive
+}
+
+// Y las pocas consultas caras y permanentes ni pasan por aqui:
+// se mantienen incrementalmente y consumen el aviso por su cuenta
+```
+
+El orden de esa cascada no es decorativo: cada etapa tiene que ser más barata que la siguiente y descartar más que ella, porque de lo contrario estás pagando el filtro caro sobre candidatos que el filtro barato habría eliminado. Es el mismo principio con el que un motor coloca los predicados más selectivos primero, aplicado a un problema que ni siquiera parece de bases de datos.
+
+<Callout type="tip" title="Deja siempre una escotilla al barrido total">
+Cualquier estrategia precisa acabará teniendo un caso que no contempla: una migración que reescribe media base, una restauración desde copia de seguridad, un lote de sincronización que llega por un camino distinto al de tus escrituras normales. Expón una operación explícita que declare invalidado todo y fuerce el barrido, y llámala desde esos caminos excepcionales. Cuesta cinco líneas y convierte una clase entera de fallos silenciosos en un refresco de más que nadie va a notar.
+</Callout>
+
+<Callout type="dios" title="Al subir de peldaño estás escribiendo un optimizador cuyos errores no se ven">
+Merece la pena detenerse en la naturaleza exacta de lo que compras y de lo que vendes al moverte por esta escalera, porque el intercambio no es el que aparenta. Aparenta ser un intercambio entre rendimiento y complejidad, que es la clase de decisión con la que los ingenieros estamos cómodos. Es en realidad un intercambio entre rendimiento y una garantía, y las garantías se pierden de una manera mucho más traicionera que el rendimiento. El barrido total es correcto por una razón que no depende de tu criterio: no razona, y por tanto no puede razonar mal. En el momento en que declaras tablas leídas, registras conjuntos de lectura o evalúas predicados, has empezado a construir un componente que emite juicios sobre la relación entre escrituras y consultas, y ese componente es exactamente un optimizador de consultas en miniatura, con la diferencia crucial de que un optimizador de verdad es incorrecto de forma ruidosa —devuelve filas equivocadas, el conjunto de pruebas se pone rojo— mientras que el tuyo es incorrecto en silencio. Un falso negativo no produce ninguna excepción, ninguna traza y ningún fallo reproducible: produce una pantalla que se quedó quieta, y el usuario que la ve no tiene ningún vocabulario para reportarla más allá de decir que a veces hay que recargar. Esa asimetría debería gobernar todas tus decisiones en este terreno, y se concreta en un principio que conviene grabar: **sesga siempre el error hacia el exceso**. Cuando dudes de si una consulta está afectada, declárala afectada; cuando un camino de escritura sea nuevo o excepcional, haz que invalide de más; cuando tengas que elegir entre un metadato preciso y difícil de mantener y otro conservador y trivial, quédate con el conservador. Un refresco de más cuesta microsegundos y lo absorbe la comparación de resultados sin repintar nada; un refresco de menos cuesta la confianza del usuario en que lo que ve es lo que hay, que es precisamente la única cosa que local-first prometía y que ninguna optimización posterior puede devolverte.
+</Callout>
+
+<Reto title="Recorre la escalera con números">
+1. Implementa el barrido total con agrupación por ráfaga y mide su coste con veinte suscripciones vivas y una importación de mil filas.
+2. Añade la comparación estructural del resultado antes de entregar y vuelve a medir, contando ahora repintados en lugar de milisegundos.
+3. Implementa la invalidación por tabla tomando el informe de escritura del gancho de fila del motor, no de tu lectura del SQL. Verifica que detecta un borrado en cascada.
+4. Instrumenta la tasa de falsos positivos: cuenta cuántas reejecuciones producen un resultado idéntico al anterior. Si pasa del ochenta por ciento, revisa qué tabla los provoca.
+5. Convierte una de tus consultas más vivas a predicado estructurado y evalúalo contra las filas escritas. Compara reejecuciones contra la versión por tabla.
+6. Escribe a mano el caso que tu implementación precisa no detecta, demuéstralo con una prueba y decide si lo arreglas o lo cubres con la escotilla al barrido.
+</Reto>

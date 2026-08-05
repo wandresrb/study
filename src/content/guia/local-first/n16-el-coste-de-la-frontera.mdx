@@ -1,0 +1,156 @@
+---
+title: "El coste de la frontera: latencia y amortización"
+description: "Cada travesía cuesta serialización, encolado y planificación, y la cura eficaz no es cruzar menos por casualidad sino colocar la frontera donde el tráfico sea escaso y grueso."
+subject: local-first
+level: 16
+order: 5
+icon: "16.5"
+duracion: "18 min"
+---
+
+<Lead>
+Has ganado un hilo y has pagado una frontera. Todo lo que en un modelo de memoria compartida sería una llamada a función —unos nanosegundos, un salto y un retorno— aquí es una serialización, un encolado, una planificación en otro bucle de eventos, una reconstrucción y el mismo recorrido de vuelta. En términos absolutos el suelo es bajo, del orden de fracciones de milisegundo para un mensaje pequeño, y esa cifra tranquilizadora es justo la que hunde arquitecturas enteras: cuando algo cuesta poco se llama mucho, y mil llamadas de un cuarto de milisegundo son un cuarto de segundo de nada. Esta lección trata de medir ese suelo en tu máquina, de entender qué lo compone y de aprender los cuatro patrones que lo amortizan. Y sobre todo de la decisión que los engloba a todos, que no es de optimización sino de diseño: dónde poner la frontera.
+</Lead>
+
+<Objetivos>
+
+- Descomponer un viaje de ida y vuelta en sus fases y saber cuál domina en cada caso.
+- Medir el suelo de latencia y el coste marginal por nodo con relojes que no engañan.
+- Aplicar los cuatro patrones de amortización: agrupar, transferir, transmitir y mover el bucle.
+- Elegir dónde va la frontera para que el tráfico sea escaso y grueso en lugar de constante y fino.
+
+</Objetivos>
+
+## Anatomía de un viaje de ida y vuelta
+
+Un mensaje que sale y una respuesta que vuelve atraviesan seis fases, y solo una de ellas es el trabajo que querías hacer.
+
+<Mermaid code={`sequenceDiagram
+  participant U as Hilo principal
+  participant W as Worker
+  U->>U: serializar el mensaje, sincrono y bloqueante
+  U->>W: encolar en el bucle del destino
+  W->>W: esperar a que termine la tarea en curso
+  W->>W: deserializar el mensaje
+  W->>W: hacer el trabajo real
+  W->>U: serializar la respuesta y encolar
+  U->>U: esperar turno, deserializar y resolver`} />
+
+Las dos fases de serialización crecen con el número de nodos del grafo, como viste en la tercera lección, y bloquean cada una a su hilo. Las dos fases de espera son las interesantes porque son las que no controlas: un mensaje no se procesa cuando llega sino cuando el bucle del destino termina lo que estuviera haciendo. Si el Worker está a mitad de una consulta de cincuenta milisegundos, tu mensaje espera cincuenta milisegundos por muy pequeño que sea. Esto tiene una consecuencia práctica que conviene interiorizar antes de medir nada: la latencia de la frontera no se describe con una media sino con una distribución, y su cola larga la dictan las tareas largas del receptor, no el tamaño de los mensajes.
+
+De ahí sale una regla de diseño que rara vez se escribe: en un Worker que atiende peticiones, las operaciones largas hay que trocearlas aunque nadie esté pintando, no por fluidez sino por **equidad de servicio**. Un Worker que se pasa doscientos milisegundos en una compactación es un Worker que impone doscientos milisegundos de latencia adicional a la siguiente consulta interactiva. Es el mismo razonamiento que separa las cargas de trabajo interactivas de las de fondo en cualquier servidor, aplicado a cuatro milímetros de distancia.
+
+## Medirlo sin engañarse
+
+El suelo se mide con un mensaje mínimo que rebota y un reloj alrededor del conjunto. Medir en un solo sentido es más difícil de lo que parece porque `performance.now` es relativo a un origen temporal que puede diferir entre agentes; lo robusto es medir el viaje completo desde un lado.
+
+```js
+// suelo de latencia: coste de una travesia vacia de ida y vuelta
+const N = 5000;
+let n = 0;
+const t0 = performance.now();
+
+worker.onmessage = () => {
+  if (++n === N) {
+    const media = (performance.now() - t0) / N;
+    console.log('ida y vuelta media', media.toFixed(3), 'ms');
+    return;
+  }
+  worker.postMessage(0);
+};
+worker.postMessage(0);
+```
+
+```js
+// coste marginal: cuanto cuesta el TAMANO frente al numero de mensajes
+for (const filas of [10, 100, 1000, 10_000]) {
+  const carga = Array.from({ length: filas }, (_, i) => ({ id: i, v: 'x' }));
+  const t = performance.now();
+  structuredClone(carga);
+  console.log(filas, 'filas ->', (performance.now() - t).toFixed(3), 'ms');
+}
+```
+
+Con esas dos cifras —el suelo por mensaje y el coste por nodo— ya puedes predecir el comportamiento de casi cualquier diseño sin implementarlo. Si tu suelo es de una décima de milisegundo, una API que hace mil llamadas finas cuesta cien milisegundos antes de calcular nada, y ninguna optimización del cálculo lo va a arreglar.
+
+<Callout type="info" title="Los relojes están deliberadamente borrosos">
+No esperes precisión de nanosegundos. Los navegadores degradan la resolución de `performance.now` y añaden ruido como defensa contra los ataques de canal lateral que viste en la lección anterior; sin aislamiento de origen cruzado la granularidad ronda los cien microsegundos, y con él mejora pero no se vuelve exacta. Por eso las mediciones útiles son siempre agregadas: miles de repeticiones y una media, nunca una sola travesía cronometrada.
+</Callout>
+
+## Los cuatro patrones que lo amortizan
+
+**Agrupar.** Si el suelo es por mensaje y no por byte, conviene que haya menos mensajes y más gordos. La forma más limpia es acumular las peticiones del turno actual y enviarlas juntas en el siguiente microturno: para quien llama no cambia nada, sigue recibiendo una promesa por operación, pero la frontera se cruza una vez en lugar de cincuenta.
+
+```js
+let lote = [];
+let programado = false;
+let siguiente = 0;
+const pendientes = new Map();
+
+export function pedir(op) {
+  return new Promise((resolve, reject) => {
+    lote.push({ op, resolve, reject });
+    if (programado) return;
+    programado = true;
+    queueMicrotask(() => {
+      const envio = lote;
+      lote = [];
+      programado = false;
+      const id = ++siguiente;
+      pendientes.set(id, envio);
+      worker.postMessage({ id, ops: envio.map((e) => e.op) });
+    });
+  });
+}
+```
+
+**Transferir en vez de copiar.** Todo lo que sea binario debe cruzar como búfer transferido, y todo lo que sea tabular gana muchísimo en forma columnar. Un resultado de diez mil filas y seis columnas es un grafo de setenta mil nodos si lo mandas como array de objetos, y seis búferes transferidos si lo mandas por columnas. La segunda forma se envía en tiempo constante y además llega lista para recorrerse sin presión sobre el recolector.
+
+**Transmitir.** Cuando el resultado es grande o llega poco a poco, un solo mensaje gigante es la peor opción: obliga a materializarlo entero en el emisor, a serializarlo de golpe y a esperar a que esté completo. Los streams son transferibles, así que el consumidor puede tirar de los datos a su ritmo, con contrapresión real.
+
+```js
+// el worker produce al ritmo al que tu consumes, no mas rapido
+const { readable, writable } = new TransformStream();
+worker.postMessage({ tipo: 'exportar', writable }, [writable]);
+
+for await (const trozo of readable) {
+  await escribirEnDisco(trozo);
+}
+```
+
+**Mover el bucle, no los datos.** Es el patrón de mayor impacto y el que menos se aplica. Si necesitas filtrar cien mil registros para mostrar veinte, la pregunta correcta no es cómo enviar cien mil registros más rápido, sino por qué los envías: manda el criterio y recibe los veinte. Toda travesía cuyo propósito sea recorrer datos al otro lado es una travesía mal planteada. El trabajo va donde están los datos, siempre, aquí igual que en una base de datos remota.
+
+<Cards>
+  <Card icon="📚" title="Agrupa por turno">
+    Una travesía por microtarea o por fotograma en lugar de una por llamada. Es transparente para quien la usa y suele dividir el coste por un factor de decenas.
+  </Card>
+  <Card icon="🎁" title="Transfiere lo binario">
+    Búferes y columnas tipadas cruzan en tiempo constante. Un resultado columnar es casi siempre dos órdenes de magnitud más barato que el mismo dato en filas.
+  </Card>
+  <Card icon="🚰" title="Transmite lo grande">
+    Un stream transferido evita materializar el resultado completo y da contrapresión, de modo que el productor no adelanta al consumidor ni infla la memoria.
+  </Card>
+  <Card icon="🧠" title="Manda la intención">
+    Envía consultas, criterios y comandos; nunca conjuntos de datos que solo vas a recorrer. El bucle viaja barato, los datos no.
+  </Card>
+</Cards>
+
+## Dónde poner la frontera
+
+Los cuatro patrones son tácticas, y todas apuntan a la misma decisión estratégica: el trazado de la línea. Una frontera bien colocada separa dos partes que se hablan poco y con mensajes con significado propio; una frontera mal colocada corta por la mitad un bucle interno, y entonces ninguna optimización la salva.
+
+En la práctica, colocarla bien significa exponer **operaciones de dominio y no métodos de acceso**. Un Worker de datos que ofrece `abrirDocumento`, `aplicarCambios` y `buscar` cruza la frontera un puñado de veces por interacción. El mismo Worker exponiendo `leerCampo`, `contarFilas` y `siguienteRegistro` la cruza miles de veces para lograr lo mismo, con idéntica funcionalidad y un orden de magnitud más de latencia. Es la regla que la industria aprendió a golpes con los objetos distribuidos de los años noventa —las interfaces charlatanas no sobreviven a una frontera— y no ha cambiado ni un ápice al mudarse de un centro de datos a una pestaña.
+
+La segunda mitad de la decisión es qué se queda en el hilo principal. Como una lectura durante el pintado es imposible a través del canal, la interfaz necesita un modelo de lectura ya materializado de su lado: una proyección pequeña, suficiente para renderizar de forma síncrona, que el Worker actualiza empujando cambios en lugar de responder preguntas. Ese diseño elimina de golpe casi todas las travesías del camino crítico, porque el camino crítico deja de tener travesías. Es lo mismo que hacen las arquitecturas que separan lectura y escritura, y aparece aquí por la misma presión.
+
+<Callout type="dios" title="La frontera no es un impuesto que pagas: es la forma que impone a tu arquitectura, y esa forma ya la conocías">
+El instinto natural al descubrir el coste de la frontera es tratarlo como una ineficiencia que hay que reducir, y ese instinto lleva a micro-optimizar mensajes durante semanas para arañar milisegundos que un rediseño de veinte líneas habría eliminado por completo. El encuadre productivo es otro: el coste de la frontera es un *gradiente de diseño*, una fuerza que empuja constantemente tu arquitectura hacia una forma concreta —pocas llamadas, gruesas, con significado de negocio, con los datos y su bucle del mismo lado—. Y lo verdaderamente notable es que esa forma no es una particularidad de los Web Workers, es la misma forma a la que empuja toda frontera que existe en computación, a cualquier escala. Una llamada al sistema empuja a leer bloques grandes en vez de bytes; el bus PCIe empuja a mandar mallas enteras a la GPU en vez de triángulos; una consulta SQL empuja a proyectar y agregar en el servidor en vez de traerse la tabla; una API HTTP empuja a recursos compuestos en vez de mil peticiones que el problema N+1 nombró para siempre. Cambian ocho órdenes de magnitud en la latencia y no cambia ni una línea del consejo. Eso ocurre porque no es una regla empírica sobre tecnologías concretas sino una consecuencia aritmética de que toda frontera tenga un coste fijo por travesía además del coste proporcional al volumen: en cuanto existe un término constante, el óptimo consiste en amortizarlo con travesías escasas y grandes. Para una aplicación local-first el corolario es especialmente valioso y cierra este nivel exactamente donde empezó: la disciplina que aprendes aquí, empujado por medio milisegundo, es literalmente la misma que necesitarás cuando la frontera sea la red y el medio milisegundo sean doscientos. Si diseñas hoy tu capa de datos como un servicio de operaciones gruesas porque un Worker te obliga, mañana la sincronización con el servidor encajará sin rediseñar nada. La frontera pequeña te está entrenando gratis para la grande, y ese es el mejor negocio que ofrece este nivel.
+</Callout>
+
+<Reto title="Presupuesta tu frontera">
+1. Mide el suelo de ida y vuelta en tres dispositivos distintos, incluido un móvil modesto, y anota la diferencia entre ellos.
+2. Cuenta cuántas travesías provoca la interacción más común de tu aplicación. Multiplica por tu suelo y compáralo con el tiempo total percibido.
+3. Introduce el agrupador por microtarea en tu cliente y vuelve a contar. Mide la mejora real, no la esperada.
+4. Convierte el resultado tabular más grande que devuelve tu Worker a formato columnar con búferes transferidos y compara ambos costes.
+5. Busca en tu protocolo una operación que devuelva datos que solo vas a recorrer y filtrar. Reescríbela para que el bucle se ejecute donde viven los datos.
+</Reto>

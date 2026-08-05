@@ -1,0 +1,158 @@
+---
+title: "Qué significa tener SQL en el cliente"
+description: "Con uniones, agregaciones e índices reales en el cliente el modelo de datos vuelve a normalizarse, la frontera de serialización se cruza una vez por consulta y no por registro, y tu capa de datos pasa a tener esquema y migraciones."
+subject: local-first
+level: 12
+order: 5
+icon: "12.5"
+duracion: "17 min"
+---
+
+<Lead>
+Has instalado un motor, entiendes qué se perdió al compilarlo, sabes por dónde se conecta al almacenamiento y has elegido sobre qué medio va a escribir. Queda la pregunta que justifica las cuatro lecciones anteriores y que casi nunca se hace con la seriedad que merece: **qué cambia realmente en tu aplicación**. La respuesta no es que las consultas sean más cómodas de escribir. Es que un conjunto entero de decisiones de diseño que habías tomado por obligación —desnormalizar, duplicar, mantener índices a mano, precalcular agregados, inventar convenciones de clave compuesta— deja de tener sentido, y a cambio aparecen obligaciones nuevas que en un almacén de objetos no existían. Esta lección hace ese inventario en ambas direcciones.
+</Lead>
+
+<Objetivos>
+
+- Entender qué aporta un planificador de consultas dentro del cliente y cómo interrogarlo.
+- Manejar índices reales, incluidos los compuestos, los parciales y los de cobertura, y verificar que se usan.
+- Rediseñar el modelo de datos que habías deformado para sobrevivir a un almacén clave-valor.
+- Reconocer con precisión qué problemas **no** resuelve tener SQL, para no descubrirlos en producción.
+
+</Objetivos>
+
+## El planificador entra en tu cliente
+
+Con cursores, el orden de las operaciones lo decides tú al escribir el código, y esa decisión queda congelada. Con SQL la decide un planificador cada vez que prepara la sentencia, consultando estadísticas sobre la distribución real de los datos. Es la diferencia entre un plan escrito por alguien que conocía los datos hace dos años y un plan escrito por algo que los conoce ahora.
+
+Ese planificador es interrogable, y esta es probablemente la herramienta más infrautilizada de todo el nivel. Anteponer una instrucción de explicación a cualquier consulta devuelve, en lugar de los resultados, el plan que el motor piensa ejecutar: qué tabla recorre primero, qué índice usa, si construye una tabla temporal para ordenar o agrupar.
+
+```sql
+EXPLAIN QUERY PLAN
+SELECT c.nombre, COUNT(*) AS n
+FROM documentos d JOIN carpetas c ON c.id = d.carpeta_id
+WHERE d.modificado_en >= :desde
+GROUP BY c.id;
+```
+
+Dos palabras en la salida concentran casi todo el diagnóstico. Si aparece un recorrido completo de tabla sobre una tabla grande, falta un índice o el que hay no es aplicable. Si aparece una estructura temporal para ordenar o agrupar, el motor no ha podido aprovechar el orden de ningún índice y está materializando resultados intermedios. Ninguna de las dos es necesariamente un error —sobre trescientas filas da igual—, pero ambas son decisiones que ahora puedes ver, y verlas es exactamente lo que con cursores era imposible.
+
+Un segundo mecanismo, menos vistoso pero igual de rentable, es la separación entre preparar y ejecutar. Compilar el SQL a bytecode cuesta trabajo; ejecutarlo con parámetros distintos, no. Reutilizar sentencias preparadas y **vincular parámetros** en lugar de concatenar cadenas es a la vez la optimización más simple del nivel y la única defensa correcta contra la inyección, que en el cliente sigue siendo un problema real en cuanto una consulta se construye con texto que escribió un tercero y que llegó por sincronización.
+
+```js
+// Preparar una vez, ejecutar muchas, dentro de una sola transaccion
+const st = db.prepare("UPDATE documentos SET archivado = 1 WHERE id = ?");
+db.transaction(() => {
+  try { for (const id of ids) st.bind(1, id).stepReset(); }
+  finally { st.finalize(); }
+});
+```
+
+Conviene además ejecutar el análisis de estadísticas después de la carga inicial de datos y de vez en cuando después. Sin estadísticas el planificador funciona con heurísticas genéricas; con ellas, elige el orden de las uniones sabiendo qué tabla filtra más. En una base local que se llena de golpe al sincronizar por primera vez, esa diferencia es visible a simple vista.
+
+## Índices de verdad
+
+En un almacén de objetos un índice es, en la práctica, una vía de acceso por un campo o por una ruta de campos. Aquí el vocabulario es mucho más rico, y merece recorrerlo porque cada variante resuelve un problema que antes resolvías duplicando datos.
+
+<Cards>
+  <Card icon="🧱" title="Compuestos y ordenados">
+    Un índice sobre varias columnas sirve para filtrar por un prefijo y además entrega las filas ya ordenadas. El orden de las columnas no es cosmético: determina qué consultas puede atender.
+  </Card>
+  <Card icon="✂️" title="Parciales">
+    Un índice que solo incluye las filas que cumplen una condición. Si el noventa por ciento de tus documentos están archivados, indexar solo los activos reduce el índice a una décima parte.
+  </Card>
+  <Card icon="🧮" title="Sobre expresiones">
+    Puedes indexar el resultado de una expresión y no solo una columna, lo que permite acelerar búsquedas insensibles a mayúsculas o consultas sobre un campo extraído de un documento JSON.
+  </Card>
+  <Card icon="📗" title="De cobertura">
+    Si el índice contiene todas las columnas que la consulta necesita, el motor responde sin tocar la tabla. Es la optimización con mejor relación entre esfuerzo y resultado que existe.
+  </Card>
+</Cards>
+
+```sql
+-- Compuesto: filtra por carpeta y devuelve ya ordenado por fecha
+CREATE INDEX idx_doc_carpeta_fecha ON documentos(carpeta_id, modificado_en DESC);
+
+-- Parcial: solo lo que la interfaz consulta a diario
+CREATE INDEX idx_doc_activos ON documentos(modificado_en DESC) WHERE archivado = 0;
+
+-- Sobre expresion: busqueda por titulo sin distinguir mayusculas
+CREATE INDEX idx_doc_titulo_norm ON documentos(lower(titulo));
+```
+
+<Callout type="tip" title="Los índices también se pagan">
+Cada índice es una estructura que hay que mantener en cada inserción, actualización y borrado, y que ocupa páginas dentro del mismo fichero cuya cuota vigilaste en el nivel 11. En el cliente esto pesa más que en un servidor por dos motivos: la escritura es la operación cara en OPFS, y el espacio no es tuyo sino prestado por el navegador. La disciplina correcta es la misma que en cualquier base seria, aplicada con más severidad: crea el índice cuando una consulta concreta lo pida, verifica con el plan que se usa, y bórralo cuando la consulta desaparezca del código.
+</Callout>
+
+## Lo que se rediseña
+
+Aquí llega el cambio de fondo, y es más profundo que sustituir unas llamadas por otras. Todo el catálogo de deformaciones que aprendiste a aplicar sobre un almacén de objetos existía para compensar la ausencia de uniones. Guardabas el nombre del autor dentro de cada documento porque cruzar con la colección de usuarios costaba un recorrido entero. Mantenías contadores actualizados a mano porque contar significaba recorrer. Inventabas claves compuestas concatenando campos porque solo podías buscar por una vía. Duplicabas datos y aceptabas la incoherencia como precio.
+
+Merece la pena mencionar dos capacidades que suelen decidir la adopción por sí solas. La primera es la búsqueda de texto completo, disponible como módulo compilado dentro del motor, que te da un índice invertido con ordenación por relevancia sobre datos locales: buscar entre los documentos del usuario deja de requerir servidor. La segunda son las funciones sobre documentos JSON, que permiten guardar una parte del modelo sin normalizar y aun así filtrar, extraer campos e incluso indexar expresiones sobre ellos. Entre ambas cubren el hueco por el que la mayoría de los equipos justificaba seguir con un almacén de objetos.
+
+Nada de eso hace falta ahora, y sostenerlo es peor que inútil: es deuda. La normalización vuelve a ser asequible porque la unión la ejecuta el motor sobre páginas ya en su caché, sin materializar objetos intermedios ni cruzar ninguna frontera. Las restricciones de integridad —claves foráneas, unicidad, comprobaciones— pasan a estar declaradas en el esquema y verificadas por el motor, en lugar de vivir dispersas en funciones que alguien puede saltarse.
+
+<Mermaid code={`flowchart LR
+  subgraph Antes
+    A1[Un objeto por registro] --> A2[Clonado estructurado por registro]
+    A2 --> A3[Union manual en JavaScript]
+    A3 --> A4[Agregacion en un bucle]
+  end
+  subgraph Ahora
+    B1[Consulta declarativa] --> B2[Plan elegido por el motor]
+    B2 --> B3[Ejecucion sobre paginas en cache]
+    B3 --> B4[Una sola travesia con el resultado]
+  end
+  style A2 fill:#f38ba8,color:#11111b
+  style B4 fill:#a6e3a1,color:#11111b`} />
+
+Ese diagrama contiene el argumento cuantitativo del nivel entero. En el modelo anterior, el número de veces que un dato cruza la frontera entre el motor de almacenamiento y tu código crece con el número de **registros examinados**. En el nuevo, crece con el número de **filas devueltas**. Una consulta que examina cincuenta mil filas para devolver veinte pasa de cincuenta mil travesías a una. Y como aprendiste en la lección 3 del nivel 10, esa travesía es también la que va del Worker al hilo principal, de modo que el ahorro se cobra dos veces.
+
+A cambio, tu capa de datos adquiere dos obligaciones que antes no tenía. La primera es un **esquema explícito y versionado**, con migraciones que se aplican en máquinas ajenas, sin supervisión y con todas las versiones anteriores conviviendo en el parque de usuarios. La segunda es más callada: las claves foráneas no se aplican por defecto y hay que activarlas en cada conexión, un detalle que ha costado incoherencias silenciosas a mucha gente.
+
+```js
+// Al abrir, siempre, y en este orden
+db.exec("PRAGMA foreign_keys = ON");
+const version = db.selectValue("PRAGMA user_version");
+for (const migracion of migraciones.slice(version)) {
+  db.transaction(() => { migracion(db); });
+}
+db.exec(`PRAGMA user_version = ${migraciones.length}`);
+```
+
+## Lo que SQL no resuelve
+
+Conviene cerrar el nivel enumerando lo que sigue siendo tuyo, porque la euforia de tener un motor completo hace olvidar que el motor solo responde preguntas sobre los datos que ya tiene.
+
+<Cards>
+  <Card icon="🔄" title="La convergencia">
+    Dos ficheros locales con el mismo esquema no se ponen de acuerdo solos. Sigues necesitando captura de cambios, orden causal y una política de conflictos, exactamente igual que antes.
+  </Card>
+  <Card icon="📡" title="La reactividad">
+    El motor no avisa a tu interfaz de que un resultado ha cambiado. La invalidación la publica tu capa de escritura, y decidir su granularidad es una decisión de diseño, no un detalle.
+  </Card>
+  <Card icon="🧯" title="La durabilidad">
+    Sigue gobernada por el modelo de cuota del nivel 11 y por la ausencia de una sincronización real hasta el disco. Tener transacciones no te exime de diseñar para el desalojo.
+  </Card>
+  <Card icon="🚧" title="La frontera del Worker">
+    La capa de datos sigue siendo un servicio remoto con protocolo propio. Conviene diseñarla gruesa, con operaciones de caso de uso, no exponiendo la base método a método.
+  </Card>
+</Cards>
+
+No resuelve la **sincronización**. Un fichero local con esquema y transacciones no converge solo con el de otro dispositivo; tener SQL no te da resolución de conflictos ni orden causal, y la captura de cambios sigue siendo trabajo tuyo, normalmente mediante disparadores que escriben en una tabla de bitácora. No resuelve la **reactividad**: el motor no notifica a tu interfaz que un resultado ha cambiado, y aunque en C existen ganchos de actualización y de confirmación, lo pragmático es que tu propia capa de escritura publique qué se ha tocado para que la interfaz invalide lo que corresponda. No resuelve la **durabilidad**, que sigue gobernada por el modelo de cuota del nivel 11 y por la ausencia de una sincronización real hasta el disco. Y no elimina la frontera del Worker: sigue siendo una interfaz remota que conviene diseñar gruesa, con operaciones de caso de uso y no con métodos finos.
+
+<Callout type="note" title="La copia de seguridad se vuelve trivial, y eso es una ventaja de producto">
+Hay una instrucción que convierte la exportación en una operación de una línea y con base consistente: escribir una copia compacta de la base actual en otro destino, incluso en un almacenamiento distinto del que estás usando. Sirve como copia de seguridad, como exportación para el usuario y como semilla para importar datos preparados en el servidor. Que el artefacto resultante sea un fichero SQLite estándar significa que el usuario puede abrirlo con herramientas que tú no escribiste, y eso es exactamente la propiedad de longevidad que el nivel 4 planteó como requisito y que ningún almacén propio del navegador podía ofrecer.
+</Callout>
+
+<Callout type="dios" title="El cliente deja de consumir respuestas y empieza a formular preguntas, y eso reordena la organización entera">
+Lo verdaderamente disruptivo de tener SQL en el navegador no es de rendimiento sino de **quién puede preguntar qué, y sin permiso de quién**. Durante treinta años el reparto ha sido estable: los datos y la capacidad de interrogarlos vivían juntos en el servidor, y el cliente accedía a través de una lista finita de preguntas previamente autorizadas, materializadas en endpoints. Todo el aparato conceptual que damos por natural —el ciclo de vida de una API, los contratos entre equipos, la conversación eterna sobre si el frontal pide demasiados campos o demasiado pocos, la existencia misma de un equipo de backend como cuello de botella de las preguntas nuevas— es una consecuencia de ese reparto, no una ley de la naturaleza. Cuando el subconjunto de datos que el usuario necesita cabe en su propio disco y el motor que sabe interrogarlo también, la lista finita de preguntas se vuelve infinita y gratuita, y una función de producto que antes costaba un endpoint, una revisión, un despliegue y dos semanas pasa a costar escribir una consulta. Pero la simetría es implacable y hay que decirla entera: lo que el cliente gana en autonomía lo gana también en responsabilidad, porque un esquema desplegado en cien mil navegadores es un esquema que no puedes migrar de golpe, ni revertir, ni inspeccionar cuando algo va mal, ni arreglar con un parche en caliente. Has ganado la capacidad de preguntar y has perdido la capacidad de corregir centralizadamente, y ese intercambio es el mismo que hizo la industria al pasar de las aplicaciones de escritorio a la web, solo que recorrido en dirección contraria y con la memoria colectiva del porqué ya borrada. Quien adopte esto sin entenderlo reinventará, uno por uno y a base de incidentes, todos los problemas que la distribución de software instalado tenía resueltos: versiones, compatibilidad hacia atrás, migraciones idempotentes, telemetría de esquema y la humildad de diseñar sabiendo que el código que escribes hoy convivirá durante años con datos escritos por versiones tuyas que ya no recuerdas.
+</Callout>
+
+<Reto title="Rediseña una parte real">
+1. Elige la vista más lenta de tu aplicación actual y escribe la consulta única que la resolvería entera. Cuenta cuántas llamadas al almacén sustituye.
+2. Ejecuta el plan de esa consulta antes y después de crear el índice que creas necesario. Guarda ambas salidas: es la prueba de que el índice sirve para algo.
+3. Localiza en tu modelo tres campos duplicados que existían solo para evitar una unión y elimínalos, sustituyéndolos por la unión correspondiente y una restricción de clave foránea.
+4. Construye la tabla de bitácora de cambios con disparadores de inserción, actualización y borrado, y comprueba que una transacción abortada no deja rastro en ella.
+5. Implementa la exportación consistente a un fichero descargable y ábrelo con una herramienta externa al navegador. Ese momento es la comprobación empírica de todo el nivel.
+</Reto>
