@@ -1,0 +1,166 @@
+---
+title: "Escribir un planificador: la cola, el bucle y los relojes"
+description: "Una cola de corrutinas listas, el bucle que las reanuda, los temporizadores ordenados por plazo y por qué este código de sesenta líneas es lo mismo que hacen las bibliotecas reales."
+subject: lua
+level: 16
+order: 4
+icon: "16.4"
+duracion: "20 min"
+---
+
+<Lead>
+Con la primitiva de espera de la lección anterior falta la mitad del sistema: alguien tiene que decidir qué tarea corre ahora, guardar a las que esperan un plazo y quedarse dormido cuando no hay nada que hacer en vez de girar en vacío. Ese alguien es el planificador, y escribirlo entero cabe en una pantalla. Vale la pena escribirlo aunque nunca lo uses en producción, porque después de hacerlo la documentación de `libuv`, de `vim.uv` o de cualquier motor de corrutinas de servidor deja de ser una lista de funciones misteriosas y pasa a ser el mismo bucle que acabas de teclear, con los detalles duros ya resueltos.
+</Lead>
+
+<Objetivos>
+
+- Construir un planificador cooperativo con cola de listas, tareas dormidas y bucle de reanudación.
+- Justificar el intercambio de colas que evita la inanición y explicar qué garantía de equidad ofrece.
+- Calcular el tiempo de espera hasta el plazo más cercano y situar ahí la llamada bloqueante del sistema.
+- Identificar qué partes del planificador de juguete cambian en una biblioteca real y cuáles son idénticas.
+
+</Objetivos>
+
+## La cola de listas y el bucle
+
+Una tarea es una corrutina más lo que haya que pasarle al reanudarla. El planificador guarda dos colecciones: las que pueden correr ya y las que esperan un plazo.
+
+```lua
+local M = {}
+local listas, dormidas = {}, {}
+local reloj = os.clock
+
+local function encolar(co, ...)
+  listas[#listas + 1] = { co = co, args = table.pack(...) }
+end
+
+function M.generar(f, ...)
+  local co = coroutine.create(f)
+  encolar(co, ...)
+  return co
+end
+
+function M.ceder()  coroutine.yield("ceder")     end
+function M.dormir(s) coroutine.yield("dormir", s) end
+```
+
+El protocolo entre tarea y planificador es una cadena y unos argumentos: la tarea cede diciendo qué quiere y el planificador decide qué hacer con ella. `ceder` significa dame la vuelta al final de la cola, `dormir` significa no me llames hasta dentro de tantos segundos. Añadir un tercer verbo para esperar un descriptor de fichero es una línea más, y ahí es donde este planificador se conectaría con el bucle de eventos de la lección anterior.
+
+```lua
+local function paso(t)
+  local r = table.pack(coroutine.resume(t.co, table.unpack(t.args, 1, t.args.n)))
+  if not r[1] then
+    io.stderr:write("tarea muerta: ", tostring(r[2]), "\n")
+    return
+  end
+  if coroutine.status(t.co) == "dead" then return end
+  if r[2] == "dormir" then
+    dormidas[#dormidas + 1] = { co = t.co, plazo = reloj() + (r[3] or 0) }
+  else
+    encolar(t.co)
+  end
+end
+```
+
+Tres cosas merecen atención en esas doce líneas. La primera es que un fallo de la tarea **no** derriba al planificador: se registra y se sigue, que es lo que distingue a un supervisor de una simple llamada. La segunda es la consulta de `coroutine.status`, imprescindible porque una corrutina que terminó devuelve valores igual que una que cedió, y solo el estado distingue ambas. La tercera es que la tarea vuelve a la cola sin argumentos, de modo que su `yield` devuelve nada; si quisieras entregarle un resultado, ese es el hueco por donde entra.
+
+## Dormir sin girar en vacío
+
+El bucle principal recorre lo que estaba listo, comprueba los plazos vencidos y, si nadie puede correr, espera hasta el plazo más cercano.
+
+```lua
+function M.correr()
+  while true do
+    local pendientes = listas
+    listas = {}
+    for i = 1, #pendientes do paso(pendientes[i]) end
+
+    if #listas == 0 then
+      if #dormidas == 0 then return end
+      local minimo = math.huge
+      for i = 1, #dormidas do
+        if dormidas[i].plazo < minimo then minimo = dormidas[i].plazo end
+      end
+      local espera = minimo - reloj()
+      if espera > 0 then bloquear(espera) end
+    end
+
+    local ahora, quedan = reloj(), {}
+    for i = 1, #dormidas do
+      local d = dormidas[i]
+      if d.plazo <= ahora then encolar(d.co) else quedan[#quedan + 1] = d end
+    end
+    dormidas = quedan
+  end
+end
+```
+
+El intercambio de las dos primeras líneas del bucle es la pieza menos evidente y la más importante. Sin él, una tarea que cede sin hacer nada se reencola en la misma tabla que estamos recorriendo y vuelve a ejecutarse dentro de la misma vuelta, con lo que puede monopolizar el planificador para siempre. Al vaciar `listas` antes de recorrer, la tanda que se ejecuta queda cerrada: cada tarea corre **exactamente una vez** por vuelta y las reencoladas esperan a la siguiente. Esa es toda la equidad que ofrece este diseño, y es una garantía real: ninguna tarea que ceda puede quedarse sin turno. Lo que no puede prometerse es nada frente a una tarea que **no** ceda, porque no hay expropiación y no la habrá.
+
+El cálculo de `espera` es el corazón del asunto. En este juguete, `bloquear` sería una espera activa o una llamada al sistema aproximada; en una biblioteca de verdad, esa línea es la llamada a `epoll_wait`, a `kqueue` o a `WaitForMultipleObjects` con ese mismo valor como tiempo límite. El planificador duerme de verdad, el sistema operativo lo despierta cuando llega un dato o vence el plazo, y el consumo de procesador en reposo es cero. Cambia solo esa línea y este código deja de ser una demostración.
+
+<Mermaid code={`flowchart TD
+  A[Tomar la tanda de listas] --> B[Reanudar cada tarea una vez]
+  B --> C{Alguna quedo lista}
+  C -->|si| E[Vencer plazos y volver a empezar]
+  C -->|no| D[Calcular el plazo mas cercano]
+  D --> F[Bloquear hasta ese instante]
+  F --> E
+  E --> A`} />
+
+Con las tres piezas puestas, el uso es tan aburrido como debe serlo, y esa es la señal de que el diseño está bien repartido:
+
+```lua
+M.generar(function(nombre)
+  for i = 1, 3 do
+    print(nombre, i)
+    M.dormir(0.1)
+  end
+end, "alfa")
+
+M.generar(function(nombre)
+  for i = 1, 5 do
+    print(nombre, i)
+    M.ceder()
+  end
+end, "beta")
+
+M.correr()
+```
+
+Dos tareas escritas como programas secuenciales corrientes, con bucles, variables locales y un final natural, entrelazadas por un planificador que ninguna de las dos menciona. La única palabra que delata el sistema es la llamada a `M.dormir`, y es exactamente la misma que escribirías en un programa de un solo hilo.
+
+Dos honestidades sobre este código. La primera: `os.clock` mide tiempo de procesador, no tiempo de pared, y usarlo para temporizadores es un error que se paga en cuanto el proceso se bloquea. En Neovim usarías `vim.uv.now` o `vim.uv.hrtime`; en un Lua pelado, `os.time` con resolución de un segundo o una función del sistema a través de una biblioteca. La segunda: recorrer la lista de dormidas en cada vuelta es `O(n)` y con miles de temporizadores se nota. La estructura correcta es un montículo mínimo ordenado por plazo, con un contador de inserción para desempatar y mantener el orden estable entre plazos idénticos, que es exactamente lo que hace `libuv`.
+
+## Lo que hacen las bibliotecas reales
+
+Puestos uno al lado del otro, el planificador de juguete y el de producción comparten el esqueleto y difieren en las respuestas a preguntas que aquí ni se han planteado.
+
+<Cards>
+  <Card icon="⚡" title="El bucle es el mismo">
+    Tanda de listas, vencimiento de temporizadores, bloqueo hasta el plazo más cercano. Esa secuencia es literalmente la de `libuv` y la de casi todo motor cooperativo.
+  </Card>
+  <Card icon="🧭" title="Los plazos van en un montículo">
+    La lista lineal se sustituye por un montículo mínimo con desempate por orden de inserción. Cambia la complejidad, no la idea.
+  </Card>
+  <Card icon="🔌" title="El bloqueo es una llamada al núcleo">
+    Donde aquí hay una espera de mentira, allí hay `epoll` o `kqueue` con el mismo tiempo límite calculado igual, y descriptores que también despiertan tareas.
+  </Card>
+  <Card icon="🛟" title="Los fallos tienen dueño">
+    Un supervisor decide si una tarea muerta se reinicia, se propaga o se registra. Nuestro `io.stderr` es la versión mínima de esa política.
+  </Card>
+</Cards>
+
+Hay una consecuencia de diseño que sobrevive intacta al cambio de escala y conviene enunciarla sin adornos. En este modelo no hay bloqueos ni condiciones de carrera del tipo que exigen un mutex, porque nunca hay dos tareas ejecutándose a la vez. Pero **sí** hay condiciones de carrera: cada punto de cesión es un lugar donde otra tarea puede tocar el estado compartido, de modo que un invariante que solo vale entre dos cesiones no vale nada. La disciplina mental es idéntica a la de la programación con hilos; lo único que ha cambiado es que las secciones críticas están delimitadas por cesiones visibles en el código en vez de por primitivas de sincronización. Eso es una ventaja enorme de legibilidad y no es en absoluto una exención.
+
+<Callout type="dios" title="Un planificador es una política escrita como código, y por eso no hay uno correcto">
+La tentación al terminar este bucle es pensar que se ha implementado un mecanismo, algo del mismo orden que una tabla hash: una pieza con una definición correcta a la que uno se acerca más o menos. No lo es. Cada decisión de las que hemos tomado —una tanda cerrada por vuelta, los plazos vencidos después de la tanda y no antes, la tarea muerta registrada en vez de propagada— es una política, y cada una tiene alternativas defendibles que producen sistemas con comportamientos distintos bajo carga. Un planificador con prioridades reordenaría la cola y perdería la garantía de que todos corren; uno que venciera los plazos antes de la tanda favorecería a los temporizadores frente al trabajo de fondo; uno que propagara la muerte de una tarea a sus hermanas construiría un árbol de supervisión al estilo de Erlang y cambiaría por completo cómo se escriben las tareas. Ninguna de esas variantes es más correcta: son respuestas a preguntas sobre qué debe pasar cuando el sistema no da abasto, y esa pregunta no la responde el lenguaje. Por eso las bibliotecas maduras no compiten en velocidad de cambio de contexto, que es despreciable en todas, sino en qué políticas exponen y con qué claridad. Y por eso escribir el tuyo, aunque acabes usando el de otro, cambia la forma en que lees su documentación: dejas de buscar funciones y empiezas a buscar las decisiones que alguien tomó por ti.
+</Callout>
+
+<Reto title="Escribe el planificador y rómpelo a propósito">
+1. Implementa el planificador completo y lanza tres tareas que impriman su nombre y cedan diez veces cada una. Verifica en la salida que el entrelazado es exactamente uno por vuelta.
+2. Sustituye el intercambio de colas por un reencolado directo sobre la tabla que estás recorriendo y lanza una tarea que ceda sin parar. Describe qué le ocurre a las demás.
+3. Añade el verbo `dormir` a una tarea y comprueba con un reloj de pared que el plazo se respeta. Cambia `os.clock` por una fuente de tiempo real y explica la diferencia que observas.
+4. Sustituye la lista de dormidas por un montículo mínimo. Mide el tiempo de una vuelta con diez, mil y cien mil temporizadores en ambas versiones.
+5. Haz que una tarea lance un error y decide una política distinta a registrar: propagar a las hermanas o reiniciar la tarea un número limitado de veces. Implementa la que elijas y argumenta en dos líneas cuándo sería la correcta.
+</Reto>
