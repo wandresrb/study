@@ -1,0 +1,156 @@
+---
+title: "Zero: el servidor manda y el cliente ya se lo cree"
+description: "Zero ejecuta cada mutador dos veces, una en el cliente para responder al instante y otra en tu servidor para decidir de verdad, y descarta el resultado local en cuanto llega el autoritativo."
+subject: local-first
+level: 53
+order: 1
+icon: "53.1"
+duracion: "22 min"
+---
+
+<Lead>
+De todos los motores que este nivel recorre, Zero es el que menos se parece a lo que el track lleva veinte niveles construyendo, y esa distancia es precisamente lo que lo hace instructivo. Su propia documentación lo declara sin rodeos: Zero no es local-first, es un sistema cliente-servidor con un servidor autoritativo. No hay convergencia algebraica, no hay estructuras que conmutan, no hay escrituras sin conexión. Lo que hay es una técnica prestada de la industria del videojuego —la reconciliación con el servidor— aplicada con obstinación a la latencia de las aplicaciones de productividad: el cliente ejecuta la mutación de inmediato para que la interfaz no espere a nadie, el servidor la vuelve a ejecutar sobre la base de datos real, y el resultado local se tira a la basura en cuanto el autoritativo llega. Entender por qué ese diseño es una elección deliberada y no una renuncia es entender qué problema resuelve de verdad la mitad del mercado de motores de sincronización.
+</Lead>
+
+<Objetivos>
+
+- Escribir un mutador personalizado en sus dos encarnaciones y saber qué comparten y qué no.
+- Seguir el ciclo completo de una mutación desde la pulsación hasta la reversión de lo especulativo.
+- Entender la sincronización dirigida por consulta y por qué el cliente nunca envía consultas arbitrarias.
+- Situar a Zero en el mapa aplicando los límites que su propia documentación declara.
+
+</Objetivos>
+
+Este nivel continúa el anterior con un cambio de registro: allí se estudió qué es un motor de sincronización y qué problemas tiene que resolver cualquiera que lo sea; aquí se examinan los que existen de verdad, uno por lección, con su documentación oficial delante y sin conceder a ninguno el beneficio de la duda. Empezamos por Zero porque es el que plantea con más nitidez la pregunta que ordena todo el nivel.
+
+## El mutador que se escribe dos veces
+
+El giro conceptual de Zero es que su API de escritura no es un conjunto de operaciones fijas sobre tablas, sino código tuyo. Un mutador personalizado es una función que corre dentro de una transacción y que puede leer y escribir; el mismo nombre lógico tiene dos implementaciones, una en el cliente escrita en TypeScript contra la interfaz de transacción de Zero, y otra en tu servidor ejecutándose contra tu base de datos dentro de un endpoint que la documentación llama el endpoint de `push`.
+
+```ts
+// Cliente: valida y escribe contra el almacen local, con lecturas en ZQL
+async function actualizarTitulo(tx, { id, titulo }) {
+  const previo = await tx.query.issue.where("id", id).one().run();
+  if (!previo.isLegacy && titulo.length > 100) {
+    throw new Error("El titulo es demasiado largo");
+  }
+  await tx.mutate.issue.update({ id, title: titulo });
+}
+
+// Servidor: la misma regla mas lo que solo el servidor puede saber
+async function actualizarTituloEnServidor(tx, args) {
+  if (await pareceSpam(args.titulo)) throw new Error("Titulo sospechoso");
+  await actualizarTitulo(tx, args); // la transaccion de servidor habla ZQL contra Postgres
+}
+```
+
+Compartir código entre ambas implementaciones es una comodidad, no un requisito: la documentación es explícita en que el mutador de servidor puede escribirse en otro lenguaje y con otra librería de acceso a datos, y en que lo único obligatorio es que el endpoint cumpla el protocolo de `push`. Para quien trabaja en TypeScript, Zero ofrece una clase que encapsula ese protocolo y un proveedor de conexión que abre la transacción contra Postgres, de modo que el endpoint completo cabe en una docena de líneas.
+
+```ts
+// El endpoint de push: recibe una peticion con una o varias mutaciones
+const procesador = new PushProcessor(schema, conexionPostgres);
+
+app.post("/push", async (c) => {
+  const resultado = await procesador.process(
+    crearMutadores(jwtDecodificado), // los permisos viven aqui dentro
+    c.req.query(),
+    await c.req.json(),
+  );
+  return c.json(resultado);
+});
+```
+
+Conviene subrayar qué tipo de objeto es esto, porque marca la diferencia con todo lo que viene después en el nivel. No es un servicio nuevo que haya que operar: es **tu servidor de siempre**, el mismo donde ya vive la autenticación, con una ruta más. Zero no te pide mover la lógica de negocio a ningún sitio raro ni adoptar un modelo de datos ajeno; te pide exponer una ruta y seguir escribiendo funciones. Esa continuidad con la arquitectura clásica es el argumento comercial central del proyecto y explica por qué su documentación insiste en que puedes convivir con tu API REST existente y migrar por partes.
+
+También conviene notar lo que el mutador de servidor **no** debe hacer, porque la documentación lo señala y es un error frecuente: mantener abierta una transacción de base de datos mientras se habla por red. Enviar correos, invocar servicios externos o notificar suscriptores debe hacerse después de que la transacción confirme. Como el mutador es código corriente, el patrón sugerido es acumular esas tareas en una lista que el manejador ejecuta al terminar, en lugar de inventar un mecanismo específico dentro del motor.
+
+<Callout type="tip" title="Los permisos de escritura desaparecen porque el mutador ya es el sitio donde se comprueban">
+Con mutadores personalizados no existe un sistema declarativo de permisos de escritura, y eso no es una carencia sino una consecuencia: si la escritura es código arbitrario que corre en tu servidor, la comprobación de autorización es una línea más de ese código. La documentación recomienda pasar los datos de autenticación —típicamente el JWT ya decodificado— como parámetro de la función que construye el mapa de mutadores, de manera que cada mutador cierre sobre la identidad de quien escribe. Los permisos de **lectura** siguen existiendo aparte y siguen haciendo falta, porque controlan qué filas llegan a sincronizarse al cliente y ahí el cliente no ejecuta nada tuyo.
+</Callout>
+
+## La reversión: siete pasos y una verdad que llega tarde
+
+Lo que hace singular a Zero no es la escritura optimista, que hoy tiene cualquiera, sino la disciplina con que trata el resultado optimista como **especulativo por definición**. El ciclo que la documentación describe tiene siete pasos y conviene leerlo entero antes de opinar sobre él.
+
+<Mermaid code={`sequenceDiagram
+  participant UI as interfaz
+  participant C as cliente
+  participant Z as zero cache
+  participant S as tu servidor
+  participant P as postgres
+  UI->>C: llamada al mutador
+  C->>C: ejecuta la version cliente y actualiza las consultas activas
+  C->>Z: envia la mutacion en segundo plano
+  Z->>S: invoca el endpoint de push
+  S->>P: ejecuta la version servidor en una transaccion
+  P-->>Z: replicacion logica de los cambios
+  Z-->>C: filas modificadas mas mutaciones ya aplicadas
+  C->>C: revierte lo especulativo y aplica lo autoritativo`} />
+
+Antes de comentarlo, fíjate en un rasgo del diagrama que es fácil pasar por alto: entre el paso quinto y el séptimo no hay un canal especial de confirmación. El cambio vuelve al cliente **por la misma vía que cualquier otro cambio del mundo**, la replicación lógica de Postgres hacia la réplica y de ahí a las consultas activas. Zero no distingue entre *tu* escritura confirmada y la escritura de otro usuario; lo único que añade es la información de qué mutaciones ya se aplicaron, para saber qué especulaciones puede retirar. Esa uniformidad es la que hace que el sistema no tenga dos caminos de datos que mantener sincronizados entre sí.
+
+El paso decisivo es el último. El cliente no compara ni fusiona: **descarta**. Si el mutador de servidor decidió algo distinto del de cliente, gana el de servidor; si lanzó una excepción, la mutación entera se deshace y el error viaja de vuelta, disponible en la propiedad `server` que devuelve la llamada. Esa asimetría es lo que permite que el mutador de servidor haga cosas que el cliente no puede ni debe hacer: consultar un modelo de lenguaje, escribir en una tabla de auditoría, enviar correos, aplicar una regla de negocio que depende de datos que nunca se sincronizan.
+
+De ese diseño se deriva una regla operativa que la documentación repite y que se paga cara cuando se ignora: **los mutadores corren varias veces** —a veces dos en el cliente y una en el servidor—, así que no deben generar identificadores dentro. Los identificadores se generan fuera y se pasan como argumento, preferentemente aleatorios y ordenables por tiempo en lugar de autoincrementales, porque un autoincremental es exactamente el tipo de valor que el cliente no puede predecir.
+
+Hay una segunda restricción, menos obvia, sobre las **lecturas dentro del mutador de cliente**. El mutador puede consultar el almacén local, pero solo verá los datos que alguna consulta activa haya traído; si tu validación necesita una fila que nadie está sincronizando, en el cliente no estará y la comprobación solo ocurrirá arriba. Eso no rompe nada —el servidor sigue teniendo la última palabra— pero produce una experiencia asimétrica que conviene diseñar a propósito: la validación que quieres que el usuario vea al instante debe apoyarse en datos que sabes que están sincronizados.
+
+Conviene también entender qué pasa cuando la red se corta a mitad de este ciclo, porque la respuesta es reveladora. Las mutaciones pendientes se quedan pendientes: no se pierden, pero tampoco se convierten en verdad, y la interfaz sigue mostrando un estado que aún nadie ha aprobado. Cuando la conexión vuelve, el ciclo se completa y la reversión ocurre entonces, quizá minutos después de que el usuario diera por hecho el cambio. Ese desfase es tolerable en cortes de segundos y desagradable en cortes de minutos, y es justamente por eso que el proyecto desaconseja los periodos largos sin conexión en lugar de venderlos como una funcionalidad.
+
+Merece la pena detenerse en la genealogía de esta técnica, porque explica su forma. La reconciliación con el servidor viene de los juegos en red de los años noventa: el cliente predice el movimiento del personaje para que el mando responda sin latencia, el servidor calcula la posición real y, cuando llega su veredicto, el cliente corrige. Nadie llamó nunca a eso local-first, y con razón. Es una técnica para **ocultar latencia sin ceder autoridad**, y trasladada a una aplicación de gestión produce exactamente el mismo perfil: sensación inmediata, corrección tardía, ningún funcionamiento real cuando el servidor no está.
+
+## Sincronización dirigida por consulta
+
+En el lado de la lectura, Zero no sincroniza tablas ni mantiene reglas estáticas: sincroniza el resultado de las consultas que tu aplicación ejecuta. El servicio `zero-cache` mantiene una réplica de tu Postgres en una base SQLite propia, alimentada por replicación lógica, y sirve desde ahí los subconjuntos de filas que cada cliente necesita. Cuando el cliente pide una consulta, no envía SQL arbitrario: envía un nombre y unos argumentos que tu servidor resuelve —aplicando ahí los permisos de lectura— hasta convertirlos en la consulta real que `zero-cache` ejecutará contra su réplica.
+
+Ese rodeo por tu servidor es la pieza que hace segura toda la arquitectura, y conviene verlo con claridad porque es una decisión de diseño y no un detalle de implementación. Si el cliente pudiera enviar consultas libres, cualquier control de acceso sería una ilusión: bastaría con abrir las herramientas del navegador y pedir otra cosa. Al obligar a que el cliente pida una consulta *por nombre*, el conjunto de consultas posibles queda cerrado y definido en tu código, y la traducción de nombre a consulta es el punto natural donde inyectar el contexto de quien pregunta. La sincronización parcial deja así de ser un problema de configuración y pasa a ser un problema de programación.
+
+La contrapartida operativa es que las consultas se convierten en carga sostenida, no en picos. Una consulta que se ejecuta una vez y va lenta es un inconveniente; una consulta suscrita que se mantiene viva y se recalcula ante cada cambio relevante es un coste permanente. Por eso la documentación insiste tanto en el análisis de planes y advierte de que los índices se derivan de los de la base de origen: si arriba falta el índice, abajo faltará también, y el motor lo notará en cada actualización que toque esas filas.
+
+<Cards>
+  <Card icon="🧠" title="La réplica es SQLite, no un caché">
+    `zero-cache` mantiene una copia completa de lo sincronizable y asume acceso local muy rápido a ella; el diseño supone disco NVMe adjunto y por eso el tamaño de esa réplica es el límite real del sistema.
+  </Card>
+  <Card icon="🔎" title="La consulta es la unidad de sincronización">
+    No hay reglas declarativas que mantener aparte del código: lo que se sincroniza es lo que se consulta, y Zero reutiliza lo ya cacheado y va al servidor solo cuando le falta algo.
+  </Card>
+  <Card icon="⚖️" title="El nombre viaja, el SQL no">
+    El cliente manda nombre y argumentos; tu servidor decide qué consulta significan. Ese rodeo es lo que permite imponer permisos de lectura sin confiar en el cliente.
+  </Card>
+  <Card icon="🐢" title="Las consultas hay que optimizarlas">
+    La documentación advierte de que los índices se derivan de los de Postgres y ofrece una herramienta de análisis; un plan con ordenación temporal en memoria es la señal de que falta un índice arriba.
+  </Card>
+</Cards>
+
+Hay un detalle de esta arquitectura que suele pasarse por alto y que tiene consecuencias en el diseño de la interfaz: los resultados de consulta deben tratarse como **inmutables**. El motor mantiene sus propias estructuras y las comparte con la vista; mutar un objeto devuelto por un hook de consulta es corromper el estado interno de un modo que no falla de inmediato sino más tarde y en otro sitio. Es la clase de regla que no aparece en los tutoriales y sí en las incidencias difíciles.
+
+## Para qué está pensado, y qué dice su propia documentación que no es
+
+Zero alcanzó la versión 1.0 y la disponibilidad general en 2026, tras un desarrollo largo y público de Rocicorp. Su página de estado describe una hoja de ruta deliberadamente conservadora: menos funcionalidad nueva y más corrección de errores y rendimiento, con las agregaciones, el renderizado en servidor y la búsqueda de texto todavía en la lista de deseos. Esa madurez conviene leerla junto a la lista de límites, que es de las más honestas del sector.
+
+La propia documentación de Zero incluye, además, una página de alternativas que recomienda a la competencia por nombre cuando el encaje no es el suyo, y ese gesto dice más sobre la madurez del proyecto que cualquier número de versión. Las cuatro lecciones restantes de este nivel recorren casi exactamente esa lista, y no por casualidad: es el mapa que el propio ecosistema reconoce.
+
+El terreno que reclama para sí lo resume su documentación con una comparación que se ha vuelto canónica en el ramo: aplicaciones *como Linear*. Merece la pena desmontar qué significa eso técnicamente, porque no es una referencia estética. Significa un conjunto de datos por usuario que cabe holgadamente en el cliente, una tasa de escritura moderada, una interacción densa en la que cada milisegundo se nota, un modelo de permisos por equipo o proyecto que no se expresa bien con reglas declarativas, y un público que trabaja con conexión salvo interrupciones breves. Cambia cualquiera de esos cinco supuestos y la respuesta cambia con él.
+
+<Callout type="info" title="Una réplica no es un caché, y la diferencia se paga en operaciones">
+Cuesta poco confundir la réplica SQLite de `zero-cache` con una capa de caché, y la confusión lleva a dimensionar mal la infraestructura. Un caché puede estar frío, puede vaciarse y puede perderse sin consecuencias graves; esta réplica es una copia consistente de lo sincronizable, se alimenta por replicación lógica desde Postgres y el motor de consultas asume acceso local muy rápido a ella, del orden de un disco de estado sólido adjunto. Reconstruirla no es calentar un caché sino repetir una replicación inicial completa. En términos prácticos, eso significa que `zero-cache` es un componente con estado que hay que planificar —almacenamiento, arranque en frío, actualizaciones— y no un proceso desechable que puedas escalar horizontalmente sin pensarlo.
+</Callout>
+
+<Callout type="warn" title="Cuatro fronteras declaradas por el propio proyecto">
+La documentación de Zero enumera sin eufemismos cuándo no usarlo. Si necesitas las garantías de privacidad o de propiedad del dato que motivan el local-first, Zero no las da, porque es cliente-servidor con servidor autoritativo. Si necesitas **escrituras sin conexión** o periodos largos desconectado, Zero no las soporta. Si construyes una aplicación móvil nativa, Zero está escrito en TypeScript y solo admite clientes TypeScript. Y si tu conjunto de datos de servidor supera el orden de los cien gigabytes, el proyecto recomienda hablarlo antes, porque la réplica SQLite deja de ser cómoda. A cambio, declara su terreno con la misma claridad: aplicaciones de productividad muy interactivas, sobre Postgres existente, con permisos finos y obsesión por la latencia de interacción.
+</Callout>
+
+Puestos a resumirlo en una frase, Zero es la respuesta más ambiciosa a la pregunta *cómo hago que mi aplicación web clásica se sienta instantánea sin dejar de ser una aplicación web clásica*. No es la respuesta a *cómo hago que mis usuarios sean dueños de sus datos*, ni a *cómo hago que mi aplicación funcione una semana sin cobertura*. Confundir esas tres preguntas es el error más caro que se comete al elegir motor, y la última lección de este nivel está dedicada precisamente a no cometerlo.
+
+<Callout type="dios" title="La escritura optimista no es una técnica de interfaz: es un contrato sobre quién tiene razón">
+Casi todo el mundo que ha construido una aplicación web ha implementado escritura optimista alguna vez, y casi todo el mundo la ha implementado mal por el mismo motivo: la trató como un truco de presentación —pintar antes de que el servidor conteste— en lugar de como lo que realmente es, **una afirmación sobre la autoridad**. En el momento en que pintas un estado que el servidor todavía no ha confirmado, has creado dos versiones de la verdad y has contraído, quieras o no, la obligación de decir cuál gana. Ese es el eje que separa a los motores de este nivel y el que hay que tener presente al leer las cuatro lecciones siguientes. Zero responde a esa pregunta de la manera más simple posible: gana el servidor, siempre, y lo local es *especulación* con fecha de caducidad. Y fíjate en lo que esa respuesta compra, porque es mucho más de lo que parece. Compra que puedas validar de verdad, porque la validación que importa corre donde están todos los datos y donde el usuario no puede tocarla. Compra que puedas cambiar la lógica de negocio desplegando el servidor, sin esperar a que se actualice el cliente de nadie. Compra que los permisos sean código en un solo sitio en lugar de un lenguaje declarativo que hay que aprender y que nunca expresa el caso raro. Compra, sobre todo, que no exista jamás un estado convergido que nadie autorizó, que es la patología silenciosa de los sistemas puramente convergentes: dos réplicas que se ponen de acuerdo en algo que la regla de negocio prohibía. Y lo que cuesta es igual de nítido: sin servidor no hay escritura, porque una especulación que nunca se confirma no es un dato, es una promesa. Por eso Zero no soporta escrituras sin conexión y por eso su documentación se niega a llamarse local-first, cuando le habría resultado comercialmente cómodo hacerlo. La lección que hay que llevarse no es que Zero acierte o se equivoque, sino que **la pregunta por la autoridad se responde una vez y condiciona todo lo demás**: el modelo de permisos, el comportamiento sin red, la posibilidad de auditar, el coste de operar y hasta qué tipo de producto puedes vender. Elegir motor de sincronización es, casi en su totalidad, elegir esa respuesta.
+</Callout>
+
+<Reto title="Somete un mutador a la asimetría">
+1. Escribe un mutador personalizado con lógica de validación real y duplícalo en cliente y servidor compartiendo la parte común.
+2. Añade al mutador de servidor una comprobación que el cliente no pueda hacer, y observa en la interfaz la reversión de lo especulativo.
+3. Provoca deliberadamente un fallo de servidor y comprueba que el error llega por la propiedad de resultado autoritativo de la llamada.
+4. Busca en tu código todos los sitios donde generas identificadores y verifica que ninguno se genera dentro de un mutador.
+5. Ejecuta el analizador de consultas sobre tus tres consultas más pesadas y anota cuáles carecen del índice correspondiente en Postgres.
+6. Escribe medio folio justificando, con los cuatro límites declarados, si tu aplicación cae dentro o fuera del terreno de Zero.
+</Reto>
