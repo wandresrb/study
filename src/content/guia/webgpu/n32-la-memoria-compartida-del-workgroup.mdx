@@ -1,0 +1,136 @@
+---
+title: "La memoria compartida del workgroup"
+description: "El address space workgroup: qué es físicamente, cuánto cabe, qué le cuesta a la ocupación y cuándo compensa de verdad usarlo."
+subject: webgpu
+level: 32
+order: 1
+icon: "32.1"
+duracion: "20 min"
+---
+
+<Lead>
+Hasta ahora cada invocación era una isla: leía de storage, calculaba, escribía en storage. El address space `workgroup` rompe ese aislamiento y abre la única puerta de comunicación que existe en una GPU. Es un bloque de memoria físicamente distinto de la VRAM, situado dentro de la unidad de cómputo, con una latencia unas cien veces menor, y compartido por todas las invocaciones de un mismo grupo. Todo el cómputo paralelo interesante —reducciones, scans, tiles, búsquedas de vecinos— existe gracias a esos pocos kilobytes.
+</Lead>
+
+<Objetivos>
+
+- Declarar variables en el address space `workgroup` respetando sus reglas sintácticas.
+- Calcular el consumo de memoria compartida de un kernel y contrastarlo con el límite.
+- Explicar el efecto de la memoria compartida sobre el número de workgroups residentes.
+- Identificar los casos en los que la memoria compartida no aporta nada.
+
+</Objetivos>
+
+## Qué es y cómo se declara
+
+En el silicio, la memoria compartida es un bloque de SRAM dentro de cada unidad de cómputo, del mismo tipo que una caché L1 pero gestionado explícitamente por el programa en vez de por el hardware. De ahí sale toda su ventaja y toda su dificultad: es rápida porque está al lado de las unidades aritméticas, y es tuya porque nadie decide por ti qué se guarda.
+
+En WGSL se declara con `var` y el address space entre ángulos, siempre a nivel de módulo, nunca dentro de una función.
+
+```wgsl
+const TAM: u32 = 256u;
+
+var<workgroup> parcial: array<f32, TAM>;
+var<workgroup> tile: array<array<f32, 16>, 16>;
+var<workgroup> bandera: atomic<u32>;
+```
+
+Tres reglas que el compilador impone y conviene conocer antes de chocarse con ellas. La primera: **no admite inicializador**. Escribir `var<workgroup> x: u32 = 0u;` no compila. La segunda, que es la contrapartida amable de la primera: WebGPU **inicializa a cero** la memoria del workgroup antes de que el grupo empiece a ejecutarse, así que el estado de partida es predecible aunque no lo escribas tú. La tercera: el tamaño de un array en este address space debe ser una expresión constante del módulo, no una `override`, con las consecuencias que ya vimos al [parametrizar el tamaño del workgroup](/guia/webgpu/n31-workgroup-size-en-tres-dimensiones/).
+
+La inicialización a cero es una garantía de seguridad, no una comodidad: sin ella, un shader podría leer restos de lo que dejó otra página web en esa misma unidad de cómputo. Puedes apoyarte en ella, pero con una reserva importante que aparece en cuanto el kernel tiene bucles: **el cero está garantizado al principio del workgroup, no al principio de cada iteración**. Si tu bucle reutiliza el mismo array en varias pasadas, tienes que limpiarlo tú y poner una barrera después.
+
+## El presupuesto: 16384 bytes
+
+`maxComputeWorkgroupStorageSize` vale 16384 bytes por defecto, y es el total de todas las variables `workgroup` del módulo, con sus reglas de alineación aplicadas. Traducido a cosas concretas:
+
+| declaración | bytes |
+|---|---|
+| `array<f32, 256>` | 1024 |
+| `array<u32, 1024>` | 4096 |
+| `array<vec4f, 256>` | 4096 |
+| `array<array<f32, 16>, 16>` | 1024 |
+| `array<array<f32, 32>, 32>` | 4096 |
+| `array<array<f32, 64>, 64>` | 16384 |
+
+Un detalle de alineación que sorprende: `array<vec3f, N>` **no** ocupa 12·N bytes. El tipo `vec3f` tiene alineación 16, así que el paso del array es 16 y el consumo real es 16·N, con un 25 por ciento desperdiciado. Si vas justo de espacio, tres arrays paralelos de `f32` ocupan 12·N y a menudo son además más rápidos, porque cada uno se lee de forma perfectamente contigua.
+
+El límite se comprueba al crear el pipeline, así que un exceso se manifiesta como un error de validación con un mensaje razonablemente claro, no como un fallo silencioso. Es de los pocos errores de compute que WebGPU sí detecta a tiempo.
+
+## Lo que la memoria compartida le cuesta a la ocupación
+
+Cada unidad de cómputo tiene una cantidad fija de memoria compartida —64 KB es un valor típico, aunque varía— que se reparte entre los workgroups residentes en ella. La aritmética es implacable: si tu kernel declara 16 KB, caben cuatro workgroups a la vez; si declara 4 KB, caben dieciséis; si declara 1 KB, el límite pasa a ser otro recurso, normalmente los registros.
+
+Y el número de workgroups residentes es lo que permite ocultar la latencia de memoria. Cuando un grupo se bloquea esperando una lectura de VRAM —del orden de 400 a 800 ciclos— el planificador cambia a otro grupo residente. Con cuatro grupos residentes tienes cuatro oportunidades de tener trabajo listo; con dieciséis, dieciséis.
+
+De ahí sale un criterio que contradice la intuición de "cuanta más caché, mejor": **pedir memoria compartida solo compensa si cada byte cargado se lee más de una vez**. La cuenta que hay que hacerse es el factor de reutilización. Si cargas un valor en memoria compartida y lo lees una sola vez, has añadido una escritura, una barrera y una lectura para sustituir una única lectura de VRAM que además habría sido coalescente. Has empeorado el kernel y encima has reducido la ocupación.
+
+```wgsl
+// INUTIL: cada valor se carga y se lee una sola vez.
+var<workgroup> cache: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn malo(@builtin(global_invocation_id) gid: vec3u,
+        @builtin(local_invocation_index) li: u32) {
+  cache[li] = entrada[gid.x];
+  workgroupBarrier();
+  salida[gid.x] = cache[li] * 2.0;   // podria haber leido entrada directamente
+}
+```
+
+Ese kernel es más lento que la versión sin memoria compartida, siempre, en todas las máquinas. El factor de reutilización es uno.
+
+## El caso donde sí: reutilización con solape
+
+El ejemplo canónico es un filtro con vecindad. Un desenfoque de radio `R` sobre una tira de 64 elementos necesita leer `64 + 2R` valores para producir 64, pero cada valor participa en `2R + 1` salidas. Sin memoria compartida, la GPU relee cada valor `2R + 1` veces de VRAM; con memoria compartida, lo lee una vez.
+
+```wgsl
+const TAM: u32 = 64u;
+const R:   u32 = 4u;
+const HALO: u32 = TAM + 2u * R;      // 72
+
+@group(0) @binding(0) var<uniform> params: Params;   // params.conteo
+@group(0) @binding(1) var<storage, read>       entrada: array<f32>;
+@group(0) @binding(2) var<storage, read_write> salida:  array<f32>;
+
+var<workgroup> tira: array<f32, HALO>;
+
+fn leerSeguro(i: i32) -> f32 {
+  // Repite el borde en vez de leer fuera: evita un escalon en la imagen.
+  let n = i32(params.conteo);
+  let c = clamp(i, 0, n - 1);
+  return entrada[u32(c)];
+}
+
+@compute @workgroup_size(TAM)
+fn desenfocar(@builtin(workgroup_id) wid: vec3u,
+              @builtin(local_invocation_index) li: u32) {
+  let base = i32(wid.x * TAM) - i32(R);
+
+  // 64 invocaciones cargan 72 valores: cada una carga una, y las 8
+  // primeras cargan una segunda. El bucle es uniforme, no diverge de grupo.
+  var k = li;
+  loop {
+    if (k >= HALO) { break; }
+    tira[k] = leerSeguro(base + i32(k));
+    k += TAM;
+  }
+  workgroupBarrier();
+
+  let i = wid.x * TAM + li;
+  if (i < params.conteo) {
+    var suma = 0.0;
+    for (var d: u32 = 0u; d <= 2u * R; d = d + 1u) {
+      suma = suma + tira[li + d];
+    }
+    salida[i] = suma / f32(2u * R + 1u);
+  }
+}
+```
+
+Aquí el factor de reutilización es nueve: cada valor cargado se lee nueve veces desde memoria compartida en vez de nueve veces desde VRAM. El consumo es de 288 bytes, insignificante para la ocupación. Es un kernel que gana de verdad.
+
+Fíjate en dos decisiones. El bucle de carga usa una zancada de `TAM` en vez de asignarle a cada invocación un tramo contiguo: así las lecturas de `entrada` son consecutivas dentro del warp. Y la lectura fuera del dominio se resuelve con `clamp` en vez de con un `if` que deje huecos, porque un hueco sin escribir en memoria compartida sería cero y produciría un oscurecimiento en los bordes.
+
+<Callout type="dios" title="El conflicto de bancos es la optimizacion que WebGPU no te deja controlar, y aun asi te afecta">
+La memoria compartida no es un bloque plano: está dividida en bancos, típicamente 32 bancos de 4 bytes que se pueden servir en paralelo, uno por ciclo cada uno. Un acceso en el que las 32 invocaciones de un warp tocan 32 bancos distintos se resuelve en un ciclo. Un acceso en el que dos invocaciones tocan el mismo banco en direcciones distintas se serializa en dos ciclos, y si las 32 tocan el mismo banco, en 32. La dirección se reparte de forma cíclica: la palabra `i` cae en el banco `i % 32`. La consecuencia práctica es que un array bidimensional `array<array<f32, 32>, 32>` recorrido por columnas —la invocación `k` lee `tile[k][j]` con `j` fijo— produce un conflicto de 32 vías, porque todas esas direcciones están separadas por 32 palabras y caen en el mismo banco. El kernel es 32 veces más lento en ese acceso y no hay ningún indicio en el código. El remedio clásico es el **padding**: declarar el array como `array<array<f32, 33>, 32>` en vez de 32 por 32. Con 33 columnas, la fila `k` empieza en la palabra `33k`, y `33k % 32` recorre todos los bancos según crece `k`, así que el acceso por columnas queda perfectamente repartido. Cuesta 128 bytes de memoria compartida y puede multiplicar por varios el rendimiento de una transposición o de una multiplicación de matrices. WGSL no expone los bancos ni te deja consultarlos —el número depende del hardware— pero el truco del padding impar funciona en todas las arquitecturas conocidas justamente porque todas usan un número de bancos que es potencia de dos.
+</Callout>

@@ -1,0 +1,117 @@
+---
+title: "Contar partículas por celda"
+description: "El histograma espacial con atómicas, la puesta a cero de millones de contadores sin coste, y qué hacer con la contención de las celdas densas."
+subject: webgpu
+level: 36
+order: 2
+icon: "36.2"
+duracion: "18 min"
+---
+
+<Lead>
+La construcción de una rejilla espacial en GPU es, literalmente, un counting sort en el que la clave es el índice de celda. Y la primera fase de un counting sort es un histograma. Esta lección es corta porque el kernel son diez líneas, pero tiene tres decisiones que separan una implementación que funciona con cien mil partículas de una que aguanta un millón: cómo se pone a cero un array de dos millones de contadores cada frame, qué pasa cuando diez mil partículas caen en la misma celda, y cómo se detecta el desbordamiento sin traer datos a la CPU.
+</Lead>
+
+<Objetivos>
+
+- Escribir el kernel de conteo por celda con el guardia de rango correcto.
+- Poner a cero el array de contadores dentro del command buffer.
+- Estimar y mitigar la contención atómica de las celdas densas.
+- Detectar en la propia GPU que una celda ha superado su capacidad.
+
+</Objetivos>
+
+## El kernel
+
+```wgsl
+struct Params { conteo: u32, celdas: u32 };
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<uniform> g: Rejilla;
+
+struct Particula { pos: vec3f, vida: f32, vel: vec3f, masa: f32 };
+@group(0) @binding(2) var<storage, read>       parts:   array<Particula>;
+@group(0) @binding(3) var<storage, read_write> conteos: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> celdaDe: array<u32>;
+
+@compute @workgroup_size(64)
+fn contar(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= p.conteo) { return; }
+
+  let c = indiceCelda(coordCelda(parts[i].pos));
+
+  // Se guarda para no recalcularlo en la fase de dispersion.
+  celdaDe[i] = c;
+  atomicAdd(&conteos[c], 1u);
+}
+```
+
+Guardar `celdaDe[i]` cuesta cuatro bytes por partícula y ahorra recalcular la coordenada de celda en el kernel de dispersión. Como ese cálculo son un `floor`, tres divisiones y dos multiplicaciones, la cuenta sale a favor de guardarlo en cuanto la partícula ocupa más de unos pocos bytes: recalcular obligaría a releer la posición completa, que son 16 bytes, para producir 4.
+
+El guardia de rango vive dentro de `indiceCelda`, con el `clamp` que ya vimos. Es fundamental que esté ahí y no aquí: si cada punto de llamada tuviera que acordarse de saturar, tarde o temprano uno se olvida.
+
+## Poner a cero dos millones de contadores
+
+El array de conteos tiene que valer cero al empezar cada frame. Con una rejilla de 128 al cubo son 2.097.152 contadores, ocho megabytes. Hay tres caminos y solo uno es bueno.
+
+Subirlos desde la CPU con `writeBuffer` son ocho megabytes por el bus cada frame: inaceptable.
+
+Un kernel que escriba ceros son 2 millones de invocaciones y ocho megabytes de escritura: aceptable, y es lo que hacía todo el mundo antes.
+
+`commandEncoder.clearBuffer` es la respuesta correcta. Es una operación del propio encoder que pone a cero un rango del buffer, la implementa el controlador con el camino más rápido que tenga —a menudo una operación de relleno de la unidad de copia, sin pasar por los shaders— y se ordena de forma natural con los passes.
+
+```js
+const enc = device.createCommandEncoder();
+
+enc.clearBuffer(bufConteos);            // el buffer entero a cero
+
+const cp = enc.beginComputePass();
+cp.setPipeline(pipeContar);
+cp.setBindGroup(0, bgContar);
+cp.dispatchWorkgroups(Math.ceil(N / 64));
+cp.end();
+```
+
+`clearBuffer` sin argumentos de rango limpia el buffer completo; con `offset` y `size` limpia un tramo, con la restricción de que ambos deben ser múltiplos de 4.
+
+Hay una optimización que a veces vale la pena: si la simulación ocupa solo una parte del dominio, limpiar únicamente el rango de celdas que se usó el frame anterior. Requiere llevar la cuenta y complica el código; en la práctica el `clearBuffer` completo de ocho megabytes cuesta muy poco porque es escritura secuencial pura, del orden de decenas de microsegundos en una GPU de escritorio.
+
+## La contención de las celdas densas
+
+Todas las partículas de una misma celda incrementan el mismo contador. Si la distribución es uniforme y hay 20 partículas por celda, la contención es de 20 vías: irrelevante. Si el sistema colapsa y cien mil partículas caen en la misma celda, esas cien mil atómicas se serializan y el kernel se para.
+
+Eso ocurre de verdad y no en casos raros: un fluido en reposo se asienta, las partículas se apilan en el fondo, y las celdas del suelo acumulan mucho más que la media. También ocurre cuando el radio de interacción está mal elegido y las celdas son demasiado grandes.
+
+El patrón de dos niveles que funciona en los histogramas —agregar en memoria compartida y hacer una aportación global por workgroup— aquí **no** se puede aplicar directamente, porque el número de celdas es de millones y no cabe un histograma local. Hay tres mitigaciones reales.
+
+**Elegir bien el tamaño de celda.** Si la celda es el radio de interacción y la densidad es la de un fluido bien resuelto, salen entre 20 y 60 partículas por celda. Si te salen cientos, la celda es demasiado grande y estás pagando contención y además volumen inspeccionado.
+
+**Ordenar las partículas por celda entre frames.** Si las partículas de la misma celda son contiguas en el array, las invocaciones que colisionan en el contador están en el mismo warp, y muchas GPU resuelven la agregación dentro del warp antes de emitir la atómica. Es un efecto de hardware que no se puede exigir, pero se nota. Y es un motivo más para [reordenar por celda](/guia/webgpu/n36-reordenar-por-celda-y-la-coalescencia/).
+
+**Usar operaciones de subgrupo cuando estén disponibles.** Con la extensión de subgrupos se puede agregar dentro del grupo SIMD y emitir una sola atómica por grupo. Como no está en los tres motores, hace falta el camino alternativo, así que solo compensa si has medido que la contención es tu problema.
+
+## Detectar el desbordamiento sin salir de la GPU
+
+Muchas implementaciones fijan una capacidad máxima por celda para poder usar arrays de tamaño fijo. Si esa capacidad se supera, hay partículas que desaparecen de la estructura y las interacciones se pierden en silencio, que es la peor forma de fallar.
+
+La detección cuesta cuatro bytes y dos líneas:
+
+```wgsl
+struct Diagnostico { maxPorCelda: atomic<u32>, desbordes: atomic<u32> };
+@group(0) @binding(5) var<storage, read_write> diag: Diagnostico;
+
+const CAPACIDAD: u32 = 64u;
+
+  // ... dentro de contar():
+  let previo = atomicAdd(&conteos[c], 1u);
+  atomicMax(&diag.maxPorCelda, previo + 1u);
+  if (previo + 1u > CAPACIDAD) { atomicAdd(&diag.desbordes, 1u); }
+```
+
+`atomicAdd` devuelve el valor antiguo, así que `previo + 1` es la ocupación después de esta partícula. `atomicMax` sobre un solo contador global tiene la misma contención que cualquier atómica global, así que en producción conviene dejarlo detrás de un `override` y compilar dos variantes del pipeline: una con diagnóstico y otra sin él.
+
+Leer `diag` a la CPU cuesta un frame de latencia, pero como es un dato de depuración se puede leer cada sesenta frames sin ningún problema. Saber que el máximo real de tu escena es 41 y no 300 te permite dimensionar la capacidad con conocimiento en vez de con miedo.
+
+<Callout type="dios" title="El conteo y la dispersion son dos recorridos del mismo array, y fusionarlos es la trampa que rompe la estructura">
+Al ver que el kernel de conteo recorre el millón de partículas y que el de dispersión hace lo mismo unos dispatches después, la reacción natural es intentar fusionarlos: contar y colocar en el mismo recorrido, ahorrándose una lectura completa. Es imposible, y entender por qué cierra el círculo de todo el bloque de compute. Para colocar una partícula hace falta saber en qué posición del array ordenado empieza su celda, y ese dato es el prefix sum de **todos** los conteos, incluidos los de partículas que otros workgroups todavía no han procesado. O sea que la dispersión depende de que el conteo haya terminado **entero**, y eso es exactamente la sincronización global que la [frontera entre workgroups](/guia/webgpu/n32-la-frontera-entre-workgroups/) no permite dentro de un dispatch. No es una limitación de la API que se pueda rodear con un truco: es la razón estructural por la que la construcción de la rejilla tiene tres fases separadas por dispatches, exactamente igual que el scan de varios bloques y que una pasada de radix sort. Y el corolario práctico es que la lectura extra del array de partículas no es un desperdicio que se pueda optimizar, es el precio de la sincronización. Lo que sí se puede hacer, y es lo que hacen las implementaciones buenas, es reducir lo que cuesta esa segunda lectura: el conteo guarda `celdaDe[i]` para que la dispersión no tenga que releer la posición ni recalcular la celda, con lo que el segundo recorrido lee 4 bytes por partícula en vez de 16. Ese detalle, que parece contabilidad menor, es un tercio del tiempo de construcción de la rejilla.
+</Callout>

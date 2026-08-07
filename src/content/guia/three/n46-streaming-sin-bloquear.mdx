@@ -1,0 +1,253 @@
+---
+title: "Cargar el mundo por trozos sin bloquear el hilo"
+description: "Cómo se divide un mundo en chunks, cómo se reparte el trabajo de carga en presupuestos por frame, dónde ayudan los workers, y por qué compilar shaders es el pico que nadie ve venir."
+subject: three
+level: 46
+order: 4
+icon: "46.4"
+duracion: "20 min"
+---
+
+<Lead>
+Un mundo grande no cabe en memoria y desde luego no cabe en el presupuesto de un primer frame. La solución es cargarlo por trozos según se acerca el observador, y el problema real no es la descarga —esa es asíncrona y no molesta— sino todo lo que ocurre después: parsear, construir geometrías, subirlas a la GPU y compilar sus shaders. Ese trabajo es síncrono, ocurre en el hilo principal, y hecho de golpe produce el tirón que arruina la sensación de un mundo continuo.
+</Lead>
+
+<Objetivos>
+
+- Dividir el mundo en trozos y decidir cuáles cargar y descargar según la posición.
+- Repartir el trabajo síncrono en presupuestos por frame en lugar de hacerlo de golpe.
+- Mover el parseo pesado a workers y saber qué se puede y qué no.
+- Precompilar materiales con `compileAsync` para evitar el tirón del primer uso.
+
+</Objetivos>
+
+## Trozos y la ventana de carga
+
+La división más simple es una rejilla regular sobre el plano horizontal. Cada celda es una unidad de carga, descarga y presupuesto.
+
+```js
+const TAM = 64;                     // lado del trozo, en unidades de mundo
+const RADIO_CARGA = 3;              // en trozos
+const RADIO_DESCARGA = 5;           // mayor: histeresis para evitar vaiven
+
+const cargados = new Map();         // clave -> { grupo, estado }
+const cola = [];
+
+function clave( cx, cz ) {
+
+	return cx + ',' + cz;
+
+}
+
+function actualizarTrozos( posicion ) {
+
+	const cx = Math.floor( posicion.x / TAM );
+	const cz = Math.floor( posicion.z / TAM );
+
+	// Encolar los que faltan, ordenados por distancia.
+	const pendientes = [];
+
+	for ( let dz = - RADIO_CARGA; dz <= RADIO_CARGA; dz ++ ) {
+
+		for ( let dx = - RADIO_CARGA; dx <= RADIO_CARGA; dx ++ ) {
+
+			const d2 = dx * dx + dz * dz;
+			if ( d2 > RADIO_CARGA * RADIO_CARGA ) continue;
+
+			const k = clave( cx + dx, cz + dz );
+			if ( cargados.has( k ) ) continue;
+
+			pendientes.push( { k, cx: cx + dx, cz: cz + dz, d2 } );
+
+		}
+
+	}
+
+	pendientes.sort( ( a, b ) => a.d2 - b.d2 );
+	cola.push( ...pendientes );
+
+	// Descargar los que se han alejado mas alla del radio de descarga.
+	for ( const [ k, trozo ] of cargados ) {
+
+		const [ tx, tz ] = k.split( ',' ).map( Number );
+		const d2 = ( tx - cx ) ** 2 + ( tz - cz ) ** 2;
+
+		if ( d2 > RADIO_DESCARGA * RADIO_DESCARGA ) {
+
+			descargar( k, trozo );
+
+		}
+
+	}
+
+}
+```
+
+Dos decisiones importantes están ahí dentro. La **ordenación por distancia** garantiza que lo más cercano —y por tanto lo más visible— llegue primero, que es lo que percibe el usuario. Y el **radio de descarga mayor que el de carga** es histéresis: sin ella, moverse en la frontera de un trozo provoca cargas y descargas continuas del mismo contenido.
+
+La descarga tiene que ser completa o acabas con una fuga:
+
+```js
+function descargar( k, trozo ) {
+
+	scene.remove( trozo.grupo );
+
+	trozo.grupo.traverse( ( o ) => {
+
+		if ( o.isMesh ) {
+
+			o.geometry.dispose();
+
+			// Los materiales pueden estar compartidos: solo si son exclusivos.
+			if ( trozo.materialesPropios ) {
+
+				const mats = Array.isArray( o.material ) ? o.material : [ o.material ];
+				for ( const m of mats ) m.dispose();
+
+			}
+
+		}
+
+	} );
+
+	cargados.delete( k );
+
+}
+```
+
+Las **texturas** merecen mención aparte: casi siempre se comparten entre trozos, así que liberarlas con el trozo es un error que produce recargas constantes. Lo correcto es una caché con recuento de referencias, o simplemente no liberarlas nunca si el conjunto es acotado.
+
+## El presupuesto por frame
+
+Aquí está el corazón del asunto. La descarga de red es asíncrona y no bloquea; lo que bloquea es el trabajo síncrono que viene después. Hacerlo todo en cuanto llega produce un tirón proporcional al tamaño del trozo.
+
+La técnica es el **time slicing**: procesar mientras quede presupuesto y ceder el control cuando se agote.
+
+```js
+const PRESUPUESTO_MS = 4;   // de los 16.6 disponibles
+
+let procesando = false;
+
+async function procesarCola() {
+
+	if ( procesando ) return;
+	procesando = true;
+
+	while ( cola.length > 0 ) {
+
+		const inicio = performance.now();
+
+		// Trabajar mientras quede presupuesto en este frame.
+		while ( cola.length > 0 && performance.now() - inicio < PRESUPUESTO_MS ) {
+
+			const tarea = cola.shift();
+			await construirTrozo( tarea );
+
+		}
+
+		// Ceder hasta el siguiente frame.
+		await nuevoFrame();
+
+	}
+
+	procesando = false;
+
+}
+
+function nuevoFrame() {
+
+	return new Promise( ( resolver ) => requestAnimationFrame( () => resolver() ) );
+
+}
+```
+
+Cuatro milisegundos de un presupuesto de 16,6 es un buen punto de partida: deja margen para el render y la lógica, y carga un mundo mediano en un par de segundos sin que se note. Si el frame ya va justo, baja a dos.
+
+`requestAnimationFrame` como punto de cesión tiene la ventaja de sincronizar con el render y de pausarse automáticamente cuando la pestaña no está visible. La alternativa es `requestIdleCallback`, que da trabajo solo cuando el navegador está ocioso y permite pedir el tiempo restante con `deadline.timeRemaining()`; conviene comprobar su existencia antes de usarlo:
+
+```js
+const cederOcioso = ( 'requestIdleCallback' in window )
+	? ( fn ) => requestIdleCallback( fn, { timeout: 200 } )
+	: ( fn ) => setTimeout( () => fn( { timeRemaining: () => 5 } ), 0 );
+```
+
+Y el trabajo dentro de `construirTrozo` también hay que trocearlo si es grande. Generar cincuenta mil vértices de terreno en un bucle es una tarea larga aunque parezca inocente; partirla en bloques de cinco mil y ceder entre ellos mantiene el frame estable.
+
+<Callout type="warn" title="La subida a la GPU es síncrona y no la controlas tú">
+Crear una geometría o una textura en JavaScript no la sube a la GPU: eso ocurre la primera vez que se usa en un `render()`. En ese momento el driver copia los buffers y las texturas, y esa copia es síncrona y puede costar varios milisegundos para una textura grande. Es decir: has repartido cuidadosamente el trabajo de construcción y el pico aparece igual, un frame después, en el sitio donde no lo estabas midiendo. La forma de controlarlo es forzar la subida cuando tú decidas: renderiza el objeto una vez a un render target de un píxel, fuera de la vista, antes de añadirlo a la escena. Es feo y funciona, porque obliga al driver a materializar todos sus recursos en ese momento.
+</Callout>
+
+## Workers y lo que se puede mover
+
+Un worker no tiene acceso al DOM ni al contexto de WebGL, así que no puede crear texturas ni compilar shaders. Lo que sí puede hacer es todo el trabajo de CPU pura, que suele ser la mayor parte:
+
+- Parsear formatos: JSON, binarios propios, geometría procedural.
+- Descomprimir: `DRACOLoader` y `KTX2Loader` ya usan workers internamente.
+- Generar geometría: ruido, marching cubes, mallas de terreno.
+- Construir estructuras espaciales: un BVH con `GenerateMeshBVHWorker`.
+
+La clave para que compense es **transferir en lugar de copiar**. Un `ArrayBuffer` puede pasarse entre hilos sin copia si se declara transferible, y a partir de ahí el hilo emisor pierde el acceso:
+
+```js
+// En el worker:
+const posiciones = new Float32Array( n * 3 );
+const indices = new Uint32Array( m );
+
+// ... rellenar ...
+
+self.postMessage(
+	{ posiciones, indices },
+	[ posiciones.buffer, indices.buffer ]   // transferibles: coste cero
+);
+
+// En el hilo principal:
+worker.onmessage = ( e ) => {
+
+	const geometria = new THREE.BufferGeometry();
+	geometria.setAttribute( 'position', new THREE.BufferAttribute( e.data.posiciones, 3 ) );
+	geometria.setIndex( new THREE.BufferAttribute( e.data.indices, 1 ) );
+	geometria.computeVertexNormals();
+
+};
+```
+
+Sin el segundo argumento de `postMessage`, el navegador **clona** los datos, y clonar diez megabytes en el hilo principal cuesta más que haberlos generado allí. Es la diferencia entre que el worker ayude y que estorbe.
+
+Lo que no puede irse al worker es la creación de objetos de Three.js —requieren el DOM para las texturas y el contexto para los recursos de GPU— así que el ensamblaje final siempre vuelve al hilo principal. Diseña el mensaje para que ese ensamblaje sea lo más barato posible: arrays tipados ya listos, nada de estructuras que haya que recorrer.
+
+## Compilar shaders antes de necesitarlos
+
+El pico más desconcertante de todos: un objeto aparece en pantalla y el frame salta a doscientos milisegundos. No es la geometría ni la textura: es el driver compilando el programa de shader la primera vez que ese material se usa con esa combinación de luces, sombras, niebla y atributos.
+
+Three.js expone una forma de adelantarlo:
+
+```js
+// Compila todos los materiales necesarios para dibujar scene con camera.
+await renderer.compileAsync( grupoNuevo, camera, scene );
+
+// Solo despues, anadirlo a la escena.
+scene.add( grupoNuevo );
+```
+
+El tercer argumento es la escena de referencia de la que se toman las luces y el entorno, que es lo que determina las variantes del shader. Sin él, se compila una variante que después no coincide con la real y el tirón vuelve a aparecer.
+
+`compileAsync` está disponible tanto en `WebGLRenderer` como en `WebGPURenderer`. En WebGL aprovecha la extensión de compilación paralela cuando existe, así que la compilación ocurre en hilos del driver y la promesa resuelve cuando están listos; sin la extensión, sigue siendo síncrona pero al menos ocurre cuando tú decides.
+
+La estrategia completa para un trozo, entonces, tiene cuatro etapas y solo la última toca la escena:
+
+1. Descargar, asíncrono, sin coste en el hilo principal.
+2. Parsear y generar en un worker, transfiriendo buffers.
+3. Ensamblar objetos de Three.js con presupuesto por frame.
+4. `compileAsync` y, cuando resuelva, `scene.add`.
+
+<Callout type="dios" title="El presupuesto por frame es una mentira si no mides el frame">
+Todo el patrón de time slicing descansa sobre una suposición que casi nunca se comprueba: que gastar cuatro milisegundos en cargar deja doce para todo lo demás. Eso solo es cierto si el resto del frame cabía en doce. En una escena que ya va a 45 fps porque el render cuesta veintidós milisegundos, robarle cuatro más la lleva a 38, y el usuario percibe la carga como una caída de rendimiento aunque tú hayas hecho los deberes del troceado. El presupuesto no puede ser una constante: tiene que ser **lo que sobra**, y para saber lo que sobra hay que medir el frame anterior. La versión adaptativa cabe en cinco líneas —mide la duración del frame anterior, réstale al objetivo, y usa la diferencia como presupuesto con un mínimo de medio milisegundo para no atascarte nunca— y transforma el comportamiento en equipos lentos: en un portátil potente carga en dos segundos, en un móvil modesto tarda ocho pero **nunca baja de sesenta**. Y hay una segunda mentira, más sutil, escondida en la palabra "frame". El navegador no te da dieciséis milisegundos: te da lo que quede después del estilo, el layout, la composición y todo el trabajo de otras pestañas. `performance.now()` mide tu tiempo de JavaScript, no el presupuesto real, y en un móvil térmicamente limitado la relación entre los dos cambia sobre la marcha. Por eso la señal que hay que vigilar no es cuánto tardan tus tareas sino **cuánto tarda el frame completo**, medido de un `requestAnimationFrame` al siguiente. Si ese número sube mientras cargas, tu presupuesto está mal calibrado por mucho que tus tareas cumplan el suyo. Es la misma disciplina que verás en el nivel de medición: instrumentar el efecto observable y no el trabajo que crees que lo causa.
+</Callout>
+
+<Reto title="Carga un mundo sin que se note">
+1. Divide un terreno en trozos de 64 unidades y carga por proximidad con radios de carga y descarga distintos.
+2. Genera la geometría de cada trozo en el hilo principal de golpe y mide el pico de frame.
+3. Aplica el presupuesto de cuatro milisegundos con cesión por `requestAnimationFrame` y vuelve a medir.
+4. Mueve la generación a un worker con buffers transferibles y compara con la versión que clona.
+5. Añade `compileAsync` antes de insertar cada trozo y comprueba si desaparece el pico del primer dibujado.
+</Reto>

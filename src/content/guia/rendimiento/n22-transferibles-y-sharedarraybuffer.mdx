@@ -1,0 +1,193 @@
+---
+title: "Objetos transferibles y SharedArrayBuffer: mover sin copiar"
+description: "Qué objetos se pueden transferir y qué le pasa al original, cómo se implementa un patrón de ida y vuelta sin copias, y los requisitos de cabeceras que exige la memoria compartida."
+subject: rendimiento
+level: 22
+order: 3
+icon: "22.3"
+duracion: "19 min"
+---
+
+<Lead>
+Transferir es la alternativa a copiar: en lugar de reconstruir los datos en el otro hilo, se cede la propiedad del bloque de memoria. El coste pasa de proporcional al tamaño a constante, y con cargas útiles de megabytes eso es la diferencia entre un trabajador que compensa y uno que no. La memoria compartida va un paso más allá y elimina también la transferencia, a cambio de exigir unas cabeceras que aíslan tu sitio de los orígenes cruzados y que hay que decidir con conocimiento de causa.
+</Lead>
+
+<Objetivos>
+
+- Enumerar los objetos transferibles y explicar qué le ocurre al original.
+- Implementar un patrón de ida y vuelta reutilizando el mismo buffer.
+- Configurar las cabeceras que habilitan `SharedArrayBuffer` y entender qué rompen.
+- Sincronizar accesos a memoria compartida con `Atomics`.
+
+</Objetivos>
+
+## Qué se puede transferir
+
+La lista de objetos transferibles es corta y muy específica:
+
+- `ArrayBuffer`
+- `MessagePort`
+- `ReadableStream`, `WritableStream` y `TransformStream`
+- `ImageBitmap`
+- `OffscreenCanvas`
+- `RTCDataChannel`
+- `AudioData` y `VideoFrame`
+
+Todo lo demás se copia. Un `Float64Array` no es transferible **por sí mismo**, pero su `.buffer` sí lo es, y transferir el buffer transfiere de hecho la vista.
+
+La sintaxis pone la lista de transferibles como segundo argumento:
+
+```js
+const datos = new Float64Array(1_000_000);
+// ... rellenar datos ...
+trabajador.postMessage({ tipo: 'procesar', datos }, [datos.buffer]);
+console.log(datos.length);   // 0 — el buffer ya no es nuestro
+```
+
+**El original queda desconectado.** `byteLength` pasa a cero y cualquier lectura o escritura falla. No es una copia con permiso de escritura compartido: es una cesión de propiedad, y por eso el coste es constante.
+
+Ese detalle es la fuente del error más común con transferibles: transferir un buffer que todavía necesitas. El síntoma es un array que de repente tiene longitud cero, sin ningún error, y en un punto del código muy lejos de donde estaba el `postMessage`.
+
+## El patrón de ida y vuelta
+
+Cuando el trabajador procesa datos y devuelve un resultado del mismo tamaño, lo eficiente es **reutilizar el mismo buffer**: se transfiere, el trabajador escribe en él y lo transfiere de vuelta. Cero copias en todo el ciclo.
+
+```js
+// procesar.worker.js
+self.addEventListener('message', (e) => {
+  const { id, buffer, ganancia } = e.data;
+  const muestras = new Float32Array(buffer);
+
+  // Se procesa en el sitio, sin asignar memoria nueva
+  for (let i = 0; i < muestras.length; i++) {
+    muestras[i] = Math.tanh(muestras[i] * ganancia);
+  }
+
+  // Se devuelve el mismo buffer, transferido otra vez
+  self.postMessage({ id, buffer }, [buffer]);
+});
+```
+
+```js
+// hilo principal
+let buffer = new Float32Array(48_000 * 4).buffer;
+
+async function procesar(ganancia) {
+  const id = crypto.randomUUID();
+  const promesa = new Promise((resolver) => {
+    const alRecibir = (e) => {
+      if (e.data.id !== id) return;
+      trabajador.removeEventListener('message', alRecibir);
+      buffer = e.data.buffer;                // recuperamos la propiedad
+      resolver(new Float32Array(buffer));
+    };
+    trabajador.addEventListener('message', alRecibir);
+  });
+  trabajador.postMessage({ id, buffer, ganancia }, [buffer]);
+  return promesa;
+}
+```
+
+La disciplina que exige este patrón: **entre el `postMessage` y la respuesta, el buffer no existe para ti**. Cualquier código que intente leerlo en ese intervalo falla. En una aplicación con varias partes tocando los mismos datos, conviene envolverlo en una abstracción que impida el acceso mientras está en vuelo.
+
+Cuando el resultado tiene un tamaño distinto de la entrada, el patrón se rompe y hay que asignar en el trabajador. Sigue siendo mucho mejor que copiar, porque la asignación ocurre en el otro hilo.
+
+## SharedArrayBuffer y sus requisitos
+
+`SharedArrayBuffer` es memoria a la que **los dos hilos acceden simultáneamente**. No se transfiere ni se copia: se comparte. El mismo bloque físico, visible desde ambos lados.
+
+```js
+const compartido = new SharedArrayBuffer(1024 * 1024 * 4);
+const vista = new Float32Array(compartido);
+trabajador.postMessage({ compartido });     // sin lista de transferibles: se comparte
+// La vista sigue siendo valida aqui, y el worker ve los mismos bytes
+```
+
+El precio es que **exige aislamiento entre orígenes**, y eso significa dos cabeceras en la respuesta del documento:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+La comprobación desde JavaScript de si están activas:
+
+```js
+if (crossOriginIsolated) {
+  // SharedArrayBuffer disponible, y tambien la API de memoria detallada
+}
+```
+
+Estas cabeceras existen porque la memoria compartida, combinada con temporizadores de alta resolución, permite construir relojes lo bastante precisos para explotar vulnerabilidades de ejecución especulativa. El aislamiento garantiza que en tu proceso de renderizado no hay datos de otros orígenes que robar.
+
+**Lo que rompen, y es serio:**
+
+`COEP: require-corp` obliga a que **todos** los recursos de origen cruzado que cargues declaren explícitamente que aceptan ser incrustados, con la cabecera `Cross-Origin-Resource-Policy: cross-origin` o mediante CORS. Imágenes de una CDN, fuentes de un proveedor, guiones de terceros, iframes de vídeo: todo lo que no lo haga **deja de cargar**.
+
+`COOP: same-origin` corta la relación con ventanas abiertas de otros orígenes, lo cual rompe flujos de autenticación mediante ventana emergente y pasarelas de pago que dependen de comunicación entre ventanas.
+
+Hay una variante menos estricta, `Cross-Origin-Embedder-Policy: credentialless`, que permite cargar recursos de origen cruzado sin credenciales en lugar de exigirles la cabecera. Resuelve el problema de las imágenes y fuentes públicas y no el de los recursos que necesitan cookies.
+
+La conclusión práctica: **activar el aislamiento es una decisión de arquitectura del sitio, no un ajuste**. Hay que auditar todos los recursos externos antes. Y en la mayoría de las aplicaciones, la ganancia de `SharedArrayBuffer` frente a transferir buffers no justifica ese coste. Los casos que sí lo justifican son concretos: WebAssembly con hilos, procesamiento de audio o vídeo en tiempo real, y simulaciones con datos compartidos entre varios trabajadores.
+
+## Sincronizar con Atomics
+
+Con memoria compartida, dos hilos pueden escribir a la vez, y ahí aparecen las condiciones de carrera de verdad, las de memoria. `Atomics` proporciona operaciones indivisibles y primitivas de espera.
+
+```js
+// Estructura: [0] = estado, [1..] = datos
+const control = new Int32Array(compartido, 0, 1);
+const datos = new Float64Array(compartido, 8);
+
+// En el worker: esperar a que el estado sea 1, sin consumir CPU
+Atomics.wait(control, 0, 0);        // bloquea mientras control[0] === 0
+procesar(datos);
+Atomics.store(control, 0, 2);       // marcar terminado
+Atomics.notify(control, 0);         // despertar a quien espere
+```
+
+```js
+// En el hilo principal: NUNCA usar Atomics.wait, bloquearia la interfaz
+Atomics.store(control, 0, 1);
+Atomics.notify(control, 0);
+// Y esperar el resultado de forma asincrona
+const { value } = await Atomics.waitAsync(control, 0, 1).value;
+```
+
+**`Atomics.wait` está prohibido en el hilo principal** —lanza una excepción— precisamente porque bloquear el hilo principal es lo contrario de lo que estamos intentando. `Atomics.waitAsync` es la variante que devuelve una promesa y sí se puede usar ahí.
+
+Este nivel de control es potente y es también donde se cometen los errores de concurrencia clásicos que en JavaScript de un solo hilo no existían. Si te encuentras escribiendo esto, merece la pena preguntarse si un patrón de mensajes con transferibles no resolvería el mismo problema con una fracción del riesgo.
+
+<Callout type="dios" title="El aislamiento entre orígenes te da algo más que SharedArrayBuffer, y ese algo puede valer más que la memoria compartida">
+La decisión de activar `COOP` y `COEP` se plantea siempre como el precio de `SharedArrayBuffer`, y hay tres capacidades adicionales que llegan con el mismo interruptor y que a menudo valen más.
+
+**Uno: `performance.measureUserAgentSpecificMemory()`.** Es la única forma de medir el consumo real de memoria de tu página en el navegador del usuario, con desglose por tipo y por origen. Sin aislamiento no está disponible, y sin ella la memoria es una caja negra en producción:
+
+```js
+if (crossOriginIsolated && performance.measureUserAgentSpecificMemory) {
+  const r = await performance.measureUserAgentSpecificMemory();
+  console.log('total MB', (r.bytes / 1024 / 1024).toFixed(1));
+  console.table(r.breakdown.filter((b) => b.bytes > 0));
+}
+```
+
+Para una aplicación de sesión larga —un editor, un panel, una herramienta de trabajo— tener esta medida en campo es lo que permite detectar fugas antes de que los usuarios empiecen a reportar que la pestaña se muere.
+
+**Dos: temporizadores de alta resolución sin degradar.** Sin aislamiento, `performance.now()` está deliberadamente degradado en resolución para dificultar los ataques de canal lateral. Con aislamiento, recupera la precisión completa, lo cual importa para cualquier medición fina de rendimiento.
+
+**Tres: WebAssembly con hilos.** Un módulo compilado con soporte de hilos necesita memoria compartida, y sin aislamiento cae al modo de un solo hilo. Si usas Wasm para cálculo pesado, el aislamiento puede multiplicar por cuatro o por ocho el rendimiento en dispositivos con varios núcleos.
+
+Y una recomendación de método para activarlo sin romper nada, que es el miedo legítimo que frena a la mayoría: **el modo de solo informe**. Las cabeceras admiten una variante que no aplica la política pero reporta lo que habría bloqueado:
+
+```
+Cross-Origin-Embedder-Policy-Report-Only: require-corp
+Cross-Origin-Opener-Policy-Report-Only: same-origin
+Reporting-Endpoints: coep="/informes/coep"
+```
+
+Se despliega en producción, se recogen los informes durante unas semanas, y se obtiene la lista exacta de recursos que se romperían. Con esa lista se puede negociar con cada proveedor, sustituir los que no cooperen, o proxear los que sean imprescindibles desde tu propio origen. Es un proyecto de semanas, no de horas, y es la única forma responsable de hacerlo en un sitio con tráfico.
+</Callout>
+
+<Reto>
+Convierte la comunicación con tu trabajador al patrón de ida y vuelta con un único buffer reutilizado. Mide el coste del mensaje antes y después, con una carga útil de al menos un megabyte. Después, en un entorno de pruebas, activa las cabeceras de aislamiento en modo de solo informe y recoge los informes durante una semana: la lista de recursos afectados te dirá si el aislamiento es viable en tu sitio, y esa lista es un dato valioso aunque decidas no activarlo.
+</Reto>

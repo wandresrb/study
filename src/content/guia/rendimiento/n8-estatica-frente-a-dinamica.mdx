@@ -1,0 +1,212 @@
+---
+title: "Compresión estática en el build frente a dinámica"
+description: "Cómo generar variantes precomprimidas en el proceso de construcción, cómo se sirven, y qué contenido no admite este enfoque y por qué."
+subject: rendimiento
+level: 8
+order: 4
+icon: "8.4"
+duracion: "16 min"
+---
+
+<Lead>
+La distinción entre comprimir en el build y comprimir por petición cambia por completo la economía del problema: en un caso el coste se paga una vez y no le importa a nadie, en el otro se paga en cada respuesta y compite con la capacidad de tu servidor. La consecuencia es que en el primer caso puedes usar el nivel máximo sin pensar, y en el segundo no. Montarlo bien es un cambio pequeño en la cadena de construcción.
+</Lead>
+
+<Objetivos>
+
+- Generar variantes precomprimidas en el proceso de construcción.
+- Configurar el servidor para servirlas sin gastar CPU en ejecución.
+- Identificar qué contenido no admite precompresión.
+- Diseñar la estrategia mixta que cubre los dos casos.
+
+</Objetivos>
+
+## Generar las variantes
+
+La idea es que junto a cada archivo estático exista su versión comprimida, con el mismo nombre y una extensión adicional:
+
+```text
+dist/
+  app.a1b2c3.js
+  app.a1b2c3.js.br
+  app.a1b2c3.js.gz
+  app.a1b2c3.js.zst
+  estilos.d4e5f6.css
+  estilos.d4e5f6.css.br
+  estilos.d4e5f6.css.gz
+```
+
+Generarlas es un paso posterior a la construcción que recorre la salida y comprime lo comprimible. Este script lo hace con Node sin dependencias externas:
+
+```js
+#!/usr/bin/env node
+// Precomprime la salida del build en Brotli y gzip al maximo nivel.
+import { readdir, readFile, writeFile, stat } from 'node:fs/promises';
+import { join, extname } from 'node:path';
+import { brotliCompress, gzip, constants } from 'node:zlib';
+import { promisify } from 'node:util';
+
+const brotli = promisify(brotliCompress);
+const gz = promisify(gzip);
+
+const COMPRIMIBLES = new Set([
+  '.js', '.mjs', '.css', '.html', '.json', '.svg',
+  '.xml', '.txt', '.map', '.wasm', '.ttf', '.otf',
+]);
+
+const MINIMO = 256;   // por debajo no compensa
+
+async function* ficheros(dir) {
+  for (const entrada of await readdir(dir, { withFileTypes: true })) {
+    const ruta = join(dir, entrada.name);
+    if (entrada.isDirectory()) yield* ficheros(ruta);
+    else yield ruta;
+  }
+}
+
+let ahorro = 0;
+
+for await (const ruta of ficheros(process.argv[2] ?? 'dist')) {
+  if (!COMPRIMIBLES.has(extname(ruta))) continue;
+
+  const datos = await readFile(ruta);
+  if (datos.length < MINIMO) continue;
+
+  const [br, gzipado] = await Promise.all([
+    brotli(datos, {
+      params: {
+        [constants.BROTLI_PARAM_QUALITY]: 11,
+        [constants.BROTLI_PARAM_SIZE_HINT]: datos.length,
+      },
+    }),
+    gz(datos, { level: 9 }),
+  ]);
+
+  await Promise.all([
+    writeFile(`${ruta}.br`, br),
+    writeFile(`${ruta}.gz`, gzipado),
+  ]);
+
+  ahorro += datos.length - br.length;
+  console.log(
+    ruta.padEnd(50),
+    String(datos.length).padStart(8),
+    '->',
+    String(br.length).padStart(8),
+    `(${(datos.length / br.length).toFixed(2)}x)`,
+  );
+}
+
+console.log(`\nAhorro total con Brotli: ${(ahorro / 1024).toFixed(1)} KiB`);
+```
+
+Dos detalles del código merecen mención. El parámetro que indica el tamaño esperado permite al compresor elegir mejor sus estructuras internas y mejora ligeramente el resultado. Y el umbral mínimo evita generar variantes de archivos diminutos, donde la compresión no ahorra y solo añade archivos al directorio.
+
+Si usas un empaquetador, casi todos tienen un complemento que hace lo mismo integrado en la construcción, lo cual evita un paso adicional. El resultado es equivalente.
+
+## Servirlas
+
+El servidor tiene que buscar la variante y servirla cuando el cliente la acepte. En nginx, las directivas de servicio estático lo hacen automáticamente:
+
+```nginx
+gzip_static   on;
+brotli_static on;
+zstd_static   on;
+```
+
+Con eso, ante una petición de `/app.a1b2c3.js` cuyo cliente acepta Brotli, nginx sirve `/app.a1b2c3.js.br` con la cabecera de codificación correcta y **sin comprimir nada en ejecución**.
+
+Si tu capa de servicio no tiene esa función incorporada, la lógica es sencilla de implementar. Este es el patrón en una función del borde:
+
+```js
+const CODIFICACIONES = [
+  ['zstd', '.zst'],
+  ['br',   '.br'],
+  ['gzip', '.gz'],
+];
+
+async function servirEstatico(peticion, buscarFichero) {
+  const acepta = peticion.headers.get('Accept-Encoding') ?? '';
+  const ruta = new URL(peticion.url).pathname;
+
+  for (const [codificacion, sufijo] of CODIFICACIONES) {
+    if (!acepta.includes(codificacion)) continue;
+    const variante = await buscarFichero(ruta + sufijo);
+    if (!variante) continue;
+
+    return new Response(variante.cuerpo, {
+      headers: {
+        'Content-Type': variante.tipo,
+        'Content-Encoding': codificacion,
+        'Vary': 'Accept-Encoding',
+        'Cache-Control': 'public, max-age=31536000, immutable',
+      },
+    });
+  }
+
+  const original = await buscarFichero(ruta);
+  if (!original) return new Response('No encontrado', { status: 404 });
+
+  return new Response(original.cuerpo, {
+    headers: {
+      'Content-Type': original.tipo,
+      'Vary': 'Accept-Encoding',
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    },
+  });
+}
+```
+
+Tres cosas de este código son obligatorias y se olvidan con frecuencia. La cabecera `Vary` va **siempre**, incluso en la respuesta sin comprimir, porque la respuesta depende de lo que el cliente acepte. El tipo de contenido se toma del archivo **original**, no de la variante: la variante `.br` de un CSS sigue siendo `text/css`. Y el orden de preferencia lo decide el servidor recorriendo su propia lista, no el orden en que el cliente los enumere.
+
+<Callout type="warn" title="El fallo silencioso de la precompresión: la variante desactualizada">
+Si tu proceso de despliegue copia el archivo original pero no regenera su variante comprimida, el servidor servirá la versión antigua a todos los clientes que acepten esa codificación, y la nueva solo a los que no acepten ninguna. El resultado es un sitio que funciona bien en un navegador viejo y mal en uno moderno, que es la clase de error que nadie sospecha. La defensa es generar las variantes **siempre** como parte del build y no como un paso opcional, y borrar el directorio de salida completo antes de construir.
+</Callout>
+
+## Qué no admite precompresión
+
+No todo el contenido se puede comprimir de antemano, y conviene tener clara la frontera.
+
+**Contenido generado por petición.** Un HTML que incluye el nombre del usuario, una respuesta de API que depende de parámetros, una página con contenido personalizado. Por definición no existe antes de la petición.
+
+**Contenido que se transforma en el borde.** Si tu CDN reescribe el HTML, inyecta etiquetas o hace pruebas A/B, la respuesta final no es el archivo que construiste.
+
+**Contenido que cambia sin pasar por el build.** Archivos subidos por usuarios, exportaciones generadas al vuelo, contenido de un gestor sin recompilación.
+
+Para todo esto la respuesta es compresión dinámica en nivel medio, tal como vimos.
+
+Hay un caso intermedio que merece atención: el HTML de un sitio generado estáticamente. Si tu HTML se produce en el build, **es precomprimible**, y como el HTML es el recurso más crítico de la ruta y el que decide si cabes en la ventana inicial, comprimirlo al máximo es especialmente rentable. Muchos equipos precomprimen el JavaScript y el CSS y se olvidan del HTML, que es el que más importa.
+
+## La estrategia mixta
+
+La configuración completa de un sitio real combina las dos formas.
+
+| Contenido | Cómo | Nivel |
+|---|---|---|
+| JavaScript, CSS, SVG y fuentes del build | Precomprimido | Máximo |
+| HTML generado estáticamente | Precomprimido | Máximo |
+| HTML generado por petición | Dinámico | Medio |
+| Respuestas de API | Dinámico | Medio |
+| Archivos subidos por usuarios | Dinámico si son de texto | Medio |
+| Imágenes y vídeo | Sin comprimir en transporte | — |
+
+Y la verificación de que todo está bien montado, en tres comprobaciones:
+
+```bash
+# 1. La variante se sirve y no se comprime en ejecucion.
+#    Compara el tamano con el del fichero .br del build: deben coincidir.
+curl -s -H 'Accept-Encoding: br' https://ejemplo.com/app.a1b2c3.js | wc -c
+wc -c < dist/app.a1b2c3.js.br
+
+# 2. Un cliente sin Brotli recibe gzip y no un error.
+curl -sI -H 'Accept-Encoding: gzip' https://ejemplo.com/app.a1b2c3.js | grep -i content-encoding
+
+# 3. Vary esta presente en todas las variantes.
+curl -sI -H 'Accept-Encoding: identity' https://ejemplo.com/app.a1b2c3.js | grep -i '^vary'
+```
+
+La primera comprobación es la que de verdad importa: si el tamaño servido no coincide con el del archivo precomprimido, tu servidor está ignorando las variantes y comprimiendo al vuelo con un nivel más bajo. Es un fallo silencioso muy común, porque todo funciona y solo se transfieren más bytes de los necesarios.
+
+<Callout type="dios" title="La precompresión tiene un segundo beneficio que nadie menciona y que a veces es mayor que el ahorro de bytes: hace determinista el tamaño de tus recursos">
+Con compresión dinámica, el tamaño que recibe cada usuario depende del nivel configurado en cada capa por la que pasa la respuesta, y esas capas cambian sin avisar: una actualización de la CDN, un cambio en el proxy inverso, una configuración por defecto distinta en un entorno nuevo. El resultado es que no puedes poner un presupuesto de bytes en integración continua, porque el número que mides en tu build no es el que recibe el usuario. Con precompresión, el archivo que generas es exactamente el archivo que viaja: puedes medirlo en el build, ponerle un umbral que rompa la construcción si crece, y saber que ese umbral describe la realidad. Ese determinismo es lo que convierte el presupuesto de rendimiento en una herramienta fiable en lugar de una aproximación. Y hay un efecto secundario útil: cuando el tamaño comprimido es un artefacto del build, aparece en el diff de cada cambio, y una dependencia que engorda el bundle en ochenta kilobytes se ve en la revisión del código en lugar de descubrirse tres meses después en un panel.
+</Callout>

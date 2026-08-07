@@ -1,0 +1,172 @@
+---
+title: "Generar mipmaps a mano: WebGPU no los genera solos"
+description: "Por qué no existe generateMipmap en WebGPU, la implementación completa de un generador con un render pass por nivel, y las trampas del sRGB y de las dimensiones impares."
+subject: webgpu
+level: 22
+order: 1
+icon: "22.1"
+duracion: "22 min"
+---
+
+<Lead>
+En WebGL bastaba `gl.generateMipmap(gl.TEXTURE_2D)`. En WebGPU esa función no existe, y no es un olvido: es una consecuencia directa del modelo explícito. La buena noticia es que escribirla es un ejercicio corto que además resulta ser el ejemplo más limpio de render pass a textura que existe, y una vez escrita se reutiliza en todos los proyectos.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué la especificación no incluye una función de generación de mipmaps.
+- Implementar un generador completo con un render pass por nivel y vistas aisladas.
+- Tratar correctamente los formatos sRGB y las dimensiones que no son potencia de dos.
+- Reutilizar el pipeline entre llamadas cacheando por formato.
+
+</Objetivos>
+
+## Por qué no existe
+
+`generateMipmap` de WebGL escondía una decisión que la aplicación no controlaba: qué filtro usar para reducir. Casi todas las implementaciones usaban una caja de 2×2, que es rápida y visualmente mediocre; algunas usaban algo mejor; ninguna lo documentaba. El resultado era una función cuyo resultado exacto dependía del driver.
+
+WebGPU tiene por norma no ofrecer operaciones cuyo resultado no esté especificado bit a bit. Además, generar mipmaps no necesita ninguna capacidad que la API no exponga ya: es renderizar un quad de pantalla completa a cada nivel muestreando el anterior. La especificación deja la decisión —caja, Kaiser, Lanczos, con corrección de gamma o sin ella— en manos de quien sabe qué contiene la textura.
+
+La consecuencia práctica es que tú eliges el filtro, y eso importa: un mapa de normales reducido con una caja produce normales no normalizadas, y un mapa de rugosidad reducido ingenuamente produce reflejos incorrectos en la distancia.
+
+## El generador completo
+
+La estructura es un pipeline con un shader de quad de pantalla completa, un sampler bilineal, y un bucle que renderiza del nivel `i-1` al nivel `i`.
+
+```js
+const WGSL_MIP = `
+struct Salida {
+  @builtin(position) pos : vec4<f32>,
+  @location(0)       uv  : vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) i : u32) -> Salida {
+  // Triángulo que cubre toda la pantalla, sin vertex buffer.
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var s : Salida;
+  s.pos = vec4<f32>(pos[i], 0.0, 1.0);
+  s.uv  = pos[i] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+  return s;
+}
+
+@group(0) @binding(0) var origen : texture_2d<f32>;
+@group(0) @binding(1) var muestreo : sampler;
+
+@fragment
+fn fs(entrada : Salida) -> @location(0) vec4<f32> {
+  return textureSample(origen, muestreo, entrada.uv);
+}
+`;
+
+function crearGeneradorDeMips(device) {
+  const modulo = device.createShaderModule({ label: 'mipmap', code: WGSL_MIP });
+  const sampler = device.createSampler({ minFilter: 'linear', magFilter: 'linear' });
+  const pipelines = new Map();   // un pipeline por formato de destino
+
+  function pipelineDe(formato) {
+    let p = pipelines.get(formato);
+    if (!p) {
+      p = device.createRenderPipeline({
+        label: `mipmap ${formato}`,
+        layout: 'auto',
+        vertex:   { module: modulo, entryPoint: 'vs' },
+        fragment: { module: modulo, entryPoint: 'fs', targets: [{ format: formato }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      pipelines.set(formato, p);
+    }
+    return p;
+  }
+
+  return function generar(textura, { capas = 1 } = {}) {
+    const pipeline = pipelineDe(textura.format);
+    const encoder = device.createCommandEncoder({ label: 'generar mipmaps' });
+
+    for (let capa = 0; capa < capas; capa++) {
+      for (let nivel = 1; nivel < textura.mipLevelCount; nivel++) {
+        const grupo = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: textura.createView({
+                dimension: '2d',
+                baseMipLevel: nivel - 1, mipLevelCount: 1,
+                baseArrayLayer: capa,    arrayLayerCount: 1,
+              }) },
+            { binding: 1, resource: sampler },
+          ],
+        });
+
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view: textura.createView({
+              dimension: '2d',
+              baseMipLevel: nivel, mipLevelCount: 1,
+              baseArrayLayer: capa, arrayLayerCount: 1,
+            }),
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: [0, 0, 0, 0],
+          }],
+        });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, grupo);
+        pass.draw(3);
+        pass.end();
+      }
+    }
+
+    device.queue.submit([encoder.finish()]);
+  };
+}
+```
+
+El uso es directo, y la textura tiene que llevar `RENDER_ATTACHMENT` y `TEXTURE_BINDING` en su `usage`:
+
+```js
+const generarMips = crearGeneradorDeMips(device);
+generarMips(texturaAlbedo);
+```
+
+<Callout type="info" title="Por qué un triángulo y no dos">
+El vertex shader emite tres vértices que forman un triángulo más grande que la pantalla, en vez de dos triángulos que la cubren exactamente. Es el truco estándar del quad de pantalla completa: evita la costura diagonal donde los dos triángulos se tocan, en la que los quads de fragmentos de 2×2 del hardware se procesan dos veces. Un triángulo grande es más rápido y no tiene ese artefacto.
+</Callout>
+
+## Las dimensiones impares
+
+El bucle de arriba funciona sin cambios con dimensiones que no son potencia de dos, porque no calcula tamaños: el render pass toma el tamaño del nivel destino y el `textureSample` normaliza sobre el origen. Una textura de 300×200 produce niveles de 150×100, 75×50, 37×25, 18×12, 9×6, 4×3, 2×1, 1×1.
+
+Lo que sí cambia es la **calidad**. Al reducir de 75 a 37, el factor no es exactamente 2, así que el filtrado bilineal de cuatro texels no cubre exactamente la región que corresponde a cada texel destino, y aparece un ligero desplazamiento acumulativo. Para texturas de material es invisible; para atlas de sprites donde la alineación importa, se nota.
+
+La solución robusta, si la calidad importa, es hacer el muestreo con más de una muestra por texel destino. Un fragment shader con cuatro `textureSample` desplazados un cuarto de texel y promediados equivale a un filtro de caja de 4×4 y tolera mucho mejor los factores no exactos:
+
+```wgsl
+@fragment
+fn fs(entrada : Salida) -> @location(0) vec4<f32> {
+  let tam = vec2<f32>(textureDimensions(origen, 0));
+  let d = 0.25 / tam;
+  return (textureSample(origen, muestreo, entrada.uv + vec2<f32>(-d.x, -d.y))
+        + textureSample(origen, muestreo, entrada.uv + vec2<f32>( d.x, -d.y))
+        + textureSample(origen, muestreo, entrada.uv + vec2<f32>(-d.x,  d.y))
+        + textureSample(origen, muestreo, entrada.uv + vec2<f32>( d.x,  d.y))) * 0.25;
+}
+```
+
+## El problema del sRGB, que es real
+
+Si la textura tiene formato `rgba8unorm-srgb`, el generador funciona y produce mipmaps **correctos**, porque el hardware linealiza al muestrear y vuelve a codificar al escribir al attachment. Ese es exactamente el comportamiento deseado: promediar en espacio lineal, que es donde promediar luz tiene sentido.
+
+Con formato `rgba8unorm` conteniendo datos ya codificados en sRGB —el caso de quien cargó una imagen sin usar el formato `-srgb`—, el generador promedia valores codificados, que es incorrecto. Los niveles bajos salen más oscuros de lo debido, y el efecto se acumula: una textura de detalle con mucho contraste se oscurece visiblemente en la distancia.
+
+La regla operativa es la misma que en la [lección de subida de datos](/guia/webgpu/n21-subir-datos-a-una-textura/): las texturas de color van en formato `-srgb` y todo funciona solo. Las de datos —normales, rugosidad, oclusión— van en formato lineal, y ahí el promedio lineal es el correcto.
+
+Queda un caso con matiz propio: los mapas de normales. Promediar cuatro normales unitarias no da una normal unitaria, y renormalizar tampoco es del todo correcto porque pierde la información de rugosidad que esa dispersión representaba. La solución de calidad —normal map filtering a lo Toksvig, o mapas LEAN— pasa por guardar la longitud del promedio y usarla para aumentar la rugosidad del nivel correspondiente. Un generador serio de motor tiene una ruta específica para normales.
+
+<Callout type="dios" title="El generador ingenuo cuesta más de lo que parece por una razón tonta">
+La implementación de arriba crea un bind group y dos vistas por nivel, dentro del bucle. Para una textura de 2048 con 12 niveles son 12 bind groups y 24 vistas, y si generas mipmaps para doscientas texturas al cargar la escena son 2400 bind groups y 4800 vistas creados y desechados. Eso convierte una operación de milisegundos en una de cientos de milisegundos, y produce el bloqueo del hilo principal más largo de la carga. La solución no es evitar el bucle sino no volcar todo en un solo `submit`: reparte la generación entre varios frames, o mejor, mueve la generación fuera del arranque usando texturas de un solo nivel al principio y generando en cuanto el objeto entra en pantalla. Y si la textura viene ya con mipmaps del disco —cualquier formato comprimido decente los trae—, no generes nada: cárgalos con `writeTexture` nivel a nivel, que es más rápido, más barato y de mejor calidad que cualquier cosa que puedas hacer en tiempo de carga.
+</Callout>
+
+<Reto>
+Extiende el generador para que acepte un cubemap: con `arrayLayerCount: 1` y `baseArrayLayer` de 0 a 5 sobre una textura de seis capas ya funciona, pero comprueba qué pasa en las costuras entre caras. Después piensa por qué el resultado no es perfecto y qué haría falta para arreglarlo.
+</Reto>

@@ -1,0 +1,251 @@
+---
+title: "Recorrer la BVH sin pila"
+description: "El test rayo-caja por slabs, por qué una pila explícita hunde la ocupación en WGSL, y el recorrido con índice de escape que reduce todo el estado a un entero."
+subject: webgpu
+level: 38
+order: 4
+icon: "38.4"
+duracion: "23 min"
+---
+
+<Lead>
+Recorrer un árbol es el ejemplo canónico de algoritmo recursivo, y WGSL no tiene recursión: la especificación prohíbe que una función se llame a sí misma directa o indirectamente, y tampoco hay punteros a función con los que hacer trampa. La salida obvia es una pila explícita en una variable local, y funciona, y es también la razón por la que muchos trazadores en compute rinden la mitad de lo que deberían. Este es el bucle más caliente de todo el algoritmo: lo que le pongas dentro se ejecuta entre treinta y cien veces por rayo, por cada uno de los dos millones de rayos del fotograma.
+</Lead>
+
+<Objetivos>
+
+- Programar el test rayo-caja por slabs con la inversa de la dirección precalculada y sin producir `NaN`.
+- Explicar por qué una pila local de 64 entradas se convierte en presión de registros y qué le hace a la ocupación.
+- Recorrer el árbol con un índice de escape por nodo, con un único `u32` de estado.
+- Estimar el impacto de la divergencia comparando rayos coherentes con rayos de rebote difuso.
+
+</Objetivos>
+
+## El test rayo-caja por slabs
+
+Una caja alineada a los ejes es la intersección de tres losas, cada una limitada por dos planos perpendiculares a un eje. Un rayo entra en la caja en el mayor de los tres instantes de entrada y sale en el menor de los tres de salida; si el instante de entrada supera al de salida, el rayo no toca la caja. Eso es todo el algoritmo, y en forma vectorial son seis operaciones por componente sin una sola rama.
+
+```wgsl
+const SIN_CORTE : f32 = 3.4e38;      // el mayor f32 normal: nunca es un impacto real
+
+fn interseccionCaja(o: vec3<f32>, invD: vec3<f32>,
+                    cmin: vec3<f32>, cmax: vec3<f32>,
+                    tMin: f32, tMax: f32) -> f32 {
+  let ta = (cmin - o) * invD;
+  let tb = (cmax - o) * invD;
+
+  let t0 = min(ta, tb);              // por componente: el plano de entrada
+  let t1 = max(ta, tb);              // por componente: el plano de salida
+
+  let entrada = max(max(t0.x, t0.y), max(t0.z, tMin));
+  let salida  = min(min(t1.x, t1.y), min(t1.z, tMax));
+
+  return select(SIN_CORTE, entrada, entrada <= salida);
+}
+```
+
+Devolver el instante de entrada y no un booleano no es un capricho: ese número es lo que permite ordenar los dos hijos y descartar un subárbol comparando contra el impacto más cercano encontrado hasta ahora.
+
+El `min` y el `max` por componente sobre los dos extremos resuelven de un golpe el problema del signo de la dirección. Si la componente `x` del rayo es negativa, `ta.x` es el plano lejano y `tb.x` el cercano; tomar el mínimo y el máximo los recoloca sin una sola comparación explícita.
+
+La **inversa de la dirección se calcula una vez por rayo, no una vez por nodo**. Es la optimización más rentable de todo el recorrido y también la más olvidada. Una división en coma flotante cuesta entre cuatro y diez veces lo que una multiplicación en la mayoría de arquitecturas; con cuarenta nodos visitados por rayo, sacar tres divisiones del bucle ahorra 120 divisiones por rayo, unos 250 millones por fotograma a 1080p.
+
+Ahora la parte delicada. Si una componente de la dirección vale exactamente cero, su inversa es infinito, y si además el origen del rayo está justo sobre uno de los dos planos de esa losa el producto es `0 · ∞`, que en IEEE-754 es `NaN`. Un `NaN` en `t0.x` se propaga o no según cómo la implementación resuelva `min` con operandos no numéricos, y **WGSL permite tratar los infinitos y los `NaN` como valores indeterminados**: el compilador puede optimizar asumiendo que no aparecen. No construyas tu robustez sobre ellos. Constrúyela sobre no generarlos:
+
+```wgsl
+fn invSegura(d: vec3<f32>) -> vec3<f32> {
+  // Sustituye una componente exactamente cero por 1e-20 conservando su signo.
+  // El inverso, 1e20, es finito, y 0 * 1e20 sigue siendo 0: no hay NaN posible.
+  let signo = select(vec3<f32>(1.0), vec3<f32>(-1.0), d < vec3<f32>(0.0));
+  return vec3<f32>(1.0) / (signo * max(abs(d), vec3<f32>(1e-20)));
+}
+```
+
+Con `1e20` como pendiente, una losa perpendicular al rayo produce instantes de entrada y salida astronómicos con el signo correcto, y las comparaciones siguen dando la respuesta geométricamente correcta. El coste son dos operaciones vectoriales por rayo.
+
+## Por qué la pila explícita duele
+
+La versión de libro guarda los nodos pendientes en un array local:
+
+```wgsl
+var pila : array<u32, 64>;
+var cima = 0u;
+```
+
+Ese array vive en el espacio de direcciones `function`, y lo que el compilador haga con él decide el rendimiento del shader entero. Si todos los índices fueran constantes en tiempo de compilación podría desplegarlo en registros. Con `pila[cima]`, donde `cima` cambia según el resultado de un test de caja, no puede: **un array indexado dinámicamente acaba en memoria de scratch**, que está respaldada por la VRAM y solo amortiguada por las cachés. Cada `push` y cada `pop` se convierten en un acceso a memoria con su latencia.
+
+Cuando el compilador sí consigue mantenerlo en registros, el problema es el otro. Sesenta y cuatro entradas de cuatro bytes son 256 bytes por invocación, es decir 64 registros de 32 bits dedicados solo a la pila. Súmale el rayo, el registro de impacto, la inversa de la dirección, los índices y el estado del generador aleatorio y te plantas cómodamente por encima de los cien registros. La regla práctica que se repite en todas las arquitecturas es que pasar de unos 64 registros por invocación parte la ocupación por la mitad, y en cuanto la ocupación baja, la GPU se queda sin hilos con los que tapar la latencia de las lecturas del buffer de nodos. Es la peor combinación posible: un algoritmo dominado por la latencia de memoria al que le has quitado precisamente el mecanismo que la esconde.
+
+La memoria de workgroup parece una salida y conviene hacer la cuenta. `maxComputeWorkgroupStorageSize` son 16 384 bytes por defecto; con un workgroup de 8 por 8, `16384 / 64 = 256` bytes por invocación, exactamente 64 entradas. Encaja al milímetro y te deja **cero** bytes para cualquier otra cosa. Y si la declaras como `array<u32, 4096>` indexada por `indiceLocal * 64 + cima`, todas las invocaciones del grupo acceden a direcciones separadas por 64 palabras y chocan en el mismo banco de memoria compartida; hay que transponerla a `cima * 64 + indiceLocal` para que las 64 lecturas de un mismo nivel de pila caigan en direcciones consecutivas. Es viable, pero es mucho presupuesto para guardar una lista de pendientes.
+
+## El índice de escape
+
+Hay una observación que hace desaparecer la pila entera. En un árbol aplanado en profundidad, cuando el test de un nodo falla, **el siguiente nodo que hay que visitar siempre es el mismo**, independientemente del rayo: es el primer nodo del array que no pertenece a este subárbol. Y cuando el test acierta y el nodo es interno, el siguiente también es siempre el mismo: el hijo izquierdo, que está en la posición contigua.
+
+Si guardas ese destino de fallo en cada nodo —el *índice de escape*, o *rope*—, todo el estado del recorrido se reduce a un `u32`. El truco funciona porque el árbol se linealizó en preorden: el escape del hijo izquierdo es el índice del hijo derecho, y el escape del hijo derecho es el escape del padre. Ese encadenamiento convierte el retroceso en un salto.
+
+Los 32 bytes del nodo no crecen; se reinterpretan. El campo que en el layout clásico guardaba el hijo derecho pasa a guardar el escape, y el otro `u32` empaqueta la primera primitiva y el conteo de la hoja:
+
+```wgsl
+struct Nodo {
+  min   : vec3<f32>,
+  salto : u32,        // indice de escape: a donde ir si este nodo falla o se agota
+  max   : vec3<f32>,
+  datos : u32,        // 0 => nodo interno ; si no, (primera << 8) | cuenta
+};
+
+@group(0) @binding(0) var<storage, read> nodos      : array<Nodo>;
+@group(0) @binding(1) var<storage, read> ordenPrims : array<u32>;
+@group(0) @binding(2) var<storage, read> tris       : array<Triangulo>;
+```
+
+Como una hoja siempre tiene al menos una primitiva, `datos` nunca vale cero en una hoja y el discriminante es exacto sin gastar un bit. Ocho bits de conteo dan hasta 255 primitivas por hoja, de sobra, y los 24 restantes direccionan 16,7 millones de primitivas, muy por encima del techo real que impone `maxStorageBufferBindingSize`.
+
+El aplanado con escapes se hace en la misma pasada, con un parche: el escape del hijo izquierdo es el índice del derecho, que todavía no se conoce cuando se escribe el izquierdo.
+
+```ts
+function aplanarConSaltos(raiz: NodoTmp, total: number): ArrayBuffer {
+  const buf = new ArrayBuffer(total * 32);
+  const f32 = new Float32Array(buf);
+  const u32 = new Uint32Array(buf);
+  let siguiente = 0;
+
+  const escribir = (nodo: NodoTmp, escape: number): number => {
+    const yo = siguiente++;
+    const o  = yo * 8;
+    f32[o + 0] = nodo.caja.min[0];
+    f32[o + 1] = nodo.caja.min[1];
+    f32[o + 2] = nodo.caja.min[2];
+    f32[o + 4] = nodo.caja.max[0];
+    f32[o + 5] = nodo.caja.max[1];
+    f32[o + 6] = nodo.caja.max[2];
+    u32[o + 3] = escape;
+
+    if (nodo.cuenta > 0) {
+      u32[o + 7] = ((nodo.primero << 8) | nodo.cuenta) >>> 0;   // hoja: nunca 0
+    } else {
+      u32[o + 7] = 0;
+      const iIzq = escribir(nodo.izq!, 0);        // escape provisional
+      const iDer = escribir(nodo.der!, escape);   // el derecho hereda el del padre
+      u32[iIzq * 8 + 3] = iDer;                   // parche: el izquierdo salta al derecho
+    }
+    return yo;
+  };
+
+  escribir(raiz, total);                          // la raiz escapa al final: fin del bucle
+  return buf;
+}
+```
+
+Y el recorrido completo, sin una sola variable de estado que no sea el índice actual:
+
+```wgsl
+fn trazar(rayo: Rayo, tMin: f32, tMax: f32) -> Hit {
+  var hit : Hit;
+  hit.t  = tMax;
+  hit.id = SIN_IMPACTO;
+
+  let invD  = invSegura(rayo.dir);
+  let total = arrayLength(&nodos);
+
+  var i = 0u;
+  loop {
+    if (i >= total) { break; }                    // la raiz escapa a 'total'
+
+    let nodo = nodos[i];
+    // hit.t como tMax: cualquier caja que empiece mas lejos ya no interesa.
+    let t = interseccionCaja(rayo.origen, invD, nodo.min, nodo.max, tMin, hit.t);
+
+    if (t >= hit.t) {
+      i = nodo.salto;                             // fallo: se salta el subarbol entero
+      continue;
+    }
+
+    if (nodo.datos == 0u) {
+      i = i + 1u;                                 // interno: hijo izquierdo, implicito
+      continue;
+    }
+
+    let primero = nodo.datos >> 8u;
+    let cuenta  = nodo.datos & 0xffu;
+    for (var k = 0u; k < cuenta; k = k + 1u) {
+      let id = ordenPrims[primero + k];
+      intersecarTriangulo(rayo, tris[id], tMin, id, &hit);   // actualiza hit.t si acierta
+    }
+    i = nodo.salto;
+  }
+  return hit;
+}
+```
+
+Lo que este recorrido pierde es el **orden**. Con una pila puedes mirar los instantes de entrada de los dos hijos, bajar primero por el más cercano y guardar el otro; si el cercano contiene el impacto, `hit.t` se estrecha antes de examinar el lejano y muchas veces lo descarta entero. Con escapes ese orden está grabado en el array en tiempo de construcción y no se puede invertir según el signo de la dirección del rayo. La versión ordenada necesita el layout clásico, con el índice del hijo derecho, y una pila corta:
+
+```wgsl
+fn trazarOrdenado(rayo: Rayo, tMin: f32, tMax: f32) -> Hit {
+  var hit : Hit;
+  hit.t  = tMax;
+  hit.id = SIN_IMPACTO;
+
+  let invD = invSegura(rayo.dir);
+  var pila : array<u32, 32>;
+  var cima = 0u;
+  var i    = 0u;
+
+  loop {
+    let nodo = nodos[i];
+
+    if (nodo.cuenta > 0u) {
+      for (var k = 0u; k < nodo.cuenta; k = k + 1u) {
+        let id = ordenPrims[nodo.indice + k];
+        intersecarTriangulo(rayo, tris[id], tMin, id, &hit);
+      }
+    } else {
+      var a = i + 1u;                             // hijo izquierdo
+      var b = nodo.indice;                        // hijo derecho
+      var ta = interseccionCaja(rayo.origen, invD, nodos[a].min, nodos[a].max, tMin, hit.t);
+      var tb = interseccionCaja(rayo.origen, invD, nodos[b].min, nodos[b].max, tMin, hit.t);
+
+      if (tb < ta) {                              // el mas cercano primero
+        let tt = ta; ta = tb; tb = tt;
+        let ii = a;  a = b;   b = ii;
+      }
+
+      if (ta < SIN_CORTE) {
+        if (tb < SIN_CORTE) { pila[cima] = b; cima = cima + 1u; }
+        i = a;
+        continue;
+      }
+    }
+
+    if (cima == 0u) { break; }
+    cima = cima - 1u;
+    i = pila[cima];
+  }
+  return hit;
+}
+```
+
+Ordenar suele recortar entre un veinte y un cuarenta por ciento los nodos visitados por rayos primarios, precisamente porque `hit.t` baja antes. Con treinta y dos entradas de pila el shader se mantiene en un consumo de registros razonable, pero **hay que acotar la profundidad del árbol en el constructor**: la SAH no garantiza equilibrio, y una pila que se desborda no degrada la calidad, pierde geometría en silencio. Forzar hoja al llegar a profundidad 28 o 30 es el seguro barato.
+
+La elección entre las dos no es religiosa. Con rayos coherentes y muchos registros disponibles, la versión ordenada gana. Con rayos incoherentes, donde la pila se llena y se vacía de forma distinta en cada carril y el orden deja de servir porque `hit.t` no encoge, la versión sin pila suele ganar por ocupación. Mide las dos con tu escena.
+
+## Divergencia: el coste lo fija el peor rayo
+
+Los carriles de un grupo SIMD —32 o 64 según el fabricante— comparten un único contador de programa. Cuando dos carriles toman ramas distintas, el hardware ejecuta **las dos**, enmascarando los carriles que no corresponden. El coste no es el promedio de los dos caminos, es su unión.
+
+Aplicado a este bucle, la consecuencia es más dura de lo que parece a primera vista: el `loop` no termina cuando termina tu rayo, termina cuando termina el último rayo del grupo. Si treinta y un rayos visitan veinte nodos y uno visita ciento veinte, el grupo entero paga ciento veinte iteraciones.
+
+Por eso los rayos primarios van tan rápido y los rebotes difusos no. Los primarios de un bloque de 8 por 8 píxeles salen todos del mismo punto con direcciones que difieren en milésimas de radián: atraviesan casi la misma secuencia de nodos, los tests dan casi siempre lo mismo, la unión de caminos es casi un solo camino, y el nodo que un carril acaba de leer ya está en la caché para los otros treinta y uno. Un rebote difuso hace lo contrario: los treinta y dos carriles parten de puntos distintos de la escena en direcciones muestreadas del hemisferio, cada uno recorre una rama diferente del árbol, y cada lectura de nodo va a una zona distinta de un buffer de decenas de megabytes. La diferencia de rendimiento entre trazar rayos coherentes e incoherentes sobre la misma escena y el mismo código suele estar entre tres y diez veces.
+
+Eso reordena las prioridades de optimización. Antes de pelear por una instrucción del test de slabs, comprueba si tu problema es la divergencia; si lo es, ninguna micro-optimización del bucle te va a devolver un factor de cinco. Lo que sí lo devuelve es reducir la varianza del número de iteraciones: hojas de tamaño uniforme, un árbol acotado en profundidad, y agrupar los rayos por dirección antes de trazarlos cuando el algoritmo lo permite.
+
+<Callout type="dios" title="La metrica util no es la media de nodos visitados, es el maximo por grupo">
+Casi todo el mundo instrumenta su trazador contando nodos visitados y dividiendo por el número de rayos. Ese número es cómodo, se compara bien entre construcciones, y **no predice el tiempo de ejecución**. La razón es la que acabas de ver: en un grupo SIMD el trabajo lo fija el máximo, no la media. Una construcción que baje la media de 40 a 34 nodos y a cambio ensanche la cola —que unos pocos rayos por grupo se vayan a 200— puede rendir peor que la que dejaste atrás, y el contador te dirá que has mejorado un quince por ciento. La métrica que sí correlaciona con el reloj es el máximo por grupo de 32 rayos, o su percentil 95 si prefieres algo menos ruidoso, y se saca con un poco de aritmética sobre el índice global: acumula el conteo por bloque de 32 invocaciones consecutivas con `atomicMax` sobre un `atomic<u32>` por bloque y léelo de vuelta. Hay un matiz de segundo orden que remata el argumento y que además explica un fenómeno desconcertante: la poda por `hit.t` **es en sí misma una fuente de divergencia**. Cada carril lleva su propio `hit.t` y por tanto toma decisiones de poda distintas ante el mismo nodo, de modo que cuanto mejor poda tu recorrido, más divergen los caminos. Es un algoritmo que se sabotea a sí mismo, y por eso el trazado de rayos es el caso de uso que empujó a los fabricantes a meter en silicio una unidad de reordenación que reagrupa rayos con estados parecidos antes de continuar. Nada de eso está expuesto en WebGPU y no hay forma de emularlo dentro de un dispatch. Lo que sí puedes hacer, si tu presupuesto lo justifica, es partir el trazado en varios dispatches y ordenar los rayos entre uno y otro por dirección o por material —la arquitectura de *wavefront path tracing*—, pagando la escritura y lectura del estado de cada rayo a memoria a cambio de recuperar coherencia. Es una decisión de arquitectura, no una optimización, y solo sale a cuenta cuando la divergencia medida supera holgadamente el coste de mover el estado.
+</Callout>
+
+<Reto title="Mide la divergencia de tu recorrido">
+1. Instrumenta el bucle con un contador de nodos visitados por rayo y píntalo como mapa de calor.
+2. Calcula la media y el máximo por bloque de 32 invocaciones consecutivas y compara los dos números para rayos primarios y para el primer rebote difuso.
+3. Implementa las dos versiones del recorrido, con escape y con pila ordenada, y mide cuál gana en cada caso.
+4. Quita `invSegura` y dispara un rayo con dirección exactamente `(0, 1, 0)` desde un punto que esté sobre una cara de una caja del árbol.
+</Reto>

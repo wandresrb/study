@@ -1,0 +1,218 @@
+---
+title: "Presupuestos que hacen fallar el build sin que nadie los desactive"
+description: "Qué métricas soportan un umbral duro y cuáles no, el fichero de presupuestos por ruta, el trinquete que aprieta solo, y el procedimiento de excepción que evita que la puerta se derribe."
+subject: rendimiento
+level: 36
+order: 2
+icon: "36.2"
+duracion: "19 min"
+---
+
+<Lead>
+Un presupuesto que no rompe nada es documentación, y la documentación no detiene regresiones. Un presupuesto que rompe cosas que no debería se desactiva en tres semanas. El diseño correcto está en distinguir qué se puede medir sin error y qué no, poner puertas duras solo sobre lo primero, y dar a lo segundo un tratamiento distinto. Esa distinción, y no el valor concreto de los umbrales, es lo que decide si el mecanismo sobrevive.
+</Lead>
+
+<Objetivos>
+
+- Clasificar cada métrica según si su medida es determinista o estocástica.
+- Escribir el fichero de presupuestos por ruta con límites de tamaño, número y tiempo.
+- Implantar el trinquete que baja el presupuesto automáticamente tras una mejora.
+- Definir un procedimiento de excepción con caducidad que la gente respete.
+
+</Objetivos>
+
+## Determinista frente a estocástico
+
+Es la clasificación que hay que hacer antes de escribir un solo umbral. La pregunta es: si ejecuto esta medida diez veces sobre el mismo commit, ¿obtengo diez veces el mismo número?
+
+**Deterministas.** El tamaño de cada paquete comprimido. El número de fragmentos. El número de peticiones que emite el HTML estático. El número de dependencias del árbol resuelto. La presencia de un módulo prohibido. Las dimensiones de un fichero de imagen. Todas se calculan a partir de artefactos de la compilación, sin ejecutar nada en un navegador, y su valor es idéntico en cada ejecución.
+
+**Estocásticas.** Todo lo que se obtiene ejecutando la página: pintado del elemento más grande, tiempo de bloqueo total, desplazamiento acumulado, tiempo hasta el primer byte. Dependen de la máquina, de su carga en ese instante, de la temperatura del procesador y del planificador del sistema.
+
+La regla que hay que aplicar, y de la que no conviene desviarse:
+
+| Tipo de medida | Tratamiento | Efecto en el trabajo |
+|---|---|---|
+| Determinista | Umbral duro | Falla y bloquea |
+| Estocástica | Umbral holgado con varias pasadas | Solo avisa y comenta |
+| Estocástica con tendencia sostenida | Alerta a un canal, no al trabajo | Se revisa, no bloquea |
+
+La razón por la que esta separación funciona es que **las dos clases fallan de forma distinta**. Una comprobación determinista que falla siempre indica un cambio real, así que su tasa de falsos positivos es cero y la confianza en ella se mantiene indefinidamente. Una comprobación estocástica falla a veces sin motivo, y cada falso positivo consume crédito. Mezclarlas en el mismo mecanismo hace que la desconfianza que genera la segunda contamine a la primera, y se acaben desactivando las dos.
+
+Y hay una buena noticia en esa tabla: **el noventa por ciento de las regresiones de rendimiento que se cuelan en un producto son detectables de forma determinista**, porque casi siempre empiezan por un paquete que crece. Alguien importa una biblioteca de fechas entera para formatear una, alguien añade un icono desde un paquete sin recorte de código muerto, alguien mete una dependencia que arrastra otras cinco. Todo eso lo caza una comprobación de bytes, que es barata, rápida y no falla nunca por casualidad.
+
+## El fichero de presupuestos
+
+La herramienta de auditoría admite un fichero de presupuestos por ruta con tres familias de límite. Los tamaños van en kibibytes:
+
+```json
+[
+  {
+    "path": "/*",
+    "resourceSizes": [
+      { "resourceType": "script",     "budget": 170 },
+      { "resourceType": "stylesheet", "budget": 60  },
+      { "resourceType": "font",       "budget": 100 },
+      { "resourceType": "image",      "budget": 400 },
+      { "resourceType": "third-party","budget": 180 },
+      { "resourceType": "total",      "budget": 900 }
+    ],
+    "resourceCounts": [
+      { "resourceType": "third-party", "budget": 8 },
+      { "resourceType": "script",      "budget": 12 }
+    ]
+  },
+  {
+    "path": "/panel/*",
+    "resourceSizes": [
+      { "resourceType": "script", "budget": 320 },
+      { "resourceType": "total",  "budget": 1400 }
+    ]
+  }
+]
+```
+
+Tres cosas que hay que decidir bien.
+
+**Los presupuestos son por ruta y tienen que serlo.** Una portada y un panel de trabajo tras autenticación tienen presupuestos legítimamente distintos, y un único límite global obliga a poner el del caso más laxo, con lo que deja de proteger a la portada. La regla al añadir una entrada específica: escribe al lado por qué esa ruta merece más.
+
+**El límite de número de terceros es el más potente de todos.** Es el único de la lista que no se puede satisfacer optimizando: para cumplirlo hay que quitar algo, y eso fuerza exactamente la conversación de la que hablaba el nivel de terceros. Un tope de ocho orígenes es un mecanismo de gobernanza disfrazado de comprobación técnica.
+
+**El límite total existe para que no se juegue con las categorías.** Sin él, se cumple el presupuesto de scripts moviendo código a un fichero que se sirve con otro tipo de contenido. Con él, el tope agregado sigue en pie.
+
+Para el tamaño de los paquetes, además, conviene una comprobación directa sobre los artefactos, que es más rápida que arrancar un navegador y da mensajes mucho mejores:
+
+```js
+// scripts/presupuesto-paquetes.mjs
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { gzipSync, brotliCompressSync } from 'node:zlib';
+import { join } from 'node:path';
+
+const LIMITES = {
+  'entrada-principal': 145 * 1024,
+  'entrada-panel':     260 * 1024,
+  'compartido':         90 * 1024,
+};
+
+function comprimido(ruta) {
+  const bytes = readFileSync(ruta);
+  return {
+    gzip: gzipSync(bytes, { level: 9 }).length,
+    brotli: brotliCompressSync(bytes).length,
+  };
+}
+
+// Los nombres llevan hash: se agrupa por nombre logico.
+function nombreLogico(fichero) {
+  return fichero.replace(/[.-][0-9a-f]{8,}(\.\w+)$/, '$1').replace(/\.\w+$/, '');
+}
+
+const dir = 'dist/assets';
+const totales = new Map();
+for (const f of readdirSync(dir)) {
+  if (!f.endsWith('.js')) continue;
+  const ruta = join(dir, f);
+  if (!statSync(ruta).isFile()) continue;
+  const clave = nombreLogico(f);
+  const { brotli } = comprimido(ruta);
+  totales.set(clave, (totales.get(clave) || 0) + brotli);
+}
+
+let fallo = false;
+for (const [clave, limite] of Object.entries(LIMITES)) {
+  const real = totales.get(clave);
+  if (real === undefined) {
+    console.error(`FALTA  ${clave}: no se ha encontrado ningun fichero`);
+    fallo = true;
+    continue;
+  }
+  const kb = (n) => (n / 1024).toFixed(1) + ' KB';
+  if (real > limite) {
+    console.error(
+      `EXCEDE ${clave}: ${kb(real)} sobre un limite de ${kb(limite)} ` +
+      `(+${kb(real - limite)})`
+    );
+    fallo = true;
+  } else {
+    console.log(`OK     ${clave}: ${kb(real)} de ${kb(limite)}`);
+  }
+}
+process.exit(fallo ? 1 : 0);
+```
+
+Dos detalles de ese guion que importan. Se mide **comprimido con Brotli**, porque es lo que viaja por la red y lo que paga el usuario; el tamaño sin comprimir es una cifra interna que engaña, y además el sin comprimir es el que predice el tiempo de análisis, así que si quieres las dos protecciones necesitas los dos límites. Y la agrupación **por nombre lógico** es imprescindible: los ficheros llevan un hash que cambia en cada compilación, así que una comparación por nombre de fichero no encuentra nunca su pareja anterior.
+
+## El trinquete
+
+El problema a medio plazo de cualquier presupuesto es que se pone holgado para que no moleste al principio, y luego nadie lo baja. Un presupuesto de 170 kilobytes en un paquete de 120 permite un cincuenta por ciento de crecimiento silencioso: todo el margen se consume sin que salte nada, y el día que salta ya es tarde.
+
+El trinquete resuelve eso automáticamente: **cuando el tamaño real baja por debajo de un margen del límite, el límite baja solo.**
+
+```js
+// Tras una compilacion correcta en la rama principal.
+const MARGEN = 1.05;   // se permite un 5 % de holgura sobre lo real
+
+function apretar(limites, reales) {
+  const nuevos = { ...limites };
+  for (const [clave, real] of Object.entries(reales)) {
+    const propuesto = Math.ceil(real * MARGEN);
+    if (propuesto < nuevos[clave]) {
+      console.log(`Trinquete ${clave}: ${nuevos[clave]} -> ${propuesto}`);
+      nuevos[clave] = propuesto;
+    }
+  }
+  return nuevos;
+}
+```
+
+El guion se ejecuta solo en la rama principal, tras una compilación correcta, y abre una petición de cambios con el fichero de límites actualizado. Dos propiedades hacen que esto funcione mucho mejor de lo que su simplicidad sugiere. **Las mejoras se conservan**: quien optimiza cuarenta kilobytes sabe que nadie se los va a gastar la semana siguiente sin darse cuenta, lo que hace que optimizar sea gratificante en lugar de futil. Y **el margen es siempre proporcional**, así que el mecanismo no requiere que nadie recuerde revisarlo.
+
+El margen del cinco por ciento hay que ajustarlo al proyecto. Demasiado ajustado y cualquier cambio legítimo dispara la comprobación; demasiado holgado y no aprieta nunca. Entre el cinco y el diez por ciento funciona bien en la mayoría de los casos.
+
+## El procedimiento de excepción
+
+Una puerta sin cerradura se derriba. Todo presupuesto necesita una vía documentada para saltárselo, y esa vía tiene que ser **rápida, visible y con caducidad**. Si saltársela cuesta más que desactivar la comprobación, la gente desactivará la comprobación.
+
+```js
+// presupuestos.config.js
+export const excepciones = [
+  {
+    clave: 'entrada-panel',
+    limite: 320 * 1024,          // temporal, por encima del normal
+    motivo: 'Migracion del editor. La libreria antigua sale en la version 4.2.',
+    responsable: 'equipo-editor',
+    caduca: '2026-10-15',
+    incidencia: 'PERF-284',
+  },
+];
+```
+
+Con una comprobación adicional que cierra el círculo y que es la pieza que casi siempre falta: **la excepción caducada rompe el trabajo igual que el presupuesto**.
+
+```js
+const hoy = new Date().toISOString().slice(0, 10);
+for (const e of excepciones) {
+  if (e.caduca < hoy) {
+    console.error(
+      `Excepcion caducada para ${e.clave} desde ${e.caduca}. ` +
+      `Responsable: ${e.responsable}. Incidencia: ${e.incidencia}. ` +
+      `Renuevala con una fecha nueva o quita la excepcion.`
+    );
+    process.exit(1);
+  }
+}
+```
+
+Eso convierte cada excepción en una deuda con vencimiento en lugar de en un agujero permanente. Y el efecto secundario más valioso es el registro: dentro de un año, el fichero de excepciones caducadas y renovadas es la historia documentada de las decisiones de rendimiento del equipo, con nombres y motivos, que es exactamente lo que no existe en ningún sitio cuando alguien pregunta por qué el paquete pesa lo que pesa.
+
+<Callout type="dios" title="Un presupuesto no es un límite técnico: es un mecanismo que convierte una externalidad difusa en un coste inmediato para quien la genera, y funciona por eso y no por la cifra">
+La razón por la que los paquetes crecen no es que la gente no sepa que el JavaScript es caro. Lo sabe. Crece porque el coste de añadir cuarenta kilobytes está perfectamente diseñado para no detener a nadie: es diminuto en la escala de una decisión individual —cuarenta kilobytes, sobre trescientos que ya hay, es un trece por ciento que ni siquiera se nota en una prueba manual—, llega mucho después de la decisión, y lo paga alguien que no está en la conversación, que es el usuario. Es la estructura exacta de una externalidad, la misma que hace que sea individualmente racional tirar una lata al suelo, y como toda externalidad no se corrige con concienciación sino con un mecanismo que internalice el coste. Eso es un presupuesto: **una máquina que coge un coste difuso, futuro y ajeno y lo convierte en un coste concreto, inmediato y propio para quien lo genera**. La persona que añade la biblioteca ve el fallo en su propia petición de cambios, en el momento de añadirla, mientras todavía tiene el contexto en la cabeza y todavía puede elegir la alternativa de tres kilobytes. Eso es todo el mecanismo, y de esa formulación salen consecuencias muy prácticas que se pierden si uno se centra en el número. La primera: **el valor exacto del umbral es casi irrelevante y el momento en que se notifica lo es todo.** Un presupuesto flojo que avisa en el instante correcto previene más regresiones que uno estricto que avisa dos semanas después en un informe. La segunda: la comprobación tiene que ejecutarse en la petición de cambios y no en la rama principal, porque en la rama principal el coste ya se ha externalizado y quien lo generó ya está en otra cosa. La tercera, y la más incómoda: **el presupuesto tiene que doler un poco.** Una comprobación que se salta con una etiqueta que cualquiera puede poner sin explicar nada no internaliza ningún coste, solo añade un clic; y una que exige una hora de burocracia hace que el mecanismo se derribe entero. El punto correcto es el de un formulario de dos minutos con un nombre y una fecha, que es suficiente fricción para que nadie lo haga por pereza y suficientemente poca para que nadie lo odie. Y la última consecuencia, la que explica por qué esto pertenece a un track de ingeniería y no de gestión: como el mecanismo funciona por su estructura de incentivos y no por su exactitud técnica, **su diseño es tan parte del trabajo de rendimiento como el código que optimiza el paquete**, y descuidarlo garantiza que el trabajo de optimización se pierda, porque el crecimiento es continuo y las optimizaciones son episódicas.
+</Callout>
+
+<Reto title="Pon la puerta">
+1. Clasifica todas tus métricas actuales en deterministas y estocásticas. Quita las puertas duras que estén sobre las segundas.
+2. Escribe el fichero de presupuestos por ruta, con una entrada por plantilla y el motivo de cada excepción de ruta al lado.
+3. Añade el guion de presupuesto de paquetes con agrupación por nombre lógico y medida en Brotli.
+4. Implanta el trinquete en la rama principal y comprueba que abre una petición de cambios tras la próxima mejora.
+5. Escribe el fichero de excepciones con caducidad y la comprobación que falla cuando una expira.
+</Reto>

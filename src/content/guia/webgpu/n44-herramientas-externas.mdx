@@ -1,0 +1,197 @@
+---
+title: "El utillaje real: consola, volcados y capturadores nativos"
+description: "Qué herramientas existen de verdad hoy para depurar WebGPU, por qué no hay depurador de shaders, cómo volcar valores a un buffer o a color, y qué te enseña realmente una captura nativa."
+subject: webgpu
+level: 44
+order: 5
+icon: "44.5"
+duracion: "19 min"
+---
+
+<Lead>
+Vienes de un ecosistema donde poner un breakpoint es gratis y esperas encontrar algo equivalente para un fragment shader. No existe, y no es un descuido temporal que se vaya a arreglar el año que viene. Lo que sí existe es un conjunto pequeño de técnicas que la industria lleva veinte años usando para lo mismo, y que en WebGPU funcionan bien: mensajes de validación de calidad inusual, un par de páginas internas del navegador que te dicen sobre qué estás corriendo de verdad, y el volcado de valores intermedios a memoria o a color. Esta lección es el inventario honesto y el orden en el que hay que usarlo.
+</Lead>
+
+<Objetivos>
+
+- Comprobar qué adaptador y qué backend está usando de verdad tu navegador.
+- Escribir una función reutilizable que vuelque una textura a un buffer y la lea en la CPU.
+- Diseñar un modo de depuración por color que cubra normales, UV, profundidad y coste.
+- Decidir cuándo una captura nativa aporta algo y cuándo solo te va a desorientar.
+
+</Objetivos>
+
+## Lo que sí tienes en el navegador
+
+WebGPU está en los tres motores desde que Safari 26 lo implementó en septiembre de 2025, pero el utillaje de depuración no viajó al mismo ritmo que la implementación: las páginas internas y las banderas que siguen son de Chrome y de Firefox.
+
+**La consola.** Es tu herramienta principal, y sin ironía. Los mensajes de validación de WebGPU son objetivamente mejores que los de casi cualquier otro API web, y la razón es estructural: como la validación ocurre al crear los objetos y no en el camino caliente, la implementación puede permitirse redactar un párrafo con la cadena completa de causas en vez de devolver un código numérico. Un mensaje típico te dice qué falló, contra qué se estaba comparando, y en qué llamada se detectó. Si además has [etiquetado tus objetos](/guia/webgpu/n44-las-etiquetas-lo-cambian-todo/), ese párrafo habla de tu programa.
+
+**Las páginas de diagnóstico.** `chrome://gpu` en Chrome y `about:gpu` en Firefox te dicen sobre qué estás corriendo realmente: qué adaptador se ha seleccionado, qué backend hay debajo —D3D12, Metal o Vulkan—, qué versión de driver, y qué funcionalidades están bloqueadas o forzadas por la lista de compatibilidad del navegador. Esa página es la respuesta a la pregunta que aparece antes o después: *por qué esto va a treinta fotogramas por segundo en esta máquina y a doscientos en la de al lado*. Las dos causas más frecuentes que verás ahí son que la aceleración está desactivada y estás en el renderizador por software, o que el navegador ha elegido la GPU integrada en un portátil que tiene dos. Ninguna de las dos se detecta desde JavaScript con fiabilidad, y las dos explican una diferencia de rendimiento de un orden de magnitud.
+
+**Las banderas de desarrollo.** Chrome esconde un conjunto de comportamientos de desarrollo detrás de `chrome://flags/#enable-webgpu-developer-features`. El más relevante afecta a las mediciones: **Chrome cuantiza los resultados de las timestamp queries a 100 microsegundos** por motivos de seguridad, porque un reloj de alta resolución accesible desde una página es un vector de ataques de canal lateral. Con esa cuantización, cualquier pass que dure menos de 100 microsegundos mide cero o 100, y toda tu tabla de tiempos por pass se convierte en una escalera inútil. Con la bandera activada recuperas la resolución real. Actívala solo en tu perfil de desarrollo y recuerda que las cifras que obtengas ahí no son las que verá un usuario.
+
+**Y lo que no hay.** No existe ningún depurador paso a paso de shaders WGSL en ningún navegador. No puedes poner un breakpoint en una línea de tu fragment shader, no puedes inspeccionar el valor de una variable local, y no puedes ejecutar una invocación instrucción a instrucción. Es el hueco más grande del ecosistema y conviene aceptarlo pronto, porque todo lo que sigue son las técnicas que lo sustituyen.
+
+## Volcar valores: el printf que no existe
+
+La técnica que reemplaza al depurador es tan vieja como el cómputo en GPU: **escribe el valor que quieres ver en un sitio que puedas leer**. Hay dos destinos posibles, un storage buffer o un render target, y la elección depende de si lo que investigas es un compute shader o un shader de render.
+
+Para un compute shader, un buffer de depuración con un contador atómico da el equivalente más cercano a un `printf`, con la ventaja de que puedes filtrar qué invocaciones escriben:
+
+```wgsl
+struct Depuracion {
+  escritos: atomic<u32>,
+  ranuras: array<vec4f, 1024>,
+}
+@group(3) @binding(0) var<storage, read_write> depuracion: Depuracion;
+
+fn volcar(valor: vec4f) {
+  let i = atomicAdd(&depuracion.escritos, 1u);
+  if (i < 1024u) {
+    depuracion.ranuras[i] = valor;
+  }
+}
+
+@compute @workgroup_size(64)
+fn principal(@builtin(global_invocation_id) gid: vec3u) {
+  let velocidad = integrar(gid.x);
+
+  // Solo una invocación de cada mil: 1024 ranuras se llenan enseguida.
+  if (gid.x % 1000u == 0u) {
+    volcar(vec4f(velocidad, f32(gid.x)));
+  }
+}
+```
+
+El contador atómico te dice cuántas invocaciones pasaron por ahí, que muchas veces es la información que buscabas. Un grupo aparte —el tres, aquí— mantiene el buffer de depuración fuera de tus layouts reales y hace trivial quitarlo después.
+
+Para un shader de render, lo que se vuelca es la textura de salida, y el ayudante que necesitas es este. Vale la pena escribirlo una vez y dejarlo en el proyecto:
+
+```ts
+/** Copia una textura a la CPU. La textura necesita el flag COPY_SRC. */
+async function volcarTextura(
+  device: GPUDevice,
+  textura: GPUTexture,
+  bytesPorTexel: number,
+): Promise<{ datos: Uint8Array; ancho: number; alto: number }> {
+  const ancho = textura.width;
+  const alto = textura.height;
+
+  // La regla que nadie recuerda: bytesPerRow debe ser múltiplo de 256.
+  const bytesPerRow = Math.ceil((ancho * bytesPorTexel) / 256) * 256;
+
+  const lectura = device.createBuffer({
+    label: `volcado/${textura.label}`,
+    size: bytesPerRow * alto,
+    // MAP_READ solo puede combinarse con COPY_DST. Nada más.
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+
+  const encoder = device.createCommandEncoder({ label: "volcado" });
+  encoder.copyTextureToBuffer(
+    { texture: textura },
+    { buffer: lectura, bytesPerRow, rowsPerImage: alto },
+    { width: ancho, height: alto },
+  );
+  device.queue.submit([encoder.finish()]);
+
+  await lectura.mapAsync(GPUMapMode.READ);
+  const crudo = new Uint8Array(lectura.getMappedRange()).slice();
+  lectura.unmap();
+  lectura.destroy();
+
+  // Quitar el relleno: cada fila ocupa bytesPerRow, no ancho * bytesPorTexel.
+  const utilPorFila = ancho * bytesPorTexel;
+  const datos = new Uint8Array(utilPorFila * alto);
+  for (let y = 0; y < alto; y++) {
+    datos.set(crudo.subarray(y * bytesPerRow, y * bytesPerRow + utilPorFila), y * utilPorFila);
+  }
+
+  return { datos, ancho, alto };
+}
+```
+
+Tres cosas de ese código son las que se aprenden a base de errores de validación. La primera es el redondeo de `bytesPerRow` a múltiplo de 256, que obliga a la fase final de desrelleno; si te la saltas, las filas salen desplazadas progresivamente y la imagen aparece inclinada, que es un síntoma inconfundible. La segunda es que `MAP_READ` solo se puede combinar con `COPY_DST`: no puedes leer directamente el buffer donde tu compute escribió, necesitas un buffer intermedio y una copia. La tercera es el `.slice()` tras `getMappedRange()`, porque la vista deja de ser válida en cuanto llamas a `unmap()` y sin la copia te quedas con un array vacío.
+
+Y un aviso operativo: esto sincroniza la CPU con la GPU. Un volcado por fotograma destruye el rendimiento. Es una herramienta de investigación puntual, no instrumentación permanente.
+
+## Depurar por color
+
+Si tuviera que quedarme con una sola técnica de esta lección sería esta, porque es la que más bugs encuentra por minuto invertido. Consiste en sustituir el color final del fragment shader por la magnitud que quieres inspeccionar, y mirarla. El ojo humano detecta discontinuidades, patrones y valores fuera de rango en una imagen mucho más rápido de lo que cualquiera lee una lista de números.
+
+```wgsl
+fn mapaDeCalor(t: f32) -> vec3f {
+  let x = clamp(t, 0.0, 1.0);
+  return vec3f(
+    smoothstep(0.5, 1.0, x),
+    1.0 - abs(x - 0.5) * 2.0,
+    1.0 - smoothstep(0.0, 0.5, x),
+  );
+}
+
+@fragment
+fn fs(entrada: Interpolado) -> @location(0) vec4f {
+  let trazado = trazar(entrada.rayo);
+
+  switch u.modoDepuracion {
+    case 0u: { return vec4f(trazado.color, 1.0); }
+
+    // Normales: de [-1,1] a [0,1]. Las costuras y las caras invertidas saltan solas.
+    case 1u: { return vec4f(normalize(entrada.normal) * 0.5 + 0.5, 1.0); }
+
+    // UV con fract: si hay estiramientos o solapes, se ven como bandas.
+    case 2u: { return vec4f(fract(entrada.uv), 0.0, 1.0); }
+
+    // Profundidad linealizada: sin linealizar es casi todo blanco y no dice nada.
+    case 3u: { return vec4f(vec3f(linealizar(entrada.posicion.z)), 1.0); }
+
+    // Coste: cuántos pasos ha dado el bucle. Encuentra el punto caliente al instante.
+    case 4u: { return vec4f(mapaDeCalor(f32(trazado.pasos) / 64.0), 1.0); }
+
+    // Índice de cluster como color pseudoaleatorio: verifica la asignación espacial.
+    case 5u: { return vec4f(colorDeIndice(trazado.cluster), 1.0); }
+
+    default: { return vec4f(1.0, 0.0, 1.0, 1.0); }   // magenta: modo desconocido
+  }
+}
+```
+
+El modo se controla desde un campo `u32` en tu buffer de uniformes, no con una constante, para poder recorrer los modos con el teclado sin recompilar nada. Y el `default` en magenta es una costumbre que ahorra confusiones: cuando ves magenta sabes con certeza que estás en un modo que no existe, en vez de dudar si el shader está haciendo algo raro.
+
+Qué buscar en cada modo, en corto. En las normales: costuras duras donde debería haber continuidad, y caras que salen del color complementario, señal de winding invertido. En las UV: bandas apretadas donde hay estiramiento de textura. En la profundidad linealizada: escalones, que significan que tu rango de profundidad está mal repartido. En el mapa de calor de iteraciones: la silueta exacta de lo que te está costando el fotograma, que casi nunca es lo que suponías. En el índice de cluster: huecos o solapes en la asignación espacial.
+
+Un detalle que arruina esta técnica si se ignora: **si tu render target tiene formato sRGB, el valor que escribes no es el valor que ves**. La conversión se aplica en la escritura, y un 0.5 aparece en pantalla como un gris bastante más claro. Para leer números a ojo con precisión, vuelca a un target lineal o desactiva cualquier tone mapping en el modo de depuración.
+
+## Los capturadores nativos y el orden de ataque
+
+Existen capturadores de fotogramas serios y funcionan con WebGPU, pero con una salvedad que hay que entender antes de perder una tarde. RenderDoc en Windows y Linux, PIX en Windows y el depurador de Metal de Xcode con Instruments en macOS **no capturan una aplicación WebGPU: capturan una aplicación nativa que resulta ser el navegador**. De ahí salen dos consecuencias.
+
+La primera es logística: hay que lanzar el navegador desde el capturador, con las banderas adecuadas para que use el backend que la herramienta entiende y para que no reparta el trabajo entre procesos de forma que la captura se pierda. Los detalles cambian con cada versión, así que la fuente fiable es la documentación de la herramienta y no un tutorial de hace dos años.
+
+La segunda es conceptual y es la importante: **lo que ves en la captura no son tus llamadas de WebGPU**. Es el resultado de traducirlas al backend nativo. Tu `draw` aparece como una llamada de D3D12, Metal o Vulkan; tu WGSL aparece como HLSL, MSL o SPIR-V traducido; tus bind groups aparecen como descriptor tables o argument buffers, y las estructuras intermedias que la implementación añade por su cuenta aparecen mezcladas con las tuyas sin distintivo. Para **rendimiento** eso da igual y hasta es útil, porque el tiempo se consume abajo y ahí es donde quieres mirar: cuántos comandos se emiten de verdad, cuánta memoria se mueve, dónde está la burbuja. Para **corrección** desorienta bastante, porque estás depurando un programa que tú no escribiste.
+
+Hay una salida elegante para el caso de corrección, y es la que usan los que hacen esto en serio. Dawn es la implementación de WebGPU de Chrome y wgpu la de Firefox, y **ambas se pueden usar como librería nativa**. Puedes montar un programa de escritorio pequeño que cree el mismo dispositivo, los mismos buffers y el mismo pipeline, con el mismo WGSL literal, y depurarlo con todas las herramientas nativas disponibles, incluida la depuración de shaders donde el backend la ofrezca. El shader es el mismo texto; el entorno no. Es trabajo, pero para un bug de shader que se resiste es la única vía que existe hacia un depurador de verdad.
+
+El orden de ataque, que es lo que de verdad hay que llevarse de este nivel:
+
+1. **Reproduce.** Un caso mínimo y determinista. Sin esto, cualquier medida es ruido.
+2. **Etiqueta.** Todos los objetos implicados y todas las fases con grupos de depuración. La mitad de los bugs se identifican aquí, leyendo un mensaje que ahora habla de tu programa.
+3. **Acota con error scopes.** Envuelve la fase sospechosa y confirma si la validación tiene algo que decir. Si lo tiene, se acabó.
+4. **Vuelca a color.** Con la consola limpia, el problema es lógico y el ojo es tu mejor instrumento. Normales, UV, profundidad, coste, índices.
+5. **Vuelca a buffer.** Cuando necesitas el número exacto y no el color aproximado.
+6. **Saca la artillería nativa.** Solo cuando lo anterior se ha agotado, o cuando el problema es de rendimiento y no de corrección, que es donde una captura nativa rinde de verdad.
+
+Saltarse pasos hacia abajo es la forma más común de perder un día entero: abrir un capturador antes de haber etiquetado nada es garantía de mirar una lista de doscientas texturas anónimas.
+
+<Callout type="dios" title="No hay depurador de shaders porque «paso a paso» no significa nada en una GPU">
+Merece la pena entender por qué este hueco no se va a cerrar, porque cambia lo que esperas del ecosistema. Un depurador paso a paso descansa sobre una premisa: existe **un** hilo de ejecución, con **un** contador de programa y **un** conjunto de variables locales, y detenerlo es una operación bien definida. Una GPU no tiene nada de eso. Tu fragment shader se ejecuta en decenas de miles de invocaciones simultáneas agrupadas en oleadas que avanzan en bloque, y cuando una condición diverge dentro de una oleada el hardware no bifurca: ejecuta las dos ramas para todo el grupo y descarta los resultados de las invocaciones que no correspondían. Preguntar «cuál es el valor de esta variable ahora» exige antes contestar «en cuál de las treinta y dos mil invocaciones», y «detén la ejecución aquí» exige parar un pipeline de hardware que no tiene ese concepto y que además está compartido con el compositor del sistema operativo. Lo que la industria hace en su lugar no es depurar, es **reejecutar**: capturar el estado completo de entrada de un draw, y luego simular en la CPU una única invocación elegida a mano reproduciendo la semántica del shader. Eso es caro de construir, se rompe con cada generación de hardware, y funciona solo sobre el código traducido, con lo que ni siquiera te devuelve tu WGSL sino el HLSL o el SPIR-V que produjo la traducción. La conclusión práctica no es derrotista sino liberadora: deja de buscar el breakpoint y monta desde el primer día la infraestructura de volcado. Un buffer de depuración con contador atómico, un modo de color en el fragment shader y la función de volcar textura de esta lección son, literalmente, el estado del arte. La gente que escribe motores lleva veinte años depurando así, y no porque no tenga acceso a herramientas mejores.
+</Callout>
+
+<Reto title="Monta tu propio utillaje">
+1. Abre `chrome://gpu` o `about:gpu` y anota qué adaptador y qué backend estás usando de verdad.
+2. Añade a tu proyecto la función de volcar textura y dibuja el resultado en un canvas 2D.
+3. Implementa cinco modos de depuración por color y cámbialos con las teclas del uno al cinco.
+4. Añade un buffer de depuración con contador atómico a un compute shader y cuenta cuántas invocaciones entran en la rama que sospechas.
+5. Provoca a propósito un `bytesPerRow` que no sea múltiplo de 256 y aprende a reconocer la imagen inclinada que produce.
+</Reto>

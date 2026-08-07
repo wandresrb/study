@@ -1,0 +1,134 @@
+---
+title: "La disposición exacta del buffer de argumentos indirectos"
+description: "Los cuatro u32 de drawIndirect y los cinco de drawIndexedIndirect con su desplazamiento en bytes, las reglas del buffer, y las dos formas de acabar con un dibujo silenciosamente vacío."
+subject: webgpu
+level: 29
+order: 2
+icon: "29.2"
+duracion: "18 min"
+---
+
+<Lead>
+Un dibujado indirecto es una llamada de dibujo cuyos argumentos no van en la llamada sino en memoria de vídeo. El cambio parece pequeño y tiene una consecuencia enorme: los argumentos dejan de pasar por la validación. WebGPU comprueba que el búfer tenga el uso correcto y el tamaño suficiente, y no puede comprobar lo que hay dentro, porque lo que hay dentro puede haberlo escrito la GPU un microsegundo antes. El precio de esa libertad es que un campo mal colocado no produce un error: produce nada, y averiguar cuál es requiere saberse la disposición de memoria al byte.
+</Lead>
+
+<Objetivos>
+
+- Escribir de memoria el orden y el tipo de cada campo de los dos formatos indirectos.
+- Aplicar las reglas de uso, tamaño y alineación del búfer de argumentos.
+- Declarar la estructura equivalente en WGSL para escribirla desde un compute shader.
+- Reconocer las dos causas de un dibujo indirecto silenciosamente vacío.
+
+</Objetivos>
+
+## Los dos formatos, al byte
+
+Los argumentos van como enteros de 32 bits empaquetados sin huecos, **en el mismo orden que los argumentos del método directo equivalente**. Esa es la regla mnemotécnica y es exacta.
+
+`drawIndirect(buffer, offset)` lee **cuatro** valores, 16 bytes en total:
+
+| Byte | Campo | Significado |
+|---|---|---|
+| 0 | `vertexCount` | vértices a emitir por instancia |
+| 4 | `instanceCount` | número de instancias |
+| 8 | `firstVertex` | primer vértice dentro del búfer de vértices |
+| 12 | `firstInstance` | desplazamiento del índice de instancia |
+
+`drawIndexedIndirect(buffer, offset)` lee **cinco** valores, 20 bytes en total:
+
+| Byte | Campo | Significado |
+|---|---|---|
+| 0 | `indexCount` | índices a leer por instancia |
+| 4 | `instanceCount` | número de instancias |
+| 8 | `firstIndex` | primer índice dentro del búfer de índices |
+| 12 | `baseVertex` | valor que se suma a cada índice leído |
+| 16 | `firstInstance` | desplazamiento del índice de instancia |
+
+La diferencia entre los dos es un campo insertado **en medio**, no al final. Ese detalle es el origen del error más frecuente de todo el dibujado indirecto: escribir un bloque de cuatro campos y llamar a `drawIndexedIndirect`, con lo que `firstInstance` acaba leyendo lo que hubiera después en el búfer y `baseVertex` recibe el valor que pretendías poner en `firstInstance`. No hay ningún síntoma útil: o no se dibuja nada, o se dibuja geometría de otro sitio.
+
+Sobre `baseVertex` conviene una precisión. El bloque indirecto se define como cinco valores de 32 bits sin signo, mientras que el argumento equivalente de la llamada directa es un desplazamiento **con signo**. En la práctica se escribe como `u32` desde WGSL y, si necesitas un desplazamiento negativo, se escribe su representación en complemento a dos. En un megabúfer bien organizado nunca hace falta: los tramos empiezan en cero y crecen.
+
+## Las reglas del búfer
+
+Tres, y las tres las comprueba la validación:
+
+**El uso.** El búfer necesita `GPUBufferUsage.INDIRECT`. Como normalmente lo escribe un compute shader, lleva además `STORAGE`, y casi siempre `COPY_DST` para poder inicializarlo desde la CPU.
+
+**El tamaño.** El desplazamiento más el tamaño del bloque tiene que caber dentro del búfer. Un búfer de 16 bytes no sirve para un dibujado indexado.
+
+**La alineación.** `indirectOffset` tiene que ser **múltiplo de 4**. Como los bloques miden 16 y 20 bytes, ambos múltiplos de 4, colocar bloques consecutivos nunca da problemas de alineación.
+
+```js
+const NUM_LOTES = 64;
+const BYTES_POR_LOTE = 20;            // version indexada
+
+const argumentos = device.createBuffer({
+  label: 'argumentos indirectos',
+  size: NUM_LOTES * BYTES_POR_LOTE,
+  usage: GPUBufferUsage.INDIRECT
+       | GPUBufferUsage.STORAGE
+       | GPUBufferUsage.COPY_DST
+       | GPUBufferUsage.COPY_SRC,   // para poder leerlos al depurar
+});
+
+// Inicializacion desde la CPU de un lote concreto.
+const bloque = new Uint32Array([36, 0, 0, 0, 0]); // 36 indices, 0 instancias
+device.queue.writeBuffer(argumentos, 7 * BYTES_POR_LOTE, bloque);
+
+// Y en el pass, un comando por lote, con el desplazamiento en BYTES.
+for (let i = 0; i < NUM_LOTES; i++) {
+  pass.drawIndexedIndirect(argumentos, i * BYTES_POR_LOTE);
+}
+```
+
+Ese `i * BYTES_POR_LOTE` merece un aviso: el desplazamiento va **en bytes**, no en número de bloques ni en número de enteros. Multiplicar por 5 en lugar de por 20 es un error que compila, valida y dibuja basura.
+
+## La estructura en WGSL
+
+Para escribir los argumentos desde un compute shader hay que declarar la misma disposición. Las reglas de alineación de WGSL para una estructura de cinco `u32` dan tamaño 20 y alineación 4, que coincide exactamente con lo que espera el hardware, así que un `array` de esa estructura en un storage buffer se corresponde bloque a bloque con lo que leerá `drawIndexedIndirect`:
+
+```wgsl
+struct ArgsIndexado {
+  indexCount    : u32,
+  instanceCount : u32,
+  firstIndex    : u32,
+  baseVertex    : u32,
+  firstInstance : u32,
+};
+
+struct ArgsNoIndexado {
+  vertexCount   : u32,
+  instanceCount : u32,
+  firstVertex   : u32,
+  firstInstance : u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> args : array<ArgsIndexado>;
+@group(0) @binding(1) var<storage, read>       lotes : array<DescripcionLote>;
+@group(0) @binding(2) var<storage, read>       visibles : array<atomic<u32>>;
+
+@compute @workgroup_size(64)
+fn preparar(@builtin(global_invocation_id) gid : vec3u) {
+  let i = gid.x;
+  if (i >= arrayLength(&args)) { return; }
+
+  let lote = lotes[i];
+  args[i].indexCount    = lote.numIndices;
+  args[i].instanceCount = atomicLoad(&visibles[i]);  // lo decide la GPU
+  args[i].firstIndex    = lote.primerIndice;
+  args[i].baseVertex    = lote.primerVertice;
+  args[i].firstInstance = 0u;
+}
+```
+
+Ojo con un detalle de las reglas de disposición: en un `uniform` la alineación del elemento de un array se redondea a 16 bytes y la estructura ocuparía 32, lo que **desalinearía** todos los bloques a partir del primero. Los argumentos indirectos van siempre en un `storage`, nunca en un `uniform`, y esta es una de las razones.
+
+<Callout type="dios" title="La validación no puede mirar dentro del buffer, y eso convierte el dibujado indirecto en la única parte de WebGPU donde vuelven los errores silenciosos de WebGL">
+La propiedad que hace agradable a WebGPU es que casi todos los errores se detectan en el momento de configurar y con un mensaje que dice qué está mal. El dibujado indirecto es la excepción estructural, y conviene entender por qué no es un descuido que vayan a arreglar: **los argumentos están en memoria de vídeo y pueden haber sido escritos por la GPU durante la ejecución de este mismo command buffer**. Validarlos exigiría leerlos desde la CPU, lo que implicaría una sincronización que destruiría exactamente la ventaja que la técnica persigue. La consecuencia es que hay una frontera nítida en tu código: a un lado, todo error produce un mensaje; al otro, los errores producen imágenes. Y dentro de esa zona hay **dos formas distintas de no dibujar nada, con causas opuestas**. La primera es `instanceCount` a cero, que es legítima y deliberada: la llamada se ejecuta, no emite ningún vértice y es la forma canónica de anular un lote sin quitarlo de la lista de comandos. La segunda es `firstInstance` distinto de cero **sin la feature `indirect-first-instance` activada**, y ahí la especificación no genera un error de validación: la llamada entera **se trata como una operación nula**. Léelo otra vez, porque es contraintuitivo: escribes un valor perfectamente razonable en un campo, no hay ningún aviso en la consola, y la llamada desaparece. Es la trampa más cruel de esta parte del API y la que más tiempo hace perder, porque el instinto lleva a sospechar de la geometría, de las matrices o del culling, jamás de un campo que has puesto a propósito. La regla defensiva es sencilla y cuesta cero: **deja `firstInstance` en cero siempre**, y si necesitas desplazar el rango de instancias, hazlo con una indirección en el shader —una lista de índices que traduzca `instance_index` al índice real— que es más portable, no requiere ninguna feature y además es exactamente lo que ya necesitas si vas a compactar visibles. La feature existe, se puede pedir, y no está en todos los adaptadores; construir sobre ella para ahorrar un acceso a memoria es un mal negocio.
+</Callout>
+
+## El bloque de dispatch, por simetría
+
+Existe el equivalente para cómputo, `dispatchWorkgroupsIndirect(buffer, offset)`, que lee **tres** `u32`, 12 bytes: `workgroupCountX`, `workgroupCountY` y `workgroupCountZ`, en ese orden. Las mismas reglas de uso y alineación.
+
+Su utilidad aparece en cuanto un compute produce una cantidad variable de trabajo que consume el siguiente: en lugar de leer el contador en la CPU para decidir cuántos grupos lanzar —lo que costaría una sincronización completa— se escribe el número de grupos en un búfer y se lanza indirectamente. Con eso, una cadena entera de pasadas de cómputo y dibujado puede depender de datos que la CPU no ha visto nunca, que es exactamente el tema de la lección siguiente.

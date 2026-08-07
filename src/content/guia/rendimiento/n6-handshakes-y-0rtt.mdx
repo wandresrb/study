@@ -1,0 +1,127 @@
+---
+title: "Los saludos, la reanudación y el riesgo del 0-RTT"
+description: "Cuántos viajes cuesta establecer una conexión segura en cada combinación de protocolos, cómo funciona la reanudación, y por qué el 0-RTT tiene un problema de seguridad que hay que gestionar."
+subject: rendimiento
+level: 6
+order: 4
+icon: "6.4"
+duracion: "17 min"
+---
+
+<Lead>
+El 0-RTT permite enviar datos de aplicación en el primer paquete de una conexión reanudada, es decir, sin esperar ningún viaje de ida y vuelta. Es la optimización más espectacular del establecimiento de conexión y trae consigo un riesgo de seguridad concreto que la especificación reconoce explícitamente y que hay que gestionar de forma activa. Usarlo sin entenderlo es la clase de decisión que produce un incidente.
+</Lead>
+
+<Objetivos>
+
+- Contar los viajes de establecimiento en cada combinación de transporte y versión de TLS.
+- Explicar cómo funciona la reanudación de sesión y qué guarda cada extremo.
+- Describir el ataque de repetición que habilita el 0-RTT y por qué es inevitable.
+- Aplicar las mitigaciones estándar en un servidor real.
+
+</Objetivos>
+
+## La tabla de viajes
+
+Todo el asunto se resume en cuántos viajes de ida y vuelta hay que pagar antes de poder enviar una petición HTTP.
+
+| Combinación | Conexión nueva | Conexión reanudada |
+|---|---|---|
+| TCP + TLS 1.2 | 3 RTT | 2 RTT |
+| TCP + TLS 1.3 | 2 RTT | 1 RTT, o 0 con 0-RTT |
+| QUIC | 1 RTT | 0 RTT |
+
+Los números excluyen el DNS, que se paga aparte y solo la primera vez por dominio.
+
+La progresión es notable: de tres viajes a cero. Con un RTT de 150 milisegundos, eso son 450 milisegundos que desaparecen del establecimiento de cada conexión.
+
+Merece la pena entender de dónde sale cada fila. Con TCP y TLS 1.2, el saludo TCP cuesta un viaje y el de TLS cuesta dos, porque el cliente y el servidor necesitan dos intercambios completos para acordar los parámetros y las claves. TLS 1.3 rediseñó ese saludo para que el cliente adivine los parámetros y envíe su parte del intercambio de claves en el primer mensaje, con lo cual basta un viaje. Y QUIC fusiona el establecimiento del transporte con el criptográfico, así que ese único viaje sirve para las dos cosas.
+
+### La reanudación de sesión
+
+Cuando un cliente ya se ha conectado antes a un servidor, ambos pueden reutilizar el material criptográfico acordado en lugar de negociarlo de nuevo.
+
+El mecanismo en TLS 1.3 funciona así: tras un saludo completo, el servidor envía al cliente uno o varios **tickets de sesión**. Cada ticket es un identificador, acompañado de material que permite derivar una clave precompartida. El cliente lo guarda. En una conexión posterior, el cliente presenta el ticket y ambos derivan las claves sin repetir el intercambio completo.
+
+El servidor puede implementar esto de dos formas. Puede guardar el estado de sesión en memoria e indexarlo por identificador, lo cual exige compartir ese estado entre todas las instancias que atienden el mismo dominio. O puede cifrar todo el estado dentro del propio ticket con una clave que solo él conoce, de forma que no necesita guardar nada; a cambio, la rotación de esa clave hay que gestionarla con cuidado, porque afecta a la confidencialidad hacia atrás.
+
+La reanudación por sí sola baja a un viaje con TLS 1.3 sobre TCP, y a cero con QUIC. Lo que añade el 0-RTT es poder enviar **datos de aplicación** ya en ese primer mensaje.
+
+## El ataque de repetición
+
+Y aquí está el problema, que es estructural y no se puede eliminar del todo.
+
+Los datos que el cliente envía en 0-RTT van cifrados con una clave derivada del material de la sesión anterior. **No hay ningún intercambio previo en esa conexión**, así que no existe ninguna prueba de frescura: nada en ese primer mensaje demuestra que se está enviando ahora y no que sea una copia de algo enviado antes.
+
+En consecuencia, un atacante que capture ese primer paquete puede **reenviarlo tal cual**, cuantas veces quiera. No puede descifrarlo ni modificarlo, pero puede conseguir que el servidor procese la misma petición repetidamente.
+
+Si la petición era una consulta de un artículo, no pasa nada. Si era una transferencia de dinero, un borrado o cualquier operación con efectos, el ataque es grave.
+
+Por eso la regla es tajante: **en 0-RTT solo pueden viajar peticiones idempotentes y sin efectos secundarios**. Un `GET` a un recurso público es aceptable. Un `POST` no lo es.
+
+Hay una segunda sutileza menos conocida y que conviene tener presente: repetir peticiones inocuas también puede tener consecuencias. Una repetición masiva sirve para amplificar carga contra el servidor, y las diferencias de tiempo entre las respuestas a peticiones repetidas pueden filtrar información en escenarios de ataque sofisticados. La recomendación de limitar 0-RTT a lo verdaderamente inocuo no es paranoia.
+
+<Callout type="danger" title="El navegador decide, pero el servidor tiene la última palabra">
+Los navegadores solo envían en 0-RTT peticiones que consideran seguras, y en general se limitan a métodos sin efectos. Pero un servidor no puede confiar en que el cliente se porte bien: un atacante controla lo que envía. La defensa tiene que estar en el servidor, no en la cortesía del cliente.
+</Callout>
+
+## Las mitigaciones estándar
+
+Existe un mecanismo estándar para gestionar esto en HTTP, y tiene dos piezas.
+
+**La cabecera de petición que marca los datos tempranos.** Un intermediario que reenvía una petición recibida en 0-RTT a un servidor de origen la marca:
+
+```http
+GET /articulo/123 HTTP/1.1
+Host: ejemplo.com
+Early-Data: 1
+```
+
+Esa cabecera dice al servidor de origen: esta petición llegó en datos tempranos y por tanto puede ser una repetición.
+
+**El código de estado que pide reintentar.** Si el servidor no quiere procesar una petición en esas condiciones, responde:
+
+```http
+HTTP/1.1 425 Too Early
+```
+
+El cliente entiende que debe reintentar la misma petición **después** de que el saludo se haya completado, es decir, sin 0-RTT. El coste es un viaje de ida y vuelta adicional, solo en ese caso concreto.
+
+En un servidor real, la configuración típica es habilitar el 0-RTT y rechazarlo selectivamente en las rutas que tienen efectos:
+
+```nginx
+# nginx: habilitar 0-RTT y marcar la peticion hacia el backend.
+ssl_early_data on;
+proxy_set_header Early-Data $ssl_early_data;
+```
+
+Y en el backend, la comprobación:
+
+```js
+// Express: rechazar datos tempranos en rutas con efectos.
+app.use((req, res, next) => {
+  const esTemprana = req.get('Early-Data') === '1';
+  const esSegura = req.method === 'GET' || req.method === 'HEAD';
+
+  if (esTemprana && !esSegura) {
+    return res.status(425).end();       // el cliente reintentara sin 0-RTT
+  }
+  next();
+});
+```
+
+Una advertencia importante sobre esta configuración: activar `ssl_early_data` sin propagar la cabecera al backend es un error de seguridad, porque el backend procesa peticiones potencialmente repetidas sin saberlo. Si activas lo primero, activa siempre lo segundo.
+
+## Cuándo compensa el 0-RTT
+
+Un balance para decidir con criterio.
+
+**Compensa** en sitios de contenido con mucho tráfico de usuarios recurrentes y navegación por `GET`: portales de noticias, documentación, comercio en su fase de navegación. Ahí ahorras un viaje de ida y vuelta en cada conexión reanudada, que en móvil son 100 a 200 milisegundos, y el riesgo es bajo porque las peticiones son inocuas.
+
+**No compensa** en aplicaciones donde casi todas las peticiones son autenticadas y con efectos. La ganancia se aplica a pocas peticiones y la superficie de riesgo es la misma.
+
+**Es discutible** cuando hay un intermediario que no controlas entre el cliente y tu backend. Si no puedes garantizar que la cabecera de datos tempranos se propague correctamente, el mecanismo de defensa no funciona y estás confiando en el buen comportamiento del cliente.
+
+<Callout type="dios" title="El 0-RTT es el único caso del rendimiento web donde una optimización correcta puede convertirse en un fallo de seguridad, y por eso se aplica al revés que todo lo demás">
+Con cualquier otra técnica de este track, la peor consecuencia de equivocarse es que el sitio vaya más lento. Con el 0-RTT, la peor consecuencia es que una operación con efectos se ejecute varias veces por acción de un atacante. Eso cambia por completo la forma de decidir: no es una optimización que se activa y se mide, es un cambio de superficie de ataque que se revisa. La regla que aplico es no habilitarlo nunca de forma global sin que alguien haya respondido por escrito a tres preguntas: qué rutas pueden recibir datos tempranos, si la cabecera que los marca llega al código que decide, y qué pasa si el mismo mensaje se procesa cien veces seguidas. Si las tres respuestas están claras, adelante; si alguna no lo está, la ganancia de cien milisegundos no vale el riesgo, porque el fallo no aparecerá en ninguna prueba y solo se manifestará cuando alguien lo busque a propósito. Y hay un matiz operativo que se olvida: si tu CDN ofrece 0-RTT como una casilla de configuración, esa casilla activa exactamente esto, con las mismas implicaciones, aunque el panel no lo diga.
+</Callout>

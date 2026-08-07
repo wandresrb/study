@@ -1,0 +1,113 @@
+---
+title: ".gltf frente a .glb: el contenedor binario por dentro"
+description: "El layout exacto de un fichero GLB con su cabecera y sus chunks, por qué base64 dentro de un .gltf es la peor opción posible, y cuándo conviene cada variante."
+subject: three
+level: 25
+order: 4
+icon: "25.4"
+duracion: "15 min"
+---
+
+<Lead>
+El mismo contenido admite tres empaquetados: un JSON con ficheros externos, un JSON autocontenido con los binarios en base64, y un contenedor binario con el JSON dentro. Los tres cargan igual en Three.js y las diferencias parecen cosméticas, pero una de las tres opciones infla el fichero un 33 % y añade una decodificación innecesaria en el hilo principal, y es precisamente la que eligen por defecto la mitad de los exportadores.
+</Lead>
+
+<Objetivos>
+
+- Describir el layout binario de un `.glb` con sus dos chunks y sus cabeceras.
+- Calcular la sobrecarga real de base64 y explicar por qué es la peor opción.
+- Elegir entre `.gltf` separado y `.glb` según el patrón de caché y de reutilización.
+- Convertir entre las tres variantes desde la línea de comandos.
+
+</Objetivos>
+
+## Las tres variantes
+
+**`.gltf` con recursos externos.** Un JSON legible más un `.bin` con la geometría más un fichero por textura. El `uri` de cada buffer e imagen apunta a un fichero vecino.
+
+**`.gltf` autocontenido.** El mismo JSON, pero cada `uri` es un data URI: `data:application/octet-stream;base64,AAAAgD8...`. Un solo fichero, todo dentro.
+
+**`.glb`.** Un contenedor binario que lleva el JSON y los binarios en chunks contiguos.
+
+## El layout de un GLB, byte a byte
+
+Es un formato muy simple y merece la pena verlo porque explica sus propiedades.
+
+```text
+Cabecera, 12 bytes:
+  [0..3]   magic     uint32  0x46546C67, que es "glTF" en ASCII little-endian
+  [4..7]   version   uint32  2
+  [8..11]  length    uint32  longitud total del fichero en bytes
+
+Chunk 0, obligatorio, JSON:
+  [12..15] chunkLength  uint32
+  [16..19] chunkType    uint32  0x4E4F534A, que es "JSON"
+  [20..]   chunkData    el JSON en UTF-8, rellenado con espacios 0x20
+                        hasta multiplo de 4
+
+Chunk 1, opcional, BIN:
+  chunkLength  uint32
+  chunkType    uint32  0x004E4942, que es "BIN\0"
+  chunkData    los bytes, rellenados con ceros hasta multiplo de 4
+```
+
+Tres detalles del diseño que importan:
+
+**El JSON va primero.** Un cargador puede leer los primeros kilobytes, parsear la estructura completa y saber qué contiene el fichero antes de haber descargado la geometría. Eso permite, por ejemplo, decidir si merece la pena seguir descargando, o empezar a preparar materiales mientras llegan los buffers.
+
+**El relleno a múltiplos de cuatro.** El JSON se rellena con espacios y el binario con ceros para que el chunk BIN empiece siempre en una dirección alineada a 4 bytes. Eso permite crear vistas tipadas directamente sobre el `ArrayBuffer` recibido, **sin copiar**. Un `Float32Array` sobre un offset no múltiplo de 4 lanza una excepción en JavaScript; el relleno lo garantiza.
+
+**Los buffers sin `uri` apuntan al chunk BIN.** Dentro del JSON de un GLB, el buffer 0 no tiene `uri`: eso significa «soy el chunk binario de este contenedor».
+
+## Por qué base64 es la peor opción
+
+La codificación base64 representa cada 3 bytes con 4 caracteres ASCII. La sobrecarga es exactamente **un 33.3 %**, más el prefijo del data URI.
+
+Y la penalización no acaba en el tamaño:
+
+**Se decodifica en el hilo principal.** El navegador tiene que convertir la cadena a `ArrayBuffer` con `atob` o equivalente, y esa operación es síncrona y bloqueante. Para 20 MB de geometría en base64, eso son cientos de milisegundos de congelación.
+
+**Duplica la memoria durante la carga.** El JSON entero, con sus datos base64 dentro, vive como cadena en memoria mientras se decodifica. Una cadena JavaScript de 27 MB más los 20 MB decodificados son 47 MB de pico.
+
+**Se comprime mal.** Es tentador pensar que gzip recupera el 33 %, y lo recupera solo en parte: base64 destruye la estructura de bytes que los compresores explotan. Un `.bin` con floats se comprime mejor que su versión en base64, incluso comparando resultados finales.
+
+La comparación completa, para un modelo cuyo contenido binario son 10 MB:
+
+| Variante | Tamaño en disco | Peticiones | Decodificación extra | Caché parcial |
+|---|---|---|---|---|
+| `.gltf` + `.bin` + texturas | 10.0 MB | 1 + 1 + N | ninguna | **sí** |
+| `.gltf` con base64 | 13.4 MB | 1 | ~200 ms bloqueantes | no |
+| `.glb` | 10.0 MB | 1 | ninguna | no |
+
+La conclusión es que base64 no gana nunca: `.glb` le iguala en número de peticiones y le gana en todo lo demás. Su única justificación es el caso muy concreto de incrustar un modelo diminuto dentro de otro fichero de texto.
+
+## gltf separado frente a glb
+
+Entre las dos opciones sensatas, la decisión depende del patrón de reutilización.
+
+**`.glb` gana cuando** el modelo es una unidad que se carga entera, cuando las texturas son suyas y no se comparten, y cuando quieres una sola petición y un solo artefacto que versionar. Es el caso mayoritario y por eso es el formato por defecto de casi todo.
+
+**`.gltf` separado gana cuando** varios modelos comparten texturas, porque el navegador las cachea una vez y las reutiliza; cuando quieres poder sustituir una textura sin volver a subir la geometría; cuando necesitas cargar progresivamente y mostrar la malla antes que las texturas; o cuando estás depurando y quieres poder abrir el JSON y editarlo.
+
+Ese último punto tiene más peso del que parece en producción. Con `.gltf` separado y HTTP/2, N peticiones pequeñas no son caras, y una textura de 2 MB compartida entre diez modelos se descarga una vez en lugar de diez. En un configurador de producto con muchas variantes, esa diferencia domina.
+
+### Convertir entre variantes
+
+Con `gltf-transform`, que se instala con `npm install --global @gltf-transform/cli`:
+
+```bash
+# De .gltf separado a .glb
+gltf-transform copy modelo.gltf modelo.glb
+
+# De .glb a .gltf separado, con las texturas extraidas a ficheros
+gltf-transform copy modelo.glb salida/modelo.gltf
+
+# Ver que hay dentro, sin abrir nada
+gltf-transform inspect modelo.glb
+```
+
+`inspect` imprime una tabla con las mallas, sus primitivas, sus vértices, los materiales, las texturas con su resolución y formato, las animaciones y las extensiones usadas. Es el primer comando que hay que ejecutar sobre cualquier modelo que te llegue, antes de decidir nada.
+
+<Callout type="dios" title="Un GLB no se puede cachear parcialmente, y eso decide la arquitectura de un configurador">
+La ventaja de «un solo fichero» del GLB tiene un reverso que solo aparece cuando el proyecto crece, y para entonces cambiar de formato cuesta caro. Un GLB es **una única entidad de caché HTTP**: si cambias un byte de una textura, cambia el hash, cambia el ETag, y el navegador vuelve a descargar los diez megabytes enteros. En un modelo estático eso da igual. En un configurador de producto con cuarenta variantes de acabado que comparten la misma geometría, es la diferencia entre descargar la geometría una vez y descargarla cuarenta. El patrón que resuelve esto es partir el contenido por **frecuencia de cambio**, exactamente igual que se hace con los bundles de JavaScript: la geometría, que nunca cambia, en un `.bin` con caché inmutable de un año; las texturas, que cambian por variante, en ficheros propios; y un `.gltf` diminuto de unos kilobytes que los referencia y que es lo único que se revalida. Cambiar de acabado descarga entonces dos megabytes de textura en lugar de doce de modelo completo, y la segunda variante que el usuario mire ya tiene la geometría en caché. Existe además una forma de llevar esto más lejos que casi nadie usa: como el `uri` de un buffer es simplemente una URL, **puede apuntar a otro dominio o a un CDN distinto**, lo que permite servir la geometría desde almacenamiento inmutable y las texturas desde un servicio de imágenes que las redimensione según el dispositivo. La regla general es la misma que en cualquier arquitectura de entrega: **empaqueta junto lo que cambia junto**. El GLB agrupa por «pertenece al mismo modelo», que es una agrupación semántica y casi nunca coincide con la de caché.
+</Callout>

@@ -25,6 +25,14 @@ const fileTitleTransformer = {
 // https://astro.build/config
 export default defineConfig({
   site: 'https://wandres.dev',
+  // `cacheDir` se deja en su valor por defecto (node_modules/.astro) a propósito:
+  // es la ruta exacta que Cloudflare Workers Builds cachea para Astro, y esas
+  // rutas no son configurables. Cambiarlo rompería el caché en CI.
+  experimental: {
+    // Reusa el HTML de páginas cuyo `cacheKey` y grafo de módulos no cambiaron.
+    // Requiere devolver `cacheKey` desde getStaticPaths (ver guia/[...slug].astro).
+    incrementalBuild: true,
+  },
   markdown: {
     // Resaltado con Shiki NATIVO (first-party, compatible con Astro 7 / Vite 8)
     shikiConfig: {

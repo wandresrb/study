@@ -1,0 +1,131 @@
+---
+title: "mappedAtCreation: llenar un búfer sin copias intermedias"
+description: "El patrón de escritura inicial que evita una copia, por qué funciona sin declarar MAP_WRITE, las reglas de tamaño y el error de olvidar unmap."
+subject: webgpu
+level: 5
+order: 3
+icon: "5.3"
+duracion: "15 min"
+---
+
+<Lead>
+Cuando un búfer nace con datos que ya conoces —la geometría de una malla, una tabla precalculada, los índices de un modelo— hay dos formas de llenarlo, y una de ellas hace una copia que la otra no. `mappedAtCreation` es la forma sin copia, es síncrona, y tiene una particularidad que despista: funciona sin declarar `MAP_WRITE`.
+</Lead>
+
+<Objetivos>
+
+- Escribir el patrón completo de creación con datos iniciales.
+- Explicar por qué `mappedAtCreation` no requiere el flag `MAP_WRITE`.
+- Aplicar las reglas de tamaño y de rango que impone la especificación.
+- Decidir entre `mappedAtCreation` y `writeBuffer` según el caso.
+
+</Objetivos>
+
+## El patrón
+
+Cuatro líneas, y el orden es obligatorio:
+
+```js
+const vertices = new Float32Array([
+   0.0,  0.5,   1, 0, 0,
+  -0.5, -0.5,   0, 1, 0,
+   0.5, -0.5,   0, 0, 1,
+]);
+
+const buffer = device.createBuffer({
+  label: 'vertices del triangulo',
+  size: vertices.byteLength,
+  usage: GPUBufferUsage.VERTEX,
+  mappedAtCreation: true,
+});
+
+new Float32Array(buffer.getMappedRange()).set(vertices);
+buffer.unmap();
+```
+
+Lo que ocurre en cada paso.
+
+`createBuffer` con `mappedAtCreation: true` reserva el búfer y lo devuelve **ya mapeado**, es decir, con su contenido accesible desde JavaScript. Es la única operación de mapeo síncrona de toda la API: no hay promesa que esperar.
+
+`getMappedRange()` devuelve un `ArrayBuffer` que representa el contenido del búfer. Sin argumentos abarca el búfer entero. Ese `ArrayBuffer` no es una copia: escribir en él escribe en la memoria que la implementación va a entregar a la GPU.
+
+`new Float32Array(...).set(...)` copia los datos. Fíjate en que el `ArrayBuffer` hay que envolverlo en una vista tipada del tipo que corresponda; `getMappedRange` no sabe qué hay dentro.
+
+`unmap()` cierra el mapeo y entrega el búfer a la GPU. **A partir de esa llamada, el `ArrayBuffer` anterior queda desanclado**: su `byteLength` pasa a cero y cualquier escritura sobre él no va a ninguna parte. Es el mismo mecanismo que cuando se transfiere un `ArrayBuffer` a un worker.
+
+Si olvidas `unmap()`, el búfer sigue mapeado y **cualquier uso desde la GPU es un error de validación**. El síntoma es un pase que falla al dibujar con un mensaje sobre un búfer en estado inválido, y la causa está diez líneas más arriba.
+
+## Por qué no hace falta MAP_WRITE
+
+Es la parte que rompe la intuición: estás escribiendo en un búfer mapeado sin haber declarado `MAP_WRITE`. Y el ejemplo de arriba solo declara `VERTEX`.
+
+La especificación lo permite explícitamente, y la razón es que **el mapeo de creación es un caso especial que ocurre antes de que el búfer exista para la GPU**. En ese instante la implementación tiene libertad total: puede reservar memoria temporal accesible desde la CPU, dejar que la llenes, y al llamar a `unmap()` copiarla a su ubicación definitiva en memoria de vídeo. O, si el búfer va a vivir en memoria visible de todas formas, puede darte acceso directo. En cualquier caso el búfer nunca ha estado en uso, así que no hay ninguna restricción de coherencia que respetar.
+
+`MAP_WRITE`, en cambio, permite mapear un búfer **durante su vida**, en cualquier momento, repetidamente. Eso sí obliga a que el búfer resida permanentemente en memoria visible desde la CPU, con las consecuencias de rendimiento que impone la regla de exclusión de usos.
+
+La consecuencia práctica es agradable: **`mappedAtCreation` se puede usar con cualquier combinación de usos**, incluidas las que serían ilegales con `MAP_WRITE`. Un búfer `VERTEX | STORAGE` puede nacer relleno.
+
+## Las reglas
+
+Tres, y las tres producen errores distintos.
+
+**El tamaño tiene que ser múltiplo de 4.** Con `mappedAtCreation: true`, un `size` que no lo sea lanza un `RangeError`. Es de los pocos sitios donde WebGPU sí lanza una excepción, así que al menos el fallo es ruidoso.
+
+```js
+const size = Math.ceil(datos.byteLength / 4) * 4;
+```
+
+**`getMappedRange(offset, size)` tiene sus propias alineaciones.** El desplazamiento tiene que ser múltiplo de 8 y el tamaño múltiplo de 4. Sin argumentos no hay problema; con argumentos hay que respetarlas.
+
+**No se pueden solapar dos rangos activos.** Si pides varios rangos del mismo búfer para escribir secciones distintas, no pueden intersecarse. Es útil para llenar un búfer compuesto en varias pasadas:
+
+```js
+const buffer = device.createBuffer({
+  size: 1024,
+  usage: GPUBufferUsage.VERTEX,
+  mappedAtCreation: true,
+});
+
+new Float32Array(buffer.getMappedRange(0, 512)).set(posiciones);
+new Float32Array(buffer.getMappedRange(512, 512)).set(normales);
+buffer.unmap();
+```
+
+## Cuándo usar cada cosa
+
+La comparación con `queue.writeBuffer` se resuelve con dos preguntas.
+
+**`mappedAtCreation` gana cuando el búfer nace con sus datos y no cambian.** Geometría estática, tablas precalculadas, índices, cualquier cosa que se carga y se queda. Evita una copia intermedia porque escribes directamente en la memoria de destino, o al menos en la memoria desde la que la implementación hará su única copia.
+
+**`writeBuffer` gana para todo lo demás.** Datos que cambian cada fotograma, actualizaciones parciales, cualquier escritura después de la creación. `mappedAtCreation` solo existe en el instante de la creación y no se puede repetir.
+
+Hay un tercer caso que conviene mencionar: **datos que llegan tarde**. Si la geometría viene de una descarga, el búfer no puede nacer relleno porque los datos no existen todavía. Ahí caben dos estrategias: esperar a que llegue y entonces crear el búfer con `mappedAtCreation`, o crearlo antes con `COPY_DST` y llenarlo con `writeBuffer` cuando llegue. La primera es marginalmente más eficiente; la segunda permite que los pipelines y bind groups se construyan antes.
+
+<Callout type="tip" title="Cargar una malla directamente al búfer">
+Cuando descargas un binario de geometría, el camino con menos copias es leerlo como `ArrayBuffer`, crear el búfer con `mappedAtCreation` y copiar de un `Uint8Array` a otro:
+
+```js
+const datos = await (await fetch('/malla.bin')).arrayBuffer();
+const buffer = device.createBuffer({
+  size: Math.ceil(datos.byteLength / 4) * 4,
+  usage: GPUBufferUsage.VERTEX,
+  mappedAtCreation: true,
+});
+new Uint8Array(buffer.getMappedRange()).set(new Uint8Array(datos));
+buffer.unmap();
+```
+
+Trabajar a nivel de bytes evita tener que saber el tipo de los datos y evita problemas de alineación de las vistas tipadas.
+</Callout>
+
+<Callout type="dios" title="El ArrayBuffer que devuelve getMappedRange no es memoria normal, y tratarlo como tal produce fallos que no se parecen a su causa">
+Hay dos propiedades del `ArrayBuffer` mapeado que rompen las suposiciones que uno trae de JavaScript, y las dos generan bugs difíciles.
+
+**La primera: se desancla al llamar a `unmap()`.** No se vacía, no se copia: deja de existir como almacenamiento. Su `byteLength` pasa a cero y cualquier vista tipada creada sobre él se queda vacía. El bug que produce es especialmente desagradable porque no lanza nada: guardas la vista en una variable, la usas después de `unmap()`, escribes en un array de longitud cero, y no ocurre absolutamente nada. Los datos no llegan y no hay error. La regla es no guardar nunca la referencia al rango mapeado: se usa entre `getMappedRange()` y `unmap()`, y ahí muere.
+
+**La segunda: escribir en él no es escribir en la GPU todavía.** Los bytes que pones ahí llegan a la memoria de vídeo cuando `unmap()` se ejecuta, no antes. Da igual en la práctica porque no puedes usar el búfer hasta desmapearlo, pero explica por qué `unmap()` puede tardar un poco en búferes grandes: puede haber una copia real detrás.
+
+Y una consecuencia menos obvia: **`mappedAtCreation` con búferes muy grandes puede provocar un parón perceptible**. Reservar 200 MB de memoria mapeable y copiar 200 MB en ella son operaciones síncronas que bloquean el hilo. Si estás cargando un modelo grande, trocearlo en varios búferes creados en fotogramas sucesivos, o hacerlo en un worker, es la diferencia entre una carga fluida y una página congelada durante medio segundo.
+</Callout>
+
+Para todo lo que cambia después de la creación, el camino es otro: [`queue.writeBuffer`](/guia/webgpu/n5-writebuffer/).

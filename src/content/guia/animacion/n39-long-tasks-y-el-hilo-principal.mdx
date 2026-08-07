@@ -1,0 +1,160 @@
+---
+title: "Long tasks: qué bloquean y cómo trocear el trabajo"
+description: "Por qué el umbral son cincuenta milisegundos, qué animaciones sobreviven a un hilo principal bloqueado y cuáles no, las herramientas para ceder el hilo por orden de calidad, y un banco de pruebas para verificarlo."
+subject: animacion
+level: 39
+order: 4
+icon: "39.4"
+duracion: "20 min"
+---
+
+<Lead>
+Una animación puede estar escrita perfectamente y aun así tartamudear, porque el problema no está en ella sino en la tarea de ciento veinte milisegundos que se ejecuta a su lado. El hilo principal es un recurso único y sin desalojo: mientras una función se ejecuta, nada más ocurre. Ni los eventos, ni los callbacks de fotograma, ni la confirmación del fotograma al compositor. Saber exactamente qué se bloquea y qué no es lo que te permite decidir dónde invertir.
+</Lead>
+
+<Objetivos>
+
+- Justificar el umbral de cincuenta milisegundos y qué se degrada al superarlo.
+- Distinguir las animaciones que sobreviven a un hilo principal bloqueado de las que no.
+- Trocear una tarea larga con las cuatro herramientas disponibles, en orden de calidad.
+- Construir un banco de pruebas que verifique tus animaciones bajo bloqueo.
+
+</Objetivos>
+
+## Por qué cincuenta milisegundos
+
+El umbral no es arbitrario. Viene del presupuesto de respuesta: para que una interfaz se perciba como reactiva, la respuesta a una acción del usuario tiene que llegar dentro de unos cien milisegundos. Si el navegador está ejecutando una tarea cuando llega el evento, no puede atenderlo hasta que termine. Con un límite de cincuenta milisegundos por tarea, el peor caso deja otros cincuenta para procesar el evento y presentar el resultado dentro del presupuesto.
+
+Una tarea que supera ese umbral se llama **tarea larga**, y mientras dura bloquea:
+
+- El procesamiento de eventos de puntero, teclado y táctiles.
+- Los callbacks de `requestAnimationFrame`, y por tanto cualquier animación dirigida por JavaScript.
+- El recálculo de estilo, el layout y el pintado, que ocurren en el mismo hilo.
+- La confirmación del fotograma al compositor.
+
+Y **no** bloquea:
+
+- Las animaciones que ya están corriendo en el hilo del compositor.
+- El desplazamiento de la página, que en los navegadores modernos vive en otro hilo salvo que un manejador no pasivo lo obligue a esperar.
+- La decodificación de vídeo.
+- Los workers.
+
+Esa distinción es la más útil de todo el nivel de rendimiento, y tiene un corolario que sorprende: **una animación de compositor sigue moviéndose durante un bloqueo, pero no puede empezar durante uno.** Poner en marcha una animación requiere ejecutar código en el hilo principal para crearla y comunicársela al compositor. Por eso un panel que debía abrirse al pulsar un botón se queda quieto doscientos milisegundos y luego se abre perfectamente fluido: la animación está bien, el arranque llegó tarde.
+
+## Medir y atribuir
+
+Dos APIs, y la segunda ha dejado a la primera casi obsoleta.
+
+**`longtask`** reporta cualquier tarea de más de cincuenta milisegundos, pero su atribución es pobre: te dice el contenedor, no la función.
+
+```js
+new PerformanceObserver((lista) => {
+  for (const e of lista.getEntries()) {
+    console.warn(`tarea larga de ${e.duration.toFixed(0)} ms`);
+  }
+}).observe({ type: "longtask", buffered: true });
+```
+
+**`long-animation-frame`** reporta el fotograma completo, no la tarea, e incluye el desglose y la atribución al script. Es lo que hay que usar cuando está disponible.
+
+```js
+try {
+  new PerformanceObserver((lista) => {
+    for (const e of lista.getEntries()) {
+      const culpables = e.scripts
+        .sort((a, b) => b.duration - a.duration)
+        .slice(0, 3)
+        .map((s) => `${s.invoker ?? s.name} ${s.duration.toFixed(0)}ms ${s.sourceURL ?? ""}`);
+      console.warn(
+        `frame ${e.duration.toFixed(0)}ms  bloqueo ${e.blockingDuration.toFixed(0)}ms\n` +
+        culpables.join("\n")
+      );
+    }
+  }).observe({ type: "long-animation-frame", buffered: true });
+} catch {
+  // Motores que aun no la implementan.
+}
+```
+
+`blockingDuration` es el campo que más importa: es cuánto tiempo del fotograma estuvo el hilo realmente inutilizable para responder a una entrada. Es el número que mueve INP y el que correlaciona con la sensación de que la página no responde.
+
+## Trocear el trabajo
+
+Cuatro herramientas, de peor a mejor.
+
+**`setTimeout` con cero.** Cede el hilo devolviendo el control al bucle de eventos. Funciona en todas partes y tiene dos defectos: la continuación se encola con prioridad baja, detrás de cualquier tarea que llegue mientras tanto, y el navegador impone un retardo mínimo tras varios anidamientos. Es el suelo, no el objetivo.
+
+**`requestIdleCallback`.** Ejecuta cuando el navegador está ocioso, con un plazo. Excelente para trabajo que puede esperar indefinidamente —precalcular, prefetch, telemetría— y mala idea para nada que el usuario esté esperando, porque en una página ocupada puede no ejecutarse nunca.
+
+**`scheduler.postTask`.** Permite encolar con prioridad explícita: `user-blocking`, `user-visible` o `background`, y admite cancelación con un `AbortSignal`. Es la herramienta correcta cuando tienes varias piezas de trabajo con importancias distintas.
+
+```js
+if (globalThis.scheduler?.postTask) {
+  scheduler.postTask(() => construirIndiceDeBusqueda(), { priority: "background" });
+  scheduler.postTask(() => pintarPrimerLote(), { priority: "user-blocking" });
+}
+```
+
+**`scheduler.yield`.** La mejor, y la que resuelve el defecto de `setTimeout`: cede el hilo para que el navegador atienda lo pendiente y **vuelve con prioridad alta**, delante de las tareas que se encolaron mientras tanto. Eso significa que trocear con `yield` no hace que tu operación tarde mucho más en terminar, que era el precio del troceado clásico.
+
+```js
+// Patron con retroceso para motores que aun no lo tienen.
+function cederElHilo() {
+  if (globalThis.scheduler?.yield) return scheduler.yield();
+  return new Promise((resolver) => setTimeout(resolver, 0));
+}
+
+async function procesar(elementos) {
+  let ultimoCorte = performance.now();
+  for (const elemento of elementos) {
+    trabajoCaro(elemento);
+    // Cede cada vez que llevas 40 ms seguidos, no cada N elementos:
+    // el numero de elementos no predice el tiempo.
+    if (performance.now() - ultimoCorte > 40) {
+      await cederElHilo();
+      ultimoCorte = performance.now();
+    }
+  }
+}
+```
+
+Fíjate en el criterio de corte: **por tiempo transcurrido, no por número de elementos**. Cortar cada cien elementos funciona en tu portátil y produce tareas de trescientos milisegundos en un móvil, porque el coste por elemento no es el mismo. Cortar por reloj se adapta solo al dispositivo.
+
+Y la quinta opción, que no es trocear sino mover: **un worker**. Si el trabajo es cómputo puro sin DOM —parsear, ordenar, transformar datos, calcular geometría— sacarlo del hilo principal lo elimina del problema en lugar de repartirlo. El coste es la serialización de los datos al enviarlos y recibirlos, que con `ArrayBuffer` transferibles es prácticamente cero y con objetos grandes puede ser significativo.
+
+<Callout type="tip" title="El caso especial de las listas largas">
+Renderizar mil filas es la tarea larga más común. Antes de trocear el renderizado, prueba `content-visibility: auto` con `contain-intrinsic-size`: le dice al navegador que se salte el layout y el pintado de lo que está fuera de la pantalla, y suele resolver el problema con dos líneas de CSS en lugar de con un virtualizador.
+</Callout>
+
+## Comprobarlo
+
+La forma de saber si una animación sobrevive a un bloqueo es bloquear el hilo a propósito y mirar. Este banco de pruebas cabe en la consola:
+
+```js
+function bloquear(ms = 1500) {
+  const fin = performance.now() + ms;
+  // Bucle ocupado: no hay forma de ceder, el hilo esta secuestrado.
+  while (performance.now() < fin) {
+    Math.sqrt(Math.random());
+  }
+  console.log(`hilo principal bloqueado ${ms} ms`);
+}
+
+// Lanza la animacion, espera a que este en marcha, y bloquea.
+document.querySelector("#abrir").click();
+setTimeout(() => bloquear(1500), 200);
+```
+
+Lo que verás:
+
+- Una transición de `transform` u `opacity` declarada en CSS: **sigue fluida**. La está ejecutando el compositor.
+- Una animación de WAAPI de `transform` u `opacity` sobre un elemento sin `filter` ni contenido que cambie: **sigue fluida**, por lo mismo.
+- Una animación de `width`, `height`, `top` o `box-shadow`: **se congela**. Cada fotograma necesita layout y pintado en el hilo bloqueado.
+- Cualquier cosa dirigida por `requestAnimationFrame`, incluida buena parte de lo que hace una librería con bucle propio: **se congela**.
+- Un vídeo: **sigue**. Lo decodifica otro proceso.
+
+Ese experimento de treinta segundos es el mejor argumento que existe para justificar por qué merece la pena limitarse a `transform` y `opacity`. No es una preferencia estilística: es la diferencia entre una interfaz que aguanta un pico de trabajo y una que se rompe con él.
+
+<Callout type="dios" title="Trocear no hace el trabajo más rápido: cambia quién espera, y esa es la decisión de diseño">
+Hay un malentendido persistente sobre por qué se trocean las tareas largas, y arreglarlo cambia cómo se toman las decisiones. Trocear **no reduce el trabajo total**; de hecho lo aumenta un poco, porque cada cesión tiene su coste de planificación y porque la localidad de caché empeora. Lo que hace es convertir un bloqueo largo en muchos huecos cortos, y en esos huecos el navegador puede atender un clic, ejecutar un callback de fotograma y presentar una imagen nueva. Dicho de otro modo: **has decidido que tu cálculo termine algo más tarde a cambio de que el usuario no espere a que termine.** Cuando se enuncia así, se ve enseguida que la decisión no siempre va en la misma dirección. Si el trabajo es exactamente lo que el usuario está esperando —el resultado de la búsqueda que acaba de pedir— trocearlo lo retrasa sin ganar nada, porque los huecos que abres no tienen nada mejor que hacer; lo que hay que hacer ahí es que el trabajo sea más rápido o mover el trabajo a un worker, no repartirlo. Si el trabajo es secundario —construir un índice, preparar la siguiente pantalla, enviar telemetría— trocearlo o encolarlo con prioridad de fondo es exactamente lo correcto, porque su retraso no le importa a nadie y los huecos valen mucho. Y la peor decisión posible, que se toma constantemente, es trocear el trabajo secundario **sin bajarle la prioridad**: entonces sigue compitiendo fotograma a fotograma con la animación que estabas intentando salvar, solo que ahora en trozos pequeños, y el resultado es un tartamudeo continuo en lugar de un bloqueo limpio, que se percibe peor y es mucho más difícil de diagnosticar porque ya no hay ninguna barra ancha en el flame chart. La herramienta importa menos que la pregunta previa: **de quién es el tiempo que estás gastando y quién debería esperar.**
+</Callout>

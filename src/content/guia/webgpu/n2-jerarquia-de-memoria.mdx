@@ -1,0 +1,101 @@
+---
+title: "La jerarquía de memoria y la latencia que no se ve"
+description: "Los cinco niveles de memoria de una GPU, cuánto cuesta cada uno, qué es la coalescencia de accesos y por qué el ancho de banda es el recurso escaso de verdad."
+subject: webgpu
+level: 2
+order: 4
+icon: "2.4"
+duracion: "19 min"
+---
+
+<Lead>
+La aritmética de una GPU moderna es prácticamente gratis y la memoria no lo es. Una tarjeta de gama alta puede ejecutar del orden de decenas de billones de operaciones en coma flotante por segundo y solo alimentarlas con un par de terabytes por segundo de memoria; la cuenta sale a decenas de operaciones por cada byte leído. Cualquier shader que no haga esa cantidad de trabajo por byte está limitado por memoria, y eso es la mayoría de los shaders que vas a escribir.
+</Lead>
+
+<Objetivos>
+
+- Enumerar los cinco niveles de memoria de una GPU y su coste relativo.
+- Explicar qué es la coalescencia y cómo se rompe.
+- Calcular la intensidad aritmética de un kernel y usarla para predecir el cuello.
+- Relacionar cada nivel de memoria con su espacio de dirección en WGSL.
+
+</Objetivos>
+
+## Los cinco niveles
+
+De más rápido a más lento, con la correspondencia en WGSL que hace que esto sea accionable y no trivia.
+
+**Registros.** Latencia efectiva nula. Es donde viven las variables locales de una invocación: cualquier `var` o `let` dentro de una función, y las variables del espacio `private`. El fichero de registros es grande pero finito, y lo comparten todas las invocaciones vivas de la unidad de cómputo, lo cual tiene consecuencias que se ven en la lección siguiente.
+
+**Memoria compartida del grupo de trabajo.** Unos pocos ciclos. En WGSL es `var<workgroup>`. Vive en chip, es visible por todas las invocaciones del mismo workgroup y su tamaño está limitado por `maxComputeWorkgroupStorageSize`, cuyo valor por defecto en WebGPU es 16384 bytes. Es explícita: la llenas tú, no hay nada automático.
+
+**Cachés L1 y de textura.** Decenas de ciclos. No son direccionables: el hardware decide qué guardar. Las lecturas de texturas pasan por una caché optimizada para localidad en dos dimensiones, y las lecturas de búferes por una caché de datos convencional. Que un acceso acierte o falle en L1 es la diferencia entre 30 y 300 ciclos.
+
+**Caché L2.** Del orden de cien ciclos, compartida por todas las unidades de cómputo. Es el último filtro antes de salir del chip.
+
+**Memoria global.** De 300 a 800 ciclos. Es la VRAM: donde viven `var<storage>`, `var<uniform>` y las texturas. En una tarjeta discreta es memoria dedicada al otro lado de un bus ancho; en un móvil o en un chip con memoria unificada, es la misma memoria del sistema, con menos ancho de banda y compartida con la CPU.
+
+Y por debajo de todo, en las tarjetas discretas, está **el bus con el sistema**: mover datos entre la memoria del sistema y la VRAM es un orden de magnitud más lento que cualquier acceso interno, y es la razón de que leer un resultado de vuelta a JavaScript sea la operación más cara de toda la API.
+
+## Coalescencia: por qué el patrón importa más que el volumen
+
+El hardware no lee bytes sueltos. Lee **líneas de caché**, bloques contiguos de 32, 64 o 128 bytes. Cuando un subgrupo ejecuta una lectura, la unidad de memoria mira las 32 direcciones que piden sus invocaciones y agrupa las que caen en la misma línea.
+
+El caso bueno: las 32 invocaciones leen 32 floats contiguos. Son 128 bytes, una o dos líneas de caché, una o dos transacciones. El caso malo: cada invocación lee un float separado del anterior por un kilobyte. Son 32 líneas distintas, 32 transacciones, y se han transferido 32 líneas completas de las que se usan 4 bytes cada una. **Mismo número de floats leídos, entre 16 y 32 veces más tráfico de memoria.**
+
+Esto tiene una traducción directa a cómo se organizan las estructuras de datos, y es la razón de que en GPU se prefiera *structure of arrays* a *array of structures*:
+
+```wgsl
+// Array de structs: la invocacion i lee el campo pos de la particula i.
+// Las lecturas de invocaciones vecinas estan separadas por 48 bytes.
+struct Particula { pos: vec3f, vel: vec3f, vida: f32, tipo: u32 };
+@group(0) @binding(0) var<storage, read> particulas: array<Particula>;
+
+// Struct de arrays: las posiciones estan contiguas entre si.
+// Las 32 invocaciones leen 32 vec3f consecutivos: coalescencia perfecta.
+@group(0) @binding(0) var<storage, read> posiciones: array<vec3f>;
+@group(0) @binding(1) var<storage, read> velocidades: array<vec3f>;
+@group(0) @binding(2) var<storage, read> vidas: array<f32>;
+```
+
+La segunda forma es más incómoda de escribir y bastante más rápida cuando un kernel toca solo algunos campos. Si un kernel toca todos los campos de cada elemento, la diferencia se reduce mucho: la elección depende del patrón de acceso, no de una regla absoluta.
+
+<Callout type="warn" title="El vec3 es una trampa de alineación además de una trampa de coalescencia">
+En WGSL, `vec3<f32>` tiene un tamaño de 12 bytes pero una **alineación de 16**. Dentro de un `array<vec3f>` en storage, cada elemento ocupa 16 bytes con 4 de relleno. Eso significa que el array desperdicia un 25% del ancho de banda y que el código de JavaScript que escribe ese búfer tiene que respetar el paso de 16, no de 12. Es el bug número uno de los principiantes en WGSL y no produce ningún error: produce datos desplazados. Cuando el rendimiento importa, `vec4f` con el cuarto componente usado para otra cosa suele ser mejor decisión que `vec3f`.
+</Callout>
+
+## Intensidad aritmética
+
+Es la métrica que predice si un kernel está limitado por cálculo o por memoria, y se calcula en treinta segundos: **operaciones en coma flotante realizadas dividido entre bytes leídos y escritos de memoria global**.
+
+Sumar dos arrays y guardar el resultado: por cada elemento, 8 bytes leídos, 4 escritos, 1 operación. Intensidad aritmética de 1 entre 12, o sea 0,083. Una GPU que necesita del orden de 50 operaciones por byte para saturar sus ALU está aquí a tres órdenes de magnitud de eso. **Ese kernel está limitado por memoria de forma absoluta**, y optimizar su aritmética no va a cambiar nada: puedes elevar cada elemento al cubo antes de sumarlo y tardará lo mismo.
+
+Multiplicar dos matrices de N por N de forma ingenua: por cada elemento del resultado, 2N lecturas y 2N operaciones. Intensidad de 2N entre 8N, o sea 0,25. Sigue limitado por memoria. Con *tiling* en memoria compartida, cada bloque de datos se lee una vez de memoria global y se reutiliza para T resultados, y la intensidad sube por un factor T. Ahí está el factor de mejora de esa técnica, y ahí se ve por qué existe `var<workgroup>`.
+
+La regla de decisión que se saca de esto: **si la intensidad aritmética de tu kernel es baja, la única optimización que sirve es reducir los bytes**. Menos precisión, formatos comprimidos, reutilizar datos en memoria compartida, mejorar la coalescencia. Y solo si la intensidad es alta tiene sentido mirar el número de operaciones.
+
+## Latencia frente a ancho de banda
+
+Son dos limitaciones distintas y se arreglan de formas distintas, y confundirlas hace perder tiempo.
+
+**La latencia** es cuánto tarda un acceso concreto. Se esconde teniendo muchos grupos vivos: mientras uno espera, otro calcula. La palanca es la ocupación, y de eso va la lección siguiente. Si tienes suficientes grupos en vuelo, la latencia deja de importar por completo.
+
+**El ancho de banda** es cuántos bytes por segundo puede mover el bus en total. No se esconde con más paralelismo: si el bus está saturado, más grupos solo hacen más cola. La única palanca es mover menos bytes.
+
+El síntoma que distingue una de otra: si añadir más trabajo paralelo mejora el rendimiento, estabas limitado por latencia. Si no cambia nada o empeora, estás limitado por ancho de banda.
+
+<Callout type="dios" title="La memoria que más rinde es la que no lees, y la segunda es la que lees una vez">
+Hay una jerarquía de decisiones que ordena todas las optimizaciones de memoria y que casi nadie enuncia, aunque todos los que optimizan GPU la aplican.
+
+**Primero: no leer.** Recalcular es más barato que leer casi siempre. Una función de ruido evaluada en el shader gana a una textura de ruido; una normal derivada de la posición gana a una normal almacenada; una matriz reconstruida de un cuaternión y una traslación gana a una matriz de 64 bytes leída de memoria. Suena al revés de todo lo que sabes de la CPU y es correcto: con cientos de ciclos de latencia y decenas de ALU ociosas, la aritmética es el recurso barato.
+
+**Segundo: leer una vez y reutilizar en chip.** Es el papel de `var<workgroup>`. Todo algoritmo con reutilización de datos —convoluciones, multiplicación de matrices, reducciones, búsqueda de vecinos— vive o muere aquí, y la mejora no es del 20%, es de un factor entre 5 y 20.
+
+**Tercero: leer menos bytes.** Formatos de 16 bits en vez de 32 donde la precisión lo permita, texturas comprimidas, empaquetar cuatro valores normalizados en un `u32`. Un factor 2 o 4 directo sobre el recurso escaso.
+
+**Cuarto, y solo entonces: leer mejor.** Coalescencia, disposición de las estructuras, alineación. Importa mucho y es lo último porque solo tiene sentido optimizar el patrón de accesos que ya has decidido que son imprescindibles.
+
+El error de método que produce esta jerarquía cuando se ignora es siempre el mismo: alguien pasa una tarde reordenando campos de un struct para mejorar la coalescencia de una lectura que, mirada con perspectiva, no hacía ninguna falta.
+</Callout>
+
+Queda la métrica que ata todo lo anterior y explica por qué a veces lanzar más trabajo hace que todo vaya más rápido: [la ocupación](/guia/webgpu/n2-ocupacion/).

@@ -1,0 +1,131 @@
+---
+title: "Qué cabe dentro del frustum: culling y volúmenes envolventes"
+description: "Cómo decide Three.js que un objeto no se dibuja, por qué esa decisión se equivoca cuando deformas la geometría, y cuándo desactivar el culling sale más barato que arreglarlo."
+subject: three
+level: 7
+order: 2
+icon: "7.2"
+duracion: "18 min"
+---
+
+<Lead>
+El frustum no sirve solo para describir lo que se ve: sirve para no pagar por lo que no se ve. Antes de emitir un solo comando de dibujo, Three.js recorre el grafo de escena y descarta cada objeto cuya esfera envolvente no toque el volumen de vista. Es una de las optimizaciones más rentables del motor y también una de las que más silenciosamente se rompe, porque la esfera envolvente se calcula una vez y nadie la vuelve a mirar.
+</Lead>
+
+<Objetivos>
+
+- Describir el algoritmo exacto que usa Three.js para descartar un objeto por frustum.
+- Identificar los tres casos en que la esfera envolvente miente y produce objetos que desaparecen.
+- Decidir con criterio entre recalcular el volumen, ampliarlo o desactivar `frustumCulled`.
+- Usar `layers` para excluir objetos de una cámara sin tocar el grafo de escena.
+
+</Objetivos>
+
+## El algoritmo, línea a línea
+
+En cada llamada a `render()`, Three.js recorre la escena y por cada objeto visible hace una comprobación. La lógica de `Frustum.intersectsObject` en r184 es corta y conviene conocerla literalmente, porque explica todo lo demás:
+
+```js
+// Reconstrucción fiel de lo que hace Frustum.intersectsObject en r184.
+if ( object.boundingSphere !== undefined ) {
+  if ( object.boundingSphere === null ) object.computeBoundingSphere();
+  esfera.copy( object.boundingSphere ).applyMatrix4( object.matrixWorld );
+} else {
+  const geometry = object.geometry;
+  if ( geometry.boundingSphere === null ) geometry.computeBoundingSphere();
+  esfera.copy( geometry.boundingSphere ).applyMatrix4( object.matrixWorld );
+}
+return this.intersectsSphere( esfera );
+```
+
+Tres hechos salen de ahí. Primero, la prueba es contra una **esfera**, no contra la caja ni contra la geometría real: es barata (seis productos escalares) y conservadora, así que a veces dibuja algo que no se ve, pero nunca descarta algo que sí. Segundo, la esfera es la de la geometría, transformada por la matriz de mundo del objeto, y una esfera transformada por una matriz con escala no uniforme se convierte en un elipsoide que Three.js aproxima tomando el mayor factor de escala. Tercero, y esto es lo importante: si el objeto define su propia propiedad `boundingSphere` —cosa que hacen `InstancedMesh` y `BatchedMesh`—, se usa esa y no la de la geometría.
+
+El interruptor es `object.frustumCulled`, que vale `true` por defecto y vive en `Object3D`, así que existe en todo: mallas, luces, grupos, cámaras.
+
+```js
+import * as THREE from 'three';
+
+const malla = new THREE.Mesh( geometria, material );
+malla.frustumCulled = false;   // se dibuja siempre, caiga donde caiga
+```
+
+Merece la pena tener claro qué ahorra el culling y qué no. Ahorra **trabajo de CPU**: la construcción de la lista de render, la subida de uniformes por objeto y la llamada de dibujo. No ahorra recorrido del grafo, porque para decidir hay que visitar el objeto de todas formas y actualizar su matriz de mundo. Y del lado de la GPU, el recorte del volumen de vista ocurre igualmente en hardware después del vertex shader, así que un objeto fuera de cámara que no se hubiera descartado sí pagaría el sombreado de todos sus vértices, pero casi ningún fragmento.
+
+De ahí una consecuencia poco intuitiva: con muchos objetos pequeños, la prueba de culling puede costar más de lo que ahorra. Cada objeto son unas decenas de nanosegundos, pero cincuenta mil objetos son varios milisegundos solo en decidir. Cuando llegas a ese régimen, la respuesta no es afinar el culling sino reducir el número de objetos.
+
+## Cuando la esfera miente
+
+La esfera envolvente se calcula a partir del atributo `position` tal y como está en memoria, la primera vez que hace falta, y se cachea. Hay tres situaciones en las que eso deja de describir lo que se dibuja, y las tres producen el mismo síntoma: un objeto que parpadea o desaparece al girar la cámara, típicamente cuando se acerca al borde de la pantalla.
+
+**Has movido vértices en la CPU.** Escribes en el array de posiciones, pones `needsUpdate`, y la geometría ocupa ahora otro sitio. La esfera cacheada sigue siendo la vieja. La solución es explícita:
+
+```js
+geometria.computeBoundingSphere();
+geometria.computeBoundingBox();   // solo si dependes de la caja, p. ej. para raycast
+```
+
+**Desplazas vértices en el vertex shader.** Este es el caso perverso, porque no hay nada que recalcular: la geometría en memoria no ha cambiado, la deformación existe solo dentro de la GPU y Three.js no tiene forma de saber cuánto se ha movido nada. Si tu shader desplaza hasta dos unidades, la respuesta correcta es ampliar la esfera a mano:
+
+```js
+geometria.computeBoundingSphere();
+geometria.boundingSphere.radius += 2;   // el máximo desplazamiento del shader
+```
+
+Es una línea que hay que escribir a conciencia, porque si el shader se vuelve más agresivo y nadie actualiza el número, el bug vuelve meses después.
+
+**El objeto es un `InstancedMesh` o un `SkinnedMesh`.** El primero se trata en el nivel de instancing; el segundo tiene el mismo problema con el esqueleto: la pose deforma la malla y la esfera de la geometría describe la pose de reposo. Para personajes, lo habitual es directamente `frustumCulled = false` o una esfera holgada calculada a mano.
+
+La regla de decisión es aritmética. Recalcular una esfera cuesta recorrer todos los vértices dos veces, así que para una geometría de cien mil vértices es una operación de milisegundos que no puedes permitirte cada frame. Ampliar el radio es gratis pero descarta menos. Desactivar el culling cuesta una llamada de dibujo por frame, que son decenas de microsegundos. Para un puñado de objetos deformables, desactivar es casi siempre lo correcto; para un bosque de mil, no.
+
+## Culling propio y capas
+
+A veces quieres tomar la decisión tú, porque tienes información que Three.js no tiene: qué objetos son caros de actualizar, cuáles pueden esperar, cuáles conviene descargar de memoria. Construir el frustum tú mismo cuesta cuatro líneas y te deja preguntar lo que quieras.
+
+```js
+import * as THREE from 'three';
+
+const frustum = new THREE.Frustum();
+const proyeccion = new THREE.Matrix4();
+const esfera = new THREE.Sphere();
+
+function actualizarVisibilidad( objetos, camera ) {
+  camera.updateMatrixWorld();
+  proyeccion.multiplyMatrices( camera.projectionMatrix, camera.matrixWorldInverse );
+  frustum.setFromProjectionMatrix( proyeccion, camera.coordinateSystem, camera.reversedDepth );
+
+  for ( const obj of objetos ) {
+    obj.geometry.computeBoundingSphere();
+    esfera.copy( obj.geometry.boundingSphere ).applyMatrix4( obj.matrixWorld );
+    const visible = frustum.intersectsSphere( esfera );
+
+    // La decisión propia: no solo dibujar o no, sino cuánto trabajo hacer.
+    obj.visible = visible;
+    obj.userData.actualizarAnimacion = visible;
+  }
+}
+```
+
+Fíjate en que `visible = false` es más contundente que `frustumCulled`: corta el subárbol entero en el recorrido, así que un grupo invisible ahorra también el coste de visitar a sus hijos. Es la herramienta correcta para regiones enteras de un mundo grande.
+
+El otro mecanismo, ortogonal a todo lo anterior, son las **capas**. Cada `Object3D` y cada `Camera` tienen un objeto `layers` que es una máscara de 32 bits, y un objeto solo se dibuja si su máscara y la de la cámara comparten al menos un bit:
+
+```js
+const AYUDAS = 1;   // canal 1: gizmos, helpers, cajas de depuración
+
+helper.layers.set( AYUDAS );          // solo en el canal 1
+camaraDepuracion.layers.enable( AYUDAS );   // esta cámara los ve, la principal no
+```
+
+Las capas se comprueban antes que el frustum y no dependen de la geometría, así que son el mecanismo adecuado para separaciones lógicas: ayudas visuales, máscaras de post-procesado, ojo izquierdo frente a ojo derecho en estéreo, o pasadas de selección. Lo que no son es una optimización espacial: excluir un objeto por capa no lo hace más barato de recorrer.
+
+<Callout type="dios" title="Un culling conservador que descarta de más es un bug que no verás en tu máquina">
+El frustum culling tiene una asimetría que conviene interiorizar: **fallar de más es invisible y fallar de menos es catastrófico**. Si tu esfera envolvente es demasiado grande, el único coste es dibujar algo que no se veía, y eso se traduce en unos microsegundos que ningún usuario percibirá jamás. Si es demasiado pequeña, un objeto desaparece de la pantalla en condiciones que dependen del ángulo exacto de la cámara, del aspecto de la ventana y de la posición del objeto. Es decir: un bug que se manifiesta en el móvil de un usuario, en una orientación concreta, y que no reproduces nunca en tu monitor porque tu FOV horizontal es el doble. He visto equipos perder días persiguiendo "parpadeos" que eran exactamente esto. La disciplina que sale de ahí es contraintuitiva para un ingeniero acostumbrado a ajustar límites finos: **redondea siempre hacia arriba**. Si dudas si tu shader desplaza uno o dos, escribe tres. Si no sabes cuánto crece un sistema de partículas, desactiva el culling y mide si de verdad te importa. El coste de un volumen envolvente generoso es lineal y despreciable; el coste de uno ajustado que se queda corto es una sesión de depuración con una reproducción intermitente, que es la peor moneda con la que se puede pagar. Y por si sirve de consuelo: el propio Three.js aplica la misma filosofía, porque usa una esfera y no la geometría real precisamente para equivocarse siempre en la dirección segura.
+</Callout>
+
+<Reto title="Rompe y arregla el culling">
+1. Crea un plano de doscientos segmentos, desplázalo en el vertex shader y mira cómo desaparece al llegar al borde.
+2. Amplía `boundingSphere.radius` con el desplazamiento máximo y verifica que deja de pasar.
+3. Mide con `performance.now()` cuánto cuesta `computeBoundingSphere()` en esa geometría y decide si podrías llamarlo cada frame.
+4. Reparte diez mil cubos por un volumen grande y compara los fotogramas por segundo con `frustumCulled` activo y desactivado.
+5. Pon los helpers en una capa propia y renderiza dos veces la misma escena, con y sin ellos, desde dos cámaras.
+</Reto>

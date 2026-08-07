@@ -1,0 +1,85 @@
+---
+title: "Early-Z: la optimización invisible y las tres cosas que la desactivan"
+description: "Por qué el hardware ejecuta la prueba de profundidad antes del fragment shader aunque la especificación diga lo contrario, y qué construcciones de WGSL le quitan ese permiso."
+subject: webgpu
+level: 25
+order: 3
+icon: "25.3"
+duracion: "17 min"
+---
+
+<Lead>
+Sobre el papel, la prueba de profundidad ocurre después del fragment shader: el shader produce un color, y luego el backend decide si ese color llega al framebuffer. Ejecutada literalmente, esa secuencia significaría sombrear cada fragmento aunque esté tapado, y ninguna GPU de los últimos veinticinco años lo hace así. El hardware adelanta la prueba cuando puede demostrar que el resultado es idéntico, y tu shader tiene tres formas de quitarle esa demostración sin darse cuenta.
+</Lead>
+
+<Objetivos>
+
+- Explicar bajo qué condición el hardware puede adelantar la prueba de profundidad.
+- Identificar las construcciones de WGSL que fuerzan la prueba tardía.
+- Cuantificar el impacto en escenas con sobredibujado alto.
+- Reescribir un shader con `discard` para recuperar la prueba temprana.
+
+</Objetivos>
+
+## La condición que el hardware necesita
+
+El adelanto de la prueba se llama *early depth test* o *early-Z*, y no es una característica opcional que se active: es una optimización que el driver aplica cuando puede probar que no cambia el resultado observable. La condición es una sola, formulada con precisión:
+
+**El fragment shader no puede influir en si el fragmento pasa la prueba ni en el valor que se compara.**
+
+Si el shader ni descarta fragmentos ni escribe profundidad, entonces la prueba con el valor interpolado da el mismo resultado antes que después, y adelantarla solo puede ahorrar trabajo. Si el shader puede descartar, la prueba adelantada podría haber **escrito** en el búfer una profundidad que luego el `discard` invalida, corrompiendo el resultado para los fragmentos posteriores. Y si el shader escribe `frag_depth`, el valor que hay que comparar no se conoce hasta después de ejecutarlo.
+
+Conviene separar dos cosas que suelen confundirse: **la prueba** puede adelantarse, y **la escritura** puede adelantarse, y son permisos distintos. Un shader con `discard` puede seguir aprovechando una prueba temprana que solo rechace —esa parte es segura, porque rechazar antes de tiempo un fragmento que iba a rechazarse igualmente no cambia nada— pero no puede escribir temprano. El hardware moderno implementa esa distinción, así que `discard` es menos catastrófico de lo que la sabiduría popular sugiere; sigue siendo caro, pero por otra razón: rompe el descarte por bloques.
+
+## Las tres construcciones que lo desactivan
+
+**`discard`.** La instrucción de WGSL que aborta el fragmento. Cualquier `discard` en el shader, aunque esté dentro de una rama que nunca se toma, es suficiente: el análisis es estático, no dinámico. Un shader con un `discard` inalcanzable paga el mismo precio que uno que descarta la mitad de los píxeles.
+
+**`@builtin(frag_depth)` como salida.** Declarar esa salida hace que la profundidad del fragmento sea desconocida hasta el final del shader. Ninguna prueba puede adelantarse. Es la construcción más cara de las tres, porque además de la prueba tardía, obliga al hardware a desactivar la compresión del búfer de profundidad en muchas arquitecturas. Los casos legítimos son el *impostor* que finge geometría —una esfera dibujada como un cuadrilátero con profundidad calculada analíticamente— y el ray marching sobre volúmenes.
+
+**Las escrituras a memoria desde el fragment shader.** Un `textureStore` a una storage texture, o una escritura a un storage buffer con acceso `read_write` desde la etapa de fragmento, son efectos secundarios observables. El hardware no puede ejecutar el shader para descubrir que el fragmento estaba tapado, porque el shader ya habría escrito. Esta es la que menos se menciona y la que más sorprende cuando aparece en un G-buffer con contadores atómicos.
+
+Un cuarto caso, más sutil: **el `alphaToCoverageEnabled`** del bloque `multisample` deriva la cobertura del alfa que produce el shader, y por tanto tampoco es compatible con una escritura temprana de profundidad. La prueba puede adelantarse; la escritura, no.
+
+```wgsl
+// Este shader NO puede aprovechar la escritura temprana de profundidad.
+@fragment
+fn fs_recortado(in: VsOut) -> @location(0) vec4f {
+  let c = textureSample(hoja, muestreador, in.uv);
+  if (c.a < 0.5) { discard; }
+  return c;
+}
+
+// Este si. La misma silueta, resuelta con alpha to coverage en el pipeline
+// y sin ninguna instruccion de descarte en el codigo.
+@fragment
+fn fs_cobertura(in: VsOut) -> @location(0) vec4f {
+  return textureSample(hoja, muestreador, in.uv);
+}
+```
+
+La segunda versión mueve el recorte a la función fija, a cambio de exigir multimuestreo. Es la razón por la que la vegetación recortada y el multimuestreo aparecen siempre juntos en los motores.
+
+<Callout type="dios" title="El coste real de discard no es la prueba tardía, es que rompe el rechazo por bloques">
+La explicación habitual —«`discard` desactiva early-Z»— es correcta pero se queda en la superficie, y por eso la gente se sorprende al medir. Las GPUs no comparan profundidad píxel a píxel: mantienen una estructura jerárquica, el llamado *Hi-Z* o *coarse depth*, que guarda por cada bloque de píxeles —típicamente de 8x8 o mayor— el rango de profundidades presentes. Con eso, el rasterizador puede rechazar un triángulo entero contra un bloque sin tocar un solo píxel, y ese rechazo por bloques es responsable de la mayor parte del ahorro real en una escena con sobredibujado. La estructura jerárquica es **conservadora**: solo funciona si el hardware sabe con certeza que todos los fragmentos de un bloque escribirán. En cuanto un shader puede descartar, el bloque queda en un estado indeterminado y la jerarquía se invalida para esa región durante el resto del pass. El efecto práctico es que **un objeto con `discard` no solo se sombrea más caro él mismo, sino que degrada el rechazo de todo lo que se dibuje después sobre esos píxeles**. De ahí sale la regla que siguen los motores y que rara vez se justifica: la vegetación con recorte alfa se dibuja **después** de la geometría opaca sólida, nunca antes, aunque esté más cerca de la cámara. Ordenar de delante a atrás es correcto dentro de cada grupo, pero el grupo que descarta va al final del bloque opaco. Si alguna vez has visto un motor con dos listas de opacos y te ha parecido complicación gratuita, esta es la razón.
+</Callout>
+
+## Cuánto cambia esto en números
+
+El impacto se estima sin instrumentación con una cuenta sencilla. Llama sobredibujado al número medio de fragmentos que se sombrean por píxel de pantalla en un fotograma. En una escena de interiores densa, con arquitectura, mobiliario y personajes, el sobredibujado antes de cualquier optimización de visibilidad ronda entre tres y ocho. Con la prueba temprana activa y ordenación aproximada de delante a atrás, ese número cae a poco más de uno.
+
+Es decir: la prueba temprana no ahorra un porcentaje, ahorra un factor. Y cuando un shader la desactiva, no vuelve a un rendimiento «un poco peor», vuelve al coste sin optimizar de esa geometría.
+
+Con eso en la mano, hay tres decisiones que se toman solas:
+
+Un shader que solo usa `discard` para un recorte binario de textura casi siempre puede sustituirse por alpha to coverage si ya tienes multimuestreo, o por geometría real si la silueta es simple. Un cartel de hoja recortada con un cuadrilátero y `discard` cuesta más que el mismo cartel con ocho triángulos que aproximen la silueta.
+
+Un shader que escribe `frag_depth` para desplazar la profundidad unos pocos milímetros —el caso del decorado sobre una pared— casi siempre debe usar en su lugar el `depthBias` del pipeline, que es función fija y no cuesta nada.
+
+Y un shader que descarta según una condición que se conoce en la CPU no debe descartar: debe estar en otro pipeline, o directamente no dibujarse.
+
+## Qué no controla WGSL
+
+Merece decirlo explícitamente porque quien viene de GLSL lo busca: **WGSL no tiene una declaración para forzar la prueba temprana**. GLSL tiene `layout(early_fragment_tests) in;` y las declaraciones de profundidad conservadora `layout(depth_greater)`; WGSL no expone ninguna de las dos. El único control que tienes es el de escribir shaders que cumplan la condición por sí mismos.
+
+Esto no es un descuido. Forzar la prueba temprana cuando el shader tiene efectos secundarios cambia la semántica de forma observable, y una API web no puede exponer una construcción cuyo resultado depende del hardware. La consecuencia es que en WebGPU la única palanca es la estructura de tu código, y por eso conviene tener la lista de las tres construcciones tan presente: son los tres sitios donde escribes una línea y pierdes un factor.

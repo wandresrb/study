@@ -1,0 +1,122 @@
+---
+title: "Divergencia: por qué un if puede costar el doble"
+description: "Qué hace el hardware cuando las invocaciones de un subgrupo toman caminos distintos, cómo se calcula el coste real de una rama y qué técnicas la reducen de verdad."
+subject: webgpu
+level: 2
+order: 3
+icon: "2.3"
+duracion: "18 min"
+---
+
+<Lead>
+La divergencia es el concepto de este nivel con más consecuencias prácticas y el peor explicado en la mayoría del material. No es que los condicionales sean caros: es que el coste de un condicional depende de los datos que lo evalúan, cosa que ningún otro lenguaje que hayas usado hace. El mismo shader, con la misma entrada de tamaño idéntico, puede tardar el doble solo porque los valores están ordenados de otra forma.
+</Lead>
+
+<Objetivos>
+
+- Explicar el mecanismo de máscara de ejecución que implementa las ramas en una GPU.
+- Calcular el coste esperado de un condicional a partir de la distribución de los datos.
+- Distinguir divergencia real de condicionales uniformes que no cuestan nada.
+- Aplicar las tres técnicas que reducen divergencia sin destrozar la legibilidad.
+
+</Objetivos>
+
+## El mecanismo: máscaras, no saltos
+
+Un subgrupo tiene un contador de programa y no puede tener dos. Cuando el código llega a un `if` y las 32 invocaciones no coinciden en el resultado de la condición, el hardware no puede saltar, así que hace otra cosa: ejecuta las dos ramas, una detrás de otra, y usa una **máscara de ejecución** —un bit por invocación— para decidir qué invocaciones escriben resultados en cada una.
+
+```wgsl
+// Si en un subgrupo hay invocaciones con x > 0 y otras con x <= 0:
+if (x > 0.0) {
+  a = caro1();     // se ejecuta con las de x <= 0 enmascaradas
+} else {
+  a = caro2();     // se ejecuta con las de x > 0 enmascaradas
+}
+// tiempo total = coste(caro1) + coste(caro2)
+```
+
+Las invocaciones enmascaradas no desaparecen: siguen avanzando por el código, ciclo a ciclo, con sus escrituras desactivadas. Ocupan la máquina y no producen nada. Esa es toda la divergencia.
+
+La generalización tiene tres casos que hay que saber distinguir de un vistazo.
+
+**Condicional uniforme.** Todas las invocaciones del subgrupo evalúan la condición igual. El hardware detecta que la máscara es completa o vacía y salta de verdad, ejecutando solo una rama. Coste: el de esa rama, más una comparación. Es prácticamente gratis.
+
+**Condicional divergente con dos ramas.** Coste: la suma de las dos ramas. Es el caso del ejemplo.
+
+**Condicionales anidados o un `switch` con muchos casos.** El coste se acumula. Un `switch` de ocho casos donde el subgrupo se reparte entre los ocho cuesta la suma de los ocho cuerpos.
+
+Un bucle divergente es la peor variante y la que más gente pilla por sorpresa:
+
+```wgsl
+// n vale 2 para 31 invocaciones y 400 para una.
+var acc = 0.0;
+for (var i = 0u; i < n; i = i + 1u) {
+  acc = acc + trabajo(i);
+}
+// El subgrupo entero itera 400 veces.
+```
+
+El subgrupo no puede salir del bucle hasta que la última invocación termine. Las 31 que acabaron en la segunda iteración siguen dando vueltas, enmascaradas, 398 veces. **El coste de un bucle divergente es el del peor caso del subgrupo, no el promedio.** Por eso un trazador de rayos donde algunos rayos rebotan veinte veces y la mayoría una es tan difícil de optimizar, y por eso las implementaciones serias reagrupan los rayos entre rebotes.
+
+## Lo que no es divergencia
+
+Tres confusiones frecuentes conviene despejarlas antes de empezar a optimizar cosas que no lo necesitan.
+
+**Un `if` sobre un uniforme no diverge.** Si la condición depende de un valor que es igual para todas las invocaciones —un flag en un búfer uniforme, una constante de especialización— todas toman la misma rama y no hay coste. La divergencia requiere que la condición dependa de datos que varían por invocación.
+
+**Un `return` temprano en la guarda del dispatch apenas diverge.** El `if (i >= arrayLength(&datos)) { return; }` del principio de cada kernel solo divide un subgrupo: el último del último workgroup. Todos los demás lo evalúan uniformemente.
+
+**Un condicional barato no importa aunque diverja.** Sumar el coste de dos ramas que hacen una multiplicación cada una es sumar dos multiplicaciones. Si el shader está limitado por memoria, ni siquiera se nota.
+
+La pregunta correcta no es «hay un `if`» sino **cuánto cuesta la rama menos tomada**. Un `if` divergente que protege una lectura de textura y quince operaciones es un problema; uno que protege una asignación no lo es.
+
+## Las tres técnicas que funcionan
+
+**Uno: ordenar los datos para que la coherencia sea espacial.** Es la más eficaz con diferencia y la que menos afecta al código del shader. Si procesas partículas de tres tipos y cada una toma una rama distinta, ordenarlas por tipo hace que la inmensa mayoría de los subgrupos contenga un solo tipo, y el condicional pasa de divergente a uniforme en casi todos. Lo mismo con rayos por dirección, con fragmentos por material, con celdas de una rejilla por estado. El coste de ordenar se amortiza si el shader es caro y los datos duran varios fotogramas.
+
+**Dos: convertir la selección en aritmética cuando las dos ramas son baratas.** Si ambas ramas son cortas, calcular las dos y elegir sin ramificar cuesta menos que el mecanismo de máscara:
+
+```wgsl
+// Con rama: el compilador probablemente ya lo convierte, pero no siempre.
+var color: vec3f;
+if (t > 0.5) { color = a; } else { color = b; }
+
+// Sin rama, explicito:
+let color = select(b, a, t > 0.5);
+```
+
+`select(falso, verdadero, condicion)` es la función de WGSL para esto, y ojo al orden de los argumentos, que es el contrario del que casi todo el mundo espera: el primero es el valor cuando la condición es falsa. Conviene no abusar: si una de las ramas es cara o tiene efectos —una lectura de textura, un bucle—, calcular las dos siempre es peor que ramificar.
+
+**Tres: separar en varios lanzamientos.** Si un kernel tiene dos caminos muy distintos y muy caros, a veces la respuesta es no tener un kernel sino dos, cada uno con su propia lista de elementos. Se paga una pasada de clasificación y se gana que ningún subgrupo diverja. Es lo que hacen los motores de partículas con muchos comportamientos y los trazadores de rayos por *wavefront*.
+
+<Callout type="warn" title="Divergencia y uniformidad no son lo mismo, aunque estén relacionadas">
+La divergencia es un asunto de rendimiento. La **uniformidad** es un asunto de corrección: WGSL exige que ciertas operaciones —`textureSample`, las derivadas, `workgroupBarrier()`— se ejecuten en control de flujo uniforme, y rechaza el shader en compilación si no lo están. Un `textureSample` dentro de un `if` que depende de datos por invocación es un error de compilación, no una lentitud. La solución es sacar el muestreo fuera del condicional y elegir después, o usar `textureSampleLevel`, que no necesita derivadas porque el nivel de mipmap se lo das tú.
+</Callout>
+
+## Un ejemplo con números
+
+Un shader de sombreado con dos materiales, uno barato y otro caro:
+
+```wgsl
+if (material == 0u) {
+  color = difuso_simple();        // 20 operaciones
+} else {
+  color = pbr_completo();         // 200 operaciones y 4 lecturas de textura
+}
+```
+
+Con los objetos mezclados al azar, la probabilidad de que un subgrupo de 32 invocaciones contenga solo un material, si están al 50%, es de dos entre dos elevado a 32: cero en la práctica. **Casi todos los subgrupos ejecutan las dos ramas: 220 operaciones y 4 lecturas por invocación.**
+
+Con los objetos ordenados por material, solo los subgrupos que caen en la frontera entre grupos divergen. Si hay diez materiales y diez mil objetos, hay del orden de diez subgrupos frontera de un total de varios cientos. **El coste medio baja a poco más de 110 operaciones**, la media ponderada real, que es la mitad.
+
+El mismo shader, los mismos datos, el mismo número de píxeles. Solo cambia el orden.
+
+<Callout type="dios" title="La divergencia no se elimina, se mueve, y el sitio donde la pones es una decisión de arquitectura">
+El instinto al descubrir la divergencia es cazar condicionales dentro de los shaders. Es la capa equivocada. Un `if` en un shader es el **síntoma** de una decisión que se tomó mucho antes: cómo están organizados los datos en memoria y en qué orden se lanzan.
+
+Piénsalo así: la divergencia es una medida de **desorden de tus datos respecto al orden de ejecución**. No se puede hacer desaparecer —el problema tiene la variedad que tiene— pero sí se puede decidir dónde se paga. Se puede pagar dentro del shader, en cada invocación, en cada fotograma. O se puede pagar una vez, en una pasada de ordenación o de clasificación, y que el shader se ejecute sobre datos coherentes. La segunda opción casi siempre gana cuando el shader es caro o los datos son estables entre fotogramas, y casi siempre pierde cuando el shader es trivial.
+
+Hay una consecuencia de diseño que se ve poco y que separa a los motores buenos de los ingenuos: **un sistema de materiales con un shader gigante lleno de ramas es la peor arquitectura posible en una GPU, y es exactamente la que produce cualquier abstracción cómoda de materiales**. Los motores que rinden usan lo contrario: muchos pipelines especializados, generados a partir de un mismo código fuente con constantes de especialización, y objetos agrupados por pipeline. Cambiar de pipeline cuesta un poco de CPU; ejecutar ramas muertas cuesta GPU en cada píxel de cada fotograma. En cuanto la escena tiene cierto tamaño, ese intercambio no está ni cerca de ser equilibrado.
+</Callout>
+
+La divergencia explica por qué se pierde tiempo ejecutando trabajo inútil. La otra mitad del rendimiento se explica por dónde están los datos: [la jerarquía de memoria](/guia/webgpu/n2-jerarquia-de-memoria/).

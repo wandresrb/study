@@ -1,0 +1,130 @@
+---
+title: "El módulo de shader en la API: por qué createShaderModule nunca falla"
+description: "Cómo se entrega WGSL al navegador, cómo se leen los mensajes de compilación con línea y columna, y dónde ocurre de verdad la compilación cara."
+subject: webgpu
+level: 9
+order: 4
+icon: "9.4"
+duracion: "16 min"
+---
+
+<Lead>
+`createShaderModule` devuelve un objeto aunque le pases WGSL que no compila. No lanza, no devuelve `null` y no espera. Ese diseño es coherente con el resto de WebGPU y es la razón de que un error de sintaxis en un shader se manifieste tres llamadas más tarde como un fallo de pipeline sin relación aparente. Con dos líneas de código en el arranque, el mismo error aparece con su número de línea y su texto subrayado.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué la creación de recursos en WebGPU es síncrona y no lanza excepciones.
+- Leer `getCompilationInfo` y formatear sus mensajes con línea, columna y contexto.
+- Capturar errores de creación de módulo con un error scope y atribuirlos con etiquetas.
+- Distinguir el coste de crear un módulo del coste de crear un pipeline, y mover el segundo fuera del bucle.
+
+</Objetivos>
+
+## Crear no valida, usar sí
+
+Toda la API de creación de WebGPU sigue la misma regla: los métodos `createX` son síncronos, devuelven un objeto inmediatamente y **nunca lanzan por contenido inválido**. Si el contenido era inválido, lo que devuelven es un objeto en estado de error, y ese estado se propaga: cualquier cosa creada a partir de él también queda inválida.
+
+```js
+const modulo = device.createShaderModule({
+  label: 'gbuffer opaco',
+  code: fuenteConUnErrorDeSintaxis,
+});
+// modulo no es null. No se ha lanzado nada. El error viaja por otro canal.
+```
+
+El motivo es de arquitectura: la implementación de WebGPU vive en otro proceso, y validar de verdad requeriría un viaje de ida y vuelta. Hacer síncrona la validación obligaría a bloquear el hilo principal en cada creación. En vez de eso, la API adopta el modelo de **error contagioso**: el objeto existe, es inválido, y quien lo use hereda la invalidez hasta que alguien pregunta.
+
+Preguntar se hace de dos maneras. La primera son los error scopes, que capturan cualquier error generado entre el `push` y el `pop`:
+
+```js
+device.pushErrorScope('validation');
+const modulo = device.createShaderModule({ label: 'gbuffer opaco', code: fuente });
+const error = await device.popErrorScope();
+if (error) console.error('[gbuffer opaco]', error.message);
+```
+
+La segunda es el evento global, que conviene tener siempre puesto porque atrapa lo que se te escape:
+
+```js
+device.addEventListener('uncapturederror', (e) => {
+  console.error('WebGPU sin capturar:', e.error.message);
+});
+```
+
+## getCompilationInfo, el canal que nadie lee
+
+El módulo tiene además un canal propio y mucho más informativo que el error genérico: `getCompilationInfo()` devuelve una promesa con la lista de mensajes del compilador de WGSL, cada uno con su posición exacta.
+
+Cada mensaje tiene `message` con el texto, `type` con `'error'`, `'warning'` o `'info'`, `lineNum` y `linePos` en base uno, y `offset` y `length` en unidades de código dentro de la fuente. Con eso se puede reconstruir el subrayado que hace un compilador de verdad:
+
+```js
+async function revisarModulo(modulo, fuente, etiqueta) {
+  const info = await modulo.getCompilationInfo();
+  if (info.messages.length === 0) return true;
+
+  const lineas = fuente.split('\n');
+  let hayError = false;
+
+  for (const m of info.messages) {
+    if (m.type === 'error') hayError = true;
+    const cabecera = `${etiqueta}:${m.lineNum}:${m.linePos} ${m.type}: ${m.message}`;
+    const cuerpo = m.lineNum > 0
+      ? `\n  ${lineas[m.lineNum - 1]}\n  ${' '.repeat(Math.max(0, m.linePos - 1))}${'^'.repeat(Math.max(1, m.length))}`
+      : '';
+    (m.type === 'error' ? console.error : console.warn)(cabecera + cuerpo);
+  }
+  return !hayError;
+}
+```
+
+La parte que se suele ignorar es que **los mensajes aparecen también cuando la compilación tiene éxito**. Los avisos de un compilador de WGSL no son ruido: uno de los que más sale es el de uniformidad rebajada a advertencia, y otro es el de una función auxiliar que nunca se usa. Revisar los módulos en el arranque durante el desarrollo cuesta un `await` y detecta problemas que de otro modo aparecen como píxeles raros en una máquina que no es la tuya.
+
+<Callout type="tip" title="Pon la etiqueta siempre y ponla descriptiva">
+`label` está en todos los descriptores de WebGPU y las implementaciones lo incrustan en los mensajes de error. La diferencia entre «error de validación en el pipeline» y «error de validación en el pipeline sombras-direccional-cascada-2» es la diferencia entre buscar y saber. Cuesta cero en tiempo de ejecución y es la mejor inversión de la API.
+</Callout>
+
+## Dónde está el coste de verdad
+
+Existe la idea de que crear el módulo es la operación cara. No lo es, o al menos no es la más cara. Lo que hace una implementación al crear el módulo es analizar el WGSL y convertirlo a su representación intermedia. Lo que hace al crear el **pipeline** es especializarlo con las `override`, resolverlo contra el layout, traducirlo al lenguaje del backend y **pasarlo por el compilador del driver**, que es el que puede tardar decenas de milisegundos por variante.
+
+De ahí salen dos consecuencias operativas. La primera es que crear un pipeline durante el bucle de dibujado produce un tirón visible, y las versiones asíncronas existen para eso:
+
+```js
+const pipeline = await device.createRenderPipelineAsync({
+  label: 'opaco pbr',
+  layout: disposicion,
+  vertex:   { module: modulo, entryPoint: 'vs', buffers: [layoutVertices] },
+  fragment: { module: modulo, entryPoint: 'fs', targets: [{ format }] },
+  depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+});
+```
+
+La versión asíncrona no compila más rápido: compila fuera del hilo crítico y la promesa se resuelve cuando el pipeline está listo de verdad. Usarla en la carga y reutilizar los objetos es la única forma de que el primer fotograma de cada material no dé un salto.
+
+La segunda es que el descriptor del módulo admite un campo opcional pensado exactamente para esto:
+
+```js
+const modulo = device.createShaderModule({
+  label: 'escena',
+  code: fuente,
+  compilationHints: [
+    { entryPoint: 'vs', layout: disposicion },
+    { entryPoint: 'fs', layout: disposicion },
+  ],
+});
+```
+
+`compilationHints` le dice a la implementación con qué layout se va a usar cada punto de entrada, para que pueda adelantar trabajo en el momento de crear el módulo en vez de esperar al pipeline. Es una pista, no un contrato: una implementación puede ignorarla por completo y el resultado será el mismo. Por eso el layout que pases ahí no obliga a nada después.
+
+<Callout type="dios" title="El shader que compila en tu máquina puede tardar cien veces más en compilar en otra, y no es culpa del código">
+El tiempo de creación de un pipeline lo domina el compilador del driver, y ese compilador varía brutalmente entre fabricantes, entre generaciones y entre sistemas operativos. Un shader PBR completo puede tardar cinco milisegundos en una máquina de desarrollo con una GPU de escritorio reciente y doscientos en un portátil integrado de hace cuatro años, con el mismo WGSL byte a byte. La complejidad ciclomática del shader importa, pero importa menos que la calidad del backend que le toque.
+
+Eso convierte la creación de pipelines en un problema de **presupuesto de carga**, no de optimización de shader. Las tres decisiones que de verdad mueven la aguja son estas. **Crear todos los pipelines en el arranque con la variante asíncrona**, lanzadas en paralelo y esperadas con un `Promise.all`, en vez de perezosamente la primera vez que se dibuja el material. **Reducir el número de variantes**: cada permutación de `override` es una compilación distinta, y cien variantes a doscientos milisegundos son veinte segundos de carga en una máquina lenta. Y **compartir el módulo entre pipelines**, porque el análisis del texto sí se reutiliza aunque la compilación del backend no.
+
+El síntoma clásico de no haber hecho esto es una aplicación que va perfecta en el equipo del desarrollador y que en el portátil del cliente se congela un segundo la primera vez que aparece cada tipo de objeto. No es que el shader sea lento: es que se está compilando delante del usuario. Y como el problema no se reproduce en la máquina donde se desarrolla, sobrevive hasta producción con una regularidad deprimente.
+</Callout>
+
+<Reto title="Un cargador de shaders con diagnóstico">
+Escribe una función `cargarModulo(device, codigo, etiqueta)` que cree el módulo dentro de un error scope de validación, espere a `getCompilationInfo`, imprima los avisos aunque no haya errores, y devuelva `null` si hubo alguno de tipo `'error'`. Añade un modo silencioso que se active con una bandera para no pagar el `await` en producción, y comprueba que un WGSL con un punto y coma de más te da la línea correcta.
+</Reto>

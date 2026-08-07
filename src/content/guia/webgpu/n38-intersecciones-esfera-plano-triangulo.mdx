@@ -1,0 +1,245 @@
+---
+title: "Intersecciones: esfera, plano y Möller-Trumbore"
+description: "La matemática de los tres tests de intersección básicos en WGSL, con las variantes numéricamente estables y el intervalo que hace que la aceleración funcione."
+subject: webgpu
+level: 38
+order: 2
+icon: "38.2"
+duracion: "22 min"
+---
+
+<Lead>
+Un trazador de rayos es, por dentro, una función que devuelve el `t` más pequeño. Todo lo demás —la estructura de aceleración, el muestreo, la acumulación— existe para llamar a esa función menos veces o para interpretar mejor lo que devuelve. Merece la pena escribirla bien, porque las tres fórmulas que vienen a continuación están en todos los tutoriales y en casi todos con la versión que se rompe: la que funciona en una escena de tres esferas alrededor del origen y produce agujeros negros parpadeantes en cuanto la escena crece.
+</Lead>
+
+<Objetivos>
+
+- Escribir el contrato de un test de intersección: el intervalo de búsqueda y el registro de impacto que devuelve.
+- Resolver la cuadrática de la esfera con la formulación que no pierde precisión a distancia.
+- Derivar Möller-Trumbore desde la definición baricéntrica y justificar el signo del determinante.
+- Diagnosticar la autointersección y corregirla desplazando el origen en unidades de precisión, no en unidades de mundo.
+
+</Objetivos>
+
+## El contrato: intervalo y registro de impacto
+
+Todo test recibe un rayo y un intervalo `[tMin, tMax]`, y solo acepta impactos dentro de él. Los dos extremos existen por razones distintas y las dos son importantes.
+
+`tMin` está para evitar que un rayo que sale de una superficie vuelva a cortar esa misma superficie a distancia casi cero. Con aritmética exacta el punto de origen está justo sobre el triángulo y `t = 0`, que queda fuera del intervalo abierto; con `f32` el punto está unos cuantos ulps a un lado o a otro, y la mitad de las veces cae por debajo. El resultado es el moteado negro clásico, la *acne* de las sombras.
+
+`tMax` está por dos motivos y el segundo es el que lo cambia todo. El primero es acotar rayos que tienen una longitud conocida: un rayo de sombra hacia una luz puntual no necesita saber qué hay detrás de la luz, así que `tMax` es la distancia a la luz. El segundo es que **`tMax` no es una constante, es estado que encoge**. Cada vez que encuentras un impacto más cercano, bajas `tMax` a ese `t`, y a partir de ahí cualquier caja o triángulo que empiece más lejos se descarta sin tocar. Eso es literalmente lo que hace que recorrer un árbol de volúmenes sirva de algo: sin un `tMax` que se estreche, el recorrido visitaría todos los nodos que el rayo atraviesa en lugar de los que puede ver.
+
+El registro que devuelve el test:
+
+```wgsl
+struct Rayo {
+  origen : vec3<f32>,
+  dir    : vec3<f32>,        // unitaria: t se mide en unidades de mundo
+};
+
+struct Hit {
+  t      : f32,
+  normal : vec3<f32>,        // geometrica, sin normalizar por interpolar
+  uv     : vec2<f32>,        // coordenadas baricentricas o de textura
+  id     : u32,              // indice de primitiva; SIN_IMPACTO si no hay
+};
+
+const SIN_IMPACTO : u32 = 0xffffffffu;
+const EPS         : f32 = 1e-8;
+```
+
+Guardar el `id` y no el material resuelto es deliberado: el bucle de recorrido escribe muchas veces en el registro de impacto y quieres que sea barato, y además el material solo hace falta una vez, al final, cuando ya sabes cuál es el impacto ganador. Resolver el material dentro del bucle es un patrón que multiplica los accesos a memoria en la parte más caliente del código.
+
+## La esfera y la cancelación catastrófica
+
+Sustituye la parametrización del rayo en la ecuación de la esfera. Con `oc = origen − centro` y dirección unitaria:
+
+```text
+|oc + t·d|² = r²
+t² + 2t(oc·d) + oc·oc − r² = 0
+```
+
+Llamando `h = oc·d` y `c = oc·oc − r²`, las raíces son `t = −h ± √(h² − c)`. Es la fórmula que aparece en todas partes, y tiene dos formas de romperse.
+
+La primera está en el discriminante. Imagina una esfera de radio 1 a diez mil unidades de la cámara. Entonces `h ≈ −10⁴`, `h² ≈ 10⁸` y `c ≈ 10⁸ − 1`. Un `f32` tiene 24 bits de mantisa, y en la vecindad de `10⁸` el escalón entre valores representables vale exactamente 8, porque `2²⁶ = 67 108 864` y el paso es `2²⁶⁻²³ = 8`. Los dos operandos se redondean a múltiplos de 8, su diferencia es un múltiplo de 8, y el discriminante real —que debería valer del orden de 1— sale cuantizado a 0 o a 8. La esfera desaparece a trozos o le crece un borde dentado que depende de la posición de la cámara. Es cancelación catastrófica de manual: restar dos números casi iguales y grandes destruye todas las cifras significativas del resultado.
+
+La corrección es reescribir el discriminante para que nunca aparezca esa resta. Un poco de álgebra vectorial:
+
+```text
+h² − c = h² − oc·oc + r² = r² − ( |oc|² − (oc·d)² ) = r² − |oc − (oc·d)d|²
+```
+
+El término de la derecha es el cuadrado de la distancia del centro de la esfera a la recta del rayo. Cuando el rayo casi acierta, ese número es del orden de `r²`, o sea del orden de 1 en el ejemplo, y se calcula con vectores cuyas componentes son pequeñas. La resta ya no cancela nada. Es la reformulación que recoge *Ray Tracing Gems* y cuesta una operación más.
+
+La segunda rotura está en la elección de la raíz. `−h + √disc` cancela cuando `h` es positivo y `√disc` se le acerca, que es justo el caso de un rayo que nace sobre la superficie. La receta clásica de la cuadrática estable evita la resta calculando la raíz "buena" y sacando la otra por Vieta, aprovechando que el producto de las raíces vale `c`:
+
+```wgsl
+fn intersecarEsfera(rayo: Rayo, centro: vec3<f32>, radio: f32,
+                    tMin: f32, tMax: f32, id: u32, hit: ptr<function, Hit>) -> bool {
+  let oc = rayo.origen - centro;
+  let h  = dot(oc, rayo.dir);
+
+  // Discriminante geometrico: r^2 menos la distancia al eje del rayo, al cuadrado.
+  let perp = oc - h * rayo.dir;
+  let disc = radio * radio - dot(perp, perp);
+  if (disc < 0.0) { return false; }
+
+  let sd = sqrt(disc);
+
+  // Vieta: q = -(h + signo(h)*sd) nunca cancela; la otra raiz es c/q.
+  let q  = -(h + select(-sd, sd, h > 0.0));
+  let c  = dot(oc, oc) - radio * radio;
+  var t0 = q;
+  var t1 = c / q;
+  if (t0 > t1) { let tmp = t0; t0 = t1; t1 = tmp; }
+
+  var t = t0;
+  if (t < tMin || t > tMax) { t = t1; }
+  if (t < tMin || t > tMax) { return false; }
+
+  let p = rayo.origen + t * rayo.dir;
+  (*hit).t      = t;
+  (*hit).normal = (p - centro) / radio;
+  (*hit).id     = id;
+
+  // uv esferica: longitud y latitud normalizadas.
+  let n = (*hit).normal;
+  (*hit).uv = vec2<f32>(atan2(-n.z, n.x) * 0.15915494 + 0.5, acos(-n.y) * 0.31830989);
+  return true;
+}
+```
+
+Las constantes son `1/(2π)` y `1/π`. La normal se obtiene dividiendo por el radio en lugar de con `normalize`, que es una raíz cuadrada y una división menos. El caso degenerado `q = 0` requiere `h = 0` y `disc = 0` a la vez —el rayo pasa exactamente rozando por el ecuador visto desde el centro—, y entonces `c / q` da infinito o `NaN`; ambas cosas fallan las comparaciones del intervalo y el test devuelve `false`, que es lo correcto.
+
+Un apunte sobre el `select`: la firma de WGSL es `select(falso, verdadero, condicion)`, con el valor de "condición falsa" primero. El orden invertido respecto a un ternario de C es una de las erratas más productivas de todo el lenguaje.
+
+## El plano y la división que no puedes ignorar
+
+Un plano por punto y normal cumple `n·(P − p₀) = 0`. Sustituyendo el rayo y despejando:
+
+```text
+t = n·(p₀ − origen) / (n·d)
+```
+
+Y ahí está todo el test. El denominador `n·d` es el coseno del ángulo entre el rayo y la normal por las longitudes: vale cero exactamente cuando el rayo es paralelo al plano. Si el rayo además está contenido en el plano, el numerador también vale cero y tienes `0/0`.
+
+En C dividir por cero da infinito, `0/0` da `NaN`, y como todas las comparaciones con `NaN` son falsas la mayoría del código sobrevive por accidente. **En WGSL no puedes apoyarte en eso.** La especificación permite que la implementación trate los infinitos y los `NaN` como valores indeterminados, es decir: el resultado puede ser cualquier valor del tipo, y las optimizaciones del compilador pueden asumir que no aparecen. Un rayo paralelo a tu plano puede acabar devolviendo un `t` finito arbitrario que pasa el test del intervalo y pinta un píxel del color del suelo en mitad del cielo. Comprueba el denominador tú:
+
+```wgsl
+fn intersecarPlano(rayo: Rayo, p0: vec3<f32>, n: vec3<f32>,
+                   tMin: f32, tMax: f32, id: u32, hit: ptr<function, Hit>) -> bool {
+  let den = dot(n, rayo.dir);
+  if (abs(den) < EPS) { return false; }        // rayo paralelo al plano
+
+  let t = dot(n, p0 - rayo.origen) / den;
+  if (t < tMin || t > tMax) { return false; }
+
+  (*hit).t      = t;
+  (*hit).normal = select(n, -n, den > 0.0);    // siempre mirando al rayo
+  (*hit).id     = id;
+  (*hit).uv     = vec2<f32>(0.0);
+  return true;
+}
+```
+
+Un plano infinito no tiene caja envolvente finita, así que no cabe en una jerarquía de volúmenes y se prueba aparte, antes o después del recorrido del árbol, con el `tMax` compartido. Es la excepción que casi todo trazador acaba teniendo para el suelo.
+
+## Möller-Trumbore, derivado
+
+Un punto del triángulo se escribe como el vértice base más una combinación de las dos aristas, con las dos coordenadas positivas y su suma acotada:
+
+```text
+P(u,w) = v₀ + u·e₁ + w·e₂     con e₁ = v₁ − v₀ , e₂ = v₂ − v₀
+         u ≥ 0 , w ≥ 0 , u + w ≤ 1
+```
+
+Igualar eso al rayo da tres ecuaciones con tres incógnitas:
+
+```text
+origen + t·d = v₀ + u·e₁ + w·e₂
+−t·d + u·e₁ + w·e₂ = origen − v₀ = s
+```
+
+Es un sistema lineal `M·[t,u,w]ᵀ = s` con `M = [−d, e₁, e₂]` por columnas. Möller-Trumbore no es más que resolverlo por Cramer y organizar las cuentas para que los productos vectoriales se compartan. El determinante de una matriz tres por tres formada por columnas es el producto mixto, y con la propiedad cíclica sale:
+
+```text
+det(M) = −d·(e₁ × e₂) = e₁·(d × e₂)
+```
+
+Define `p = d × e₂`, y ya tienes `det = e₁·p`. Aplicando Cramer y usando de nuevo la propiedad cíclica para reutilizar `p` y un segundo producto `q = s × e₁`:
+
+```text
+u = s·p / det        w = d·q / det        t = e₂·q / det
+```
+
+Tres productos escalares y dos vectoriales para las tres incógnitas. Eso es todo el algoritmo:
+
+```wgsl
+fn intersecarTriangulo(rayo: Rayo, v0: vec3<f32>, v1: vec3<f32>, v2: vec3<f32>,
+                       tMin: f32, tMax: f32, id: u32, hit: ptr<function, Hit>) -> bool {
+  let e1 = v1 - v0;
+  let e2 = v2 - v0;
+
+  let p   = cross(rayo.dir, e2);
+  let det = dot(e1, p);
+
+  // Doble cara:  abs(det) < EPS  -> rayo paralelo al plano del triangulo.
+  // Una cara:    det < EPS       -> ademas descarta las caras traseras.
+  if (abs(det) < EPS) { return false; }
+
+  let invDet = 1.0 / det;
+  let s = rayo.origen - v0;
+
+  let u = dot(s, p) * invDet;
+  if (u < 0.0 || u > 1.0) { return false; }
+
+  let q = cross(s, e1);
+  let w = dot(rayo.dir, q) * invDet;
+  if (w < 0.0 || u + w > 1.0) { return false; }
+
+  let t = dot(e2, q) * invDet;
+  if (t < tMin || t > tMax) { return false; }
+
+  (*hit).t      = t;
+  (*hit).normal = cross(e1, e2);     // sin normalizar: cuesta menos aqui
+  (*hit).uv     = vec2<f32>(u, w);   // baricentricas: el tercer peso es 1-u-w
+  (*hit).id     = id;
+  return true;
+}
+```
+
+Las coordenadas baricéntricas salen gratis porque el algoritmo las necesita para el test de pertenencia. Con ellas interpolas cualquier atributo por vértice sin volver a calcular nada: `attr = attr₀·(1−u−w) + attr₁·u + attr₂·w`. Normales suavizadas, coordenadas de textura, colores por vértice, todo con la misma pareja de números.
+
+El backface culling es un caso de signo y ahora se puede justificar en lugar de recitar. Como `det = −d·(e₁ × e₂)` y `e₁ × e₂` es la normal geométrica con la regla de la mano derecha para un vértice en sentido antihorario, `det > 0` equivale a `d·n < 0`, es decir, el rayo llega a la cara delantera. Cambiar `abs(det) < EPS` por `det < EPS` descarta las traseras y ahorra la mitad de los tests en geometría cerrada. No lo actives si tu escena tiene planos de un polígono como paredes o vegetación en cartelas: desaparecen desde un lado y aparecen desde el otro.
+
+El epsilon del determinante merece un párrafo aparte porque casi nadie se para en él. `det` tiene dimensiones de longitud al cubo: es aproximadamente el doble del área del triángulo por el coseno del ángulo de incidencia. Un `EPS` de `1e-8` con triángulos de arista unidad rechaza solo incidencias de menos de `1e-8` radianes, que es lo que quieres. Pero exporta ese mismo modelo en milímetros, con aristas de `1e-3`, y los determinantes típicos caen a `1e-9`: **el epsilon pasa a rechazar el triángulo entero desde cualquier ángulo**. La geometría desaparece y el bug se atribuye al exportador. La solución robusta es un epsilon relativo al tamaño del triángulo, o mejor, normalizar la escala del modelo en la construcción de la escena para que las aristas típicas ronden la unidad.
+
+<Callout type="dios" title="El tMin constante es un parche que la aritmetica de coma flotante desmonta">
+Todo el mundo escribe `tMin = 0.001` para matar la acne y todo el mundo descubre tarde por qué no siempre funciona. La razón es que un `f32` no tiene una resolución absoluta, tiene una **resolución relativa**: 24 bits de mantisa significan que el escalón entre valores consecutivos es aproximadamente la magnitud del número dividida por dieciséis millones. Cerca del origen, a distancia 1, ese escalón vale `6·10⁻⁸` y un desplazamiento de `0.001` son más de dieciséis mil escalones, muchísimo margen. A distancia 1000 el escalón ya vale `6,1·10⁻⁵` y el mismo `0.001` son dieciséis escalones, justito. A distancia 100 000 —una escena de ciudad en centímetros, o cualquier cosa exportada desde un CAD sin recentrar— el escalón vale `0,0078`, así que `punto + 0.001` **es exactamente el mismo número en coma flotante que `punto`**: el desplazamiento se pierde entero en el redondeo y la acne vuelve, ahora sí, sin remedio. Subir el epsilon tampoco arregla nada, porque lo que es suficiente a cien mil unidades produce sombras despegadas y luz filtrándose por las esquinas cerca del origen. La corrección correcta es desplazar el origen en unidades de precisión en lugar de unidades de mundo: sumar un número fijo de ulps a la representación entera del flotante, que es una operación exactamente igual de barata y sí es invariante de escala. Con `bitcast` en WGSL cabe en diez líneas, y es la función `offset_ray` de *Ray Tracing Gems*:
+
+```wgsl
+const ORIGEN   : f32 = 1.0 / 32.0;
+const ESCALA_F : f32 = 1.0 / 65536.0;
+const ESCALA_I : f32 = 256.0;
+
+fn desplazarOrigen(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+  let oi = vec3<i32>(ESCALA_I * n);
+  let pi = vec3<f32>(
+    bitcast<f32>(bitcast<i32>(p.x) + select(oi.x, -oi.x, p.x < 0.0)),
+    bitcast<f32>(bitcast<i32>(p.y) + select(oi.y, -oi.y, p.y < 0.0)),
+    bitcast<f32>(bitcast<i32>(p.z) + select(oi.z, -oi.z, p.z < 0.0)),
+  );
+  // Cerca de cero la representacion entera se vuelve densisima: alli si vale un epsilon fijo.
+  return select(pi, p + ESCALA_F * n, abs(p) < vec3<f32>(ORIGEN));
+}
+```
+
+Sumar 256 al patrón de bits de un `f32` avanza 256 ulps sea cual sea la magnitud, porque los flotantes positivos ordenados por su patrón de bits interpretado como entero están ordenados por valor. Es el mismo truco que hay detrás del `nextafter` de la biblioteca estándar de C. Con esto puedes poner `tMin = 0.0` y quitar el epsilon del intervalo: el desplazamiento ya está hecho donde debe hacerse, en el origen, y escala solo.
+</Callout>
+
+<Reto title="Rompe los tres tests a propósito">
+1. Coloca una esfera de radio 1 a `1e4` unidades y compara la versión ingenua del discriminante con la geométrica: cuenta cuántos píxeles del borde cambian.
+2. Dispara un rayo exactamente paralelo a tu plano infinito y comprueba qué `t` devuelve tu GPU sin la guarda del denominador.
+3. Escala un modelo por `1e-3` y encuentra el valor de `EPS` a partir del cual los triángulos empiezan a desaparecer.
+4. Sustituye `tMin = 0.001` por `desplazarOrigen` y traslada la escena entera `1e5` unidades: la primera versión se llena de acne, la segunda no cambia.
+</Reto>

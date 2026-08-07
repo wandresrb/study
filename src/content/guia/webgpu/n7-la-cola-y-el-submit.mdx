@@ -1,0 +1,124 @@
+---
+title: "La cola: orden total, un solo destino y el coste de cada submit"
+description: "Qué garantiza el orden de la cola, cómo se intercalan writeBuffer y submit, por qué WebGPU expone una sola cola y cuántas veces conviene enviar por fotograma."
+subject: webgpu
+level: 7
+order: 5
+icon: "7.5"
+duracion: "16 min"
+---
+
+<Lead>
+`device.queue` es el único destino de trabajo de toda la API. Todo lo que la GPU hace —dibujar, calcular, copiar, recibir datos— entra por ahí y sale en el mismo orden en que entró. Esa garantía de orden total es lo que sustituye a toda la maquinaria de semáforos y vallas de Vulkan, y entenderla bien es lo que permite razonar sobre cuándo un dato está donde tiene que estar.
+</Lead>
+
+<Objetivos>
+
+- Enunciar la garantía de orden de la cola y qué se deduce de ella.
+- Ordenar correctamente `writeBuffer` y `submit` dentro de un fotograma.
+- Justificar por qué WebGPU expone una sola cola y qué se pierde con ello.
+- Decidir cuántos `submit` hacer por fotograma.
+
+</Objetivos>
+
+## Orden total
+
+La cola tiene una propiedad simple y muy potente: **todo lo que se le encola se ejecuta en el orden en que se encoló**. No hay reordenamiento observable, no hay ejecución concurrente de dos elementos de la cola, no hay que sincronizar nada.
+
+Eso incluye las cuatro operaciones que encolan trabajo:
+
+```js
+device.queue.submit([commandBuffers]);
+device.queue.writeBuffer(buffer, offset, datos);
+device.queue.writeTexture(destino, datos, disposicion, tamano);
+device.queue.copyExternalImageToTexture(origen, destino, tamano);
+```
+
+Las tres últimas son copias que se encolan igual que un command buffer, en el mismo orden relativo. Ese detalle es el que resuelve la pregunta que todo el mundo se hace la primera semana: si `writeBuffer` es asíncrono, cómo sé que los datos han llegado antes del dibujo que los usa.
+
+La respuesta es el orden:
+
+```js
+// Correcto: la escritura se encola antes que el submit.
+device.queue.writeBuffer(uniformes, 0, datos);
+device.queue.submit([encoder.finish()]);
+
+// Incorrecto: los comandos ya estaban encolados cuando llega la escritura.
+device.queue.submit([encoder.finish()]);
+device.queue.writeBuffer(uniformes, 0, datos);   // llega tarde para este frame
+```
+
+En el segundo caso los datos sí llegan, pero los usará el fotograma siguiente. El síntoma es un desfase de un fotograma que solo se nota cuando algo se mueve rápido, y es el tipo de bug que se descarta como «cosas del navegador» hasta que alguien mira el orden.
+
+Y una garantía complementaria sobre `writeBuffer` que hace que sea cómoda de usar: **la copia desde tu `ArrayBuffer` es síncrona**. Cuando la llamada retorna, puedes modificar el array libremente sin afectar a lo que se va a escribir. Reutilizar el mismo array cada fotograma es correcto y es el patrón recomendado.
+
+## Una sola cola
+
+`device.queue` es el único objeto de cola que existe y no hay forma de crear otro. La especificación deja la puerta abierta a exponer más en el futuro, pero no las define.
+
+Es una simplificación grande respecto a las APIs nativas. Vulkan expone familias de colas —gráficos, cómputo, transferencia— y a menudo varias de cada familia, con la posibilidad de que trabajos de colas distintas se ejecuten a la vez en el hardware. Un motor nativo aprovecha eso para, por ejemplo, subir texturas de un nivel en la cola de transferencia mientras la cola de gráficos dibuja el nivel actual.
+
+**Lo que se pierde:** no se puede expresar que una operación es independiente de las demás y puede solaparse. Una copia grande de subida bloquea la cola igual que un pase de render.
+
+**Lo que se gana:** desaparece toda la sincronización entre colas, que en Vulkan es una de las fuentes más ricas de errores difíciles. No hay semáforos, no hay vallas, no hay propiedad de recursos que transferir entre familias. El orden total lo resuelve gratis.
+
+Es un intercambio muy razonable para una API que quiere ser portable a tres modelos distintos y usable sin un año de experiencia previa. Y en la práctica, la implementación tiene libertad para usar varias colas nativas por debajo mientras el comportamiento observable respete el orden.
+
+<Callout type="info" title="Orden total no significa ejecución estrictamente serial">
+La GPU puede solapar internamente el final de un trabajo con el principio del siguiente si no hay dependencias de datos entre ellos. Lo que la especificación garantiza es que los **resultados** son los mismos que si se ejecutaran uno detrás de otro. La implementación tiene bastante libertad para exprimir el hardware dentro de esa garantía.
+</Callout>
+
+## Cuántos submit por fotograma
+
+El valor por defecto es uno, y hay razones para desviarse en las dos direcciones.
+
+**Un solo `submit` con un solo command buffer** es lo correcto para la mayoría de aplicaciones. Un cruce de frontera, una traducción, una entrega.
+
+**Un solo `submit` con varios command buffers** es igual de eficiente y mejor arquitectónicamente cuando distintos subsistemas graban por separado. `queue.submit([escena, interfaz, efectos])` los ejecuta en ese orden y cuesta lo mismo que enviar uno.
+
+```js
+const cbEscena = grabarEscena(device, estado);
+const cbInterfaz = grabarInterfaz(device, estado);
+device.queue.submit([cbEscena, cbInterfaz]);
+```
+
+**Varios `submit`** tiene un coste fijo cada uno y solo compensa por un motivo: **que la GPU empiece a trabajar antes**. Si el fotograma tiene una fase de cómputo pesada al principio y la preparación de la fase de render requiere trabajo de CPU considerable, enviar el cómputo pronto pone a la GPU a trabajar mientras la CPU sigue grabando:
+
+```js
+// La GPU empieza la simulacion mientras la CPU prepara el render.
+const cbComputo = grabarSimulacion(device);
+device.queue.submit([cbComputo]);
+
+const cbRender = grabarRender(device, estado);   // trabajo de CPU considerable
+device.queue.submit([cbRender]);
+```
+
+Y hay un caso donde un `submit` extra es obligatorio: **para que una promesa de lectura pueda avanzar**. Un `mapAsync` no se resuelve hasta que la copia que lo alimenta se ha enviado. Si la copia sigue dentro de un encoder que no has cerrado, la promesa se queda pendiente para siempre. Es un interbloqueo silencioso que se describe como «mi lectura no vuelve» y cuya causa es que faltaba enviar.
+
+## Saber cuándo ha terminado
+
+```js
+await device.queue.onSubmittedWorkDone();
+```
+
+No recibe argumentos y resuelve con `undefined` cuando **todo el trabajo enviado antes de la llamada** ha terminado en la GPU. Su resolución implica además que los `mapAsync` pendientes sobre búferes usados exclusivamente en esa cola pueden avanzar.
+
+Sus dos usos legítimos son medir —envolver un trabajo entre dos marcas de tiempo de CPU para saber cuánto tardó de verdad— y reciclar recursos, sabiendo con certeza que ya no están en uso.
+
+Y su uso ilegítimo es tan común que merece decirse otra vez: **un `await` sobre esto dentro del bucle de fotograma serializa la CPU con la GPU y tira por la borda el solapamiento entre fotogramas**. El resultado es aproximadamente la mitad de rendimiento, con los dos lados aparentando estar ociosos.
+
+<Callout type="dios" title="La cola tiene profundidad, y esa profundidad es la latencia que sientes al mover el ratón">
+Hay un fenómeno que la gente atribuye a todo menos a su causa: **la sensación de que la cámara responde con retraso, aunque el contador de fotogramas diga 60**. No es un problema de rendimiento; es un problema de profundidad de cola.
+
+La mecánica es esta. Tu bucle graba y envía un fotograma cada vez que `requestAnimationFrame` se dispara. Si la GPU tarda más que la CPU en cada fotograma, el trabajo se acumula: la CPU va por el fotograma N+3 mientras la GPU ejecuta el N y la pantalla muestra el N-1. El resultado se ve fluido, porque los fotogramas salen a ritmo constante, y **cada uno refleja una entrada de hace cuatro fotogramas**: sesenta y tantos milisegundos de retraso entre mover el ratón y ver el efecto. Es perfectamente perceptible en cualquier cosa interactiva y es infernal en realidad virtual.
+
+Lo que hay que saber es que **WebGPU no expone ningún control directo sobre la profundidad de la cola**. No hay `setMaximumFrameLatency` ni equivalente. Lo que hay son dos estrategias indirectas.
+
+La primera es **no adelantarse**: usar `onSubmittedWorkDone` para no encolar el fotograma N+2 hasta que el N haya terminado, manteniendo como mucho dos fotogramas en vuelo. Es un uso legítimo de esa promesa, y hay que hacerlo con cuidado de no serializar del todo: uno en vuelo es latencia mínima y rendimiento pésimo, dos es el equilibrio habitual.
+
+La segunda, y casi siempre la mejor, es **hacer que la GPU no sea el cuello**. Si el trabajo de GPU cabe holgadamente en el presupuesto del fotograma, la cola no se llena y la latencia se mantiene mínima sola. Bajar la resolución interna un 20% suele tener más efecto sobre la sensación de respuesta que cualquier truco de sincronización.
+
+Y el corolario para medir: **el tiempo de fotograma y la latencia de entrada son dos métricas distintas y hay que vigilar las dos**. Un cambio que mejora la primera puede empeorar la segunda, y solo una de las dos se nota al mirar la pantalla sin tocar nada.
+</Callout>
+
+Queda el otro lado de la cola, el que va de la GPU a tu código: [por qué leer de la GPU es caro](/guia/webgpu/n8-por-que-leer-es-caro/).

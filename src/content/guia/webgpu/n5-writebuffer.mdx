@@ -1,0 +1,146 @@
+---
+title: "queue.writeBuffer: la escritura de cada fotograma"
+description: "La firma completa y su trampa de unidades, las alineaciones obligatorias, qué hace la implementación por debajo y cuándo writeBuffer deja de ser la mejor opción."
+subject: webgpu
+level: 5
+order: 4
+icon: "5.4"
+duracion: "16 min"
+---
+
+<Lead>
+`queue.writeBuffer` es la función que más se llama en una aplicación de WebGPU y la que más fácil es usar mal, porque su firma tiene cinco parámetros de los que tres son opcionales y dos cambian de unidad según el tipo del argumento que le pases. Detrás hace algo más complejo de lo que aparenta, y saber qué es determina cuándo conviene usarla y cuándo hay algo mejor.
+</Lead>
+
+<Objetivos>
+
+- Usar la firma completa de `writeBuffer` sin equivocarse de unidades.
+- Aplicar las alineaciones que exige la validación.
+- Describir qué hace la implementación entre la llamada y la escritura real.
+- Elegir entre `writeBuffer`, staging propio y `copyBufferToBuffer` según el caso.
+
+</Objetivos>
+
+## La firma y su trampa
+
+```js
+device.queue.writeBuffer(buffer, bufferOffset, data, dataOffset, size);
+```
+
+**`buffer`** tiene que tener `COPY_DST` en su `usage`. Sin él, error de validación.
+
+**`bufferOffset`** es el desplazamiento en el búfer de destino, **siempre en bytes**, y tiene que ser múltiplo de 4.
+
+**`data`** puede ser un `ArrayBuffer` o cualquier vista tipada.
+
+**`dataOffset`** y **`size`** son opcionales, y aquí está la trampa: **si `data` es una vista tipada, se miden en elementos; si es un `ArrayBuffer`, en bytes**.
+
+```js
+const datos = new Float32Array(1000);
+
+// Escribe los elementos 100 a 199 de 'datos' al principio del buffer.
+// dataOffset y size en ELEMENTOS porque datos es un Float32Array.
+device.queue.writeBuffer(buffer, 0, datos, 100, 100);   // 400 bytes escritos
+
+// Lo mismo con un ArrayBuffer: ahora los numeros son BYTES.
+device.queue.writeBuffer(buffer, 0, datos.buffer, 400, 400);
+```
+
+Las dos líneas escriben lo mismo con números distintos. Es una fuente de errores constante, y la forma de no caer en ella es fijar una convención en tu proyecto y no mezclarlas. La recomendación práctica: **usa siempre vistas tipadas y piensa en elementos**, que es lo que la mayoría del código de ejemplo hace.
+
+Y una regla de validación adicional: **el tamaño escrito, convertido a bytes, tiene que ser múltiplo de 4**. Escribir tres bytes lanza un `OperationError`.
+
+<Callout type="warn" title="Subvistas y byteOffset">
+Si pasas una subvista creada con `subarray()`, su `byteOffset` respecto al `ArrayBuffer` subyacente **ya está tenido en cuenta**: `dataOffset` se cuenta desde el principio de la vista, no del búfer subyacente. Es lo intuitivo, y aun así conviene tenerlo presente cuando se combinan `subarray` y `dataOffset` en la misma llamada, porque los desplazamientos se suman y es fácil contar uno dos veces.
+</Callout>
+
+## Qué ocurre por debajo
+
+`writeBuffer` retorna inmediatamente y la escritura no ha ocurrido todavía. Lo que hace la implementación es, en esencia, esto:
+
+Copia tus datos a un búfer de staging interno que gestiona ella. **Esa copia sí es síncrona**: cuando `writeBuffer` retorna, puedes modificar tu `Float32Array` sin que afecte a lo que se va a escribir. Es una garantía importante y es la razón de que `writeBuffer` sea cómoda.
+
+Encola una operación de copia del staging al búfer de destino, **en el mismo orden de la cola que los `submit`**. Eso significa que una escritura hecha antes de un `submit` es visible para los comandos de ese submit, y una hecha después no lo es para los comandos ya enviados. El orden que ves en tu código es el orden que se respeta.
+
+Recicla el staging interno cuando la copia ha terminado. Ese reciclaje es lo que hace que llamar a `writeBuffer` mil veces por fotograma no reserve mil búferes, y también es lo que puede saturarse si escribes cantidades muy grandes.
+
+De ese modelo salen dos consecuencias operativas. La primera: **`writeBuffer` es la forma correcta de actualizar datos pequeños cada fotograma**, y la implementación está optimizada para ese caso. La segunda: **hay una copia extra respecto a escribir en un búfer mapeado**, y con volúmenes grandes esa copia se nota.
+
+## Los patrones que funcionan
+
+**Uniformes por fotograma.** El caso más común. Un `Float32Array` reutilizado, rellenado en sitio, escrito de una vez:
+
+```js
+const datosUniformes = new Float32Array(32);   // 128 bytes
+
+function frame() {
+  datosUniformes.set(matrizVistaProyeccion, 0);
+  datosUniformes.set(posicionCamara, 16);
+  datosUniformes[19] = tiempo;
+  device.queue.writeBuffer(bufferUniformes, 0, datosUniformes);
+  // ... grabar y enviar comandos
+}
+```
+
+Reutilizar el mismo array evita reservas y presión sobre el recolector de basura. Una escritura de 128 bytes por fotograma es despreciable.
+
+**Actualización parcial.** Solo lo que cambió, en lugar del búfer entero:
+
+```js
+// Actualizar solo la instancia 42, sin tocar las otras mil.
+const OFFSET_INSTANCIA = 42 * 64;
+device.queue.writeBuffer(instancias, OFFSET_INSTANCIA, matriz);
+```
+
+**Agrupar en lugar de fragmentar.** Mil llamadas de 64 bytes cuestan mucho más que una de 64000. Si vas a actualizar muchos elementos, monta un array en JavaScript y escribe una vez.
+
+## Cuándo dejar de usarla
+
+Tres casos en que hay algo mejor.
+
+**Datos muy grandes que se escriben una vez.** Para varios megabytes de geometría al cargar, `mappedAtCreation` evita la copia intermedia. La diferencia con 200 MB es medible.
+
+**Escrituras grandes y repetidas.** Si escribes decenas de megabytes por fotograma, el staging interno puede convertirse en el cuello. Un anillo de búferes de staging propios con `MAP_WRITE | COPY_SRC` da control sobre cuánta memoria se usa y cuándo:
+
+```js
+// Anillo propio de staging para escrituras grandes y frecuentes.
+const staging = buffersDisponibles.pop() ?? device.createBuffer({
+  size: TAM, usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC,
+});
+await staging.mapAsync(GPUMapMode.WRITE);
+new Float32Array(staging.getMappedRange()).set(datosGrandes);
+staging.unmap();
+
+const encoder = device.createCommandEncoder();
+encoder.copyBufferToBuffer(staging, 0, destino, 0, TAM);
+device.queue.submit([encoder.finish()]);
+device.queue.onSubmittedWorkDone().then(() => buffersDisponibles.push(staging));
+```
+
+Es bastante más código y solo compensa cuando el perfil dice que compensa.
+
+**Datos que ya están en la GPU.** Si el contenido que quieres poner en un búfer lo produjo otro búfer, `copyBufferToBuffer` lo mueve sin pasar por la CPU. Es la operación más rápida de todas y la que se olvida:
+
+```js
+const encoder = device.createCommandEncoder();
+encoder.copyBufferToBuffer(origen, 0, destino, 0, tamano);
+// O la forma corta, equivalente a los desplazamientos a cero:
+encoder.copyBufferToBuffer(origen, destino, tamano);
+device.queue.submit([encoder.finish()]);
+```
+
+La especificación admite las dos formas. Los desplazamientos y el tamaño tienen que ser múltiplos de 4, el origen necesita `COPY_SRC`, el destino `COPY_DST`, y no pueden ser el mismo búfer.
+
+<Callout type="dios" title="El bug de writeBuffer que más tiempo cuesta no es de la API: es de disposición de memoria">
+`writeBuffer` funciona. Lo que falla es lo que escribes, y el modo de fallo es cruel: **no hay ningún error, ni de validación ni de consola, y los datos llegan mal**.
+
+La causa es siempre la misma. Las reglas de alineación de WGSL no son las de C ni las que asume tu código de JavaScript. Un `struct` con un `vec3f` seguido de un `f32` **no** ocupa 16 bytes seguidos: `vec3f` tiene tamaño 12 y alineación 16, así que el `f32` no va en el byte 12, va en el 16, y el struct ocupa 32 bytes. Si tu `Float32Array` pone el escalar en el índice 3, el shader lee basura de relleno.
+
+Peor todavía: **muchas veces funciona por casualidad**. Si todos tus campos son `vec4f` o `mat4x4f`, la disposición coincide y el código parece correcto durante meses. El día que alguien añade un `f32` al final o cambia un `vec4f` por un `vec3f`, todo se desplaza y aparecen valores absurdos en un sitio que nadie ha tocado.
+
+La disciplina que lo elimina no es aprenderse las reglas de memoria, aunque también: es **verificar la disposición una vez, con un test, y no volver a confiar en la vista**. El método más directo cabe en veinte líneas: escribe un patrón conocido —1, 2, 3, 4...— en el búfer, lánzalo por un compute shader trivial que copie cada campo del struct a un búfer de salida, léelo de vuelta e imprime. Los números te dicen exactamente en qué byte ha caído cada campo. Cuesta media hora la primera vez y se reutiliza en cada struct nuevo del proyecto.
+
+Y el hábito complementario, que no cuesta nada: **usa `vec4f` en lugar de `vec3f` en cualquier struct que cruce la frontera CPU-GPU**. El cuarto componente casi siempre encuentra un uso —un escalar que ibas a poner al lado— y a cambio la disposición se vuelve trivialmente predecible.
+</Callout>
+
+Falta poner nombre a lo que hay detrás de todo esto: [el modelo de memoria](/guia/webgpu/n5-el-modelo-de-memoria/).

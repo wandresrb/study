@@ -1,0 +1,168 @@
+---
+title: "Decodificar fuera del hilo principal"
+description: "Evitar el tirón que produce decodificar una imagen grande justo antes de dibujarla, usando decode, createImageBitmap y un worker de decodificación."
+subject: canvas
+level: 8
+order: 4
+icon: "8.4"
+duracion: "16 min"
+---
+
+<Lead>
+Una imagen que ha terminado de descargarse todavía no está lista para dibujarse: los bytes están comprimidos y hay que descomprimirlos, y esa descompresión cuesta decenas de milisegundos en una foto grande. Si ocurre dentro de tu `drawImage`, ocurre en el hilo principal y produce un fotograma perdido. Hay tres formas de sacarla de ahí, con distinto grado de control.
+</Lead>
+
+<Objetivos>
+
+- Distinguir descarga, decodificación y dibujo como tres fases con costes distintos.
+- Usar `img.decode()` para adelantar la decodificación de forma controlada.
+- Delegar la decodificación completa a un worker con `createImageBitmap`.
+- Medir el coste real de decodificar y decidir si merece la pena optimizarlo.
+
+</Objetivos>
+
+## Tres fases, no una
+
+Cuando escribes `img.src = url` y esperas al evento `load`, has cubierto solo dos de las tres fases.
+
+**Descarga**: los bytes llegan por la red. El evento `load` se dispara cuando termina.
+
+**Decodificación**: los bytes comprimidos se convierten en una rejilla de píxeles. Puede ocurrir durante la descarga, después, o **en el momento del primer dibujo**, según el navegador y las circunstancias.
+
+**Subida y dibujo**: los píxeles llegan a la memoria de vídeo y se componen.
+
+El problema es que la segunda fase no tiene un momento garantizado. En muchos casos el navegador la aplaza hasta que la imagen se necesita de verdad, que es una optimización sensata salvo cuando ese momento coincide con tu bucle de animación.
+
+Una foto de 4000 por 3000 en JPEG tarda del orden de 30 a 80 milisegundos en decodificarse en un portátil, y varias veces más en un móvil de gama media. Eso son entre dos y quince fotogramas perdidos.
+
+## decode: adelantar de forma controlada
+
+`HTMLImageElement.decode()` devuelve una promesa que se resuelve cuando la imagen está descargada **y** decodificada y lista para dibujar sin bloquear.
+
+```js
+const img = new Image();
+img.src = '/foto-grande.jpg';
+await img.decode();          // aqui ya no hay sorpresas
+ctx.drawImage(img, 0, 0);    // dibujo barato y predecible
+```
+
+Comparado con esperar al evento `load`, la diferencia es exactamente la fase de decodificación. Comparado con no esperar nada, la diferencia es que el tirón ocurre donde tú decides.
+
+Un detalle importante: `decode()` **rechaza** si la imagen no se puede decodificar, lo que la convierte también en una forma limpia de detectar errores.
+
+```js
+async function cargarLista(url) {
+  const img = new Image();
+  img.src = url;
+  try { await img.decode(); return img; }
+  catch { throw new Error('Imagen inválida o no disponible: ' + url); }
+}
+```
+
+Y una advertencia: llamar a `decode()` sobre una imagen cuyo `src` aún no se ha asignado deja la promesa pendiente indefinidamente en algunos motores. Asigna primero.
+
+## createImageBitmap: decodificación completa fuera del hilo
+
+`createImageBitmap` va un paso más allá: en los navegadores actuales, la decodificación de un `Blob` ocurre **fuera del hilo principal** y la promesa se resuelve con la imagen ya lista.
+
+```js
+const blob = await (await fetch(url)).blob();
+const bitmap = await createImageBitmap(blob);
+ctx.drawImage(bitmap, 0, 0);
+```
+
+Frente a `decode()`, gana en dos cosas: el resultado ya está en un formato apto para la GPU, y puedes reescalar durante la decodificación con `resizeWidth`, lo que reduce enormemente el coste cuando la imagen se va a mostrar pequeña.
+
+Frente a un elemento `<img>`, pierde en una: no participa en la carga de recursos del documento, así que no se beneficia de las prioridades de red del navegador ni de `srcset`. Para la imagen principal de una página, un `<img>` con `decode()` suele ser mejor; para recursos de una aplicación gráfica, `createImageBitmap` es mejor.
+
+## Un worker de decodificación
+
+Cuando hay muchas imágenes —una galería, un mapa de teselas, un catálogo— compensa montar un worker dedicado que descargue y decodifique, y devuelva bitmaps transferidos.
+
+```js
+// decodificador.js (worker)
+self.onmessage = async ({ data }) => {
+  const { id, url, opciones } = data;
+  try {
+    const respuesta = await fetch(url);
+    if (!respuesta.ok) throw new Error('HTTP ' + respuesta.status);
+    const blob = await respuesta.blob();
+    const bitmap = await createImageBitmap(blob, opciones);
+    // Transferir: no se copian los pixeles, se mueve la propiedad
+    self.postMessage({ id, bitmap }, [bitmap]);
+  } catch (e) {
+    self.postMessage({ id, error: String(e) });
+  }
+};
+```
+
+```js
+// hilo principal
+class Decodificador {
+  constructor(n = 3) {
+    this.workers = Array.from({ length: n }, () => new Worker('/decodificador.js'));
+    this.pendientes = new Map();
+    this.siguiente = 0;
+    this.id = 0;
+    for (const w of this.workers) {
+      w.onmessage = ({ data }) => {
+        const pendiente = this.pendientes.get(data.id);
+        if (!pendiente) return;
+        this.pendientes.delete(data.id);
+        data.error ? pendiente.rechazar(new Error(data.error))
+                   : pendiente.resolver(data.bitmap);
+      };
+    }
+  }
+  cargar(url, opciones) {
+    const id = ++this.id;
+    const w = this.workers[this.siguiente++ % this.workers.length];
+    return new Promise((resolver, rechazar) => {
+      this.pendientes.set(id, { resolver, rechazar });
+      w.postMessage({ id, url, opciones });
+    });
+  }
+  terminar() { for (const w of this.workers) w.terminate(); }
+}
+```
+
+Con tres workers, la decodificación de una galería se paraleliza y el hilo principal solo recibe bitmaps listos. El coste en el hilo principal por imagen se reduce a la recepción del mensaje, que con transferencia es prácticamente cero porque no se copia nada.
+
+<Callout type="dios" title="El tirón que ves puede no ser la decodificación, sino la subida a la GPU">
+Aquí hay una distinción que casi nadie hace y que explica por qué a veces mover la decodificación a un worker **no arregla el tirón**. Después de decodificar hay una cuarta fase que no aparece en ninguna documentación: **la subida de la textura a memoria de vídeo**. La primera vez que dibujas una imagen grande en un canvas acelerado, el navegador tiene que transferir esos megabytes desde la memoria del sistema a la de la GPU, y esa transferencia ocurre en el hilo que hace el dibujo, sincronizada con el pipeline gráfico. En una foto de 4K son entre 5 y 20 milisegundos que aparecen en el perfil como tiempo dentro de `drawImage`, no como decodificación. El síntoma es característico y desconcierta: la **primera** vez que dibujas una imagen cuesta mucho, y todas las siguientes son gratis. La técnica que lo resuelve se llama calentamiento de textura y consiste en dibujar la imagen una vez, fuera de la vista, antes de necesitarla de verdad: un `drawImage` de un píxel en un canvas auxiliar basta para forzar la subida. Después, el dibujo real ya encuentra la textura en la GPU.
+
+```js
+function calentar(bitmap) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 1;
+  c.getContext('2d').drawImage(bitmap, 0, 0, 1, 1);
+}
+```
+
+Es un hack, y es el tipo de hack que separa una galería que va fluida de una que da un salto en cada imagen. Y hay un corolario incómodo: el navegador puede **expulsar** texturas de la memoria de vídeo bajo presión, con lo que una imagen ya calentada puede volver a costar la subida más adelante. Por eso el calentamiento es una mejora estadística, no una garantía, y por eso las aplicaciones que necesitan latencia predecible limitan el número de imágenes grandes vivas a la vez.
+</Callout>
+
+## Medir antes de optimizar
+
+Todo lo anterior tiene coste de complejidad, así que conviene medir si el problema existe. La medición directa:
+
+```js
+async function medirDecodificacion(url) {
+  const blob = await (await fetch(url)).blob();
+  const t0 = performance.now();
+  const bitmap = await createImageBitmap(blob);
+  const t1 = performance.now();
+  const c = document.createElement('canvas');
+  c.width = c.height = 1;
+  c.getContext('2d').drawImage(bitmap, 0, 0, 1, 1);
+  const t2 = performance.now();
+  bitmap.close();
+  return {
+    decodificar: +(t1 - t0).toFixed(2),
+    subir: +(t2 - t1).toFixed(2),
+    dimensiones: `${bitmap.width}×${bitmap.height}`,
+  };
+}
+```
+
+Si la suma de ambos tiempos está por debajo de unos pocos milisegundos, no hay problema que resolver. Si supera los diez, ya vale la pena adelantar la decodificación; si supera los treinta, hace falta el worker o reducir la resolución de origen, que casi siempre es la respuesta correcta y la que nadie propone.

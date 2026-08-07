@@ -1,0 +1,167 @@
+---
+title: "mapAsync, getMappedRange y unmap: el ciclo completo"
+description: "La firma de mapAsync y sus alineaciones, qué devuelve getMappedRange, por qué el ArrayBuffer se desancla al desmapear, y el estado mapState que evita los errores de doble mapeo."
+subject: webgpu
+level: 8
+order: 3
+icon: "8.3"
+duracion: "17 min"
+---
+
+<Lead>
+Mapear un búfer es pedir que su contenido esté accesible desde JavaScript. Son tres llamadas y un ciclo de vida estricto: una promesa que espera a la GPU, un `ArrayBuffer` que solo existe mientras dura el mapeo, y una liberación obligatoria. Saltarse cualquiera de los tres pasos produce errores que no se parecen a su causa, incluidas escrituras que se pierden sin dejar rastro.
+</Lead>
+
+<Objetivos>
+
+- Usar `mapAsync` con sus tres parámetros y sus alineaciones.
+- Explicar qué es el `ArrayBuffer` de `getMappedRange` y cuánto vive.
+- Consultar `mapState` para evitar los errores de doble mapeo.
+- Escribir el ciclo completo de lectura con manejo de errores.
+
+</Objetivos>
+
+## mapAsync
+
+```js
+await buffer.mapAsync(modo, offset, size);
+```
+
+**`modo`** es `GPUMapMode.READ` o `GPUMapMode.WRITE`. Son las dos únicas constantes que existen, con valores 1 y 2. El modo tiene que ser coherente con el `usage` del búfer: `READ` exige `MAP_READ`, `WRITE` exige `MAP_WRITE`.
+
+**`offset`** es opcional, por defecto 0, y tiene que ser **múltiplo de 8**.
+
+**`size`** es opcional; si se omite, el rango llega hasta el final del búfer. El tamaño resultante tiene que ser **múltiplo de 4**.
+
+Si alguna de esas dos alineaciones no se cumple, la promesa rechaza con `OperationError`. Las dos son fáciles de cumplir mapeando el búfer entero desde cero, que es lo que se hace casi siempre.
+
+La promesa resuelve con `undefined` cuando el búfer está listo, y eso ocurre **después de que la GPU haya terminado todo el trabajo enviado antes**. Ahí está la latencia entera de la que va este nivel.
+
+Y una condición que produce un interbloqueo silencioso: **la promesa no puede resolverse si el trabajo que llena el búfer no se ha enviado**. Si grabas la copia en un encoder y no llamas a `queue.submit()`, `mapAsync` se queda pendiente para siempre, sin error y sin aviso. Es el fallo que se describe como «mi lectura no vuelve», y la causa es casi siempre un `submit` que falta.
+
+## getMappedRange
+
+```js
+const arrayBuffer = buffer.getMappedRange(offset, size);
+```
+
+Devuelve un `ArrayBuffer` con el contenido del rango mapeado. Sin argumentos abarca todo lo que se mapeó. Sus alineaciones son las mismas que las de `mapAsync`: offset múltiplo de 8, tamaño múltiplo de 4. Y el rango pedido tiene que estar dentro del que se mapeó y no solaparse con otro rango activo.
+
+El `ArrayBuffer` no tiene tipo, así que hay que envolverlo en la vista que corresponda:
+
+```js
+const datos = new Float32Array(buffer.getMappedRange());
+console.log(datos[0], datos[1], datos[2]);
+```
+
+Y aquí está la propiedad que hay que interiorizar: **ese `ArrayBuffer` se desancla al llamar a `unmap()`**. No se vacía ni se copia: deja de existir como almacenamiento. Su `byteLength` pasa a cero y cualquier vista creada sobre él se queda vacía.
+
+```js
+await staging.mapAsync(GPUMapMode.READ);
+const vista = new Float32Array(staging.getMappedRange());
+staging.unmap();
+console.log(vista.length);        // 0
+console.log(vista[0]);            // undefined
+```
+
+Ese es el bug que más cuesta encontrar de todo el ciclo, porque **no lanza ningún error**. Escribes en un array de longitud cero, lees `undefined`, y el código sigue como si nada.
+
+La regla que lo elimina es sencilla y absoluta: **copia los datos antes de desmapear**.
+
+```js
+await staging.mapAsync(GPUMapMode.READ);
+const copia = new Float32Array(staging.getMappedRange().slice(0));   // copia real
+staging.unmap();
+// 'copia' sobrevive y es tuya.
+```
+
+`slice(0)` sobre el `ArrayBuffer` produce un `ArrayBuffer` nuevo e independiente. También vale construir la vista tipada y llamar a `.slice()` sobre ella, o copiar con `set` a un array que ya tengas reservado, que es lo más eficiente si vas a leer cada pocos fotogramas.
+
+<Callout type="danger" title="Nunca guardes la referencia al rango mapeado">
+No pases el resultado de `getMappedRange()` a otra función que pueda usarlo más tarde, no lo guardes en un objeto, no lo metas en una promesa. Su vida útil es entre `getMappedRange()` y `unmap()`, y esas dos llamadas deberían estar en la misma función y a poder ser a la vista una de otra.
+</Callout>
+
+## unmap y mapState
+
+`unmap()` cierra el mapeo, desancla los rangos y devuelve el búfer a un estado en que la GPU puede usarlo. Es obligatorio: **un búfer mapeado no se puede usar en ningún comando**, así que olvidar `unmap()` inutiliza el búfer para siempre.
+
+`buffer.mapState` permite saber en qué estado está, y tiene tres valores:
+
+- `'unmapped'`: libre, se puede llamar a `mapAsync`.
+- `'pending'`: hay un `mapAsync` en curso.
+- `'mapped'`: mapeado, se puede llamar a `getMappedRange`.
+
+Es lo que evita el error de llamar a `mapAsync` sobre un búfer que ya tiene una petición pendiente, que es un error de validación:
+
+```js
+if (staging.mapState === 'unmapped') {
+  staging.mapAsync(GPUMapMode.READ).then(procesar);
+}
+```
+
+Esa comprobación es la base del anillo de búferes de staging: en lugar de esperar, se busca uno que esté libre y, si no lo hay, se salta la lectura de ese fotograma.
+
+## El ciclo completo, con errores
+
+Reuniendo todo, una función de lectura puntual —para una selección al hacer clic o una captura— con el manejo de errores que hace falta:
+
+```js
+async function leerBuffer(device, origen, tamano) {
+  const staging = device.createBuffer({
+    label: 'staging temporal',
+    size: tamano,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const encoder = device.createCommandEncoder({ label: 'lectura' });
+  encoder.copyBufferToBuffer(origen, 0, staging, 0, tamano);
+  device.queue.submit([encoder.finish()]);      // sin esto, mapAsync no vuelve
+
+  try {
+    await staging.mapAsync(GPUMapMode.READ);
+    const copia = staging.getMappedRange().slice(0);
+    staging.unmap();
+    return copia;
+  } finally {
+    staging.destroy();
+  }
+}
+
+// Uso: un evento puntual, nunca dentro del bucle de fotograma.
+canvas.addEventListener('click', async () => {
+  const bytes = await leerBuffer(device, bufferSeleccion, 4);
+  const id = new Uint32Array(bytes)[0];
+  console.log('objeto seleccionado:', id);
+});
+```
+
+Tres detalles del código que son deliberados. El `submit` va **antes** del `await`, porque sin él la promesa nunca resuelve. El `slice(0)` copia antes de desmapear. Y el `finally` con `destroy()` garantiza que el búfer temporal se libera aunque el mapeo falle, por ejemplo si el dispositivo se pierde mientras tanto.
+
+Esta versión con un búfer temporal por lectura es correcta para eventos puntuales. Para lecturas repetidas hace falta el anillo, y esa es la lección que cierra el nivel.
+
+<Callout type="dios" title="mapAsync también sirve para escribir, y ahí es donde de verdad se gana algo">
+El 95% del material sobre mapeo habla solo de lectura, y por eso casi nadie usa `MAP_WRITE`, que es la mitad más útil cuando hay volumen de por medio.
+
+`queue.writeBuffer` es cómoda porque hace una copia síncrona a un búfer de staging interno que gestiona la implementación. Esa copia es invisible y para datos pequeños es irrelevante. Para datos grandes —subir un modelo, actualizar una textura de vóxeles, alimentar una simulación con datos que llegan de la red— esa copia extra es medible, y además el staging interno tiene un tamaño que no controlas y que se puede saturar.
+
+Con un búfer `MAP_WRITE | COPY_SRC` propio escribes **directamente** en la memoria que la GPU va a leer, sin copia intermedia:
+
+```js
+await subida.mapAsync(GPUMapMode.WRITE);
+const destino = new Float32Array(subida.getMappedRange());
+generarDatos(destino);          // escribe DIRECTAMENTE en el buffer de la GPU
+subida.unmap();
+
+const encoder = device.createCommandEncoder();
+encoder.copyBufferToBuffer(subida, 0, trabajo, 0, TAM);
+device.queue.submit([encoder.finish()]);
+```
+
+Fíjate en `generarDatos(destino)`: no genera un array y lo copia, **genera directamente en el destino final**. Con un procedimiento que rellena un millón de floats, eso elimina una reserva de 4 MB en el montón de JavaScript, una copia de 4 MB, y la presión sobre el recolector de basura que produce reservar eso cada vez.
+
+El coste es que `mapAsync` para escribir **también espera**: la promesa no resuelve hasta que la GPU ha terminado con el uso anterior de ese búfer. Con un solo búfer de subida, eso serializa. La solución es la misma que en lectura y por la misma razón: **un anillo de búferes de subida**, donde siempre hay uno cuyo uso anterior ya terminó.
+
+Y una regla de decisión para no complicarse sin motivo: **por debajo de unos cientos de kilobytes por fotograma, `writeBuffer` y ya está**. Por encima, o cuando el perfilador señale el coste de la copia, el anillo de `MAP_WRITE` es la respuesta, y su estructura es idéntica a la del anillo de lectura.
+</Callout>
+
+Queda la otra forma de saber cuándo la GPU ha terminado: [`onSubmittedWorkDone`](/guia/webgpu/n8-onsubmittedworkdone/).

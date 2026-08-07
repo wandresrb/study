@@ -1,0 +1,176 @@
+---
+title: "Medir memoria en producción: measureUserAgentSpecificMemory"
+description: "La API estándar, sus requisitos de aislamiento y su desglose, cómo muestrear sin sesgar el resultado, y cómo detectar fugas en integración continua."
+subject: rendimiento
+level: 29
+order: 5
+icon: "29.5"
+duracion: "18 min"
+---
+
+<Lead>
+Todo lo anterior se hace en tu máquina, con tu sesión y tu recorrido. El problema es que las fugas se manifiestan en sesiones de cuarenta minutos, en móviles con dos gigas y con veinte pestañas abiertas, y ese escenario no lo reproduces. Para eso existe una API estándar que mide la memoria de la página en usuarios reales, con condiciones estrictas que vienen impuestas por la seguridad y que conviene entender antes de intentar activarla.
+</Lead>
+
+<Objetivos>
+
+- Activar `performance.measureUserAgentSpecificMemory()` con los requisitos de aislamiento correctos.
+- Interpretar el desglose por atribución y por tipo.
+- Muestrear con un esquema que no sesgue el resultado hacia ningún momento de la sesión.
+- Detectar regresiones de memoria en integración continua sobre un escenario repetible.
+
+</Objetivos>
+
+## La API estándar y sus condiciones
+
+`performance.measureUserAgentSpecificMemory()` devuelve una promesa con el consumo total de memoria del grupo de contextos de la página —ventana principal, iframes del mismo agente y workers dedicados— y un desglose.
+
+```js
+const resultado = await performance.measureUserAgentSpecificMemory();
+// {
+//   bytes: 58230145,
+//   breakdown: [
+//     { bytes: 41000000,
+//       attribution: [{ url: 'https://ejemplo.com/', scope: 'Window' }],
+//       types: ['JavaScript'] },
+//     { bytes: 12000000,
+//       attribution: [{ url: 'https://ejemplo.com/', scope: 'Window' }],
+//       types: ['DOM'] },
+//     ...
+//   ]
+// }
+```
+
+Tres características que hay que tener claras antes de usarla.
+
+**Exige aislamiento de origen cruzado.** La página tiene que servirse con las cabeceras que separan su proceso del de cualquier otro origen:
+
+```text
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Sin ellas, la llamada rechaza con un `SecurityError`. El requisito no es burocracia: una medida precisa del consumo de memoria de un proceso es un canal lateral que permite deducir información de otros orígenes cargados en ese mismo proceso. El aislamiento garantiza que no hay nada de otro origen que espiar, y solo entonces el navegador se permite dar el número exacto. La contrapartida es real y hay que valorarla: `require-corp` obliga a que todos los recursos de terceros que incrustes declaren explícitamente que se pueden incrustar, y eso rompe integraciones. La variante `credentialless` relaja el requisito para peticiones sin credenciales y suele ser el camino practicable.
+
+**Tarda.** La implementación difiere deliberadamente la respuesta hasta que ocurra una recolección de basura, porque medir antes daría un número contaminado de basura pendiente. En la práctica pueden pasar varios segundos, a veces decenas. No la pongas en el camino de nada.
+
+**Mide el grupo entero.** Incluye la memoria de los iframes del mismo agente. Si tu página incrusta contenido, el desglose te dirá cuánto le corresponde a cada uno mediante `attribution`, lo cual convierte esta API en el mejor argumento cuantitativo que existe para una conversación sobre el coste de un tercero.
+
+El desglose tiene dos ejes. `types` clasifica en `JavaScript`, `DOM` y `Shared`, lo que te permite separar el problema: si tu crecimiento está en `DOM`, tienes nodos desprendidos y hay que ir a [la lección de desprendidos](/guia/rendimiento/n29-nodos-dom-desprendidos/); si está en `JavaScript`, es retención de objetos. `attribution` dice de qué contexto viene: la ventana principal, un worker, o un iframe de origen cruzado agregado bajo una etiqueta genérica, porque decir cuál exactamente sería otra vez un canal lateral.
+
+Para lo que no puedas medir con la API estándar queda `performance.memory`, que no es estándar, solo existe en Chromium, y devuelve valores cuantizados en saltos de unos cien kilobytes y con un tope. Sirve para vigilar tendencias en desarrollo. No sirve para presupuestos.
+
+## Muestrear sin sesgar
+
+El error de instrumentación más frecuente con memoria es medir en momentos fijos: al cargar, cada treinta segundos, al cambiar de ruta. Todos esos instantes están correlacionados con el estado de la aplicación, así que la distribución que obtienes no describe la sesión sino los momentos que elegiste. Si mides justo después de cada navegación, mides sistemáticamente el punto más bajo.
+
+El esquema correcto es un **proceso de Poisson**: intervalos aleatorios con distribución exponencial y una media conocida. Cada instante de la sesión tiene la misma probabilidad de ser muestreado, así que la media de tus muestras converge al consumo medio real.
+
+```js
+const MEDIA_MS = 5 * 60 * 1000; // una medida cada cinco minutos de media
+
+function intervaloExponencial(media) {
+  // Transformada inversa: -ln(U) * media da una exponencial de esa media.
+  return -Math.log(Math.random()) * media;
+}
+
+async function medirYProgramar() {
+  await new Promise((r) => setTimeout(r, intervaloExponencial(MEDIA_MS)));
+
+  try {
+    const resultado = await performance.measureUserAgentSpecificMemory();
+    navigator.sendBeacon(
+      '/rum/memoria',
+      JSON.stringify({
+        bytes: resultado.bytes,
+        desglose: resultado.breakdown.map((b) => ({
+          bytes: b.bytes,
+          tipos: b.types,
+        })),
+        ruta: location.pathname,
+        segundosDeSesion: Math.round(performance.now() / 1000),
+        memoriaDispositivo: navigator.deviceMemory ?? null,
+        nucleos: navigator.hardwareConcurrency ?? null,
+      })
+    );
+  } catch (error) {
+    if (error.name === 'SecurityError') return; // sin aislamiento: abandona
+    throw error;
+  }
+
+  medirYProgramar();
+}
+
+if (typeof performance.measureUserAgentSpecificMemory === 'function') {
+  medirYProgramar();
+}
+```
+
+El campo `segundosDeSesion` es el que convierte la instrumentación en un detector de fugas. Una aplicación sana tiene un consumo que no correlaciona con la duración de la sesión: el usuario que lleva cinco minutos y el que lleva cincuenta consumen parecido. Una aplicación con fuga muestra una recta ascendente clarísima en cuanto pintas consumo contra duración. Es el gráfico más útil que vas a tener, y no requiere entender nada del heap.
+
+## Segmentar: sin dispositivo no hay número
+
+Un consumo de trescientos megabytes es irrelevante en un portátil y letal en un móvil de dos gigas con la aplicación en segundo plano. Reportar la media global de memoria no informa de nada.
+
+`navigator.deviceMemory` devuelve una aproximación de la RAM del dispositivo en gigabytes, redondeada hacia abajo a una potencia de dos y limitada por arriba: los valores posibles son 0.25, 0.5, 1, 2, 4 y 8. La granularidad grosera es deliberada, otra vez por privacidad: un valor exacto sería un identificador más para la huella del dispositivo.
+
+Con esos seis grupos basta para lo que importa. Segmenta el consumo por grupo de memoria del dispositivo y mira el percentil alto de cada uno. Y cruza con la señal de descarte:
+
+```js
+if (document.wasDiscarded) {
+  navigator.sendBeacon('/rum/memoria', JSON.stringify({
+    evento: 'descartada',
+    ruta: location.pathname,
+    memoriaDispositivo: navigator.deviceMemory ?? null,
+  }));
+}
+```
+
+La tasa de descarte por grupo de dispositivo es el indicador de resultado; el consumo es el indicador de causa. Vigila los dos, pero la que decide si hay problema es la primera.
+
+## Vigilarlo en integración continua
+
+Detectar la fuga en producción está bien; impedir que llegue está mejor. La prueba automatizable es la misma técnica de los tres snapshots, ejecutada por un navegador sin interfaz sobre un escenario repetible.
+
+La herramienta hecha para esto es **memlab**, que automatiza el ciclo completo: navega, ejecuta la acción, vuelve atrás, toma snapshots, los compara y te da los caminos de retención de lo que quedó.
+
+```js
+// escenario-detalle.js
+function url() {
+  return 'https://ejemplo.com/lista';
+}
+
+// La accion que se sospecha que filtra.
+async function action(page) {
+  await page.click('[data-test="abrir-detalle"]');
+  await page.waitForSelector('[data-test="panel-detalle"]');
+}
+
+// La vuelta al estado inicial. Sin esto no hay ciclo cerrado.
+async function back(page) {
+  await page.click('[data-test="cerrar-detalle"]');
+  await page.waitForSelector('[data-test="lista"]');
+}
+
+module.exports = { url, action, back };
+```
+
+```bash
+npx memlab run --scenario ./escenario-detalle.js
+```
+
+La salida es una lista de objetos filtrados con su camino de retención, exactamente el mismo dato que sacarías a mano del panel de memoria, pero en un fichero que puedes comparar entre ramas. Si prefieres no añadir dependencias, el mismo ciclo se monta con un navegador controlado por protocolo, forzando recolección y leyendo el tamaño del heap entre iteraciones; es más código y menos análisis.
+
+La prueba que hay que meter en el pipeline es simple: **el número de nodos desprendidos y el tamaño del heap tras diez ciclos no deben crecer respecto a la rama principal**. No hace falta un umbral absoluto, que es imposible de fijar y siempre está mal; basta con el diferencial. Y como el escenario es determinista y no depende de la red, el ruido es bajísimo, muy por debajo del de cualquier medida temporal. Ese contraste con la variabilidad de las medidas de tiempo tiene consecuencias para diseñar la vigilancia entera, y se trata en el [nivel de rendimiento en CI](/guia/rendimiento/n36-la-variabilidad-de-las-medidas/).
+
+<Callout type="dios" title="La memoria es la única métrica de rendimiento cuyo fallo es binario, y eso cambia qué percentil hay que mirar">
+En todo lo demás que mides en una web, la degradación es continua: un LCP de tres segundos es peor que uno de dos y mejor que uno de cuatro, y por eso tiene sentido gobernar con el percentil 75, que representa una mayoría razonable de tus usuarios. La memoria no se comporta así. Por debajo del límite del dispositivo, consumir cien o trescientos megabytes es indistinguible para el usuario: no lo nota, no aparece en ninguna métrica, nadie se queja. Por encima del límite, la pestaña se recarga o se cierra y el usuario pierde todo lo que estaba haciendo. No hay gradación entre esas dos cosas; hay un acantilado. Y donde hay un acantilado, la media y el percentil 75 no informan de nada, porque el noventa y cinco por ciento de tus sesiones puede estar perfectamente mientras el cinco por ciento restante se estrella una y otra vez, y ese cinco por ciento está concentrado, no repartido: son los dispositivos con menos RAM, los usuarios con sesiones largas, los que más usan el producto. Es decir, **el fallo se concentra exactamente en tus mejores usuarios**. De aquí salen dos consecuencias operativas que contradicen el manual estándar. La primera: para memoria hay que gobernar con el percentil 95 o 99 segmentado por clase de dispositivo, nunca con el agregado, y el número que de verdad importa no es el consumo sino la tasa de descarte de pestaña, que es la manifestación observable del acantilado. La segunda es más incómoda: como la degradación no es perceptible hasta que es total, **la memoria es la única dimensión del rendimiento en la que no puedes fiarte del feedback de los usuarios ni de tu propia experiencia usando el producto**. En latencia, si va lento lo notas; en memoria, tú tienes treinta y dos gigabytes y una sesión de diez minutos, y jamás vas a ver el problema por mucho que uses tu aplicación. Solo lo vas a ver instrumentando. Por eso la instrumentación de memoria no es una optimización opcional que se hace cuando sobra tiempo: es la única forma de enterarse.
+</Callout>
+
+<Reto title="Instrumenta y vigila">
+1. Activa el aislamiento de origen cruzado en un entorno de pruebas y comprueba que `measureUserAgentSpecificMemory` resuelve. Anota qué terceros se rompen.
+2. Implementa el muestreo de Poisson y pinta consumo contra duración de sesión. Decide si tu recta sube.
+3. Segmenta el percentil 95 de consumo por `deviceMemory` y compara los grupos de 2 y de 8.
+4. Mide la tasa de `document.wasDiscarded` por segmento y comprueba si correlaciona con el consumo.
+5. Monta un escenario de memlab para el flujo que más se usa y añádelo al pipeline como comparación contra la rama principal.
+</Reto>

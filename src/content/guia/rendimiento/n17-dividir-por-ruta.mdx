@@ -1,0 +1,186 @@
+---
+title: "Dividir por ruta: el primer corte y el que más rinde"
+description: "Cómo se establece la frontera entre rutas, qué hacer con el código compartido, por qué el chunk común puede acabar siendo el problema, y cómo medir el ahorro real por punto de entrada."
+subject: rendimiento
+level: 17
+order: 1
+icon: "17.1"
+duracion: "18 min"
+---
+
+<Lead>
+Un usuario que entra a leer un artículo no necesita el código del panel de administración, ni el del carrito, ni el del editor. Enviárselo es la forma más pura de desperdicio que existe en frontend: bytes que se descargan, se parsean, se compilan y se quedan en memoria sin producir absolutamente nada. La división por ruta es el corte que elimina ese desperdicio, es el primero que hay que hacer, y en aplicaciones que nunca lo han hecho suele recortar entre el 40 y el 70 por ciento del arranque.
+</Lead>
+
+<Objetivos>
+
+- Establecer fronteras de ruta que el empaquetador reconozca automáticamente.
+- Decidir qué va al chunk común y qué se duplica deliberadamente.
+- Detectar el chunk compartido que ha crecido hasta anular la división.
+- Medir el peso por punto de entrada en lugar del peso total.
+
+</Objetivos>
+
+## La frontera se declara con un import dinámico
+
+El mecanismo es siempre el mismo: donde hay un `import()` dinámico, el empaquetador corta. Todo lo que solo alcanza ese módulo se va a un fichero aparte que se descarga cuando la expresión se evalúa.
+
+Con un enrutador, la forma canónica es que cada ruta apunte a un módulo cargado dinámicamente:
+
+```js
+const rutas = [
+  { ruta: '/',            cargar: () => import('./paginas/Inicio.js') },
+  { ruta: '/articulo/:id',cargar: () => import('./paginas/Articulo.js') },
+  { ruta: '/carrito',     cargar: () => import('./paginas/Carrito.js') },
+  { ruta: '/panel',       cargar: () => import('./paginas/Panel.js') },
+];
+
+async function navegar(url) {
+  const entrada = emparejar(rutas, url);
+  document.body.dataset.cargando = 'si';
+  try {
+    const { default: Pagina } = await entrada.cargar();
+    montar(Pagina, entrada.params);
+  } finally {
+    delete document.body.dataset.cargando;
+  }
+}
+```
+
+Dos detalles del fragmento que no son decorativos.
+
+**La función `cargar` devuelve la promesa, no la ejecuta al definir el array.** Si escribieras `cargar: import('./paginas/Panel.js')` sin la flecha, la importación se evaluaría al construir la tabla de rutas y se descargarían las cuatro páginas de golpe. Es un fallo real y frecuente, y el síntoma es que la división parece configurada y no ahorra nada.
+
+**El estado de carga se marca antes y se limpia en `finally`.** Un fragmento que falla al descargar —red intermitente, despliegue que invalidó el fichero— deja la interfaz colgada para siempre si el estado se limpia solo en el camino feliz.
+
+Los marcos con enrutamiento basado en el sistema de ficheros hacen este corte solos, y ahí el trabajo no es configurarlo sino **comprobar que sigue funcionando**, porque un único `import` estático mal puesto lo deshace.
+
+## El código compartido y su trampa
+
+En cuanto hay varias rutas aparece el problema interesante: el código que usan varias de ellas. El empaquetador lo detecta y lo extrae a un chunk común, para no duplicarlo.
+
+Eso es correcto por defecto y tiene un fallo que aparece con el tiempo. El chunk común se descarga **siempre**, porque cualquier ruta lo necesita. Y cada vez que un módulo pasa de usarse en una ruta a usarse en dos, migra al chunk común y su peso pasa a pagarlo todo el mundo. Al cabo de un año, el chunk común puede ser más grande que las rutas, y la división no ahorra nada.
+
+El síntoma es inconfundible: el fichero común pesa 180 KB y cada ruta pesa 12. La división está configurada, el informe la muestra, y el usuario descarga casi lo mismo que antes.
+
+La respuesta es contraintuitiva: **duplicar deliberadamente**. Un módulo de 6 KB usado por dos rutas de las nueve que tienes cuesta 6 KB si se duplica y 6 KB a todos los usuarios si se comparte. Duplicarlo es mejor para siete de las nueve rutas.
+
+La regla práctica que funciona: un módulo va al chunk común solo si lo usan **la mayoría** de las rutas, o si es lo bastante grande como para que duplicarlo duela. Los umbrales se configuran:
+
+```js
+// vite.config.js
+export default {
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id, { getModuleInfo }) {
+          // El marco y sus companeros: estables, grandes, usados en todas partes
+          if (/node_modules\/(react|react-dom|scheduler)\//.test(id)) return 'marco';
+          // Dependencias grandes y aisladas, en su propio chunk cacheable
+          if (id.includes('node_modules/chart.js')) return 'graficas';
+          // El resto de node_modules, por defecto
+          if (id.includes('node_modules')) return 'vendor';
+          // El codigo propio lo reparte el algoritmo automatico
+          return undefined;
+        },
+      },
+    },
+  },
+};
+```
+
+Separar el marco en su propio fichero tiene un beneficio adicional grande: **es la parte que menos cambia**. Con nombres basados en el hash del contenido, un despliegue que solo toca tu código no invalida el chunk del marco, y los usuarios recurrentes no lo vuelven a descargar. En una aplicación que se despliega varias veces por semana, eso es la diferencia entre 200 KB y 15 KB por visita para un usuario habitual.
+
+## Lo que hay que medir es el punto de entrada
+
+El peso total del bundle es una cifra que no le corresponde a ningún usuario. Lo que hay que medir es, para cada punto de entrada, cuántos bytes descarga alguien que llega ahí en frío: el chunk de arranque, más el común, más el de la ruta, más lo que esos arrastren.
+
+```js
+// scripts/por-ruta.mjs — coste real de cada punto de entrada
+import { readFileSync } from 'node:fs';
+import { brotliCompressSync } from 'node:zlib';
+
+const manifiesto = JSON.parse(readFileSync('dist/.vite/manifest.json', 'utf8'));
+const peso = (f) => brotliCompressSync(readFileSync(`dist/${f}`)).length;
+
+function cierre(clave, vistos = new Set()) {
+  if (vistos.has(clave)) return vistos;
+  vistos.add(clave);
+  const e = manifiesto[clave];
+  for (const dep of [...(e.imports ?? []), ...(e.dynamicImports ?? [])]) {
+    // Solo los estaticos cuentan para la carga inicial
+    if ((e.imports ?? []).includes(dep)) cierre(dep, vistos);
+  }
+  return vistos;
+}
+
+for (const [clave, e] of Object.entries(manifiesto)) {
+  if (!e.isEntry) continue;
+  const ficheros = [...cierre(clave)].map((k) => manifiesto[k].file);
+  const total = ficheros.reduce((s, f) => s + peso(f), 0);
+  console.log(clave.padEnd(40), (total / 1024).toFixed(1) + ' KB', `(${ficheros.length} ficheros)`);
+}
+```
+
+Esa tabla es la que hay que llevar al presupuesto, y suele producir sorpresas: la ruta que todo el mundo creía ligera arrastra una dependencia pesada por un `import` estático olvidado.
+
+<Callout type="dios" title="Un import estático en cualquier punto del grafo deshace la división entera, y no da ningún aviso">
+Este es el fallo que hace que la mitad de las divisiones por ruta no funcionen, y es especialmente cruel porque no produce ningún error, ninguna advertencia y ningún cambio visible salvo en el informe del bundle.
+
+El mecanismo: si **cualquier** módulo que se carga en el arranque tiene un `import` estático a un módulo de una ruta diferida, ese módulo y todo lo que él importe vuelven al chunk principal. El `import()` dinámico de la ruta sigue ahí, sigue funcionando, y el empaquetador ya no crea fichero aparte porque el contenido ya está incluido.
+
+Los tres vehículos habituales, por frecuencia:
+
+**El fichero barril.** Un `index.js` que reexporta todo un directorio, importado desde el arranque para coger una cosa:
+
+```js
+// src/componentes/index.js
+export * from './Boton.js';
+export * from './Modal.js';
+export * from './EditorRico.js';   // 90 KB que ahora estan en el arranque
+```
+
+```js
+// src/app.js
+import { Boton } from './componentes';   // arrastra los tres
+```
+
+Con `sideEffects` bien declarado y módulos ES puros, el recortado puede salvarlo. Con cualquier efecto secundario en la cadena, no. Los barriles son cómodos y son la causa número uno de divisiones rotas; la alternativa es importar por ruta concreta.
+
+**Los tipos de TypeScript importados sin `type`.** Un `import { TipoUsuario } from './paginas/Panel'` que el compilador no puede eliminar porque no está marcado como tipo, y que arrastra el módulo entero. La cura es `import type` explícito y la opción `verbatimModuleSyntax`.
+
+**El módulo de constantes compartido.** Un fichero de configuración que importa un enumerado de una página, y esa página se lo lleva puesto.
+
+Cómo cazarlo sin adivinar: pídele al empaquetador la lista de módulos del chunk de arranque y busca lo que no debería estar ahí.
+
+```bash
+# Con el metafichero de esbuild
+node -e "
+  const m=JSON.parse(require('fs').readFileSync('meta.json','utf8'));
+  const salida=Object.entries(m.outputs).find(([k])=>k.includes('app'))[1];
+  Object.entries(salida.inputs)
+    .filter(([k])=>/paginas|rutas|panel|editor/i.test(k))
+    .forEach(([k,v])=>console.log(v.bytesInOutput, k));
+"
+```
+
+Cualquier fichero de `paginas/` que aparezca en el chunk de arranque es una división rota. Y la comprobación que hay que automatizar en integración continua es más simple todavía: **falla la compilación si el número de ficheros generados baja**. Una división que se rompe reduce el número de chunks, y esa es una señal barata y muy fiable.
+</Callout>
+
+## Qué corte hacer primero
+
+Si vas a empezar hoy, el orden que rinde más:
+
+**Uno: separa el panel de administración o cualquier zona autenticada.** Es lo más grande y lo que menos gente usa. En muchos productos, la mitad del código sirve al 2 por ciento de las visitas.
+
+**Dos: separa el marco y las dependencias grandes y estables en su propio chunk cacheable.** No reduce la primera visita, y reduce mucho las siguientes.
+
+**Tres: separa cada ruta.** El corte por defecto, el que hace el enrutador solo.
+
+**Cuatro: dentro de la ruta más pesada, separa por interacción.** Es el tema de [la siguiente lección](/guia/rendimiento/n17-dividir-por-interaccion/), y es donde están las ganancias que la división por ruta no alcanza.
+
+Una advertencia sobre el exceso, porque también existe: **trocear demasiado tiene un coste**. Cada fichero adicional es una petición más, y aunque con HTTP/2 y HTTP/3 el coste por petición es mucho menor que antes, no es cero: hay sobrecarga de cabeceras, de compresión —los ficheros pequeños comprimen peor porque el diccionario no se amortiza— y de planificación. Cien chunks de 3 KB son peores que diez de 30. El punto razonable está en fragmentos de entre 20 y 80 KB comprimidos, y en no crear un chunk para algo que pese menos de 10 KB.
+
+<Reto>
+Genera la tabla de peso por punto de entrada de tu aplicación. Después busca en el chunk de arranque cualquier módulo que pertenezca a una ruta concreta y rastrea qué `import` estático lo arrastra. Corrige uno y vuelve a generar la tabla: la diferencia en el punto de entrada de la página de inicio es tu ahorro real, y suele ser mayor que lo que el informe del bundle sugería.
+</Reto>

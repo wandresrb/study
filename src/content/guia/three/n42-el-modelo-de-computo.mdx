@@ -1,0 +1,129 @@
+---
+title: "El modelo de cómputo de Three.js"
+description: "Qué es un nodo de cómputo en TSL, cómo se despacha con compute y computeAsync, por qué solo existe sobre WebGPU, y cuándo mover trabajo de la CPU a la GPU compensa de verdad."
+subject: three
+level: 42
+order: 1
+icon: "42.1"
+duracion: "18 min"
+---
+
+<Lead>
+Hasta ahora la GPU solo dibujaba: le dabas vértices y te devolvía píxeles. Un compute shader rompe ese contrato. Es un programa que se ejecuta en la GPU sin pipeline de rasterización detrás, sin geometría de entrada y sin framebuffer de salida: solo miles de invocaciones paralelas leyendo y escribiendo memoria. Three.js expone esa capacidad a través de TSL con una API sorprendentemente pequeña —tres o cuatro nombres— y con una restricción que conviene entender antes de escribir nada: el cómputo **solo existe sobre el backend de WebGPU**.
+</Lead>
+
+<Objetivos>
+
+- Construir un nodo de cómputo con `Fn` y `.compute()` y despacharlo con el renderer.
+- Distinguir `renderer.compute()` de `renderer.computeAsync()` y saber cuándo hace falta cada uno.
+- Detectar en tiempo de ejecución si el backend activo es WebGPU o WebGL2.
+- Decidir con criterio si un problema concreto merece bajar a la GPU.
+
+</Objetivos>
+
+## Un kernel es una función que se ejecuta N veces
+
+En un fragment shader no eliges cuántas veces se ejecuta tu código: lo decide la rasterización. En un compute shader lo decides tú. Le dices a la GPU "ejecuta esta función doscientas mil veces" y cada ejecución recibe un identificador distinto, que en TSL se llama `instanceIndex`. Ese índice es lo único que distingue una invocación de otra, y es la base de todo el modelo: cada hilo mira su índice, decide qué trozo de memoria le toca y trabaja sobre él.
+
+La construcción mínima tiene tres piezas: una función TSL, su invocación, y la llamada a `.compute()` con el número de hilos.
+
+```js
+import * as THREE from 'three/webgpu';
+import { Fn, instancedArray, instanceIndex, float } from 'three/tsl';
+
+const total = 200000;
+
+// Un buffer de 200k floats que vive en la GPU.
+const valores = instancedArray( total, 'float' );
+
+// El kernel: se ejecutará una vez por cada indice de 0 a total-1.
+const rellenar = Fn( () => {
+
+	valores.element( instanceIndex ).assign( float( instanceIndex ).mul( 0.001 ) );
+
+} )().compute( total );
+```
+
+Fíjate en el doble paréntesis de `Fn( () => { ... } )()`. `Fn` devuelve una plantilla de función; el segundo paréntesis la **invoca**, produciendo el nodo que representa la llamada; y `.compute( total )` envuelve ese nodo en un `ComputeNode` con el número de invocaciones. Es la misma cadena que ves en todos los ejemplos oficiales de Three.js y no es adorno sintáctico: `Fn` puede recibir parámetros, y separar la definición de la invocación es lo que permite reutilizar el mismo kernel con argumentos distintos.
+
+El objeto que devuelve `.compute()` es un nodo normal de Three.js. Puedes guardarlo, nombrarlo con `.setName( 'Rellenar' )` para que aparezca identificado en las herramientas de depuración, y despacharlo tantas veces como quieras.
+
+## Despachar: compute frente a computeAsync
+
+El renderer tiene dos métodos y la diferencia entre ellos es exactamente una: si el backend ya está inicializado o no.
+
+```js
+const renderer = new THREE.WebGPURenderer( { antialias: true } );
+renderer.setSize( window.innerWidth, window.innerHeight );
+document.body.appendChild( renderer.domElement );
+
+// Inicializar el backend es asincrono: pide el adaptador y el dispositivo.
+await renderer.init();
+
+// A partir de aqui, compute() sincrono es seguro.
+renderer.compute( rellenar );
+```
+
+`renderer.compute( nodo )` graba el despacho en la cola de comandos y vuelve inmediatamente. No espera a que la GPU termine, y eso es correcto: es lo que quieres dentro del bucle de render, donde la llamada tiene que costar microsegundos. Si lo llamas antes de que el backend esté listo, Three.js emite un aviso y delega internamente en la versión asíncrona, pero es un parche, no un patrón. La forma limpia es hacer `await renderer.init()` una vez durante el arranque.
+
+`renderer.computeAsync( nodo )` es la versión que garantiza la inicialización: si el backend no está listo, lo inicializa y después despacha. Devuelve una promesa que **resuelve cuando el despacho se ha encolado**, no cuando la GPU ha terminado el trabajo. Es la herramienta correcta para los kernels de inicialización que ejecutas una sola vez en el arranque, cuando todavía no sabes si el dispositivo está disponible.
+
+```js
+// Inicializacion: una vez, sin bucle de render todavia.
+await renderer.computeAsync( rellenar );
+
+// Cada frame: sincrono, dentro del animation loop.
+function animate() {
+
+	renderer.compute( actualizar );
+	renderer.render( scene, camera );
+
+}
+
+renderer.setAnimationLoop( animate );
+```
+
+<Callout type="warn" title="El cómputo no cae a WebGL">
+`WebGPURenderer` tiene fallback automático a WebGL2 cuando no hay WebGPU, y eso cubre el render: tus materiales de nodos siguen funcionando porque TSL compila el mismo grafo a GLSL. **Los compute shaders no.** WebGL2 no tiene compute shaders, punto. Un `renderer.compute()` sobre el backend de WebGL no hace lo que esperas. Si tu experiencia depende del cómputo, necesitas detectarlo y tener un plan B; lo verás en [la lección sobre GPGPU clásico](/guia/three/n42-gpgpu-clasico-en-webgl/).
+</Callout>
+
+La detección es directa una vez inicializado el renderer:
+
+```js
+await renderer.init();
+
+const esWebGPU = renderer.backend.isWebGPUBackend === true;
+const esWebGL = renderer.backend.isWebGLBackend === true;
+
+if ( ! esWebGPU ) {
+
+	console.warn( 'Sin WebGPU: la simulacion se ejecutara en CPU con menos particulas.' );
+
+}
+```
+
+Antes incluso de construir el renderer puedes preguntar por la existencia de la API con `navigator.gpu`, pero eso solo te dice que el objeto existe, no que se haya conseguido un adaptador. La comprobación fiable es la de después de `init()`.
+
+## Cuándo compensa bajar a la GPU
+
+Un compute shader no es gratis. Tiene tres costes que la CPU no tiene y que deciden si el cambio merece la pena.
+
+El primero es el **coste de despacho**. Cada `compute()` implica grabar comandos, validar el pipeline y sincronizar con el sistema gráfico. Para diez mil elementos el trabajo en CPU probablemente sea más rápido que la ceremonia de enviarlo a la GPU. La ventaja aparece cuando el número de elementos es tan grande que el paralelismo domina: cien mil, un millón, diez millones.
+
+El segundo es el **coste de volver**. Leer un buffer de GPU desde JavaScript obliga a esperar a que el trabajo termine y a copiar la memoria a un buffer mapeable. Eso destruye el paralelismo entre CPU y GPU y puede costar un frame entero. La regla es dura y es la que separa un uso bueno de uno malo: **si los datos tienen que volver a la CPU cada frame, no lo hagas en la GPU**. El caso ideal es el que nunca cruza de vuelta —simular partículas y renderizarlas desde el mismo buffer— porque los datos se quedan donde ya están.
+
+El tercero es el **coste de divergencia**. Las invocaciones se ejecutan en grupos de hilos que comparten el contador de programa. Si dentro de tu kernel unos hilos toman una rama y otros toman la contraria, el hardware ejecuta las dos ramas y descarta los resultados que no tocan. Un kernel lleno de condicionales dependientes del índice puede rendir peor que el mismo cálculo sin ramas y con máscaras aritméticas.
+
+Con eso en la mano, la lista de candidatos buenos es corta y reconocible: sistemas de partículas, simulaciones de fluidos y telas, cálculos de vecindad sobre mallas grandes, generación procedural de geometría, reducciones sobre conjuntos masivos. Y la lista de candidatos malos también: lógica de juego, máquinas de estado, cualquier cosa cuyo resultado necesite una condición en JavaScript el mismo frame.
+
+<Callout type="dios" title="El índice acotado que Three.js escribe por ti">
+Aquí hay un detalle que cuesta caro descubrir a mano. Cuando escribes `.compute( 200000 )`, la GPU no despacha exactamente doscientas mil invocaciones. Despacha **workgroups completos**, y el tamaño de workgroup por defecto en Three.js es 64. Doscientos mil no es múltiplo de 64: hacen falta 3125 workgroups, que son exactamente 200000 invocaciones… en este caso sí, porque 200000 dividido entre 64 da 3125 exacto. Prueba con 200001 y necesitarás 3126 workgroups, es decir **200064 invocaciones**, sesenta y tres de las cuales tienen un `instanceIndex` que apunta fuera de tu buffer. En WebGPU crudo eso es un fallo clásico: escrituras fuera de rango que el validador recorta o que corrompen datos vecinos, dependiendo del backend. Three.js lo resuelve por ti, y merece la pena saber exactamente cómo. Cuando pasas un **número** a `.compute()`, el `ComputeNode` guarda ese número en `count`, crea internamente un uniform con él y, al generar el código, antepone al cuerpo de tu kernel una línea equivalente a `if ( instanceIndex >= count ) return;`. Es un `early return` inyectado automáticamente. Por eso puedes escribir kernels con cualquier `count` sin pensar en la aritmética de workgroups. Ahora la consecuencia práctica: si en lugar de un número le pasas un **array** de tres elementos, Three.js interpreta que le estás dando el `dispatchSize` directamente —cuántos workgroups en X, Y y Z— y **no genera la comprobación**, porque ya no sabe cuál es tu límite lógico. Ese es el modo experto, el que necesitas para despachos 2D o 3D, y el que te obliga a acotar tú. Si alguna vez ves escrituras fantasma al final de un buffer, mira primero si pasaste un array donde querías pasar un número.
+</Callout>
+
+<Reto title="Mide dónde está la frontera">
+1. Escribe un kernel que eleve al cuadrado cada elemento de un `instancedArray` de floats.
+2. Implementa el mismo cálculo en JavaScript sobre un `Float32Array` y cronometra ambos con `performance.now()`.
+3. Repite la medida con 1e4, 1e5, 1e6 y 1e7 elementos y anota dónde se cruzan las curvas.
+4. Añade una lectura de vuelta a CPU al final del kernel y vuelve a medir: comprueba cuánto se desplaza el cruce.
+5. Comprueba con `renderer.backend.isWebGPUBackend` qué ocurre si fuerzas el fallback a WebGL2.
+</Reto>

@@ -1,0 +1,123 @@
+---
+title: "La frontera entre workgroups: la restricción que lo condiciona todo"
+description: "Por qué dos workgroups no pueden sincronizarse jamás, qué le pasa a quien lo intenta, y cómo esa restricción obliga a partir cualquier algoritmo global en varios dispatches."
+subject: webgpu
+level: 32
+order: 4
+icon: "32.4"
+duracion: "20 min"
+---
+
+<Lead>
+Dentro de un workgroup hay memoria compartida y barreras. Fuera, no hay nada. No existe ninguna función de WGSL que sincronice dos workgroups, no existe ninguna variable que compartan más allá de los storage buffers, y no existe ningún truco que lo supla: intentarlo cuelga el dispositivo. Esta no es una laguna de la API que se rellenará en una versión futura, es una consecuencia directa de cómo planifica el trabajo una GPU. Y es la causa de la mayoría de los errores de diseño en cómputo paralelo, porque quien no la interioriza escribe algoritmos que no pueden existir.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué el modelo de ejecución hace imposible sincronizar workgroups.
+- Predecir qué ocurre cuando un kernel intenta esperar a otro workgroup.
+- Partir un algoritmo global en una cadena de dispatches con las dependencias correctas.
+- Distinguir entre atomicidad y ordenación en storage buffers.
+
+</Objetivos>
+
+## Por qué es imposible, no solo difícil
+
+Cuando lanzas `dispatchWorkgroups(10000)` con workgroups de 256 invocaciones, estás pidiendo 2.560.000 invocaciones. Ninguna GPU del mercado tiene tantas unidades de ejecución. Lo que hace el planificador es asignar a cada unidad de cómputo tantos workgroups como le quepan según registros y memoria compartida —digamos ocho— y, cuando uno termina, meter el siguiente de la cola.
+
+De ahí sale el hecho crudo: **en un momento dado, la inmensa mayoría de los workgroups del dispatch no existen todavía**. El workgroup 9999 puede no haber empezado cuando el workgroup 0 termina. Si el workgroup 0 se pone a esperar a que el 9999 escriba algo, esperará para siempre, porque el 9999 no puede empezar hasta que el 0 libere su sitio. Es un interbloqueo perfecto, y no depende de la suerte: está garantizado en cuanto el número de workgroups supera los que caben a la vez.
+
+La especificación lo formaliza diciendo que WebGPU **no garantiza progreso hacia adelante** entre workgroups. Un workgroup que espera no obliga a nadie a avanzar. Cualquier construcción que dependa de que otro workgroup progrese es incorrecta por definición, aunque funcione en un dispatch pequeño en tu máquina.
+
+<Mermaid code={`flowchart TB
+  Q[Cola de workgroups pendientes] --> CU1[Unidad de computo 1]
+  Q --> CU2[Unidad de computo 2]
+  CU1 --> R1[Residentes 0 1 2 3]
+  CU2 --> R2[Residentes 4 5 6 7]
+  R1 --> S1[Memoria compartida propia y barreras]
+  R2 --> S2[Memoria compartida propia y barreras]
+  R1 -. sin canal de sincronizacion .- R2
+  R1 --> G[Storage buffers en VRAM]
+  R2 --> G
+  G --> N[Visibilidad garantizada solo al terminar el dispatch]
+  style Q fill:#f9e2af,color:#11111b
+  style CU1 fill:#fab387,color:#11111b
+  style CU2 fill:#fab387,color:#11111b
+  style R1 fill:#89b4fa,color:#11111b
+  style R2 fill:#89b4fa,color:#11111b
+  style S1 fill:#94e2d5,color:#11111b
+  style S2 fill:#94e2d5,color:#11111b
+  style G fill:#94e2d5,color:#11111b
+  style N fill:#a6e3a1,color:#11111b
+`} />
+
+El caso que más veces se intenta es el cerrojo por espera activa:
+
+```wgsl
+// NO ESCRIBAS ESTO. Cuelga el dispositivo.
+if (li == 0u) {
+  loop {
+    if (atomicLoad(&senal.listo) == 1u) { break; }
+  }
+}
+workgroupBarrier();
+```
+
+Si el workgroup que debe poner `listo` a uno todavía no ha sido planificado porque este workgroup ocupa su sitio, el bucle no termina nunca. El navegador detecta que la GPU no responde, provoca una pérdida de dispositivo y todo el contexto WebGPU se cae. En algunos sistemas se lleva por delante el compositor entero durante unos segundos.
+
+Y `storageBarrier()` no ayuda, por mucho que el nombre invite. Ordena los accesos a storage **de las invocaciones del propio workgroup**, exactamente igual que `workgroupBarrier` ordena la memoria compartida. Sobre otros workgroups no tiene ningún efecto, ni de ordenación ni de espera.
+
+## Lo que sí funciona: el límite de dispatch
+
+La sincronización global existe, pero solo en un sitio: **el final de un dispatch**. WebGPU garantiza que, cuando un dispatch termina, todas sus escrituras son visibles para el dispatch siguiente del mismo pass, y para cualquier pass posterior del mismo command buffer. Esa garantía es automática; no hay que insertar barreras a mano como en Vulkan.
+
+Por tanto, cualquier algoritmo que necesite que "todos hayan terminado la fase A antes de empezar la fase B" se escribe como dos dispatches. No hay alternativa, y no es una limitación que se pueda rodear: es **la** forma de hacerlo.
+
+```js
+const enc = device.createCommandEncoder();
+const pass = enc.beginComputePass();
+
+// Fase A: cada workgroup escribe su parcial.
+pass.setPipeline(pipeReducirBloques);
+pass.setBindGroup(0, bgFaseA);
+pass.dispatchWorkgroups(numBloques);
+
+// Fase B: ve TODOS los parciales de la fase A. Barrera implicita.
+pass.setPipeline(pipeReducirParciales);
+pass.setBindGroup(0, bgFaseB);
+pass.dispatchWorkgroups(1);
+
+pass.end();
+device.queue.submit([enc.finish()]);
+```
+
+Ni siquiera hace falta abrir un pass nuevo: dos dispatches consecutivos dentro del mismo compute pass ya tienen la garantía. Abrir passes distintos también funciona y es lo que hay que hacer cuando entre medias hay un render pass, pero no aporta ninguna sincronización adicional.
+
+Esa es la razón estructural de que los algoritmos paralelos de GPU tengan la forma que tienen. Una reducción no es un bucle: es un dispatch que produce parciales y otro que los consolida. Un scan de un array grande no es un recorrido: son [tres dispatches](/guia/webgpu/n33-scan-de-varios-bloques/). Un bitonic sort no es una llamada: son decenas de dispatches encadenados. Cada vez que veas un algoritmo de GPU con una estructura extraña de varias fases, la explicación casi siempre es esta frontera.
+
+Y también explica el criterio de diseño: como cada frontera cuesta un dispatch y cada dispatch tiene sobrecoste, se maximiza el trabajo que cabe dentro de un workgroup. Un scan de bloque de 256 elementos hace ocho pasos con barreras internas sin salir del dispatch; hacer esos ocho pasos como ocho dispatches globales sería cientos de veces más lento y produciría exactamente el mismo resultado.
+
+## Atomicidad no es ordenación
+
+Hay una excepción parcial que conviene entender bien porque se malinterpreta en la dirección peligrosa. Las operaciones atómicas sobre un storage buffer **sí funcionan entre workgroups**: si mil workgroups hacen `atomicAdd` sobre el mismo contador, el resultado final es la suma exacta de las mil aportaciones, sin ninguna pérdida.
+
+Lo que las atómicas garantizan es **indivisibilidad**: la lectura, la modificación y la escritura de una atómica no se pueden entrelazar con las de otra. Lo que no garantizan es **ordenación de otros accesos**: que la invocación A haya incrementado el contador no dice nada sobre si sus escrituras normales en otras direcciones son ya visibles para B.
+
+```wgsl
+// Peligroso: el patron "publicar con una bandera atomica".
+datos[i] = calcular();                 // escritura normal
+atomicStore(&listo[i], 1u);            // bandera atomica
+
+// Otro workgroup:
+if (atomicLoad(&listo[i]) == 1u) {
+  let v = datos[i];                    // NO garantizado que vea el valor
+}
+```
+
+Ese patrón funciona en una CPU con las anotaciones de orden adecuadas y no es fiable aquí, además de tener el problema de progreso hacia adelante que ya vimos. La única publicación segura entre workgroups es el límite de dispatch.
+
+El uso legítimo de las atómicas entre workgroups es acumular resultados cuya lectura ocurre en un dispatch posterior: contadores, histogramas, mínimos y máximos globales, punteros de reserva en un búfer de anexado. Todos comparten la misma forma: **se escriben en el dispatch N y se leen en el N+1**.
+
+<Callout type="dios" title="La reduccion de un solo paso con atomicas existe, y su resultado en coma flotante no es reproducible">
+Hay un atajo tentador para evitar el segundo dispatch de una reducción: que cada workgroup, en vez de escribir su parcial en un array, lo sume directamente a un único acumulador global con una atómica. Funciona, es un solo dispatch, y para enteros es perfectamente correcto y determinista. Para flotantes tiene dos problemas que hay que decidir conscientemente. El primero es que WGSL **no tiene atómicas de coma flotante**: `atomic` solo admite `i32` y `u32`, así que hay que montar un bucle de comparación e intercambio con `atomicCompareExchangeWeak` y `bitcast`, que funciona pero cuesta bastante más que una suma. El segundo es más profundo: el orden en que llegan las aportaciones de los workgroups depende de la planificación, y la suma en coma flotante no es asociativa, así que `(a+b)+c` y `a+(b+c)` dan resultados distintos en el último bit. La consecuencia es que **el mismo programa, con la misma entrada, en la misma máquina, da resultados que difieren en los últimos bits entre ejecuciones**. Para un total de energía de una simulación da igual. Para un test de regresión que compara buffers bit a bit es un desastre, y para una simulación que realimenta ese total en el paso siguiente puede divergir de forma visible al cabo de unos miles de pasos. La regla que yo aplico: atómicas de entero para contar, siempre; atómicas emuladas de flotante solo cuando el resultado se muestra al usuario y no se realimenta; y en cualquier caso donde haga falta reproducibilidad, el segundo dispatch, que además suele ser más rápido porque no serializa nada.
+</Callout>

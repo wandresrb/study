@@ -1,0 +1,237 @@
+---
+title: "Doble buffer y un sistema de partículas entero en GPU"
+description: "Cuándo hace falta el ping-pong y cuándo no, cómo se implementa con dos storage buffers en TSL, y cómo se dibuja el resultado sin que los datos vuelvan nunca a la CPU."
+subject: three
+level: 42
+order: 4
+icon: "42.4"
+duracion: "22 min"
+---
+
+<Lead>
+El patrón de doble buffer aparece en todos los tutoriales de GPGPU como si fuera obligatorio, y no lo es. Existe para resolver un problema concreto —la condición de carrera cuando un hilo lee lo que otro está escribiendo— y aplicarlo cuando ese problema no existe duplica el consumo de memoria a cambio de nada. Saber distinguir los dos casos es lo que separa una simulación que funciona de una que funciona **y** cabe en un móvil.
+</Lead>
+
+<Objetivos>
+
+- Identificar cuándo una simulación necesita ping-pong y cuándo puede trabajar en sitio.
+- Implementar el intercambio de buffers con dos nodos de cómputo alternos.
+- Renderizar cientos de miles de partículas desde el mismo buffer que las simula.
+- Reinicializar el estado sin recrear buffers ni recompilar el kernel.
+
+</Objetivos>
+
+## Cuándo el ping-pong es innecesario
+
+La regla es exacta y se comprueba mirando el kernel: **si cada invocación solo lee y escribe su propio elemento, no hace falta doble buffer**. Ese es el caso de la integración de partículas independientes, que es también el caso más común.
+
+```js
+// Cada hilo toca solo su indice: seguro en sitio.
+const integrar = Fn( () => {
+
+	const p = posiciones.element( instanceIndex );
+	const v = velocidades.element( instanceIndex );
+
+	v.addAssign( vec3( 0, gravedad, 0 ) );
+	p.addAssign( v );
+
+} )().compute( total );
+```
+
+Aquí no hay carrera posible. El hilo 5 lee `posiciones[5]` y escribe `posiciones[5]`; el hilo 6 hace lo propio con el suyo. Que se ejecuten en cualquier orden, o simultáneamente, es irrelevante: no comparten memoria. Duplicar el buffer solo serviría para gastar el doble de VRAM y añadir una copia.
+
+El problema aparece en cuanto una invocación lee el elemento de **otra**:
+
+```js
+// Cada hilo lee a sus vecinos: NO es seguro en sitio.
+const suavizar = Fn( () => {
+
+	const izq = alturas.element( instanceIndex.sub( 1 ).max( 0 ) );
+	const der = alturas.element( instanceIndex.add( 1 ).min( total - 1 ) );
+
+	alturas.element( instanceIndex ).assign( izq.add( der ).mul( 0.5 ) );
+
+} )().compute( total );
+```
+
+Este kernel está roto y produce resultados distintos en cada ejecución y en cada GPU. El hilo 5 quiere leer el valor **anterior** de `alturas[4]`, pero el hilo 4 puede haberlo sobrescrito ya. No hay forma de imponer un orden entre workgroups: la especificación de WebGPU no lo garantiza, y las barreras solo sincronizan dentro de un workgroup, no entre ellos.
+
+La lista de simulaciones que necesitan ping-pong es reconocible: difusión y suavizado, autómatas celulares, boids y cualquier comportamiento de bandada, fluidos, propagación de ondas, cualquier cosa donde el nuevo valor de un elemento dependa del valor **antiguo** de sus vecinos.
+
+## El intercambio con dos buffers
+
+La solución es tener dos copias del estado y alternar cuál es la de lectura y cuál la de escritura. En TSL, como el buffer forma parte del grafo del nodo de cómputo, no puedes cambiar el buffer de un nodo ya construido: lo que se construye son **dos nodos de cómputo**, uno para cada dirección, y se alternan desde JavaScript.
+
+```js
+import * as THREE from 'three/webgpu';
+import { Fn, instancedArray, instanceIndex, uniform, float, If } from 'three/tsl';
+
+const total = 512 * 512;
+
+const bufferA = instancedArray( total, 'float' );
+const bufferB = instancedArray( total, 'float' );
+
+const decaimiento = uniform( 0.995 );
+
+// Fabrica de kernels: recibe origen y destino, devuelve un nodo de computo.
+function crearPaso( origen, destino ) {
+
+	return Fn( () => {
+
+		const izq = origen.element( instanceIndex.sub( 1 ).max( 0 ) );
+		const cen = origen.element( instanceIndex );
+		const der = origen.element( instanceIndex.add( 1 ).min( total - 1 ) );
+
+		const media = izq.add( cen.mul( 2 ) ).add( der ).mul( 0.25 );
+
+		destino.element( instanceIndex ).assign( media.mul( decaimiento ) );
+
+	} )().compute( total );
+
+}
+
+const pasoAB = crearPaso( bufferA, bufferB ).setName( 'Difusion A a B' );
+const pasoBA = crearPaso( bufferB, bufferA ).setName( 'Difusion B a A' );
+```
+
+El intercambio es un booleano:
+
+```js
+let leerDeA = true;
+
+function simular() {
+
+	renderer.compute( leerDeA ? pasoAB : pasoBA );
+	leerDeA = ! leerDeA;
+
+}
+```
+
+Dos kernels compilados, un booleano, cero copias. El estado válido después de cada paso está siempre en el buffer de destino, que es el que hay que enlazar al material para dibujar. Como el material también forma parte del grafo, la solución simétrica es tener dos materiales —o un material cuyo nodo de color sea un `mix` controlado por un uniform binario— pero en la práctica casi siempre basta con un truco más simple: **ejecutar siempre un número par de pasos por frame**. Con dos pasos por frame, el estado final vuelve siempre al mismo buffer y el material puede apuntar a él para siempre.
+
+<Callout type="tip" title="El coste real de duplicar">
+Dos buffers de un millón de `vec4` son 32 MB de VRAM. En una tarjeta de escritorio no es nada; en un móvil de gama media con memoria compartida es una fracción notable del presupuesto. Antes de duplicar, comprueba si puedes reformular el algoritmo para que cada hilo solo toque su elemento. Muchas veces se puede: la integración de Verlet, por ejemplo, guarda la posición anterior en el propio elemento y evita el ping-pong por completo.
+</Callout>
+
+## Un sistema completo que nunca vuelve a la CPU
+
+Este es el caso canónico y el que justifica toda la maquinaria. Partículas con posición y velocidad, simuladas en GPU, dibujadas desde el mismo buffer.
+
+```js
+import * as THREE from 'three/webgpu';
+import {
+	Fn, instancedArray, instanceIndex, uniform,
+	vec3, float, hash, uv, shapeCircle, If
+} from 'three/tsl';
+
+const total = 300000;
+
+const posiciones = instancedArray( total, 'vec3' );
+const velocidades = instancedArray( total, 'vec3' );
+const colores = instancedArray( total, 'vec3' );
+
+const gravedad = uniform( - 0.00098 );
+const rebote = uniform( 0.8 );
+const rozamiento = uniform( 0.99 );
+const tamano = uniform( 0.1 );
+
+// --- Kernels ---
+
+const inicializar = Fn( () => {
+
+	const p = posiciones.element( instanceIndex );
+	const c = colores.element( instanceIndex );
+
+	const lado = Math.floor( Math.sqrt( total ) );
+	const x = instanceIndex.mod( lado );
+	const z = instanceIndex.div( lado );
+
+	p.x = float( lado / 2 ).sub( float( x ) ).mul( 0.2 );
+	p.y = hash( instanceIndex ).mul( 10 );
+	p.z = float( lado / 2 ).sub( float( z ) ).mul( 0.2 );
+
+	c.x = hash( instanceIndex );
+	c.y = hash( instanceIndex.add( 2 ) );
+	c.z = hash( instanceIndex.add( 5 ) );
+
+} )().compute( total ).setName( 'Inicializar' );
+
+const actualizar = Fn( () => {
+
+	const p = posiciones.element( instanceIndex );
+	const v = velocidades.element( instanceIndex );
+
+	v.addAssign( vec3( 0, gravedad, 0 ) );
+	p.addAssign( v );
+	v.mulAssign( rozamiento );
+
+	If( p.y.lessThan( 0 ), () => {
+
+		p.y = float( 0 );
+		v.y = v.y.negate().mul( rebote );
+		v.x = v.x.mul( 0.9 );
+		v.z = v.z.mul( 0.9 );
+
+	} );
+
+} )().compute( total ).setName( 'Actualizar' );
+
+// --- Render desde el mismo buffer ---
+
+const material = new THREE.SpriteNodeMaterial();
+material.positionNode = posiciones.toAttribute();
+material.colorNode = uv().mul( colores.element( instanceIndex ) );
+material.scaleNode = tamano;
+material.opacityNode = shapeCircle();
+material.transparent = true;
+material.alphaToCoverage = true;
+
+const particulas = new THREE.Sprite( material );
+particulas.count = total;
+particulas.frustumCulled = false;
+scene.add( particulas );
+
+// --- Arranque ---
+
+await renderer.init();
+renderer.compute( inicializar );
+
+renderer.setAnimationLoop( () => {
+
+	renderer.compute( actualizar );
+	renderer.render( scene, camera );
+
+} );
+```
+
+Hay cuatro decisiones en ese código que no son evidentes y todas importan.
+
+`particulas.count = total` es lo que convierte un único `Sprite` en trescientas mil instancias. La propiedad `count` existe en `Mesh` y en `Sprite` y **solo funciona con `WebGPURenderer`**; es la forma de Three.js de decir "dibuja este objeto N veces sin construir un `InstancedMesh`". Combinada con `positionNode` apuntando a un storage buffer, produce el sistema de partículas más barato posible: un draw call, cero atributos subidos desde CPU.
+
+`posiciones.toAttribute()` es la pieza central. Convierte el storage buffer en un atributo de vértice sin copiar memoria. Los datos que el kernel acaba de escribir son los mismos bytes que el vertex shader va a leer.
+
+`frustumCulled = false` es obligatorio. El culling de Three.js usa la bounding sphere de la geometría, que aquí es la de un sprite de tamaño uno en el origen, porque las posiciones reales viven en la GPU y la CPU no las conoce. Sin desactivarlo, el sistema entero desaparece en cuanto la cámara mira a otro lado. Es el fallo más frecuente al montar esto por primera vez y es la consecuencia inevitable de que la CPU haya dejado de saber dónde están las cosas.
+
+`shapeCircle()` es una función de TSL que devuelve una máscara circular a partir de las coordenadas del punto. Con `alphaToCoverage` activado y un material transparente, da partículas redondas sin necesidad de textura y sin los artefactos de ordenación de la transparencia clásica.
+
+Reinicializar es simplemente volver a despachar el kernel de inicialización. No hay que recrear buffers, ni materiales, ni recompilar nada:
+
+```js
+document.addEventListener( 'keydown', ( e ) => {
+
+	if ( e.key === 'r' ) renderer.compute( inicializar );
+
+} );
+```
+
+<Callout type="dios" title="Por qué el doble buffer se parece tanto al ping-pong de WebGL, y por qué no es lo mismo">
+Quien venga de la técnica clásica de GPGPU con render targets reconocerá el patrón inmediatamente: dos texturas, se lee de una y se escribe en la otra, se intercambian. Es el mismo esqueleto. Pero la razón por la que se hace es distinta y merece la pena tenerlo claro, porque explica por qué en WebGPU a veces puedes prescindir de él y en WebGL nunca. En WebGL la restricción es de la **API**: leer y escribir la misma textura en el mismo draw call es comportamiento indefinido, y el driver puede rechazarlo directamente. No es una cuestión de carreras de datos entre tus hilos; es que el hardware de texturas tiene cachés que no se invalidan durante un pase, y muestrear una textura que estás rasterizando produce basura. El ping-pong en WebGL es obligatorio siempre, incluso para una simulación donde cada texel solo dependa de sí mismo, porque la API no te deja hacer otra cosa. En WebGPU, en cambio, un storage buffer con acceso de lectura y escritura es exactamente eso: memoria a la que puedes hacer las dos cosas, sin ceremonias. La restricción ya no es de la API sino de la **coherencia de tu algoritmo**. Por eso la integración de partículas puede correr en sitio, y por eso la difusión no. Y de ahí sale la consecuencia práctica que casi nadie menciona: cuando portes un shader de simulación de WebGL a TSL, el primer paso no es traducir el GLSL, es **mirar si el ping-pong sigue siendo necesario**. Muchas simulaciones portadas arrastran el doble buffer del original sin motivo, gastan el doble de memoria y pagan un paso extra de escritura por frame. Preguntar "¿cada hilo toca solo su índice?" antes de traducir nada ahorra la mitad de la VRAM en más casos de los que parece.
+</Callout>
+
+<Reto title="Rompe la simulación a propósito">
+1. Monta el sistema de partículas del ejemplo y comprueba que corre a 60 fps con 300 000 elementos.
+2. Quita `frustumCulled = false` y gira la cámara hasta que las partículas desaparezcan.
+3. Escribe un kernel de difusión en sitio, sin doble buffer, y ejecuta la escena varias veces: anota si el resultado es idéntico.
+4. Conviértelo a doble buffer con dos nodos alternos y verifica que ahora sí es determinista.
+5. Cambia a dos pasos por frame y elimina el intercambio del material comprobando que el estado siempre acaba en el mismo buffer.
+</Reto>

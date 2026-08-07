@@ -1,0 +1,199 @@
+---
+title: "Encontrar las tareas largas con PerformanceObserver en producción"
+description: "Cómo instrumentar el navegador del usuario para detectar bloqueo del hilo, qué atribución da cada API, cómo la de fotogramas de animación largos resuelve las carencias de la de tareas largas, y cómo enviar los datos sin empeorar el problema."
+subject: rendimiento
+level: 19
+order: 4
+icon: "19.4"
+duracion: "19 min"
+---
+
+<Lead>
+Un perfil en tu máquina te dice qué pasa en tu máquina. Para saber dónde se bloquea el hilo en los dispositivos reales de tus usuarios hace falta instrumentar producción, y el navegador expone dos APIs para eso con niveles de detalle muy distintos. La primera lleva años disponible y da poco más que una duración; la segunda es reciente, solo está en Chromium, y da la atribución que hace que los datos sean accionables en lugar de meramente alarmantes.
+</Lead>
+
+<Objetivos>
+
+- Instrumentar la detección de tareas largas con la atribución que ofrece.
+- Usar la API de fotogramas de animación largos y leer sus campos de atribución.
+- Agregar los datos en el cliente para no inundar la telemetría.
+- Enviar la información sin añadir trabajo al hilo que estás midiendo.
+
+</Objetivos>
+
+## Tareas largas: lo básico y sus límites
+
+El observador se registra con el tipo `longtask` y `buffered: true`, que entrega también las tareas ocurridas antes de que el observador existiera:
+
+```js
+if (PerformanceObserver.supportedEntryTypes?.includes('longtask')) {
+  new PerformanceObserver((lista) => {
+    for (const t of lista.getEntries()) {
+      console.log({
+        inicio: Math.round(t.startTime),
+        duracion: Math.round(t.duration),
+        nombre: t.name,                      // 'self', 'same-origin-descendant', 'cross-origin-ancestor'...
+        contenedor: t.attribution[0]?.containerType,   // 'window', 'iframe', 'embed', 'object'
+        origenContenedor: t.attribution[0]?.containerSrc,
+      });
+    }
+  }).observe({ type: 'longtask', buffered: true });
+}
+```
+
+La comprobación con `supportedEntryTypes` no es opcional: llamar a `observe` con un tipo no soportado lanza una excepción en algunos navegadores y no hace nada en otros, y no está disponible en todos los motores.
+
+Lo que se saca de aquí es útil y limitado. `name` distingue si la tarea la causó el propio documento o un descendiente, lo cual permite separar el coste de terceros incrustados en un `<iframe>`. `containerSrc` da la URL de ese iframe, y con eso ya se puede construir un cuadro de qué tercero bloquea cuánto. Pero **dentro de tu propio documento no hay atribución**: sabes que hubo 340 milisegundos de bloqueo y nada más.
+
+## Fotogramas de animación largos: la atribución que faltaba
+
+La API de fotogramas de animación largos —disponible en Chromium desde 2024— cambia la unidad de medida: en lugar de tareas, informa de **fotogramas** cuya actualización de renderizado tardó más de 50 milisegundos. Eso incluye el trabajo de guion, el de estilo y layout, y el de pintura, que la API anterior no veía.
+
+Y, sobre todo, incluye un array de atribución de guiones con nombre de fuente, función y posición en el fichero.
+
+```js
+if (PerformanceObserver.supportedEntryStypes === undefined &&
+    PerformanceObserver.supportedEntryTypes?.includes('long-animation-frame')) {
+  new PerformanceObserver((lista) => {
+    for (const f of lista.getEntries()) {
+      console.log('fotograma largo', {
+        duracion: Math.round(f.duration),
+        bloqueo: Math.round(f.blockingDuration),
+        inicioRender: Math.round(f.renderStart - f.startTime),
+        estiloYLayout: Math.round(f.styleAndLayoutStart ? f.duration - (f.styleAndLayoutStart - f.startTime) : 0),
+        guiones: f.scripts.map((s) => ({
+          invocador: s.invoker,          // p.ej. 'BUTTON#pagar.onclick'
+          tipo: s.invokerType,           // 'event-listener', 'user-callback', 'classic-script'...
+          fuente: s.sourceURL,
+          funcion: s.sourceFunctionName,
+          caracter: s.sourceCharPosition,
+          duracion: Math.round(s.duration),
+          forzadoLayout: Math.round(s.forcedStyleAndLayoutDuration),
+        })),
+      });
+    }
+  }).observe({ type: 'long-animation-frame', buffered: true });
+}
+```
+
+Los campos que hacen que esto sea utilizable en producción:
+
+**`invoker`** dice qué disparó el guion, con una cadena legible como `IMG#hero.onload` o `BUTTON#pagar.onclick`. Es el dato que convierte «hay bloqueo» en «el manejador de clic del botón de pagar bloquea».
+
+**`sourceURL`, `sourceFunctionName` y `sourceCharPosition`** localizan la función en el fichero. Con mapas de fuentes aplicados en el servidor de telemetría, eso lleva directamente a tu línea de código.
+
+**`blockingDuration`** es la parte del fotograma que de verdad bloqueó, ya descontado el umbral, lo que evita hacer la resta a mano.
+
+**`forcedStyleAndLayoutDuration`** aísla el tiempo perdido en layouts forzados síncronos, que es una causa de bloqueo específica y con una cura específica.
+
+La condición de la primera línea del ejemplo está mal escrita a propósito para que te fijes en lo que importa: la comprobación real es la de `supportedEntryTypes`. Escrita bien:
+
+```js
+const soportado = (t) => PerformanceObserver.supportedEntryTypes?.includes(t);
+const tipo = soportado('long-animation-frame') ? 'long-animation-frame'
+           : soportado('longtask') ? 'longtask'
+           : null;
+if (tipo) new PerformanceObserver(manejar).observe({ type: tipo, buffered: true });
+```
+
+Esa degradación en cascada es la forma correcta: la API buena donde exista, la básica donde no, y nada donde no haya ninguna.
+
+## Agregar antes de enviar
+
+Enviar un evento de telemetría por cada tarea larga es una mala idea por dos razones: inunda el sistema de recogida, y la propia construcción y envío de los eventos añade trabajo al hilo que intentas liberar.
+
+La forma correcta es acumular en memoria un resumen compacto y enviarlo una vez, al ocultarse la página:
+
+```js
+const resumen = {
+  n: 0,               // numero de tareas largas
+  total: 0,           // suma de duraciones
+  bloqueo: 0,         // suma de excesos sobre 50
+  max: 0,             // la peor
+  porInvocador: new Map(),
+};
+
+function acumular(entradas) {
+  for (const e of entradas) {
+    const d = e.duration;
+    resumen.n++;
+    resumen.total += d;
+    resumen.bloqueo += Math.max(0, d - 50);
+    if (d > resumen.max) resumen.max = d;
+    for (const s of e.scripts ?? []) {
+      const clave = `${s.invoker ?? '?'}|${s.sourceFunctionName ?? '?'}`;
+      resumen.porInvocador.set(clave, (resumen.porInvocador.get(clave) ?? 0) + s.duration);
+    }
+  }
+}
+
+const tipo = /* la deteccion de arriba */ 'long-animation-frame';
+new PerformanceObserver((l) => acumular(l.getEntries())).observe({ type: tipo, buffered: true });
+
+function enviar() {
+  if (!resumen.n) return;
+  const cuerpo = JSON.stringify({
+    ruta: location.pathname,
+    n: resumen.n,
+    totalMs: Math.round(resumen.total),
+    bloqueoMs: Math.round(resumen.bloqueo),
+    maxMs: Math.round(resumen.max),
+    // Solo los cinco peores invocadores: suficiente para actuar, barato de enviar
+    top: [...resumen.porInvocador.entries()]
+      .sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([k, v]) => ({ k, ms: Math.round(v) })),
+    memoriaGB: navigator.deviceMemory ?? null,
+    nucleos: navigator.hardwareConcurrency ?? null,
+  });
+  navigator.sendBeacon('/telemetria/bloqueo', cuerpo);
+  resumen.n = 0; resumen.total = 0; resumen.bloqueo = 0; resumen.max = 0;
+  resumen.porInvocador.clear();
+}
+
+addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') enviar();
+});
+addEventListener('pagehide', enviar);
+```
+
+Tres decisiones del código que importan.
+
+**`sendBeacon` y no `fetch`.** Garantiza el envío aunque la página se esté descargando, y no bloquea. Un `fetch` en `pagehide` se cancela en muchos casos.
+
+**`visibilitychange` a oculto y `pagehide`, no `unload`.** El evento `unload` no se dispara de forma fiable en móvil, donde el sistema puede matar la pestaña sin más, y además impide que la página entre en la caché de retroceso. Es el error de instrumentación más extendido.
+
+**Se envían los cinco peores invocadores, no todos.** El objetivo es actuar, y para actuar bastan los peores. El resto es ruido que cuesta ancho de banda del usuario.
+
+<Callout type="dios" title="Instrumentar en producción con la CPU al límite es la definición de empeorar lo que mides, y hay tres formas de hacerlo mal">
+La ironía de esta instrumentación es que corre en el hilo principal, en las páginas donde el hilo principal es el problema. Tres errores concretos convierten la medición en parte del problema, y los tres son fáciles de cometer.
+
+**Uno: procesar cada entrada en el momento en que llega.** La devolución de llamada del observador se ejecuta en el hilo principal, y si dentro haces algo caro —serializar, comprimir, calcular percentiles— estás añadiendo trabajo justo después de una tarea que ya bloqueó. El acumulador de arriba está escrito para ser trivial: sumas y una entrada de mapa. Todo lo demás espera al envío.
+
+**Dos: guardar todas las entradas en un array.** En una sesión larga de una aplicación pesada puede haber miles de fotogramas largos, cada uno con su array de guiones. Guardarlos todos es una fuga de memoria que crece con el tiempo de sesión y que afecta más a los dispositivos con menos memoria, es decir, exactamente a los que ya iban mal. **Acumula agregados, no eventos.**
+
+**Tres, y es el más sutil: medir con una frecuencia que cambia el resultado.** Si añades un `setInterval` para enviar cada treinta segundos, has introducido trabajo periódico en el hilo principal, que es una de las causas de mal INP que estabas buscando. El envío por `visibilitychange` no tiene ese coste porque ocurre una vez, cuando el usuario ya no está mirando.
+
+Hay además una decisión de muestreo que conviene tomar conscientemente. Instrumentar al cien por cien de los usuarios da los mejores datos y el mayor coste; muestrear al diez por ciento da datos suficientes para percentiles con volumen alto y reduce el coste a la décima parte. La forma correcta es decidirlo en el arranque, no por sesión ni por página:
+
+```js
+const MUESTREO = 0.1;
+const instrumentar = Math.random() < MUESTREO;
+if (instrumentar) arrancarObservador();
+```
+
+Y una advertencia sobre la interpretación de los datos agregados que arruina muchos paneles: **los usuarios con dispositivos peores generan más eventos por sesión**, porque tienen más tareas largas. Si agregas por evento en lugar de por sesión, tu media está dominada por una minoría de usuarios y no representa a nadie. Agrega siempre **por sesión primero y por percentil después**: calcula el bloqueo total de cada sesión, y después el percentil 75 sobre las sesiones. Es la diferencia entre un panel que dice la verdad y uno que dice una media que ningún usuario ha experimentado.
+</Callout>
+
+## Qué hacer con los datos
+
+Los tres cortes que producen acciones.
+
+**Por ruta.** El bloqueo total por sesión, agrupado por ruta de entrada, ordenado descendente. Te dice qué página arreglar primero.
+
+**Por invocador.** La suma de duración por invocador, agregada sobre todas las sesiones. Te dice qué manejador o qué guion arreglar dentro de esa página. Si aparece un `sourceURL` de un dominio de terceros en los tres primeros puestos, tienes una conversación que tener con quien lo puso.
+
+**Por clase de dispositivo.** El mismo dato segmentado por memoria y núcleos. Confirma o desmiente la hipótesis de que el problema es solo de gama baja, y a veces revela lo contrario: un problema que afecta a todos y que en gama alta pasa desapercibido porque cae justo por debajo del umbral.
+
+<Reto>
+Instrumenta tu aplicación con la detección en cascada y el acumulador agregado, muestreando al veinte por ciento. Recoge datos durante una semana. Después construye los tres cortes y comprueba una hipótesis concreta: que el invocador que más bloquea coincide con el que habrías adivinado. En la mayoría de los casos no coincide, y esa es exactamente la razón de instrumentar.
+</Reto>

@@ -1,0 +1,227 @@
+---
+title: "Coordenadas relativas a cámara: que ningún número grande llegue al shader"
+description: "La técnica que resuelve las escalas grandes con el código completo, más el origen flotante, la doble precisión emulada con dos f32, y la lista de lo que puede viajar en treinta y dos bits."
+subject: webgpu
+level: 41
+order: 4
+icon: "41.4"
+duracion: "24 min"
+---
+
+<Lead>
+La solución al problema de las escalas grandes cabe en una frase: nunca dejes que un número grande llegue al shader. No hay que hacer la GPU más precisa —no se puede— sino asegurarse de que lo que cruza la frontera del `Float32Array` sean siempre cantidades pequeñas, donde `f32` tiene toda su resolución disponible. La resta que rompe todo se hace una vez por objeto en la CPU, en doble precisión, gratis, y a partir de ahí el shader trabaja en un espacio centrado en la cámara donde la precisión es máxima justo donde el ojo mira.
+</Lead>
+
+<Objetivos>
+
+- Construir la matriz de modelo-vista relativa a cámara componiéndola en doble precisión.
+- Implementar un origen flotante con su umbral y su lista de sistemas que reubicar.
+- Evaluar cuándo la doble precisión emulada con dos `f32` merece su coste y cuándo no.
+- Auditar qué valores de tu motor cruzan a `f32` y cuáles no deberían hacerlo.
+
+</Objetivos>
+
+## La composición relativa a cámara
+
+El error entra en el momento en que una coordenada absoluta grande se guarda en treinta y dos bits. Así que el objetivo es que eso no ocurra nunca: la posición del objeto y la de la cámara se quedan en la CPU, en `number`, que son dobles de cincuenta y tres bits de significando, y lo único que sube es la **diferencia**, que es pequeña.
+
+Mecánicamente son dos cambios sobre lo que probablemente ya tienes. El primero: quitar la traslación de la matriz de vista, dejando solo la rotación de la cámara. El segundo: sustituir la traslación de la matriz de modelo por la traslación relativa `posicionModelo - posicionCamara`, calculada en doble. Componer esas dos y subir el resultado.
+
+Que eso es equivalente se ve en una línea. La matriz de vista de un `lookAt` es `R · T(-ojo)`, y `T(-ojo) · M` tiene la misma parte lineal que `M` y una traslación igual a `traslacion(M) - ojo`. Por tanto `R · Mrelativo` es exactamente `Vista · Modelo`, solo que la resta se hace en `f64` sobre dos escalares en vez de en `f32` dentro de una multiplicación de matrices.
+
+Las matrices van en orden de columnas, que es la convención de WGSL para `mat4x4f`: los elementos `12`, `13` y `14` son la traslación.
+
+```ts
+type Mat4 = number[];
+type Vec3 = readonly [number, number, number];
+
+function multiplicar(a: Mat4, b: Mat4): Mat4 {
+  const o = new Array<number>(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+      o[c * 4 + r] = s;
+    }
+  }
+  return o;
+}
+
+/** La vista SIN traslacion: solo la orientacion de la camara. */
+function baseDeCamara(ojo: Vec3, objetivo: Vec3, arriba: Vec3): Mat4 {
+  let zx = ojo[0] - objetivo[0], zy = ojo[1] - objetivo[1], zz = ojo[2] - objetivo[2];
+  let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+  let xx = arriba[1] * zz - arriba[2] * zy;
+  let xy = arriba[2] * zx - arriba[0] * zz;
+  let xz = arriba[0] * zy - arriba[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return [ xx, yx, zx, 0,   xy, yy, zy, 0,   xz, yz, zz, 0,   0, 0, 0, 1 ];
+}
+
+/**
+ * modeloVista con la traslacion relativa calculada en doble precision.
+ * El resultado solo contiene numeros del orden de la distancia a la camara.
+ */
+function modeloVistaRelativo(modelo: Mat4, ojo: Vec3, objetivo: Vec3, arriba: Vec3): Mat4 {
+  const relativo = modelo.slice();
+  relativo[12] = modelo[12] - ojo[0];   // <- la resta critica, en f64
+  relativo[13] = modelo[13] - ojo[1];
+  relativo[14] = modelo[14] - ojo[2];
+  return multiplicar(baseDeCamara(ojo, objetivo, arriba), relativo);
+}
+
+/** Proyeccion en perspectiva con z de recorte en el rango 0 a 1, la de WebGPU. */
+function perspectiva(fovY: number, aspecto: number, cerca: number, lejos: number): Mat4 {
+  const f = 1 / Math.tan(fovY / 2);
+  const nf = 1 / (cerca - lejos);
+  return [ f / aspecto, 0, 0, 0,
+           0, f, 0, 0,
+           0, 0, lejos * nf, -1,
+           0, 0, lejos * cerca * nf, 0 ];
+}
+```
+
+Y la subida, que es donde ocurre la única conversión a treinta y dos bits de toda la cadena:
+
+```ts
+const uniformes = new Float32Array(32);            // dos mat4x4f
+const bufferUniformes = device.createBuffer({
+  size: uniformes.byteLength,
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+});
+
+function subirCamara(modelo: Mat4, ojo: Vec3, objetivo: Vec3, arriba: Vec3) {
+  const mv = modeloVistaRelativo(modelo, ojo, objetivo, arriba);
+  const proj = perspectiva(Math.PI / 3, canvas.width / canvas.height, 0.1, 1e5);
+  uniformes.set(mv, 0);        // f64 -> f32, con valores ya pequenos
+  uniformes.set(proj, 16);
+  device.queue.writeBuffer(bufferUniformes, 0, uniformes);
+}
+```
+
+El shader no cambia respecto al que ya tenías, porque la técnica es puramente de CPU:
+
+```wgsl
+struct Camara {
+  modeloVista: mat4x4f,
+  proyeccion:  mat4x4f,
+}
+@group(0) @binding(0) var<uniform> camara: Camara;
+
+@vertex
+fn vs(@location(0) local: vec3f) -> @builtin(position) vec4f {
+  return camara.proyeccion * (camara.modeloVista * vec4f(local, 1.0));
+}
+```
+
+Con la cámara a `500 000` metros del origen, un objeto a `500 000,05` y un vértice a un centímetro, esta cadena da `-0,06000000238418579` en espacio de vista frente al valor exacto `-0,05999999998835847`: un error de `2,4e-9` metros, dos nanómetros. La versión que sube modelo y vista por separado da `-0,0625`, con dos milímetros y medio de error. La técnica no es un paliativo: elimina el problema.
+
+Hay dos condiciones que sostienen todo esto. Las posiciones de mundo tienen que vivir en `number` de JavaScript y **no pasar nunca por un `Float32Array` intermedio**; si tu escenógrafo guarda `object.position` en un `Float32Array`, el daño ya está hecho antes de llegar aquí. Y las posiciones de vértice dentro de un modelo tienen que ser locales al modelo; si el exportador horneó las coordenadas de mundo en el búfer de vértices, ningún cambio de matriz te salva y hay que recentrar la malla.
+
+## Origen flotante
+
+La técnica anterior arregla la posición de los objetos frente a la cámara, pero no arregla nada de lo que ocurre en espacio de mundo: la física, las colisiones, el recorte, los volúmenes de sombra, un sistema de partículas que integra posiciones absolutas. Cuando esos sistemas también trabajan en `f32`, la respuesta complementaria es mover el mundo entero.
+
+El origen flotante consiste en llevar la cuenta de un desplazamiento acumulado y, cuando la cámara supera un umbral, restarlo a todo y sumarlo al acumulador. Un umbral típico es `10 000` unidades, donde el escalón es de un milímetro y todavía hay margen de sobra.
+
+```ts
+const UMBRAL = 10_000;
+
+interface Reubicable {
+  reubicar(delta: Vec3): void;
+}
+
+class Mundo {
+  /** Desplazamiento absoluto acumulado, en f64. La posicion real de algo
+   *  es su posicion local mas este vector. */
+  origen: [number, number, number] = [0, 0, 0];
+  suscriptores: Reubicable[] = [];
+
+  rebasar(camara: { posicion: [number, number, number] }): boolean {
+    const [x, y, z] = camara.posicion;
+    if (Math.hypot(x, y, z) < UMBRAL) return false;
+
+    const delta: Vec3 = [-x, -y, -z];
+    this.origen[0] -= delta[0];
+    this.origen[1] -= delta[1];
+    this.origen[2] -= delta[2];
+
+    for (const s of this.suscriptores) s.reubicar(delta);
+    camara.posicion = [0, 0, 0];
+    return true;
+  }
+}
+```
+
+Lo difícil no es el código, es la lista de suscriptores. Todo lo que guarde una posición en espacio de mundo tiene que reubicarse: las transformaciones de los nodos de la escena, los cuerpos de la física y su estructura de fase amplia, los sistemas de partículas, las trayectorias y estelas, los emisores de audio, las cascadas de sombras y su matriz de luz, los decals pegados a superficies, las cachés de recorte, y cualquier posición que un compute shader guarde entre fotogramas en un storage buffer. Un solo sistema que se olvide se queda a diez mil unidades del resto y produce un artefacto espectacular.
+
+El efecto secundario clásico merece nombre propio. Si la reubicación ocurre a mitad de tick, entre la integración de posiciones y el cálculo de velocidades, cada cuerpo ve su posición cambiar en diez mil unidades en un solo paso, y como una velocidad es una diferencia de posiciones dividida por `dt`, la física deduce que todo el mundo se mueve a diez mil unidades por fotograma y lo lanza al infinito. La regla es que el rebase se hace **en un único punto del tick, antes de que nadie calcule diferencias temporales**, y que cualquier caché de la posición anterior se reubica en el mismo momento y con el mismo delta.
+
+## Doble precisión emulada
+
+Cuando ni las coordenadas relativas ni el origen flotante alcanzan —una simulación orbital, un dataset geodésico donde las coordenadas absolutas tienen que estar en la GPU— queda representar cada valor como dos `f32`: uno alto y un residuo que recoge lo que el alto no pudo representar. Es la técnica de *double-single*, y da unos cuarenta y ocho bits efectivos de significando.
+
+```wgsl
+// x guarda la parte alta, y el residuo. El valor es x + y.
+alias ds = vec2f;
+
+fn ds_desde(a: f32) -> ds { return ds(a, 0.0); }
+fn ds_valor(a: ds) -> f32 { return a.x + a.y; }
+
+fn ds_suma(a: ds, b: ds) -> ds {
+  let t1 = a.x + b.x;
+  let e  = t1 - a.x;
+  let t2 = ((b.x - e) + (a.x - (t1 - e))) + a.y + b.y;
+  let hi = t1 + t2;
+  return ds(hi, t2 - (hi - t1));
+}
+
+fn ds_resta(a: ds, b: ds) -> ds { return ds_suma(a, ds(-b.x, -b.y)); }
+```
+
+El algoritmo funciona porque `e = t1 - a.x` recupera exactamente cuánto se perdió al redondear la suma, y esa cantidad se recicla en el residuo. Con `500 000` y `0,01`, la suma en `f32` plano da `500 000` —el ULP a esa magnitud es `0,03125`, así que el centímetro desaparece entero— mientras que la versión double-single devuelve la pareja `(500000, 0.00999999977)` y conserva el centímetro. La resta relativa posterior lo recupera intacto.
+
+Tres avisos antes de que lo escribas en producción. **La suma cuesta once operaciones en lugar de una**, y la multiplicación, que necesita partir cada operando en dos mitades, ronda las veinte; en un vertex shader que procesa millones de vértices eso se nota. **Solo hay suma, resta y multiplicación** con este esquema: la división y la raíz cuadrada requieren iteración de Newton sobre el resultado y multiplican otra vez el coste. Y la más importante: **el algoritmo depende de que el compilador no reasocie ni contraiga esas expresiones**, y WGSL le permite explícitamente hacer ambas cosas. Un compilador que decida que `(b.x - e) + (a.x - (t1 - e))` se simplifica algebraicamente destruye la técnica en silencio, y no hay atributo en WGSL para impedírselo. Si la usas, verifica el resultado numéricamente en cada familia de hardware que te importe.
+
+Por eso el consejo por defecto es no usarla. Con coordenadas relativas a cámara ya no queda ningún número grande dentro del shader, y la doble precisión emulada resuelve un problema que ya no tienes.
+
+La combinación que emplean los motores que de verdad manejan mundos enormes es distinta y mucho más barata: **coordenadas en enteros de 64 bits en la CPU, `f32` relativos en la GPU**. Un `BigInt` o un par de enteros de treinta y dos bits que represente milímetros cubre `±9,2e18` milímetros, unos `9,2e12` kilómetros, sesenta mil unidades astronómicas, con precisión de milímetro constante en todo el rango y sin ninguna de las sorpresas de la coma flotante. La aritmética entera es exacta, asociativa y reproducible. La conversión a `f32` ocurre solo al restar la posición de la cámara, justo antes de subir, y el resultado siempre es pequeño.
+
+## Qué puede cruzar en `f32`
+
+La auditoría se reduce a clasificar cada valor que escribes en un `Float32Array`.
+
+**Puede cruzar sin problema:**
+
+| Valor | Por qué |
+|---|---|
+| Posiciones relativas a la cámara | Del orden de la distancia visible, nunca de la del origen |
+| Vértices en espacio local del modelo | Acotados por el tamaño del propio modelo |
+| Direcciones y normales normalizadas | Magnitud uno por construcción |
+| Colores en rango lineal | Entre `0` y unos pocos miles con HDR |
+| Cuaterniones | Componentes en `[-1, 1]` |
+| Matriz de proyección | Sus términos son razones, no distancias |
+| Deltas de tiempo | Milésimas de segundo |
+| Coordenadas de textura | Entre `0` y `1` salvo repetición extrema |
+
+**No debe cruzar nunca:**
+
+| Valor | Qué hacer en su lugar |
+|---|---|
+| Posición absoluta de un objeto en un mundo grande | Restar la cámara en `f64` y subir la diferencia |
+| Posición absoluta de la cámara | No subirla; es el nuevo origen, vale cero |
+| Matriz de modelo y de vista por separado | Componer `modeloVista` relativa en la CPU |
+| Tiempo absoluto desde el arranque | Módulo en la CPU, o en segundos, o el delta |
+| Coordenadas geográficas en grados o metros | Relativas a un ancla local |
+| Acumuladores de larga vida | Acumular en `f64` y subir el valor actual |
+
+Y una regla que resume las dos tablas: **si un valor crece sin límite con el tiempo o con el tamaño del mundo, no puede ser un `f32`**. Todo lo demás sí. Cuando algo la incumple, el remedio siempre tiene la misma forma: encuentra la resta que convierte esa cantidad ilimitada en una acotada, y hazla un escalón antes, en doble precisión.
+
+<Callout type="dios" title="El rebase no es un cambio de coordenadas, es un cambio de contrato">
+Lo que hunde las implementaciones de origen flotante no es la matemática, que es una resta, sino que el rebase **invalida una suposición que nadie escribió en ninguna parte**: que una posición de mundo guardada hoy sigue significando lo mismo mañana. En cuanto introduces el rebase, esa suposición deja de valer y de golpe todo el código que guardaba una posición «para luego» se convierte en código roto, sin que el compilador diga nada y sin que falle de forma reproducible, porque solo falla en el fotograma en que se cruza el umbral. Un raycast que cachea el punto de impacto. Un sistema de misiones que recuerda dónde estaba el objetivo. Un editor con deshacer que guarda la posición anterior. Un pool de partículas que reutiliza slots antiguos. Todos correctos hasta que el jugador camina diez kilómetros.
+
+La lección estructural es que el origen flotante debería obligarte a **dejar de tener un tipo llamado «posición»**. Los motores que lo hacen bien distinguen en el sistema de tipos entre una posición absoluta —enteros de 64 bits, o un doble, válida para siempre— y una posición local al origen actual —`f32`, válida solo durante este fotograma— y no dejan que se asignen entre sí sin una conversión explícita que consulte el origen vigente. Cuesta un día montarlo y elimina de raíz una categoría entera de bugs de la que, si no lo haces, vas a estar cazando ejemplares durante toda la vida del proyecto.
+
+El corolario práctico, por si no quieres montar el sistema de tipos: pon un contador de rebases y, en modo depuración, sella cada posición guardada con el valor del contador en el momento de guardarla. Cuando alguien la lea con un contador distinto, lanza. Cuestan cinco líneas y convierten un artefacto visual imposible de reproducir en una excepción con una traza que apunta al culpable exacto.
+</Callout>

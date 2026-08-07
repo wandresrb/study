@@ -1,0 +1,172 @@
+---
+title: "Compilar variantes sin duplicar el shader"
+description: "Un shader de material con tres banderas de configuración, el gestor de pipelines que cachea las variantes, el ajuste del tamaño de grupo en cómputo, y cuántas variantes son demasiadas."
+subject: webgpu
+level: 16
+order: 3
+icon: "16.3"
+duracion: "18 min"
+---
+
+<Lead>
+El caso de uso que justifica las `override` es este: un material que tiene mapa de normales o no lo tiene, que recibe sombras o no las recibe, que ilumina con cuatro luces o con dieciséis. Con un preprocesador serían ocho textos distintos; con `override` es un texto y ocho pipelines, y el compilador elimina exactamente lo mismo que habría eliminado el `#ifdef`.
+</Lead>
+
+<Objetivos>
+
+- Escribir un shader con banderas de configuración en `override` y ramas eliminables.
+- Implementar un gestor de pipelines que cachee variantes por su configuración.
+- Usar `override` para ajustar el tamaño de grupo de un compute shader.
+- Acotar el número de variantes con criterio.
+
+</Objetivos>
+
+## Un shader con tres banderas
+
+```wgsl
+override NUM_LUCES      : u32  = 4u;
+override USA_NORMAL_MAP : bool = true;
+override USA_SOMBRAS    : bool = true;
+
+@fragment
+fn fs(e : EntradaFS) -> @location(0) vec4f {
+  var n = normalize(e.normal);
+
+  if USA_NORMAL_MAP {
+    let tn = textureSample(mapaNormal, muestreo, e.uv).xyz * 2.0 - 1.0;
+    let tbn = mat3x3f(normalize(e.tangente), normalize(e.bitangente), n);
+    n = normalize(tbn * tn);
+  }
+
+  let v = normalize(camara.posicion - e.mundo);
+  var acumulado = vec3f(0.0);
+
+  for (var i = 0u; i < NUM_LUCES; i = i + 1u) {
+    let luz = luces[i];
+    var visibilidad = 1.0;
+
+    if USA_SOMBRAS {
+      let coord = luz.matrizSombra * vec4f(e.mundo, 1.0);
+      let uv = coord.xy / coord.w * 0.5 + 0.5;
+      visibilidad = textureSampleCompare(mapaSombra, cmpSombra, uv, coord.z / coord.w - 0.001);
+    }
+
+    acumulado += brdf(n, v, luz) * visibilidad;
+  }
+
+  return vec4f(acumulado, 1.0);
+}
+```
+
+Con `USA_SOMBRAS` en falso, la comparación de sombra y su muestreo de textura desaparecen del binario. Con `NUM_LUCES` en 4, el bucle se desenrolla. Y las tres banderas juntas producen ocho binarios distintos a partir de un solo texto.
+
+<Callout type="tip" title="Ramificar sobre un override no rompe la uniformidad">
+Un `override` es uniforme por definición: vale lo mismo para todas las invocaciones. Por eso el `textureSampleCompare` de dentro del `if USA_SOMBRAS` no da error de uniformidad, mientras que el mismo muestreo dentro de un `if` sobre una coordenada interpolada sí lo daría. Es una de las razones por las que las banderas de configuración deben ser `override` y no valores leídos de un storage buffer.
+</Callout>
+
+## El gestor de variantes
+
+Crear los pipelines a mano se descontrola en cuanto hay más de dos banderas. El patrón estándar es un caché indexado por la configuración:
+
+```js
+class GestorDeVariantes {
+  constructor(device, modulo, descriptorBase) {
+    this.device = device;
+    this.modulo = modulo;
+    this.base = descriptorBase;
+    this.cache = new Map();
+  }
+
+  static clave(cfg) {
+    return Object.keys(cfg).sort().map((k) => `${k}=${cfg[k]}`).join('|');
+  }
+
+  obtener(cfg) {
+    const clave = GestorDeVariantes.clave(cfg);
+    let p = this.cache.get(clave);
+    if (p) return p;
+
+    p = this.device.createRenderPipelineAsync({
+      ...this.base,
+      label: `material [${clave}]`,
+      vertex:   { ...this.base.vertex,   module: this.modulo, constants: cfg },
+      fragment: { ...this.base.fragment, module: this.modulo, constants: cfg },
+    });
+    this.cache.set(clave, p);
+    return p;
+  }
+}
+```
+
+Guardar la **promesa** en el caché y no el pipeline es lo que evita que dos peticiones simultáneas de la misma variante lancen dos compilaciones. Y la etiqueta con la clave hace que cualquier error de validación posterior te diga exactamente qué variante lo produjo.
+
+La parte importante es cuándo se llama a `obtener`. Llamarlo la primera vez que se dibuja cada material produce un tirón por variante durante los primeros segundos. La forma correcta es **recorrer la escena al cargar**, recoger el conjunto de configuraciones que de verdad se usan, y compilarlas todas en paralelo antes del primer fotograma.
+
+```js
+const configuraciones = new Map();
+for (const material of escena.materiales) {
+  const cfg = {
+    NUM_LUCES: escena.numLuces,
+    USA_NORMAL_MAP: material.mapaNormal ? 1 : 0,
+    USA_SOMBRAS: material.recibeSombras ? 1 : 0,
+  };
+  configuraciones.set(GestorDeVariantes.clave(cfg), cfg);
+}
+await Promise.all([...configuraciones.values()].map((c) => gestor.obtener(c)));
+```
+
+Fíjate en que el número de variantes compiladas no es el número teórico de combinaciones, sino **el número de combinaciones que la escena usa de verdad**, que suele ser mucho menor.
+
+## Variantes de cómputo: el tamaño de grupo
+
+En cómputo, la `override` más rentable no es una bandera: es el tamaño del grupo de trabajo, porque el valor óptimo depende del hardware y no se puede saber al escribir el shader.
+
+```wgsl
+override TAM : u32 = 256u;
+
+var<workgroup> parciales : array<f32, TAM>;
+
+@compute @workgroup_size(TAM)
+fn reducir(@builtin(local_invocation_index) li : u32,
+           @builtin(global_invocation_id) gid : vec3u) {
+  var v = 0.0;
+  if gid.x < arrayLength(&datos) { v = datos[gid.x]; }
+  parciales[li] = v;
+  workgroupBarrier();
+
+  var salto = TAM / 2u;
+  while salto > 0u {
+    if li < salto { parciales[li] = parciales[li] + parciales[li + salto]; }
+    workgroupBarrier();
+    salto = salto / 2u;
+  }
+
+  if li == 0u { salidas[gid.x / TAM] = parciales[0]; }
+}
+```
+
+El mismo texto sirve para grupos de 32, 64, 128 o 256 sin tocar una línea, y el array de memoria compartida se dimensiona solo. Sin `override` habría que elegir un número al escribir el shader y aceptar que en la mitad de los dispositivos no es el bueno.
+
+## Cuántas variantes son demasiadas
+
+Tres banderas booleanas son ocho variantes. Cinco son treinta y dos. Diez son mil veinticuatro, y ahí ya no hay compilación asíncrona que salve la carga.
+
+El criterio que funciona tiene tres reglas:
+
+**Solo son `override` las banderas que eliminan código caro.** Si quitar la rama ahorra dos instrucciones, esa bandera es una uniform y no multiplica nada.
+
+**Los valores numéricos se cuantizan a pocos escalones.** `NUM_LUCES` no toma dieciséis valores: toma 1, 4, 8 y 16, y se redondea hacia arriba al escalón siguiente. Cuatro variantes en vez de dieciséis, con un coste de ejecución despreciable.
+
+**Las banderas correlacionadas se fusionan.** Si `USA_NORMAL_MAP`, `USA_MAPA_RUGOSIDAD` y `USA_OCLUSION` van casi siempre juntas, una sola bandera `MATERIAL_COMPLETO` cubre el caso real con una variante en vez de ocho.
+
+<Callout type="dios" title="El tamaño de grupo óptimo se puede medir al arrancar, y casi nadie lo hace">
+Elegir el tamaño de grupo de un compute shader es un problema sin respuesta analítica. Depende del número de registros que use el shader, del tamaño de la memoria compartida que pida, del ancho de onda del hardware —32 en unas arquitecturas, 64 en otras—, del número de unidades de ejecución y de si el kernel está limitado por ALU o por memoria. Los libros dan reglas generales, del tipo «múltiplo de 64, entre 128 y 256», y esas reglas fallan en una fracción notable de los casos.
+
+Con `override`, hay una alternativa que no requiere adivinar: **medirlo en el dispositivo del usuario, la primera vez que se ejecuta**.
+
+El procedimiento cabe en treinta líneas. Al arrancar, se crean cuatro o cinco pipelines del mismo kernel con tamaños distintos. Se ejecuta cada uno sobre datos representativos unas cuantas veces, midiendo con timestamp queries si el dispositivo las soporta o con el tiempo de pared de `onSubmittedWorkDone` si no. Se elige el más rápido y se guarda la elección en almacenamiento local indexada por la cadena del adaptador, para no repetir la medida en cada carga.
+
+El coste es de unas decenas de milisegundos en el primer arranque. La ganancia, en kernels no triviales, suele estar entre el diez y el cuarenta por ciento, y en algún caso patológico es un factor de dos. Y a diferencia de casi cualquier otra optimización, **se adapta sola a hardware que todavía no existe**: un dispositivo nuevo con un ancho de onda distinto elegirá el tamaño que le convenga sin que tú hayas tocado nada.
+
+Lo mismo vale para el tamaño de tesela de un kernel de imagen, para el número de elementos que procesa cada invocación, y para cualquier parámetro que sea una decisión de rendimiento y no de corrección. La condición para poder hacerlo es que ese parámetro sea una `override` y no un número escrito en el shader, y esa es la razón de fondo por la que la especificación permite `override` en `@workgroup_size` y en el tamaño de los arrays de grupo, que son los dos únicos sitios donde no es una expresión de ejecución.
+</Callout>

@@ -1,0 +1,85 @@
+---
+title: "Elegir arquitectura de render: el árbol de decisión"
+description: "Los seis ejes que deciden entre forward, forward con prepass, clustered y deferred, una tabla comparativa sin marketing, el visibility buffer, y cuatro casos resueltos."
+subject: webgpu
+level: 39
+order: 5
+icon: "39.5"
+duracion: "21 min"
+---
+
+<Lead>
+Las cuatro arquitecturas no forman una escalera de peor a mejor: forman un espacio de compromisos donde cada una gana en unos ejes y pierde en otros. La elección es reversible, pero cara: cambiarla a mitad de proyecto significa reescribir todos los shaders de material y buena parte del pase de post-proceso. Merece la pena media hora de decisión informada, y sobre todo merece la pena poder decir en números por qué has elegido lo que has elegido.
+</Lead>
+
+<Objetivos>
+
+- Enumerar los seis ejes que determinan la elección y traducir cada uno a un número medible del proyecto.
+- Comparar las cuatro arquitecturas en ancho de banda, coste con pocas y con muchas luces, transparencia, MSAA y complejidad.
+- Explicar qué es un visibility buffer, qué gana, y qué le falta hoy a WebGPU para hacerlo cómodo.
+- Aplicar un criterio de decisión cerrado a un proyecto concreto y justificarlo.
+
+</Objetivos>
+
+## Los seis ejes
+
+**Número de luces dinámicas que afectan a un mismo píxel.** No el número total de la escena: el número efectivo por píxel, que es lo que paga el bucle. Cuéntalo de verdad, con un mapa de calor que pinte la longitud de la lista de cada cluster o el contador de luces que pasan el culling por objeto. Casi siempre es mucho menor de lo que la gente supone, y esa sola medición desmonta la mitad de las decisiones de arquitectura que se toman por intuición.
+
+**Presupuesto de ancho de banda.** Es el eje que decide y el que nadie mira. Un G-buffer de 24 bytes por muestra a 1080p60 son 6 GB/s de tráfico; a 4K60, 24 GB/s. Contra los 400 o 500 GB/s de una tarjeta dedicada eso es ruido; contra los 30 a 100 GB/s de un portátil con gráficos integrados o de un móvil, es una fracción decisiva de un bus que además comparte con la CPU. Si tu público objetivo incluye portátiles finos, este eje ya ha decidido por ti.
+
+**Transparencia importante.** "Importante" quiere decir que hay superficies con mezcla alfa que tienen que estar iluminadas por las mismas luces y con el mismo modelo que las opacas: cristal, agua, humo iluminado, tela translúcida. El follaje con alfa recortado no cuenta, porque un `discard` lo resuelve en cualquier arquitectura. Si la respuesta es sí, cualquier ruta diferida te obliga a mantener [dos implementaciones del modelo de sombreado](/guia/webgpu/n39-los-problemas-del-deferred/), y esa duplicidad es un coste de mantenimiento permanente, no un coste de una vez.
+
+**Necesidad de MSAA.** Si el producto es un configurador, un visor arquitectónico o cualquier cosa con líneas rectas y contraste alto sobre fondo claro, el aliasing de bordes es la primera cosa que se ve y el antialiasing temporal la resuelve peor y con estelas. Si es una escena orgánica con mucho detalle en movimiento, TAA es la respuesta correcta de todos modos y el MSAA deja de ser un argumento.
+
+**Variedad de materiales.** Cuenta cuántos modelos de sombreado distintos necesitas: PBR metálico-rugoso solo, o también piel, pelo anisótropo, cristal con refracción, hojas con transmisión. Un G-buffer obliga a que todos quepan en un conjunto común de canales, o a que lleves un id de material y hagas una rama por él en el pase de sombreado, que es divergencia dentro del warp. En forward cada material es simplemente otro pipeline y no molesta a nadie.
+
+**Objetivo en móvil.** Si sí, la decisión está tomada: nada de deferred clásico. Las GPU por tiles resuelven el sombreado en memoria on-chip, y WebGPU no expone hoy input attachments ni framebuffer fetch, así que un G-buffer obliga a round trips completos a DRAM que es justo lo que esa arquitectura está diseñada para evitar. Además, en un dispositivo con batería el tráfico a memoria externa es la operación más cara en energía por bit del sistema.
+
+## La tabla, sin marketing
+
+| Arquitectura | Ancho de banda | Con 4 luces | Con 500 luces | Transparencia | MSAA | Complejidad |
+|---|---|---|---|---|---|---|
+| **Forward** | Mínimo, 4 bytes por muestra | Óptimo | Inviable | Nativa, sin trabajo extra | Nativo, alta calidad | Baja |
+| **Forward con depth prepass** | Bajo, dos pases de geometría | Muy bueno | Malo, sigue siendo el producto | Nativa | Nativo | Baja |
+| **Forward+ / clustered** | Bajo, más un par de buffers de índices | Bueno, coste fijo de dos compute passes | Muy bueno, lista de 2 a 20 por cluster | Nativa, el mismo camino | Nativo | Alta |
+| **Deferred / clustered deferred** | Alto, 20 a 32 bytes por muestra escritos y leídos | Regular, el coste fijo se paga igual | Óptimo, una evaluación por píxel | Pasada forward aparte, dos rutas de material | Solo por post-proceso en la práctica | Muy alta |
+
+Tres lecturas de la tabla que conviene hacer explícitas.
+
+La primera es que **el clustered domina al deferred en casi todo el rango útil**. Solo pierde en el extremo de muchísimas luces por píxel, y lo hace por poco, porque su bucle sigue siendo por fragmento y no por píxel: con overdraw alto vuelve a pagar de más. Esa es la razón real de que prácticamente ningún motor nuevo desde 2016 arranque en deferred puro.
+
+La segunda es que la columna de complejidad no es una molestia estética. El clustered mete en tu motor dos compute passes, tres storage buffers, una rejilla que hay que reconstruir cuando cambia la proyección, un contador atómico que hay que poner a cero cada fotograma y un espacio de coordenadas —el de vista con profundidad positiva— que hay que mantener coherente entre CPU y shader. Son cuatro o cinco sitios donde equivocarse produce un bug que se manifiesta como "algunas luces parpadean a ciertas distancias".
+
+La tercera es que el deferred nunca fue gratis en ninguna casilla: su única columna ganadora es la de muchas luces, y esa columna se la ha quitado el clustered.
+
+## El visibility buffer
+
+La evolución actual del deferred no consiste en apretar más el G-buffer, sino en dejar de guardar atributos de material. Un **visibility buffer** guarda por píxel solo la identidad de lo que se ve: un identificador de instancia y un identificador de triángulo, empaquetados en un `r32uint` —por ejemplo ocho bits de instancia y veinticuatro de triángulo— o en un `rg32uint` si necesitas más rango. Cuatro u ocho bytes por píxel frente a los veinte de un G-buffer.
+
+El sombreado reconstruye todo lo demás. Con el identificador vas al buffer de índices, lees los tres vértices del triángulo, los proyectas, resuelves analíticamente las coordenadas baricéntricas del centro del píxel dentro de ese triángulo, interpolas con corrección de perspectiva los atributos que necesites, y evalúas el material. Es más trabajo aritmético a cambio de muchísimo menos tráfico de memoria, que es exactamente el intercambio favorable en el hardware moderno.
+
+Las ventajas son grandes y reales: el ancho de banda baja a la quinta parte, la memoria residente también, no hay límite de canales para los parámetros de material porque no se guardan, y admite geometría de triángulos diminutos —donde el G-buffer se hunde porque cada triángulo escribe su cuota completa de atributos.
+
+Lo que exige es lo que hay que mirar antes de emocionarse. Necesita acceso desde un único shader a **toda** la geometría de la escena: todos los buffers de vértices, todos los de índices, todos los datos de instancia. En Vulkan o D3D12 eso se resuelve con recursos sin ligadura, arrays de descriptores de tamaño dinámico. **WebGPU no tiene bindless hoy**: `maxStorageBuffersPerShaderStage` son 8 y `maxBindGroups` son 4, así que la única forma de hacerlo es consolidar toda la geometría del mundo en dos o tres storage buffers gigantes con desplazamientos, y todas las texturas de material en atlas o en arrays de textura. Es viable —de hecho es lo que ya hacen los motores orientados a dibujado indirecto— pero es una decisión que afecta a todo tu pipeline de carga de assets, no solo al renderer.
+
+Además necesita derivadas analíticas. En un pase a pantalla completa no puedes fiarte de `dpdx` y `dpdy` para elegir el nivel de mip, porque los píxeles vecinos del cuad de rasterización pueden pertenecer a triángulos completamente distintos: hay que derivar los gradientes de las coordenadas de textura a partir de la geometría del triángulo y muestrear con `textureSampleGrad`. Y necesita clasificar los píxeles por material antes de sombrear —normalmente con un compute pass que produce listas y un dispatch indirecto por material— porque si no, cada workgroup del pase de sombreado toca veinte materiales distintos y la divergencia se come la ganancia.
+
+El resumen honesto: el visibility buffer es la arquitectura correcta para un motor con geometría densísima y cientos de materiales, y hoy en WebGPU es un proyecto grande. Merece conocerse porque es hacia donde va el estado del arte, no porque sea el siguiente paso de tu proyecto.
+
+## Criterio operativo
+
+La regla de arranque, en cuatro frases. **Empieza en forward**, siempre, sin excepción; es la línea base contra la que vas a medir todo lo demás. **Añade el depth prepass** cuando midas con `timestamp-query` que el pase de sombreado cuesta claramente más que una pasada extra de geometría, y no antes. **Pasa a clustered** cuando el número de luces efectivas por píxel supere las treinta y el mapa de calor te lo confirme. **Considera el deferred** solo si mides que el cuello está en la evaluación de luces y no en el ancho de banda, y solo si ya tienes TAA por otros motivos.
+
+Cuatro casos concretos, resueltos:
+
+**Configurador de producto en la web.** Un objeto, iluminación basada en imagen más tres o cuatro luces de estudio, materiales con barniz y piezas de cristal, fondo claro, el usuario gira despacio y mira los bordes. Respuesta: **forward puro con 4x MSAA**, sin prepass siquiera. El overdraw es mínimo porque hay un solo objeto, las luces son cuatro, y la nitidez de los bordes es literalmente el producto. Meter aquí un G-buffer es pagar seis gigabytes por segundo y perder el MSAA para resolver un problema que no tienes.
+
+**Visualización arquitectónica de interiores.** Trescientas luces puntuales de pequeño radio —focos empotrados, apliques, tiras led—, ventanas con cristal, escritorio, se busca calidad de imagen estática y recorridos suaves. Respuesta: **clustered forward con depth prepass**. Las trescientas luces hacen inviable el forward y hacen brillar al clustered, porque son de radio pequeño y el culling por cluster las descarta casi todas en cada región; el cristal sigue siendo una pasada más sin ruta de material duplicada; y el MSAA salva las líneas rectas del interiorismo, que es donde el aliasing canta.
+
+**Escena urbana nocturna.** Tres mil luces, materiales homogéneos —asfalto, ladrillo, metal, todos PBR metálico-rugoso—, overdraw alto por la vegetación y las vallas, escritorio con tarjeta dedicada, y el proyecto ya usa TAA con vectores de movimiento por otras razones. Respuesta: **clustered deferred**. Aquí sí: el overdraw alto castiga al clustered forward porque su bucle es por fragmento, el ancho de banda no es un problema en esa clase de hardware, los materiales caben de sobra en el G-buffer, y el precio del MSAA ya estaba pagado. Los transparentes van en una pasada forward posterior compartiendo la función de sombreado.
+
+**Aplicación para móvil.** WebGPU en iOS y Android, treinta luces, presupuesto térmico ajustado, y una parte del público sin WebGPU que va a caer a WebGL2. Respuesta: **clustered forward, y ni de lejos deferred**. La rejilla se puede recortar a algo como 12x7x16 para bajar el coste del culling; el depth prepass hay que medirlo antes de darlo por bueno, porque las GPU por tiles ya eliminan superficies ocultas en hardware y el prepass suele salir a perder. Y el hecho de que el clustered sea forward tiene aquí un valor extra: la ruta de respaldo en WebGL2 comparte la estructura del renderer y buena parte de la lógica, mientras que un deferred habría exigido dos motores distintos.
+
+<Callout type="dios" title="Casi nadie que discute esta decisión tiene un problema de luces">
+El patrón que se repite proyecto tras proyecto: alguien lee sobre deferred, monta un G-buffer, pelea tres semanas con la transparencia y el antialiasing, y al final mide y descubre que su fotograma se iba en otra parte. Antes de tocar la arquitectura, abre el perfilador y pon números en la mesa, porque en la web los cuellos de botella reales están casi siempre en otro sitio. El primero es la compilación de shaders: un `createRenderPipeline` síncrono con un shader PBR grande puede bloquear el hilo principal decenas de milisegundos, y si compilas veinte al entrar en escena eso es medio segundo de pantalla congelada que ningún cambio de arquitectura arregla —lo arregla `createRenderPipelineAsync`. El segundo es el coste de CPU por llamada de dibujado: dos mil objetos individuales tumban el fotograma a base de cambios de bind group, y la respuesta es instancing y dibujado indirecto, no un G-buffer. El tercero es el tamaño y la descompresión de los assets, que no aparece en ninguna gráfica de GPU pero se lleva los primeros segundos de la experiencia. Y el cuarto, sorprendentemente frecuente, es el post-proceso: tres pases a pantalla completa de bloom mal dimensionados cuestan más que todo tu bucle de luces. Ninguno de esos cuatro tiene nada que ver con forward contra deferred. La prueba que zanja la discusión cuesta diez minutos: activa la feature `timestamp-query` si el adaptador la ofrece, mide el tiempo de GPU de cada pase por separado, y luego haz el experimento tonto de dejar el fragment shader en un color plano. Si el fotograma no mejora, tu problema no es la iluminación y cambiar de arquitectura solo te va a quitar el MSAA. Y si con `timestamp-query` no llegas a ninguna conclusión clara, la respuesta es la misma que si no hubieras medido: quédate en [forward](/guia/webgpu/n39-forward-y-el-coste-cuadratico/), que es la única de las cuatro que no te cierra ninguna puerta.
+</Callout>

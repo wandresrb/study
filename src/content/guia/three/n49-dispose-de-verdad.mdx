@@ -1,0 +1,284 @@
+---
+title: "dispose de verdad: la fuga de memoria de GPU que mata la pestaña"
+description: "Qué libera y qué no libera cada llamada, por qué scene.remove no toca la GPU, y una función de limpieza completa que recorre geometrías, materiales, texturas, render targets y esqueletos."
+subject: three
+level: 49
+order: 2
+icon: "49.2"
+duracion: "24 min"
+---
+
+<Lead>
+`scene.remove(objeto)` quita un nodo de una lista de hijos. Eso es todo lo que hace. La geometría sigue en la memoria de la GPU, las texturas siguen en la memoria de la GPU, el programa de shader sigue compilado, y el recolector de basura de JavaScript no puede hacer nada al respecto porque esos recursos no viven en el montículo de JavaScript: viven en el driver, detrás de un identificador entero. Es el bug más caro del 3D en aplicaciones, y es caro precisamente porque no se manifiesta como un error sino como una pestaña que se vuelve lenta y muere media hora después.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué el recolector de basura no puede liberar recursos de GPU.
+- Enumerar qué libera cada método `dispose` y qué queda fuera de su alcance.
+- Escribir una función de limpieza que recorra un subárbol completo sin dejar nada.
+- Verificar con `renderer.info` que la limpieza ha funcionado de verdad.
+
+</Objetivos>
+
+## Por qué el recolector no puede ayudarte
+
+Cuando creas una `BufferGeometry` y la usas en un render, el renderer pide a WebGL un buffer, sube los datos y guarda la correspondencia en un mapa interno. En JavaScript tienes un objeto `BufferGeometry`. En el driver hay un bloque de memoria de vídeo. Los dos están unidos por un número.
+
+El recolector de basura de JavaScript sabe cuándo el objeto `BufferGeometry` deja de ser alcanzable, y libera sus arrays tipados. Lo que no sabe es que había un bloque de VRAM asociado, porque el recolector no tiene ninguna visibilidad sobre el driver ni forma de llamarlo. Ese bloque queda huérfano: nadie lo referencia y nadie lo libera. Se recupera solo cuando el contexto WebGL entero desaparece.
+
+Esta es la razón de que Three.js tenga métodos `dispose` explícitos. No son una optimización: son la única vía de comunicación para decir "este recurso de GPU ya no hace falta". Internamente, `geometry.dispose()` dispara un evento que el renderer escucha para llamar a `gl.deleteBuffer` sobre los buffers correspondientes.
+
+```js
+import * as THREE from 'three';
+
+const g = new THREE.BoxGeometry();
+const m = new THREE.MeshStandardMaterial({ map: unaTextura });
+const malla = new THREE.Mesh(g, m);
+scene.add(malla);
+renderer.render(scene, camera);
+
+scene.remove(malla);
+renderer.render(scene, camera);
+
+// El objeto ya no se dibuja, pero:
+console.log(renderer.info.memory.geometries); // sigue contando la geometria
+console.log(renderer.info.memory.textures);   // sigue contando la textura
+```
+
+`renderer.info.memory` es la forma directa de comprobarlo. Si esos dos contadores no bajan al retirar objetos, tienes una fuga. Y como el contador es acumulativo, la prueba definitiva es montar y desmontar la escena veinte veces seguidas: si los números crecen linealmente, la limpieza está incompleta.
+
+### Qué libera cada dispose
+
+El mapa de responsabilidades no es intuitivo, y las omisiones son siempre las mismas.
+
+<Mermaid code={`flowchart TB
+  a[Objeto3D en la escena] --> b[geometry.dispose]
+  a --> c[material.dispose]
+  a --> d[skeleton.dispose para SkinnedMesh]
+  a --> e[dispose propio de InstancedMesh y BatchedMesh]
+  c --> f[map normalMap roughnessMap y demas]
+  c --> g[uniforms con texturas en ShaderMaterial]
+  f --> h[texture.dispose]
+  g --> h
+  i[Recursos que no cuelgan de ningun objeto] --> j[scene.background]
+  i --> k[scene.environment]
+  i --> l[Render targets del post proceso]
+  i --> m[PMREMGenerator]
+  n[Fuera del grafo por completo] --> o[Cache de loaders]
+  n --> p[Workers de DRACOLoader y KTX2Loader]
+  n --> q[El propio renderer y su contexto]
+  style a fill:#89b4fa,color:#11111b
+  style c fill:#f9e2af,color:#11111b
+  style h fill:#a6e3a1,color:#11111b
+  style i fill:#f38ba8,color:#11111b
+  style n fill:#f38ba8,color:#11111b
+  style q fill:#fab387,color:#11111b
+`} />
+
+Los dos bloques rojos son los que se olvidan. Los recursos que no cuelgan de ningún objeto del grafo no aparecen si recorres la escena con `traverse`, porque `traverse` visita objetos y ellos no lo son. Y lo que está completamente fuera del grafo, como los workers de descompresión, ni siquiera es memoria de GPU: son hilos vivos que siguen consumiendo si no los cierras.
+
+El punto crítico, el que hay que memorizar: **`material.dispose()` no libera las texturas del material**. Es deliberado, porque una textura se comparte entre materiales con frecuencia y liberarla desde uno rompería a los demás. La consecuencia práctica es que hay que recorrer las propiedades del material buscando texturas.
+
+## La función de limpieza completa
+
+Esta es la implementación que hay que tener en el proyecto. Recorre un subárbol, libera todo lo que encuentra, y lleva un registro de lo ya liberado para no llamar dos veces sobre recursos compartidos.
+
+```js
+import * as THREE from 'three';
+
+/**
+ * Libera todos los recursos de GPU de un subarbol y lo desconecta del padre.
+ * @param {THREE.Object3D} raiz
+ * @param {Set<object>} [vistos] recursos ya liberados, para compartidos
+ */
+export function liberarSubarbol(raiz, vistos = new Set()) {
+  function liberarTextura(t) {
+    if (!t || !t.isTexture || vistos.has(t)) return;
+    vistos.add(t);
+    t.dispose();
+  }
+
+  function liberarMaterial(material) {
+    if (!material || vistos.has(material)) return;
+    vistos.add(material);
+
+    // Todas las propiedades del material que sean texturas:
+    // map, normalMap, roughnessMap, metalnessMap, aoMap, emissiveMap,
+    // alphaMap, envMap, lightMap, displacementMap, bumpMap, ...
+    for (const clave of Object.keys(material)) {
+      liberarTextura(material[clave]);
+    }
+
+    // ShaderMaterial y NodeMaterial guardan texturas en uniforms
+    if (material.uniforms) {
+      for (const nombre of Object.keys(material.uniforms)) {
+        const v = material.uniforms[nombre]?.value;
+        if (!v) continue;
+        if (v.isTexture) liberarTextura(v);
+        else if (v.isWebGLRenderTarget) v.dispose();
+        else if (Array.isArray(v)) v.forEach((x) => liberarTextura(x));
+      }
+    }
+
+    material.dispose();
+  }
+
+  raiz.traverse((objeto) => {
+    if (objeto.geometry && !vistos.has(objeto.geometry)) {
+      vistos.add(objeto.geometry);
+      objeto.geometry.dispose();
+    }
+
+    if (objeto.material) {
+      const materiales = Array.isArray(objeto.material)
+        ? objeto.material
+        : [objeto.material];
+      for (const m of materiales) liberarMaterial(m);
+    }
+
+    // SkinnedMesh: el esqueleto tiene su propia textura de huesos
+    if (objeto.isSkinnedMesh && objeto.skeleton) {
+      objeto.skeleton.dispose();
+    }
+
+    // InstancedMesh y BatchedMesh tienen dispose propio para sus buffers
+    if (typeof objeto.dispose === 'function' && objeto !== raiz) {
+      objeto.dispose();
+    }
+  });
+
+  raiz.removeFromParent();
+  return vistos;
+}
+```
+
+El `Set` de recursos vistos no es una optimización, es corrección. Llamar dos veces a `dispose` sobre la misma textura no rompe nada en Three.js, pero cuando la limpieza abarca varios subárboles que comparten una textura de entorno, el `Set` te deja pasar el mismo conjunto entre llamadas y garantizar que la textura compartida solo se libera cuando has terminado con todos.
+
+El bucle sobre `Object.keys(material)` funciona porque los materiales de Three.js declaran todas sus propiedades en el constructor, incluidos los mapas que valen `null`. No hay que enumerar los nombres a mano ni mantener una lista que se queda obsoleta cada vez que sale una versión con un mapa nuevo.
+
+### Lo que queda fuera del subárbol
+
+Con la función anterior tienes el grafo cubierto. Falta el resto, y aquí es donde una limpieza a medias sigue filtrando.
+
+```js
+import * as THREE from 'three';
+
+export function destruirEscena({ renderer, scene, composer, pmrem, loaders }) {
+  // 1. Parar el bucle antes que nada: un frame tardio sobre recursos
+  //    liberados produce errores de WebGL dificiles de rastrear.
+  renderer.setAnimationLoop(null);
+
+  // 2. El grafo completo
+  liberarSubarbol(scene);
+
+  // 3. Fondo y entorno: no son hijos de nadie
+  if (scene.background?.isTexture) scene.background.dispose();
+  if (scene.environment?.isTexture) scene.environment.dispose();
+  scene.background = null;
+  scene.environment = null;
+  scene.clear();
+
+  // 4. Post-procesado: cada pass puede tener render targets propios
+  if (composer) {
+    for (const pass of composer.passes) {
+      if (typeof pass.dispose === 'function') pass.dispose();
+    }
+    composer.dispose();
+  }
+
+  // 5. El generador de PMREM guarda su propio render target
+  if (pmrem) pmrem.dispose();
+
+  // 6. Los loaders con workers: DRACOLoader y KTX2Loader arrancan hilos
+  for (const l of loaders ?? []) {
+    if (typeof l.dispose === 'function') l.dispose();
+  }
+
+  // 7. La cache de ficheros descargados vive en un modulo global
+  THREE.Cache.clear();
+
+  // 8. El renderer: libera programas, listas de render y estado interno
+  renderer.dispose();
+
+  // 9. Y por ultimo, el contexto WebGL en si
+  renderer.forceContextLoss();
+  renderer.domElement.remove();
+}
+```
+
+Los tres puntos que la mayoría de los proyectos se saltan son el cuatro, el seis y el nueve.
+
+El **post-procesado** es una fuente enorme de fuga porque cada `EffectComposer` guarda al menos dos render targets del tamaño de la pantalla. En una pantalla de retina eso son varias decenas de megabytes por composer. Montar y desmontar una ruta con post-procesado diez veces sin limpiar acerca la pestaña al límite de memoria de vídeo del dispositivo.
+
+Los **workers de los loaders comprimidos** no son memoria de GPU, pero son hilos. `DRACOLoader` y `KTX2Loader` arrancan un pool de workers al primer uso y lo mantienen vivo. Su método `dispose` los termina. Sin él, cada montaje deja un puñado de hilos ociosos que ni el recolector ni el navegador cierran mientras la página viva.
+
+El **contexto** es el punto más sutil. `renderer.dispose()` libera lo que el renderer gestiona, pero no cierra el contexto WebGL: el canvas sigue teniendo uno vivo. `forceContextLoss()` invoca la extensión que lo pierde deliberadamente, y solo entonces el navegador libera la asignación completa y descuenta uno del límite de contextos simultáneos. Después de llamarlo, el renderer queda inservible: es la última operación, no un reinicio.
+
+<Callout type="danger">
+No llames a `forceContextLoss()` si vas a reutilizar el renderer. Después de perder el contexto, cualquier llamada a `render` falla silenciosamente y la escena se queda en negro sin excepción alguna. Si tu arquitectura reutiliza un único renderer entre rutas, la limpieza correcta termina en `renderer.dispose()` y nunca llega al paso nueve.
+</Callout>
+
+## Verificar que la limpieza funciona
+
+Confiar en que la función está bien escrita no basta, porque el fallo típico es olvidar un recurso concreto de un modelo concreto. La verificación es objetiva y cabe en unas líneas.
+
+```js
+function instantanea(renderer) {
+  return {
+    geometrias: renderer.info.memory.geometries,
+    texturas: renderer.info.memory.textures,
+    programas: renderer.info.programs.length,
+  };
+}
+
+// En consola, tras montar y desmontar la escena N veces:
+console.table([instantanea(renderer)]);
+```
+
+El criterio es simple: los tres números tienen que volver al valor que tenían antes del montaje. Si vuelven a cero cuando la escena está desmontada, perfecto. Si se quedan en una cifra constante, tienes recursos compartidos legítimos y basta con comprobar que la cifra no crece. Si crecen con cada ciclo, hay fuga y la diferencia te dice de qué tipo.
+
+Para localizar **cuál** es el recurso que se escapa, el truco es instrumentar temporalmente el prototipo:
+
+```js
+// Solo en desarrollo: registra quien crea geometrias y no las libera
+const vivas = new Set();
+const crearOriginal = THREE.BufferGeometry.prototype.dispose;
+
+THREE.BufferGeometry.prototype.dispose = function () {
+  vivas.delete(this);
+  return crearOriginal.call(this);
+};
+
+// Marcar en el momento de creacion es mas util con la traza de pila
+function marcar(g, etiqueta) {
+  g.userData.origen = etiqueta;
+  vivas.add(g);
+  return g;
+}
+
+// Tras desmontar:
+console.log([...vivas].map((g) => g.userData.origen));
+```
+
+Etiquetar en el punto de creación y listar lo que queda vivo tras el desmontaje convierte una búsqueda a ciegas en una lista concreta de culpables.
+
+<Callout type="dios">
+Hay una fuga que resiste a todo lo anterior y que solo se ve en aplicaciones de larga vida: los **materiales clonados dentro del bucle de render**. Un patrón aparentemente inocente, como clonar un material para resaltar un objeto al pasar el ratón, crea un material nuevo cada vez que el puntero entra en un objeto. El material viejo se queda sin referencias en JavaScript, el recolector se lo lleva, y su programa de shader queda con el contador de usos sin decrementar porque nadie llamó a `dispose`. `renderer.info.programs.length` crece sin parar y llega un punto en que el driver empieza a desalojar programas y a recompilarlos, lo que produce microparones cada vez más frecuentes. El diagnóstico es característico: una aplicación que va perfecta durante diez minutos y empieza a dar tirones sin que nada haya cambiado en la escena. La solución no es limpiar mejor sino no clonar: guarda dos materiales, el normal y el resaltado, y cambia la referencia.
+</Callout>
+
+## El resumen operativo
+
+Cuatro reglas que evitan el noventa y nueve por ciento de los casos.
+
+`remove` quita del grafo, `dispose` libera de la GPU. Son operaciones independientes y hacen falta las dos.
+
+Un material no libera sus texturas. Recorre sus propiedades.
+
+Lo que no cuelga del grafo (fondo, entorno, render targets, workers) no lo alcanza ningún `traverse`. Llévalo en una lista aparte desde el principio: un array de recursos a liberar al que se apunta todo lo que creas fuera del grafo cuesta una línea por recurso y elimina la categoría entera de olvidos.
+
+Y comprueba con `renderer.info` después de montar y desmontar veinte veces. Es la única prueba que distingue una limpieza correcta de una que parece correcta.
+
+<Reto>
+Escribe un test que monte una escena con un modelo glTF comprimido con Draco, la renderice un frame, la destruya con la función completa, y repita el ciclo cincuenta veces. Comprueba en cada iteración que `renderer.info.memory.geometries` y `.textures` vuelven al mismo valor. Después quita a propósito el paso que libera el `DRACOLoader` y observa en el panel de rendimiento del navegador cómo el número de hilos crece hasta que el navegador empieza a reciclarlos.
+</Reto>

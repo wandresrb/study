@@ -1,0 +1,136 @@
+---
+title: "Cómo funciona un shadow map, paso a paso"
+description: "El mecanismo completo de dos pases: renderizar la escena desde la luz para guardar profundidades, y comparar en el segundo pase. Con la matriz que hace la conversión y el código que la construye."
+subject: three
+level: 22
+order: 1
+icon: "22.1"
+duracion: "19 min"
+---
+
+<Lead>
+Una sombra es una pregunta de visibilidad: ¿este punto ve la fuente de luz, o hay algo en medio? Resolverla exactamente exige lanzar un rayo desde el punto hasta la luz y comprobar intersecciones, que es lo que hace un trazador de rayos y lo que ninguna GPU de móvil va a hacer sesenta veces por segundo para dos millones de píxeles. La técnica que sí funciona —inventada por Lance Williams en 1978 y todavía dominante— invierte el problema: en vez de preguntar por cada píxel, **renderiza la escena una vez desde el punto de vista de la luz y guarda a qué distancia está lo primero que ve en cada dirección**.
+</Lead>
+
+<Objetivos>
+
+- Describir los dos pases de un shadow map y qué se escribe y se lee en cada uno.
+- Construir la matriz que transforma un punto de espacio de mundo al espacio de textura de la sombra.
+- Activar sombras en Three.js sabiendo qué hace cada uno de los tres interruptores.
+- Explicar por qué la comparación de profundidades es una prueba binaria y qué se pierde con ello.
+
+</Objetivos>
+
+## Los dos pases
+
+El algoritmo es este, y es sorprendentemente corto de describir:
+
+<Mermaid code={`flowchart TB
+  A[Pase 1 renderizar la escena desde la posicion de la luz] --> B[No se escribe color solo profundidad]
+  B --> C[Shadow map cada texel guarda la distancia al oclusor mas cercano en esa direccion]
+  C --> D[Pase 2 renderizar la escena desde la camara]
+  D --> E[Cada fragmento se transforma al espacio de la luz]
+  E --> F[Se lee el texel correspondiente del shadow map]
+  F --> G[Comparar la profundidad del fragmento con la guardada]
+  G --> H[Fragmento mas lejos que el texel entonces hay algo delante y esta en sombra]
+  G --> I[Fragmento igual o mas cerca entonces el es el primero y recibe luz]
+  style A fill:#89b4fa,color:#11111b
+  style B fill:#89b4fa,color:#11111b
+  style C fill:#94e2d5,color:#11111b
+  style D fill:#89b4fa,color:#11111b
+  style E fill:#cba6f7,color:#11111b
+  style F fill:#94e2d5,color:#11111b
+  style G fill:#cba6f7,color:#11111b
+  style H fill:#f38ba8,color:#11111b
+  style I fill:#a6e3a1,color:#11111b`} />
+
+El primer pase es un render normal con dos diferencias: la cámara es la de la luz, y el material se sustituye por uno que solo escribe profundidad. Three.js usa internamente `MeshDepthMaterial` con `depthPacking: RGBADepthPacking`, que codifica un float de 32 bits en los cuatro canales de 8 bits de una textura RGBA. Ese empaquetado existe por compatibilidad: no todos los dispositivos permiten leer texturas de profundidad directamente.
+
+El segundo pase es el render que ya conoces, con una operación extra por fragmento y por luz con sombra: proyectar el fragmento al espacio de la luz y comparar.
+
+## La matriz que hace la conversión
+
+El fragment shader recibe la posición del fragmento en espacio de mundo. Para leer el shadow map necesita coordenadas de textura en `[0, 1]` y una profundidad comparable con la guardada. Esa conversión es una sola matriz, y Three.js la construye en `LightShadow.updateMatrices`:
+
+```js
+// Lo que hace LightShadow.updateMatrices, simplificado.
+
+// 1. La camara de la sombra se coloca en la luz y mira al target.
+shadowCamera.position.copy( posicionMundoDeLaLuz );
+shadowCamera.lookAt( posicionMundoDelTarget );
+shadowCamera.updateMatrixWorld();
+
+// 2. Proyeccion por vista: mundo -> clip space de la luz, en [-1, 1].
+projScreenMatrix.multiplyMatrices(
+  shadowCamera.projectionMatrix,
+  shadowCamera.matrixWorldInverse
+);
+
+// 3. Matriz de sesgo: remapea [-1, 1] a [0, 1] en X e Y (y en Z para WebGL).
+shadowMatrix.set(
+  0.5, 0.0, 0.0, 0.5,
+  0.0, 0.5, 0.0, 0.5,
+  0.0, 0.0, 0.5, 0.5,
+  0.0, 0.0, 0.0, 1.0
+);
+
+// 4. La composicion final: mundo -> coordenadas de textura del shadow map.
+shadowMatrix.multiply( projScreenMatrix );
+```
+
+El paso 3 es el que suele sorprender. El clip space de OpenGL va de `-1` a `1` en los tres ejes, pero las coordenadas de textura van de `0` a `1`. La matriz de sesgo hace `x * 0.5 + 0.5` en cada componente, que es exactamente ese remapeo. En el código real hay una rama para `WebGPUCoordinateSystem`, donde la Z de clip space ya va de `0` a `1` y por tanto la tercera fila es la identidad; es una de las diferencias de bajo nivel entre WebGL y WebGPU que Three.js absorbe por ti.
+
+En el shader, la comparación queda así:
+
+```glsl
+// vShadowCoord viene del vertex shader: shadowMatrix * posicionMundo
+vec3 coord = vShadowCoord.xyz / vShadowCoord.w;   // division perspectiva
+
+// Fuera del frustum de la sombra: no hay informacion, se asume iluminado.
+bool dentro = coord.x >= 0.0 && coord.x <= 1.0
+           && coord.y >= 0.0 && coord.y <= 1.0
+           && coord.z <= 1.0;
+
+float profundidadGuardada = unpackRGBAToDepth( texture2D( shadowMap, coord.xy ) );
+float sombra = ( coord.z <= profundidadGuardada ) ? 1.0 : 0.0;
+```
+
+Esa comprobación de «dentro del frustum» explica el comportamiento que desconcierta a todo el mundo la primera vez: **fuera del volumen de la cámara de sombra no hay sombra, hay luz**. No es un bug, es la única decisión razonable cuando no tienes información.
+
+## Los tres interruptores de Three.js
+
+Activar sombras requiere tocar tres sitios distintos, y olvidarse de cualquiera de ellos produce el mismo resultado —nada— sin ningún mensaje.
+
+```js
+// 1. El renderizador tiene que hacer el pase extra.
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+// 2. La luz tiene que generar un mapa.
+sol.castShadow = true;
+
+// 3. Cada objeto declara su papel, y son independientes.
+cubo.castShadow = true;     // aparece en el pase 1, ocluye
+cubo.receiveShadow = true;  // su material lee el mapa en el pase 2
+suelo.receiveShadow = true; // el suelo recibe pero no proyecta
+```
+
+Que `castShadow` y `receiveShadow` sean propiedades separadas no es burocracia: es la palanca de rendimiento más directa del sistema. Un objeto con `castShadow = false` **se salta el primer pase entero**, lo que ahorra draw calls; un objeto con `receiveShadow = false` compila un shader sin el código de muestreo de sombras, lo que ahorra ALU y registros. En una escena con un terreno grande y muchos objetos pequeños, marcar el terreno como `receiveShadow` pero no como `castShadow` es gratis y correcto.
+
+<Callout type="warn" title="Los materiales se recompilan al cambiar receiveShadow">
+`receiveShadow` forma parte de la clave del programa. Cambiarlo en caliente sobre muchos objetos provoca una tanda de compilaciones y un tirón visible. Decídelo al construir la escena, no durante la interacción.
+</Callout>
+
+## Lo que se pierde con una prueba binaria
+
+La comparación devuelve `1.0` o `0.0`: iluminado o en sombra. No hay término medio. Eso tiene tres consecuencias que van a ocupar el resto de este nivel.
+
+**No hay penumbra física.** Una fuente real tiene tamaño y produce un borde gradual cuya anchura crece con la distancia al oclusor. Un shadow map produce un borde de anchura constante, y lo poco de gradiente que ves viene del filtrado, no de la física.
+
+**No hay sombras de translúcidos.** Un cristal de color proyecta una sombra tintada porque atenúa parcialmente. El shadow map solo sabe «hay algo» o «no hay nada». Three.js ofrece una válvula de escape parcial con `light.shadow.intensity`, que va de 0 a 1 y controla cuánta luz bloquea la sombra en global; para sombras coloreadas por objeto no hay solución en el pipeline estándar.
+
+**La resolución es finita y discreta.** Un texel del mapa cubre un área de la escena, y toda esa área comparte un único valor de profundidad. Esa discretización es la causa directa del artefacto que arruina más escenas que ningún otro, y es lo que toca a continuación en [acné y peter-panning](/guia/three/n22-acne-y-peter-panning/).
+
+<Callout type="dios" title="El shadow map no guarda distancias, guarda profundidad no lineal, y eso decide dónde puedes poner el near">
+Es tentador imaginar que cada texel contiene «la distancia en metros al objeto más cercano». No es así, y la diferencia tiene consecuencias muy prácticas. Lo que se guarda es la **coordenada Z del clip space después de la división perspectiva**, remapeada a `[0, 1]`. Para una cámara ortográfica —la que usa `DirectionalLight`— esa coordenada sí es lineal en la distancia, y todo se comporta como esperas. Pero para `SpotLight` y `PointLight` la cámara es de perspectiva, y ahí la relación entre Z de clip y distancia real es **hiperbólica**: `z_clip = (f + n) / (f - n) + (2 f n) / ((f - n) * (-z_vista))`. La consecuencia es que la precisión no se reparte por igual. Con `near = 0.5` y `far = 500`, la mitad de todos los valores representables del buffer se gastan en el primer 0.5 % del rango, es decir entre 0.5 y 1 unidad de la luz, y al otro extremo del frustum dos superficies separadas por medio metro pueden acabar en el mismo valor cuantizado. El efecto es que **subir `shadow.camera.near` mejora la calidad de la sombra en todo el rango**, y suele mejorarla más que duplicar la resolución del mapa, porque estás recuperando bits de precisión en lugar de añadir texels. La regla operativa: pon el `near` de la cámara de sombra tan lejos como puedas sin recortar oclusores —si la luz está a 10 unidades del suelo y no hay nada entre medias, `near = 8` es correcto y `near = 0.5` está tirando siete bits de precisión—. Es el ajuste que menos gente hace y el que más barato sale, porque no cuesta ni un byte de memoria ni un milisegundo de render.
+</Callout>

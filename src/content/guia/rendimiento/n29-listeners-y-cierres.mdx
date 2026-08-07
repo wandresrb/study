@@ -1,0 +1,248 @@
+---
+title: "Listeners que nunca se van y cierres que retienen de más"
+description: "El patrón de AbortController para desregistrarlo todo de golpe, por qué un cierre retiene variables que ni siquiera menciona, y las cachés que son fugas con calendario."
+subject: rendimiento
+level: 29
+order: 4
+icon: "29.4"
+duracion: "19 min"
+---
+
+<Lead>
+Un listener registrado en `window` desde un componente que se desmonta es la fuga más frecuente del frontend, y la más silenciosa: no falla nada, no hay error, la función simplemente se sigue ejecutando sobre un componente que ya no existe y mantiene vivo todo lo que capturó. Junto a ella va una segunda, más difícil de ver, en la que un cierre retiene variables que ni siquiera menciona, porque en JavaScript la unidad de retención no es la variable sino el ámbito.
+</Lead>
+
+<Objetivos>
+
+- Registrar y desregistrar listeners de forma que sea imposible olvidarse.
+- Usar una única `AbortSignal` para limpiar listeners, peticiones y temporizadores de un componente.
+- Explicar el contexto compartido de cierres y por qué retiene variables no referenciadas.
+- Dotar a toda caché de una política de expulsión desde el día en que se escribe.
+
+</Objetivos>
+
+## El listener que nadie retira
+
+El caso canónico:
+
+```js
+class Panel {
+  constructor(raiz) {
+    this.raiz = raiz;
+    this.datos = new Array(50000).fill({ campo: 'valor' });
+    window.addEventListener('resize', () => this.recolocar());
+  }
+  recolocar() { /* ... */ }
+  destruir() { this.raiz.remove(); }
+}
+```
+
+`destruir()` quita el nodo del documento y no hace nada más. El listener sigue registrado en `window`, que es una raíz de recolección. La función flecha captura `this`, que es la instancia, que retiene `raiz` —un árbol desprendido completo— y `datos`. El componente vive para siempre y arrastra todo consigo. Abrir y cerrar el panel cuarenta veces son cuarenta instancias vivas.
+
+Hay una variante todavía más traicionera, porque el desarrollador **sí** intentó limpiar:
+
+```js
+// NO funciona: cada .bind() crea una funcion NUEVA.
+window.addEventListener('resize', this.recolocar.bind(this));
+window.removeEventListener('resize', this.recolocar.bind(this));
+
+// NO funciona: cada flecha es una funcion nueva.
+window.addEventListener('resize', () => this.recolocar());
+window.removeEventListener('resize', () => this.recolocar());
+```
+
+`removeEventListener` compara por identidad de función. Una función enlazada y una flecha creadas en momentos distintos son objetos distintos, así que el listener original nunca se quita y encima ahora hay dos. Este código pasa cualquier revisión porque *parece* correcto.
+
+Las dos formas que sí funcionan: guardar la referencia, o usar un campo de clase con flecha, que se crea una vez por instancia.
+
+```js
+class Panel {
+  // Campo de clase: se crea una sola vez por instancia y su
+  // identidad es estable, asi que removeEventListener funciona.
+  #alRedimensionar = () => this.recolocar();
+
+  montar() {
+    window.addEventListener('resize', this.#alRedimensionar);
+  }
+  destruir() {
+    window.removeEventListener('resize', this.#alRedimensionar);
+  }
+}
+```
+
+## Una señal para desregistrarlo todo
+
+Guardar una referencia por listener funciona pero no escala: un componente con seis listeners, dos observadores, un intervalo y una petición en vuelo necesita nueve líneas de limpieza y basta olvidar una. La solución moderna es una sola `AbortSignal` compartida.
+
+```js
+export class Componente {
+  #control = new AbortController();
+  #observador = null;
+  #intervalo = 0;
+
+  async montar(raiz) {
+    const { signal } = this.#control;
+
+    // Todos los listeners con la misma senal.
+    window.addEventListener('resize', this.#alRedimensionar,
+                            { signal, passive: true });
+    document.addEventListener('keydown', this.#alTecla, { signal });
+    raiz.addEventListener('click', this.#alClic, { signal });
+
+    // Los observadores no aceptan senal: se desconectan a mano.
+    this.#observador = new ResizeObserver(this.#alRedimensionar);
+    this.#observador.observe(raiz);
+
+    // Los temporizadores tampoco.
+    this.#intervalo = setInterval(this.#refrescar, 30000);
+
+    // fetch si acepta la senal: al abortar, la peticion se cancela
+    // y su cadena de promesas deja de retener nada.
+    try {
+      const respuesta = await fetch('/api/datos', { signal });
+      this.datos = await respuesta.json();
+    } catch (error) {
+      if (error.name !== 'AbortError') throw error;
+    }
+  }
+
+  destruir() {
+    this.#control.abort();          // los tres listeners y el fetch
+    this.#observador?.disconnect();
+    clearInterval(this.#intervalo);
+    this.#observador = null;
+  }
+
+  #alRedimensionar = () => { /* ... */ };
+  #alTecla = (e) => { /* ... */ };
+  #alClic = (e) => { /* ... */ };
+  #refrescar = () => { /* ... */ };
+}
+```
+
+La opción `signal` de `addEventListener` es la mejora ergonómica más importante que ha tenido esta API: convierte N desregistros en uno. Y como `fetch` acepta la misma señal, cancelas de paso las peticiones en vuelo, que además de retener memoria pueden intentar escribir sobre un componente destruido.
+
+Dos utilidades relacionadas que conviene conocer: `AbortSignal.timeout(ms)` crea una señal que se aborta sola pasado un tiempo, y `AbortSignal.any([a, b])` combina varias, lo que permite que una petición se cancele tanto al desmontar el componente como al agotarse su plazo.
+
+```js
+const señal = AbortSignal.any([
+  this.#control.signal,
+  AbortSignal.timeout(8000),
+]);
+const respuesta = await fetch('/api/lento', { signal: señal });
+```
+
+La opción `{ once: true }` resuelve el caso de un solo disparo sin ninguna contabilidad: el navegador retira el listener después de ejecutarlo.
+
+## El contexto compartido: cierres que retienen lo que no usan
+
+Esta es la parte que no se deduce y que hay que saber.
+
+Cuando una función contiene funciones internas que capturan variables, el motor no guarda una copia de las variables por cada cierre. Crea **un solo objeto de contexto** para el ámbito, con todas las variables que alguna función interna necesita, y todos los cierres de ese ámbito apuntan a él. Es una optimización razonable: evita duplicar y hace baratas las capturas múltiples.
+
+El efecto secundario es que **basta con que un cierre sobreviva para que todo el contexto sobreviva**, incluidas las variables que ese cierre no menciona.
+
+```js
+function inicializar(elemento) {
+  const enorme = new Array(1_000_000).fill('dato');  // decenas de MB
+  const contador = { valor: 0 };
+
+  // Este cierre usa `enorme`. Se ejecuta una vez y se descarta.
+  const total = (() => enorme.length)();
+
+  // Este cierre NO menciona `enorme`. Pero comparte contexto con el
+  // anterior, y se queda registrado para siempre.
+  window.addEventListener('scroll', () => {
+    contador.valor++;
+  });
+
+  return total;
+}
+```
+
+El listener de scroll retiene el contexto del ámbito de `inicializar`. Ese contexto contiene `contador` —que sí usa— y también `enorme`, porque otra función del mismo ámbito lo capturaba. El array de un millón de elementos se queda en memoria mientras el listener exista, y no hay ninguna línea de código que lo sugiera.
+
+En el snapshot esto aparece como una entrada `system / Context` con tamaño retenido enorme, y el camino de retenedores pasa por `(closure)`. Es la firma inconfundible del problema.
+
+Hay tres reparaciones, en orden de preferencia:
+
+```js
+// 1. Reducir el ambito: lo pesado vive en su propia funcion.
+function calcularTotal() {
+  const enorme = new Array(1_000_000).fill('dato');
+  return enorme.length;         // `enorme` muere al salir
+}
+
+function inicializar(elemento) {
+  const total = calcularTotal();
+  const contador = { valor: 0 };
+  window.addEventListener('scroll', () => contador.valor++);
+  return total;
+}
+```
+
+```js
+// 2. Soltar explicitamente cuando no se puede reestructurar.
+let enorme = new Array(1_000_000).fill('dato');
+const total = enorme.length;
+enorme = null;                  // el contexto sigue, el array se va
+```
+
+```js
+// 3. No capturar: pasar por parametro en vez de por cierre.
+window.addEventListener('scroll', crearContador(contador));
+
+function crearContador(estado) {   // ambito propio, no ve `enorme`
+  return () => estado.valor++;
+}
+```
+
+La primera es la correcta y además mejora el código por otras razones. La segunda funciona y es fea. La tercera es la que hay que usar cuando escribes una librería y no controlas quién te llama.
+
+## Cachés, temporizadores y promesas que no terminan
+
+Tres fuentes más, cada una con su reparación.
+
+**Toda caché sin política de expulsión es una fuga con calendario.** Da igual lo pequeña que sea la entrada: si el número de claves posibles no está acotado, el consumo crece hasta el límite del heap. La reparación no es debilitar las referencias, es escribir la política el mismo día que la caché.
+
+```js
+// LRU minimo. Map conserva el orden de insercion, y reinsertar
+// mueve la clave al final: eso basta para implementar LRU.
+export class CacheLRU {
+  #mapa = new Map();
+  constructor(limite = 200) { this.limite = limite; }
+
+  obtener(clave) {
+    if (!this.#mapa.has(clave)) return undefined;
+    const valor = this.#mapa.get(clave);
+    this.#mapa.delete(clave);
+    this.#mapa.set(clave, valor);   // pasa a ser el mas reciente
+    return valor;
+  }
+
+  guardar(clave, valor) {
+    if (this.#mapa.has(clave)) this.#mapa.delete(clave);
+    this.#mapa.set(clave, valor);
+    if (this.#mapa.size > this.limite) {
+      // El primero del iterador es el menos usado recientemente.
+      this.#mapa.delete(this.#mapa.keys().next().value);
+    }
+  }
+}
+```
+
+**Un `setInterval` es una raíz de recolección.** Mientras no lo canceles, su callback y todo lo que capture están vivos, aunque el componente que lo creó lleve horas desmontado. Y a diferencia de `setTimeout`, no se agota solo. Cada `setInterval` de tu código debe tener su `clearInterval` en la misma unidad de limpieza.
+
+**Una promesa que nunca se resuelve retiene su cadena.** Si guardas una promesa pendiente y sus `then` capturan objetos grandes, esos objetos viven mientras la promesa no se resuelva ni se rechace. El caso típico es una petición sin tiempo de espera contra un servidor que no responde: la promesa queda colgada indefinidamente. `AbortSignal.timeout` lo resuelve de raíz.
+
+<Callout type="dios" title="Todo lo que registra debe devolver cómo se desregistra, y eso es una regla de API, no de disciplina">
+Fíjate en lo que tienen en común los cinco casos de esta lección. En los cinco existe un momento de registro —añadir un listener, arrancar un intervalo, observar un elemento, guardar en una caché, lanzar una petición— y en los cinco el desregistro es una acción **separada, opcional y silenciosa si no se hace**. Nada falla si te la saltas. Ninguna herramienta te avisa. El único momento en que se manifiesta es cuarenta minutos después, en el móvil de otra persona. Cuando una clase entera de errores tiene esa forma, la solución no puede ser pedir más cuidado a los programadores: el cuidado no escala, y quien escribe el registro casi nunca es quien escribe la limpieza seis meses después. La solución tiene que ser estructural, y consiste en una regla que conviene aplicar sin excepciones en cualquier API que diseñes: **toda función que registre algo devuelve la función que lo desregistra**. No un booleano de éxito, no `undefined`: el desregistro. Así el que llama tiene el mecanismo de limpieza en la mano en el mismo momento en que crea el problema, y no tiene que ir a buscarlo a la documentación ni recordar el nombre del método simétrico. Es exactamente el patrón que popularizaron los sistemas de efectos de los frameworks modernos, donde el efecto devuelve su limpieza, y no es casualidad que la clase entera de fugas de listeners casi haya desaparecido del código escrito con ellos. Lo mismo con la señal de aborto: en vez de N desregistros simétricos, un único objeto que representa "la vida de esta cosa", y todo lo que se registre durante esa vida se cuelga de él. Cuando adoptas esa mentalidad, la pregunta al escribir cualquier componente deja de ser "¿me he acordado de limpiar?" y pasa a ser "¿cuál es el objeto que representa la vida de esto, y está todo colgado de él?". La primera pregunta la fallas de vez en cuando. La segunda la responde el propio código.
+</Callout>
+
+<Reto title="Audita tus registros">
+1. Busca en tu código todos los `addEventListener` sobre `window` o `document`. Comprueba, uno a uno, que existe un desregistro alcanzable.
+2. Busca los `removeEventListener` que reciban `.bind(this)` o una flecha en línea. Son todos inútiles: arréglalos.
+3. Convierte un componente completo al patrón de `AbortController` y verifica con la técnica de los tres snapshots que deja de filtrar.
+4. Reproduce el caso del contexto compartido y confirma en el snapshot que aparece un `system / Context` con tamaño retenido grande.
+5. Localiza todas las cachés de tu aplicación sin política de expulsión y ponles un límite. Anota cuántas había.
+</Reto>

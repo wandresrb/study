@@ -1,0 +1,177 @@
+---
+title: "El caparazón de aplicación y la precarga de navegación"
+description: "El patrón de app shell y cuándo deja de compensar, el coste real del arranque en frío del service worker, y cómo la precarga de navegación lo elimina lanzando la petición en paralelo."
+subject: rendimiento
+level: 33
+order: 4
+icon: "33.4"
+duracion: "19 min"
+---
+
+<Lead>
+Un service worker que responde de su propia caché es lo más rápido que existe en la web: cero red, cero latencia, respuesta en un puñado de milisegundos. Salvo por un detalle que arruina el cálculo en la primera navegación de cada sesión: antes de que el worker pueda responder, hay que arrancarlo, y ese arranque está en el camino crítico. La precarga de navegación existe exactamente para eso, y es de las APIs con mejor relación entre esfuerzo y beneficio que hay en la plataforma.
+</Lead>
+
+<Objetivos>
+
+- Implementar el caparazón de aplicación y decidir si tu sitio se beneficia de él.
+- Cuantificar el arranque en frío del service worker con Resource Timing.
+- Activar la precarga de navegación y consumir `event.preloadResponse` correctamente.
+- Distinguir en el servidor una petición de precarga de una normal para responder distinto.
+
+</Objetivos>
+
+## El caparazón de aplicación
+
+El patrón consiste en separar la página en dos piezas: el **caparazón**, que es el HTML, el CSS y el JavaScript mínimos para dibujar la estructura de la interfaz sin ningún dato, y el **contenido**, que llega después. El caparazón se precarga en `install`, se sirve siempre de la caché y es idéntico para todas las rutas. El resultado es que cualquier navegación pinta algo en el tiempo que tarda la caché, y el contenido aparece a continuación.
+
+```js
+const CAPARAZON = 'caparazon-v14';
+const ARCHIVOS_CAPARAZON = [
+  '/caparazon.html',
+  '/app.a3f9c1d2.css',
+  '/app.7b2e4f80.js',
+  '/logo.svg',
+  '/sin-conexion.html',
+];
+
+self.addEventListener('install', (evento) => {
+  evento.waitUntil(
+    caches.open(CAPARAZON).then((c) => c.addAll(ARCHIVOS_CAPARAZON))
+  );
+});
+
+self.addEventListener('fetch', (evento) => {
+  if (evento.request.mode !== 'navigate') return;
+  // Toda navegacion recibe el mismo caparazon; el enrutador del cliente
+  // decide que pintar dentro.
+  evento.respondWith(
+    caches.match('/caparazon.html').then((r) => r || fetch(evento.request))
+  );
+});
+```
+
+Ese `addAll` tiene una propiedad importante: **es atómico**. Si cualquiera de los ficheros falla, la promesa rechaza, `install` falla y el worker pasa a `redundant`. Es el comportamiento correcto —un caparazón a medias es peor que ninguno— pero hay que saberlo, porque un solo nombre mal escrito en esa lista impide instalar el worker y el síntoma es "el service worker no se registra" sin más explicación.
+
+El patrón nació cuando la alternativa era esperar a un servidor lento, y en ese contexto era una mejora enorme. Hoy hay que ser honesto sobre sus límites, porque se sigue recomendando en sitios donde perjudica:
+
+**Empeora el LCP en el primer pintado si el contenido no es instantáneo.** El caparazón es, por definición, una interfaz vacía. Si el contenido tarda 800 ms en llegar, has pintado un armazón a los 100 ms y el elemento grande aparece a los 900. El LCP mide el elemento grande, no el armazón. Frente a un HTML del servidor que llega completo a los 500 ms, el caparazón ha perdido.
+
+**Rompe el contenido indexable.** Toda ruta devuelve el mismo HTML. Los rastreadores que ejecutan JavaScript lo resuelven, pero pagan por ello y no todos lo hacen.
+
+**Compite con las estrategias de render del nivel anterior.** El streaming de HTML desde el borde, con el marco cacheado y los huecos rellenados, consigue lo mismo sin duplicar el enrutado en el cliente. Para un sitio de contenido, [el árbol de decisión de render](/guia/rendimiento/n30-el-arbol-de-decision/) lleva casi siempre a una hoja mejor.
+
+El caparazón sigue siendo la respuesta correcta en un caso concreto y bien definido: **aplicaciones con estado, tras autenticación, que se usan a diario y donde la primera carga ocurre una vez por sesión larga.** Un panel de trabajo, un cliente de correo, un editor. Ahí no hay nada que indexar, el usuario vuelve constantemente, y arrancar en 100 ms en lugar de en 900 es la diferencia entre una herramienta que se siente instalada y una que se siente una web.
+
+## El arranque en frío
+
+Cuando llega una navegación y el proceso del service worker no está en memoria, el navegador tiene que arrancarlo: crear el contexto, descargar o leer el script, evaluarlo entero, y registrar los manejadores. Solo entonces puede entregar el evento `fetch`. Ese tiempo está **antes** de que empiece tu estrategia de caché y se suma íntegro al tiempo hasta el primer byte.
+
+En Resource Timing, el intervalo entre `workerStart` y `fetchStart` es exactamente ese arranque:
+
+```js
+// Ejecutar en la pagina, sobre la entrada de navegacion.
+new PerformanceObserver((lista) => {
+  for (const nav of lista.getEntries()) {
+    if (!nav.workerStart) {
+      console.log('Esta navegacion no paso por el service worker');
+      continue;
+    }
+    console.log({
+      arranqueDelWorker: Math.round(nav.fetchStart - nav.workerStart),
+      respuesta: Math.round(nav.responseStart - nav.fetchStart),
+      total: Math.round(nav.responseStart - nav.startTime),
+    });
+  }
+}).observe({ type: 'navigation', buffered: true });
+```
+
+Los números típicos: en un portátil de desarrollo, entre 10 y 40 milisegundos. En un móvil de gama media con el script del worker grande, de 50 a 150. En gama baja con el disco lento y el proceso expulsado de memoria, puede pasar de 200. Y es tiempo que se paga en la **primera** navegación de cada sesión, que es exactamente la que el usuario percibe como "abrir la aplicación".
+
+Dos cosas reducen el arranque y las dos merecen la pena. La primera: **el script del worker se evalúa entero en cada arranque**, así que su tamaño importa mucho más que el de cualquier otro fichero. Un worker con doscientos kilobytes de librería paga esa evaluación cada vez que arranca en frío. La segunda: cualquier trabajo en el ámbito superior del script —abrir bases de datos, leer configuración, calcular listas— ocurre también en cada arranque. Mueve todo eso dentro de los manejadores, en carga perezosa.
+
+## La precarga de navegación
+
+La solución de la plataforma a este problema es elegante: **mientras el service worker arranca, el navegador lanza la petición de red en paralelo**, y cuando el worker está listo le entrega la respuesta ya en marcha. El arranque deja de estar en el camino crítico porque se solapa con la red.
+
+Son tres piezas. Activarla en `activate`:
+
+```js
+self.addEventListener('activate', (evento) => {
+  evento.waitUntil(
+    (async () => {
+      if (self.registration.navigationPreload) {
+        await self.registration.navigationPreload.enable();
+      }
+      const nombres = await caches.keys();
+      await Promise.all(
+        nombres.filter((n) => n !== CAPARAZON).map((n) => caches.delete(n))
+      );
+      await self.clients.claim();
+    })()
+  );
+});
+```
+
+Consumirla en `fetch`:
+
+```js
+self.addEventListener('fetch', (evento) => {
+  if (evento.request.mode !== 'navigate') return;
+
+  evento.respondWith(
+    (async () => {
+      // 1. La respuesta que el navegador ya lanzo mientras arrancabamos.
+      const precargada = await evento.preloadResponse;
+      if (precargada) {
+        const cache = await caches.open('documentos-v14');
+        cache.put(evento.request, precargada.clone());
+        return precargada;
+      }
+
+      // 2. Si no hay precarga, red normal con tiempo limite.
+      try {
+        return await fetch(evento.request);
+      } catch {
+        return (
+          (await caches.match(evento.request)) ||
+          (await caches.match('/sin-conexion.html')) ||
+          Response.error()
+        );
+      }
+    })()
+  );
+});
+```
+
+Y la parte que se olvida constantemente: **si no consumes `event.preloadResponse`, has hecho una petición de más**. El navegador la ha lanzado; si tu manejador responde de la caché y nunca lee esa promesa, el servidor ha recibido y procesado una petición cuya respuesta se descarta. En un sitio con tráfico eso es carga real y gratuita para nadie. La regla: si vas a servir de la caché sin mirar la red, o consumes y descartas explícitamente la promesa, o no actives la precarga para esa ruta.
+
+La tercera pieza es del lado del servidor. Las peticiones de precarga llevan la cabecera `Service-Worker-Navigation-Preload` con el valor `true`, y ese valor se puede cambiar:
+
+```js
+// Enviar la version en cache que tiene el cliente para que el servidor
+// pueda responder solo con lo que ha cambiado.
+await self.registration.navigationPreload.setHeaderValue('v14');
+```
+
+```text
+# El servidor puede distinguir y responder distinto.
+GET /panel HTTP/2
+Service-Worker-Navigation-Preload: v14
+```
+
+El caso de uso real es responder con un fragmento en lugar del documento completo cuando el cliente ya tiene el caparazón, ahorrando bytes en cada navegación. Requiere coordinación entre worker y servidor, así que solo compensa si controlas los dos, pero cuando compensa la diferencia es grande.
+
+Un aviso de compatibilidad honesto: la precarga de navegación no está en todos los motores. La comprobación `if (self.registration.navigationPreload)` no es defensiva por costumbre, es necesaria, y el camino sin precarga tiene que seguir funcionando igual de bien. Nunca conviertas la precarga en un requisito.
+
+<Callout type="dios" title="Un service worker añade latencia a todas las peticiones que no acierta en caché, y ese coste es invisible en el laboratorio">
+El razonamiento con el que se justifica instalar un service worker es siempre el del caso bueno: la petición acierta en caché, se ahorra la red entera, se gana medio segundo. Es cierto. Lo que casi nunca se pone en la otra columna es que **el worker se interpone también en todas las peticiones que no acierta**, y en esas no ahorra nada: añade. Añade el arranque en frío si el proceso no estaba vivo, añade el tiempo de tu enrutador, añade el coste de consultar la caché para descubrir que no está, y solo entonces empieza la petición de red que habría empezado inmediatamente sin worker. En un sitio con una tasa de aciertos del noventa por ciento eso es un intercambio excelente y no hay más que hablar. En uno con un cuarenta por ciento, que es lo que acaba teniendo mucha gente cuando el contenido es dinámico y las cachés se invalidan a menudo, el balance puede ser negativo, y lo peor es que no lo verás. No lo verás porque tus pruebas de laboratorio se ejecutan casi siempre con perfil limpio y sin worker registrado, o con el worker ya caliente porque acabas de cargar la página tres veces; porque las herramientas sintéticas miden por defecto la primera visita, que es precisamente aquella en la que el worker no participa; y porque tu propia experiencia como desarrollador es la de alguien con el proceso siempre en memoria. El coste lo paga el usuario que abre la aplicación una vez al día, con el proceso expulsado, en un teléfono con el disco lento, y ese usuario no está en ninguna de tus mediciones. La forma de no engañarse es doble y no cuesta casi nada. **Primero: segmenta tus datos de campo por si la navegación pasó o no por el worker**, cosa que sabes con `workerStart` mayor que cero, y compara la distribución de tiempo hasta el primer byte de los dos grupos; si el grupo con worker no es claramente mejor en el percentil 75, tienes un problema. **Segundo: mide el arranque en frío en un dispositivo real de gama baja, no en tu máquina**, y usa ese número, no el tuyo, para decidir si activas la precarga de navegación. La conclusión incómoda a la que llega bastante gente cuando hace estas dos cosas es que su service worker no estaba aportando nada y llevaba dos años en producción con la deuda de mantenimiento que eso implica. Retirarlo bien es una decisión de ingeniería perfectamente respetable, y para hacerlo hace falta el procedimiento que cierra este nivel.
+</Callout>
+
+<Reto title="Mide lo que cuesta arrancar">
+1. Mide `fetchStart` menos `workerStart` en tu portátil y en un móvil real de gama baja. Anota los dos números.
+2. Activa la precarga de navegación, comprueba que existe `event.preloadResponse` y vuelve a medir el tiempo hasta el primer byte de la primera navegación de la sesión.
+3. Cuenta el tamaño de tu script de service worker y todo el trabajo que hace en el ámbito superior. Muévelo dentro de los manejadores y mide de nuevo el arranque.
+4. Segmenta tus datos de campo por `workerStart` mayor que cero y compara el percentil 75 de tiempo hasta el primer byte entre los dos grupos.
+5. Comprueba en los registros de tu servidor si te llegan peticiones con la cabecera de precarga cuya respuesta nadie consume.
+</Reto>

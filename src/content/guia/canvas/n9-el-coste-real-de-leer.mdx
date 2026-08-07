@@ -1,0 +1,152 @@
+---
+title: "El coste real de leer del canvas"
+description: "Entender por qué getImageData es la operación más cara de la API: la sincronización con la GPU que obliga a provocar, y qué hace willReadFrequently exactamente."
+subject: canvas
+level: 9
+order: 5
+icon: "9.5"
+duracion: "18 min"
+---
+
+<Lead>
+`getImageData` no es una lectura de memoria: es una barrera de sincronización con la GPU. Obliga a vaciar la cola de comandos pendientes, esperar a que el hardware termine de dibujarlos y copiar el resultado desde la memoria de vídeo a la del sistema. Ese viaje de vuelta es el pico de latencia más brutal que puede tener un canvas, y explica por qué existe una opción del contexto dedicada exclusivamente a avisar de que vas a hacerlo.
+</Lead>
+
+<Objetivos>
+
+- Explicar la secuencia de operaciones que provoca una lectura de píxeles en un canvas acelerado.
+- Describir qué hace `willReadFrequently` y qué se pierde al activarlo.
+- Medir el coste de una lectura en tu propio dispositivo.
+- Elegir alternativas a la lectura de píxeles en los casos donde no es necesaria.
+
+</Objetivos>
+
+## Qué pasa cuando lees
+
+Un canvas acelerado por hardware funciona con un flujo en un solo sentido. Tus llamadas de dibujo no se ejecutan cuando las escribes: se **encolan** como comandos, y la GPU los procesa cuando le llega el turno. Esa asincronía es lo que hace que dibujar sea barato desde el punto de vista del hilo principal: encolar es prácticamente gratis, y el trabajo real ocurre en otro sitio.
+
+`getImageData` rompe ese flujo. Para devolverte píxeles correctos, el navegador tiene que:
+
+1. **Vaciar la cola**: enviar a la GPU todos los comandos pendientes.
+2. **Esperar** a que la GPU los ejecute. Esto es una espera activa del hilo, sin nada que hacer.
+3. **Leer de vuelta** los píxeles desde la memoria de vídeo a la del sistema, atravesando el bus.
+4. **Convertir el formato**: des-premultiplicar el alfa y reordenar canales si hace falta.
+
+Los pasos 2 y 3 son los caros. El 2 puede costar varios milisegundos si había trabajo encolado; el 3 depende del tamaño de la región y del ancho de banda del bus, que en gráficos integrados es bastante menor de lo que la gente supone.
+
+En cifras típicas: leer un píxel de un canvas acelerado que acaba de dibujar puede costar entre 1 y 10 milisegundos. **Un píxel.** El coste no está en la cantidad de datos sino en la sincronización.
+
+## willReadFrequently: cambiar de arquitectura
+
+```js
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+```
+
+Ese indicador le dice al navegador: este canvas va a leerse mucho, así que **no lo pongas en la GPU**. Créalo en memoria del sistema y ejecuta las operaciones de dibujo por software.
+
+Con eso, `getImageData` se convierte en lo que la gente cree que es: una copia de memoria. Sin sincronización, sin espera, sin bus. El coste cae a microsegundos.
+
+El precio es que **todo el dibujo pasa a ejecutarse en la CPU**. Los rellenos, los trazados de rutas complejas, `drawImage` con escalado, los degradados y sobre todo las sombras y los desenfoques pasan a costar mucho más. Para un canvas que dibuja poco y lee mucho, es una ganancia enorme; para uno que dibuja mucho, es un desastre.
+
+La comparación resumida:
+
+| Operación | Canvas acelerado | Canvas con `willReadFrequently` |
+|---|---|---|
+| Dibujar formas y trazos | Muy rápido | Más lento, según complejidad |
+| `drawImage` escalado | Muy rápido | Notablemente más lento |
+| Sombras y desenfoque | Rápido | Muy lento |
+| `getImageData` | Muy lento | Muy rápido |
+| `putImageData` | Lento | Rápido |
+
+## La arquitectura correcta: dos canvas
+
+De esa tabla sale la conclusión práctica más importante del nivel: **separa los canvas por rol**.
+
+Un canvas visible, acelerado, sin el indicador, que dibuja lo que el usuario ve. Y un canvas auxiliar, invisible, pequeño, con `willReadFrequently`, dedicado exclusivamente al análisis.
+
+```js
+// Canvas visible: acelerado, dibuja rapido
+const vista = document.getElementById('vista');
+const ctxVista = vista.getContext('2d');
+
+// Canvas de analisis: en CPU, pequeno, se lee constantemente
+const analisis = document.createElement('canvas');
+analisis.width = 160; analisis.height = 120;      // resolucion reducida a proposito
+const ctxAnalisis = analisis.getContext('2d', { willReadFrequently: true });
+
+function procesarFotograma(video) {
+  // Dibujar el fotograma a resolucion completa para el usuario
+  ctxVista.drawImage(video, 0, 0, vista.width, vista.height);
+  // Y una version pequena para analizar
+  ctxAnalisis.drawImage(video, 0, 0, 160, 120);
+  const d = ctxAnalisis.getImageData(0, 0, 160, 120).data;
+  return colorDominante(d);
+}
+```
+
+La reducción de resolución en el canvas de análisis es la otra mitad del ahorro. Para detectar el color dominante, el brillo medio, un movimiento o un código de barras, 160 por 120 suele bastar y son **noventa y seis veces menos píxeles** que un fotograma de 1920 por 1080.
+
+## Medir el coste
+
+Los números varían mucho entre dispositivos, así que conviene medirlos en el tuyo:
+
+```js
+function medirLectura(ancho = 1024, alto = 1024, muestras = 30) {
+  const resultados = {};
+  for (const wrf of [false, true]) {
+    const c = document.createElement('canvas');
+    c.width = ancho; c.height = alto;
+    const ctx = c.getContext('2d', { willReadFrequently: wrf });
+    // Trabajo pendiente, para que la lectura tenga que esperar a algo
+    for (let i = 0; i < 200; i++) {
+      ctx.fillStyle = `hsl(${i * 7} 70% 50%)`;
+      ctx.fillRect(Math.random() * ancho, Math.random() * alto, 60, 60);
+    }
+    ctx.getImageData(0, 0, 1, 1);          // calentar
+    const t0 = performance.now();
+    for (let i = 0; i < muestras; i++) {
+      ctx.fillRect(i, i, 10, 10);          // ensuciar para forzar sincronizacion
+      ctx.getImageData(0, 0, ancho, alto);
+    }
+    resultados[wrf ? 'willReadFrequently' : 'acelerado'] =
+      +((performance.now() - t0) / muestras).toFixed(2);
+    c.width = c.height = 0;
+  }
+  return resultados;
+}
+```
+
+Ese `fillRect` antes de cada lectura es esencial para que la medición sea honesta: sin él, el navegador podría servir la misma lectura sin resincronizar y el resultado sería engañosamente bueno.
+
+<Callout type="dios" title="La mitad de las lecturas de píxeles que hay en producción son innecesarias">
+El mejor optimizador de `getImageData` es no llamarlo. Después de revisar bastante código, estos son los cuatro usos que aparecen una y otra vez y que tienen alternativa mejor. **Uno: hit testing.** "Leo el píxel bajo el cursor para saber si di en la figura." Para eso existen `isPointInPath` e `isPointInStroke`, que operan sobre geometría, no sobre píxeles, y son entre cien y mil veces más rápidos. Si la geometría es sencilla, una comparación aritmética es aún mejor. **Dos: detección de colisiones.** "Leo los píxeles de dos sprites para ver si se solapan." Se resuelve con cajas envolventes y, si hace falta precisión, con máscaras de bits precalculadas una sola vez. Leer píxeles cada fotograma para esto es de los peores patrones que existen. **Tres: leer un color que tú mismo pintaste.** Si el color salió de tu modelo de escena, está en tu modelo de escena. Léelo de ahí. **Cuatro: comprobar si el canvas está vacío.** Se resuelve manteniendo un indicador. Y hay un quinto uso que sí es legítimo pero que casi siempre se hace a la resolución equivocada: el análisis de imagen o vídeo. Detectar el color dominante de una portada, medir el brillo de un fotograma para adaptar la interfaz, encontrar un marcador: todos ellos funcionan igual de bien con una versión de 128 píxeles de lado, y muchísima gente los hace a resolución completa. Reducir la resolución de análisis es la optimización con mejor relación entre esfuerzo y beneficio de todo el procesamiento de imagen en la web, y prácticamente nadie la aplica de entrada. Antes de activar `willReadFrequently`, revisa si de verdad necesitas leer, y si necesitas leer, revisa a qué resolución.
+</Callout>
+
+## Alternativas cuando sí hay que leer
+
+Cuando la lectura es inevitable, quedan tres formas de reducir su impacto.
+
+**Leer la región mínima.** El coste de sincronización es fijo, pero el de la transferencia es proporcional al área. Si solo necesitas una zona, léela sola.
+
+**Leer una vez y procesar en memoria.** Si vas a aplicar varios filtros, no vayas y vuelvas del canvas entre ellos: lee una vez, encadena todas las transformaciones sobre el array, y escribe una vez. Además de ahorrar sincronizaciones, evita la pérdida de precisión del alfa.
+
+**Sacar la lectura del hilo principal.** Con `OffscreenCanvas` en un worker, la sincronización sigue existiendo pero bloquea el worker, no la interfaz. La aplicación sigue respondiendo mientras el análisis ocurre.
+
+```js
+// En el worker: leer no bloquea la interfaz
+const lienzo = new OffscreenCanvas(320, 240);
+const ctx = lienzo.getContext('2d', { willReadFrequently: true });
+
+self.onmessage = ({ data: { bitmap } }) => {
+  ctx.drawImage(bitmap, 0, 0, 320, 240);
+  bitmap.close();
+  const d = ctx.getImageData(0, 0, 320, 240).data;
+  let suma = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    suma += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+  }
+  self.postMessage({ brillo: suma / (d.length / 4) });
+};
+```
+
+Ese patrón —transferir un `ImageBitmap` al worker, analizarlo allí y devolver solo el resultado numérico— es la forma correcta de hacer análisis de vídeo en tiempo real sin tocar la fluidez de la interfaz. El coste de mover el bitmap es cero porque se transfiere, y el de la respuesta es un número.

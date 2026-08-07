@@ -1,0 +1,191 @@
+---
+title: "Emisión y reciclado con contadores atómicos"
+description: "El pool de ranuras, la lista de libres construida con atomicAdd, el presupuesto de emisión por frame y el conteo que alimenta un dibujo indirecto."
+subject: webgpu
+level: 35
+order: 5
+icon: "35.5"
+duracion: "21 min"
+---
+
+<Lead>
+Un sistema de partículas real no tiene un número fijo de partículas: nacen a un ritmo, viven un tiempo variable y mueren. Como en la GPU no se puede reservar memoria, la única estructura viable es un pool de ranuras de tamaño fijo del que se sacan y al que se devuelven índices, y la coordinación de ese pool entre un millón de invocaciones que no se pueden sincronizar se hace exactamente con una herramienta: el contador atómico. De cómo se use ese contador dependen la corrección, el determinismo y buena parte del rendimiento.
+</Lead>
+
+<Objetivos>
+
+- Construir una lista de ranuras libres con operaciones atómicas y sin carreras.
+- Repartir un presupuesto de emisión por frame entre las invocaciones.
+- Poner a cero los contadores entre frames sin viajes a la CPU.
+- Encadenar el conteo de vivas con un dibujo y un dispatch indirectos.
+
+</Objetivos>
+
+## El pool y las dos formas de reciclar
+
+Hay dos arquitecturas, y la segunda es más simple de lo que la primera te hace creer que es posible.
+
+**Con lista de libres.** Un array de índices y dos contadores. Cuando una partícula muere, empuja su índice a la lista con un `atomicAdd` sobre el contador de libres. Cuando el emisor necesita una ranura, la saca con un `atomicSub`. Es la estructura clásica y tiene dos problemas: el `atomicSub` sobre `u32` puede envolver por debajo de cero, y hay que separar la muerte de la emisión en dos dispatches, porque si no una ranura recién liberada puede ser reutilizada en el mismo dispatch por otra invocación que ya había leído el contador.
+
+**Sin lista de libres.** Cada invocación mira su propia ranura. Si su partícula está viva, la integra. Si está muerta, intenta consumir una unidad de un presupuesto de emisión con un `atomicSub`; si lo consigue, inicializa una partícula nueva en esa misma ranura. No hay lista, no hay indirección, no hay dos dispatches, y el patrón de acceso a memoria sigue siendo perfectamente secuencial.
+
+La segunda gana casi siempre, y la única razón para preferir la primera es si necesitas que la reutilización siga un orden concreto, cosa que en partículas visuales no ocurre nunca.
+
+## El kernel único
+
+```wgsl
+struct Params {
+  capacidad:  u32,
+  h:          f32,
+  tiempo:     f32,
+  semilla:    u32,
+};
+@group(0) @binding(0) var<uniform> p: Params;
+
+struct Contadores {
+  presupuesto: atomic<u32>,   // cuantas se pueden emitir este frame
+  vivas:       atomic<u32>,   // cuantas hay vivas al terminar
+};
+@group(0) @binding(1) var<storage, read_write> cont: Contadores;
+
+struct Particula { pos: vec3f, vida: f32, vel: vec3f, masa: f32 };
+@group(0) @binding(2) var<storage, read_write> parts: array<Particula>;
+
+fn hash(x0: u32) -> u32 {
+  var x = x0 * 747796405u + 2891336453u;
+  x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+  return (x >> 22u) ^ x;
+}
+fn aleatorio(s: u32) -> f32 { return f32(hash(s)) * (1.0 / 4294967296.0); }
+
+fn nacer(indice: u32, semilla: u32) -> Particula {
+  let a = aleatorio(semilla)       * 6.2831853;
+  let r = aleatorio(semilla + 1u)  * 0.35;
+  let v = aleatorio(semilla + 2u)  * 5.0 + 3.0;
+  var q: Particula;
+  q.pos  = vec3f(cos(a) * r, 0.0, sin(a) * r);
+  q.vel  = vec3f(cos(a) * 0.4, v, sin(a) * 0.4);
+  q.vida = 1.5 + aleatorio(semilla + 3u) * 2.0;
+  q.masa = 0.6 + aleatorio(semilla + 4u) * 0.8;
+  return q;
+}
+
+@compute @workgroup_size(64)
+fn actualizar(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= p.capacidad) { return; }
+
+  var q = parts[i];
+
+  if (q.vida <= 0.0) {
+    // Reservar una unidad del presupuesto. El valor antiguo dice si
+    // quedaba: si era cero, no habia, y hay que devolver la reserva.
+    let antes = atomicSub(&cont.presupuesto, 1u);
+    if (antes == 0u) {
+      atomicAdd(&cont.presupuesto, 1u);      // deshacer el desbordamiento
+      parts[i] = q;
+      return;
+    }
+    q = nacer(i, hash(i ^ p.semilla));
+  } else {
+    q.vel = q.vel + vec3f(0.0, -9.81, 0.0) * p.h - q.vel * (0.2 * p.h);
+    q.pos = q.pos + q.vel * p.h;
+    q.vida = q.vida - p.h;
+  }
+
+  if (q.vida > 0.0) { atomicAdd(&cont.vivas, 1u); }
+  parts[i] = q;
+}
+```
+
+El punto delicado es el `atomicSub`. Restar de un `u32` que vale cero no da error: envuelve a 4.294.967.295, y a partir de ahí todas las invocaciones que lleguen creerán que hay presupuesto de sobra y el emisor se descontrolará. El patrón correcto es mirar el **valor antiguo** que devuelve la operación: si era cero, la reserva no era válida y hay que devolverla con un `atomicAdd`. Entre la resta y la suma el contador queda momentáneamente en un valor absurdo, y eso está bien: cualquier otra invocación que lo lea en ese instante también verá que su valor antiguo no era válido y también devolverá.
+
+Hay una alternativa sin ventana: usar un contador que solo crece y comparar contra el límite.
+
+```wgsl
+// Contador monotono: nunca se desborda, y el limite lo pone el uniform.
+let ticket = atomicAdd(&cont.emitidas, 1u);
+if (ticket >= p.presupuestoFrame) { parts[i] = q; return; }
+q = nacer(i, hash(i ^ p.semilla ^ ticket));
+```
+
+Es más limpio y el ticket sirve además como semilla distinta para cada partícula nueva. El precio es que el contador crece sin parar y hay que ponerlo a cero cada frame, cosa que hay que hacer de todas formas.
+
+### Poner a cero los contadores sin la CPU
+
+Los contadores tienen que valer un valor conocido al empezar cada frame. Hay tres formas y conviene conocer la buena.
+
+La incorrecta es leerlos a la CPU y volver a escribirlos: cuesta un frame de latencia y sincroniza la cola.
+
+La aceptable es `queue.writeBuffer` con los valores del frame, que no necesita leer nada y es una escritura de ocho bytes. Vale perfectamente cuando el presupuesto lo decide JavaScript, que es lo normal: la tasa de emisión suele ser un parámetro del efecto.
+
+```js
+const emitirEsteFrame = Math.round(TASA * dt);
+device.queue.writeBuffer(bufContadores, 0,
+  new Uint32Array([emitirEsteFrame, 0]));      // presupuesto, vivas
+```
+
+Y hay una tercera que sirve cuando el valor inicial es cero y no depende de nada: `commandEncoder.clearBuffer`, que pone a cero un rango del buffer dentro del propio command buffer, sin pasar por la cola de escrituras.
+
+```js
+enc.clearBuffer(bufContadores, 4, 4);          // poner 'vivas' a cero
+```
+
+El orden importa: la puesta a cero tiene que estar encolada **antes** del dispatch que incrementa, y como `clearBuffer` es una operación del encoder, se ordena de forma natural con los passes.
+
+## Encadenar con el dibujo indirecto
+
+El contador de vivas alimenta directamente el `instanceCount` de un `drawIndirect`, y también puede alimentar el `x` de un `dispatchWorkgroupsIndirect` del frame siguiente si compactas.
+
+```wgsl
+struct ArgsDibujo { vertices: u32, instancias: u32, primerV: u32, primerI: u32 };
+@group(0) @binding(3) var<storage, read_write> args: ArgsDibujo;
+
+@compute @workgroup_size(1)
+fn preparar() {
+  args.vertices   = 6u;
+  args.instancias = atomicLoad(&cont.vivas);
+  args.primerV    = 0u;
+  args.primerI    = 0u;
+}
+```
+
+```js
+const enc = device.createCommandEncoder();
+enc.clearBuffer(bufContadores, 4, 4);
+
+const cp = enc.beginComputePass();
+cp.setPipeline(pipeActualizar);
+cp.setBindGroup(0, bgSim);
+cp.dispatchWorkgroups(Math.ceil(CAPACIDAD / 64));
+cp.setPipeline(pipePreparar);
+cp.setBindGroup(0, bgPreparar);
+cp.dispatchWorkgroups(1);
+cp.end();
+
+const rp = enc.beginRenderPass(descriptor);
+rp.setPipeline(pipeRender);
+rp.setBindGroup(0, bgRender);
+rp.drawIndirect(bufArgs, 0);
+rp.end();
+
+device.queue.submit([enc.finish()]);
+```
+
+Ojo con un detalle que descoloca la primera vez: si dibujas el pool entero sin compactar, `instancias` debe ser la **capacidad**, no el número de vivas, porque las vivas no están agrupadas al principio del array. El conteo de vivas solo sirve como `instanceCount` si antes has compactado con el [scan](/guia/webgpu/n33-scan-de-varios-bloques/). Confundir las dos cosas produce el síntoma clásico de que solo se ven las partículas de las primeras ranuras.
+
+## Determinismo
+
+El contador atómico reparte tickets en un orden que depende de la planificación, así que dos ejecuciones con el mismo estado inicial pueden asignar el ticket 7 a ranuras distintas. Si la semilla de la partícula nueva depende del ticket, la simulación deja de ser reproducible.
+
+La solución es sencilla y conviene aplicarla desde el principio: **que la semilla dependa del índice de ranura y del número de frame, no del ticket**. El ticket decide *si* nace, que es una decisión de conteo y no afecta al aspecto; el índice y el frame deciden *cómo*, y los dos son deterministas.
+
+```wgsl
+q = nacer(i, hash(i * 2654435761u ^ p.numeroFrame));
+```
+
+Con eso, dos ejecuciones producen exactamente las mismas partículas aunque el orden de los tickets difiera, y una grabación se puede reproducir. Es una precaución barata que se agradece el día que hay que depurar un comportamiento que aparece en el segundo 40.
+
+<Callout type="dios" title="El contador atomico de vivas serializa un millon de invocaciones si lo escribes de la forma evidente">
+El `atomicAdd(&cont.vivas, 1u)` que hay al final del kernel es correcto y es, con diferencia, la línea más cara del sistema. Un millón de invocaciones incrementando la misma dirección de memoria se serializan: el hardware resuelve las colisiones una tras otra y ese único contador puede acabar costando más que toda la integración. Se mide fácil: comenta la línea y verás caer el tiempo del kernel a menudo a la mitad. La corrección es el patrón de dos niveles que ya conoces de los histogramas: acumular en un contador de memoria compartida dentro del workgroup y hacer **una sola** aportación global por grupo. Con workgroups de 64 pasas de un millón de atómicas globales a 15.625, un factor de 64. El código son cuatro líneas: un `var<workgroup> vivasLocal: atomic<u32>` que la invocación cero pone a cero, una barrera, el `atomicAdd` local de cada invocación viva, otra barrera, y un `if (li == 0u) { atomicAdd(&cont.vivas, atomicLoad(&vivasLocal)); }`. Cuidado con una cosa: eso mete dos barreras en un kernel que hasta ahora podía usar `return` temprano, así que el guardia de capacidad tiene que dejar de ser un `return` y convertirse en una condición que envuelva el cuerpo. Es exactamente el tipo de refactorización que provoca bugs de uniformidad si se hace con prisa, y por eso merece la pena hacerla desde el principio en vez de como optimización tardía. Y hay un caso en el que puedes evitarla entera: si de todas formas vas a compactar con un scan, el conteo de vivas sale gratis del propio scan —es el último elemento del prefijo más la última bandera— y el contador atómico sobra por completo.
+</Callout>

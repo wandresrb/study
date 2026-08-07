@@ -1,0 +1,127 @@
+---
+title: "read y read_write: los modos de acceso de un storage buffer"
+description: "Qué permite y qué prohíbe cada modo de acceso, por qué la etapa de vértices no puede escribir, las carreras de datos que el modo read_write hace posibles, y el papel de atomic."
+subject: webgpu
+level: 20
+order: 2
+icon: "20.2"
+duracion: "19 min"
+---
+
+<Lead>
+El modo de acceso de un storage buffer no es una anotación decorativa: cambia dónde se puede usar el buffer, qué garantías ofrece el hardware sobre él, y qué clase de errores puedes cometer. Un buffer `read` es aburrido y seguro. Uno `read_write` abre la puerta a la escritura desde el shader, que es lo que hace posible el cómputo, y con ella a la clase entera de bugs de concurrencia que WebGL no permitía tener.
+</Lead>
+
+<Objetivos>
+
+- Declarar los dos modos de acceso en WGSL y su `type` correspondiente en el layout.
+- Explicar por qué `read_write` no es visible desde la etapa de vértices.
+- Identificar las condiciones de carrera que aparecen al escribir el mismo buffer que se lee.
+- Usar `atomic` cuando varias invocaciones escriben la misma dirección.
+
+</Objetivos>
+
+## Los dos modos, uno a uno
+
+`read` es el modo por defecto del espacio `storage`. El shader puede leer cualquier posición del buffer y no puede escribir ninguna. En la API se declara con `type: 'read-only-storage'`.
+
+```wgsl
+@group(0) @binding(0) var<storage, read> luces : array<Luz>;
+```
+
+```js
+{ binding: 0,
+  visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
+  buffer: { type: 'read-only-storage' } }
+```
+
+`read_write` permite ambas cosas. En la API es `type: 'storage'`, sin adjetivo, que es un nombre desafortunado porque sugiere que es el caso general cuando en realidad es el caso restringido.
+
+```wgsl
+@group(0) @binding(1) var<storage, read_write> salida : array<vec4<f32>>;
+```
+
+```js
+{ binding: 1,
+  visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,  // VERTEX no
+  buffer: { type: 'storage' } }
+```
+
+Existe también el modo `write`, que en el espacio `storage` está definido en el lenguaje pero no lo expone el layout de WebGPU: el `type: 'storage'` de la API corresponde a `read_write`. En la práctica, si quieres solo escribir, declaras `read_write` y no lees.
+
+<Callout type="warn" title="El nombre del tipo en la API no coincide con el del lenguaje">
+`'read-only-storage'` corresponde a `read`, y `'storage'` a `read_write`. Es una de las asimetrías de nomenclatura que más despistan al empezar, sobre todo porque en las storage textures la API sí usa los tres nombres explícitos: `'read-only'`, `'write-only'` y `'read-write'`. No hay lógica que recordar, solo la tabla.
+</Callout>
+
+## Por qué vertex no puede escribir
+
+La restricción no es caprichosa. En el pipeline gráfico, el orden en que se ejecutan las invocaciones del vertex shader no está definido, y además el hardware puede **reejecutar** un vertex shader para el mismo vértice: con una caché de vértices post-transformación, un vértice compartido por varios triángulos se procesa una vez o varias según convenga a la implementación. Escribir efectos secundarios desde una etapa que puede ejecutarse un número indeterminado de veces es, sencillamente, indefinido.
+
+D3D11 y algunas GPUs móviles no exponen escritura desde la etapa de vértices en absoluto. Como WebGPU tiene que ser portable sobre todo el hardware que cubre, la especificación convierte la limitación en regla: una entrada de bind group layout con `type: 'storage'` o de clase `storageTexture` cuya `visibility` incluya `GPUShaderStage.VERTEX` produce un error de validación al crear el layout.
+
+La regla se aplica al **layout**, no al uso: aunque tu vertex shader no toque la variable, si la entrada declara `VERTEX` en su visibilidad el layout es inválido. Por eso conviene declarar visibilidades estrechas: no solo ahorra presupuesto, sino que evita este error.
+
+La forma de escribir desde el camino de vértices, cuando hace falta, es un compute pass previo que prepare los datos. Es el patrón que sostiene todo el renderizado dirigido por GPU: el compute escribe, el render lee.
+
+## Las carreras que ahora puedes tener
+
+Con `read_write` aparecen los problemas de concurrencia. WGSL define un modelo de memoria explícito, y sus dos reglas prácticas son estas.
+
+**Dentro de una misma invocación, el orden de las operaciones se respeta.** Escribir y luego leer la misma dirección en el mismo shader funciona como esperas.
+
+**Entre invocaciones distintas no hay ningún orden garantizado sin sincronización explícita.** Si dos invocaciones escriben la misma dirección, el resultado es una de las dos escrituras, indeterminada. Si una escribe y otra lee, la lectora puede ver el valor viejo o el nuevo.
+
+El caso que más aparece es el acumulador. Este código es incorrecto aunque parezca obvio:
+
+```wgsl
+@group(0) @binding(0) var<storage, read_write> histograma : array<u32, 256>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+  let cubeta = calcularCubeta(id.x);
+  histograma[cubeta] = histograma[cubeta] + 1u;   // carrera: lectura-modificación-escritura
+}
+```
+
+Sesenta y cuatro invocaciones leen el mismo valor, le suman uno y lo escriben. El resultado no es 64 sino un número entre 1 y 64. La solución es declarar el elemento como atómico:
+
+```wgsl
+@group(0) @binding(0) var<storage, read_write> histograma : array<atomic<u32>, 256>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+  atomicAdd(&histograma[calcularCubeta(id.x)], 1u);
+}
+```
+
+`atomic<T>` solo admite `u32` e `i32`, solo existe en los espacios `storage` con acceso `read_write` y `workgroup`, y sus valores solo se tocan con las funciones atómicas: `atomicLoad`, `atomicStore`, `atomicAdd`, `atomicSub`, `atomicMax`, `atomicMin`, `atomicAnd`, `atomicOr`, `atomicXor`, `atomicExchange` y `atomicCompareExchangeWeak`. No se puede leer un `atomic<u32>` con el operador de índice normal.
+
+Su `AlignOf` y `SizeOf` son los de `u32`: 4 y 4. Un `array<atomic<u32>, 256>` ocupa exactamente lo mismo que un `array<u32, 256>`, así que la anotación es gratis en memoria.
+
+<Callout type="danger" title="No hay atómicos de coma flotante">
+WGSL no tiene `atomic<f32>`. Si necesitas acumular flotantes desde varias invocaciones, las salidas son tres: acumular en enteros de punto fijo con un factor de escala conocido, hacer una reducción en árbol dentro del workgroup con memoria compartida y un solo `atomicAdd` al final, o usar `atomicCompareExchangeWeak` sobre el patrón de bits con un bucle de reintento. La tercera funciona pero es lenta y hay que escribirla con cuidado.
+</Callout>
+
+## Leer y escribir el mismo buffer en el mismo pass
+
+Hay un caso que parece natural y no lo es: un compute shader que lee un array, lo transforma y escribe el resultado en el mismo array. Sin sincronización entre invocaciones, una invocación puede leer un elemento que otra ya sobrescribió.
+
+Si cada invocación toca **solo su propio índice**, no hay problema: no hay dos invocaciones que compartan dirección.
+
+```wgsl
+// Seguro: cada invocación escribe únicamente su índice.
+@compute @workgroup_size(64)
+fn integrar(@builtin(global_invocation_id) id : vec3<u32>) {
+  let i = id.x;
+  if (i >= arrayLength(&estado)) { return; }
+  estado[i].pos = estado[i].pos + estado[i].vel * dt;
+}
+```
+
+Si una invocación necesita leer los **vecinos** —un desenfoque, una simulación de fluidos, un autómata celular— entonces sí hay carrera, y la solución estructural es el patrón de doble buffer, que es el tema de la [lección correspondiente](/guia/webgpu/n20-doble-buffer-para-simulaciones/).
+
+Dentro de un mismo workgroup hay una tercera vía: `workgroupBarrier()` sincroniza las invocaciones del grupo y hace visibles las escrituras a `var<workgroup>`; `storageBarrier()` hace lo mismo para las escrituras a `var<storage>`. Ambas sincronizan **solo dentro del workgroup**, nunca entre workgroups distintos: para eso hace falta terminar el dispatch.
+
+<Callout type="dios" title="La validación de WebGPU no atrapa las carreras, y por diseño">
+WebGPU valida exhaustivamente los usos incompatibles a nivel de recurso —no puedes atar la misma textura como attachment y como fuente en el mismo pass— pero **no** detecta carreras de datos dentro de un buffer. La razón es que hacerlo requeriría analizar el shader entero y demostrar propiedades de sus índices, que es indecidible en general. Lo que la especificación hace en su lugar es definir un modelo de memoria que garantiza que una carrera nunca corrompe otra cosa ni filtra memoria ajena: el resultado es un valor indeterminado dentro del buffer, no un fallo de seguridad. Esa garantía es lo que hace de WebGPU una API segura, y también lo que hace que el bug se manifieste como parpadeo intermitente en vez de como excepción. Cuando una simulación produce resultados que cambian entre ejecuciones sin que cambie nada más, la primera hipótesis siempre es una carrera, y la primera comprobación es reducir el `workgroup_size` a 1: si el bug desaparece, ya sabes qué es.
+</Callout>

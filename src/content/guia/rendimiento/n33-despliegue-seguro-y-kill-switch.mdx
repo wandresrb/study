@@ -1,0 +1,200 @@
+---
+title: "El despliegue seguro y la vía de escape"
+description: "Los cuatro modos de fallo que dejan a un usuario atrapado en una versión rota, la propiedad del protocolo que garantiza que siempre hay salida, el service worker lápida, y el procedimiento de despliegue que evita necesitarlo."
+subject: rendimiento
+level: 33
+order: 5
+icon: "33.5"
+duracion: "21 min"
+---
+
+<Lead>
+Un service worker es de los pocos errores de frontend que no se arreglan con otro despliegue. El código está en el disco del usuario, decide qué se descarga, sobrevive al cierre del navegador y sigue ahí cuando tú ya has corregido el fallo en el servidor. Esta lección trata ese riesgo con la seriedad que merece: los modos de fallo concretos, la propiedad del protocolo que garantiza que siempre existe una salida, el procedimiento para no llegar a necesitarla, y el mecanismo de emergencia escrito y probado antes de que haga falta.
+</Lead>
+
+<Objetivos>
+
+- Enumerar los cuatro modos de fallo que atrapan a un usuario en una versión rota.
+- Explicar por qué el script del service worker nunca puede quedar bloqueado por sí mismo.
+- Escribir y probar el service worker lápida que da de baja el registro y limpia las cachés.
+- Aplicar el procedimiento de despliegue progresivo con vigilancia de la versión en campo.
+
+</Objetivos>
+
+## Los cuatro modos de fallo
+
+Todos tienen la misma forma: el usuario recarga y no pasa nada, porque lo que responde a la recarga es precisamente lo que está roto.
+
+**Uno: navegaciones servidas con caché primero.** Es el fallo grave y el más frecuente. Si el manejador de `fetch` responde a una navegación con la copia en caché sin consultar la red, y esa copia es de una versión con un error fatal en el arranque, el usuario recarga, recibe otra vez la misma copia rota, recarga de nuevo y recibe lo mismo. No hay ninguna secuencia de acciones normales que lo saque de ahí. Corregir el HTML en el servidor no cambia nada, porque el servidor no participa.
+
+**Dos: la instalación de la versión nueva falla.** Despliegas el arreglo, el `install` del worker nuevo llama a `addAll` con una lista de ficheros y uno de ellos devuelve 404 porque el nombre con hash cambió y la lista no. La promesa rechaza, el worker nuevo pasa a `redundant`, y el viejo —el roto— sigue activo y controlando. Has desplegado la corrección y no ha llegado a nadie. El síntoma en tu registro de errores es un silencio absoluto: no hay ningún error nuevo, porque el código nuevo nunca se ejecuta.
+
+**Tres: el script del worker está cacheado antes de llegar al navegador.** Tu CDN sirve `/sw.js` con la política de los ficheros estáticos, una semana de caducidad. Despliegas la corrección, la purga por etiquetas no incluye ese fichero porque nadie lo puso en la lista, y durante una semana los navegadores que comprueban si hay versión nueva reciben del borde exactamente el mismo byte que ya tenían. La comparación byte a byte dice que no hay cambios y no pasa nada.
+
+**Cuatro: el manejador de `fetch` lanza una excepción.** Si la promesa que pasas a `respondWith()` rechaza, el navegador no vuelve a la red por su cuenta: muestra un error de red. Un error de programación en el enrutador —una propiedad de `undefined`, un `await` sobre algo que no es una promesa— convierte todas las peticiones de tu sitio en errores de red. Los datos de campo, que se envían por red, tampoco salen. La página está caída y tu instrumentación está caída con ella.
+
+Los cuatro tienen algo en común que conviene subrayar: **ninguno produce un error visible en tu servidor**. Tu monitorización de origen está verde, tus métricas de laboratorio están perfectas, y una parte de tus usuarios no puede usar el sitio.
+
+## La propiedad que garantiza que hay salida
+
+Hay una regla del protocolo que hace que ninguno de esos cuatro fallos sea definitivo, y merece conocerse con precisión porque es el suelo sobre el que se apoya todo plan de emergencia:
+
+**Un service worker no puede interceptar las peticiones de su propio script ni de lo que importa con `importScripts`.** El navegador las hace directamente, saltándose el manejador de `fetch`. Y las hace en cada navegación dentro del ámbito, en cada `registration.update()`, y periódicamente en sesiones largas.
+
+La consecuencia es que **siempre puedes hacer llegar código nuevo**, por muy roto que esté lo que hay instalado. El canal de actualización no lo puede bloquear el worker, ni siquiera adrede. Lo que sí puede bloquearlo es una caché HTTP delante, y por eso el modo de fallo número tres es el peligroso de verdad: es el único que corta la vía de escape.
+
+De ahí sale la primera medida preventiva, que es innegociable y cuesta una línea de configuración:
+
+```text
+# Cabeceras para /sw.js. Sin excepciones.
+Cache-Control: no-cache, max-age=0, must-revalidate
+CDN-Cache-Control: no-cache, max-age=0
+Content-Type: text/javascript
+Service-Worker-Allowed: /
+```
+
+Y su comprobación, que debería estar en tu proceso de despliegue como una prueba automática:
+
+```bash
+# Debe devolver no-cache y un Age bajo o inexistente.
+curl -sI https://ejemplo.com/sw.js | grep -iE 'cache-control|age|etag|content-type'
+```
+
+A esto se suma `updateViaCache: 'none'` en el registro, que impide que el navegador use su propia caché HTTP para el script al comprobar actualizaciones. Con las dos cosas, la vía de escape está garantizada.
+
+## El service worker lápida
+
+Este fichero es el mecanismo de emergencia. Su función es una sola: darse de baja, borrarlo todo y devolver a los usuarios a una web sin service worker. Tenlo escrito, probado y guardado en el repositorio **antes** de necesitarlo, porque el día que lo necesites vas a estar bajo presión.
+
+```js
+// sw-lapida.js -> se despliega tal cual como /sw.js en una emergencia.
+// No tiene manejador de fetch: todas las peticiones van a la red.
+
+self.addEventListener('install', () => {
+  // Nada que instalar. Adelanta la activacion.
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (evento) => {
+  evento.waitUntil(
+    (async () => {
+      // 1. Borrar todas las cachES de este origen.
+      const nombres = await caches.keys();
+      await Promise.all(nombres.map((n) => caches.delete(n)));
+
+      // 2. Darse de baja. A partir de aqui no controla nada nuevo.
+      await self.registration.unregister();
+
+      // 3. Recargar las ventanas abiertas para que dejen de estar
+      //    controladas por este worker.
+      const ventanas = await self.clients.matchAll({ type: 'window' });
+      for (const ventana of ventanas) {
+        ventana.navigate(ventana.url).catch(() => {});
+      }
+    })()
+  );
+});
+```
+
+Tres puntos sobre este código. El `skipWaiting` aquí sí es correcto y necesario: es exactamente la situación en la que quieres saltarte la espera, porque lo que hay controlando está roto. La ausencia de manejador de `fetch` es deliberada y es la parte esencial: un worker sin `fetch` no intercepta nada, así que en el instante en que se activa el sitio vuelve a comportarse como una web normal. Y `unregister()` no destruye el worker en marcha: sigue controlando los clientes actuales hasta que se recarguen, de ahí el `navigate` del paso tres.
+
+Como refuerzo, no como sustituto, está la cabecera estándar de limpieza:
+
+```text
+Clear-Site-Data: "storage"
+```
+
+Enviada en cualquier respuesta del origen, borra el almacenamiento del sitio, y eso incluye los registros de service worker. Su soporte no es uniforme entre navegadores, así que **no puede ser tu único plan**, y tiene un efecto secundario grande: se lleva por delante el almacenamiento local y las bases de datos indexadas del usuario, con lo que haya guardado ahí. Es una herramienta de emergencia real, pero es la maza.
+
+La comprobación final del procedimiento: prueba la lápida en un entorno de preproducción **antes** de guardarla. Registra un worker que cachee agresivamente, comprueba que estás controlado, sustituye el fichero por la lápida, recarga una vez y verifica que `navigator.serviceWorker.controller` pasa a ser `null` y que las cachés están vacías. Un plan de emergencia que no se ha ejecutado nunca no es un plan.
+
+## El procedimiento que evita llegar ahí
+
+Seis reglas, ordenadas por lo que evitan.
+
+**Uno: las navegaciones nunca con caché primero.** `network first` con tiempo límite corto, o `stale while revalidate` con revalidación garantizada. Esto solo elimina el modo de fallo número uno, que es el grave. La propiedad que ganas se llama **auto-reparación**: si el HTML servido está roto y lo corriges en el servidor, la siguiente navegación de cualquier usuario trae el arreglo, sin intervención.
+
+**Dos: `install` no puede fallar por un fichero que falta.** Sustituye el `addAll` atómico por un `add` individual tolerante para todo lo que no sea imprescindible, y deja el fallo duro solo para el puñado de ficheros sin los cuales el worker no tiene sentido.
+
+```js
+self.addEventListener('install', (evento) => {
+  evento.waitUntil(
+    (async () => {
+      const cache = await caches.open(VERSION);
+      // Imprescindibles: si fallan, mejor no instalar.
+      await cache.addAll(['/sin-conexion.html']);
+      // El resto, uno a uno y sin romper la instalacion.
+      await Promise.allSettled(OPCIONALES.map((u) => cache.add(u)));
+    })()
+  );
+});
+```
+
+**Tres: el servidor conserva los recursos de las últimas versiones.** Tres o cuatro despliegues de recursos con hash ocupan poco y eliminan la clase entera de fallos en los que un cliente antiguo pide un fichero que ya no existe.
+
+**Cuatro: despliegue progresivo del registro.** No registres el worker para todo el mundo el primer día. Un porcentaje estable por usuario permite que un fallo afecte al uno por ciento en lugar de al cien.
+
+```js
+// Cubeta estable por navegador, no por sesion.
+function cubeta() {
+  let v = localStorage.getItem('sw-cubeta');
+  if (v === null) {
+    v = String(Math.floor(Math.random() * 100));
+    localStorage.setItem('sw-cubeta', v);
+  }
+  return Number(v);
+}
+
+const PORCENTAJE = 5; // se sube desde la configuracion, no en el codigo
+if ('serviceWorker' in navigator && cubeta() < PORCENTAJE) {
+  window.addEventListener('load', () =>
+    navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
+  );
+}
+```
+
+Con un aviso importante: bajar el porcentaje **no desinstala** el worker de quien ya lo tiene. El único camino de vuelta es la lápida. El porcentaje limita el daño de un despliegue nuevo, no lo revierte.
+
+**Cinco: vigila la versión en campo.** Es la instrumentación que convierte este tema de opaco en observable. Cada página controlada pregunta a su worker qué versión es y lo envía con el resto de datos de campo.
+
+```js
+// En el worker.
+self.addEventListener('message', (evento) => {
+  if (evento.data?.tipo === 'VERSION') {
+    evento.source.postMessage({ tipo: 'VERSION', version: VERSION });
+  }
+});
+```
+
+```js
+// En la pagina.
+async function versionDelWorker(limiteMs = 1000) {
+  const sw = navigator.serviceWorker.controller;
+  if (!sw) return 'sin-worker';
+  return new Promise((resolver) => {
+    const reloj = setTimeout(() => resolver('sin-respuesta'), limiteMs);
+    const canal = new MessageChannel();
+    canal.port1.onmessage = (e) => {
+      clearTimeout(reloj);
+      resolver(e.data?.version ?? 'desconocida');
+    };
+    sw.postMessage({ tipo: 'VERSION' }, [canal.port2]);
+  });
+}
+```
+
+El histograma de versiones de worker en producción es el dato que te dice si un despliegue ha llegado. Si tres días después del despliegue el veinte por ciento sigue en la versión anterior, tienes un problema de propagación y quieres saberlo antes de que se convierta en un incidente. Y el valor `sin-respuesta` es una alarma por sí solo: significa un worker activo que no contesta, que es el modo de fallo número cuatro en directo.
+
+**Seis: segmenta tus errores por si hay worker.** Manda el resultado de `navigator.serviceWorker.controller !== null` con cada error de JavaScript que registres. Una tasa de errores desproporcionada en el grupo controlado es la señal más temprana que vas a tener.
+
+<Callout type="dios" title="Un service worker convierte un fallo recuperable en uno persistente, y por eso el criterio para instalarlo no es cuánto gana sino cuánto puede perder">
+Toda la web está construida sobre una propiedad que nadie enuncia porque parece parte del mobiliario: **el estado se recupera recargando**. Es la razón por la que el frontend es un sitio relativamente cómodo para trabajar. Metes un fallo en producción, lo arreglas, despliegas, y en el peor de los casos el usuario pulsa F5. No hay estado persistente que reconciliar, no hay instalación que revertir, no hay clientes con versiones de hace meses. Un despliegue malo dura lo que tardas en hacer el siguiente. Un service worker retira esa propiedad, y la retira en silencio, sin que ningún error de compilación te avise de que acabas de asumir una responsabilidad distinta. A partir de ese momento existe una capa de código tuyo que se ejecuta antes que la red, decide qué se descarga, persiste en disco y sobrevive a todo lo que un usuario normal sabe hacer. Y si esa capa está rota, tu botón de deshacer no funciona, porque el botón de deshacer del frontend era precisamente la red. Piensa en lo que eso implica para el análisis coste-beneficio, porque cambia el signo de la decisión más veces de las que la gente cree. El beneficio de un service worker se mide en milisegundos ahorrados multiplicados por visitas recurrentes, y es real, y en una aplicación que se usa a diario es grande. El riesgo se mide en algo que no tiene unidades comparables: la probabilidad, pequeña pero no nula, de dejar a un subconjunto de usuarios sin acceso al producto durante un tiempo que depende de lo rápido que te des cuenta. No son magnitudes que se puedan restar, y por eso la pregunta correcta no es "¿merece la pena el ahorro?" sino **"¿tenemos la disciplina operativa que esto exige?"**. Esa disciplina es concreta y se puede auditar en diez minutos: la lápida escrita y probada, las cabeceras del script verificadas en el despliegue, las navegaciones nunca con caché primero, el histograma de versiones en el panel de métricas, el porcentaje de registro controlado por configuración y no por código, y alguien que sepa qué hacer un domingo por la tarde. Si un equipo tiene esas seis cosas, un service worker es una herramienta excelente y el riesgo está domesticado. Si no las tiene, el service worker no es una optimización: es una deuda con vencimiento desconocido, y la respuesta profesional es no instalarlo todavía. He visto las dos situaciones y la diferencia entre ellas no era el talento del equipo ni la calidad del código: era si alguien se había tomado en serio que esto es software distribuido a máquinas ajenas, con todo lo que eso arrastra.
+</Callout>
+
+<Reto title="Prepara la emergencia antes de tenerla">
+1. Escribe el service worker lápida, guárdalo en el repositorio junto a un documento de una página con el procedimiento, y pruébalo en preproducción de principio a fin.
+2. Comprueba con `curl` las cabeceras con las que tu CDN sirve `/sw.js`. Si tienen caducidad, corrígelo hoy y añade una prueba automática al despliegue.
+3. Busca en tu manejador de `fetch` si alguna navegación se sirve con caché primero. Cámbialo.
+4. Provoca a propósito el modo de fallo número dos: despliega un worker cuyo `addAll` incluya un fichero inexistente y observa que el viejo sigue mandando.
+5. Implementa el informe de versión del worker y monta el histograma. Despliega y observa cuánto tarda en propagarse al noventa y cinco por ciento.
+</Reto>

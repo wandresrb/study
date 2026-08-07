@@ -1,0 +1,159 @@
+---
+title: "Storage buffers: instancedArray, attributeArray y storage"
+description: "Cómo se declara memoria de GPU escribible desde TSL, qué diferencia hay entre las tres funciones que la crean, cómo se accede a un elemento y qué modificadores existen para el acceso."
+subject: three
+level: 42
+order: 2
+icon: "42.2"
+duracion: "19 min"
+---
+
+<Lead>
+Un compute shader sin memoria escribible no sirve para nada: podría calcular, pero no dejaría rastro. La pieza que falta es el **storage buffer**, un bloque de memoria en la GPU al que el shader puede escribir con acceso arbitrario. En TSL se declara con una llamada de una línea, y esa brevedad esconde tres funciones distintas con propósitos distintos que conviene no confundir, porque elegir mal se paga al intentar renderizar los datos que has calculado.
+</Lead>
+
+<Objetivos>
+
+- Crear buffers de GPU con `instancedArray`, `attributeArray` y `storage` sabiendo qué construye cada uno.
+- Acceder a un elemento con `.element()` y escribir en sus componentes.
+- Declarar buffers de estructuras con `struct` en lugar de vectores sueltos.
+- Aplicar los modificadores de acceso: solo lectura, atómico y PBO.
+
+</Objetivos>
+
+## Tres funciones, un mismo nodo
+
+Las tres devuelven un `StorageBufferNode`. Lo que cambia es el tipo de atributo que crean por debajo, y ese detalle decide si los datos podrán usarse después como atributo de instancia al renderizar.
+
+```js
+import { instancedArray, attributeArray, storage } from 'three/tsl';
+import * as THREE from 'three/webgpu';
+
+const total = 100000;
+
+// 1. Datos por instancia: lo que usaras para dibujar N copias de una malla.
+const posiciones = instancedArray( total, 'vec3' );
+
+// 2. Datos generales: una tabla de trabajo que no se mapea a instancias.
+const acumulador = attributeArray( total, 'float' );
+
+// 3. Control total: tu construyes el atributo y decides su contenido inicial.
+const datos = new Float32Array( total * 4 );
+for ( let i = 0; i < total; i ++ ) datos[ i * 4 + 3 ] = 1;
+
+const atributo = new THREE.StorageBufferAttribute( datos, 4 );
+const estado = storage( atributo, 'vec4', total );
+```
+
+`instancedArray( count, tipo )` construye un `StorageInstancedBufferAttribute`. Es el que necesitas cuando los datos van a alimentar el renderizado por instancias: un elemento por instancia dibujada. `attributeArray( count, tipo )` construye un `StorageBufferAttribute` normal, sin la marca de instancia. Y `storage( atributo, tipo, count )` es la función de bajo nivel que las dos anteriores usan internamente; la llamas directamente cuando quieres controlar el contenido inicial del buffer o su disposición exacta en memoria.
+
+La diferencia entre las dos primeras importa en un punto muy concreto: al convertir el buffer en atributo para el material. `posiciones.toAttribute()` produce un atributo que la GPU lee **una vez por instancia**; si el buffer no está marcado como instanciado, se leería una vez por vértice, que no es lo que quieres. Cuando dudes, la pregunta es "¿cada elemento de este buffer corresponde a un objeto dibujado?". Si la respuesta es sí, `instancedArray`.
+
+El argumento de tipo acepta las cadenas habituales de TSL: `'float'`, `'int'`, `'uint'`, `'vec2'`, `'vec3'`, `'vec4'`, y sus variantes enteras. Three.js deduce de ahí el `itemSize` y el `TypedArray` correcto. Si lo omites, el valor por defecto es `'float'`.
+
+<Callout type="warn" title="vec3 no ocupa lo que crees">
+Un `vec3` en un storage buffer de WebGPU se alinea a 16 bytes, no a 12. La especificación de WGSL obliga a ello. Eso significa que un buffer de un millón de `vec3` ocupa 16 MB, no 12 MB, y que si construyes el `Float32Array` a mano asumiendo tres floats por elemento vas a desalinear todo. Cuando uses `storage()` con datos tuyos, o bien trabajas con `vec4` y aprovechas el cuarto canal para algo útil, o bien te aseguras de que la disposición coincide con lo que espera el backend.
+</Callout>
+
+## Acceder a un elemento
+
+`.element( indice )` devuelve un nodo que representa la posición del buffer en ese índice. Es un **lvalue**: puedes leerlo y puedes asignarle.
+
+```js
+import { Fn, instanceIndex, vec3, float } from 'three/tsl';
+
+const inicializar = Fn( () => {
+
+	const p = posiciones.element( instanceIndex );
+
+	// Asignacion por componente: la forma mas legible.
+	p.x = float( instanceIndex ).mod( 100 ).sub( 50 );
+	p.y = float( 0 );
+	p.z = float( instanceIndex ).div( 100 ).sub( 50 );
+
+} )().compute( total );
+```
+
+Hay tres formas de escribir en un elemento y las tres aparecen en el código real de Three.js, así que conviene reconocerlas:
+
+```js
+const v = velocidades.element( instanceIndex );
+
+v.assign( vec3( 0, - 0.001, 0 ) );      // sustituye el valor entero
+v.addAssign( vec3( 0, - 0.001, 0 ) );   // suma en sitio
+v.y = v.y.negate().mul( 0.8 );          // asignacion por swizzle
+```
+
+`assign` reemplaza. Los métodos con sufijo `Assign` —`addAssign`, `subAssign`, `mulAssign`, `divAssign`— son azúcar sobre la operación seguida de la asignación, y Three.js los genera automáticamente para toda operación encadenable. La asignación directa a un swizzle funciona porque el prototipo de nodo define setters para `x`, `y`, `z`, `w` y todas sus combinaciones.
+
+El índice no tiene por qué ser `instanceIndex`. Puedes leer el elemento de otro hilo, y ahí es donde empieza lo interesante y lo peligroso:
+
+```js
+// Leer al vecino: valido, pero cuidado con las carreras.
+const anterior = posiciones.element( instanceIndex.sub( 1 ).max( 0 ) );
+```
+
+Si en el mismo kernel un hilo escribe en su elemento y otro lee ese mismo elemento, el resultado depende del orden de ejecución, que no está definido. Ese es exactamente el problema que resuelve el patrón de doble buffer, y es el asunto de [la lección sobre simulación con doble buffer](/guia/three/n42-doble-buffer-y-particulas/).
+
+## Estructuras en lugar de buffers paralelos
+
+Con vectores sueltos acabas con cinco buffers para un mismo conjunto de partículas: posición, velocidad, color, tamaño, vida. Funciona, y de hecho es lo que hacen varios ejemplos oficiales, porque cada buffer se lee de forma perfectamente coalescente. Pero cuando el número de campos crece, TSL permite declarar una estructura y usarla como tipo del buffer.
+
+```js
+import { struct, Fn, instanceIndex, instancedArray, vec3, float } from 'three/tsl';
+
+const Particula = struct( {
+	posicion: 'vec3',
+	velocidad: 'vec3',
+	vida: 'float'
+}, 'Particula' );
+
+const particulas = instancedArray( total, Particula );
+
+const actualizar = Fn( () => {
+
+	const p = particulas.element( instanceIndex );
+
+	p.get( 'velocidad' ).addAssign( vec3( 0, - 0.0098, 0 ) );
+	p.get( 'posicion' ).addAssign( p.get( 'velocidad' ) );
+	p.get( 'vida' ).subAssign( float( 0.016 ) );
+
+} )().compute( total );
+```
+
+`struct` viene de `three/tsl` y `instancedArray` detecta que el tipo es una estructura, calcula la longitud total del layout y dimensiona el buffer en consecuencia. El acceso a un miembro se hace con `.get( nombre )`.
+
+La elección entre estructuras y buffers paralelos no es de estilo. Es la vieja disyuntiva entre *array de estructuras* y *estructura de arrays*. Con buffers paralelos, un kernel que solo toca posiciones lee memoria contigua y aprovecha cada línea de caché al completo. Con una estructura, ese mismo kernel arrastra velocidad y vida en cada lectura aunque no las use. La estructura gana cuando casi todos los kernels tocan casi todos los campos; los buffers paralelos ganan cuando hay kernels especializados. Para un sistema de partículas sencillo, con dos o tres campos que se usan siempre juntos, la diferencia es ruido.
+
+## Los modificadores de acceso
+
+Un `StorageBufferNode` tiene por defecto acceso de lectura y escritura. Tres métodos cambian ese contrato y los tres tienen consecuencias reales.
+
+```js
+// Solo lectura: permite al compilador optimizar y evita escrituras accidentales.
+const tabla = attributeArray( 256, 'vec4' ).toReadOnly();
+
+// Atomico: habilita operaciones atomicas sobre enteros.
+const contador = attributeArray( 1, 'uint' ).toAtomic();
+
+// PBO: solo relevante en el backend de WebGL.
+const salida = instancedArray( total, 'vec4' ).setPBO( true );
+```
+
+`toReadOnly()` marca el buffer como `read` en el shader generado. No es cosmético: un buffer de solo lectura puede colocarse en un espacio de dirección más restrictivo y el compilador puede asumir que nadie lo modifica durante el despacho, lo que a veces habilita optimizaciones de caché. Úsalo siempre que un kernel consuma una tabla que no modifica.
+
+`toAtomic()` convierte el tipo del buffer en atómico, que es el requisito para usar operaciones como `atomicAdd`. Sin esa marca, una suma concurrente desde miles de hilos sobre el mismo elemento pierde incrementos: el clásico leer-modificar-escribir sin protección. Con ella, el hardware garantiza que cada incremento se aplica. El precio es la serialización: si todos los hilos atacan el mismo contador, el paralelismo desaparece en ese punto.
+
+`setPBO( true )` marca el nodo para usar *pixel buffer objects* y solo tiene efecto sobre el backend de WebGL, donde no hay storage buffers reales y Three.js tiene que emular el acceso a través de texturas. Si trabajas exclusivamente sobre WebGPU, ignóralo.
+
+<Callout type="dios" title="El buffer que se dibuja a sí mismo">
+El detalle que convierte todo esto en algo más que una curiosidad es `toAttribute()`. Un `StorageBufferNode` puede transformarse en un `BufferAttributeNode` sin copiar nada: el mismo bloque de memoria que el compute shader acaba de escribir se enlaza directamente como atributo de vértice para el pipeline de render. `material.positionNode = posiciones.toAttribute()` y ya está. **Cero transferencias, cero sincronización, cero latencia.** Ese es el motivo real por el que el cómputo en GPU merece la pena, y también el motivo por el que el consejo de "no leas de vuelta a la CPU" no es una limitación sino una invitación: el destino natural de los datos calculados en GPU es el propio render. Pero hay una trampa escondida en la implementación que conviene conocer. Mira el código de `StorageBufferNode.generate()`: cuando el backend **no** tiene storage buffers disponibles —es decir, en WebGL2— el nodo no falla. Cae silenciosamente al camino de atributo: construye un `bufferAttribute`, lo envuelve en un `varying` y registra una transformación. El resultado es que un grafo que usa `toAttribute()` sigue compilando en WebGL, y el render sigue funcionando… con los datos que hubiera en el buffer, porque el compute que debía llenarlo nunca se ejecutó. No hay excepción, no hay aviso en consola, solo partículas quietas en el origen. Si alguna vez ves tu simulación congelada en un dispositivo concreto y perfecta en el tuyo, comprueba `renderer.backend.isWebGPUBackend` antes de buscar el fallo en el kernel.
+</Callout>
+
+<Reto title="Diseña la memoria antes que el kernel">
+1. Declara un sistema de 250 000 partículas con tres `instancedArray` separados: posición, velocidad y color.
+2. Reescribe lo mismo con un único `struct` de tres campos y compara el código resultante.
+3. Añade un `attributeArray( 1, 'uint' ).toAtomic()` que cuente cuántas partículas están por debajo de `y = 0`.
+4. Marca como `toReadOnly()` una tabla de 64 direcciones que el kernel solo consulta y comprueba que sigue compilando.
+5. Intenta escribir en el buffer de solo lectura y observa el error que produce el generador de código.
+</Reto>

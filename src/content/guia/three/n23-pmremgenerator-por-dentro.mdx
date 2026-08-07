@@ -1,0 +1,117 @@
+---
+title: "PMREMGenerator: qué precomputa exactamente y por qué"
+description: "El prefiltrado por rugosidad, el formato CubeUV y sus mips extra, el muestreo de importancia GGX que trae r184, y por qué sin este paso los reflejos rugosos serían inviables en tiempo real."
+subject: three
+level: 23
+order: 3
+icon: "23.3"
+duracion: "21 min"
+---
+
+<Lead>
+`PMREMGenerator` es la pieza que casi nadie entiende y que casi todo el mundo usa. Su nombre lo dice todo si sabes desplegarlo: *Prefiltered Mipmapped Radiance Environment Map*. Un mapa de entorno de radiancia, con mipmaps, **prefiltrado**. La palabra que carga con el peso es la última: no genera mipmaps normales, genera una cadena en la que cada nivel es el resultado de convolucionar el entorno con el lóbulo especular de una rugosidad concreta. Sin esa precomputación, cada fragmento rugoso tendría que integrar el entorno a mano y no habría tiempo real que valiera.
+</Lead>
+
+<Objetivos>
+
+- Explicar qué se guarda en cada nivel de la cadena PMREM y a qué rugosidad corresponde.
+- Justificar por qué un mipmap normal no sirve como aproximación del entorno filtrado.
+- Describir qué cambió en r184 con el muestreo de importancia GGX VNDF.
+- Usar la API completa —`fromEquirectangular`, `fromCubemap`, `fromScene`, `dispose`— sin fugas.
+
+</Objetivos>
+
+## El problema que resuelve
+
+Un fragmento con `roughness = 0.4` necesita, para su término especular, la integral del entorno ponderada por el lóbulo GGX correspondiente a esa rugosidad, centrado en la dirección de reflexión. Hacerlo en tiempo de ejecución exigiría cientos de muestras del entorno por fragmento. Con un millón de fragmentos y sesenta frames por segundo, es un no rotundo.
+
+Pero fíjate en de qué depende esa integral: **solo del entorno, de la rugosidad y de la dirección**. No depende del material, ni de la posición, ni de la cámara. Es decir, es precalculable: para cada dirección y cada rugosidad, hay un único valor, y se puede tabular una vez al cargar la escena.
+
+Esa tabla tiene tres dimensiones —dos de dirección más una de rugosidad—, y la estructura de datos que la GPU ya sabe indexar en tres dimensiones con interpolación gratis es **la cadena de mipmaps de un cubemap**. Las dos coordenadas de dirección son la cara y las UV; la tercera, la rugosidad, es el nivel de mip, accesible con `textureLod`. Ahí está toda la idea.
+
+### Por qué un mipmap normal no vale
+
+Es la pregunta correcta y tiene una respuesta precisa. Un mipmap estándar se genera promediando cada bloque de 2×2 texels: es un filtro **de caja en el espacio de la textura**. El lóbulo GGX no es una caja: es una campana con una cola larga, definida sobre la **esfera de direcciones**, y su anchura angular depende de la rugosidad de una forma concreta y no lineal.
+
+Las tres discrepancias son visibles:
+
+**La forma del filtro.** Una caja produce bordes duros donde el lóbulo produce transiciones suaves. Los reflejos con mipmaps normales tienen un aspecto característico de «foto reducida», con los altos cortados en bloques.
+
+**Las costuras del cubemap.** Un mip normal promedia dentro de cada cara por separado, así que en los bordes entre caras el filtro se queda sin datos y aparece una costura. El prefiltrado del PMREM trabaja en el espacio de direcciones y cruza las caras correctamente.
+
+**La correspondencia rugosidad-nivel.** En un mipmap normal, cada nivel divide la resolución por dos, lo que corresponde a duplicar el ancho angular del filtro. Esa progresión no coincide con la relación entre `roughness` y el ancho del lóbulo GGX, que es aproximadamente cuadrática. Un mapeo directo daría materiales rugosos con reflejos demasiado nítidos y viceversa.
+
+## Qué construye Three.js exactamente
+
+El formato de salida es `CubeUVReflectionMapping`: las seis caras del cubo desplegadas en una **única textura 2D**, con las cadenas de niveles colocadas en columnas. No es un `CubeTexture` de OpenGL; es un atlas plano en el que Three.js hace la interpolación a mano en el shader —la función `bilinearCubeUV` del chunk `cube_uv_reflection_fragment`—. Esa decisión permite una cosa que el hardware no da: **interpolar entre dos niveles de rugosidad manualmente**, sin depender del filtrado trilineal del sampler, que no respetaría los bordes del atlas.
+
+La cadena tiene una particularidad que revela el diseño. Los niveles no bajan hasta 1×1 sino solo hasta `LOD_MIN`, que vale 4, es decir 16×16 texels. A partir de ahí se añaden **seis niveles extra a la misma resolución**, cada uno más filtrado que el anterior, asociados a sigmas crecientes:
+
+```js
+// De PMREMGenerator.js, r184:
+const LOD_MIN = 4;
+const EXTRA_LOD_SIGMA = [ 0.125, 0.215, 0.35, 0.446, 0.526, 0.582 ];
+```
+
+El razonamiento es de precisión: para rugosidades muy altas, el reflejo es una mancha suave, pero **el término difuso también se lee de ahí** y necesita variación angular suave y sin escalones. Bajar la resolución por debajo de 16×16 introduciría bandas visibles en las superficies mates. Mantener la resolución y aumentar solo el filtrado da un gradiente limpio. Es un caso de libro de separar «resolución de la señal» de «ancho de banda de la señal».
+
+## Lo que cambió en r184: muestreo de importancia GGX
+
+Durante años, el prefiltrado de Three.js fue un desenfoque gaussiano esférico separable: dos pases, latitudinal y longitudinal, con pesos gaussianos. Rápido y visualmente aceptable, pero una aproximación: un gaussiano no es un lóbulo GGX.
+
+En r184 el filtro principal es otro. El código lo dice sin ambigüedad:
+
+```js
+// Comentario del propio PMREMGenerator.js en r184:
+// The prefiltering uses GGX VNDF (Visible Normal Distribution Function)
+// importance sampling based on "Sampling the GGX Distribution of Visible
+// Normals" (Heitz, 2018) to generate environment maps that accurately match
+// the GGX BRDF used in material rendering.
+const GGX_SAMPLES = 256;
+```
+
+Cada nivel se genera tomando 256 muestras distribuidas según la distribución de normales visibles del propio GGX, ponderadas por `n · l` —integración de Monte Carlo con muestreo de importancia—, y leyendo del nivel anterior con una rugosidad **incremental**:
+
+```js
+// Roughness incremental entre niveles, para no difuminar de mas.
+const incrementalRoughness = Math.sqrt(
+  targetRoughness * targetRoughness - sourceRoughness * sourceRoughness
+);
+```
+
+Esa raíz de la diferencia de cuadrados es la composición correcta de dos filtros: si ya has difuminado hasta una rugosidad y quieres llegar a otra mayor, el filtro que falta aplicar no es la diferencia sino la raíz de la diferencia de los cuadrados, igual que al componer desviaciones típicas. Sin esa corrección, filtrar en cascada sobredifumina.
+
+El resultado práctico es que el reflejo prefiltrado **coincide** con lo que el BRDF del material calcularía para una luz analítica en esa misma dirección. La coherencia entre iluminación directa y de entorno mejora de forma apreciable en materiales metálicos de rugosidad media.
+
+<Callout type="warn" title="El gaussiano no ha desaparecido, pero ya no es el filtro de rugosidad">
+El método `_blur` sigue en el código, con sus pesos gaussianos y su `MAX_SAMPLES = 20`. Su uso ahora es otro: aplicar el desenfoque inicial que pide el parámetro `sigma` de `fromScene`. Es una distinción que importa al leer el código fuente y que confunde a quien busca la vieja cadena de blur.
+</Callout>
+
+## La API, entera y sin fugas
+
+```js
+const pmrem = new THREE.PMREMGenerator( renderer );
+
+// Opcional pero recomendado: compila el shader mientras se descarga el HDRI.
+pmrem.compileEquirectangularShader();
+
+const hdr = await new HDRLoader().loadAsync( '/env/taller_1k.hdr' );
+
+// Devuelve un WebGLRenderTarget; lo que se asigna es su .texture
+const target = pmrem.fromEquirectangular( hdr );
+scene.environment = target.texture;
+
+// El HDRI original ya no hace falta: su informacion esta en el PMREM.
+hdr.dispose();
+
+// El generador tampoco, si no vas a generar mas entornos.
+pmrem.dispose();
+```
+
+Los tres métodos de entrada son `fromEquirectangular( textura )`, `fromCubemap( cubeTexture )` y `fromScene( scene, sigma, near, far, options )`. Los tres devuelven un `WebGLRenderTarget`, no una textura: hay que coger `.texture`. Y ese render target es tuyo: si sustituyes el entorno, llama a `target.dispose()` sobre el anterior o dejarás una textura de coma flotante de varios megabytes colgada en la VRAM.
+
+Un aviso sobre `dispose()` que está en la propia documentación y sorprende: *"PMREMGenerator is a static class, so you should not need more than one... calling dispose() on one of them will cause any others to also become unusable"*. Los recursos internos son compartidos. Un único generador por aplicación, y se desecha cuando ya no vas a generar más.
+
+<Callout type="dios" title="El PMREM no sabe dónde estás, y por eso los reflejos de una habitación pequeña siempre mienten">
+Hay una limitación estructural del IBL que ninguna calidad de prefiltrado arregla y que conviene tener clarísima antes de invertir tiempo en HDRIs mejores. Un mapa de entorno es una función **solo de la dirección**: para cada dirección, un color. Eso equivale a asumir que todo lo que refleja está infinitamente lejos. Para un cielo es exacto. Para las paredes de una habitación de cuatro metros es falso, y el error es enorme: mueves un objeto metálico de una esquina a la otra y su reflejo **no cambia**, porque la dirección de reflexión es la misma y el entorno no tiene noción de posición. En la realidad, acercarse a una pared hace que esa pared ocupe más ángulo sólido y domine el reflejo. El síntoma es que los interiores con IBL se ven correctos en una captura estática y se derrumban en cuanto el usuario mueve la cámara u orbita el objeto: los reflejos se sienten «pegados», como una calcomanía. La corrección clásica se llama *box projection* o *parallax-corrected cubemap*, y consiste en intersectar el rayo reflejado con una caja que representa la habitación y usar el punto de intersección en lugar de la dirección pura. Three.js **no la trae** en `MeshStandardMaterial`; hay que inyectarla con `onBeforeCompile` sobre el chunk de envmap, o construirla en TSL con un nodo propio. Las alternativas más baratas, en orden de esfuerzo: usar un `CubeCamera` que capture el entorno real desde el centro del objeto y refrescarlo poco —caro pero exacto para un objeto—, usar `GroundedSkybox` de los addons, que proyecta el entorno sobre un domo con suelo plano y arregla al menos el reflejo del suelo, que es el que más se nota, o simplemente elegir un HDRI de exterior donde la hipótesis de infinito sea cierta. Reconocer cuál de los tres casos tienes vale más que cualquier ajuste de `environmentIntensity`.
+</Callout>

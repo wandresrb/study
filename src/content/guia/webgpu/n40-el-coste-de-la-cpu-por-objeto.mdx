@@ -1,0 +1,111 @@
+---
+title: "El coste de la CPU por objeto"
+description: "Qué cuesta de verdad cada objeto antes de que la GPU toque un solo píxel, por qué WebGPU redujo ese coste sin eliminarlo, y en qué consiste invertir quién decide."
+subject: webgpu
+level: 40
+order: 1
+icon: "40.1"
+duracion: "19 min"
+---
+
+<Lead>
+Hay un tipo de fotograma lento que no tiene nada que ver con la GPU: el perfil muestra el hilo principal saturado durante ocho milisegundos y la cola de la GPU vacía la mitad del tiempo. No sobran triángulos ni píxeles; sobra JavaScript decidiendo qué dibujar. Ese coste crece linealmente con el número de objetos y no lo arregla ningún shader. El renderizado dirigido por GPU es la respuesta estructural: mover la decisión al mismo sitio donde están los datos.
+</Lead>
+
+<Objetivos>
+
+- Descomponer el coste de CPU de un objeto en sus cinco tareas reales y ponerle números.
+- Calcular cuántos objetos caben en un presupuesto de fotograma dado un coste por objeto medido.
+- Explicar qué parte del sobrecoste de WebGL eliminó WebGPU y por qué el resto sigue ahí.
+- Distinguir el trabajo de CPU que escala con la escena del que es constante por fotograma.
+
+</Objetivos>
+
+## Los cinco trabajos que la CPU hace por cada objeto
+
+Antes de que la GPU procese un vértice, el hilo principal ha ejecutado una secuencia fija por cada cosa que quieras dibujar. Vale la pena listarla entera, porque casi nadie la tiene presente completa y porque cada línea es un candidato a desaparecer.
+
+**Recorrer el grafo de escena.** Un nodo tiene padre, y su matriz de mundo es la del padre por la suya local. Multiplicar dos matrices de cuatro por cuatro son 64 multiplicaciones y 48 sumas, más la comprobación de si el nodo está sucio, más el salto de puntero a los hijos. En una jerarquía de 5.000 nodos eso son 320.000 multiplicaciones en coma flotante repartidas en un recorrido con acceso a memoria completamente disperso: cada nodo está en una zona distinta del heap, así que la caché falla casi siempre.
+
+**Calcular el volumen envolvente en espacio de mundo.** Para poder descartar algo hay que saber dónde está. Si guardas una esfera envolvente local, transformarla es barato; si guardas una caja alineada a los ejes, transformarla exige recalcular los extremos a partir de las ocho esquinas o de la forma con valores absolutos de la matriz.
+
+**El test de frustum en JavaScript.** Seis planos, un producto escalar de tres componentes contra cada uno. Son 24 multiplicaciones y 18 sumas por objeto en el mejor caso, pero el coste real no está ahí: está en que lo estás haciendo con números en cajas del motor de JavaScript, en un bucle que no se vectoriza, sobre datos que están en objetos y no en un `Float32Array` contiguo.
+
+**Ordenar.** Los opacos por pipeline y por material para minimizar cambios de estado, los transparentes por distancia de atrás hacia delante. Un `Array.prototype.sort` sobre 5.000 elementos con un comparador en JavaScript son unas 60.000 llamadas al comparador.
+
+**Grabar los comandos.** Y aquí está la parte visible: `setPipeline`, `setBindGroup`, `setVertexBuffer`, `setIndexBuffer`, `drawIndexed`. Cinco llamadas a la API por objeto en el caso simple.
+
+Ninguna de las cinco es cara aislada. El problema es que todas se multiplican por el número de objetos. Estos son órdenes de magnitud medidos en un portátil de gama alta con Chrome; mide los tuyos antes de creerte los míos, porque varían con el navegador y con la forma de tus datos:
+
+| tarea | coste típico por objeto |
+|---|---|
+| recorrido del grafo y matriz de mundo | 0,2 – 0,5 µs |
+| volumen envolvente a espacio de mundo | 0,1 – 0,2 µs |
+| test de frustum en JavaScript | 0,1 – 0,3 µs |
+| parte proporcional de la ordenación | 0,1 – 0,2 µs |
+| grabar los cinco comandos | 0,8 – 2,0 µs |
+| **total** | **1,3 – 3,2 µs** |
+
+Ahora la aritmética que importa. A 60 fotogramas por segundo tienes **16,6 ms** por fotograma, y no son tuyos enteros: el navegador se queda una parte para componer, y el sistema quiere margen para no perder el vsync. El presupuesto real de tu aplicación está más cerca de **11 o 12 ms**. Con un coste medio de 1,6 µs por objeto:
+
+- 1.000 objetos: 1,6 ms. Irrelevante.
+- 5.000 objetos: 8,0 ms. Te has comido dos tercios del presupuesto.
+- 20.000 objetos: 32 ms. Vas a 30 fotogramas por segundo con la GPU aburrida.
+
+Y si tu pantalla es de 120 Hz, que ya es lo normal en móviles de gama media y en portátiles, el presupuesto entero baja a **8,33 ms** y el umbral se cruza con 3.000 objetos.
+
+Lo cruel de este perfil es que la GPU no aparece por ningún lado. Puedes bajar la resolución a la mitad, quitar sombras, simplificar los materiales, y el fotograma tarda exactamente lo mismo, porque lo que manda es cuánto tarda el hilo principal en terminar de grabar. Un fotograma limitado por CPU no responde a ninguna optimización gráfica.
+
+## Lo que WebGPU ya arregló
+
+WebGL heredó de OpenGL un modelo de máquina de estados en el que la validación ocurre lo más tarde posible. Cuando llamas a `gl.drawElements`, el driver tiene que resolver en ese instante la combinación completa del estado vigente: qué programa está activo, qué texturas hay en qué unidades, qué buffers en qué puntos de enlace, qué formato tiene cada atributo, si el blending es compatible con el formato del destino. Esa combinación puede no haberse visto nunca, así que a menudo hay que compilar una variante del shader ahí mismo, en mitad del fotograma. De ahí vienen los tirones inexplicables de WebGL y de ahí viene la práctica de "calentar" los shaders dibujando un triángulo invisible con cada combinación al arrancar.
+
+WebGPU rompe eso por dos sitios a la vez.
+
+El primero es el **pipeline como objeto inmutable**. Todo el estado gráfico —módulos de shader, disposición de vértices, primitiva, profundidad y estarcido, mezcla, muestreo múltiple— se fija en `createRenderPipeline` y se valida y compila una sola vez. Cuando en el fotograma llamas a `setPipeline`, no se valida nada: se conmuta a un objeto ya cocinado. La validación se ha movido del momento en que estorba al momento en que no importa.
+
+El segundo son los **bind groups**. En WebGL enlazabas recurso a recurso: una llamada por textura, una por buffer de uniformes, una por sampler. En WebGPU agrupas todo lo que cambia a la misma frecuencia en un `GPUBindGroup` que también se construye y se valida una vez, y en el fotograma una sola llamada a `setBindGroup` enlaza el conjunto entero. Un material con cinco texturas y dos buffers pasa de siete llamadas con validación a una sin ella.
+
+El resultado es que grabar un objeto en WebGPU cuesta bastante menos que en WebGL, y que el coste es **predecible**, que es incluso más valioso: no hay compilaciones sorpresa en mitad del fotograma.
+
+Pero fíjate en lo que no ha cambiado. Sigue habiendo una llamada de JavaScript por objeto, y sigue siendo la CPU la que decide **qué** objetos hay en esa lista. Reducir el coste unitario de 3 µs a 1,5 µs duplica el número de objetos que caben en el presupuesto; no cambia el hecho de que el presupuesto se agota. El término lineal sigue en la ecuación.
+
+<Callout type="info" title="En el navegador, una llamada a la API no es solo una llamada">
+En Chrome la implementación de WebGPU vive en el proceso de GPU, no en el proceso de renderizado donde corre tu JavaScript. Cada `setBindGroup` o `draw` se serializa en un protocolo de mensajes y se envía al otro proceso, donde se deserializa y se traduce a Vulkan, Metal o D3D12. No es un salto de puntero: es una escritura en un buffer de comandos más una validación al otro lado. Por eso el coste por llamada en el navegador es sistemáticamente mayor que el equivalente nativo, y por eso las técnicas que reducen el **número** de llamadas rinden más aquí que en un motor de escritorio.
+</Callout>
+
+## Invertir quién decide
+
+El renderizado dirigido por GPU parte de una observación incómoda: para decidir qué dibujar, la CPU necesita leer datos —transformadas, volúmenes envolventes, la profundidad del fotograma anterior— que ya están en la memoria de la GPU o que van a acabar allí. Estamos trayendo información hacia el lado equivocado para tomar una decisión que después hay que empujar de vuelta.
+
+La inversión consiste en tres movimientos.
+
+**Los datos de la escena viven en storage buffers.** Un array de estructuras con la matriz de modelo, el volumen envolvente, el índice de material y el índice de malla, uno por instancia. La CPU lo escribe cuando algo cambia —y en una escena estática eso es *nunca* después del arranque— en lugar de recorrerlo cada fotograma.
+
+**La GPU decide.** Un compute pass evalúa el frustum sobre las 100.000 instancias en paralelo, otro las prueba contra la jerarquía de profundidad, otro compacta las supervivientes en una lista densa, y otro escribe el número final en un buffer de argumentos indirectos.
+
+**La CPU graba un puñado de comandos fijos.** Un compute pass por etapa de culling y una llamada de dibujo indirecta por lote de geometría. El número de llamadas deja de depender del número de objetos y pasa a depender del número de **combinaciones distintas de malla y material**, que en una escena real son cientos, no cientos de miles.
+
+El cambio de mentalidad se resume en una frase: **de "la CPU manda" a "la CPU prepara y la GPU decide"**. La CPU deja de ser el director de orquesta y pasa a ser el que deja la partitura en el atril. Y la consecuencia práctica es que puedes multiplicar por cien el número de objetos de la escena sin tocar ni un milisegundo del presupuesto de CPU, porque el término lineal ha desaparecido.
+
+Las cuatro lecciones siguientes construyen esa cadena pieza a pieza: [el culling por frustum en compute](/guia/webgpu/n40-frustum-culling-en-compute/), [el culling de oclusión contra la jerarquía de profundidad](/guia/webgpu/n40-oclusion-con-la-jerarquia-de-profundidad/), [la compactación de la lista de visibles](/guia/webgpu/n40-compactar-visibles-con-un-scan/) y [la generación del buffer indirecto](/guia/webgpu/n40-generar-el-draw-indirect-desde-la-gpu/).
+
+## El coste que no se va
+
+Sería deshonesto vender esto como que la CPU desaparece. Queda trabajo, y conviene saber exactamente cuál, porque es el suelo por debajo del cual no vas a bajar.
+
+**Por fotograma, constante.** Obtener la textura del lienzo con `getCurrentTexture`, abrir y cerrar los passes, escribir el buffer de cámara —dos matrices y seis planos, unos 200 bytes—, poner a cero los contadores atómicos, y `queue.submit`. Todo eso junto son decenas de microsegundos y no depende de la escena.
+
+**Por lote de geometría.** Cada combinación distinta de pipeline, malla y material sigue necesitando su `setPipeline`, su `setBindGroup` y su llamada de dibujo indirecta. Si tienes 400 lotes a 1,5 µs, son 0,6 ms fijos, tanto si la escena tiene 5.000 objetos como si tiene 500.000. Ese es el precio de que el núcleo de WebGPU no ofrezca multi-draw indirect.
+
+**Cuando la escena cambia.** Añadir, quitar o mover objetos exige actualizar el buffer de instancias. Con `queue.writeBuffer` puedes escribir solo el rango modificado; el coste es proporcional a lo que cambia, no a lo que hay. Una escena con animación esqueletal o física en CPU vuelve a tener un término lineal, y ahí la respuesta es mover también esa simulación a compute.
+
+**En el arranque.** Crear pipelines, compilar shaders, subir geometría y texturas. Es caro y es inevitable, pero ocurre una vez.
+
+<Callout type="dios" title="El objetivo no es ahorrar microsegundos, es borrar un termino de la ecuacion">
+La forma habitual de vender el renderizado dirigido por GPU —"reduce las llamadas de dibujo"— es cierta y es una manera pobre de entenderlo, porque invita a pensar que es una optimización cuantitativa, algo que aplicas cuando vas justo. No lo es. Lo que hace es cambiar la **forma** de la función de coste del fotograma.
+
+Antes tenías `t_cpu = a + b · n`, con `n` el número de objetos. Todas las optimizaciones clásicas —agrupar por material, usar bundles pregrabados, cachear matrices, evitar el sort— atacan la constante `b`. Puedes reducirla a la mitad con mucho trabajo, y con eso duplicas `n`. Pero el término sigue ahí, así que sigues teniendo un techo, y ese techo condiciona el diseño artístico de todo el proyecto: alguien va a tener que decirle al modelador que no puede poner tantos objetos. El renderizado dirigido por GPU hace `b ≈ 0` y deja `t_cpu ≈ a + c · m`, donde `m` es el número de lotes de geometría, que no crece con la escena sino con la variedad del arte. Y eso no es "el doble de objetos": es que la pregunta "cuántos objetos caben" deja de tener sentido en el lado de la CPU y se traslada íntegramente al lado de la GPU, donde el coste es de ancho de banda y de píxeles, que es donde debe estar.
+
+El corolario práctico, y es el que más se ignora: **no adoptes esto porque tengas muchos objetos, adóptalo cuando el perfil te diga que el fotograma está limitado por CPU**. Si la GPU está al cien por cien y el hilo principal a un veinte, montar toda esta maquinaria te va a costar cuatro compute passes por fotograma y no vas a ganar nada; vas a perder, porque esos passes también ocupan la GPU. La forma de saberlo es mirar si el tiempo de fotograma cambia cuando bajas la resolución a la mitad. Si no cambia, estás limitado por CPU y esta lección es para ti. Si se reduce casi a la mitad, estás limitado por la GPU y tu problema es otro.
+</Callout>

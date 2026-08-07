@@ -1,0 +1,91 @@
+---
+title: "loadOp y storeOp: por qué clear es más barato que load"
+description: "Los cuatro valores que decide cada attachment al entrar y salir de un pass, y el modelo de renderizado por tiles que convierte esa elección en megabytes de tráfico a memoria por fotograma."
+subject: webgpu
+level: 27
+order: 3
+icon: "27.3"
+duracion: "21 min"
+---
+
+<Lead>
+Cada attachment de un render pass declara qué hacer con su contenido al entrar y qué hacer con el resultado al salir. Son dos enumeraciones de dos valores cada una, la cosa más pequeña del descriptor, y en el hardware que ejecuta la mitad de la web —cualquier teléfono, cualquier tableta, cualquier portátil con gráficos integrados de arquitectura de tiles— esa elección decide si el fotograma toca la memoria principal o no la toca. La diferencia entre `clear` y `load` no es un porcentaje: es la presencia o ausencia de una lectura completa del framebuffer.
+</Lead>
+
+<Objetivos>
+
+- Enumerar los valores de `loadOp` y `storeOp` y las reglas de validación asociadas.
+- Describir el ciclo de un render pass en una GPU de renderizado por tiles.
+- Cuantificar el tráfico a memoria que provoca un `load` a resolución de pantalla.
+- Reestructurar un fotograma para minimizar los cruces entre memoria de tile y memoria principal.
+
+</Objetivos>
+
+## Los cuatro valores
+
+`loadOp` admite `'clear'` y `'load'`. Con `'clear'`, el attachment empieza el pass con el valor de `clearValue`, que si se omite vale cero en los cuatro canales. Con `'load'`, empieza con lo que ya hubiera en la textura.
+
+`storeOp` admite `'store'` y `'discard'`. Con `'store'`, el resultado del pass queda en la textura. Con `'discard'`, el contenido queda indefinido al terminar.
+
+Para el attachment de profundidad y estarcido hay seis campos análogos y **son independientes entre sí**: `depthLoadOp`, `depthStoreOp`, `depthClearValue`, `stencilLoadOp`, `stencilStoreOp` y `stencilClearValue`. Con un formato combinado hay que dar los seis; olvidar los de estarcido en un `depth24plus-stencil8` es un error de validación, no un valor por defecto.
+
+Tres reglas más que la validación comprueba. Si `depthLoadOp` es `'clear'`, hay que dar `depthClearValue`, y tiene que estar entre cero y uno. Si el aspecto está marcado como solo lectura con `depthReadOnly` o `stencilReadOnly`, **no se pueden especificar sus operaciones de carga y guardado**, porque serían contradictorias. Y con un formato combinado, `depthReadOnly` y `stencilReadOnly` tienen que valer lo mismo.
+
+## Qué hace una GPU de tiles con un render pass
+
+Una GPU de escritorio clásica es de modo inmediato: rasteriza cada triángulo directamente contra el framebuffer, que vive en memoria de vídeo, apoyada en cachés grandes. Una GPU de tiles funciona al revés y lo hace por una razón de energía: **mover un byte desde la DRAM externa cuesta del orden de cien veces más energía que leerlo de la memoria interna del chip**, y en un dispositivo alimentado por batería esa proporción manda sobre todo lo demás.
+
+Su ciclo tiene dos fases. En la primera procesa toda la geometría del pass y la reparte en listas, una por cada bloque de pantalla —el *tile*, típicamente de 16 por 16 o 32 por 32 píxeles—. En la segunda recorre los tiles de uno en uno: reserva para el tile actual un trozo de memoria interna donde caben sus attachments de color, profundidad y estarcido, sombrea todos los fragmentos de ese tile operando **enteramente dentro del chip**, y al terminar escribe el resultado a memoria principal.
+
+En ese modelo, las operaciones de carga y guardado dejan de ser detalles y se convierten en la interfaz entre las dos memorias:
+
+- `loadOp: 'clear'` rellena la memoria del tile con una constante. No lee nada de la memoria principal. Es **gratis**.
+- `loadOp: 'load'` obliga a **copiar desde la memoria principal el contenido previo de cada tile** antes de empezar a sombrearlo. Sumado sobre todos los tiles, es una lectura completa de la textura.
+- `storeOp: 'store'` escribe cada tile a memoria principal al terminarlo. Sumado, es una escritura completa.
+- `storeOp: 'discard'` no escribe nada. También es gratis.
+
+## La cuenta
+
+Pon números, que es lo que convierte el consejo en principio. Un attachment de color `rgba8unorm` a 1920 por 1080 ocupa 8,3 MB. A 60 fotogramas por segundo:
+
+| Configuración | Tráfico por fotograma | Tráfico por segundo |
+|---|---|---|
+| `clear` más `discard` | 0 MB | 0 MB/s |
+| `clear` más `store` | 8,3 MB de escritura | 500 MB/s |
+| `load` más `store` | 16,6 MB | 1000 MB/s |
+
+Añade el búfer de profundidad, que con `depth32float` son otros 8,3 MB, y multiplica por el número de pasadas del fotograma. Un renderizador con cuatro pasadas que carguen y guarden color y profundidad mueve del orden de 8 GB por segundo **solo en operaciones de carga y guardado**, sin haber contado ni una textura ni un vértice. El ancho de banda de memoria de un teléfono de gama media está entre 10 y 30 GB por segundo y lo comparte con la CPU y con el compositor del sistema. La cuenta no da.
+
+De ahí sale la recomendación que la propia documentación de la plataforma repite en cada operación de carga: **usa `'clear'` siempre que el valor inicial no importe**. No porque sea marginalmente más rápido, sino porque `'load'` es una lectura de pantalla completa disfrazada de campo de un descriptor.
+
+```js
+// Correcto: no nos importa lo que hubiera, y la profundidad no se usa despues.
+const pass = encoder.beginRenderPass({
+  colorAttachments: [{
+    view: destino.createView(),
+    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+    loadOp: 'clear',
+    storeOp: 'store',
+  }],
+  depthStencilAttachment: {
+    view: profundidad.createView(),
+    depthClearValue: 1.0,
+    depthLoadOp: 'clear',
+    depthStoreOp: 'discard',   // nadie la lee tras el pass: no la escribas
+  },
+});
+```
+
+La especificación ha llegado a formalizar esta idea con un uso de vista, `TRANSIENT_ATTACHMENT`, que declara que un attachment **nunca sale de la memoria del tile**. Una vista con ese uso obliga a `loadOp: 'clear'` y `storeOp: 'discard'`, y a cambio permite que la implementación no reserve memoria de respaldo para ella en absoluto. Es la profundidad de un renderizador directo llevada a su conclusión lógica: un búfer que existe solo dentro del chip.
+
+<Callout type="dios" title="En una GPU de tiles, el número de render passes es una métrica de primer orden, y WebGPU no te da la herramienta para reducirlo por debajo de cierto punto">
+La consecuencia de todo lo anterior es que **cada frontera entre render passes es un viaje de ida y vuelta completo del framebuffer a la memoria principal**, y por tanto el número de passes de tu fotograma es una métrica de rendimiento tan directa como el número de triángulos. Esto choca de frente con el instinto de organización de un ingeniero: separar cada efecto en su propio pass es limpio, componible y fácil de razonar, y en móvil es una catástrofe. La versión corta del consejo es fusionar: si dos pasadas escriben en el mismo attachment y la segunda no necesita leer píxeles distintos de los que escribió la primera, son **una** pasada con dos secuencias de dibujado, no dos. El caso más frecuente y más rentable es el de la interfaz dibujada encima de la escena, que casi todo el mundo pone en un pass propio con `loadOp: 'load'` y que debería ir en el mismo pass que la escena. Ahora la parte incómoda. Existe un caso que **no se puede fusionar en WebGPU** y que en las APIs nativas sí: leer, en el mismo píxel, lo que la pasada anterior escribió. Vulkan lo expresa con subpasses y attachments de entrada, Metal con memoria de imagen y grupos de orden de rasterización, y ambos mantienen el resultado intermedio dentro del tile sin tocar la DRAM. WebGPU **no tiene equivalente**: la única forma de leer lo que escribió una pasada anterior es terminar el pass, guardar a memoria y muestrear la textura en el siguiente. Eso significa que un renderizador diferido en móvil paga en WebGPU el viaje entero del G-buffer, que es precisamente el coste que las extensiones nativas existen para evitar, y es la razón técnica de fondo por la que el diferido es mala idea en móvil aquí y solo regular en nativo. La conclusión práctica no es esperar sentado a que llegue la funcionalidad, es de diseño: **en móvil elige arquitecturas que no necesiten releer el framebuffer** —directo, o directo por clústeres— y reserva el diferido para escritorio. Y cuando midas un fotograma en móvil, cuenta los passes antes que los triángulos.
+</Callout>
+
+## Lo que hace el escritorio, para no sobreoptimizar
+
+Conviene no convertir esto en dogma universal. En una GPU de modo inmediato con memoria de vídeo dedicada no hay memoria de tile que precargar, así que `'load'` no dispara ninguna copia adicional: el framebuffer ya está en memoria de vídeo y se accede a él con las cachés normales. El coste existe, pero es mucho menor y no tiene esa forma escalonada.
+
+Curiosamente, `'clear'` también es especialmente barato ahí, por otra razón: las GPUs modernas implementan la limpieza con metadatos de compresión —marcan los bloques como «este bloque es el color de limpieza» sin escribir un solo píxel— y solo materializan el valor cuando alguien escribe encima. Es el llamado *fast clear*. Así que la recomendación coincide en las dos arquitecturas aunque los mecanismos no tengan nada que ver.
+
+La diferencia importante es el orden de magnitud del error. Poner `'load'` donde tocaba `'clear'` en escritorio te cuesta un pequeño porcentaje que probablemente ni midas. En móvil te cuesta un factor, y el usuario lo nota en la temperatura del dispositivo antes que en el contador de fotogramas.

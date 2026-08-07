@@ -1,0 +1,145 @@
+---
+title: "Los límites: lo que la especificación garantiza y lo que hay de verdad"
+description: "Los valores por defecto que todo dispositivo conforme ofrece, cómo pedir más sin romper el arranque, y por qué desarrollar contra los límites de tu máquina produce aplicaciones que no funcionan fuera de ella."
+subject: webgpu
+level: 3
+order: 4
+icon: "3.4"
+duracion: "19 min"
+---
+
+<Lead>
+Los límites son la parte de WebGPU que separa una demo de un producto. La especificación garantiza un conjunto de valores mínimos que todo dispositivo conforme ofrece, y cualquier cosa por encima hay que pedirla y puede no estar. La trampa es que tu máquina de desarrollo casi con seguridad supera esos mínimos, así que el código que escribes sin pensar en ellos funciona perfectamente hasta que llega a un dispositivo real.
+</Lead>
+
+<Objetivos>
+
+- Enumerar los valores por defecto de los límites que más condicionan el diseño.
+- Explicar la semántica de `requiredLimits` y su modo de fallo.
+- Diseñar contra el mínimo garantizado y escalar hacia arriba cuando hay margen.
+- Reconocer qué límites tienen la dirección invertida y por qué.
+
+</Objetivos>
+
+## Los números que hay que conocer
+
+WebGPU define un valor por defecto para cada límite. **Ese valor es el que obtienes si no pides nada, y es el que todo dispositivo conforme está obligado a ofrecer.** Diseñar dentro de esos números es la única forma de garantizar que tu aplicación funciona en cualquier sitio.
+
+Estos son los que condicionan decisiones de arquitectura de verdad:
+
+| Límite | Por defecto | Qué significa en la práctica |
+|---|---|---|
+| `maxBindGroups` | 4 | Solo cuatro grupos de recursos por pipeline: obliga a organizarlos por frecuencia de cambio |
+| `maxBindingsPerBindGroup` | 640 | Recursos dentro de un mismo grupo |
+| `maxUniformBufferBindingSize` | 65536 | 64 KiB por enlace uniforme: un array grande no cabe |
+| `maxStorageBufferBindingSize` | 134217728 | 128 MiB por enlace de almacenamiento |
+| `maxBufferSize` | 268435456 | 256 MiB por búfer |
+| `minUniformBufferOffsetAlignment` | 256 | Los desplazamientos dinámicos van de 256 en 256 bytes |
+| `minStorageBufferOffsetAlignment` | 256 | Lo mismo para almacenamiento |
+| `maxTextureDimension2D` | 8192 | Una textura de 8192 por 8192 como máximo |
+| `maxTextureDimension3D` | 2048 | Volúmenes de 2048 por lado |
+| `maxTextureArrayLayers` | 256 | Capas de un array de texturas |
+| `maxVertexBuffers` | 8 | Búferes de vértices simultáneos |
+| `maxVertexAttributes` | 16 | Atributos de vértice en total |
+| `maxVertexBufferArrayStride` | 2048 | Bytes por vértice |
+| `maxColorAttachments` | 8 | Salidas de color simultáneas |
+| `maxColorAttachmentBytesPerSample` | 32 | Suma de bytes de todas las salidas por muestra |
+| `maxUniformBuffersPerShaderStage` | 12 | Enlaces uniformes por etapa |
+| `maxStorageBuffersPerShaderStage` | 8 | Enlaces de almacenamiento por etapa |
+| `maxStorageTexturesPerShaderStage` | 4 | Texturas de almacenamiento por etapa |
+| `maxSampledTexturesPerShaderStage` | 16 | Texturas muestreables por etapa |
+| `maxSamplersPerShaderStage` | 16 | Samplers por etapa |
+| `maxComputeWorkgroupSizeX` | 256 | Tamaño máximo del grupo en X |
+| `maxComputeWorkgroupSizeZ` | 64 | Y en Z, que es más bajo |
+| `maxComputeInvocationsPerWorkgroup` | 256 | Producto de las tres dimensiones |
+| `maxComputeWorkgroupStorageSize` | 16384 | 16 KiB de `var<workgroup>` por grupo |
+| `maxComputeWorkgroupsPerDimension` | 65535 | Grupos por dimensión en un `dispatchWorkgroups` |
+| `maxInterStageShaderVariables` | 16 | Variables interpoladas entre vertex y fragment |
+
+Hay cinco de esa tabla que producen la mayoría de los rediseños tardíos, y merecen que te fijes ahora.
+
+**`maxBindGroups` es 4.** No es mucho. La organización canónica —grupo 0 para lo que cambia por fotograma, grupo 1 por pase, grupo 2 por material, grupo 3 por objeto— usa exactamente los cuatro. Cualquier arquitectura que quiera un quinto nivel de agrupación tiene que fusionar.
+
+**`maxUniformBufferBindingSize` es 65536.** Sesenta y cuatro kilobytes. Un array de mil matrices de 4 por 4 son 64000 bytes: cabe por los pelos. Dos mil no caben. Los datos por instancia de una escena grande no van en un búfer uniforme, van en uno de almacenamiento.
+
+**`maxComputeInvocationsPerWorkgroup` es 256.** El producto de las tres dimensiones de `@workgroup_size` no puede pasar de 256. `@workgroup_size(16, 16)` son exactamente 256 y es válido; `@workgroup_size(32, 32)` son 1024 y no lo es en un dispositivo por defecto.
+
+**`maxComputeWorkgroupsPerDimension` es 65535.** Un `dispatchWorkgroups(x)` con x mayor que 65535 falla. Con grupos de 64 invocaciones eso son poco más de 4 millones de elementos por dimensión: para más hay que repartir en dos dimensiones o procesar varios elementos por invocación.
+
+**`maxComputeWorkgroupStorageSize` es 16384.** Dieciséis kilobytes de memoria compartida por grupo. Un tile de 64 por 64 floats son 16384 bytes exactos, así que ese es el techo del tiling en el caso por defecto.
+
+<Callout type="warn" title="Dos límites van al revés">
+`minUniformBufferOffsetAlignment` y `minStorageBufferOffsetAlignment` empiezan por *min* y su valor por defecto es 256. Son alineaciones mínimas exigidas, así que **un valor más bajo es mejor**. Y por eso `requiredLimits` los trata al revés: pedir un valor para uno de estos límites significa pedir que sea *como mucho* ese valor. Si escribes 256 estás pidiendo lo que ya tienes; si escribes 32 estás pidiendo hardware con una alineación más fina, y puede fallar.
+</Callout>
+
+## Pedir más, sin romperse
+
+`requiredLimits` es un objeto plano de nombre a valor. Su semántica es «necesito al menos esto», y si el adaptador no llega, `requestDevice()` **rechaza con `OperationError`**. No hay degradación automática.
+
+La forma correcta es recortar cada petición contra lo que el adaptador anuncia:
+
+```js
+function limitesRecortados(adapter, deseados) {
+  const out = {};
+  for (const [nombre, valor] of Object.entries(deseados)) {
+    const disponible = adapter.limits[nombre];
+    if (typeof disponible !== 'number') continue;
+    // Para los limites 'min*', mas bajo es mejor: hay que invertir.
+    out[nombre] = nombre.startsWith('min')
+      ? Math.max(valor, disponible)
+      : Math.min(valor, disponible);
+  }
+  return out;
+}
+
+const device = await adapter.requestDevice({
+  requiredLimits: limitesRecortados(adapter, {
+    maxStorageBufferBindingSize: 1073741824,   // 1 GiB si lo hay
+    maxComputeWorkgroupStorageSize: 32768,     // 32 KiB si lo hay
+  }),
+});
+
+// Y despues, el codigo se adapta a lo que realmente se concedio.
+const tamTile = device.limits.maxComputeWorkgroupStorageSize >= 32768 ? 32 : 16;
+```
+
+La última línea es la parte que casi nadie escribe y la que hace que esto sirva de algo. **Pedir un límite alto no basta: hay que leer `device.limits` después y adaptar el algoritmo.** Si tu shader asume un tile de 32 y solo te concedieron memoria para 16, el shader no compilará o el pipeline será inválido.
+
+Y hay un detalle que sorprende: **pedir un límite más alto puede tener coste aunque te lo concedan**. Algunas implementaciones eligen rutas internas distintas según los límites solicitados, y pedir el máximo de todo «por si acaso» puede reservar más memoria o desactivar optimizaciones. Pide lo que necesitas.
+
+## Diseñar hacia arriba, no hacia abajo
+
+Es la disciplina que separa las aplicaciones que funcionan de las que funcionan en la máquina de quien las escribió, y consta de tres pasos.
+
+**Uno: el camino base usa solo los valores por defecto.** Búferes uniformes por debajo de 64 KiB. Workgroups de 256 invocaciones o menos. Texturas de 8192 o menos. Cuatro bind groups. Ese camino tiene que existir y tiene que probarse.
+
+**Dos: las mejoras se activan al leer `device.limits`, no al pedirlas.** Cada uso de un límite por encima del defecto va detrás de una comprobación explícita sobre el dispositivo concedido.
+
+**Tres: hay una forma de forzar el camino base en desarrollo.** Un parámetro de URL que ignore las peticiones de límites altos y arranque con los valores por defecto. Sin eso, el camino base no se ejecuta nunca en tu equipo y se pudre.
+
+```js
+const modesto = new URLSearchParams(location.search).has('minimos');
+const device = await adapter.requestDevice({
+  requiredLimits: modesto ? {} : limitesRecortados(adapter, deseados),
+});
+```
+
+Tres líneas, y son la única prueba realista que vas a tener del comportamiento en hardware modesto sin comprar hardware modesto.
+
+<Callout type="dios" title="El límite que te va a morder no es el que consultas: es el que no sabías que existía">
+Los límites de la tabla son consultables y por tanto manejables. El problema real es otro y aparece siempre igual: **usas un valor que supera un límite del que no tenías ni idea, la validación lo rechaza, y el mensaje de error habla de un descriptor inválido sin decir cuál de los treinta límites has violado**.
+
+El caso canónico es `maxColorAttachmentBytesPerSample`, cuyo valor por defecto es 32. Suena inofensivo hasta que montas un G-buffer con cuatro salidas `rgba16float`: cada una son 8 bytes por muestra, cuatro son 32, y estás justo en el límite. Añade una quinta salida, o cambia una a `rgba32float`, y el pipeline se vuelve inválido con un mensaje que no menciona el límite. Lo mismo pasa con `maxInterStageShaderVariables`, que a 16 parece generoso hasta que un shader con tangentes, dos juegos de coordenadas de textura y color por vértice se pasa sin avisar.
+
+De ahí un hábito que vale su peso: **al principio del proyecto, vuelca `device.limits` entero a la consola y déjalo ahí**. Son treinta números y cuando un pipeline falle sin explicación vas a repasarlos uno a uno de todas formas; tenerlos delante convierte veinte minutos de búsqueda a ciegas en dos. Y una regla que se deriva: cuando la validación rechace algo que parece correcto, **sospecha primero de un límite, no de un nombre de campo mal escrito**. Los nombres de campo mal escritos producen mensajes claros; los límites, no.
+
+```js
+console.table(Object.fromEntries(
+  Object.keys(Object.getPrototypeOf(device.limits))
+    .map((k) => [k, device.limits[k]])
+    .filter(([, v]) => typeof v === 'number')
+));
+```
+</Callout>
+
+Falta el modo de fallo que no ocurre al arrancar sino en cualquier momento: [la pérdida de dispositivo](/guia/webgpu/n3-device-lost/).

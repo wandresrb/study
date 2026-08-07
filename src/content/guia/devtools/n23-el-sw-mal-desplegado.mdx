@@ -1,0 +1,180 @@
+---
+title: "El bug clásico: el worker que sirve una versión antigua para siempre"
+description: "Cómo se produce el estado en el que un despliegue no llega nunca a los usuarios, por qué no se corrige solo, el diagnóstico completo y las cuatro defensas que lo previenen."
+subject: devtools
+level: 23
+order: 5
+icon: "23.5"
+duracion: "20 min"
+---
+
+<Lead>
+Existe un estado del que una aplicación web no puede salir sola: un service worker que cachea el documento con estrategia de caché primero, y que además está cacheado él mismo. A partir de ahí, cada usuario que lo tenga instalado recibirá indefinidamente la versión que tenía el día que se instaló, no importa cuántas veces despliegues, y no importa cuántas veces recargue. Es el peor incidente que puede producir esta tecnología y el más fácil de provocar sin darse cuenta.
+</Lead>
+
+<Objetivos>
+
+- Reconstruir la secuencia exacta que produce el bloqueo permanente.
+- Diagnosticarlo en la máquina de un usuario en menos de dos minutos.
+- Aplicar el procedimiento de recuperación y sus límites.
+- Implementar las cuatro defensas que hacen imposible el estado.
+
+</Objetivos>
+
+## Cómo se llega ahí
+
+La secuencia tiene cuatro ingredientes y ninguno parece un error por sí solo.
+
+**Uno: el worker cachea el documento HTML con estrategia de caché primero.** Es la recomendación de muchos tutoriales porque hace que la aplicación arranque instantáneamente y funcione sin red. Y es correcta para un armazón cuya URL no cambia... siempre que el resto de las piezas estén bien.
+
+**Dos: el documento cacheado apunta a recursos versionados.** El HTML antiguo referencia el paquete de la versión antigua.
+
+**Tres: el propio script del worker se sirve con una caché larga.** El navegador comprueba si hay un worker nuevo pidiendo su script, y si el servidor o una capa intermedia responde con la copia guardada en lugar de la nueva, la comprobación concluye que no hay cambios.
+
+**Cuatro: nadie implementó un mecanismo de escape.** No hay comprobación de versión, ni señal remota, ni ruta de recuperación.
+
+Con esos cuatro, el sistema es un bucle cerrado: el worker sirve el HTML viejo, el HTML viejo carga el JavaScript viejo, y el mecanismo que debería traer la versión nueva del worker está cortocircuitado por la caché de su propio script.
+
+<Callout type="danger">
+Lo que hace este bug excepcionalmente grave es que **no se puede arreglar desde el servidor**. Puedes desplegar cien veces, purgar la CDN, cambiar la infraestructura entera: el usuario afectado no llegará a ver nada de eso, porque su navegador ni siquiera está preguntando. El código que decide qué se sirve está en su disco y es el que tú le entregaste.
+</Callout>
+
+### Por qué la caché del script no debería ser el problema, y a veces lo es
+
+Los navegadores modernos son conscientes de este riesgo y aplican una protección: al comprobar si hay una actualización del worker, **ignoran la caché HTTP por defecto**. Además, si el script se sirve con una vida de caché larga, la limitan a un máximo del orden de un día.
+
+Eso reduce mucho la probabilidad del bloqueo permanente, pero no la elimina, por tres motivos.
+
+**La protección cubre la caché del navegador, no las intermedias.** Un proxy o una CDN mal configurada que devuelva la copia guardada burla el mecanismo por completo, porque el navegador pregunta correctamente y le responden mal.
+
+**El comportamiento se puede desactivar explícitamente** con una opción del registro, y hay código que lo hace sin entender las consecuencias.
+
+**El worker puede cachear sus propias dependencias.** Si el script principal no cambia pero importa otro que sí, la comprobación de igualdad byte a byte del script principal concluye que no hay novedad. El worker nuevo nunca llega a instalarse aunque su lógica real haya cambiado.
+
+## El diagnóstico
+
+En la máquina de la persona afectada, con las DevTools abiertas, tres comprobaciones en orden. Cuesta menos de dos minutos.
+
+**Uno: el estado del worker.** En el panel de aplicación, mira la fecha de la última actualización y el identificador. Si la fecha es muy anterior al despliegue, el worker no se está actualizando.
+
+**Dos: de dónde viene el documento.** En el panel de red, recarga y mira la primera petición. Si su tamaño indica que la sirvió el worker, el documento viene de caché y ahí está la causa.
+
+**Tres: qué hay en la caché.** Inspecciona la entrada del documento y mira su cabecera de fecha. Si es de hace semanas, confirmado.
+
+```js
+// Diagnostico completo pegado en la consola de la maquina afectada
+(async () => {
+  const registros = await navigator.serviceWorker?.getRegistrations?.() ?? [];
+  console.log('Service workers registrados:', registros.length);
+  for (const r of registros) {
+    console.table([{
+      ambito: r.scope,
+      script: r.active?.scriptURL ?? '-',
+      activo: r.active?.state ?? '-',
+      esperando: r.waiting?.state ?? '-',
+      instalando: r.installing?.state ?? '-'
+    }]);
+  }
+  console.log('Esta pagina esta controlada:', !!navigator.serviceWorker?.controller);
+
+  const nombres = await caches.keys();
+  console.log('Caches:', nombres);
+  for (const n of nombres) {
+    const c = await caches.open(n);
+    const claves = await c.keys();
+    const documentos = [];
+    for (const k of claves.slice(0, 100)) {
+      const res = await c.match(k);
+      const ct = res?.headers.get('content-type') || '';
+      if (ct.includes('text/html')) {
+        documentos.push({
+          cache: n,
+          url: k.url.slice(-60),
+          fecha: res.headers.get('date') || '(sin fecha)',
+          edad: res.headers.get('age') || ''
+        });
+      }
+    }
+    if (documentos.length) {
+      console.warn('Documentos HTML en cache: la causa mas probable del bloqueo');
+      console.table(documentos);
+    }
+  }
+
+  console.log('Forzar comprobacion de actualizacion:');
+  for (const r of registros) {
+    await r.update().then(
+      () => console.log('  update() completado para', r.scope),
+      e => console.warn('  update() fallo:', e.message)
+    );
+  }
+})();
+```
+
+La tabla de documentos HTML cacheados es la evidencia decisiva: **un documento en la caché del worker con una fecha antigua es el bug, sin más análisis**.
+
+## Recuperación
+
+Para el usuario afectado, el procedimiento tiene tres niveles.
+
+**Nivel uno: forzar la comprobación.** Llamar a la actualización del registro desde la consola, o pulsar el botón de actualizar del panel. A veces basta, si el problema era solo que la comprobación no se había disparado.
+
+**Nivel dos: dar de baja y recargar.** Elimina el worker y devuelve la aplicación a un estado sin control, desde el que la carga siguiente viene de la red.
+
+```js
+// Recuperacion completa. Esto es lo que deberia estar en una ruta interna.
+(async () => {
+  const registros = await navigator.serviceWorker.getRegistrations();
+  await Promise.all(registros.map(r => r.unregister()));
+  const nombres = await caches.keys();
+  await Promise.all(nombres.map(n => caches.delete(n)));
+  console.log('Dados de baja', registros.length, 'workers y eliminadas', nombres.length, 'caches.');
+  console.log('Recargando...');
+  location.reload();
+})();
+```
+
+**Nivel tres: borrar todo el estado del origen** desde el panel de aplicación. Es el recurso final y funciona siempre.
+
+El problema operativo es que **ninguno de los tres se puede ejecutar remotamente**: requieren que la persona afectada haga algo. Por eso lo importante no es el procedimiento de recuperación sino la prevención.
+
+## Las cuatro defensas
+
+**Uno: el documento nunca con caché primero.** Sírvelo con red primero y caché de respaldo, o con una estrategia que revalide en segundo plano. Si la red responde, gana la red. Con eso, un despliegue llega siempre en la siguiente carga con conexión, y el modo sin red sigue funcionando.
+
+**Dos: el script del worker con una vida de caché muy corta o nula.** En el servidor y en cualquier capa intermedia. Comprobar esto es una línea en la configuración y es la que corta la vía de la CDN.
+
+**Tres: un mecanismo de escape.** El worker comprueba periódicamente una señal remota y, si se activa, se da de baja solo y limpia sus cachés.
+
+```js
+// Dentro del service worker: interruptor de emergencia remoto
+const VERSION = '2026.08.06-1';
+
+async function comprobarInterruptor() {
+  try {
+    const r = await fetch('/sw-control.json', { cache: 'no-store' });
+    if (!r.ok) return;
+    const control = await r.json();
+    if (control.desactivarWorker === true ||
+        (control.versionMinima && control.versionMinima > VERSION)) {
+      console.warn('[sw] Interruptor activado. Desregistrando y limpiando.');
+      const nombres = await caches.keys();
+      await Promise.all(nombres.map(n => caches.delete(n)));
+      await self.registration.unregister();
+      const clientes = await self.clients.matchAll({ type: 'window' });
+      clientes.forEach(c => c.navigate(c.url));   // recarga a todos
+    }
+  } catch { /* sin red: se reintentara */ }
+}
+
+self.addEventListener('activate', (e) => e.waitUntil(comprobarInterruptor()));
+self.addEventListener('fetch', (e) => {
+  if (e.request.mode === 'navigate') comprobarInterruptor();   // sin bloquear la respuesta
+});
+```
+
+**Cuatro: una ruta de recuperación en la aplicación.** Una dirección conocida que ejecute la limpieza completa, documentada para el equipo de soporte. El detalle que la hace funcionar es que **esa ruta tiene que quedar excluida de la interceptación del worker**, para que sea alcanzable incluso cuando el worker esté sirviendo basura.
+
+<Callout type="dios" title="Un service worker es código que entregas y ya no puedes retirar, y esa propiedad debería cambiar cómo se revisa">
+La lección de fondo de este nivel no es sobre cachés sino sobre una categoría de código que la web no tenía antes y para la que el proceso habitual de desarrollo no está preparado. Todo lo demás que despliegas es **revocable**: si sale mal, despliegas la corrección y en la siguiente carga el problema desapareció. Un service worker no lo es. Una vez instalado en el dispositivo de alguien, ese código se ejecuta antes que el tuyo, decide qué recibe tu aplicación, y **solo se sustituye si él mismo colabora**. Es, en el sentido literal, código que le entregaste a un usuario y que ya no controlas. Esa propiedad debería tener consecuencias visibles en el proceso, y en la mayoría de los equipos no las tiene: el fichero del worker se revisa como cualquier otro, se despliega con el mismo pipeline, y nadie le presta atención especial hasta el día del incidente. Las tres prácticas que corrigen el desajuste son de proceso y no de código. **Una: el fichero del worker necesita revisión reforzada.** Un cambio en ese fichero tiene un radio de impacto mayor que casi cualquier otro del proyecto y merece la misma atención que un cambio de esquema de base de datos: dos revisores, y una pregunta explícita de qué pasa con los clientes que ya tienen la versión anterior. **Dos: despliegue progresivo.** Un worker nuevo debería llegar primero a una fracción pequeña del tráfico, con la posibilidad de detener el despliegue si aparecen errores, exactamente igual que se hace con un servicio de backend. Es fácil de implementar sirviendo el script solo a una parte de las peticiones. **Tres: la prueba de la versión anterior en cada despliegue.** Antes de publicar, comprobar que un cliente con la versión anterior instalada recibe la nueva correctamente: cargar el sitio con la versión antigua, desplegar la nueva, y verificar la transición completa. Es la prueba que ningún equipo hace y la única que habría detectado este bug antes de que llegara a nadie. Un service worker, visto desde la operación, es infraestructura desplegada en el dispositivo del cliente, y merece las mismas cautelas que cualquier otra infraestructura de la que dependa el producto.
+</Callout>

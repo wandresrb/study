@@ -1,0 +1,99 @@
+---
+title: "Qué es un render bundle y qué problema resuelve"
+description: "El descriptor de createRenderBundleEncoder campo a campo, el ciclo de grabar y ejecutar, y la razón arquitectónica por la que pregrabar comandos ahorra tiempo de CPU en un navegador."
+subject: webgpu
+level: 30
+order: 1
+icon: "30.1"
+duracion: "17 min"
+---
+
+<Lead>
+Un render bundle es una secuencia de comandos de dibujado grabada una vez y ejecutada muchas. No hace nada que no puedas hacer llamando a los mismos métodos cada fotograma, y esa es precisamente la cuestión: su valor no está en lo que permite expresar sino en lo que deja de costar. Entender de dónde sale el ahorro exige mirar por debajo del API, a la frontera entre el proceso donde corre tu JavaScript y el proceso donde vive el driver, que es donde se paga el precio de cada llamada.
+</Lead>
+
+<Objetivos>
+
+- Crear un codificador de bundles con el descriptor coherente con el pass que lo ejecutará.
+- Grabar, finalizar y ejecutar un bundle, y reutilizarlo entre fotogramas.
+- Explicar por qué pregrabar ahorra tiempo de CPU en la arquitectura de un navegador.
+- Distinguir qué queda congelado en un bundle y qué sigue siendo libre.
+
+</Objetivos>
+
+## El ciclo completo
+
+Un bundle se crea con un codificador propio, se le graban comandos con los mismos métodos que a un render pass, y se cierra con `finish()`, que devuelve un objeto inmutable.
+
+```js
+// 1. El descriptor describe el TIPO de pass en el que va a poder ejecutarse.
+const codificador = device.createRenderBundleEncoder({
+  label: 'mobiliario estatico',
+  colorFormats: [navigator.gpu.getPreferredCanvasFormat()],
+  depthStencilFormat: 'depth32float',
+  sampleCount: 4,
+  depthReadOnly: false,
+  stencilReadOnly: false,
+});
+
+// 2. Se graban los comandos. Esto ocurre UNA vez, no por fotograma.
+codificador.setPipeline(pipelineOpaco);
+codificador.setBindGroup(0, grupoEscena);
+codificador.setVertexBuffer(0, megaVertices);
+codificador.setIndexBuffer(megaIndices, 'uint32');
+for (const lote of lotesEstaticos) {
+  codificador.setBindGroup(1, lote.grupoMaterial);
+  codificador.drawIndexed(lote.numIndices, lote.numInstancias,
+                          lote.primerIndice, lote.primerVertice);
+}
+
+// 3. finish devuelve un objeto inmutable que se guarda.
+const bundle = codificador.finish({ label: 'mobiliario estatico' });
+
+// 4. Cada fotograma, una sola llamada.
+function fotograma() {
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass(descriptorRender);
+  pass.executeBundles([bundle]);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+}
+```
+
+El descriptor del codificador no describe recursos concretos: describe la **forma** del render pass donde el bundle podrá ejecutarse. Los formatos de color en orden, el formato de profundidad y estarcido si lo hay, el número de muestras y las banderas de solo lectura. Un pass con formatos distintos no puede ejecutar ese bundle, y la validación lo comprueba al ejecutarlo.
+
+`colorFormats` es el único campo obligatorio y admite valores nulos en las posiciones que correspondan a attachments ausentes, igual que el array `targets` de un pipeline. `sampleCount` vale 1 por defecto, y `depthReadOnly` y `stencilReadOnly` valen `false`.
+
+`finish()` acepta un descriptor opcional con solo `label`, y tiene una condición de validación que sorprende la primera vez: **la pila de grupos de depuración tiene que estar vacía**. Un `pushDebugGroup` sin su `popDebugGroup` invalida el bundle.
+
+## Qué queda congelado y qué no
+
+Esta es la distinción que decide si los bundles te sirven, y conviene fijarla antes que cualquier otra cosa: **un bundle congela los comandos, no los datos**.
+
+Queda congelado qué pipeline se usa, qué bind groups se vinculan, qué búferes de vértices e índices, cuántos vértices se dibujan, con cuántas instancias y desde qué desplazamiento. Cambiar cualquiera de esas cosas exige regrabar el bundle.
+
+**No** queda congelado el **contenido** de los búferes ni el de las texturas. El bind group vinculado apunta a un búfer de uniformes; lo que haya dentro de ese búfer en el momento de ejecutar el bundle es lo que se usará. Puedes escribir la matriz de la cámara cada fotograma con `writeBuffer` y el mismo bundle, grabado hace mil fotogramas, dibujará desde el punto de vista nuevo.
+
+Tampoco queda congelado el contenido de un búfer de argumentos indirectos. Un `drawIndexedIndirect` grabado en un bundle lee sus argumentos en el momento de ejecutarse, así que **un bundle con dibujados indirectos tiene comandos fijos y contenido completamente dinámico**. Es la combinación más potente que ofrece el núcleo del API y la aproximación más cercana que existe hoy a emitir muchos dibujados con un coste de CPU constante.
+
+## De dónde sale el ahorro
+
+La pregunta razonable es por qué grabar los mismos comandos iba a ser más caro que ejecutarlos pregrabados, si el trabajo de la GPU es idéntico. La respuesta no está en la GPU.
+
+Cuando llamas a `pass.drawIndexed(...)` desde JavaScript en un navegador moderno, ocurren varias cosas antes de que ese comando llegue a ningún driver. La llamada cruza la frontera entre JavaScript y el motor, los argumentos se convierten y se validan contra el estado actual del pass —que el pipeline esté fijado, que los búferes de vértices cubran el rango pedido, que los bind groups sean compatibles con el layout—, y el comando se serializa para cruzar al **proceso de GPU**, que es un proceso distinto por razones de seguridad. Ese último paso es el caro: cada comando se escribe en un búfer de transporte que se envía por un canal entre procesos.
+
+Un bundle hace todo eso **una vez**. La validación se ejecuta al grabar, la serialización se hace al grabar, y lo que queda almacenado es una secuencia ya traducida. `executeBundles()` es entonces un único comando que referencia esa secuencia.
+
+De ahí sale la propiedad que hay que retener para decidir cuándo usarlos: **el ahorro es proporcional al número de comandos, no al trabajo de la GPU**. Un bundle con quinientos dibujados triviales ahorra mucho más que uno con tres dibujados de un millón de triángulos cada uno.
+
+<Callout type="dios" title="Los bundles existen porque WebGPU cruza una frontera de procesos, y ese detalle de implementación explica todo su comportamiento">
+La documentación presenta los render bundles como una optimización genérica, y quien viene de las APIs nativas los compara con los command buffers secundarios de Vulkan y espera un beneficio parecido, que es modesto. En la web el beneficio es bastante mayor y la razón es específica del navegador: **tu JavaScript no habla con el driver**. Por seguridad, el proceso que ejecuta la página no tiene acceso a la GPU; los comandos se serializan y viajan por un canal a un proceso privilegiado que los deserializa, los revalida y los entrega al driver. Ese viaje es el coste dominante de una llamada de dibujo en WebGPU, y es la razón por la que el mismo bucle escrito en C++ sobre Vulkan y en JavaScript sobre WebGPU no cuesta lo mismo ni de lejos. Con ese modelo en la cabeza, tres comportamientos que parecen arbitrarios se explican solos. **Por qué el ahorro no depende del tamaño de los dibujados**: lo que se ahorra es transporte de comandos, y un comando ocupa lo mismo dibuje tres vértices o tres millones. **Por qué un bundle que se regraba cada fotograma es peor que no usarlo**: pagas el transporte igual, más la construcción del objeto y su validación adicional. Y **por qué el número de comandos importa más que su naturaleza**: cincuenta `setBindGroup` cuestan aproximadamente lo mismo que cincuenta `draw`, así que reducir cambios de estado es tan valioso como reducir dibujados, y un bundle que alterna estado en cada elemento ahorra el doble que uno que no lo hace. Hay un corolario incómodo que conviene saber: como el coste vive en la implementación del navegador y no en el hardware, **la ganancia de los bundles varía entre navegadores y entre versiones**. Un motor que use un canal más eficiente, o que ejecute en el mismo proceso en alguna configuración, verá menos beneficio. Eso no invalida la técnica, pero sí invalida cualquier cifra concreta que leas por ahí, incluida la de un artículo de hace dos años. Mide en los navegadores que te importan y vuelve a medir de vez en cuando.
+</Callout>
+
+## Reutilizar entre passes
+
+Un bundle no está atado al pass que lo ejecuta: puede ejecutarse en varios passes distintos y varias veces en el mismo, siempre que la forma coincida. Eso abre un uso que se aprovecha poco: **la misma geometría dibujada en varios destinos compatibles**.
+
+El caso obvio son los renderizados estéreo o las vistas múltiples de un configurador, donde la misma escena se dibuja dos veces desde puntos de vista distintos. Como el punto de vista vive en un búfer de uniformes y no en los comandos, basta con actualizar ese búfer entre las dos ejecuciones —en passes distintos— y el mismo bundle sirve para las dos.
+
+La restricción a tener presente es que los formatos tienen que coincidir exactamente. Un bundle grabado para el pass principal con cuatro muestras y profundidad no vale para el pass del mapa de sombras, que no tiene attachment de color y probablemente tampoco multimuestreo. Cada forma de pass necesita su propio bundle, y esa es una de las razones por las que el número de bundles de un motor crece igual que el número de pipelines.

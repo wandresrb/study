@@ -1,0 +1,102 @@
+---
+title: "frag_depth y discard: las dos formas de romper el early-z"
+description: "Qué hace escribir la profundidad desde el shader, qué hace descartar un fragmento, por qué las dos desactivan la prueba de profundidad temprana, y cómo recuperar lo perdido."
+subject: webgpu
+level: 15
+order: 4
+icon: "15.4"
+duracion: "18 min"
+---
+
+<Lead>
+Hay dos construcciones del fragment shader que parecen inocentes y que cambian el comportamiento del hardware para la geometría entera que las use: escribir `@builtin(frag_depth)` y ejecutar `discard`. Las dos rompen la misma suposición —que la profundidad de un fragmento se conoce antes de ejecutar el shader— y las dos convierten una optimización que estaba activa por defecto en una que deja de aplicarse.
+</Lead>
+
+<Objetivos>
+
+- Escribir `frag_depth` correctamente y saber a qué rango se acota.
+- Explicar qué hace `discard` y en qué se diferencia de `return`.
+- Enumerar por qué las dos impiden la prueba de profundidad temprana.
+- Recuperar el rendimiento perdido con las técnicas que sí funcionan.
+
+</Objetivos>
+
+## frag_depth
+
+Por defecto, la profundidad de un fragmento es la que interpola el rasterizador desde los tres vértices, y el hardware la conoce **antes** de ejecutar el shader. Declarar `@builtin(frag_depth)` en la salida sustituye ese valor por uno que calculas tú:
+
+```wgsl
+struct SalidaFS {
+  @location(0) color : vec4f,
+  @builtin(frag_depth) profundidad : f32,
+};
+
+@fragment
+fn fs(entrada : EntradaFS) -> SalidaFS {
+  var s : SalidaFS;
+  s.color = vec4f(1.0);
+  s.profundidad = calcularProfundidadDeLaEsferaImpostora(entrada);
+  return s;
+}
+```
+
+El valor se acota al rango de profundidad del viewport, así que escribir números fuera de él no rompe nada pero tampoco hace lo que esperas.
+
+Los casos donde hace falta de verdad son pocos y todos comparten la misma forma: **la geometría que se dibuja no coincide con la superficie que se quiere representar**. Impostores de esferas dibujados como cuadrados, billboards que tienen que intersecar correctamente con la escena, ray marching dentro de una caja, decals proyectados. En todos ellos, la profundidad interpolada del polígono es la de la caja o el cuadrado, no la de la superficie real.
+
+WGSL no tiene ningún mecanismo para declarar profundidad conservadora —el equivalente de `depth_greater` de GLSL—, así que no hay forma de decirle al hardware que tu profundidad solo puede ser mayor que la interpolada. Escribir `frag_depth` es todo o nada.
+
+## discard
+
+`discard` anula la contribución del fragmento: no se escribe color, no se escribe profundidad, no se escribe nada.
+
+```wgsl
+@fragment
+fn fs(entrada : EntradaFS) -> @location(0) vec4f {
+  let muestra = textureSample(albedo, muestreo, entrada.uv);
+  if muestra.a < 0.5 { discard; }
+  return muestra;
+}
+```
+
+Dos cosas que hay que tener claras y que lo distinguen de un `return`.
+
+**No es una salida de la función.** `discard` marca la invocación como descartada; la especificación está redactada de forma que las invocaciones vecinas del cuadrado conservan derivadas bien definidas, que es precisamente lo que se rompía en implementaciones antiguas de otras APIs. En la práctica conviene escribirlo donde el flujo lo permita y no asumir que corta la ejecución como un `return`.
+
+**Puede aparecer en cualquier punto**, incluso dentro de una función auxiliar, y contamina a todo punto de entrada que la alcance. Una función que hace `discard` no se puede llamar desde un vertex shader.
+
+## Por qué las dos rompen el early-z
+
+La prueba de profundidad está definida conceptualmente **después** del fragment shader: primero se sombrea, luego se compara la profundidad, luego se escribe. Si se hiciera así de verdad, cada fragmento tapado costaría un shader completo.
+
+Lo que hace el hardware es adelantar la prueba: si puede demostrar que el resultado será el mismo, compara la profundidad **antes** de ejecutar el shader y se ahorra los fragmentos tapados. Esa es la prueba de profundidad temprana, y no es una opción que se activa: es una optimización que el driver aplica cuando puede demostrar que es segura.
+
+Deja de poder demostrarlo cuando:
+
+- **El shader escribe `frag_depth`**, porque la profundidad que hay que comparar no se conoce hasta ejecutarlo.
+- **El shader puede hacer `discard`**, porque la escritura de profundidad depende de si se descarta o no. Ojo: el hardware puede seguir haciendo la **prueba** temprana para rechazar fragmentos tapados, pero no puede hacer la **escritura** temprana, y en varias arquitecturas eso desactiva mecanismos de rechazo por bloques que dependen de un buffer de profundidad jerárquico actualizado.
+- **El shader escribe a storage buffers o a storage textures**, porque esos efectos ocurrirían aunque el fragmento se rechace.
+
+El coste real depende de cuánta geometría tapada haya. En una escena con poco sobredibujado se nota poco; en vegetación densa, donde cada píxel puede estar cubierto por diez capas de hojas con alpha test, la diferencia es enorme.
+
+## Cómo recuperar lo perdido
+
+**Separa la geometría con alpha test de la opaca.** Un pipeline sin `discard` para lo opaco conserva todas las optimizaciones; el `discard` solo penaliza a los objetos que lo necesitan. El error habitual es un único shader de material con un `discard` condicionado por una uniform: el hardware no sabe que la condición es falsa y penaliza a todo.
+
+**Dibuja lo opaco primero y de cerca a lejos.** Así el buffer de profundidad está lleno cuando llega la geometría con alpha test, y la prueba temprana rechaza la mayoría de sus fragmentos antes de ejecutar el shader.
+
+**Considera un depth prepass para la vegetación.** Un pase de solo profundidad con el mismo alpha test, seguido del pase de color con `depthCompare: 'equal'` y sin `discard`, ejecuta el alpha test una vez y el shader de iluminación exactamente una vez por píxel visible. Con shaders de iluminación caros compensa claramente; con shaders baratos, no.
+
+**Usa alpha-to-coverage en lugar de `discard` cuando haya multimuestreo.** Convierte el alfa en una máscara de cobertura y da bordes suaves sin ramas en el shader. Recuerda que entonces el shader no puede escribir `@builtin(sample_mask)`.
+
+<Callout type="dios" title="El early-z no se activa: se pierde, y la lista de cosas que lo pierden es más larga de lo que parece">
+La idea de que hay una optimización llamada early-z que se puede encender es la fuente de la mayoría de los malentendidos. Lo que hay es un conjunto de optimizaciones —rechazo jerárquico por bloques, prueba temprana, escritura temprana, compresión del buffer de profundidad— que el hardware aplica **mientras nada las invalide**, y que se pierden de forma escalonada y silenciosa.
+
+La lista completa de lo que las invalida, en orden de frecuencia con la que aparece en código real: escribir `frag_depth`; poder ejecutar `discard`; escribir a storage buffers o storage textures desde el fragment shader; usar mezcla con la profundidad todavía escribiéndose; cambiar la función de comparación de profundidad en mitad de una pasada, lo cual en algunas arquitecturas invalida el buffer jerárquico; y dibujar con `depthWriteEnabled` activado geometría transparente que se mezcla.
+
+Lo importante es que **ninguna de esas cosas produce una advertencia**. No hay validación que te avise, no hay contador que lo muestre, y el efecto es un fotograma más lento sin ninguna causa visible. La única forma de detectarlo es medir el tiempo del pase con timestamp queries y compararlo con lo que debería costar.
+
+Y hay una consecuencia de diseño que se deduce de todo esto y que ordena la arquitectura de un renderer: **el orden de dibujado y la separación por tipo de material no son cuestiones de organización del código, son la optimización principal de la etapa de fragmentos**. Opacos primero, ordenados de cerca a lejos, con pipelines que no descartan ni escriben profundidad. Después el alpha test, que descarta pero se beneficia de la profundidad ya escrita. Y al final los transparentes, ordenados de lejos a cerca, sin escribir profundidad.
+
+Ese orden no es una convención heredada: cada uno de los tres grupos existe porque interactúa de forma distinta con las optimizaciones de profundidad del hardware. Mezclarlos, que es lo que hace un renderer que dibuja los objetos en el orden en que están en la escena, cuesta más que cualquier optimización de shader que puedas hacer después.
+</Callout>

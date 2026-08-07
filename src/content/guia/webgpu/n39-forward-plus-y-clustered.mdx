@@ -1,0 +1,240 @@
+---
+title: "Forward+ y clustered: culling de luces por región"
+description: "Partir la pantalla en tiles y el frustum en rebanadas exponenciales, asignar luces a cada cluster en un compute pass, y recorrer solo esa lista desde el fragment shader."
+subject: webgpu
+level: 39
+order: 4
+icon: "39.4"
+duracion: "25 min"
+---
+
+<Lead>
+El [forward puro se rompe](/guia/webgpu/n39-forward-y-el-coste-cuadratico/) porque la granularidad de su culling de luces es el objeto, y el objeto es demasiado grande. El deferred arregla el problema desacoplando la geometría, pero [cobra tres precios](/guia/webgpu/n39-los-problemas-del-deferred/) que en la web duelen especialmente. La tercera vía no renuncia a nada: mantiene el forward y le cambia la granularidad del culling, de "por objeto" a "por región del espacio". Con eso, un fragmento deja de evaluar mil luces para evaluar las diez que de verdad le llegan, y sigues teniendo MSAA, transparencia y materiales libres.
+</Lead>
+
+<Objetivos>
+
+- Construir la lista de luces por tile de un renderer Forward+ y explicar su límite en profundidad.
+- Derivar la partición exponencial del frustum en rebanadas y justificar por qué la lineal desperdicia clusters.
+- Escribir el compute shader que calcula el AABB de cada cluster y le asigna las luces que lo intersecan.
+- Consultar la lista de luces del cluster desde el fragment shader con el par de buffers de rangos e índices.
+
+</Objetivos>
+
+## Forward+: una lista de luces por tile
+
+La idea es de una simplicidad casi ofensiva. Divide la pantalla en tiles de 16x16 píxeles. Antes de dibujar, lanza un compute pass en el que cada workgroup se ocupa de un tile: proyecta cada luz de la escena y comprueba si su esfera de influencia toca el volumen que ese tile barre. Guarda en un buffer la lista de índices de las luces que sí. Después, en la pasada de geometría normal, el fragment shader mira en qué tile cae, lee su lista, y recorre solo esa.
+
+A 1920x1080 con tiles de 16x16 salen 120 tiles horizontales y 68 verticales —1080 no es múltiplo de 16, así que la última fila se queda a medias y se redondea hacia arriba—, en total 8160 tiles. El coste del culling es 8160 tiles por el número de luces: con 1000 luces son 8,16 millones de tests de intersección por fotograma, unos cientos de millones por segundo. Para una GPU eso es trabajo de un par de décimas de milisegundo. A cambio, el bucle del fragment shader baja de 1000 iteraciones a las que realmente tocan ese tile.
+
+El nombre "Forward+" es de 2012 y la técnica se llama también tiled forward shading. Su equivalente diferido, el tiled deferred, es exactamente lo mismo aplicado al pase de sombreado del G-buffer, y de hecho apareció antes.
+
+El límite de la técnica está en la dimensión que no se ha particionado. **Un tile es una columna que atraviesa todo el rango de profundidad**, desde el plano cercano hasta el lejano. Si tu escena va de 0,1 a 1000 metros, cada tile de 16x16 píxeles es una pirámide truncada de casi un kilómetro de largo. Una bombilla a dos metros de la cámara y un farol a quinientos entran los dos en la lista del mismo tile en cuanto sus proyecciones se solapan en pantalla, y todos los fragmentos de ese tile —estén donde estén— evalúan las dos.
+
+El caso patológico es fácil de encontrar: un pasillo visto desde un extremo. Los tiles del centro de la pantalla contienen literalmente todas las luces del pasillo, porque todas se proyectan sobre la misma zona. Es la situación en la que un renderer tiled se comporta como uno forward y no lo entiendes hasta que dibujas un mapa de calor de la longitud de las listas.
+
+Se puede mitigar a medias calculando el mínimo y el máximo de profundidad de cada tile a partir del buffer de profundidad de un prepass, y usando ese rango en lugar del frustum completo. Ayuda mucho en superficies continuas y no ayuda nada en el borde de una silueta, donde el tile abarca a la vez el primer plano y el fondo lejano y el rango vuelve a ser enorme. Es un parche sobre la carencia estructural, que es que falta un eje.
+
+## Clustered: la tercera dimensión
+
+El clustered shading añade el eje que falta: en lugar de una rejilla 2D de columnas infinitas, una rejilla 3D de cajas acotadas. Cada celda —el cluster— es un tile de pantalla recortado entre dos planos de profundidad. Ahora una luz cercana y una lejana caen en clusters distintos y ningún fragmento paga por las dos.
+
+La pregunta interesante es cómo repartir las rebanadas en profundidad. La respuesta ingenua es repartirlas linealmente entre `near` y `far`, y es un desperdicio enorme. Con `near` a 0,1 y `far` a 1000, veinticuatro rebanadas lineales miden 41,7 metros cada una: la primera va de 0,1 a 41,8 metros, es decir, **toda tu escena de interior cabe en la primera rebanada** y las veintitrés restantes se reparten un fondo lejano donde probablemente no hay nada. El culling se degrada al de un tile.
+
+La partición correcta es exponencial, y el motivo es que la perspectiva ya lo es: un objeto a dos metros ocupa el doble de pantalla que el mismo a cuatro, así que la densidad útil de clusters tiene que caer con la distancia igual que cae el tamaño aparente. Se quiere que cada rebanada abarque el mismo factor multiplicativo de profundidad, no la misma diferencia. Con `S` rebanadas, el plano de la rebanada `k` está en:
+
+```text
+z(k) = near · (far / near)^(k / S)
+```
+
+Invirtiendo esa expresión sale la fórmula que va en el shader, que es la que convierte una profundidad de vista en un índice de rebanada:
+
+```text
+slice = floor( log(z) · S / log(far/near)  −  S · log(near) / log(far/near) )
+```
+
+Los dos coeficientes son constantes de la cámara, así que se precalculan y se suben en un uniform: `escalaZ = S / log(far/near)` y `sesgoZ = −S · log(near) / log(far/near)`. En el shader queda un `log`, un multiplicar-y-sumar y un truncado.
+
+Con `near = 0,1`, `far = 1000` y `S = 24`, la primera rebanada va de 0,1 a 0,147 metros y la última de 683 a 1000. Cada una cubre un factor de 1,468 sobre la anterior. La rejilla típica es de **16x9x24 = 3456 clusters**, que a 1080p da tiles de 120x120 píxeles: bastante más gruesos que los 16x16 de Forward+, y aun así el culling es mejor porque la tercera dimensión aporta más que afinar las dos primeras.
+
+<Callout type="dios" title="La rejilla hereda el problema del plano cercano, y casi nadie lo mira">
+El factor que gobierna toda la partición es `log(far/near)`, así que el número que decide la calidad de tu rejilla de clusters no es `far`, es `near` —exactamente el mismo fenómeno que arruina la precisión del buffer de profundidad, y por la misma razón matemática. Haz la cuenta. Con `near = 0,1` y `far = 1000`, `log(far/near)` vale 9,21 y la profundidad de un metro cae en la rebanada `24 · 2,303 / 9,21 = 6`: seis de tus veinticuatro rebanadas viven dentro del primer metro delante de la cámara. Ya es mucho. Ahora baja `near` a 0,01 porque alguien quiso poder acercarse a un objeto pequeño: `log(far/near)` sube a 11,51, y el metro cae ahora en la rebanada 9,6. **Diez de tus veinticuatro rebanadas se han ido a cubrir el primer metro**, y la primera de ellas mide un centímetro y medio. Has perdido el cuarenta por ciento de tu resolución en profundidad en una zona donde raramente hay geometría, y el resto de la escena —de un metro a mil— se apaña con catorce. El síntoma en producción es que el renderer va perfecto en las pruebas de escritorio y se hunde cuando el artista baja `near` para arreglar un recorte, y nadie relaciona una cosa con la otra porque el cambio parecía cosmético. La solución es de una línea y la usan todos los motores serios: **la rejilla de clusters no tiene por qué compartir el plano cercano con la cámara**. Define un `nearClusters` propio, más grande —medio metro, un metro—, mete todo lo que esté por delante en la rebanada cero, y usa ese valor en `escalaZ` y `sesgoZ`. La rebanada cero se queda con más luces de las que le tocarían, pero cubre una fracción minúscula de la pantalla y de la escena, mientras que las veintitrés restantes recuperan el rango donde de verdad está tu geometría. Es gratis, son dos números en un uniform, y arregla un problema que de otro modo aparece disfrazado de otra cosa.
+</Callout>
+
+## Asignar luces a clusters en compute
+
+El trabajo se parte en dos compute passes. El primero calcula la caja envolvente de cada cluster en espacio de vista y solo hace falta rehacerlo cuando cambian la proyección o el tamaño del lienzo. El segundo asigna las luces y se ejecuta cada fotograma.
+
+Para el primero, la clave es que la extensión en `x` de un cluster depende solo de la coordenada `x` del tile y la de `y` solo de la `y`, así que basta con lanzar dos rayos por las esquinas diagonales del tile y evaluarlos en los dos planos de profundidad. Trabajamos en espacio de vista con la cámara mirando hacia `-z` y llamamos `zv` a la profundidad positiva, es decir `zv = -pos.z`:
+
+```wgsl
+struct Rejilla {
+  invProj:     mat4x4f,
+  tamPantalla: vec2f,
+  tamTile:     vec2f,
+  dims:        vec3u,   // 16, 9, 24
+  cerca:       f32,
+  lejos:       f32,
+};
+
+struct AABB { minimo: vec4f, maximo: vec4f };
+
+@group(0) @binding(0) var<uniform> rejilla: Rejilla;
+@group(0) @binding(1) var<storage, read_write> cajas: array<AABB>;
+
+// Pixel de pantalla a una direccion en espacio de vista con la componente z valiendo -1
+fn direccionVista(px: vec2f) -> vec3f {
+  let ndc = px / rejilla.tamPantalla * 2.0 - 1.0;
+  let p   = rejilla.invProj * vec4f(ndc.x, -ndc.y, 0.0, 1.0);   // z = 0 es el plano cercano
+  let v   = p.xyz / p.w;
+  return v / -v.z;
+}
+
+@compute @workgroup_size(16, 9, 1)
+fn construirClusters(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x + rejilla.dims.x * (gid.y + rejilla.dims.y * gid.z);
+
+  let dMin = direccionVista(vec2f(gid.xy) * rejilla.tamTile);
+  let dMax = direccionVista(vec2f(gid.xy + vec2u(1u, 1u)) * rejilla.tamTile);
+
+  // Particion exponencial en profundidad
+  let razon  = rejilla.lejos / rejilla.cerca;
+  let zCerca = rejilla.cerca * pow(razon, f32(gid.z)       / f32(rejilla.dims.z));
+  let zLejos = rejilla.cerca * pow(razon, f32(gid.z + 1u)  / f32(rejilla.dims.z));
+
+  let a = dMin * zCerca;   let b = dMin * zLejos;
+  let c = dMax * zCerca;   let d = dMax * zLejos;
+
+  cajas[idx] = AABB(
+    vec4f(min(min(a, b), min(c, d)), 0.0),
+    vec4f(max(max(a, b), max(c, d)), 0.0),
+  );
+}
+```
+
+Un `@workgroup_size(16, 9, 1)` son 144 invocaciones, cómodamente por debajo del máximo de 256 que garantiza `maxComputeInvocationsPerWorkgroup`, y con `dispatchWorkgroups(1, 1, 24)` cubres los 3456 clusters exactos sin invocaciones sobrantes ni comprobación de límites.
+
+El segundo pase recorre las luces. El test es esfera contra AABB, y es de una elegancia que merece la pena entender: la distancia de un punto a una caja alineada es la distancia de ese punto a su propia proyección recortada dentro de la caja. Un `clamp` y un producto escalar.
+
+```wgsl
+struct Luz { posicionVista: vec4f, color: vec4f };   // w de posicionVista = radio
+
+@group(0) @binding(2) var<storage, read>       luces:   array<Luz>;
+@group(0) @binding(3) var<storage, read_write> rangos:  array<vec2u>;   // desplazamiento, cuenta
+@group(0) @binding(4) var<storage, read_write> indices: array<u32>;
+@group(0) @binding(5) var<storage, read_write> cursor:  atomic<u32>;
+
+fn distanciaCuadradaAABB(p: vec3f, mn: vec3f, mx: vec3f) -> f32 {
+  let q = clamp(p, mn, mx);
+  let d = p - q;
+  return dot(d, d);
+}
+
+@compute @workgroup_size(16, 9, 1)
+fn asignarLuces(@builtin(global_invocation_id) gid: vec3u) {
+  let idx  = gid.x + rejilla.dims.x * (gid.y + rejilla.dims.y * gid.z);
+  let caja = cajas[idx];
+  let n    = arrayLength(&luces);
+
+  // Primera vuelta: contar, para reservar sitio de una sola vez
+  var cuenta = 0u;
+  for (var i = 0u; i < n; i = i + 1u) {
+    let l = luces[i];
+    if (distanciaCuadradaAABB(l.posicionVista.xyz, caja.minimo.xyz, caja.maximo.xyz)
+        <= l.posicionVista.w * l.posicionVista.w) {
+      cuenta = cuenta + 1u;
+    }
+  }
+
+  let base = atomicAdd(&cursor, cuenta);
+
+  // Segunda vuelta: escribir en el hueco reservado
+  var k = 0u;
+  for (var i = 0u; i < n && k < cuenta; i = i + 1u) {
+    let l = luces[i];
+    if (distanciaCuadradaAABB(l.posicionVista.xyz, caja.minimo.xyz, caja.maximo.xyz)
+        <= l.posicionVista.w * l.posicionVista.w) {
+      indices[base + k] = i;
+      k = k + 1u;
+    }
+  }
+
+  rangos[idx] = vec2u(base, cuenta);
+}
+```
+
+Recorrer las luces dos veces parece un desperdicio y no lo es. La alternativa —acumular los índices en un array local y volcarlo al final— necesitaría un `array<u32, N>` en el espacio de direcciones de función, con `N` igual al máximo de luces por cluster; a 128 elementos por invocación y 144 invocaciones por workgroup, eso son registros que ninguna GPU tiene y acabaría desbordando a memoria de scratch, destrozando la ocupación. La segunda pasada cuesta un `clamp` y un producto escalar por luz, que es de las cosas más baratas que puede hacer una GPU. Y `atomicAdd` se llama exactamente una vez por cluster en vez de una vez por luz aceptada, que era el otro motivo para hacerlo así.
+
+El `cursor` hay que ponerlo a cero cada fotograma antes del dispatch, con `encoder.clearBuffer(bufferCursor)` o escribiendo un cero con `queue.writeBuffer`. Es el fallo de un fotograma que se manifiesta como que las listas crecen sin parar hasta desbordar el buffer.
+
+Sobre memoria: con 1000 luces, una rejilla de 3456 clusters y un tope de 100 luces por cluster, el array plano de índices son 345 600 valores de 32 bits, es decir 1,38 MB, y el de rangos 3456 por 8 bytes, 27,6 KB. Los dos caben con muchísimo margen en los 128 MiB de `maxStorageBufferBindingSize`. Y el pase completo son 3456 clusters por 1000 luces por dos vueltas, 6,9 millones de tests por fotograma: 415 millones por segundo a 60 fps, frente a los 622 millones de **evaluaciones completas de luz** por fotograma del forward ingenuo. No es que sea más barato: es que estás comparando un `clamp` con una BRDF entera.
+
+## Consultar el cluster desde el fragment shader
+
+El lado del consumo es la parte corta, y es donde se ve que el clustered es forward de verdad: el shader sigue siendo un fragment shader normal con su bucle de luces, solo que el bucle es sobre un rango.
+
+```wgsl
+@group(1) @binding(0) var<storage, read> luces:   array<Luz>;
+@group(1) @binding(1) var<storage, read> rangos:  array<vec2u>;
+@group(1) @binding(2) var<storage, read> indices: array<u32>;
+@group(1) @binding(3) var<uniform>       u:       ParametrosCluster;
+// u contiene tamTile: vec2f, dims: vec3u, escalaZ: f32, sesgoZ: f32
+
+fn indiceDeCluster(posPantalla: vec2f, zVista: f32) -> u32 {
+  let tile = vec2u(posPantalla / u.tamTile);
+  let s    = u32(clamp(log(zVista) * u.escalaZ + u.sesgoZ,
+                       0.0, f32(u.dims.z - 1u)));
+  return tile.x + u.dims.x * (tile.y + u.dims.y * s);
+}
+
+@fragment
+fn fs_pbr(e: Varyings) -> @location(0) vec4f {
+  let zVista = -e.posVista.z;                        // profundidad positiva
+  let rango  = rangos[indiceDeCluster(e.posicion.xy, zVista)];
+
+  let n = normalize(e.normalMundo);
+  let v = normalize(camara.posicion - e.posMundo);
+  var acumulado = vec3f(0.0);
+
+  for (var i = 0u; i < rango.y; i = i + 1u) {
+    let luz = luces[indices[rango.x + i]];
+    acumulado = acumulado + contribucion(luz, e.posMundo, n, v);
+  }
+
+  return vec4f(acumulado, 1.0);
+}
+```
+
+`e.posicion` es el `@builtin(position)`, que en el fragment shader llega ya en coordenadas de framebuffer en píxeles, así que dividir por el tamaño del tile da directamente el índice del tile sin más conversiones. El `clamp` de la rebanada no es defensivo por gusto: los fragmentos exactamente en el plano lejano, y los transparentes que dibujes con una proyección ligeramente distinta, pueden caerse un índice por arriba.
+
+Cuenta los recursos: el fragment stage consume tres storage buffers y un uniform. `maxStorageBuffersPerShaderStage` son 8 por defecto, así que hay margen, pero es margen que se gasta rápido en cuanto añades datos de sombras o de sondas de iluminación. Y con `maxBindGroups` en 4, la disciplina de agrupar por frecuencia de cambio —grupo 0 para lo que cambia por fotograma, grupo 1 para lo de la iluminación, grupo 2 para el material, grupo 3 para el objeto— deja de ser una recomendación y pasa a ser obligatoria.
+
+Los números finales son los que justifican todo el aparato. Con 1000 luces puntuales repartidas por una escena de interior y una rejilla de 16x9x24, la longitud típica de la lista de un cluster está **entre 2 y 20**, con picos en los clusters cercanos a un grupo denso de luces. El fragment shader pasa de mil iteraciones a diez: dos órdenes de magnitud, sin G-buffer, sin renunciar al MSAA, sin una segunda ruta de material para los transparentes y con medio megabyte de tráfico de memoria en vez de seis gigabytes por segundo.
+
+La arquitectura completa queda así:
+
+<Mermaid code={`flowchart TB
+  A[Camara y rejilla 16x9x24] --> B[Compute construir AABB de cada cluster]
+  B --> C[Buffer de AABB por cluster]
+  D[Luces de la escena en espacio de vista] --> E[Compute asignar luces a clusters]
+  C --> E
+  E --> F[Buffer de rangos desplazamiento y cuenta]
+  E --> G[Buffer plano de indices de luz]
+  H[Pasada de profundidad] --> I[Pasada de sombreado forward]
+  F --> I
+  G --> I
+  I --> J[Transparentes ordenados de atras a delante]
+  J --> K[Post proceso y mapeo de tonos]
+  style A fill:#cba6f7,color:#11111b
+  style D fill:#cba6f7,color:#11111b
+  style B fill:#fab387,color:#11111b
+  style E fill:#fab387,color:#11111b
+  style C fill:#94e2d5,color:#11111b
+  style F fill:#94e2d5,color:#11111b
+  style G fill:#94e2d5,color:#11111b
+  style H fill:#89b4fa,color:#11111b
+  style I fill:#89b4fa,color:#11111b
+  style J fill:#f9e2af,color:#11111b
+  style K fill:#a6e3a1,color:#11111b`} />
+
+Los dos compute passes van al principio del `GPUCommandEncoder` del fotograma, antes de abrir ningún render pass. La construcción de los AABB se puede saltar en la mayoría de los fotogramas: solo depende de la matriz de proyección y del tamaño del lienzo, así que basta con reconstruirla cuando alguno de los dos cambia. La asignación de luces, en cambio, va cada fotograma, porque las posiciones de las luces en espacio de vista cambian con la cámara.

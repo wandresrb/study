@@ -1,0 +1,179 @@
+---
+title: "Error scopes: acotar el fallo en un API que casi nunca lanza"
+description: "Por qué WebGPU devuelve objetos inválidos en lugar de lanzar excepciones, los tres filtros de pushErrorScope, cómo se apilan los scopes y el ayudante que impide dejarse uno abierto."
+subject: webgpu
+level: 44
+order: 1
+icon: "44.1"
+duracion: "20 min"
+---
+
+<Lead>
+Escribes un descriptor mal, ejecutas, y no pasa nada: ninguna excepción, ninguna traza, ningún valor nulo. Lo que recibes es un `GPUBuffer` de aspecto perfectamente normal que por dentro está inválido, y el síntoma aparecerá más tarde, en otro sitio y casi siempre en forma de pantalla negra. Los error scopes son el mecanismo que la especificación te da para preguntar «¿ha ido bien esto que acabo de hacer?» dentro de un API diseñado deliberadamente para no contestar esa pregunta de forma síncrona. Entenderlos es la diferencia entre acotar un fallo en dos minutos o en dos horas.
+</Lead>
+
+<Objetivos>
+
+- Explicar por qué WebGPU marca objetos como inválidos en vez de lanzar excepciones.
+- Distinguir los tres filtros de `pushErrorScope` y el tipo de error que captura cada uno.
+- Predecir qué scope captura un error concreto cuando hay varios anidados.
+- Escribir un ayudante que garantice que cada `push` tiene su `pop` aunque el código intermedio lance.
+
+</Objetivos>
+
+## Un API que decidió no lanzar
+
+Llama a `device.createBuffer` con un descriptor imposible —un tamaño que no es múltiplo de cuatro, un `usage` que combina `MAP_READ` con `MAP_WRITE`— y la llamada devuelve un objeto. No `null`, no una excepción: un `GPUBuffer` con su `label`, su `size` y su `usage`. Ese objeto está **inválido**, y la invalidez es contagiosa: cualquier operación que lo use genera a su vez un error de validación y produce, si produce algo, otro objeto inválido. Un bind group construido sobre un buffer inválido nace inválido; un pipeline con un módulo de shader inválido nace inválido; un command buffer que referencia cualquiera de los dos nace inválido y su `submit` no dibuja nada.
+
+La razón de este diseño no es estética. La implementación de WebGPU no vive en tu proceso. En Chrome, tu JavaScript corre en el proceso de renderizado y Dawn corre en el proceso de GPU; en Firefox, wgpu también vive fuera. Entre ambos hay un canal de comandos asíncrono, y ese canal es lo que permite que grabar mil llamadas de dibujo cueste lo que cuesta escribir mil registros en un búfer de comandos en lugar de mil viajes de ida y vuelta entre procesos. Si `createBuffer` tuviera que lanzar una excepción cuando el descriptor es inválido, tendría que conocer el veredicto **antes de retornar**, y eso significa bloquear el hilo hasta que el proceso de GPU conteste. Una sola llamada así por fotograma ya te cuesta milisegundos; una por recurso te destruye el arranque.
+
+Así que la especificación separó los dos canales. Las llamadas retornan siempre, inmediatamente y sin bloquear; los errores viajan por su cuenta y llegan cuando llegan. Lo único que sigue lanzando de forma síncrona es lo que cualquier binding de Web IDL rechaza antes de tocar la GPU: un `TypeError` cuando pasas un número donde va un objeto, o cuando falta un miembro obligatorio del diccionario. Eso no es validación de WebGPU, es el traductor de tipos del navegador diciéndote que la llamada ni siquiera se ha hecho.
+
+## Los tres filtros y la pila
+
+`device.pushErrorScope(filtro)` abre una región de captura. El filtro es una cadena y solo hay tres valores posibles:
+
+| Filtro | Tipo capturado | Qué significa |
+|---|---|---|
+| `"validation"` | `GPUValidationError` | Has usado el API mal. Es tuyo, es determinista y es el 95% de lo que verás |
+| `"out-of-memory"` | `GPUOutOfMemoryError` | La asignación era legal pero no cabía. Depende del dispositivo y del momento |
+| `"internal"` | `GPUInternalError` | La operación era válida pero la implementación no pudo ejecutarla. Un shader que el compilador nativo rechaza, un límite del backend que WebGPU no expone |
+
+Los tres tipos derivan de `GPUError` y comparten una única propiedad útil, `message`, con el texto de diagnóstico. No hay códigos, no hay clases de error dentro de cada familia, no hay pila de llamadas. El texto es todo lo que hay, y por eso la lección de [las etiquetas](/guia/webgpu/n44-las-etiquetas-lo-cambian-todo/) importa tanto como esta.
+
+`device.popErrorScope()` cierra la región y devuelve una promesa que resuelve al **primer** error capturado, o a `null` si no hubo ninguno. Fíjate bien en «primer»: si dentro del scope se generan cinco errores, la promesa resuelve al primero y los otros cuatro se descartan sin dejar rastro. Un scope no es un recolector de errores, es un detector con memoria de uno. Esto está pensado a propósito para que la implementación no tenga que retener listas ilimitadas, y tiene una consecuencia práctica: si envuelves demasiado código en un solo scope, obtienes la causa raíz pero pierdes el resto; si lo envuelves en scopes estrechos, obtienes el detalle pero pagas una promesa por cada uno.
+
+Los scopes se apilan por dispositivo. Cuando se genera un error, la implementación recorre la pila desde el más interno hacia el más externo buscando el primero cuyo filtro coincida con el tipo del error. Ese lo captura; si ya tenía uno guardado, lo descarta. Un scope de `"validation"` **no** intercepta un `GPUOutOfMemoryError`: lo deja pasar hacia arriba. Y si ningún scope de la pila coincide, el error sale del sistema de scopes y acaba en el evento `uncapturederror`, que es la red de seguridad que cubre [el dispositivo entero](/guia/webgpu/n44-device-lost-y-uncapturederror/).
+
+Dos detalles de comportamiento que muerden. El primero: hacer `pop` sin un `push` correspondiente no devuelve `null`, **rechaza** la promesa. Si tu código de limpieza hace pops de más y no capturas el rechazo, te aparece un `unhandled rejection` que no tiene nada que ver con la GPU. El segundo: sobre un dispositivo perdido, `popErrorScope()` resuelve a `null` en lugar de contarte nada, lo que significa que un dispositivo muerto se parece exactamente a un dispositivo donde todo va bien.
+
+## Los dos patrones que se usan de verdad
+
+El primero es el único caso donde `"out-of-memory"` gana algo: una asignación grande con plan B. Pedir una textura de 4096 por 4096 en formato de profundidad son 64 MB si es de 32 bits, y en una integrada con memoria compartida bajo presión esa petición es legal y puede fallar igualmente. La única forma de saberlo es preguntar.
+
+```ts
+async function crearMapaDeSombras(
+  device: GPUDevice,
+  lado: number,
+): Promise<GPUTexture | null> {
+  device.pushErrorScope("out-of-memory");
+
+  const textura = device.createTexture({
+    label: `sombras-${lado}x${lado}`,
+    size: [lado, lado],
+    format: "depth32float",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+  });
+
+  const error = await device.popErrorScope();
+  if (error) {
+    textura.destroy();
+    return null;
+  }
+  return textura;
+}
+
+// Degradar hasta que quepa, en vez de morir con pantalla negra.
+async function mapaDeSombrasDisponible(device: GPUDevice): Promise<GPUTexture> {
+  for (const lado of [4096, 2048, 1024]) {
+    const t = await crearMapaDeSombras(device, lado);
+    if (t) return t;
+    console.warn(`[webgpu] no cabe un mapa de sombras de ${lado}, bajando`);
+  }
+  throw new Error("ni siquiera cabe un mapa de sombras de 1024");
+}
+```
+
+Fíjate en que llamamos a `destroy()` sobre la textura inválida. No es imprescindible —un objeto inválido no reserva memoria— pero mantiene la simetría del código y evita que alguien la use por descuido.
+
+El segundo patrón es de desarrollo puro: envolver el fotograma entero en un scope de `"validation"` y volcarlo a consola. Con esto, cualquier error que introduzcas mientras trabajas aparece en el fotograma en el que lo introdujiste, no tres minutos después cuando notas que algo no se dibuja.
+
+```ts
+const DEPURAR = import.meta.env.DEV;
+
+function fotograma() {
+  if (DEPURAR) device.pushErrorScope("validation");
+
+  const encoder = device.createCommandEncoder({ label: "fotograma" });
+  grabarEscena(encoder);
+  device.queue.submit([encoder.finish()]);
+
+  if (DEPURAR) {
+    // Sin await: esperar aquí bloquearía el bucle contra el proceso de GPU.
+    device.popErrorScope().then((error) => {
+      if (error) console.error("[webgpu] validación:", error.message);
+    });
+  }
+
+  requestAnimationFrame(fotograma);
+}
+```
+
+Ese `.then` en lugar de `await` no es un capricho de estilo. `popErrorScope()` no resuelve hasta que el proceso de GPU ha procesado todo lo encolado dentro del scope, así que esperarlo dentro del bucle de fotogramas sincroniza la CPU con la GPU y te hunde la tasa de refresco justo mientras intentas medir. Deja la promesa suelta y que reporte cuando pueda.
+
+Hay una trampa relacionada con la asincronía que conviene ver antes de sufrirla: **un `await` entre el `push` y el `pop` deja la puerta abierta**. Mientras esperas, el bucle de eventos ejecuta otro código —otro `requestAnimationFrame`, un `then` de una carga de texturas— y todas las llamadas a WebGPU que ese código haga caen dentro de tu scope. El resultado es un mensaje de error que señala a un recurso que tu función ni conoce. Si necesitas esperar algo en medio, cierra el scope antes y abre otro después.
+
+## Cada push necesita su pop
+
+La pila de scopes es estado global del dispositivo, y como todo estado global se corrompe cuando una excepción salta por encima del código de limpieza. El escenario clásico: abres un scope, llamas a una función de creación de recursos, esa función lanza un `TypeError` porque el descriptor venía de un JSON mal parseado, y tu `pop` nunca se ejecuta. A partir de ese momento tienes un scope de `"validation"` abierto para siempre, que se traga en silencio todos los errores de validación del resto de la aplicación. El síntoma es demoledor: `uncapturederror` deja de dispararse y la consola se queda muda mientras la pantalla está en negro.
+
+La regla es simple y no admite excepciones: **cada `push` necesita su `pop`, incluso en el camino de error**. En la práctica eso significa `try` con `finally`, o mejor, un ayudante que lo encapsule para que no dependa de que te acuerdes.
+
+```ts
+interface Resultado<T> {
+  valor: T | null;
+  error: GPUError | null;
+}
+
+async function conScope<T>(
+  device: GPUDevice,
+  filtro: GPUErrorFilter,
+  fn: () => T,
+): Promise<Resultado<T>> {
+  device.pushErrorScope(filtro);
+
+  let valor: T | null = null;
+  let lanzado: unknown = null;
+  try {
+    valor = fn();
+  } catch (e) {
+    lanzado = e;
+  }
+
+  // Se emite pase lo que pase: la pila queda equilibrada siempre.
+  const error = await device.popErrorScope();
+
+  if (lanzado !== null) throw lanzado;
+  return { valor, error };
+}
+```
+
+Con eso, comprobar una creación concreta cuesta una línea y no puede desequilibrar la pila:
+
+```ts
+const { valor: pipeline, error } = await conScope(device, "validation", () =>
+  device.createRenderPipeline(descriptor),
+);
+
+if (error) {
+  throw new Error(`pipeline "${descriptor.label}" inválido: ${error.message}`);
+}
+```
+
+Y anidar es trivial, porque cada nivel se cierra solo. Envuelve la creación de un recurso caro en un scope de `"out-of-memory"` dentro de un scope de `"validation"` que cubre toda la fase de arranque: el error de memoria lo captura el interno, cualquier descriptor mal escrito lo captura el externo, y ninguno se come al otro porque los filtros no coinciden.
+
+<Callout type="warn" title="No dejes los scopes de depuración activos en producción">
+Cada par `push`/`pop` obliga a la implementación a rastrear el origen de cada error y a resolver una promesa que cruza el límite entre procesos. Con un scope por fotograma el coste es despreciable; con un scope por llamada de creación en un cargador que crea miles de recursos, no lo es. Enciéndelos con una bandera de compilación, no con una constante que se te olvide cambiar.
+</Callout>
+
+<Callout type="dios" title="El error del draw no aparece en el draw, y por eso tus scopes estrechos no capturan nada">
+Aquí está el detalle que hace que la mitad de la gente concluya que los error scopes «no funcionan». Los comandos que grabas en un `GPUCommandEncoder` —`setPipeline`, `setBindGroup`, `draw`, `dispatchWorkgroups`— **no generan un error de validación en el momento de la llamada**. Lo que hacen es marcar el encoder como inválido y seguir. El error de validación se genera cuando llamas a `encoder.finish()`, y se atribuye a esa llamada, no a la línea culpable. Así que si envuelves solo el `draw` con un scope, `popErrorScope()` resuelve a `null` y tú deduces que el `draw` está bien, cuando lo que ocurre es que el veredicto todavía no se ha emitido. Lo mismo ocurre un escalón más arriba: un command buffer inválido no se queja al construirse, se queja en `queue.submit()`. La razón de este diseño es que el encoder es precisamente el sitio donde WebGPU acumula trabajo para no cruzar el límite entre procesos por cada comando, y validar comando a comando anularía todo el beneficio. La consecuencia práctica es una regla de granularidad que conviene interiorizar: **en el camino de comandos, la unidad mínima útil para un scope es "desde antes de crear el encoder hasta después del submit"**; cualquier scope más estrecho que eso es ruido. Los scopes finos solo pagan en el camino de creación de recursos —buffers, texturas, bind groups, pipelines—, donde cada llamada sí emite su veredicto por separado. Y cuando el mensaje de `finish()` te llegue diciendo que el encoder es inválido sin decirte en qué comando, la única forma de localizarlo es que cada objeto lleve su etiqueta y que hayas agrupado los comandos con `pushDebugGroup`.
+</Callout>
+
+<Reto title="Rompe la pila a propósito">
+1. Abre un scope de `"validation"`, crea un buffer con `size: 3` y comprueba que el mensaje menciona la alineación de cuatro bytes.
+2. Anida un scope de `"out-of-memory"` dentro de uno de `"validation"`, provoca un error de validación dentro del interno y verifica cuál de los dos lo captura.
+3. Provoca dos errores distintos dentro del mismo scope y confirma que solo recibes el primero.
+4. Llama a `popErrorScope()` sin `push` y observa el rechazo.
+5. Envuelve un `draw` con un bind group incompatible en un scope que se cierre antes de `finish()` y comprueba que resuelve a `null`.
+</Reto>

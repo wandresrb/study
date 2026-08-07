@@ -1,0 +1,202 @@
+---
+title: "Renderizar desde el mismo buffer que simula"
+description: "Leer el storage buffer de partículas directamente desde el vertex shader, construir billboards por instancia, y dibujar con el conteo que produjo la GPU."
+subject: webgpu
+level: 35
+order: 4
+icon: "35.4"
+duracion: "20 min"
+---
+
+<Lead>
+Este es el patrón que justifica todo el nivel. El compute shader escribe las posiciones en un storage buffer; el vertex shader lee ese mismo buffer sin que un solo byte pase por la CPU, sin copias, sin vertex buffers, sin `writeBuffer` por frame. Con WebGL había que hacer transform feedback o codificar el estado en texturas de coma flotante y leerlas desde el vértice; aquí es una línea de declaración. Y el mismo mecanismo permite que el número de partículas que se dibujan lo decida un kernel, no JavaScript.
+</Lead>
+
+<Objetivos>
+
+- Enlazar un storage buffer de solo lectura en la etapa de vértices.
+- Construir un billboard orientado a cámara a partir de `vertex_index` e `instance_index`.
+- Configurar la mezcla aditiva y la profundidad para partículas.
+- Dibujar con `drawIndirect` usando un conteo calculado en la GPU.
+
+</Objetivos>
+
+## Storage buffer en la etapa de vértices
+
+Un `var<storage, read>` se puede declarar visible en la etapa de vértices. Un `var<storage, read_write>` **no**: WebGPU prohíbe los recursos de almacenamiento escribibles en la etapa de vértices, y el error de validación aparece al crear el bind group layout. Es una restricción de la especificación y no hay forma de rodearla, ni falta, porque el vertex shader no tiene nada que escribir.
+
+```js
+const bglRender = device.createBindGroupLayout({ entries: [
+  { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+    buffer: { type: 'uniform' } },
+  { binding: 1, visibility: GPUShaderStage.VERTEX,
+    buffer: { type: 'read-only-storage' } },      // el mismo bufParticulas
+]});
+```
+
+El buffer no necesita el uso `VERTEX`. Ese flag hace falta solo para enlazarlo con `setVertexBuffer`, que es el camino clásico de atributos. Aquí se enlaza como recurso de un bind group, así que con `STORAGE` basta. Si vas a usar los dos caminos, entonces sí pones los dos flags.
+
+## El billboard por instancia
+
+Sin vertex buffers, la geometría se genera en el propio shader. Se dibujan seis vértices por instancia —dos triángulos— y las esquinas del cuadrado salen de una tabla constante indexada por `vertex_index`. La posición de la partícula sale del storage buffer indexado por `instance_index`.
+
+```wgsl
+struct Camara {
+  vistaProyeccion: mat4x4f,
+  derecha: vec3f,          // eje X de la camara en espacio mundo
+  _r0: f32,
+  arriba: vec3f,           // eje Y de la camara en espacio mundo
+  _r1: f32,
+};
+@group(0) @binding(0) var<uniform> cam: Camara;
+
+struct Particula { pos: vec3f, vida: f32, vel: vec3f, masa: f32 };
+@group(0) @binding(1) var<storage, read> parts: array<Particula>;
+
+struct Salida {
+  @builtin(position) clip: vec4f,
+  @location(0) uv: vec2f,
+  @location(1) intensidad: f32,
+};
+
+@vertex
+fn vs(@builtin(vertex_index)   vi: u32,
+      @builtin(instance_index) ii: u32) -> Salida {
+  // Declarada como var de funcion: se puede indexar con un valor
+  // que no es constante sin depender de extensiones del compilador.
+  var esquinas = array<vec2f, 6>(
+    vec2f(-1.0, -1.0), vec2f( 1.0, -1.0), vec2f(-1.0,  1.0),
+    vec2f(-1.0,  1.0), vec2f( 1.0, -1.0), vec2f( 1.0,  1.0),
+  );
+
+  let q = parts[ii];
+  let e = esquinas[vi];
+
+  // El tamano se apaga con la vida: las particulas mueren encogiendo.
+  let vida = clamp(q.vida, 0.0, 1.0);
+  let tam = 0.06 * vida;
+
+  // Billboard: desplazar en los ejes de la camara, no en los del mundo.
+  let mundo = q.pos + cam.derecha * (e.x * tam) + cam.arriba * (e.y * tam);
+
+  var s: Salida;
+  s.clip = cam.vistaProyeccion * vec4f(mundo, 1.0);
+  s.uv = e;
+  s.intensidad = vida;
+  return s;
+}
+
+@fragment
+fn fs(en: Salida) -> @location(0) vec4f {
+  // Disco con caida suave: descartar fuera del circulo evita el cuadrado.
+  let r2 = dot(en.uv, en.uv);
+  if (r2 > 1.0) { discard; }
+  let alfa = (1.0 - r2) * (1.0 - r2) * en.intensidad;
+  return vec4f(vec3f(1.0, 0.65, 0.25) * alfa, alfa);
+}
+```
+
+Los ejes `derecha` y `arriba` de la cámara son las dos primeras filas de la matriz de vista, y se calculan una vez por frame en la CPU. Multiplicar la esquina por ellos es lo que hace que el cuadrado esté siempre de frente sin necesidad de una matriz por partícula.
+
+Hay una alternativa que parece más simple y casi nunca lo es: la topología `'point-list'`. WebGPU la admite, pero **WGSL no tiene ningún builtin de tamaño de punto**, así que cada punto ocupa exactamente un píxel. Sirve para depurar y para nubes de puntos densas vistas de lejos, y no sirve para nada que necesite tamaño, textura o caída suave. El billboard de seis vértices es el camino real.
+
+## Mezcla y profundidad
+
+Las partículas luminosas se dibujan con **mezcla aditiva** y sin escritura de profundidad. Aditiva porque la luz se suma y el orden deja de importar, lo cual evita tener que ordenar por profundidad. Sin escritura de profundidad porque si una partícula escribiera su `z`, taparía a las que están detrás y el efecto de acumulación desaparecería. La **comparación** de profundidad sí se mantiene, para que la geometría opaca de la escena las oculte correctamente.
+
+```js
+const pipelineRender = device.createRenderPipeline({
+  layout: device.createPipelineLayout({ bindGroupLayouts: [bglRender] }),
+  vertex:   { module, entryPoint: 'vs' },
+  fragment: { module, entryPoint: 'fs', targets: [{
+    format: formatoCanvas,
+    blend: {
+      color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+      alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+    },
+  }]},
+  primitive: { topology: 'triangle-list', cullMode: 'none' },
+  depthStencil: {
+    format: 'depth24plus',
+    depthWriteEnabled: false,       // no tapar a las de detras
+    depthCompare: 'less',           // pero si dejarse tapar por la escena
+  },
+});
+```
+
+Con `cullMode: 'none'` no hay que preocuparse del orden de los vértices del cuadrado. Y el `discard` del fragment shader tiene un coste que conviene conocer: desactiva la prueba de profundidad temprana en muchos hardware. Para partículas sin escritura de profundidad eso importa poco, pero si alguna vez las dibujas opacas, sustituye el `discard` por multiplicar el alfa por cero.
+
+## El frame completo
+
+Cómputo y render en el mismo encoder, con la barrera implícita entre passes haciendo todo el trabajo de sincronización.
+
+```js
+function frame() {
+  const enc = device.createCommandEncoder();
+
+  const cp = enc.beginComputePass();
+  cp.setPipeline(pipeIntegrar);
+  cp.setBindGroup(0, bgSim);
+  cp.dispatchWorkgroups(Math.ceil(N / 64));
+  cp.end();
+
+  const rp = enc.beginRenderPass({
+    colorAttachments: [{
+      view: contexto.getCurrentTexture().createView(),
+      loadOp: 'clear', storeOp: 'store',
+      clearValue: { r: 0.02, g: 0.02, b: 0.04, a: 1 },
+    }],
+    depthStencilAttachment: {
+      view: vistaProfundidad,
+      depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1.0,
+    },
+  });
+  rp.setPipeline(pipelineRender);
+  rp.setBindGroup(0, bgRender);      // el MISMO buffer que acaba de escribir
+  rp.draw(6, N);                     // 6 vertices, N instancias
+  rp.end();
+
+  device.queue.submit([enc.finish()]);
+  requestAnimationFrame(frame);
+}
+```
+
+Ni una copia, ni una lectura de vuelta, ni un `writeBuffer` con datos de partículas. Lo único que sube por el bus cada frame son los sesenta y pico bytes del uniform de cámara.
+
+### Dibujar el conteo que decidió la GPU
+
+Cuando el número de partículas vivas lo calcula un kernel, `draw(6, N)` obliga a conocer `N` en JavaScript, y traerlo cuesta un frame de latencia. `drawIndirect` lo evita: lee los cuatro argumentos de un buffer.
+
+```js
+// [vertexCount, instanceCount, firstVertex, firstInstance]
+const bufIndirecto = device.createBuffer({
+  size: 16,
+  usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE
+       | GPUBufferUsage.COPY_DST,
+});
+device.queue.writeBuffer(bufIndirecto, 0, new Uint32Array([6, 0, 0, 0]));
+```
+
+```wgsl
+// Un kernel escribe instanceCount, que es la palabra de indice 1.
+struct ArgsDibujo { vertices: u32, instancias: u32, primerV: u32, primerI: u32 };
+struct Contadores { vivas: atomic<u32>, libres: atomic<u32> };
+
+@group(0) @binding(2) var<storage, read_write> cont: Contadores;
+@group(0) @binding(3) var<storage, read_write> args: ArgsDibujo;
+
+@compute @workgroup_size(1)
+fn fijarConteo() {
+  args.instancias = atomicLoad(&cont.vivas);
+}
+```
+
+```js
+rp.drawIndirect(bufIndirecto, 0);
+```
+
+El buffer necesita a la vez `INDIRECT` para que `drawIndirect` lo lea y `STORAGE` para que el compute shader lo escriba. Es la misma idea del dispatch indirecto y la base del [reciclado con contadores atómicos](/guia/webgpu/n35-emision-y-reciclado-con-atomicos/).
+
+<Callout type="dios" title="Dibujar el buffer entero con las muertas invisibles suele ganar a compactar, y el motivo esta en el rasterizador">
+El instinto al ver un pool de un millón de ranuras con doscientas mil partículas vivas es compactar antes de dibujar, para no gastar ochocientas mil instancias en nada. La cuenta que casi nadie hace es cuánto cuesta realmente una instancia que no produce píxeles. El vertex shader se ejecuta seis veces, lee 32 bytes, calcula un billboard degenerado —con tamaño cero si la vida es cero— y el rasterizador descarta un triángulo de área nula sin generar un solo fragmento. Son unos pocos nanosegundos y, sobre todo, **cero trabajo de fragmento**, que es donde se va el tiempo en un sistema de partículas con mezcla aditiva y solape alto. Compactar, en cambio, cuesta un scan de un millón de elementos y una dispersión de 32 megabytes: bastante más que las ochocientas mil instancias vacías. La regla que sale de ahí es que compactar solo compensa cuando la fracción de vivas es muy baja de forma sostenida, digamos por debajo del cinco por ciento, o cuando el pool es tan grande que el propio recorrido del vertex shader se nota. Hay un tercer caso en el que sí compensa siempre, y es cuando lo que quieres no es dibujar sino **simular**: si el kernel de integración recorre un millón de ranuras para mover doscientas mil partículas, ahí sí estás pagando cinco veces de más en un kernel limitado por memoria, y la compactación se amortiza en un frame. Lo cual lleva a una arquitectura que se ve poco y funciona muy bien: compactar el array de simulación de vez en cuando, no cada frame, y dibujar siempre el pool entero con las muertas encogidas a tamaño cero.
+</Callout>
