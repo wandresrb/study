@@ -3,6 +3,8 @@ import { defineConfig, fontProviders } from 'astro/config';
 import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 
+import solidJs from '@astrojs/solid-js';
+
 // Transformer de Shiki (nativo) para exponer el `title="archivo"` de los
 // bloques de código como atributo data-title, que la CSS pinta como "chip".
 // Es best-effort: si el meta no está disponible, simplemente no se muestra.
@@ -90,5 +92,5 @@ export default defineConfig({
       transformers: [fileTitleTransformer],
     },
   },
-  integrations: [mdx(), sitemap()],
+  integrations: [mdx(), sitemap(), solidJs()],
 });

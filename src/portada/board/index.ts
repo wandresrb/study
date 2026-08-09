@@ -12,14 +12,14 @@
 // —cuánto se apaga una, cuánto entra la otra, dónde aterriza cada una— y el
 // relevo se notaba. Aquí no hay nada que sincronizar.
 //
-// La barra tampoco es geometría 3D: es una pasada ortográfica en píxeles con
-// una textura pintada a mano (`barra.ts`). Plana de verdad, no un objeto sin
-// perspectiva.
+// La PILA ya no se dibuja aquí. Pasó a ser DOM porque es la navegación del
+// sitio, y una textura en un lienzo no recibe foco con Tab, no se anuncia a un
+// lector de pantalla y no tiene área de pulsación. Eso no es cuestión de
+// estilo: es el suelo de accesibilidad de cualquier control.
 
 import gsap from 'gsap';
 
 import type { Escena } from '../escena';
-import { barra } from './barra';
 import { construir } from './placa';
 import { motor } from './render';
 import { rig } from './rig';
@@ -42,7 +42,16 @@ const suave = (t: number) => t * t * (3 - 2 * t);
 const franja = (p: number, a: number, b: number) =>
   suave(Math.min(1, Math.max(0, (p - a) / (b - a))));
 
-export type EscenaPlaca = Escena;
+export interface EscenaPlaca extends Escena {
+  /**
+   * Enciende la máquina. Antes de esto solo se dibuja la pila vacía — ni un
+   * triángulo de la placa, ni una sombra. La pantalla de inicio es texto, un
+   * editor y un hueco reservado; no tiene por qué costar una escena entera.
+   */
+  arrancar(): void;
+  /** Vuelve al punto de partida. Lo llama el `pop` de la pila. */
+  reiniciar(): void;
+}
 
 export async function montar(host: HTMLElement): Promise<EscenaPlaca> {
   const reducido = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -51,11 +60,7 @@ export async function montar(host: HTMLElement): Promise<EscenaPlaca> {
   const forzarGL = new URLSearchParams(window.location.search).has('gl');
 
   const r = rig();
-  const rotulo = barra();
-  const m = await motor(host, forzarGL, (w, h) => {
-    r.redimensionar(w, h);
-    rotulo.redimensionar(w, h, Math.min(1.5, window.devicePixelRatio || 1));
-  });
+  const m = await motor(host, forzarGL, (w, h) => r.redimensionar(w, h));
   const placa = construir(m.renderer);
 
   host.dataset.backend = m.backend;
@@ -65,6 +70,7 @@ export async function montar(host: HTMLElement): Promise<EscenaPlaca> {
 
   let cuadros = 0;
   let fallo = false;
+  let arrancado = reducido;
 
   const componer = (t: number) => {
     // Una excepción aquí dentro es invisible: el siguiente fotograma ya está
@@ -76,25 +82,21 @@ export async function montar(host: HTMLElement): Promise<EscenaPlaca> {
       const camara = Math.min(1, estado.p / FIN);
       const hundido = franja(estado.p, HUNDE[0], HUNDE[1]);
 
-      r.aplicar(camara, estado.intro);
-      // El mismo avance que mueve la cámara le hace crecer el canto: el filo y
-      // el encuadre tienen que ir a la vez o el grosor aparece de la nada.
-      placa.componer(camara, hundido);
-      placa.animar(t, estado.intro);
-      rotulo.aplicar(estado.p);
-
-      // Cuando la máquina ya se ha ido del todo no hay nada que dibujar de
-      // ella: se salta la escena entera y solo queda la barra. Eso es lo que
-      // quita el tirón del final — antes se seguía pagando placa, aparatos y
-      // sombras para no ver nada.
-      if (hundido < 0.999) m.renderer.render(placa.escena, r.camara);
-      else m.renderer.clear();
-
-      if (rotulo.visible()) {
-        // Segunda pasada, encima y sin borrar lo anterior.
-        m.renderer.autoClear = false;
-        m.renderer.render(rotulo.escena, rotulo.camara);
-        m.renderer.autoClear = true;
+      // Antes de arrancar, y cuando la máquina ya se ha ido del todo, no hay
+      // nada que dibujar de ella: se salta la escena entera. Eso es lo que
+      // quita el tirón del final —antes se seguía pagando placa, aparatos y
+      // sombras para no ver nada— y lo que hace que la pantalla de inicio no
+      // cueste un fotograma completo de 3D.
+      const hayMaquina = arrancado && hundido < 0.999;
+      if (hayMaquina) {
+        r.aplicar(camara, estado.intro);
+        // El mismo avance que mueve la cámara le hace crecer el canto: el filo
+        // y el encuadre tienen que ir a la vez o el grosor aparece de la nada.
+        placa.componer(camara, hundido);
+        placa.animar(t, estado.intro);
+        m.renderer.render(placa.escena, r.camara);
+      } else {
+        m.renderer.clear();
       }
 
       // Solo después de que haya algo dibujado.
@@ -117,7 +119,6 @@ export async function montar(host: HTMLElement): Promise<EscenaPlaca> {
     // Un solo fotograma y punto. Es lo que pide esa preferencia.
     componer(0);
   } else {
-    gsap.to(estado, { intro: 1, duration: 2.6, ease: 'power2.out' });
     const cuadro = () => {
       if (!vivo) return;
       raf = requestAnimationFrame(cuadro);
@@ -127,6 +128,22 @@ export async function montar(host: HTMLElement): Promise<EscenaPlaca> {
   }
 
   return {
+    reiniciar() {
+      arrancado = false;
+      gsap.killTweensOf(estado);
+      estado.p = 0;
+      estado.intro = 0;
+    },
+
+    arrancar() {
+      if (arrancado || !vivo) return;
+      arrancado = true;
+      // La entrada de cámara empieza AQUÍ y no al montar: si arrancara con la
+      // página, para cuando alguien pulsa Run ya se habría consumido y la
+      // máquina aparecería de golpe, sin llegada.
+      gsap.to(estado, { intro: 1, duration: 2.2, ease: 'power2.out' });
+    },
+
     avance(p) {
       if (reducido || !vivo) return;
       // La inercia va aquí, no en el scroll. El valor crudo salta; este tween
@@ -141,7 +158,6 @@ export async function montar(host: HTMLElement): Promise<EscenaPlaca> {
       gsap.killTweensOf(estado);
       delete host.dataset.backend;
       delete host.dataset.cuadros;
-      rotulo.soltar();
       placa.soltar();
       m.soltar();
     },

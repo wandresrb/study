@@ -4,7 +4,6 @@
 
 import { NeutralToneMapping, PCFSoftShadowMap, WebGPURenderer } from 'three/webgpu';
 
-import { PAL } from './placa';
 
 export interface Motor {
   renderer: WebGPURenderer;
@@ -28,13 +27,23 @@ export async function motor(
     'position:absolute;inset:0;width:100%;height:100%;display:block;opacity:0;transition:opacity .9s ease';
   host.appendChild(canvas);
 
+  // LIENZO TRANSPARENTE, y es lo que quita el agujero negro de la portada.
+  //
+  // Antes era opaco y se limpiaba con su propio color, un degradado que iba de
+  // #0e0e15 a #06060a. Eso se eligió cuando la placa llenaba el encuadre —un
+  // entorno casi negro la hacía resaltar y disimulaba dónde acababa la escena—
+  // pero medido contra la paleta del sitio era 3 veces más oscuro por abajo y
+  // 7 por arriba. O sea: un agujero recortado sobre la página.
+  //
+  // Sin fondo propio hay UNA superficie en vez de dos, y se acabó la costura.
+  // Los metales no se enteran: reflejan el `environment`, que es otra cosa.
   const renderer = new WebGPURenderer({
     canvas,
     antialias: true,
-    alpha: false,
+    alpha: true,
     forceWebGL: forzarGL,
   });
-  renderer.setClearColor(PAL.fondo, 1);
+  renderer.setClearColor(0x000000, 0);
   // Neutral y no ACES: ACES tiene un pie muy marcado y sobre una placa —que es
   // oscura por definición— se come los medios enteros. Aquí lo que hay que
   // conservar es justo la franja media, donde vive toda la superficie.

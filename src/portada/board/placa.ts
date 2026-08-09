@@ -18,7 +18,7 @@ import {
   Scene,
   type WebGPURenderer,
 } from 'three/webgpu';
-import { color, length, mix, screenUV, smoothstep, texture, uniform, uv } from 'three/tsl';
+import { color, length, mix, smoothstep, texture, uniform, uv } from 'three/tsl';
 
 import { entorno } from './entorno';
 import { LADO } from './layout';
@@ -30,8 +30,6 @@ import { sembrar } from './siembra';
 import { pulsos } from './pulsos';
 
 export const PAL = {
-  fondo: 0x0e0e15,
-  cielo: 0x06060a,
   sustrato: 0x12121c,
   // Aluminio anodizado: metal de verdad, pero oscuro. Ni la plata de antes
   // —que lavaba media placa— ni el plástico mate al que lo bajé después.
@@ -74,10 +72,8 @@ export function construir(renderer: WebGPURenderer): Placa {
   //
   // La profundidad la da el degradado del fondo, que no depende de la cámara.
 
-  // El fondo arranca en el color de la niebla y se oscurece hacia arriba. Sin
-  // esto el horizonte se lee como una raya, no como distancia.
-  escena.backgroundNode = mix(color(PAL.fondo), color(PAL.cielo), smoothstep(0.3, 1, screenUV.y));
-
+  // SIN FONDO PROPIO. El lienzo es transparente y el fondo lo pone la página.
+  // La profundidad la da un degradado en CSS, que además no cuesta nada.
   // Sin entorno los metales son negros: casi no tienen componente difusa, solo
   // reflejan. Y si no hay nada que reflejar, no hay nada que ver.
   const env = entorno(renderer);
