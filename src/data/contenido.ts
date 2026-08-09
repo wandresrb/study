@@ -34,7 +34,11 @@ export async function getNiveles(trackId: string): Promise<Nivel[]> {
     tags: n.tags,
     color: n.color ?? PAL[i % PAL.length],
     colorHex: n.colorHex ?? PALHEX[i % PALHEX.length],
-    icono: n.icono ?? (i === 0 ? '🗺️' : i === total - 1 ? '🔱' : String(i)),
+    // `String(i)` sigue produciendo una cifra, que es tipografía legítima: el
+    // temario numera los niveles intermedios y Chip la pinta con la misma tinta
+    // y la misma altura óptica que un icono. Los dos extremos sí pasan a ser
+    // iconos de verdad.
+    icono: n.icono ?? (i === 0 ? 'lucide:map' : i === total - 1 ? 'lucide:crown' : String(i)),
   }));
 }
 
@@ -47,9 +51,58 @@ export async function nivelDe(trackId: string, levelId: number): Promise<Nivel> 
 export type Track = CollectionEntry<'tracks'>;
 export type Categoria = CollectionEntry<'categorias'>;
 
+// --- Contraste de las marcas ------------------------------------------------
+// Un logo de marca se pinta con su hex oficial sobre la placa oscura de la
+// ficha, y esos hex se eligieron para fondo BLANCO: Lua es #2C2D72 y CSS
+// #663399, que sobre negro no se ven. Esto no elige colores —eso produciría dos
+// sistemas visuales conviviendo en /mapa— sino que se niega a construir.
+
+const canal = (v: number) => (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+const luminancia = (hex: string) => {
+  const n = parseInt(hex.slice(1), 16);
+  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((c) => canal(c / 255));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+const contraste = (a: string, b: string) => {
+  const [x, y] = [luminancia(a), luminancia(b)].sort((p, q) => q - p);
+  return (x + 0.05) / (y + 0.05);
+};
+/** La placa de la ficha: 12% del color del track disuelto en --crust (#11111b). */
+const placa = (grad: string) => {
+  const g = parseInt(grad.slice(1), 16);
+  const c = 0x11111b;
+  const canalMix = (d: number) =>
+    Math.round((((g >> d) & 255) * 0.12 + ((c >> d) & 255) * 0.88));
+  return '#' + [16, 8, 0].map((d) => canalMix(d).toString(16).padStart(2, '0')).join('');
+};
+/** La tinta: el hex oficial subido un 18% hacia --text (#cdd6f4). */
+const tinta = (marca: string) => {
+  const m = parseInt(marca.slice(1), 16);
+  const t = 0xcdd6f4;
+  const canalMix = (d: number) => Math.round((((m >> d) & 255) * 0.82 + ((t >> d) & 255) * 0.18));
+  return '#' + [16, 8, 0].map((d) => canalMix(d).toString(16).padStart(2, '0')).join('');
+};
+
+const MINIMO = 4.5;
+
 /** Todos los tracks en el orden declarado. */
 export async function getTracks(): Promise<Track[]> {
-  return (await getCollection('tracks')).sort((a, b) => a.data.orden - b.data.orden);
+  const ts = (await getCollection('tracks')).sort((a, b) => a.data.orden - b.data.orden);
+  for (const t of ts) {
+    const { logoHex, logoHexDark, gradFrom } = t.data;
+    if (!logoHex) continue;
+    // Con logoHexDark declarado, ese es el que se pinta y el que se mide.
+    const usado = logoHexDark ?? tinta(logoHex);
+    const c = contraste(usado, placa(gradFrom));
+    if (c < MINIMO) {
+      throw new Error(
+        `El track "${t.id}" pinta su logo en ${usado}, que sobre su placa mide ` +
+          `${c.toFixed(2)}:1 (mínimo ${MINIMO}). ` +
+          `Declara "logoHexDark" con una variante de la marca elegida para fondo oscuro.`,
+      );
+    }
+  }
+  return ts;
 }
 
 /** Un track por su id. Lanza si no existe: es un fallo de datos, no un 404. */
