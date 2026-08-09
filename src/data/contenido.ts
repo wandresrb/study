@@ -124,12 +124,15 @@ export interface CategoriaConTracks {
   minutos: number;
 }
 
+export type Plano = 'entorno' | 'nucleo' | 'aplicaciones';
+
 /**
- * El mapa completo, separado en sus dos planos. `nucleo` son los conceptos
- * —matemática, ciencias de la computación, sistemas operativos, system design
- * y el entorno de trabajo—; `aplicaciones`, los dominios donde se implementan.
+ * El mapa completo, separado en sus tres planos, que son las tres pestañas de
+ * /hub: `entorno` son las herramientas del día a día; `nucleo`, los conceptos
+ * —matemática, ciencias de la computación, sistemas operativos, system design—;
+ * y `aplicaciones`, los dominios donde se implementan.
  */
-export async function getMapa(): Promise<Record<'nucleo' | 'aplicaciones', CategoriaConTracks[]>> {
+export async function getMapa(): Promise<Record<Plano, CategoriaConTracks[]>> {
   const [cats, ts] = await Promise.all([getCollection('categorias'), getTracks()]);
 
   // `reference()` valida la forma, no la existencia: sin esto, un track que
@@ -153,12 +156,16 @@ export async function getMapa(): Promise<Record<'nucleo' | 'aplicaciones', Categ
     return { cat, tracks, escritos, porEscribir: tracks.filter((t) => t.data.estado === 'proximamente'), lecciones, minutos };
   };
 
-  const porPlano = async (plano: 'nucleo' | 'aplicaciones') =>
+  const porPlano = async (plano: Plano) =>
     Promise.all(
       cats.filter((c) => c.data.plano === plano).sort((a, b) => a.data.orden - b.data.orden).map(armar),
     );
 
-  return { nucleo: await porPlano('nucleo'), aplicaciones: await porPlano('aplicaciones') };
+  return {
+    entorno: await porPlano('entorno'),
+    nucleo: await porPlano('nucleo'),
+    aplicaciones: await porPlano('aplicaciones'),
+  };
 }
 
 /** "18 min" -> 18. El frontmatter lo declara en texto libre. */
