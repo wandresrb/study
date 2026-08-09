@@ -1,6 +1,19 @@
 import { defineCollection, reference } from 'astro:content';
 import { glob } from 'astro/loaders';
 import { z } from 'astro/zod';
+import { FORMATO, existe as existeIcono } from './data/iconos';
+
+// Un icono se declara como `set:nombre`. El regex por sí solo no basta: rechaza
+// el emoji viejo, pero deja pasar `lucide:cpuu`, que reventaría mucho más
+// tarde, al renderizar una de 5074 páginas y sin decir qué entrada lo
+// declaraba. El `.refine` comprueba la EXISTENCIA contra el JSON del set, así
+// que el fallo sale al cargar la colección, con el id de la entrada delante.
+const nombreDeIcono = z
+  .string()
+  .regex(FORMATO, 'El icono se declara como "lucide:nombre" o "simple-icons:nombre"; ya no se aceptan emoji')
+  .refine(existeIcono, 'Ese icono no existe en su set (busca el nombre exacto en icones.js.org)');
+
+const hex = z.string().regex(/^#[0-9a-f]{6}$/i);
 
 // Cinco entidades, cinco colecciones, y las relaciones declaradas con
 // `reference()` en vez de con cadenas sueltas: da tipos, autocompletado y
@@ -19,7 +32,7 @@ const categorias = defineCollection({
   schema: z.object({
     nombre: z.string().min(1),
     descripcion: z.string().min(1),
-    icono: z.string().min(1),
+    icono: nombreDeIcono,
     colorHex: z.string().regex(/^#[0-9a-f]{6}$/i),
     gradFrom: z.string().regex(/^#[0-9a-f]{6}$/i),
     gradTo: z.string().regex(/^#[0-9a-f]{6}$/i),
@@ -41,7 +54,14 @@ const tracks = defineCollection({
     nombre: z.string().min(1),
     subtitulo: z.string().min(1),
     descripcion: z.string().min(1),
-    logo: z.string().min(1),
+    logo: nombreDeIcono,
+    // El hex de marca NO sale de @iconify-json/simple-icons: ese paquete declara
+    // "palette": false y no trae ninguno. Se declara a mano, como gradFrom/gradTo.
+    logoHex: hex.optional(),
+    // Solo cuando el hex oficial no llega a 4,5:1 sobre la placa oscura (Lua y
+    // CSS son azul marino y morado oscuro). La guarda de getTracks() rompe el
+    // build si falta donde hace falta, así que esto no se puede olvidar.
+    logoHexDark: hex.optional(),
     colorHex: z.string().regex(/^#[0-9a-f]{6}$/i),
     gradFrom: z.string().regex(/^#[0-9a-f]{6}$/i),
     gradTo: z.string().regex(/^#[0-9a-f]{6}$/i),
@@ -101,7 +121,10 @@ const niveles = defineCollection({
         // del patrón (hoy, únicamente neovim).
         color: z.string().optional(),
         colorHex: z.string().optional(),
-        icono: z.string().optional(),
+        // Los enteros son tipografía legítima —el temario numera los niveles
+        // intermedios— y se quedan. Todo lo demás tiene que ser un icono de
+        // verdad, para que un emoji rezagado no sobreviva a la migración.
+        icono: z.union([z.string().regex(/^\d+$/), nombreDeIcono]).optional(),
       }),
     ).min(1),
   }),
