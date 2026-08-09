@@ -31,7 +31,7 @@ const TOPE = 40;
 
 const ATAJOS: Entrada[] = [
   ['Inicio', 'ir a', '/'],
-  ['Todos los temas', 'ir a', '/mapa/'],
+  ['Todos los temas', 'ir a', '/hub/'],
   ['Recursos', 'ir a', '/recursos/'],
   ['Sobre mí', 'ir a', '/about/'],
 ];

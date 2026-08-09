@@ -44,9 +44,18 @@ export default defineConfig({
     collectionStorage: 'chunked',
   },
 
+  // URLs antiguas que hay que mantener vivas.
+  //
   // /cheatsheet se movió a /neovim/cheatsheet al unificar las 25 hojas en una
-  // ruta dinámica. Sin esto la URL antigua queda muerta.
-  redirects: { '/cheatsheet': '/neovim/cheatsheet/' },
+  // ruta dinámica.
+  //
+  // /mapa pasó a /hub: la página se llamaba «mapa» y el enlace de la barra ya
+  // decía «Hub de estudio», así que la URL era el único sitio donde seguía
+  // teniendo el nombre viejo.
+  redirects: {
+    '/cheatsheet': '/neovim/cheatsheet/',
+    '/mapa': '/hub/',
+  },
 
   // El formato de build es `directory`, y la doc pide fijar trailingSlash a
   // 'always' con ese formato para que dev y producción no discrepen.

@@ -55,7 +55,7 @@ export type Categoria = CollectionEntry<'categorias'>;
 // Un logo de marca se pinta con su hex oficial sobre la placa oscura de la
 // ficha, y esos hex se eligieron para fondo BLANCO: Lua es #2C2D72 y CSS
 // #663399, que sobre negro no se ven. Esto no elige colores —eso produciría dos
-// sistemas visuales conviviendo en /mapa— sino que se niega a construir.
+// sistemas visuales conviviendo en /hub— sino que se niega a construir.
 
 const canal = (v: number) => (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
 const luminancia = (hex: string) => {
