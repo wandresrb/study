@@ -5,6 +5,8 @@ import sitemap from '@astrojs/sitemap';
 
 import solidJs from '@astrojs/solid-js';
 
+import tailwindcss from '@tailwindcss/vite';
+
 // Transformer de Shiki (nativo) para exponer el `title="archivo"` de los
 // bloques de código como atributo data-title, que la CSS pinta como "chip".
 // Es best-effort: si el meta no está disponible, simplemente no se muestra.
@@ -28,6 +30,7 @@ const fileTitleTransformer = {
 // https://astro.build/config
 export default defineConfig({
   site: 'https://wandres.dev',
+
   // `cacheDir` se deja en su valor por defecto (node_modules/.astro) a propósito:
   // es la ruta exacta que Cloudflare Workers Builds cachea para Astro, y esas
   // rutas no son configurables. Cambiarlo rompería el caché en CI.
@@ -84,6 +87,7 @@ export default defineConfig({
       fallbacks: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
     },
   ],
+
   markdown: {
     // Resaltado con Shiki NATIVO (first-party, compatible con Astro 7 / Vite 8)
     shikiConfig: {
@@ -92,5 +96,10 @@ export default defineConfig({
       transformers: [fileTitleTransformer],
     },
   },
+
   integrations: [mdx(), sitemap(), solidJs()],
+
+  vite: {
+    plugins: [tailwindcss()],
+  },
 });
