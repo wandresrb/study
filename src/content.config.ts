@@ -23,7 +23,14 @@ const categorias = defineCollection({
     colorHex: z.string().regex(/^#[0-9a-f]{6}$/i),
     gradFrom: z.string().regex(/^#[0-9a-f]{6}$/i),
     gradTo: z.string().regex(/^#[0-9a-f]{6}$/i),
+    // Los dos planos del mapa. `nucleo` son los conceptos —matemática, CS,
+    // sistemas operativos, system design y el entorno de trabajo—; y
+    // `aplicaciones`, los dominios donde se implementan. Un mismo tema aparece
+    // en los dos: sistemas distribuidos es concepto y Cloud su despliegue;
+    // programación reactiva es paradigma y Redux o TCA sus implementaciones.
+    plano: z.enum(['nucleo', 'aplicaciones']),
     // getCollection() no garantiza orden: hay que llevarlo en los datos.
+    // El orden es dentro del plano, no global.
     orden: z.number().int().nonnegative(),
   }),
 });

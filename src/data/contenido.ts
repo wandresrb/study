@@ -59,24 +59,65 @@ export async function getTrack(id: string): Promise<Track> {
   return t;
 }
 
-/** Las categorías en orden, cada una con sus tracks en orden. */
-export async function getCategoriasConTracks(): Promise<Array<{ cat: Categoria; tracks: Track[] }>> {
+export interface CategoriaConTracks {
+  cat: Categoria;
+  tracks: Track[];
+  /** Los que ya tienen contenido. */
+  escritos: Track[];
+  /** Los declarados como `proximamente`: casillas reales del campo, vacías. */
+  porEscribir: Track[];
+  lecciones: number;
+  /** Suma de la `duracion` declarada en el frontmatter, en minutos. */
+  minutos: number;
+}
+
+/**
+ * El mapa completo, separado en sus dos planos. `nucleo` son los conceptos
+ * —matemática, ciencias de la computación, sistemas operativos, system design
+ * y el entorno de trabajo—; `aplicaciones`, los dominios donde se implementan.
+ */
+export async function getMapa(): Promise<Record<'nucleo' | 'aplicaciones', CategoriaConTracks[]>> {
   const [cats, ts] = await Promise.all([getCollection('categorias'), getTracks()]);
-  // `reference()` valida la forma, no la existencia: si un track apunta a una
-  // categoría que no existe se caería de la portada sin decir nada.
+
+  // `reference()` valida la forma, no la existencia: sin esto, un track que
+  // apunte a una categoría inexistente se caería de la portada en silencio.
   for (const t of ts) {
     if (t.data.categoria && !(await getEntry(t.data.categoria))) {
       throw new Error(`El track "${t.id}" apunta a la categoría "${t.data.categoria.id}", que no existe`);
     }
   }
-  return cats
-    .sort((a, b) => a.data.orden - b.data.orden)
-    .map((cat) => ({ cat, tracks: ts.filter((t) => t.data.categoria?.id === cat.id) }));
+
+  const armar = async (cat: Categoria): Promise<CategoriaConTracks> => {
+    const tracks = ts.filter((t) => t.data.categoria?.id === cat.id);
+    const escritos = tracks.filter((t) => t.data.estado === 'disponible');
+    let lecciones = 0;
+    let minutos = 0;
+    for (const t of escritos) {
+      const ls = await leccionesDe(t.id);
+      lecciones += ls.length;
+      minutos += ls.reduce((a, l) => a + minutosDe(l.data.duracion), 0);
+    }
+    return { cat, tracks, escritos, porEscribir: tracks.filter((t) => t.data.estado === 'proximamente'), lecciones, minutos };
+  };
+
+  const porPlano = async (plano: 'nucleo' | 'aplicaciones') =>
+    Promise.all(
+      cats.filter((c) => c.data.plano === plano).sort((a, b) => a.data.orden - b.data.orden).map(armar),
+    );
+
+  return { nucleo: await porPlano('nucleo'), aplicaciones: await porPlano('aplicaciones') };
 }
 
-/** Tracks sin categoría, que se listan sueltos. */
-export async function tracksSueltos(): Promise<Track[]> {
-  return (await getTracks()).filter((t) => !t.data.categoria);
+/** "18 min" -> 18. El frontmatter lo declara en texto libre. */
+export function minutosDe(duracion?: string): number {
+  const m = /(\d+)/.exec(duracion ?? '');
+  return m ? Number(m[1]) : 0;
+}
+
+/** Las horas de un track, para que la tarjeta diga algo más que "280 lecciones". */
+export async function horasDe(trackId: string): Promise<number> {
+  const ls = await leccionesDe(trackId);
+  return Math.round(ls.reduce((a, l) => a + minutosDe(l.data.duracion), 0) / 60);
 }
 
 // `leccionesDe` se llama unas 10.300 veces por build (una por lección desde
