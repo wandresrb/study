@@ -25,7 +25,7 @@ import {
 } from './layout';
 import { enTaladro, taladros } from './agujeros';
 import { HUELLAS, type Pieza } from './siembra';
-import { buses, type Punto } from './trazas';
+import { abanicoCpu, buses, type Punto } from './trazas';
 
 const N = 2048;
 const PX = N / LADO; // píxeles por milímetro
@@ -166,6 +166,23 @@ export function mascara(anisotropia: number, piezas: readonly Pieza[]): Mascara 
         ]);
         vias.push([qx, qz]);
       }
+    }
+  });
+
+  // El abanico de salida del procesador: la corona de pistas cortas que asoma
+  // bajo el encapsulado por los cuatro costados y muere en su vía. Es lo que
+  // hace que el chip parezca soldado a la placa y no apoyado encima. El recorte
+  // de taladros se hace aquí porque `trazas.ts` no puede pedirle nada a
+  // `agujeros.ts` sin cerrar un ciclo de importación.
+  const abanico = abanicoCpu();
+  capa(ctxs, [COLOR.pista, SUP.pista], (c) => {
+    c.lineWidth = Math.max(1.2, 0.26 * PX);
+    c.lineCap = 'round';
+    for (let i = 0; i < abanico.pistas.length; i++) {
+      const v = abanico.vias[i];
+      if (enTaladro(v[0], v[1], 0.8)) continue;
+      trazar(c, abanico.pistas[i]);
+      vias.push([v[0], v[1]]);
     }
   });
 

@@ -11,6 +11,10 @@ export interface Motor {
   /** Cuál acabó usándose. Útil para depurar y para el HUD de desarrollo. */
   backend: 'webgpu' | 'webgl';
   medir(): { w: number; h: number };
+  /** El lienzo, para poder copiarlo antes de soltar la escena. */
+  lienzo: HTMLCanvasElement;
+  /** Descubre el lienzo. Se llama tras componer el primer fotograma. */
+  mostrar(): void;
   soltar(): void;
 }
 
@@ -77,14 +81,23 @@ export async function motor(
 
   // El lienzo entra con fundido: si aparece de golpe se nota el salto entre el
   // texto que ya estaba pintado y la escena.
-  requestAnimationFrame(() => {
-    canvas.style.opacity = '1';
-  });
+  //
+  // El descubrimiento va atado al primer fotograma COMPUESTO, no a un
+  // `requestAnimationFrame` suelto. Con el rAF suelto bastaba que el navegador
+  // lo estrangulara durante el montaje —pestaña de fondo, hilo principal
+  // ocupado— para que el lienzo se quedara transparente para siempre: la escena
+  // dibujando a pleno rendimiento detrás de un `opacity: 0`. Así solo aparece
+  // cuando hay algo que enseñar, y aparece siempre.
 
   return {
     renderer,
     backend,
     medir,
+    lienzo: canvas,
+
+    mostrar() {
+      if (canvas.style.opacity !== '1') canvas.style.opacity = '1';
+    },
     soltar() {
       obs.disconnect();
       renderer.dispose();

@@ -102,7 +102,14 @@ export function taladros(): Taladro[] {
     let puesto: Taladro | null = null;
 
     // Espiral: primero el sitio ideal, luego anillos cada 2 mm.
-    for (let r = 0; r <= 46 && !puesto; r += 2) {
+    //
+    // El tope era 46 mm y eso no es apartar, es mudarse: un taladro acabó a
+    // 44 mm de su sitio —o sea, en cualquier parte— y otro no cabía y se
+    // descartaba sin que nadie se enterara. 14 mm es un empujón para esquivar
+    // una pista o el pestillo de una ranura. Si hace falta más, la que está mal
+    // es la posición ideal, y hay que corregirla en el plano: por eso ahora
+    // `taladros()` devuelve menos de nueve y la comprobación lo canta.
+    for (let r = 0; r <= 14 && !puesto; r += 2) {
       const pasos = r === 0 ? 1 : Math.max(8, Math.round((r * Math.PI * 2) / 2));
       for (let i = 0; i < pasos; i++) {
         const a = (i / pasos) * Math.PI * 2;

@@ -16,7 +16,7 @@
 // isla, fase— anclados a las zonas del plano y repetidos. Lo único aleatorio es
 // una pizca de tinte para que una fila no sea un bloque plano de color.
 
-import { azar, BOBINAS, denso, fisico } from './layout';
+import { azar, BOBINAS, denso, fisico, zona } from './layout';
 import { enTaladro } from './agujeros';
 import { reservaBuses } from './trazas';
 
@@ -109,10 +109,19 @@ function fase(cx: number, cz: number): Pieza[] {
 function motivos(): Pieza[] {
   const p: Pieza[] = [];
 
-  // Banda de desacoplo bajo el socket. Es la fila más característica de una
-  // placa: muchas piezas iguales, muy juntas, pegadas al borde del socket.
-  p.push(...fila(-5, -30, 1.8, 0, 25, 'p0402', 1));
-  p.push(...fila(-5, -27.4, 1.8, 0, 25, 'p0402', 1));
+  // Banda de desacoplo bajo el procesador. Es la fila más característica de una
+  // placa: muchas piezas iguales, muy juntas, pegadas a su borde.
+  //
+  // Decía «pegada al borde del socket» y estaba a 9,5 mm de él, porque se
+  // escribió a mano y la zona se movió después. Sale del plano: los 5,3 mm son
+  // el hueco justo para que pase el abanico de salida sin que se toquen.
+  const cpu = zona('cpu');
+  if (cpu) {
+    const z0 = cpu.z + cpu.pr / 2 + 5.3;
+    const x0 = cpu.x - cpu.an / 2 - 3;
+    p.push(...fila(x0, z0, 1.8, 0, 25, 'p0402', 1));
+    p.push(...fila(x0, z0 + 2.6, 1.8, 0, 25, 'p0402', 1));
+  }
   // Y su gemela por el lado de la memoria.
   p.push(...fila(45, -80, 0, 1.8, 24, 'p0402', 0));
   p.push(...fila(47.6, -80, 0, 1.8, 24, 'p0402', 0));

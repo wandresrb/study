@@ -32,6 +32,11 @@ export interface Zona {
   rotulo?: string;
 }
 
+/** Una zona por su nombre. Devuelve `undefined` si se retiró del plano. */
+export function zona(id: string): Zona | undefined {
+  return ZONAS.find((s) => s.id === id);
+}
+
 /**
  * Huella real de una zona, pestillo incluido. Las ranuras llevan un pestillo
  * que sobresale por un extremo, y no estaba contado en ninguna prueba de
@@ -88,16 +93,26 @@ export const ZONAS: readonly Zona[] = [
 ];
 
 /**
- * Posiciones IDEALES de los nueve taladros de una micro-ATX. Las definitivas
- * las resuelve `agujeros.ts`, que aparta la que caiga sobre algo.
+ * Posiciones IDEALES de los nueve taladros. Las definitivas las resuelve
+ * `agujeros.ts`, que aparta la que caiga sobre algo — pero solo un empujón: si
+ * una necesita irse lejos, la mal puesta es ESTA lista, no el resultado.
+ *
+ * Tres estaban inventadas sin mirar el plano y el resolutor lo tapaba dejándolas
+ * vagar hasta 46 mm: una acabó a 44 mm de su sitio y otra no cabía en ninguna
+ * parte y se descartaba en silencio. Corregidas contra el hueco real:
+ *
+ *   · la de arriba al centro no existe. Esa franja es panel de E/S, VRM y
+ *     bobinas de lado a lado; baja a la banda libre al sur del panel.
+ *   · las dos del canto derecho no cabían porque el haz de alimentación subía
+ *     por el borde. Reruteado ese haz, entran con 1 y 4 mm de ajuste.
  */
 export const TALADROS_IDEALES: readonly { x: number; z: number }[] = [
   { x: -115, z: -78 },
-  { x: -6, z: -92 },
-  { x: 112, z: -95 },
+  { x: -60, z: -86 },
+  { x: 113, z: -95 },
   { x: -115, z: 4 },
   { x: -6, z: 12 },
-  { x: 112, z: -22 },
+  { x: 113, z: -26 },
   { x: -115, z: 108 },
   { x: -6, z: 108 },
   { x: 112, z: 108 },

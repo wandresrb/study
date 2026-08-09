@@ -10,10 +10,7 @@
 // adelante se lea como la primera capa de una pila y no como un suelo infinito.
 
 import {
-  AmbientLight,
-  Color,
   DirectionalLight,
-  FogExp2,
   Group,
   Mesh,
   MeshStandardNodeMaterial,
@@ -27,6 +24,8 @@ import { entorno } from './entorno';
 import { LADO } from './layout';
 import { mascara } from './mascara';
 import { relieve, type Materiales } from './piezas';
+import { canto } from './canto';
+import { dispositivos } from './dispositivos';
 import { sembrar } from './siembra';
 import { pulsos } from './pulsos';
 
@@ -55,12 +54,25 @@ export interface Placa {
   uPulsos: { value: number };
   /** Avanza los destellos. */
   animar(t: number, intensidad: number): void;
+  /**
+   * `p` es el avance de la cámara, de 0 a 1. `hundido` es cuánto se ha ido la
+   * máquina hacia el suelo de la pantalla, también de 0 a 1 — va aparte porque
+   * ocurre DESPUÉS de que la cámara haya terminado.
+   */
+  componer(p: number, hundido: number): void;
   soltar(): void;
 }
 
 export function construir(renderer: WebGPURenderer): Placa {
   const escena = new Scene();
-  escena.fog = new FogExp2(PAL.fondo, 0.0016);
+  // SIN NIEBLA, y a propósito.
+  //
+  // Había una `FogExp2` que no pidió nadie, y era la única cosa de la escena
+  // cuyo brillo dependía de dónde estuviera la cámara: crece con el cuadrado de
+  // la distancia, así que al alejarse para que cupiera la mesa entera lo apagaba
+  // todo. O sea que era, literalmente, un cambio de iluminación con el scroll.
+  //
+  // La profundidad la da el degradado del fondo, que no depende de la cámara.
 
   // El fondo arranca en el color de la niebla y se oscurece hacia arriba. Sin
   // esto el horizonte se lee como una raya, no como distancia.
@@ -174,10 +186,17 @@ export function construir(renderer: WebGPURenderer): Placa {
 
   const grupo = new Group();
 
+  // La máquina va en su propio grupo. El apilado ya NO ocurre aquí: cuando la
+  // escena 3D termina, el lienzo se desvanece y la pila la dibuja HTML y CSS.
+  // Aplastar mallas para simular un diagrama era justo lo contrario de lo que
+  // hacía falta — geometría iluminada sin perspectiva sigue siendo geometría.
+  const maquina = new Group();
+  grupo.add(maquina);
+
   const cara = new Mesh(new PlaneGeometry(LADO, LADO), matSustrato);
   cara.rotation.x = -Math.PI / 2;
   cara.receiveShadow = true;
-  grupo.add(cara);
+  maquina.add(cara);
 
   const alzado = relieve(materiales, piezas);
   // Todo lo que sobresale arroja sombra y la recibe; la cara de la placa solo
@@ -188,12 +207,22 @@ export function construir(renderer: WebGPURenderer): Placa {
     o.castShadow = true;
     o.receiveShadow = true;
   });
-  grupo.add(alzado);
+  maquina.add(alzado);
 
   // El encendido de los buses trae su propio material y su propia tabla de
   // brillos: se enciende la pista entera, no un punto viajando por ella.
   const chispas = pulsos();
-  grupo.add(chispas.malla);
+  maquina.add(chispas.malla);
+
+  // El grosor de la placa, para que a cámara oblicua se lea como objeto.
+  const filo = canto();
+  maquina.add(filo.grupo);
+
+  // Y lo que la placa mueve. Van en ESTA escena y con esta luz: un icono plano
+  // al lado de una placa modelada canta. Además así la señal puede seguir de la
+  // pista al cable sin empalme, porque es el mismo fenómeno saliendo.
+  const trastos = dispositivos(materiales);
+  maquina.add(trastos.grupo);
 
   escena.add(grupo);
 
@@ -209,21 +238,37 @@ export function construir(renderer: WebGPURenderer): Placa {
   // defecto que más pesaba de todos.
   // Bajada de 19 a 12: con el especular del sustrato ya contenido no hace falta
   // tanta clave, y a 19 la luz se leía como un foco de teatro.
+  //
+  // Estuvo un rato a 26 por una medición mía que era falsa: al mirar la escena
+  // congelando el hilo, la interpolación de entrada se quedaba a medias, la
+  // cámara a 2,15 veces la distancia y la niebla —exponencial con la
+  // distancia— se comía la placa entera. Eso no era falta de luz. La lección va
+  // escrita aquí porque el síntoma es idéntico al de una escena mal iluminada:
+  // si la placa se ve apagada, antes de tocar nada hay que comprobar que la
+  // entrada ya ha terminado.
   const rasante = new DirectionalLight(PAL.rasante, 12);
   rasante.position.set(-300, 127, 180);
   rasante.castShadow = true;
-  rasante.shadow.mapSize.set(1024, 1024);
+  // 2048 y no 1024, y no es capricho: el volumen de sombra pasa de cubrir la
+  // placa a cubrir la mesa entera —de ±150 mm a ±480—, así que con el mapa
+  // anterior cada texel abarcaría tres veces más superficie y el filo de los
+  // disipadores se convertiría en escalera. Al doblarlo, la densidad queda casi
+  // como estaba.
+  rasante.shadow.mapSize.set(2048, 2048);
   // La sombra estaba pero era un agujero negro. Al 60 % marca el apoyo de cada
   // pieza sin comerse lo que hay debajo.
   rasante.shadow.intensity = 0.6;
   rasante.shadow.radius = 3;
+  // El volumen tiene que cubrir la mesa, no solo la placa: el monitor está a
+  // 330 mm por detrás y el teclado a 300 por delante. Lo que quede fuera no
+  // proyecta sombra, y una pieza sin sombra se lee como pegada encima.
   const c = rasante.shadow.camera;
-  c.left = -150;
-  c.right = 150;
-  c.top = 150;
-  c.bottom = -150;
+  c.left = -480;
+  c.right = 480;
+  c.top = 480;
+  c.bottom = -480;
   c.near = 1;
-  c.far = 700;
+  c.far = 1400;
   rasante.shadow.bias = -0.0006;
   rasante.shadow.normalBias = 0.35;
   escena.add(rasante);
@@ -249,6 +294,17 @@ export function construir(renderer: WebGPURenderer): Placa {
       chispas.actualizar(t, intensidad);
     },
 
+    componer(p, hundido) {
+      filo.aplicar(p);
+      trastos.aplicar(p);
+      // Se va al suelo de la pantalla y se sale por abajo. NO se aplasta: eso
+      // se probó y solo dejaba geometría rara. Lo que hace es irse, que es lo
+      // que tiene que pasar cuando algo se mete en una pila y deja de ser
+      // visible como objeto.
+      maquina.position.y = -hundido * 820;
+      maquina.scale.setScalar(1 - hundido * 0.34);
+    },
+
     soltar() {
       grupo.traverse((n) => {
         const m = n as Mesh;
@@ -258,6 +314,8 @@ export function construir(renderer: WebGPURenderer): Placa {
         m.dispose();
       }
       chispas.soltar();
+      filo.soltar();
+      trastos.soltar();
       mapas.soltar();
       env.soltar();
       escena.environment = null;

@@ -10,7 +10,10 @@
 // placa. Lo que sí es geometría son las luces que viajan por ellas, y para eso
 // este módulo devuelve además el recorrido de cada haz.
 
-import { ZONAS } from './layout';
+// Solo del plano. `agujeros.ts` importa de aquí, así que pedirle `enTaladro`
+// cerraría el ciclo: el recorte de taladros del abanico lo hace `mascara.ts`,
+// que ya importa los dos módulos.
+import { azar, fisico, ZONAS } from './layout';
 
 export type Punto = readonly [number, number];
 
@@ -90,7 +93,13 @@ function haz(p: Peticion): Haz {
  * ese borde. Los extremos de los haces se sacan de aquí y no a mano: un bus que
  * arranca o muere en mitad de la nada delata que el ruteo es decorativo.
  */
-function borde(id: string, lado: 'n' | 's' | 'e' | 'o', t = 0, respaldo?: Punto): Punto {
+function borde(
+  id: string,
+  lado: 'n' | 's' | 'e' | 'o',
+  t = 0,
+  adentro = 0,
+  respaldo?: Punto,
+): Punto {
   const z = ZONAS.find((s) => s.id === id);
   if (!z) {
     // Sin respaldo esto lanzaba, y quitar una zona del plano tumbaba la placa
@@ -99,15 +108,18 @@ function borde(id: string, lado: 'n' | 's' | 'e' | 'o', t = 0, respaldo?: Punto)
     if (respaldo) return respaldo;
     throw new Error(`zona desconocida y sin respaldo: ${id}`);
   }
+  // `adentro` mete el extremo bajo la pieza. Una pista que muere justo en el
+  // canto deja una holgura de antialias y se lee como que no llega; metida dos
+  // milímetros, desaparece bajo el encapsulado, que es lo que hace de verdad.
   switch (lado) {
     case 'n':
-      return [z.x + t, z.z - z.pr / 2];
+      return [z.x + t, z.z - z.pr / 2 + adentro];
     case 's':
-      return [z.x + t, z.z + z.pr / 2];
+      return [z.x + t, z.z + z.pr / 2 - adentro];
     case 'o':
-      return [z.x - z.an / 2, z.z + t];
+      return [z.x - z.an / 2 + adentro, z.z + t];
     default:
-      return [z.x + z.an / 2, z.z + t];
+      return [z.x + z.an / 2 - adentro, z.z + t];
   }
 }
 
@@ -117,31 +129,26 @@ function borde(id: string, lado: 'n' | 's' | 'e' | 'o', t = 0, respaldo?: Punto)
  * enlace de expansión, y eso se ve.
  */
 /**
- * El área del procesador. Ya no hay pieza montada ahí, pero sigue siendo el
- * punto del que salen los haces principales: en una placa todo converge en el
- * procesador, y unos buses que no fueran a ninguna parte se notarían.
+ * Cuánto se meten los extremos bajo el encapsulado del procesador.
  *
- * Va a mano y no con `borde()` precisamente porque no existe la zona. Si algún
- * día vuelve a haber socket, estos cuatro puntos son sus bordes.
+ * Los cuatro bordes del CPU estuvieron escritos a mano —de cuando no había
+ * pieza montada ahí— y se quedaron así al volver el procesador: los cinco haces
+ * que dicen converger en él morían en laminado desnudo, hasta 9,5 mm cortos por
+ * el costado este. Ahora salen de la zona, como los de cualquier otra pieza.
  */
-const CPU = {
-  este: [40, -58] as Punto,
-  oeste: [-8, -58] as Punto,
-  norte: [16, -82] as Punto,
-  sur: [16, -34] as Punto,
-};
+const BAJO_CPU = 2;
 
 export function buses(): Haz[] {
   return [
     // Procesador → memoria, los dos canales. Es el haz más ancho de la placa.
-    haz({ desde: [CPU.este[0], CPU.este[1] - 12], hasta: borde('dimm-a', 'o', -24), n: 16, paso: 0.85, ancho: 0.3, horizontal: true }),
-    haz({ desde: [CPU.este[0], CPU.este[1] + 12], hasta: borde('dimm-a', 'o', 26), n: 16, paso: 0.85, ancho: 0.3, horizontal: true }),
+    haz({ desde: borde('cpu', 'e', -12, BAJO_CPU), hasta: borde('dimm-a', 'o', -24), n: 16, paso: 0.85, ancho: 0.3, horizontal: true }),
+    haz({ desde: borde('cpu', 'e', 12, BAJO_CPU), hasta: borde('dimm-a', 'o', 26), n: 16, paso: 0.85, ancho: 0.3, horizontal: true }),
 
     // Procesador → ranura de expansión principal.
-    haz({ desde: [CPU.sur[0] - 6, CPU.sur[1]], hasta: borde('pcie16', 'n', 32), n: 14, paso: 0.85, ancho: 0.3, horizontal: false }),
+    haz({ desde: borde('cpu', 's', -6, BAJO_CPU), hasta: borde('pcie16', 'n', 32), n: 14, paso: 0.85, ancho: 0.3, horizontal: false }),
 
     // Procesador → panel trasero.
-    haz({ desde: [CPU.oeste[0], CPU.oeste[1] - 14], hasta: borde('io', 'e', 6), n: 10, paso: 0.9, ancho: 0.3, horizontal: true }),
+    haz({ desde: borde('cpu', 'o', -14, BAJO_CPU), hasta: borde('io', 'e', 6), n: 10, paso: 0.9, ancho: 0.3, horizontal: true }),
 
     // Chipset → almacenamiento y expansión.
     haz({ desde: borde('chipset', 'o', -4), hasta: borde('m2-inf', 'e', 0), n: 10, paso: 0.85, ancho: 0.3, horizontal: true }),
@@ -149,11 +156,89 @@ export function buses(): Haz[] {
     haz({ desde: borde('chipset', 's', -8), hasta: [40, 108], n: 12, paso: 0.8, ancho: 0.28, horizontal: false }),
     haz({ desde: borde('chipset', 'n', 0), hasta: borde('m2-sup', 'e', 4), n: 8, paso: 0.9, ancho: 0.3, horizontal: true }),
 
-    // Alimentación: pocas pistas y mucho más gruesas. Rodean las ranuras de
-    // memoria por arriba, que es por donde hay sitio.
-    haz({ desde: borde('atx', 'n', -2), hasta: borde('vrm-n', 'e', 2), n: 5, paso: 2.6, ancho: 1.5, horizontal: false }),
-    haz({ desde: borde('vrm-n', 's', 0), hasta: CPU.norte, n: 4, paso: 2.4, ancho: 1.4, horizontal: false }),
+    // Alimentación: pocas pistas y mucho más gruesas.
+    //
+    // Subía por el canto derecho, por x ≈ 111. Ninguna placa rutea por ahí: el
+    // canto es donde apoyan los separadores, y ese haz sellaba los quince
+    // milímetros del lado derecho — dos de los nueve taladros se quedaban sin
+    // sitio por él, uno se descartaba en silencio.
+    //
+    // Sacarlo por el oeste del conector fue peor: le cruzaba a la placa el
+    // centro con un manchón de pista gruesa. Va donde va en una placa de
+    // verdad: BAJO la última ranura de memoria, escondido por el cuerpo del
+    // conector, y por encima de las ranuras hasta el VRM. Tres pistas en vez de
+    // cinco, que es lo que cabe en ese pasillo.
+    haz({ desde: borde('atx', 'n', -9), hasta: borde('vrm-n', 'e', 2), n: 3, paso: 2.2, ancho: 1.4, horizontal: false }),
+    // El `t = 4` no es adorno: pone el extremo del CPU en x = 16, que es donde
+    // sale el del VRM, y así el tramo baja recto en vez de doblar en el último
+    // milímetro.
+    haz({ desde: borde('vrm-n', 's', -8), hasta: borde('cpu', 'n', 4, BAJO_CPU), n: 4, paso: 2.4, ancho: 1.4, horizontal: false }),
   ];
+}
+
+/**
+ * El abanico de salida del procesador.
+ *
+ * Un CPU no se lee como conectado por cinco haces gordos: se lee por la corona
+ * de pistas cortas que asoma bajo TODO el perímetro del encapsulado y muere en
+ * una vía a los pocos milímetros. Es por donde escapan de verdad las señales de
+ * un encapsulado con mil setecientos contactos, y sin ella el chip parece
+ * apoyado en la placa en vez de soldado a ella.
+ *
+ * No entra en `buses()` a propósito. Los buses reservan sitio y se encienden;
+ * esto es dibujo de máscara y nada más. Como haz reservaría media zona del
+ * procesador y `pulsos.ts` levantaría un centenar de cintas luminosas de tres
+ * milímetros — ruido, no señal.
+ */
+export interface Abanico {
+  pistas: Punto[][];
+  vias: Punto[];
+}
+
+export function abanicoCpu(): Abanico {
+  const z = ZONAS.find((s) => s.id === 'cpu');
+  if (!z) return { pistas: [], vias: [] };
+
+  const rnd = azar(0x0cfa11);
+  const pistas: Punto[][] = [];
+  const vias: Punto[] = [];
+  const PASO = 1.1;
+  /** Arranca bajo el encapsulado; lo que se ve empieza en el canto. */
+  const DENTRO = 1.6;
+
+  // Los lados, cada uno con su normal hacia fuera.
+  const lados: { fijo: number; eje: 'x' | 'z'; n: -1 | 1 }[] = [
+    { fijo: z.z - z.pr / 2, eje: 'x', n: -1 },
+    { fijo: z.z + z.pr / 2, eje: 'x', n: 1 },
+    { fijo: z.x - z.an / 2, eje: 'z', n: -1 },
+    { fijo: z.x + z.an / 2, eje: 'z', n: 1 },
+  ];
+
+  for (const lado of lados) {
+    const largo = lado.eje === 'x' ? z.an : z.pr;
+    const centro = lado.eje === 'x' ? z.x : z.z;
+    const n = Math.floor((largo - 3) / PASO);
+
+    for (let i = 0; i <= n; i++) {
+      const t = centro + (i - n / 2) * PASO;
+      // Las vías se escalonan en tres filas. Alineadas en una sola forman una
+      // raya continua, que es justo lo que no hace una placa.
+      const salida = 2.2 + (i % 3) * 1.3 + rnd() * 0.5;
+
+      const a: Punto =
+        lado.eje === 'x'
+          ? [t, lado.fijo - lado.n * DENTRO]
+          : [lado.fijo - lado.n * DENTRO, t];
+      const b: Punto =
+        lado.eje === 'x' ? [t, lado.fijo + lado.n * salida] : [lado.fijo + lado.n * salida, t];
+
+      if (fisico(b[0], b[1], 0.6)) continue;
+      pistas.push([a, b]);
+      vias.push(b);
+    }
+  }
+
+  return { pistas, vias };
 }
 
 /**
