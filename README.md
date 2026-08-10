@@ -67,3 +67,8 @@ El hub, el sidebar y la portada del tema se generan solos a partir de esos datos
 ---
 
 Un tema, un camino, de cero a ∞.
+
+
+Porcentaje de avance en el estudio.  Goals y badgets
+
+
