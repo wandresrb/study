@@ -1,6 +1,7 @@
 // @ts-check
 import { fileURLToPath } from 'node:url';
 import { defineConfig, fontProviders } from 'astro/config';
+import { unified } from '@astrojs/markdown-remark';
 import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 import rehypeKatex from 'rehype-katex';
@@ -9,6 +10,8 @@ import remarkMath from 'remark-math';
 import solidJs from '@astrojs/solid-js';
 
 import tailwindcss from '@tailwindcss/vite';
+
+import pagefind from 'astro-pagefind';
 
 import { fileTitleTransformer } from './src/lib/shiki-file-title.ts';
 import catalog from './src/integrations/catalog.ts';
@@ -51,11 +54,13 @@ export default defineConfig({
   ],
 
   markdown: {
-    remarkPlugins: [remarkMath],
     // La notación se resuelve en el build: sale HTML con clases de KaTeX y el
     // navegador no descarga ni ejecuta nada. `throwOnError` para que una fórmula
     // rota falle el build en vez de publicarse en rojo.
-    rehypePlugins: [[rehypeKatex, { throwOnError: true, strict: 'error' }]],
+    processor: unified({
+      remarkPlugins: [remarkMath],
+      rehypePlugins: [[rehypeKatex, { throwOnError: true, strict: 'error' }]],
+    }),
     shikiConfig: {
       theme: 'catppuccin-mocha',
       wrap: false,
@@ -63,7 +68,7 @@ export default defineConfig({
     },
   },
 
-  integrations: [catalog(), mdx(), sitemap(), solidJs()],
+  integrations: [catalog(), mdx(), sitemap(), solidJs(), pagefind()],
 
   vite: {
     plugins: [tailwindcss()],

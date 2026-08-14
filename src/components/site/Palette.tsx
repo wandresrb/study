@@ -22,6 +22,7 @@ const SHORTCUTS: Entry[] = [
   ['Inicio', 'ir a', '/'],
   ['Centro de Estudios', 'ir a', '/cs/'],
   ['Conceptos', 'ir a', '/concepts/'],
+  ['Buscar a fondo', 'ir a', '/search/'],
   ['Recursos', 'ir a', '/resources/'],
   ['Sobre el sitio', 'ir a', '/about/'],
 ];
