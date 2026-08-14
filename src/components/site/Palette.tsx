@@ -31,7 +31,11 @@ interface CatalogData {
   concepts: [string, string][];
 }
 
-// The full catalog is fetched once, and only when the palette first opens:
+interface SheetData {
+  shortcuts: [string, string, string, string][];
+}
+
+// Both indexes are fetched once, and only when the palette first opens:
 // the inline entries (categories and tracks) cover the first paint.
 let catalog: Promise<CatalogData> | undefined;
 const loadCatalog = () => {
@@ -41,12 +45,21 @@ const loadCatalog = () => {
   return catalog;
 };
 
+let sheets: Promise<SheetData> | undefined;
+const loadSheets = () => {
+  sheets ??= fetch('/idx/cheatsheets.json')
+    .then((r) => (r.ok ? r.json() : { shortcuts: [] }))
+    .catch(() => ({ shortcuts: [] }) as SheetData);
+  return sheets;
+};
+
 export default function Palette(props: Props) {
   const [open, setOpen] = createSignal(false);
   const [query, setQuery] = createSignal('');
   const [cursor, setCursor] = createSignal(0);
   const [lessons, setLessons] = createSignal<LessonHit[]>([]);
   const [extras, setExtras] = createSignal<Entry[]>([]);
+  const [sheetHits, setSheetHits] = createSignal<LessonHit[]>([]);
 
   const trackNames = new Map(
     props.entries.filter((e) => e[1] === 'tema').map((e) => [e[2].split('/')[1], e[0]]),
@@ -71,6 +84,16 @@ export default function Palette(props: Props) {
         );
         setExtras(data.concepts.map(([name, id]): Entry => [name, 'concepto', `/concepts/${id}/`]));
       });
+      loadSheets().then((data) =>
+        setSheetHits(
+          data.shortcuts.map(([id, name, keys, action]) => ({
+            title: action,
+            folded: fold(`${keys} ${action}`),
+            label: `${name} · ${keys}`,
+            url: `/${id}/cheatsheet/`,
+          })),
+        ),
+      );
     }
     setQuery('');
     setCursor(0);
@@ -101,6 +124,11 @@ export default function Palette(props: Props) {
       const at = l.folded.indexOf(q);
       if (at < 0) continue;
       scored.push({ entry: [l.title, l.label, l.url], rank: at === 0 ? 0 : 1, kind: 1 });
+    }
+    for (const s of sheetHits()) {
+      const at = s.folded.indexOf(q);
+      if (at < 0) continue;
+      scored.push({ entry: [s.title, s.label, s.url], rank: at === 0 ? 0 : 1, kind: 2 });
     }
     scored.sort((a, b) => a.rank - b.rank || a.kind - b.kind);
     return [...shortcuts, ...scored.slice(0, LIMIT).map((s) => s.entry)];
@@ -280,7 +308,7 @@ export default function Palette(props: Props) {
               <span>↑↓ moverse</span>
               <span>⏎ abrir</span>
               <span>esc cerrar</span>
-              <span class="ml-auto">{props.entries.length + extras().length + lessons().length} destinos</span>
+              <span class="ml-auto">{props.entries.length + extras().length + lessons().length + sheetHits().length} destinos</span>
             </p>
           </div>
         </div>
