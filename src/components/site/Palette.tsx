@@ -20,6 +20,7 @@ const LIMIT = 40;
 const SHORTCUTS: Entry[] = [
   ['Inicio', 'ir a', '/'],
   ['Centro de Estudios', 'ir a', '/cs/'],
+  ['Conceptos', 'ir a', '/conceptos/'],
   ['Recursos', 'ir a', '/recursos/'],
   ['Sobre el sitio', 'ir a', '/about/'],
 ];
