@@ -152,7 +152,11 @@ Microinteracciones, sonido opcional (off por defecto), transiciones entre leccio
 
 # Parte V · Riesgos
 
-- **Fidelidad de la emulación**: codemirror-vim no es Neovim (sin splits, sin folds reales, sin Lua). Mitigación: los drills cubren edición pura (donde la emulación es fiel); los conceptos de plataforma (LSP, ventanas, plugins) se enseñan con las familias de diagramas interactivos, no con el emulador. La fase 1 valida esto antes de invertir en el resto.
+- **Fidelidad de la emulación** — evaluadas las tres vías, la decisión es un híbrido:
+  - **Neovim real en el navegador: no existe.** El WASM oficial es una propuesta de GSoC **2026** aún en discusión (libuv no mapea a WASM sin mocks; ver neovim/neovim#35567 y discussions #38033). `vim.wasm` es Vim, muerto desde 2020. Y headless en servidor rompe el sitio estático (infra, latencia, seguridad). Descartado hoy.
+  - **Simular la semántica a mano con CSS/HTML: trampa.** Las sutilezas (reglas de `:h exclusive`, `cw`≈`ce`, tipos de registro) son exactamente lo que el curso enseña; una reimplementación propia mentiría donde el texto acierta. codemirror-vim ya es esa reimplementación, con 10 años de batalla.
+  - **La vía elegida**: motor codemirror-vim + **piel propia en CSS/HTML** (statusline con modo, ruler, cmdline: se ve como un Neovim de terminal) + **compuertas por lección** (el drill solo acepta teclas ya enseñadas, estilo keybr) + **oráculo en CI**: cada solución se ejecuta en `nvim --headless` real y el buffer resultante se compara con el del emulador; si divergen, el drill se corrige o degrada a reproducción. Fidelidad garantizada drill a drill contra Neovim de verdad, sin cargarlo en el navegador. Y el formato `{doc, cursor, objetivo}` es agnóstico del motor: cuando llegue el WASM oficial, se cambia el motor sin tocar los ejercicios.
+  - Los conceptos de plataforma (LSP, ventanas, plugins) se enseñan con las familias de diagramas, no con el emulador.
 - **Peso de página**: CM6 solo carga al ver el primer drill (`client:visible`), una instancia de módulo por página. Los diagramas SVG son más ligeros que el Mermaid actual (que hoy descarga el renderer entero).
 - **Los otros 27 tracks usan Mermaid**: no se tocan. Los componentes nuevos conviven con Mermaid; la migración de otros tracks es una decisión futura por track.
 - **Móvil**: los drills exigen teclado físico. En pantallas táctiles el drill degrada a modo reproducción (ver la solución animada) con aviso honesto.

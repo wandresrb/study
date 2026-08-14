@@ -1,6 +1,17 @@
 import { DatabaseSync } from 'node:sqlite';
 
-const db = new DatabaseSync('db/catalog.db', { readOnly: true });
+// Inlined by vite.define in astro.config.mjs: an absolute path anchored to the
+// project root, valid in dev and inside the prerender bundle (where
+// import.meta.url would point at dist/.prerender/).
+const DB_PATH = import.meta.env.DB_PATH as string;
+
+// In dev the catalog integration invalidates this module after regenerating the
+// db; closing the previous connection keeps file descriptors from leaking.
+const globals = globalThis as Record<string, unknown>;
+if (globals.__catalogDb instanceof DatabaseSync) globals.__catalogDb.close();
+
+const db = new DatabaseSync(DB_PATH, { readOnly: true });
+globals.__catalogDb = db;
 
 export type Stratum = 'concept' | 'implementation' | 'tool';
 export type Status = 'written' | 'indexed' | 'planned';

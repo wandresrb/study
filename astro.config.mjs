@@ -1,4 +1,5 @@
 // @ts-check
+import { fileURLToPath } from 'node:url';
 import { defineConfig, fontProviders } from 'astro/config';
 import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
@@ -8,6 +9,7 @@ import solidJs from '@astrojs/solid-js';
 import tailwindcss from '@tailwindcss/vite';
 
 import { fileTitleTransformer } from './src/lib/shiki-file-title.ts';
+import catalog from './src/integrations/catalog.ts';
 
 export default defineConfig({
   site: 'https://wandres.dev',
@@ -54,9 +56,12 @@ export default defineConfig({
     },
   },
 
-  integrations: [mdx(), sitemap(), solidJs()],
+  integrations: [catalog(), mdx(), sitemap(), solidJs()],
 
   vite: {
     plugins: [tailwindcss()],
+    define: {
+      'import.meta.env.DB_PATH': JSON.stringify(fileURLToPath(new URL('./db/catalog.db', import.meta.url))),
+    },
   },
 });
