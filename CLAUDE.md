@@ -375,7 +375,8 @@ español. Las rutas viejas en español (`/guia/`, `/recursos/`) son legado: se m
 cuando se decida, no de tapadillo. La migración de código está a medias: `src/lib/board/`,
 `src/portada/`, `src/lib/iconos.ts` y `src/lib/escena.ts` siguen en español; al tocarlos, migra
 hacia el inglés, nunca al revés. Los mensajes de commit también en inglés (`feat(track): …`,
-`fix(neovim): …`).
+`fix(neovim): …`), **de una línea: sin cuerpo narrativo y sin coautorías** — el historial no es un
+diario.
 
 **Comentarios: cortos.** Una o dos líneas, y solo cuando explican un *por qué* que no se deduce del
 código (una decisión contraintuitiva, una restricción de Astro, una colisión conocida). El repo
