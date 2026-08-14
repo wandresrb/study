@@ -1,130 +1,145 @@
+import { spawnSync } from 'node:child_process';
 import { readdir, readFile } from 'node:fs/promises';
-import { join, basename } from 'node:path';
+import { basename, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
-const GUIA = 'src/content/guia';
-const TRACKS = 'src/content/tracks';
-const ICONOS = 'src/lib/iconos.ts';
+const GUIDE = 'src/content/guia';
+const ICONS = 'src/lib/iconos.ts';
+const DB = 'db/catalog.db';
 
-const COMPONENTES = new Set([
+const COMPONENTS = new Set([
   'Callout', 'KeyCap', 'Kbd', 'Mermaid', 'Cards', 'Card', 'PluginCard',
   'Objetivos', 'Reto', 'Lead', 'Drill', 'Paso', 'Instalar',
   'Fragment',
 ]);
 
-const fallos = [];
-const avisos = [];
-const falla = (f, m) => fallos.push(`${f}: ${m}`);
-const avisa = (f, m) => avisos.push(`${f}: ${m}`);
+const errors = [];
+const warnings = [];
+const fail = (f, m) => errors.push(`${f}: ${m}`);
+const warn = (f, m) => warnings.push(`${f}: ${m}`);
 
-function frontmatter(texto) {
-  if (!texto.startsWith('---\n')) return null;
-  const fin = texto.indexOf('\n---', 4);
-  if (fin === -1) return null;
-  const datos = {};
-  for (const linea of texto.slice(4, fin).split('\n')) {
-    const m = linea.match(/^(\w+):\s*(.*)$/);
-    if (m) datos[m[1]] = m[2].trim().replace(/^["'](.*)["']$/, '$1');
+function frontmatter(text) {
+  if (!text.startsWith('---\n')) return null;
+  const end = text.indexOf('\n---', 4);
+  if (end === -1) return null;
+  const data = {};
+  for (const line of text.slice(4, end).split('\n')) {
+    const m = line.match(/^(\w+):\s*(.*)$/);
+    if (m) data[m[1]] = m[2].trim().replace(/^["'](.*)["']$/, '$1');
   }
-  return datos;
+  return data;
 }
 
-const soloTrack = process.argv[2];
-const tracks = new Set(
-  (await readdir(TRACKS)).filter((f) => f.endsWith('.json')).map((f) => basename(f, '.json')),
-);
-const carpetas = (await readdir(GUIA, { withFileTypes: true }))
-  .filter((d) => d.isDirectory() && (!soloTrack || d.name === soloTrack))
+// build-db valida la estructura (tracks, niveles, referencias del frontmatter)
+// y deja la base que este script consulta; si falla, su mensaje ya dice qué.
+const built = spawnSync(process.execPath, ['scripts/build-db.mjs'], {
+  stdio: ['ignore', 'ignore', 'inherit'],
+});
+if (built.status !== 0) {
+  console.error('✗ build-db falló: la estructura no valida (el mensaje de arriba dice dónde)');
+  process.exit(1);
+}
+
+const db = new DatabaseSync(DB, { readOnly: true });
+const tracks = new Set(db.prepare('SELECT id FROM track').all().map((r) => String(r.id)));
+const levelNames = new Map();
+for (const r of db.prepare('SELECT track, idx, name FROM level').all()) {
+  if (!levelNames.has(r.track)) levelNames.set(r.track, new Map());
+  levelNames.get(r.track).set(Number(r.idx), String(r.name));
+}
+
+const onlyTrack = process.argv[2];
+const folders = (await readdir(GUIDE, { withFileTypes: true }))
+  .filter((d) => d.isDirectory() && (!onlyTrack || d.name === onlyTrack))
   .map((d) => d.name);
 
-for (const sueltoEnRaiz of (await readdir(GUIA, { withFileTypes: true })).filter((d) => d.isFile())) {
-  falla(GUIA, `"${sueltoEnRaiz.name}" está en la raíz; cada track va en su carpeta`);
+for (const loose of (await readdir(GUIDE, { withFileTypes: true })).filter((d) => d.isFile())) {
+  fail(GUIDE, `"${loose.name}" está en la raíz; cada track va en su carpeta`);
 }
 
 let total = 0;
 
-for (const track of carpetas) {
-  const dir = join(GUIA, track);
-  if (!tracks.has(track)) falla(dir, `no existe ${TRACKS}/${track}.json`);
+for (const track of folders) {
+  const dir = join(GUIDE, track);
+  if (!tracks.has(track)) fail(dir, `no existe el track "${track}" en db/seeds/03-tracks.sql`);
 
-  let niveles;
-  try {
-    niveles = JSON.parse(await readFile(join(dir, '_niveles.json'), 'utf8')).niveles;
-  } catch {
-    falla(dir, 'falta _niveles.json o no es JSON válido');
+  const levels = levelNames.get(track);
+  if (!levels) {
+    fail(dir, 'el track no tiene niveles en db/seeds/04-levels.sql');
     continue;
   }
 
-  const lecciones = [];
+  const lessons = [];
   for (const f of (await readdir(dir)).filter((f) => f.endsWith('.mdx'))) {
-    const ruta = join(dir, f);
-    const texto = await readFile(ruta, 'utf8');
-    const fm = frontmatter(texto);
+    const path = join(dir, f);
+    const text = await readFile(path, 'utf8');
+    const fm = frontmatter(text);
     total++;
-    if (!fm) { falla(ruta, 'sin frontmatter'); continue; }
+    if (!fm) { fail(path, 'sin frontmatter'); continue; }
 
-    for (const campo of ['title', 'description', 'subject', 'level', 'order', 'posicion']) {
-      if (!fm[campo]) falla(ruta, `falta "${campo}"`);
+    for (const field of ['title', 'description', 'subject', 'level', 'order', 'posicion']) {
+      if (!fm[field]) fail(path, `falta "${field}"`);
     }
     if (fm.subject && fm.subject !== track) {
-      falla(ruta, `subject "${fm.subject}" no coincide con la carpeta "${track}"`);
+      fail(path, `subject "${fm.subject}" no coincide con la carpeta "${track}"`);
     }
     if (fm.posicion && !/^\d+(\.\d+)?$/.test(fm.posicion)) {
-      falla(ruta, `posicion "${fm.posicion}" no tiene la forma «17» o «17.5»`);
+      fail(path, `posicion "${fm.posicion}" no tiene la forma «17» o «17.5»`);
     }
     const level = Number(fm.level);
     const order = Number(fm.order);
-    if (!Number.isInteger(level) || level < 0) falla(ruta, `level "${fm.level}" inválido`);
-    else if (level >= niveles.length) falla(ruta, `level ${level} y _niveles.json solo tiene ${niveles.length}`);
-    if (!Number.isInteger(order) || order < 1) falla(ruta, `order "${fm.order}" inválido`);
+    if (!Number.isInteger(level) || level < 0) fail(path, `level "${fm.level}" inválido`);
+    else if (!levels.has(level)) fail(path, `level ${level} no existe en db/seeds/04-levels.sql`);
+    if (!Number.isInteger(order) || order < 1) fail(path, `order "${fm.order}" inválido`);
     if (fm.posicion && fm.posicion !== `${level}.${order}`) {
-      avisa(ruta, `posicion "${fm.posicion}" debería ser "${level}.${order}"`);
+      warn(path, `posicion "${fm.posicion}" debería ser "${level}.${order}"`);
     }
 
-    const prosa = texto
-      .slice(texto.indexOf('\n---', 4) + 4)
+    const prose = text
+      .slice(text.indexOf('\n---', 4) + 4)
       .replace(/^ {0,3}(```|~~~)[\s\S]*?^ {0,3}\1/gm, '')
       .replace(/`[^`\n]*`/g, '');
-    for (const [, etiqueta] of prosa.matchAll(/<([A-Z]\w*)[\s/>]/g)) {
-      if (!COMPONENTES.has(etiqueta)) falla(ruta, `<${etiqueta}> no está registrado en guia/[...slug].astro`);
+    for (const [, tag] of prose.matchAll(/<([A-Z]\w*)[\s/>]/g)) {
+      if (!COMPONENTS.has(tag)) fail(path, `<${tag}> no está registrado en guia/[...slug].astro`);
     }
 
-    lecciones.push({ ruta, level, order });
+    lessons.push({ path, level, order });
   }
 
-  const vistas = new Map();
-  for (const l of lecciones) {
-    const clave = `${l.level}.${l.order}`;
-    if (vistas.has(clave)) falla(l.ruta, `level.order ${clave} duplicado con ${vistas.get(clave)}`);
-    else vistas.set(clave, basename(l.ruta));
+  const seen = new Map();
+  for (const l of lessons) {
+    const key = `${l.level}.${l.order}`;
+    if (seen.has(key)) fail(l.path, `level.order ${key} duplicado con ${seen.get(key)}`);
+    else seen.set(key, basename(l.path));
   }
 
-  for (let n = 0; n < niveles.length; n++) {
-    const ordenes = lecciones.filter((l) => l.level === n).map((l) => l.order).sort((a, b) => a - b);
-    if (ordenes.length === 0) { avisa(dir, `el nivel ${n} ("${niveles[n].nombre}") no tiene lecciones`); continue; }
-    for (let i = 0; i < ordenes.length; i++) {
-      if (ordenes[i] !== i + 1) { falla(dir, `nivel ${n}: la numeración salta (${ordenes.join(',')})`); break; }
+  for (const n of [...levels.keys()].sort((a, b) => a - b)) {
+    const orders = lessons.filter((l) => l.level === n).map((l) => l.order).sort((a, b) => a - b);
+    if (orders.length === 0) { warn(dir, `el nivel ${n} ("${levels.get(n)}") no tiene lecciones`); continue; }
+    for (let i = 0; i < orders.length; i++) {
+      if (orders[i] !== i + 1) { fail(dir, `nivel ${n}: la numeración salta (${orders.join(',')})`); break; }
     }
   }
 }
 
 {
-  const fuente = await readFile(ICONOS, 'utf8');
-  const mapa = /const TRACK_ICON[^{]*\{([\s\S]*?)^\};/m.exec(fuente);
-  if (!mapa) falla(ICONOS, 'no se encuentra el objeto TRACK_ICON');
+  const source = await readFile(ICONS, 'utf8');
+  const map = /const TRACK_ICON[^{]*\{([\s\S]*?)^\};/m.exec(source);
+  if (!map) fail(ICONS, 'no se encuentra el objeto TRACK_ICON');
   else {
-    const claves = new Set([...mapa[1].matchAll(/^\s*'([^']+)':/gm)].map((m) => m[1]));
+    const keys = new Set([...map[1].matchAll(/^\s*'([^']+)':/gm)].map((m) => m[1]));
     for (const t of tracks) {
-      if (!claves.has(t)) falla(ICONOS, `el track "${t}" no tiene icono en TRACK_ICON`);
+      if (!keys.has(t)) fail(ICONS, `el track "${t}" no tiene icono en TRACK_ICON`);
     }
-    for (const c of claves) {
-      if (!tracks.has(c)) falla(ICONOS, `"${c}" tiene icono pero no existe ${TRACKS}/${c}.json`);
+    for (const k of keys) {
+      if (!tracks.has(k)) fail(ICONS, `"${k}" tiene icono pero no existe en db/seeds/03-tracks.sql`);
     }
   }
 }
 
-for (const m of fallos) console.error(`✗ ${m}`);
-for (const m of avisos) console.warn(`⚠ ${m}`);
+for (const m of errors) console.error(`✗ ${m}`);
+for (const m of warnings) console.warn(`⚠ ${m}`);
 console.log(
-  `\n${total} lecciones en ${carpetas.length} tracks · ${fallos.length} errores · ${avisos.length} avisos`,
+  `\n${total} lecciones en ${folders.length} tracks · ${errors.length} errores · ${warnings.length} avisos`,
 );
-process.exit(fallos.length ? 1 : 0);
+process.exit(errors.length ? 1 : 0);

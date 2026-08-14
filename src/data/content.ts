@@ -90,6 +90,12 @@ const qTotals = db.prepare(
           (SELECT count(*) FROM track WHERE status = 'written') tracks
    FROM lesson`,
 );
+const qCheatsheet = db.prepare('SELECT meta, description, placeholder FROM cheatsheet WHERE track = ?');
+const qCheatsheetTracks = db.prepare('SELECT track FROM cheatsheet ORDER BY track');
+const qCheatsheetCats = db.prepare('SELECT sort, name, icon FROM cheatsheet_category WHERE track = ? ORDER BY sort');
+const qCheatsheetItems = db.prepare(
+  'SELECT category, keys, action FROM cheatsheet_item WHERE track = ? ORDER BY category, sort',
+);
 
 type Row = Record<string, string | number | null>;
 
@@ -238,4 +244,47 @@ export function lessonsOf(trackId: string): Lesson[] {
     description: String(l.description),
     minutes: Number(l.minutes),
   }));
+}
+
+export interface CheatsheetItem {
+  keys: string;
+  action: string;
+}
+
+export interface Cheatsheet {
+  meta: string;
+  description: string;
+  placeholder: string;
+  cats: { name: string; icon: string; items: CheatsheetItem[] }[];
+}
+
+export function cheatsheetTracks(): string[] {
+  return (qCheatsheetTracks.all() as Row[]).map((r) => String(r.track));
+}
+
+export function hasCheatsheet(trackId: string): boolean {
+  return qCheatsheet.get(trackId) !== undefined;
+}
+
+export function getCheatsheet(trackId: string): Cheatsheet {
+  const head = qCheatsheet.get(trackId) as Row | undefined;
+  if (!head) throw new Error(`Track "${trackId}" has no cheatsheet`);
+
+  const items = new Map<number, CheatsheetItem[]>();
+  for (const it of qCheatsheetItems.all(trackId) as Row[]) {
+    const list = items.get(Number(it.category)) ?? [];
+    list.push({ keys: String(it.keys), action: String(it.action) });
+    items.set(Number(it.category), list);
+  }
+
+  return {
+    meta: String(head.meta),
+    description: String(head.description),
+    placeholder: String(head.placeholder),
+    cats: (qCheatsheetCats.all(trackId) as Row[]).map((c) => ({
+      name: String(c.name),
+      icon: String(c.icon),
+      items: items.get(Number(c.sort)) ?? [],
+    })),
+  };
 }
