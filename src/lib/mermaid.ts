@@ -9,6 +9,32 @@ async function pintar() {
 
   if (!mermaid) {
     ({ default: mermaid } = await import('mermaid'));
+
+    // Colors come from the active theme's tokens at first paint. Mermaid
+    // initializes once, so diagrams keep that palette until the next page
+    // load even if the theme switches afterwards — acceptable for a lazy,
+    // per-page renderer.
+    const css = getComputedStyle(document.documentElement);
+    const v = (name: string) => css.getPropertyValue(name).trim();
+    const crust = v('--crust');
+    const mantle = v('--mantle');
+    const surface0 = v('--surface0');
+    const surface1 = v('--surface1');
+    const surface2 = v('--surface2');
+    const overlay0 = v('--overlay0');
+    const text = v('--text');
+    const mauve = v('--mauve');
+    const blue = v('--blue');
+    const green = v('--green');
+    const peach = v('--peach');
+    const pink = v('--pink');
+    const teal = v('--teal');
+    const yellow = v('--yellow');
+    const lavender = v('--lavender');
+    const sapphire = v('--sapphire');
+    const maroon = v('--maroon');
+    const red = v('--red');
+
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: 'loose',
@@ -18,88 +44,88 @@ async function pintar() {
         darkMode: true,
         fontSize: '14px',
 
-        background: '#11111b',
-        mainBkg: '#313244',
-        primaryColor: '#313244',
-        primaryTextColor: '#cdd6f4',
-        primaryBorderColor: '#cba6f7',
-        secondaryColor: '#45475a',
-        secondaryTextColor: '#cdd6f4',
-        secondaryBorderColor: '#585b70',
-        tertiaryColor: '#181825',
-        tertiaryTextColor: '#cdd6f4',
-        tertiaryBorderColor: '#45475a',
-        lineColor: '#89b4fa',
-        arrowheadColor: '#89b4fa',
-        defaultLinkColor: '#89b4fa',
-        textColor: '#cdd6f4',
-        titleColor: '#cdd6f4',
-        border2: '#45475a',
+        background: crust,
+        mainBkg: surface0,
+        primaryColor: surface0,
+        primaryTextColor: text,
+        primaryBorderColor: mauve,
+        secondaryColor: surface1,
+        secondaryTextColor: text,
+        secondaryBorderColor: surface2,
+        tertiaryColor: mantle,
+        tertiaryTextColor: text,
+        tertiaryBorderColor: surface1,
+        lineColor: blue,
+        arrowheadColor: blue,
+        defaultLinkColor: blue,
+        textColor: text,
+        titleColor: text,
+        border2: surface1,
 
-        nodeBorder: '#cba6f7',
-        nodeTextColor: '#cdd6f4',
-        clusterBkg: '#181825',
-        clusterBorder: '#45475a',
-        nodeBkg: '#313244',
-        edgeLabelBackground: '#181825',
-        labelTextColor: '#cdd6f4',
-        labelBackgroundColor: '#181825',
-        labelBoxBkgColor: '#313244',
-        labelBoxBorderColor: '#cba6f7',
-        scaleLabelColor: '#cdd6f4',
+        nodeBorder: mauve,
+        nodeTextColor: text,
+        clusterBkg: mantle,
+        clusterBorder: surface1,
+        nodeBkg: surface0,
+        edgeLabelBackground: mantle,
+        labelTextColor: text,
+        labelBackgroundColor: mantle,
+        labelBoxBkgColor: surface0,
+        labelBoxBorderColor: mauve,
+        scaleLabelColor: text,
 
-        actorBkg: '#313244',
-        actorBorder: '#cba6f7',
-        actorTextColor: '#cdd6f4',
-        actorLineColor: '#6c7086',
-        signalColor: '#cdd6f4',
-        signalTextColor: '#cdd6f4',
-        messageTextColor: '#cdd6f4',
-        loopTextColor: '#cdd6f4',
-        noteBkgColor: '#45475a',
-        noteBorderColor: '#f9e2af',
-        noteTextColor: '#cdd6f4',
-        activationBkgColor: '#45475a',
-        activationBorderColor: '#cba6f7',
-        sequenceNumberColor: '#11111b',
-        altBackground: '#181825',
+        actorBkg: surface0,
+        actorBorder: mauve,
+        actorTextColor: text,
+        actorLineColor: overlay0,
+        signalColor: text,
+        signalTextColor: text,
+        messageTextColor: text,
+        loopTextColor: text,
+        noteBkgColor: surface1,
+        noteBorderColor: yellow,
+        noteTextColor: text,
+        activationBkgColor: surface1,
+        activationBorderColor: mauve,
+        sequenceNumberColor: crust,
+        altBackground: mantle,
 
-        stateBkg: '#313244',
-        stateLabelColor: '#cdd6f4',
-        transitionColor: '#89b4fa',
-        transitionLabelColor: '#cdd6f4',
-        compositeBackground: '#181825',
-        compositeBorder: '#45475a',
-        compositeTitleBackground: '#313244',
-        innerEndBackground: '#cba6f7',
-        specialStateColor: '#cdd6f4',
-        errorBkgColor: '#f38ba8',
-        errorTextColor: '#11111b',
+        stateBkg: surface0,
+        stateLabelColor: text,
+        transitionColor: blue,
+        transitionLabelColor: text,
+        compositeBackground: mantle,
+        compositeBorder: surface1,
+        compositeTitleBackground: surface0,
+        innerEndBackground: mauve,
+        specialStateColor: text,
+        errorBkgColor: red,
+        errorTextColor: crust,
 
-        cScale0: '#313244',  cScaleLabel0: '#cdd6f4',
-        cScale1: '#45475a',  cScaleLabel1: '#cdd6f4',
-        cScale2: '#181825',  cScaleLabel2: '#cdd6f4',
-        cScale3: '#313244',  cScaleLabel3: '#cdd6f4',
-        cScale4: '#45475a',  cScaleLabel4: '#cdd6f4',
-        cScale5: '#181825',  cScaleLabel5: '#cdd6f4',
-        cScale6: '#313244',  cScaleLabel6: '#cdd6f4',
-        cScale7: '#45475a',  cScaleLabel7: '#cdd6f4',
-        cScale8: '#181825',  cScaleLabel8: '#cdd6f4',
-        cScale9: '#313244',  cScaleLabel9: '#cdd6f4',
-        cScale10: '#45475a', cScaleLabel10: '#cdd6f4',
-        cScale11: '#181825', cScaleLabel11: '#cdd6f4',
+        cScale0: surface0,  cScaleLabel0: text,
+        cScale1: surface1,  cScaleLabel1: text,
+        cScale2: mantle,    cScaleLabel2: text,
+        cScale3: surface0,  cScaleLabel3: text,
+        cScale4: surface1,  cScaleLabel4: text,
+        cScale5: mantle,    cScaleLabel5: text,
+        cScale6: surface0,  cScaleLabel6: text,
+        cScale7: surface1,  cScaleLabel7: text,
+        cScale8: mantle,    cScaleLabel8: text,
+        cScale9: surface0,  cScaleLabel9: text,
+        cScale10: surface1, cScaleLabel10: text,
+        cScale11: mantle,   cScaleLabel11: text,
 
-        cScalePeer0: '#cba6f7', cScalePeer1: '#89b4fa', cScalePeer2: '#a6e3a1',
-        cScalePeer3: '#fab387', cScalePeer4: '#f5c2e7', cScalePeer5: '#94e2d5',
-        cScalePeer6: '#f9e2af', cScalePeer7: '#b4befe', cScalePeer8: '#74c7ec',
-        cScalePeer9: '#eba0ac', cScalePeer10: '#cba6f7', cScalePeer11: '#89b4fa',
+        cScalePeer0: mauve, cScalePeer1: blue, cScalePeer2: green,
+        cScalePeer3: peach, cScalePeer4: pink, cScalePeer5: teal,
+        cScalePeer6: yellow, cScalePeer7: lavender, cScalePeer8: sapphire,
+        cScalePeer9: maroon, cScalePeer10: mauve, cScalePeer11: blue,
 
-        git0: '#cba6f7', git1: '#89b4fa', git2: '#a6e3a1', git3: '#fab387',
-        git4: '#f5c2e7', git5: '#94e2d5', git6: '#f9e2af', git7: '#b4befe',
-        gitBranchLabel0: '#11111b', gitBranchLabel1: '#11111b',
-        gitBranchLabel2: '#11111b', gitBranchLabel3: '#11111b',
-        gitBranchLabel4: '#11111b', gitBranchLabel5: '#11111b',
-        gitBranchLabel6: '#11111b', gitBranchLabel7: '#11111b',
+        git0: mauve, git1: blue, git2: green, git3: peach,
+        git4: pink, git5: teal, git6: yellow, git7: lavender,
+        gitBranchLabel0: crust, gitBranchLabel1: crust,
+        gitBranchLabel2: crust, gitBranchLabel3: crust,
+        gitBranchLabel4: crust, gitBranchLabel5: crust,
+        gitBranchLabel6: crust, gitBranchLabel7: crust,
       },
     });
   }

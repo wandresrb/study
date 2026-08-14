@@ -27,6 +27,13 @@ const SHORTCUTS: Entry[] = [
   ['Sobre el sitio', 'ir a', '/about/'],
 ];
 
+// Proto-omnibar: until the Modo Normal chrome lands, :theme lives here.
+const THEME_CMDS: Entry[] = [
+  ['Tema: Kanagawa', 'tema', ':theme kanagawa'],
+  ['Tema: Catppuccin', 'tema', ':theme catppuccin'],
+  ['Tema: Everforest', 'tema', ':theme everforest'],
+];
+
 interface CatalogData {
   lessons: [string, string, string][];
   concepts: [string, string][];
@@ -114,7 +121,7 @@ export default function Palette(props: Props) {
     const shortcuts = SHORTCUTS.filter((s) => fold(s[0]).includes(q));
 
     const scored: { entry: Entry; rank: number; kind: number }[] = [];
-    for (const entry of [...props.entries, ...extras()]) {
+    for (const entry of [...THEME_CMDS, ...props.entries, ...extras()]) {
       const name = fold(entry[0]);
       const at = name.indexOf(q);
       if (at === 0) scored.push({ entry, rank: 0, kind: 0 });
@@ -136,6 +143,17 @@ export default function Palette(props: Props) {
   };
 
   const go = (path: string) => {
+    if (path.startsWith(':theme ')) {
+      const theme = path.slice(7);
+      try {
+        localStorage.setItem('theme', theme);
+      } catch {
+        /* private mode: the switch still applies for this page */
+      }
+      document.documentElement.dataset.theme = theme;
+      close();
+      return;
+    }
     setOpen(false);
     lastFocused = null;
     navigate(path);

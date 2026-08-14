@@ -62,7 +62,12 @@ export default defineConfig({
       rehypePlugins: [[rehypeKatex, { throwOnError: true, strict: 'error' }]],
     }),
     shikiConfig: {
-      theme: 'catppuccin-mocha',
+      themes: {
+        kanagawa: 'kanagawa-wave',
+        catppuccin: 'catppuccin-mocha',
+        everforest: 'everforest-dark',
+      },
+      defaultColor: false,
       wrap: false,
       transformers: [fileTitleTransformer],
     },
