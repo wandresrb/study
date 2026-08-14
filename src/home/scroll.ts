@@ -1,212 +1,213 @@
 import { createEffect, createRoot } from 'solid-js';
 
-import type { Escena, Montar } from '../lib/escena';
-import { empujar, fase, irA, pila, plegarConsola } from './estado';
-import { MARCAS, PASOS } from './guion';
-const seguirEstado = () => {
-  sueltaEstado?.();
-  sueltaEstado = createRoot((soltar) => {
+import type { Scene, Mount } from '../lib/scene';
+import { push, phase, goTo, stack, collapseConsole } from './state';
+import { MARKS, STEPS } from './script';
+const watchPhase = () => {
+  disposePhase?.();
+  disposePhase = createRoot((dispose) => {
     createEffect(() => {
-      const f = fase();
+      const f = phase();
+      // data-fase feeds the portada:/arrancando: variants in theme.css; keep the name.
       document.documentElement.dataset.fase = f;
-      const esc = anfitrion && montadas.get(anfitrion);
+      const scn = host && mounted.get(host);
 
       if (f === 'corriendo') {
-        esc?.arrancar?.();
+        scn?.start?.();
       } else if (f === 'inicio') {
-        esc?.reiniciar?.();
+        scn?.reset?.();
         window.scrollTo({ top: 0, behavior: 'auto' });
-        avance = -1;
-        crudo = -1;
-        medir();
+        progress = -1;
+        raw = -1;
+        measure();
       }
     });
-    return soltar;
+    return dispose;
   });
 };
 
-const CARGA: Record<string, () => Promise<{ montar: Montar }>> = {
+const LOADERS: Record<string, () => Promise<{ mount: Mount }>> = {
   hardware: () => import('../lib/board'),
 };
 
-let portada: HTMLElement | null = null;
-let capa: HTMLElement | null = null;
-let anfitrion: HTMLElement | null = null;
-let aviso: HTMLElement | null = null;
-let avance = -1;
-let crudo = -1;
-let pendiente = false;
-let activa = -1;
+let home: HTMLElement | null = null;
+let layer: HTMLElement | null = null;
+let host: HTMLElement | null = null;
+let hint: HTMLElement | null = null;
+let progress = -1;
+let raw = -1;
+let pending = false;
+let active = -1;
 
-const montadas = new Map<HTMLElement, Escena>();
-const montando = new Set<HTMLElement>();
-let vigia: IntersectionObserver | null = null;
+const mounted = new Map<HTMLElement, Scene>();
+const mounting = new Set<HTMLElement>();
+let watcher: IntersectionObserver | null = null;
 
-const reducido = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const reduced = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-let sueltaEstado: (() => void) | null = null;
+let disposePhase: (() => void) | null = null;
 
-const medir = () => {
-  pendiente = false;
-  if (!capa) return;
+const measure = () => {
+  pending = false;
+  if (!layer) return;
   const vh = window.innerHeight;
-  const r = capa.getBoundingClientRect();
-  const recorrido = r.height - vh;
-  const bruto = recorrido > 0 ? -r.top / recorrido : r.top <= 0 ? 1 : 0;
-  const ahora = Math.min(1, Math.max(0, bruto));
+  const r = layer.getBoundingClientRect();
+  const travel = r.height - vh;
+  const gross = travel > 0 ? -r.top / travel : r.top <= 0 ? 1 : 0;
+  const now = Math.min(1, Math.max(0, gross));
 
-  const p = Math.round(ahora * PASOS) / PASOS;
-  if (p !== avance) {
-    avance = p;
-    capa.style.setProperty('--p', String(p));
+  const p = Math.round(now * STEPS) / STEPS;
+  if (p !== progress) {
+    progress = p;
+    layer.style.setProperty('--p', String(p));
   }
-  if (ahora !== crudo) {
-    crudo = ahora;
-    const esc = anfitrion && montadas.get(anfitrion);
-    if (esc) esc.avance(ahora);
-    if (aviso) {
-      if (ahora > 0.06) aviso.dataset.lejos = '';
-      else delete aviso.dataset.lejos;
+  if (now !== raw) {
+    raw = now;
+    const scn = host && mounted.get(host);
+    if (scn) scn.advance(now);
+    if (hint) {
+      if (now > 0.06) hint.dataset.far = '';
+      else delete hint.dataset.far;
     }
   }
 
   let k = 0;
-  for (let i = 0; i < MARCAS.length; i++) if (ahora >= MARCAS[i]) k = i;
-  activa = k;
+  for (let i = 0; i < MARKS.length; i++) if (now >= MARKS[i]) k = i;
+  active = k;
 };
 
-const alScroll = () => {
-  if (pendiente) return;
-  pendiente = true;
-  requestAnimationFrame(medir);
+const onScroll = () => {
+  if (pending) return;
+  pending = true;
+  requestAnimationFrame(measure);
 };
 
-const irAMomento = (k: number) => {
-  if (!capa) return;
-  const f = MARCAS[Math.max(0, Math.min(MARCAS.length - 1, k))];
-  const arriba = capa.getBoundingClientRect().top + window.scrollY;
-  const recorrido = Math.max(0, capa.offsetHeight - window.innerHeight);
+const goToMark = (k: number) => {
+  if (!layer) return;
+  const f = MARKS[Math.max(0, Math.min(MARKS.length - 1, k))];
+  const top = layer.getBoundingClientRect().top + window.scrollY;
+  const travel = Math.max(0, layer.offsetHeight - window.innerHeight);
   window.scrollTo({
-    top: arriba + recorrido * f,
-    behavior: reducido() ? 'auto' : 'smooth',
+    top: top + travel * f,
+    behavior: reduced() ? 'auto' : 'smooth',
   });
 };
 
-let ultimaG = -1e9;
+let lastG = -1e9;
 
-const alTeclado = (e: KeyboardEvent) => {
-  if (!capa) return;
+const onKeydown = (e: KeyboardEvent) => {
+  if (!layer) return;
   const t = e.target as HTMLElement | null;
   if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-  if (fase() !== 'corriendo') return;
+  if (phase() !== 'corriendo') return;
 
   switch (e.key) {
     case 'j':
     case 'ArrowDown':
     case 'PageDown':
       e.preventDefault();
-      irAMomento(activa + 1);
+      goToMark(active + 1);
       break;
     case 'k':
     case 'ArrowUp':
     case 'PageUp':
       e.preventDefault();
-      irAMomento(activa - 1);
+      goToMark(active - 1);
       break;
     case 'g':
       e.preventDefault();
-      if (performance.now() - ultimaG < 500) irAMomento(0);
-      ultimaG = performance.now();
+      if (performance.now() - lastG < 500) goToMark(0);
+      lastG = performance.now();
       break;
     case 'G':
     case 'End':
       e.preventDefault();
-      irAMomento(MARCAS.length - 1);
+      goToMark(MARKS.length - 1);
       break;
     case 'Home':
       e.preventDefault();
-      irAMomento(0);
+      goToMark(0);
       break;
   }
 };
 
-const soltarTodas = () => {
-  for (const esc of montadas.values()) esc.destruir();
-  montadas.clear();
-  montando.clear();
-  vigia?.disconnect();
-  vigia = null;
+const destroyAll = () => {
+  for (const scn of mounted.values()) scn.destroy();
+  mounted.clear();
+  mounting.clear();
+  watcher?.disconnect();
+  watcher = null;
 };
 
-const vigilar = () => {
-  vigia = new IntersectionObserver(
-    (entradas) => {
-      for (const ent of entradas) {
-        const host = ent.target as HTMLElement;
-        const carga = CARGA[host.dataset.scene ?? ''];
-        if (!carga) continue;
+const watch = () => {
+  watcher = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        const el = entry.target as HTMLElement;
+        const loader = LOADERS[el.dataset.scene ?? ''];
+        if (!loader) continue;
 
-        if (ent.isIntersecting) {
-          if (montadas.has(host) || montando.has(host)) continue;
-          montando.add(host);
-          carga()
-            .then((m) => m.montar(host))
-            .then((esc) => {
-              if (!montando.has(host)) {
-                esc.destruir();
+        if (entry.isIntersecting) {
+          if (mounted.has(el) || mounting.has(el)) continue;
+          mounting.add(el);
+          loader()
+            .then((m) => m.mount(el))
+            .then((scn) => {
+              if (!mounting.has(el)) {
+                scn.destroy();
                 return;
               }
-              montadas.set(host, esc);
-              esc.avance(crudo < 0 ? 0 : crudo);
+              mounted.set(el, scn);
+              scn.advance(raw < 0 ? 0 : raw);
             })
             .catch((err) => {
-              if (import.meta.env.DEV) console.warn('[portada] escena no montada:', err);
+              if (import.meta.env.DEV) console.warn('[home] scene not mounted:', err);
             })
-            .finally(() => montando.delete(host));
+            .finally(() => mounting.delete(el));
         } else {
-          montando.delete(host);
-          const esc = montadas.get(host);
-          if (esc) {
-            esc.destruir();
-            montadas.delete(host);
+          mounting.delete(el);
+          const scn = mounted.get(el);
+          if (scn) {
+            scn.destroy();
+            mounted.delete(el);
           }
         }
       }
     },
     { rootMargin: '60% 0px 60% 0px' },
   );
-  if (anfitrion) vigia.observe(anfitrion);
+  if (host) watcher.observe(host);
 };
 
-document.addEventListener('scroll', alScroll, { passive: true });
-window.addEventListener('resize', alScroll);
-document.addEventListener('keydown', alTeclado);
-document.addEventListener('astro:before-swap', soltarTodas);
+document.addEventListener('scroll', onScroll, { passive: true });
+window.addEventListener('resize', onScroll);
+document.addEventListener('keydown', onKeydown);
+document.addEventListener('astro:before-swap', destroyAll);
 
 document.addEventListener('astro:before-swap', () => {
-  sueltaEstado?.();
-  sueltaEstado = null;
+  disposePhase?.();
+  disposePhase = null;
   delete document.documentElement.dataset.fase;
 });
 
 document.addEventListener('astro:page-load', () => {
-  portada = document.getElementById('portada');
-  capa = portada?.querySelector<HTMLElement>('[data-layer]') ?? null;
-  anfitrion = capa?.querySelector<HTMLElement>('[data-scene]') ?? null;
-  aviso = document.getElementById('teclas');
-  avance = -1;
-  crudo = -1;
-  activa = -1;
-  if (!portada) return;
+  home = document.getElementById('home');
+  layer = home?.querySelector<HTMLElement>('[data-layer]') ?? null;
+  host = layer?.querySelector<HTMLElement>('[data-scene]') ?? null;
+  hint = document.getElementById('keys');
+  progress = -1;
+  raw = -1;
+  active = -1;
+  if (!home) return;
 
-  if (reducido() && pila().length === 0) {
-    empujar('HARDWARE');
-    plegarConsola(true);
-    irA('corriendo');
+  if (reduced() && stack().length === 0) {
+    push('HARDWARE');
+    collapseConsole(true);
+    goTo('corriendo');
   }
-  seguirEstado();
-  medir();
-  if (!reducido()) vigilar();
+  watchPhase();
+  measure();
+  if (!reduced()) watch();
 });

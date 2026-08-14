@@ -1,9 +1,9 @@
-import { FIN } from '../lib/escena';
+import { END } from '../lib/scene';
 
-export { FIN };
+export { END };
 
-export const TRAMOS = 7.5;
+export const SPANS = 7.5;
 
-export const MARCAS = [0, 0.32, 0.56, 0.76].map((v) => v * FIN);
+export const MARKS = [0, 0.32, 0.56, 0.76].map((v) => v * END);
 
-export const PASOS = 32;
+export const STEPS = 32;

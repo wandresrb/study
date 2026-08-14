@@ -1,39 +1,39 @@
 import { For, Show } from 'solid-js';
 
-import { fase, irA, pila, sacar as sacarDeLaPila } from '../../portada/estado';
+import { phase, goTo, stack, pop as popStack } from '../../home/state';
 
-const SALIDA_MS = 620;
+const EXIT_MS = 620;
 
-const RANURA = 'flex items-center gap-4 min-h-[4.4rem] px-4 py-3.5 rounded-sm font-mono';
+const SLOT = 'flex items-center gap-4 min-h-[4.4rem] px-4 py-3.5 rounded-sm font-mono';
 
 export default function Stack() {
   const pop = () => {
-    if (fase() !== 'corriendo') return;
-    irA('saliendo');
+    if (phase() !== 'corriendo') return;
+    goTo('saliendo');
     window.setTimeout(() => {
-      sacarDeLaPila();
-      irA('inicio');
-    }, SALIDA_MS);
+      popStack();
+      goTo('inicio');
+    }, EXIT_MS);
   };
 
   return (
     <nav aria-label="Pila de capas">
       <ol class="m-0 list-none p-0">
         {}
-        <Show when={pila().length === 0}>
-          <li class={`${RANURA} border border-dashed border-overlay0`}>
+        <Show when={stack().length === 0}>
+          <li class={`${SLOT} border border-dashed border-overlay0`}>
             <span class="text-xs text-overlay2">0x0000</span>
             <span class="ml-auto text-sm text-overlay2">ranura libre</span>
           </li>
         </Show>
 
-        <For each={pila()}>
-          {(capa, i) => (
-            <li class={`${RANURA} border border-solid border-overlay1 bg-mantle`}>
-              <span class="text-xs text-overlay2">{capa.dir}</span>
-              <span class="text-lg tracking-versalita text-text">{capa.nombre}</span>
+        <For each={stack()}>
+          {(layer, i) => (
+            <li class={`${SLOT} border border-solid border-overlay1 bg-mantle`}>
+              <span class="text-xs text-overlay2">{layer.addr}</span>
+              <span class="text-lg tracking-versalita text-text">{layer.name}</span>
               {}
-              <Show when={i() === pila().length - 1}>
+              <Show when={i() === stack().length - 1}>
                 <button
                   type="button"
                   onClick={pop}
@@ -50,7 +50,7 @@ export default function Stack() {
       {}
       <div class="mt-2.5 h-px bg-overlay1" />
       <p class="mt-2 font-mono text-xs text-mauve">
-        <span aria-hidden="true">sp →</span> len <b class="font-semibold">{pila().length}</b> · cap 3
+        <span aria-hidden="true">sp →</span> len <b class="font-semibold">{stack().length}</b> · cap 3
       </p>
     </nav>
   );

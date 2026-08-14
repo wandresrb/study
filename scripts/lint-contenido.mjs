@@ -4,7 +4,7 @@ import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 const GUIDE = 'src/content/guia';
-const ICONS = 'src/lib/iconos.ts';
+const ICONS = 'src/lib/icons.ts';
 const DB = 'db/catalog.db';
 
 const COMPONENTS = new Set([
@@ -105,7 +105,7 @@ for (const track of folders) {
     // un <Esc> ahí dentro es texto. Se pelan de dentro afuera.
     for (let i = 0; i < 6; i++) prose = prose.replace(/\{[^{}]*\}/g, '');
     for (const [, tag] of prose.matchAll(/<([A-Z]\w*)[\s/>]/g)) {
-      if (!COMPONENTS.has(tag)) fail(path, `<${tag}> no está registrado en guia/[...slug].astro`);
+      if (!COMPONENTS.has(tag)) fail(path, `<${tag}> no está registrado en guide/[...slug].astro`);
     }
 
     lessons.push({ path, level, order });

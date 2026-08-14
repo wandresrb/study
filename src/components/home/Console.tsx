@@ -1,40 +1,40 @@
 import { For, Show } from 'solid-js';
 
 import './editor.css';
-import { SALIDA, TRAS_SALIDA } from '../../portada/programa';
+import { OUTPUT, AFTER_OUTPUT } from '../../home/program';
 import {
-  empujar,
-  escribir,
-  fase,
-  irA,
-  limpiarSalida,
-  plegada,
-  plegarConsola,
-  salida,
-} from '../../portada/estado';
+  push,
+  write,
+  phase,
+  goTo,
+  clearOutput,
+  collapsed,
+  collapseConsole,
+  output,
+} from '../../home/state';
 
 const PANEL = 'rounded-sm border border-overlay0 overflow-hidden';
-const BARRA = 'm-0 border-b border-surface1 bg-crust px-3.5 py-2 font-mono';
+const BAR = 'm-0 border-b border-surface1 bg-crust px-3.5 py-2 font-mono';
 
-export default function Console(props: { codigo: string }) {
-  let relojes: number[] = [];
+export default function Console(props: { code: string }) {
+  let timers: number[] = [];
 
-  const correr = () => {
-    if (fase() !== 'inicio') return;
-    limpiarSalida();
+  const run = () => {
+    if (phase() !== 'inicio') return;
+    clearOutput();
 
-    for (const l of SALIDA) {
-      relojes.push(window.setTimeout(() => escribir(l.texto, l.clase), l.t));
+    for (const l of OUTPUT) {
+      timers.push(window.setTimeout(() => write(l.text, l.cls), l.t));
     }
 
-    const ultimo = SALIDA[SALIDA.length - 1].t;
-    relojes.push(
+    const last = OUTPUT[OUTPUT.length - 1].t;
+    timers.push(
       window.setTimeout(() => {
-        empujar('HARDWARE');
-        plegarConsola(true);
-        irA('corriendo');
-        relojes = [];
-      }, ultimo + TRAS_SALIDA),
+        push('HARDWARE');
+        collapseConsole(true);
+        goTo('corriendo');
+        timers = [];
+      }, last + AFTER_OUTPUT),
     );
   };
 
@@ -43,23 +43,23 @@ export default function Console(props: { codigo: string }) {
       {}
       <button
         type="button"
-        aria-expanded={!plegada()}
-        onClick={() => plegarConsola(!plegada())}
+        aria-expanded={!collapsed()}
+        onClick={() => collapseConsole(!collapsed())}
         class="flex cursor-pointer items-center gap-2 rounded-sm border border-overlay0 bg-mantle px-3 py-1.5 font-mono text-xs text-subtext0 transition-colors hover:text-text focus-visible:text-text"
       >
         <span
           aria-hidden="true"
           class="inline-block text-2xs transition-[rotate] duration-200"
-          classList={{ '-rotate-90': plegada() }}
+          classList={{ '-rotate-90': collapsed() }}
         >
           ▾
         </span>
         <span>main.rs</span>
       </button>
 
-      <div class="mt-3 grid gap-3" classList={{ hidden: plegada() }}>
+      <div class="mt-3 grid gap-3" classList={{ hidden: collapsed() }}>
         <div class={`${PANEL} bg-mantle shadow-flotante`}>
-          <p class={`${BARRA} flex items-center gap-1.5 text-xs text-subtext0`}>
+          <p class={`${BAR} flex items-center gap-1.5 text-xs text-subtext0`}>
             <span aria-hidden="true" class="size-2 rounded-full bg-surface1" />
             <span aria-hidden="true" class="size-2 rounded-full bg-surface1" />
             <span aria-hidden="true" class="size-2 rounded-full bg-surface1" />
@@ -68,7 +68,7 @@ export default function Console(props: { codigo: string }) {
 
           {}
           {}
-          <div class="editor" innerHTML={props.codigo} />
+          <div class="editor" innerHTML={props.code} />
 
           {}
           <p class="m-0 flex items-center gap-3 border-t border-surface1 bg-crust px-3.5 py-1.5 font-mono text-2xs text-overlay1">
@@ -82,23 +82,23 @@ export default function Console(props: { codigo: string }) {
         </div>
 
         <div class={`${PANEL} bg-crust`}>
-          <p class={`${BARRA} flex items-baseline gap-2.5 text-2xs text-overlay1`}>
+          <p class={`${BAR} flex items-baseline gap-2.5 text-2xs text-overlay1`}>
             <b class="font-medium text-subtext0">zsh</b> <span>~/maquina</span>
           </p>
           <pre
             aria-live="polite"
             class="m-0 min-h-[4.6rem] px-3.5 py-2.5 font-mono text-xs/relaxed whitespace-pre-wrap text-subtext0"
           >
-            <For each={salida()}>
+            <For each={output()}>
               {(l) => (
                 <>
-                  <span class={l.clase}>{l.texto}</span>
+                  <span class={l.cls}>{l.text}</span>
                   {'\n'}
                 </>
               )}
             </For>
             {}
-            <Show when={salida().length === 0}>
+            <Show when={output().length === 0}>
               <span class="text-overlay1">
                 ${' '}
                 <b class="inline-block h-[1em] w-[0.5em] translate-y-[0.15em] animate-parpadeo bg-subtext0" />
@@ -109,8 +109,8 @@ export default function Console(props: { codigo: string }) {
 
         <button
           type="button"
-          onClick={correr}
-          disabled={fase() !== 'inicio'}
+          onClick={run}
+          disabled={phase() !== 'inicio'}
           class="inline-flex cursor-pointer items-center gap-2.5 justify-self-start rounded-full border border-green/55 bg-green/12 px-4 py-2.5 font-mono text-sm text-green transition-colors hover:not-disabled:bg-green/20 focus-visible:bg-green/20 disabled:cursor-default disabled:opacity-45"
         >
           <span aria-hidden="true" class="text-2xs">

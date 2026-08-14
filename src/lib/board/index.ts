@@ -1,108 +1,108 @@
 import gsap from 'gsap';
 
-import { FIN, type Escena } from '../escena';
-import { construir } from './placa';
-import { motor } from './render';
+import { END, type Scene } from '../scene';
+import { build } from './board';
+import { engine } from './render';
 import { rig } from './rig';
 
-const REPOSO = 0.72;
+const REST = 0.72;
 
-const HUNDE = [FIN, 0.94] as const;
+const SINK = [END, 0.94] as const;
 
-const suave = (t: number) => t * t * (3 - 2 * t);
-const franja = (p: number, a: number, b: number) =>
-  suave(Math.min(1, Math.max(0, (p - a) / (b - a))));
+const smooth = (t: number) => t * t * (3 - 2 * t);
+const band = (p: number, a: number, b: number) =>
+  smooth(Math.min(1, Math.max(0, (p - a) / (b - a))));
 
-export interface EscenaPlaca extends Escena {
-  arrancar(): void;
-  reiniciar(): void;
+export interface BoardScene extends Scene {
+  start(): void;
+  reset(): void;
 }
 
-export async function montar(host: HTMLElement): Promise<EscenaPlaca> {
-  const reducido = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const forzarGL = new URLSearchParams(window.location.search).has('gl');
+export async function mount(host: HTMLElement): Promise<BoardScene> {
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const forceGL = new URLSearchParams(window.location.search).has('gl');
 
   const r = rig();
-  const m = await motor(host, forzarGL, (w, h) => r.redimensionar(w, h));
-  const placa = construir(m.renderer);
+  const m = await engine(host, forceGL, (w, h) => r.resize(w, h));
+  const board = build(m.renderer);
 
   host.dataset.backend = m.backend;
 
-  const estado = { p: reducido ? REPOSO : 0, intro: reducido ? 1 : 0 };
-  const arranque = performance.now();
+  const state = { p: reduced ? REST : 0, intro: reduced ? 1 : 0 };
+  const startTime = performance.now();
 
-  let cuadros = 0;
-  let fallo = false;
-  let arrancado = reducido;
+  let frames = 0;
+  let failed = false;
+  let started = reduced;
 
-  const componer = (t: number) => {
+  const compose = (t: number) => {
     try {
-      const camara = Math.min(1, estado.p / FIN);
-      const hundido = franja(estado.p, HUNDE[0], HUNDE[1]);
+      const camera = Math.min(1, state.p / END);
+      const sunk = band(state.p, SINK[0], SINK[1]);
 
-      const hayMaquina = arrancado && hundido < 0.999;
-      if (hayMaquina) {
-        r.aplicar(camara, estado.intro);
-        placa.componer(camara, hundido);
-        placa.animar(t, estado.intro);
-        m.renderer.render(placa.escena, r.camara);
+      const showMachine = started && sunk < 0.999;
+      if (showMachine) {
+        r.apply(camera, state.intro);
+        board.compose(camera, sunk);
+        board.animate(t, state.intro);
+        m.renderer.render(board.scene, r.camera);
       } else {
         m.renderer.clear();
       }
 
-      m.mostrar();
-      cuadros++;
-      if (import.meta.env.DEV && cuadros % 30 === 1) host.dataset.cuadros = String(cuadros);
+      m.show();
+      frames++;
+      if (import.meta.env.DEV && frames % 30 === 1) host.dataset.frames = String(frames);
     } catch (err) {
-      if (!fallo) {
-        fallo = true;
-        host.dataset.fallo = String((err as Error)?.message ?? err);
-        console.error('[placa] el bucle no puede componer:', err);
+      if (!failed) {
+        failed = true;
+        host.dataset.error = String((err as Error)?.message ?? err);
+        console.error('[board] render loop cannot compose:', err);
       }
     }
   };
 
-  let vivo = true;
+  let alive = true;
   let raf = 0;
 
-  if (reducido) {
-    componer(0);
+  if (reduced) {
+    compose(0);
   } else {
-    const cuadro = () => {
-      if (!vivo) return;
-      raf = requestAnimationFrame(cuadro);
-      componer((performance.now() - arranque) / 1000);
+    const frame = () => {
+      if (!alive) return;
+      raf = requestAnimationFrame(frame);
+      compose((performance.now() - startTime) / 1000);
     };
-    raf = requestAnimationFrame(cuadro);
+    raf = requestAnimationFrame(frame);
   }
 
   return {
-    reiniciar() {
-      arrancado = false;
-      gsap.killTweensOf(estado);
-      estado.p = 0;
-      estado.intro = 0;
+    reset() {
+      started = false;
+      gsap.killTweensOf(state);
+      state.p = 0;
+      state.intro = 0;
     },
 
-    arrancar() {
-      if (arrancado || !vivo) return;
-      arrancado = true;
-      gsap.to(estado, { intro: 1, duration: 2.2, ease: 'power2.out' });
+    start() {
+      if (started || !alive) return;
+      started = true;
+      gsap.to(state, { intro: 1, duration: 2.2, ease: 'power2.out' });
     },
 
-    avance(p) {
-      if (reducido || !vivo) return;
-      gsap.to(estado, { p, duration: 0.7, ease: 'power2.out', overwrite: 'auto' });
+    advance(p) {
+      if (reduced || !alive) return;
+      gsap.to(state, { p, duration: 0.7, ease: 'power2.out', overwrite: 'auto' });
     },
 
-    destruir() {
-      vivo = false;
+    destroy() {
+      alive = false;
       cancelAnimationFrame(raf);
-      gsap.killTweensOf(estado);
+      gsap.killTweensOf(state);
       delete host.dataset.backend;
-      delete host.dataset.cuadros;
-      placa.soltar();
-      m.soltar();
+      delete host.dataset.frames;
+      board.dispose();
+      m.dispose();
     },
   };
 }

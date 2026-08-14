@@ -39,13 +39,13 @@ La capa interactiva del track de neovim (plan en `_PLAN-RUTA-INTERACTIVA.md`):
   racha, y cola de repaso 1/3/7/21 días que consume **`/neovim/dojo/`**. Completar todos los
   drills de una página marca la lección como leída en el sistema de `lib/progress.ts`.
 - **Diagramas**: Mermaid está siendo sustituido por familias de componentes (`Pipeline`, `ModeMap`,
-  `KeyboardMap` — registradas en `guia/[...slug].astro` y en el linter). `ModeMap` es la máquina
+  `KeyboardMap` — registradas en `guide/[...slug].astro` y en el linter). `ModeMap` es la máquina
   de modos que responde a teclas reales. Mermaid sigue siendo válido en tracks no migrados.
 - En las lecciones, `[` y `]` navegan anterior/siguiente (salvo con el foco en un input o un drill). `bun run check` (`astro check`) cubre los 73 ficheros de
 código y hoy está **limpio: 0 errores, 0 warnings, 0 hints**. Ese cero es el listón; si tu cambio
 añade un hint, quítalo antes de seguir. `bun run lint:contenido [track]` cubre las ~5.100
 lecciones en segundos: frontmatter, `subject` contra la carpeta, `posicion` contra `level.order`,
-numeración sin huecos ni duplicados y componentes sin registrar en `guia/[...slug].astro` —que no
+numeración sin huecos ni duplicados y componentes sin registrar en `guide/[...slug].astro` —que no
 dan error, salen como texto en la página—. Los `throw` de `src/data/contenido.ts` siguen saliendo
 solo en `bun run build`.
 
@@ -125,9 +125,9 @@ fantasma que nadie pintaba.
 | `/cs/` | `cs.astro` | El mapa: categorías × tracks, por planos |
 | `/{track}/` | `[track].astro` | Portada del track (solo los `disponible`) |
 | `/{track}/cheatsheet/` | `[track]/cheatsheet.astro` | Una ruta para las 28 hojas |
-| `/guia/{slug}/` | `guia/[...slug].astro` | Cada lección |
+| `/guide/{slug}/` | `guide/[...slug].astro` | Cada lección |
 | `/nav/{track}.json` | `nav/[track].json.ts` | El índice del track para la barra lateral |
-| `/config/`, `/recursos/` | sueltas | Referencia de Neovim. Sus datos NO están en la página: la config son ficheros `.lua` reales en `src/data/config-neovim/`, y los enlaces, `src/data/recursos-neovim.json` |
+| `/config/`, `/resources/` | sueltas | Referencia de Neovim. Sus datos NO están en la página: la config son ficheros `.lua` reales en `src/data/config-neovim/`, y los enlaces, `src/data/resources-neovim.json` |
 | `/about/` | `about.astro` | Sobre mí |
 
 `trailingSlash: 'always'` en `astro.config.mjs`. El único `redirect` que queda es `/cheatsheet`; las
@@ -139,7 +139,7 @@ una hora declarada en `public/_headers` (en salida estática Astro descarta las 
 `Response` de un endpoint, así que la caché tiene que estar ahí). Lo consumen las dos cosas que
 necesitan el índice entero: desplegar un nivel y filtrar por texto.
 
-**`cacheKey` en `guia/[...slug].astro`**: cada lección hashea su propio `digest` *más* una firma del
+**`cacheKey` en `guide/[...slug].astro`**: cada lección hashea su propio `digest` *más* una firma del
 track entero (todas sus hermanas, el `_niveles.json` y el JSON del track). Hace falta porque la
 página pinta también el paginador y la cabecera de la barra lateral; con solo el digest propio,
 añadir una lección dejaba a las demás restauradas de caché con el paginador viejo. Si tocas lo que
@@ -208,7 +208,7 @@ components/site/      el armazón: Header, Footer, Sidebar, Palette, ReaderPrefs
 components/ui/        las primitivas: Button, Badge, Chip, Tile, Section, Stat, PageHeader, Accordion
 ```
 
-Los componentes disponibles dentro del MDX se inyectan desde `guia/[...slug].astro`; **un componente
+Los componentes disponibles dentro del MDX se inyectan desde `guide/[...slug].astro`; **un componente
 nuevo hay que registrarlo ahí o el MDX no lo ve** (y no da error: sale como texto). El nombre con el
 que se escribe en el MDX es español y el fichero es inglés, así que no se deducen el uno del otro:
 
@@ -230,12 +230,12 @@ de `@lucide/astro/icons/<nombre>` (nada de barriles, glob ni cadenas convertidas
 render). Existía un `lucide:cpu` dentro de los JSON y un renombrado de Lucide obligaba a editar
 contenido.
 
-La correspondencia track → icono vive en **`src/lib/iconos.ts` y en ningún otro sitio**: un `import`
+La correspondencia track → icono vive en **`src/lib/icons.ts` y en ningún otro sitio**: un `import`
 por icono y un `TRACK_ICON` de 58 entradas, una por track. Va en `lib/` y no en `components/` porque
 no es un componente y ahí solo hay `.astro`/`.tsx`; no hay pega técnica porque los iconos de Lucide
 ya son `.ts`.
 
-Se accede por `iconoDe(trackId)`, que **lanza** si falta la entrada, diciendo el track y el fichero.
+Se accede por `iconOf(trackId)`, que **lanza** si falta la entrada, diciendo el track y el fichero.
 Es el patrón de `getTrack`/`getNiveles`: sin él, un track sin icono daba «Unable to render Icon», que
 no dice cuál. El `import type { AstroComponent } from '@lucide/astro'` de la cabecera parece un
 barril y no lo es — se borra en compilación—; los iconos siguen entrando uno a uno por su ruta.
@@ -360,7 +360,7 @@ el orden es pedagógico, no alfabético. Para tocar la config, edita el `.lua`, 
    `estado: 'proximamente'` hasta que tenga lecciones.
 2. `src/content/guia/<id>/_niveles.json` — el temario.
 3. `src/content/guia/<id>/*.mdx` — lecciones con `subject: <id>`, `level`, `order`, `posicion`.
-4. Su icono en `TRACK_ICON` (`src/lib/iconos.ts`), con su `import` de
+4. Su icono en `TRACK_ICON` (`src/lib/icons.ts`), con su `import` de
    `@lucide/astro/icons/<nombre>`. Sin esto falla el linter, y el render lanza.
 5. Opcional: `src/content/cheatsheets/<id>.json` (el enlace aparece solo).
 
@@ -371,9 +371,9 @@ Hub, sidebar y portada del track se generan a partir de eso. Comprueba con `bun 
 El código va **en inglés**: identificadores, comentarios, nombres de fichero, los `id` de
 elementos, clases propias y anclas (`#path`, no `#camino`), **y las rutas** (`/concepts/`, no
 `/conceptos/`). En español van solo la UI y el contenido — es un sitio en español, no un código en
-español. Las rutas viejas en español (`/guia/`, `/recursos/`) son legado: se migran con redirects
+español. Las rutas viejas en español (`/guia/`, `/resources/`) son legado: se migran con redirects
 cuando se decida, no de tapadillo. La migración de código está a medias: `src/lib/board/`,
-`src/portada/`, `src/lib/iconos.ts` y `src/lib/escena.ts` siguen en español; al tocarlos, migra
+`src/portada/`, `src/lib/icons.ts` y `src/lib/escena.ts` siguen en español; al tocarlos, migra
 hacia el inglés, nunca al revés. Los mensajes de commit también en inglés (`feat(track): …`,
 `fix(neovim): …`), **de una línea: sin cuerpo narrativo y sin coautorías** — el historial no es un
 diario.

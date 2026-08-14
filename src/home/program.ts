@@ -1,4 +1,4 @@
-export const PROGRAMA = `fn main() {
+export const PROGRAM = `fn main() {
     let mut maquina = Stack::new();
 
     // Una placa sola es una pieza.
@@ -9,11 +9,11 @@ export const PROGRAMA = `fn main() {
     });
 }`;
 
-export const SALIDA = [
-  { t: 0, texto: '$ cargo run', clase: 'text-text' },
-  { t: 520, texto: '   Compiling maquina v0.1.0', clase: 'text-overlay1' },
-  { t: 1180, texto: '    Finished dev [unoptimized] in 0.61s', clase: 'text-overlay1' },
-  { t: 1500, texto: '     Running `target/debug/maquina`', clase: 'text-green' },
+export const OUTPUT = [
+  { t: 0, text: '$ cargo run', cls: 'text-text' },
+  { t: 520, text: '   Compiling maquina v0.1.0', cls: 'text-overlay1' },
+  { t: 1180, text: '    Finished dev [unoptimized] in 0.61s', cls: 'text-overlay1' },
+  { t: 1500, text: '     Running `target/debug/maquina`', cls: 'text-green' },
 ];
 
-export const TRAS_SALIDA = 420;
+export const AFTER_OUTPUT = 420;

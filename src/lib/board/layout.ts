@@ -1,65 +1,65 @@
 export const SOCKET_X = 12;
 export const SOCKET_Z = -58;
 
-export const LADO = 244;
-export const MEDIO = LADO / 2;
-export const GROSOR = 1.6;
+export const SIDE = 244;
+export const HALF = SIDE / 2;
+export const THICKNESS = 1.6;
 
-export interface Zona {
+export interface Zone {
   id: string;
   x: number;
   z: number;
-  an: number;
-  pr: number;
-  al: number;
-  tipo: 'carcasa' | 'disipador' | 'cpu' | 'ranura' | 'placa' | 'bloque';
-  rotulo?: string;
+  w: number;
+  d: number;
+  h: number;
+  kind: 'shell' | 'heatsink' | 'cpu' | 'slot' | 'board' | 'block';
+  label?: string;
 }
 
-export function zona(id: string): Zona | undefined {
-  return ZONAS.find((s) => s.id === id);
+export function zone(id: string): Zone | undefined {
+  return ZONES.find((s) => s.id === id);
 }
 
-export function huella(s: Zona): { x: number; z: number; an: number; pr: number } {
-  if (s.tipo !== 'ranura') return { x: s.x, z: s.z, an: s.an, pr: s.pr };
-  const alLargo = s.pr > s.an;
-  const crece = 7;
-  return alLargo
-    ? { x: s.x, z: s.z, an: s.an, pr: s.pr + crece * 2 }
-    : { x: s.x, z: s.z, an: s.an + crece * 2, pr: s.pr };
+export function footprint(s: Zone): { x: number; z: number; w: number; d: number } {
+  if (s.kind !== 'slot') return { x: s.x, z: s.z, w: s.w, d: s.d };
+  const lengthwise = s.d > s.w;
+  const grow = 7;
+  return lengthwise
+    ? { x: s.x, z: s.z, w: s.w, d: s.d + grow * 2 }
+    : { x: s.x, z: s.z, w: s.w + grow * 2, d: s.d };
 }
 
-export const ZONAS: readonly Zona[] = [
-  { id: 'io', x: -78, z: -107, an: 84, pr: 26, al: 27, tipo: 'carcasa' },
+export const ZONES: readonly Zone[] = [
+  { id: 'io', x: -78, z: -107, w: 84, d: 26, h: 27, kind: 'shell' },
 
-  { id: 'vrm-n', x: 16, z: -108, an: 92, pr: 20, al: 23, tipo: 'disipador' },
-  { id: 'vrm-o', x: -26, z: -66, an: 18, pr: 62, al: 23, tipo: 'disipador' },
+  { id: 'vrm-n', x: 16, z: -108, w: 92, d: 20, h: 23, kind: 'heatsink' },
+  { id: 'vrm-w', x: -26, z: -66, w: 18, d: 62, h: 23, kind: 'heatsink' },
 
-  { id: 'cpu', x: SOCKET_X, z: SOCKET_Z, an: 37, pr: 37, al: 4.3, tipo: 'cpu', rotulo: 'CPU' },
+  { id: 'cpu', x: SOCKET_X, z: SOCKET_Z, w: 37, d: 37, h: 4.3, kind: 'cpu', label: 'CPU' },
 
-  { id: 'dimm-a', x: 74, z: -42, an: 6, pr: 108, al: 9, tipo: 'ranura', rotulo: 'A1' },
-  { id: 'dimm-b', x: 84, z: -42, an: 6, pr: 108, al: 9, tipo: 'ranura', rotulo: 'A2' },
-  { id: 'dimm-c', x: 94, z: -42, an: 6, pr: 108, al: 9, tipo: 'ranura', rotulo: 'B1' },
-  { id: 'dimm-d', x: 104, z: -42, an: 6, pr: 108, al: 9, tipo: 'ranura', rotulo: 'B2' },
+  { id: 'dimm-a', x: 74, z: -42, w: 6, d: 108, h: 9, kind: 'slot', label: 'A1' },
+  { id: 'dimm-b', x: 84, z: -42, w: 6, d: 108, h: 9, kind: 'slot', label: 'A2' },
+  { id: 'dimm-c', x: 94, z: -42, w: 6, d: 108, h: 9, kind: 'slot', label: 'B1' },
+  { id: 'dimm-d', x: 104, z: -42, w: 6, d: 108, h: 9, kind: 'slot', label: 'B2' },
 
-  { id: 'atx', x: 113, z: 14, an: 12, pr: 52, al: 11, tipo: 'ranura', rotulo: 'ATX_PWR' },
+  { id: 'atx', x: 113, z: 14, w: 12, d: 52, h: 11, kind: 'slot', label: 'ATX_PWR' },
 
-  { id: 'm2-sup', x: -34, z: -6, an: 92, pr: 16, al: 4, tipo: 'placa', rotulo: 'M.2_1' },
+  { id: 'm2-top', x: -34, z: -6, w: 92, d: 16, h: 4, kind: 'board', label: 'M.2_1' },
 
-  { id: 'pcie16', x: -32, z: 26, an: 100, pr: 8, al: 11, tipo: 'ranura', rotulo: 'PCIEX16' },
-  { id: 'm2-inf', x: -34, z: 46, an: 92, pr: 16, al: 4, tipo: 'placa', rotulo: 'M.2_2' },
-  { id: 'pcie1', x: -52, z: 66, an: 62, pr: 6, al: 9, tipo: 'ranura', rotulo: 'PCIEX1' },
+  { id: 'pcie16', x: -32, z: 26, w: 100, d: 8, h: 11, kind: 'slot', label: 'PCIEX16' },
+  { id: 'm2-bot', x: -34, z: 46, w: 92, d: 16, h: 4, kind: 'board', label: 'M.2_2' },
+  { id: 'pcie1', x: -52, z: 66, w: 62, d: 6, h: 9, kind: 'slot', label: 'PCIEX1' },
 
-  { id: 'chipset', x: 68, z: 62, an: 44, pr: 44, al: 6, tipo: 'disipador' },
+  { id: 'chipset', x: 68, z: 62, w: 44, d: 44, h: 6, kind: 'heatsink' },
 
-  { id: 'denso-a', x: 66, z: -100, an: 40, pr: 34, al: 0, tipo: 'bloque' },
-  { id: 'denso-b', x: -70, z: -60, an: 44, pr: 50, al: 0, tipo: 'bloque' },
-  { id: 'denso-c', x: 40, z: 20, an: 56, pr: 44, al: 0, tipo: 'bloque' },
-  { id: 'denso-d', x: -20, z: 98, an: 150, pr: 30, al: 0, tipo: 'bloque' },
-  { id: 'denso-e', x: -96, z: 30, an: 36, pr: 90, al: 0, tipo: 'bloque' },
+  { id: 'dense-a', x: 66, z: -100, w: 40, d: 34, h: 0, kind: 'block' },
+  { id: 'dense-b', x: -70, z: -60, w: 44, d: 50, h: 0, kind: 'block' },
+  { id: 'dense-c', x: 40, z: 20, w: 56, d: 44, h: 0, kind: 'block' },
+  { id: 'dense-d', x: -20, z: 98, w: 150, d: 30, h: 0, kind: 'block' },
+  { id: 'dense-e', x: -96, z: 30, w: 36, d: 90, h: 0, kind: 'block' },
 ];
 
-export const TALADROS_IDEALES: readonly { x: number; z: number }[] = [
+export const IDEAL_HOLES: readonly { x: number; z: number }[] = [
   { x: -115, z: -78 },
   { x: -60, z: -86 },
   { x: 113, z: -95 },
@@ -71,14 +71,14 @@ export const TALADROS_IDEALES: readonly { x: number; z: number }[] = [
   { x: 112, z: 108 },
 ];
 
-export const RADIO_TALADRO = 6;
+export const HOLE_RADIUS = 6;
 
-export const BOBINAS: readonly { x: number; z: number }[] = Array.from(
+export const COILS: readonly { x: number; z: number }[] = Array.from(
   { length: 8 },
   (_, i) => ({ x: -12 + i * 10, z: -92 }),
 );
 
-export const CONDENSADORES: readonly { x: number; z: number }[] = [
+export const CAPACITORS: readonly { x: number; z: number }[] = [
   { x: -46, z: -78 },
   { x: -46, z: -66 },
   { x: -46, z: -54 },
@@ -89,70 +89,70 @@ export const CONDENSADORES: readonly { x: number; z: number }[] = [
   { x: -88, z: -6 },
 ];
 
-export const RADIO_CONDENSADOR = 3.2;
-export const MEDIA_BOBINA = 3.5;
+export const CAPACITOR_RADIUS = 3.2;
+export const COIL_HALF = 3.5;
 
-export function fisico(x: number, z: number, margen = 0): boolean {
-  for (const s of ZONAS) {
-    if (s.tipo === 'bloque') continue;
-    const h = huella(s);
-    if (Math.abs(x - h.x) < h.an / 2 + margen && Math.abs(z - h.z) < h.pr / 2 + margen) return true;
+export function solid(x: number, z: number, margin = 0): boolean {
+  for (const s of ZONES) {
+    if (s.kind === 'block') continue;
+    const fp = footprint(s);
+    if (Math.abs(x - fp.x) < fp.w / 2 + margin && Math.abs(z - fp.z) < fp.d / 2 + margin) return true;
   }
-  for (const b of BOBINAS) {
-    if (Math.abs(x - b.x) < MEDIA_BOBINA + margen && Math.abs(z - b.z) < MEDIA_BOBINA + margen) {
+  for (const b of COILS) {
+    if (Math.abs(x - b.x) < COIL_HALF + margin && Math.abs(z - b.z) < COIL_HALF + margin) {
       return true;
     }
   }
-  for (const c of CONDENSADORES) {
-    if ((x - c.x) ** 2 + (z - c.z) ** 2 < (RADIO_CONDENSADOR + margen) ** 2) return true;
+  for (const c of CAPACITORS) {
+    if ((x - c.x) ** 2 + (z - c.z) ** 2 < (CAPACITOR_RADIUS + margin) ** 2) return true;
   }
-  for (const b of INDUCTORES) {
-    if (Math.abs(x - b.x) < 4 + margen && Math.abs(z - b.z) < 4 + margen) return true;
+  for (const b of INDUCTORS) {
+    if (Math.abs(x - b.x) < 4 + margin && Math.abs(z - b.z) < 4 + margin) return true;
   }
-  for (const d of DIODOS) {
-    if (Math.abs(x - d.x) < 4.5 + margen && Math.abs(z - d.z) < 4.5 + margen) return true;
-  }
-  return false;
-}
-
-export function denso(x: number, z: number): boolean {
-  for (const s of ZONAS) {
-    if (s.tipo !== 'bloque') continue;
-    if (Math.abs(x - s.x) < s.an / 2 && Math.abs(z - s.z) < s.pr / 2) return true;
+  for (const d of DIODES) {
+    if (Math.abs(x - d.x) < 4.5 + margin && Math.abs(z - d.z) < 4.5 + margin) return true;
   }
   return false;
 }
 
-export const ocupado = fisico;
+export function dense(x: number, z: number): boolean {
+  for (const s of ZONES) {
+    if (s.kind !== 'block') continue;
+    if (Math.abs(x - s.x) < s.w / 2 && Math.abs(z - s.z) < s.d / 2) return true;
+  }
+  return false;
+}
 
-export const CABECERAS: readonly { x: number; z: number; pines: number }[] = [
-  { x: -84, z: 112, pines: 5 },
-  { x: -58, z: 112, pines: 9 },
-  { x: -20, z: 112, pines: 4 },
-  { x: 2, z: 112, pines: 9 },
-  { x: 40, z: 112, pines: 5 },
-  { x: 62, z: 112, pines: 4 },
-  { x: 96, z: 96, pines: 6 },
+export const occupied = solid;
+
+export const HEADERS: readonly { x: number; z: number; pins: number }[] = [
+  { x: -84, z: 112, pins: 5 },
+  { x: -58, z: 112, pins: 9 },
+  { x: -20, z: 112, pins: 4 },
+  { x: 2, z: 112, pins: 9 },
+  { x: 40, z: 112, pins: 5 },
+  { x: 62, z: 112, pins: 4 },
+  { x: 96, z: 96, pins: 6 },
 ];
 
-export const PASO_PIN_CABECERA = 2.54;
+export const HEADER_PIN_PITCH = 2.54;
 
-export const INDUCTORES: readonly { x: number; z: number }[] = [
+export const INDUCTORS: readonly { x: number; z: number }[] = [
   { x: 100, z: 74 }, { x: 100, z: 88 }, { x: 30, z: 58 },
   { x: -70, z: 84 }, { x: 30, z: 34 }, { x: -74, z: -20 },
   { x: -80, z: -70 }, { x: -80, z: -48 },
 ];
 
-export const DIODOS: readonly { x: number; z: number; giro: 0 | 1 }[] = [
-  { x: 100, z: 58, giro: 1 }, { x: 22, z: 76, giro: 0 },
-  { x: -62, z: 8, giro: 0 }, { x: 44, z: -6, giro: 1 },
-  { x: -104, z: 46, giro: 1 }, { x: 66, z: 100, giro: 0 },
+export const DIODES: readonly { x: number; z: number; rot: 0 | 1 }[] = [
+  { x: 100, z: 58, rot: 1 }, { x: 22, z: 76, rot: 0 },
+  { x: -62, z: 8, rot: 0 }, { x: 44, z: -6, rot: 1 },
+  { x: -104, z: 46, rot: 1 }, { x: 66, z: 100, rot: 0 },
 ];
 
-export const PILA = { x: -101, z: 90, r: 10 } as const;
+export const BATTERY = { x: -101, z: 90, r: 10 } as const;
 
-export function azar(semilla: number): () => number {
-  let s = semilla >>> 0;
+export function rng(seed: number): () => number {
+  let s = seed >>> 0;
   return () => {
     s = (s * 1664525 + 1013904223) >>> 0;
     return s / 4294967296;

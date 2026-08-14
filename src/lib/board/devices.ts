@@ -13,59 +13,59 @@ import {
 } from 'three/webgpu';
 import { color, smoothstep, uniform, uv } from 'three/tsl';
 
-import { CABECERAS, ZONAS } from './layout';
-import type { Materiales } from './piezas';
+import { HEADERS, ZONES } from './layout';
+import type { Materials } from './parts';
 
-type Punto = readonly [number, number];
+type Point = readonly [number, number];
 
 const NEON = 0x7fd6ff;
-const TUBO = 3.4;
+const TUBE = 3.4;
 
 const MONITOR = {
   z: -330,
-  base: { an: 210, al: 12, gr: 140, z: 26 },
-  cuello: { an: 40, al: 190, gr: 30, z: 18 },
-  panel: { an: 530, al: 310, gr: 18, inclina: -0.14 },
-  solape: 10,
+  base: { w: 210, h: 12, d: 140, z: 26 },
+  neck: { w: 40, h: 190, d: 30, z: 18 },
+  panel: { w: 530, h: 310, d: 18, tilt: -0.14 },
+  overlap: 10,
 };
-const Y_PANEL = MONITOR.base.al + MONITOR.cuello.al - MONITOR.solape;
+const PANEL_Y = MONITOR.base.h + MONITOR.neck.h - MONITOR.overlap;
 
-const TECLADO = { x: -24, z: 300, an: 430, al: 18, pr: 150 };
-const RATON = { x: 262, z: 296, an: 62, al: 30, pr: 105 };
+const KEYBOARD = { x: -24, z: 300, w: 430, h: 18, d: 150 };
+const MOUSE = { x: 262, z: 296, w: 62, h: 30, d: 105 };
 
-const ALTO_NEON = 0.14;
+const NEON_Y = 0.14;
 
-interface Cinta {
+interface Ribbon {
   pos: number[];
   uvs: number[];
   idx: number[];
   v: number;
 }
 
-function cinta(c: Cinta, camino: Punto[], u0: number, u1: number, ancho: number) {
-  const largos: number[] = [];
+function ribbon(c: Ribbon, path: Point[], u0: number, u1: number, width: number) {
+  const lengths: number[] = [];
   let total = 0;
-  for (let i = 1; i < camino.length; i++) {
-    const d = Math.hypot(camino[i][0] - camino[i - 1][0], camino[i][1] - camino[i - 1][1]);
-    largos.push(d);
+  for (let i = 1; i < path.length; i++) {
+    const d = Math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]);
+    lengths.push(d);
     total += d;
   }
   if (total <= 0) return;
 
-  let recorrido = 0;
-  const h = ancho / 2;
+  let traveled = 0;
+  const h = width / 2;
 
-  for (let i = 1; i < camino.length; i++) {
-    const [x0, z0] = camino[i - 1];
-    const [x1, z1] = camino[i];
-    const largo = largos[i - 1] || 1;
+  for (let i = 1; i < path.length; i++) {
+    const [x0, z0] = path[i - 1];
+    const [x1, z1] = path[i];
+    const len = lengths[i - 1] || 1;
 
-    const ua = u0 + ((u1 - u0) * recorrido) / total;
-    recorrido += largo;
-    const ub = u0 + ((u1 - u0) * recorrido) / total;
+    const ua = u0 + ((u1 - u0) * traveled) / total;
+    traveled += len;
+    const ub = u0 + ((u1 - u0) * traveled) / total;
 
-    const dx = (x1 - x0) / largo;
-    const dz = (z1 - z0) / largo;
+    const dx = (x1 - x0) / len;
+    const dz = (z1 - z0) / len;
     const ex = dx * h;
     const ez = dz * h;
     const nx = -dz * h;
@@ -77,10 +77,10 @@ function cinta(c: Cinta, camino: Punto[], u0: number, u1: number, ancho: number)
     const bz = z1 + ez;
 
     c.pos.push(
-      ax - nx, ALTO_NEON, az - nz,
-      ax + nx, ALTO_NEON, az + nz,
-      bx + nx, ALTO_NEON, bz + nz,
-      bx - nx, ALTO_NEON, bz - nz,
+      ax - nx, NEON_Y, az - nz,
+      ax + nx, NEON_Y, az + nz,
+      bx + nx, NEON_Y, bz + nz,
+      bx - nx, NEON_Y, bz - nz,
     );
     c.uvs.push(ua, 0, ua, 1, ub, 1, ub, 0);
     c.idx.push(c.v, c.v + 1, c.v + 2, c.v, c.v + 2, c.v + 3);
@@ -88,190 +88,190 @@ function cinta(c: Cinta, camino: Punto[], u0: number, u1: number, ancho: number)
   }
 }
 
-function cables(): { camino: Punto[]; retardo: number }[] {
-  const io = ZONAS.find((z) => z.id === 'io');
-  const video: Punto = io ? [io.x + 18, io.z - io.pr / 2] : [-60, -120];
-  const frontal = (i: number): Punto => {
-    const c = CABECERAS[i];
+function cables(): { path: Point[]; delay: number }[] {
+  const io = ZONES.find((z) => z.id === 'io');
+  const video: Point = io ? [io.x + 18, io.z - io.d / 2] : [-60, -120];
+  const front = (i: number): Point => {
+    const c = HEADERS[i];
     return c ? [c.x, c.z + 4] : [0, 116];
   };
 
   return [
-    { retardo: 0, camino: [video, [video[0], -212], [0, -212], [0, MONITOR.base.z]] },
-    { retardo: 0.08, camino: [frontal(2), [frontal(2)[0], 232], [TECLADO.x, 232], [TECLADO.x, TECLADO.z - TECLADO.pr / 2]] },
-    { retardo: 0.15, camino: [frontal(4), [frontal(4)[0], 232], [RATON.x, 232], [RATON.x, RATON.z - RATON.pr / 2]] },
+    { delay: 0, path: [video, [video[0], -212], [0, -212], [0, MONITOR.base.z]] },
+    { delay: 0.08, path: [front(2), [front(2)[0], 232], [KEYBOARD.x, 232], [KEYBOARD.x, KEYBOARD.z - KEYBOARD.d / 2]] },
+    { delay: 0.15, path: [front(4), [front(4)[0], 232], [MOUSE.x, 232], [MOUSE.x, MOUSE.z - MOUSE.d / 2]] },
   ];
 }
 
-export interface Dispositivos {
-  grupo: Group;
-  aplicar(p: number): void;
-  soltar(): void;
+export interface Devices {
+  group: Group;
+  apply(p: number): void;
+  dispose(): void;
 }
 
-export function dispositivos(m: Materiales): Dispositivos {
-  const grupo = new Group();
+export function devices(m: Materials): Devices {
+  const group = new Group();
   const geos: BufferGeometry[] = [];
 
-  const nido = (x: number, z: number) => {
+  const nest = (x: number, z: number) => {
     const g = new Group();
     g.position.set(x, 0, z);
-    grupo.add(g);
+    group.add(g);
     return g;
   };
 
-  const caja = (
-    padre: Group,
-    an: number,
-    al: number,
-    pr: number,
+  const box = (
+    parent: Group,
+    w: number,
+    h: number,
+    d: number,
     x: number,
     y: number,
     z: number,
     mat: MeshStandardNodeMaterial,
   ) => {
-    const g = new BoxGeometry(an, al, pr);
+    const g = new BoxGeometry(w, h, d);
     geos.push(g);
-    const malla = new Mesh(g, mat);
-    malla.position.set(x, y + al / 2, z);
-    malla.castShadow = true;
-    malla.receiveShadow = true;
-    padre.add(malla);
-    return malla;
+    const mesh = new Mesh(g, mat);
+    mesh.position.set(x, y + h / 2, z);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    parent.add(mesh);
+    return mesh;
   };
 
-  const gMonitor = nido(0, MONITOR.z);
-  caja(gMonitor, MONITOR.base.an, MONITOR.base.al, MONITOR.base.gr, 0, 0, MONITOR.base.z, m.cuerpo);
-  caja(
+  const gMonitor = nest(0, MONITOR.z);
+  box(gMonitor, MONITOR.base.w, MONITOR.base.h, MONITOR.base.d, 0, 0, MONITOR.base.z, m.body);
+  box(
     gMonitor,
-    MONITOR.cuello.an,
-    MONITOR.cuello.al,
-    MONITOR.cuello.gr,
+    MONITOR.neck.w,
+    MONITOR.neck.h,
+    MONITOR.neck.d,
     0,
-    MONITOR.base.al,
-    MONITOR.cuello.z,
-    m.cuerpo,
+    MONITOR.base.h,
+    MONITOR.neck.z,
+    m.body,
   );
 
-  const panel = caja(gMonitor, MONITOR.panel.an, MONITOR.panel.al, MONITOR.panel.gr, 0, Y_PANEL, 0, m.cuerpo);
-  panel.rotation.x = MONITOR.panel.inclina;
+  const panel = box(gMonitor, MONITOR.panel.w, MONITOR.panel.h, MONITOR.panel.d, 0, PANEL_Y, 0, m.body);
+  panel.rotation.x = MONITOR.panel.tilt;
 
-  const matPantalla = new MeshStandardNodeMaterial({
+  const screenMat = new MeshStandardNodeMaterial({
     color: 0x0a1622,
     metalness: 0.1,
     roughness: 0.28,
   });
-  const geoPantalla = new BoxGeometry(MONITOR.panel.an - 26, MONITOR.panel.al - 26, 2);
-  geos.push(geoPantalla);
-  const pantalla = new Mesh(geoPantalla, matPantalla);
-  pantalla.position.set(0, Y_PANEL + MONITOR.panel.al / 2, MONITOR.panel.gr / 2 + 1);
-  pantalla.rotation.x = MONITOR.panel.inclina;
-  gMonitor.add(pantalla);
+  const screenGeo = new BoxGeometry(MONITOR.panel.w - 26, MONITOR.panel.h - 26, 2);
+  geos.push(screenGeo);
+  const screen = new Mesh(screenGeo, screenMat);
+  screen.position.set(0, PANEL_Y + MONITOR.panel.h / 2, MONITOR.panel.d / 2 + 1);
+  screen.rotation.x = MONITOR.panel.tilt;
+  gMonitor.add(screen);
 
-  const gTeclado = nido(TECLADO.x, TECLADO.z);
-  caja(gTeclado, TECLADO.an, TECLADO.al, TECLADO.pr, 0, 0, 0, m.cuerpo);
+  const gKeyboard = nest(KEYBOARD.x, KEYBOARD.z);
+  box(gKeyboard, KEYBOARD.w, KEYBOARD.h, KEYBOARD.d, 0, 0, 0, m.body);
 
   const COLS = 21;
-  const FILAS = 5;
-  const PASO_X = 19;
-  const PASO_Z = 19;
-  const geoTecla = new BoxGeometry(15, 5, 15);
-  geos.push(geoTecla);
-  const teclas = new InstancedMesh(geoTecla, m.plastico, COLS * FILAS);
-  teclas.castShadow = true;
-  teclas.receiveShadow = true;
+  const ROWS = 5;
+  const STEP_X = 19;
+  const STEP_Z = 19;
+  const keyGeo = new BoxGeometry(15, 5, 15);
+  geos.push(keyGeo);
+  const keys = new InstancedMesh(keyGeo, m.plastic, COLS * ROWS);
+  keys.castShadow = true;
+  keys.receiveShadow = true;
   const mat4 = new Matrix4();
   let n = 0;
-  for (let f = 0; f < FILAS; f++) {
+  for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
       mat4.makeTranslation(
-        (c - (COLS - 1) / 2) * PASO_X,
-        TECLADO.al + 2.5,
-        (f - (FILAS - 1) / 2) * PASO_Z,
+        (c - (COLS - 1) / 2) * STEP_X,
+        KEYBOARD.h + 2.5,
+        (r - (ROWS - 1) / 2) * STEP_Z,
       );
-      teclas.setMatrixAt(n++, mat4);
+      keys.setMatrixAt(n++, mat4);
     }
   }
-  teclas.instanceMatrix.needsUpdate = true;
-  gTeclado.add(teclas);
+  keys.instanceMatrix.needsUpdate = true;
+  gKeyboard.add(keys);
 
-  const gRaton = nido(RATON.x, RATON.z);
-  const geoRaton = new SphereGeometry(0.5, 22, 12, 0, Math.PI * 2, 0, Math.PI / 2);
-  geoRaton.scale(RATON.an, RATON.al * 2, RATON.pr);
-  geos.push(geoRaton);
-  const raton = new Mesh(geoRaton, m.cuerpo);
-  raton.castShadow = true;
-  raton.receiveShadow = true;
-  gRaton.add(raton);
+  const gMouse = nest(MOUSE.x, MOUSE.z);
+  const mouseGeo = new SphereGeometry(0.5, 22, 12, 0, Math.PI * 2, 0, Math.PI / 2);
+  mouseGeo.scale(MOUSE.w, MOUSE.h * 2, MOUSE.d);
+  geos.push(mouseGeo);
+  const mouse = new Mesh(mouseGeo, m.body);
+  mouse.castShadow = true;
+  mouse.receiveShadow = true;
+  gMouse.add(mouse);
 
-  const geoRanura = new BoxGeometry(1.6, 3, RATON.pr * 0.42);
-  geos.push(geoRanura);
-  const ranura = new Mesh(geoRanura, m.canal);
-  ranura.position.set(0, RATON.al - 1, -RATON.pr * 0.22);
-  gRaton.add(ranura);
+  const slotGeo = new BoxGeometry(1.6, 3, MOUSE.d * 0.42);
+  geos.push(slotGeo);
+  const slot = new Mesh(slotGeo, m.channel);
+  slot.position.set(0, MOUSE.h - 1, -MOUSE.d * 0.22);
+  gMouse.add(slot);
 
-  const c: Cinta = { pos: [], uvs: [], idx: [], v: 0 };
-  for (const cable of cables()) cinta(c, cable.camino, cable.retardo, cable.retardo + 0.85, TUBO);
+  const rib: Ribbon = { pos: [], uvs: [], idx: [], v: 0 };
+  for (const cable of cables()) ribbon(rib, cable.path, cable.delay, cable.delay + 0.85, TUBE);
 
-  const geoNeon = new BufferGeometry();
-  geoNeon.setAttribute('position', new Float32BufferAttribute(c.pos, 3));
-  geoNeon.setAttribute('uv', new Float32BufferAttribute(c.uvs, 2));
-  geoNeon.setIndex(c.idx);
+  const neonGeo = new BufferGeometry();
+  neonGeo.setAttribute('position', new Float32BufferAttribute(rib.pos, 3));
+  neonGeo.setAttribute('uv', new Float32BufferAttribute(rib.uvs, 2));
+  neonGeo.setIndex(rib.idx);
 
-  const frente = uniform(0);
-  const nivel = uniform(0);
+  const front = uniform(0);
+  const level = uniform(0);
 
   const co = uv();
-  const tubo = co.y.sub(0.5).abs().mul(2).oneMinus().pow(2.6);
-  const vivo = smoothstep(frente.sub(0.07), frente, co.x).oneMinus();
-  const i = tubo.mul(vivo).mul(nivel);
+  const tube = co.y.sub(0.5).abs().mul(2).oneMinus().pow(2.6);
+  const live = smoothstep(front.sub(0.07), front, co.x).oneMinus();
+  const i = tube.mul(live).mul(level);
 
-  const matNeon = new MeshBasicNodeMaterial({
+  const neonMat = new MeshBasicNodeMaterial({
     blending: AdditiveBlending,
     depthWrite: false,
     transparent: true,
   });
-  matNeon.colorNode = color(NEON).mul(i);
-  matNeon.opacityNode = i;
+  neonMat.colorNode = color(NEON).mul(i);
+  neonMat.opacityNode = i;
 
-  const mallaNeon = new Mesh(geoNeon, matNeon);
-  mallaNeon.frustumCulled = false;
-  grupo.add(mallaNeon);
+  const neonMesh = new Mesh(neonGeo, neonMat);
+  neonMesh.frustumCulled = false;
+  group.add(neonMesh);
 
-  const suave = (t: number) => t * t * (3 - 2 * t);
-  const franja = (p: number, a: number, b: number) =>
-    suave(Math.min(1, Math.max(0, (p - a) / (b - a))));
+  const smooth = (t: number) => t * t * (3 - 2 * t);
+  const band = (p: number, a: number, b: number) =>
+    smooth(Math.min(1, Math.max(0, (p - a) / (b - a))));
 
-  const nidos: { g: Group; retardo: number }[] = [
-    { g: gMonitor, retardo: 0 },
-    { g: gTeclado, retardo: 0.05 },
-    { g: gRaton, retardo: 0.09 },
+  const nests: { g: Group; delay: number }[] = [
+    { g: gMonitor, delay: 0 },
+    { g: gKeyboard, delay: 0.05 },
+    { g: gMouse, delay: 0.09 },
   ];
-  for (const nn of nidos) nn.g.scale.set(1, 0.0001, 1);
-  grupo.visible = false;
+  for (const nn of nests) nn.g.scale.set(1, 0.0001, 1);
+  group.visible = false;
 
   return {
-    grupo,
+    group,
 
-    aplicar(p) {
-      const entra = franja(p, 0.56, 0.68);
-      grupo.visible = entra > 0.001;
+    apply(p) {
+      const reveal = band(p, 0.56, 0.68);
+      group.visible = reveal > 0.001;
 
-      for (const nn of nidos) {
-        const e = franja(p, 0.56 + nn.retardo, 0.68 + nn.retardo);
+      for (const nn of nests) {
+        const e = band(p, 0.56 + nn.delay, 0.68 + nn.delay);
         nn.g.scale.y = Math.max(0.0001, e);
       }
 
-      nivel.value = entra;
-      frente.value = franja(p, 0.59, 0.74) * 1.15;
+      level.value = reveal;
+      front.value = band(p, 0.59, 0.74) * 1.15;
     },
 
-    soltar() {
+    dispose() {
       for (const g of geos) g.dispose();
-      geoNeon.dispose();
-      matNeon.dispose();
-      matPantalla.dispose();
-      teclas.dispose();
+      neonGeo.dispose();
+      neonMat.dispose();
+      screenMat.dispose();
+      keys.dispose();
     },
   };
 }

@@ -9,193 +9,193 @@ import {
 } from 'three/webgpu';
 import { color, length, mix, smoothstep, texture, uniform, uv } from 'three/tsl';
 
-import { entorno } from './entorno';
-import { LADO } from './layout';
-import { mascara } from './mascara';
-import { relieve, type Materiales } from './piezas';
-import { canto } from './canto';
-import { dispositivos } from './dispositivos';
-import { sembrar } from './siembra';
-import { pulsos } from './pulsos';
+import { environment } from './environment';
+import { SIDE } from './layout';
+import { mask } from './mask';
+import { relief, type Materials } from './parts';
+import { edge } from './edge';
+import { devices } from './devices';
+import { seed } from './seeding';
+import { pulses } from './pulses';
 
 export const PAL = {
-  sustrato: 0x12121c,
-  aluminio: 0x6b7188,
-  plastico: 0x14151d,
-  contacto: 0x8f96b4,
-  cuerpo: 0x21222e,
-  acento: 0xfab387,
-  acero: 0xb9c0d6,
-  contactoFino: 0x2a2c3c,
-  canal: 0x0d0e15,
-  luz: 0xb4befe,
-  rasante: 0xe6ebff,
-  rebote: 0xffcda6,
+  substrate: 0x12121c,
+  aluminum: 0x6b7188,
+  plastic: 0x14151d,
+  contact: 0x8f96b4,
+  body: 0x21222e,
+  accent: 0xfab387,
+  steel: 0xb9c0d6,
+  fineContact: 0x2a2c3c,
+  channel: 0x0d0e15,
+  light: 0xb4befe,
+  grazing: 0xe6ebff,
+  bounce: 0xffcda6,
 } as const;
 
-export interface Placa {
-  escena: Scene;
-  uPulsos: { value: number };
-  animar(t: number, intensidad: number): void;
-  componer(p: number, hundido: number): void;
-  soltar(): void;
+export interface Board {
+  scene: Scene;
+  uPulses: { value: number };
+  animate(t: number, intensity: number): void;
+  compose(p: number, sunk: number): void;
+  dispose(): void;
 }
 
-export function construir(renderer: WebGPURenderer): Placa {
-  const escena = new Scene();
+export function build(renderer: WebGPURenderer): Board {
+  const scene = new Scene();
 
-  const env = entorno(renderer);
-  escena.environment = env.textura;
-  escena.environmentIntensity = 1.75;
+  const env = environment(renderer);
+  scene.environment = env.texture;
+  scene.environmentIntensity = 1.75;
 
-  const uPulsos = uniform(0);
+  const uPulses = uniform(0);
 
-  const piezas = sembrar();
-  const mapas = mascara(renderer.getMaxAnisotropy?.() ?? 8, piezas);
+  const parts = seed();
+  const maps = mask(renderer.getMaxAnisotropy?.() ?? 8, parts);
 
-  const matSustrato = new MeshStandardNodeMaterial();
-  matSustrato.colorNode = texture(mapas.color, uv());
-  const sup = texture(mapas.superficie, uv());
-  matSustrato.metalnessNode = sup.r;
-  matSustrato.roughnessNode = sup.g;
-  matSustrato.envMapIntensity = 0.3;
+  const substrateMat = new MeshStandardNodeMaterial();
+  substrateMat.colorNode = texture(maps.color, uv());
+  const surf = texture(maps.surface, uv());
+  substrateMat.metalnessNode = surf.r;
+  substrateMat.roughnessNode = surf.g;
+  substrateMat.envMapIntensity = 0.3;
 
-  const matAluminio = new MeshStandardNodeMaterial({
-    color: PAL.aluminio,
+  const aluminumMat = new MeshStandardNodeMaterial({
+    color: PAL.aluminum,
     metalness: 0.85,
     roughness: 0.34,
   });
-  const matPlastico = new MeshStandardNodeMaterial({
-    color: PAL.plastico,
+  const plasticMat = new MeshStandardNodeMaterial({
+    color: PAL.plastic,
     metalness: 0.02,
     roughness: 0.88,
   });
-  const matContacto = new MeshStandardNodeMaterial({
-    color: PAL.contacto,
+  const contactMat = new MeshStandardNodeMaterial({
+    color: PAL.contact,
     metalness: 0.95,
     roughness: 0.26,
   });
-  const matCuerpo = new MeshStandardNodeMaterial({
-    color: PAL.cuerpo,
+  const bodyMat = new MeshStandardNodeMaterial({
+    color: PAL.body,
     metalness: 0.1,
     roughness: 0.7,
   });
-  const matAcento = new MeshStandardNodeMaterial({
-    color: PAL.acento,
+  const accentMat = new MeshStandardNodeMaterial({
+    color: PAL.accent,
     metalness: 0.1,
     roughness: 0.5,
   });
 
-  const matCanal = new MeshStandardNodeMaterial({
-    color: PAL.canal,
+  const channelMat = new MeshStandardNodeMaterial({
+    color: PAL.channel,
     metalness: 0.35,
     roughness: 0.55,
   });
-  const matAcero = new MeshStandardNodeMaterial({
-    color: PAL.acero,
+  const steelMat = new MeshStandardNodeMaterial({
+    color: PAL.steel,
     metalness: 0.96,
     roughness: 0.3,
   });
-  const matContactoFino = new MeshStandardNodeMaterial();
-  const celda = uv().mul(72).fract().sub(0.5);
-  const pin = smoothstep(0.34, 0.2, length(celda));
-  matContactoFino.colorNode = mix(color(PAL.contactoFino), color(PAL.acero), pin);
-  matContactoFino.metalnessNode = pin.mul(0.8).add(0.12);
-  matContactoFino.roughnessNode = pin.mul(-0.32).add(0.72);
+  const fineContactMat = new MeshStandardNodeMaterial();
+  const cell = uv().mul(72).fract().sub(0.5);
+  const pin = smoothstep(0.34, 0.2, length(cell));
+  fineContactMat.colorNode = mix(color(PAL.fineContact), color(PAL.steel), pin);
+  fineContactMat.metalnessNode = pin.mul(0.8).add(0.12);
+  fineContactMat.roughnessNode = pin.mul(-0.32).add(0.72);
 
-  const materiales: Materiales = {
-    sustrato: matSustrato,
-    aluminio: matAluminio,
-    plastico: matPlastico,
-    contacto: matContacto,
-    canal: matCanal,
-    cuerpo: matCuerpo,
-    acento: matAcento,
-    acero: matAcero,
-    contactoFino: matContactoFino,
+  const materials: Materials = {
+    substrate: substrateMat,
+    aluminum: aluminumMat,
+    plastic: plasticMat,
+    contact: contactMat,
+    channel: channelMat,
+    body: bodyMat,
+    accent: accentMat,
+    steel: steelMat,
+    fineContact: fineContactMat,
   };
 
-  const grupo = new Group();
+  const group = new Group();
 
-  const maquina = new Group();
-  grupo.add(maquina);
+  const machine = new Group();
+  group.add(machine);
 
-  const cara = new Mesh(new PlaneGeometry(LADO, LADO), matSustrato);
-  cara.rotation.x = -Math.PI / 2;
-  cara.receiveShadow = true;
-  maquina.add(cara);
+  const face = new Mesh(new PlaneGeometry(SIDE, SIDE), substrateMat);
+  face.rotation.x = -Math.PI / 2;
+  face.receiveShadow = true;
+  machine.add(face);
 
-  const alzado = relieve(materiales, piezas);
-  alzado.traverse((n) => {
+  const raised = relief(materials, parts);
+  raised.traverse((n) => {
     const o = n as Mesh;
     if (!o.isMesh) return;
     o.castShadow = true;
     o.receiveShadow = true;
   });
-  maquina.add(alzado);
+  machine.add(raised);
 
-  const chispas = pulsos();
-  maquina.add(chispas.malla);
+  const sparks = pulses();
+  machine.add(sparks.mesh);
 
-  const filo = canto();
-  maquina.add(filo.grupo);
+  const boardEdge = edge();
+  machine.add(boardEdge.group);
 
-  const trastos = dispositivos(materiales);
-  maquina.add(trastos.grupo);
+  const peripherals = devices(materials);
+  machine.add(peripherals.group);
 
-  escena.add(grupo);
+  scene.add(group);
 
-  const rasante = new DirectionalLight(PAL.rasante, 12);
-  rasante.position.set(-300, 127, 180);
-  rasante.castShadow = true;
-  rasante.shadow.mapSize.set(2048, 2048);
-  rasante.shadow.intensity = 0.6;
-  rasante.shadow.radius = 3;
-  const c = rasante.shadow.camera;
+  const grazing = new DirectionalLight(PAL.grazing, 12);
+  grazing.position.set(-300, 127, 180);
+  grazing.castShadow = true;
+  grazing.shadow.mapSize.set(2048, 2048);
+  grazing.shadow.intensity = 0.6;
+  grazing.shadow.radius = 3;
+  const c = grazing.shadow.camera;
   c.left = -480;
   c.right = 480;
   c.top = 480;
   c.bottom = -480;
   c.near = 1;
   c.far = 1400;
-  rasante.shadow.bias = -0.0006;
-  rasante.shadow.normalBias = 0.35;
-  escena.add(rasante);
+  grazing.shadow.bias = -0.0006;
+  grazing.shadow.normalBias = 0.35;
+  scene.add(grazing);
 
-  const rebote = new DirectionalLight(PAL.rebote, 4);
-  rebote.position.set(240, 90, -230);
-  escena.add(rebote);
+  const bounce = new DirectionalLight(PAL.bounce, 4);
+  bounce.position.set(240, 90, -230);
+  scene.add(bounce);
 
   return {
-    escena,
-    uPulsos,
+    scene,
+    uPulses,
 
-    animar(t, intensidad) {
-      chispas.actualizar(t, intensidad);
+    animate(t, intensity) {
+      sparks.update(t, intensity);
     },
 
-    componer(p, hundido) {
-      filo.aplicar(p);
-      trastos.aplicar(p);
-      maquina.position.y = -hundido * 820;
-      maquina.scale.setScalar(1 - hundido * 0.34);
+    compose(p, sunk) {
+      boardEdge.apply(p);
+      peripherals.apply(p);
+      machine.position.y = -sunk * 820;
+      machine.scale.setScalar(1 - sunk * 0.34);
     },
 
-    soltar() {
-      grupo.traverse((n) => {
+    dispose() {
+      group.traverse((n) => {
         const m = n as Mesh;
         if (m.geometry) m.geometry.dispose();
       });
-      for (const m of [matSustrato, matAluminio, matPlastico, matContacto, matCuerpo, matAcento, matAcero, matContactoFino, matCanal]) {
+      for (const m of [substrateMat, aluminumMat, plasticMat, contactMat, bodyMat, accentMat, steelMat, fineContactMat, channelMat]) {
         m.dispose();
       }
-      chispas.soltar();
-      filo.soltar();
-      trastos.soltar();
-      mapas.soltar();
-      env.soltar();
-      escena.environment = null;
-      escena.clear();
+      sparks.dispose();
+      boardEdge.dispose();
+      peripherals.dispose();
+      maps.dispose();
+      env.dispose();
+      scene.environment = null;
+      scene.clear();
     },
   };
 }

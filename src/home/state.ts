@@ -1,45 +1,46 @@
 import { createSignal } from 'solid-js';
 
-export interface Capa {
-  dir: string;
-  nombre: string;
+export interface Layer {
+  addr: string;
+  name: string;
 }
 
-export type Fase = 'inicio' | 'corriendo' | 'saliendo';
+// Values travel as data-fase on <html>; theme.css variants match them. Do not translate.
+export type Phase = 'inicio' | 'corriendo' | 'saliendo';
 
-const [fase, setFase] = createSignal<Fase>('inicio');
-const [pila, setPila] = createSignal<Capa[]>([]);
-const [plegada, setPlegada] = createSignal(false);
-const [salida, setSalida] = createSignal<{ texto: string; clase: string }[]>([]);
+const [phase, setPhase] = createSignal<Phase>('inicio');
+const [stack, setStack] = createSignal<Layer[]>([]);
+const [collapsed, setCollapsed] = createSignal(false);
+const [output, setOutput] = createSignal<{ text: string; cls: string }[]>([]);
 
-export { fase, pila, plegada, salida };
+export { phase, stack, collapsed, output };
 
-function direccion(): string {
-  const alto = 0x7ffc + Math.floor(Math.random() * 4);
-  const bajo = Math.floor(Math.random() * 0xffffffff);
-  return `0x${alto.toString(16)}${bajo.toString(16).padStart(8, '0')}`;
+function address(): string {
+  const hi = 0x7ffc + Math.floor(Math.random() * 4);
+  const lo = Math.floor(Math.random() * 0xffffffff);
+  return `0x${hi.toString(16)}${lo.toString(16).padStart(8, '0')}`;
 }
 
-export function empujar(nombre: string) {
-  setPila((p) => [...p, { dir: direccion(), nombre }]);
+export function push(name: string) {
+  setStack((p) => [...p, { addr: address(), name }]);
 }
 
-export function sacar() {
-  setPila((p) => p.slice(0, -1));
+export function pop() {
+  setStack((p) => p.slice(0, -1));
 }
 
-export function irA(f: Fase) {
-  setFase(f);
+export function goTo(f: Phase) {
+  setPhase(f);
 }
 
-export function plegarConsola(v: boolean) {
-  setPlegada(v);
+export function collapseConsole(v: boolean) {
+  setCollapsed(v);
 }
 
-export function escribir(texto: string, clase: string) {
-  setSalida((s) => [...s, { texto, clase }]);
+export function write(text: string, cls: string) {
+  setOutput((s) => [...s, { text, cls }]);
 }
 
-export function limpiarSalida() {
-  setSalida([]);
+export function clearOutput() {
+  setOutput([]);
 }

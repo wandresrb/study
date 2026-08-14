@@ -1,10 +1,12 @@
-export interface Escena {
-  avance(p: number): void;
-  arrancar?(): void;
-  reiniciar?(): void;
-  destruir(): void;
+export interface Scene {
+  advance(p: number): void;
+  start?(): void;
+  reset?(): void;
+  destroy(): void;
 }
 
-export type Montar = (host: HTMLElement) => Escena | Promise<Escena>;
+export type Mount = (host: HTMLElement) => Scene | Promise<Scene>;
 
-export const FIN = 0.72;
+// Single source for the engine's phase split and the page's keyboard jumps.
+// Duplicating it desynced them twice; import it, never copy the number.
+export const END = 0.72;

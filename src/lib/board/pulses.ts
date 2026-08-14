@@ -10,63 +10,63 @@ import {
 } from 'three/webgpu';
 import { color, texture, uv } from 'three/tsl';
 
-import { enTaladro } from './agujeros';
-import { azar } from './layout';
-import { buses, type Punto } from './trazas';
+import { inHole } from './holes';
+import { rng } from './layout';
+import { buses, type Point } from './traces';
 
-const ALTO = 0.09;
-const ANCHO = 0.45;
-const TINTE = 0xa9b6ff;
+const LIFT = 0.09;
+const WIDTH = 0.45;
+const TINT = 0xa9b6ff;
 
-interface Ciclo {
-  proxima: number;
-  desde: number;
-  subida: number;
-  sostenido: number;
-  bajada: number;
-  pico: number;
+interface Cycle {
+  next: number;
+  since: number;
+  rise: number;
+  hold: number;
+  fall: number;
+  peak: number;
 }
 
-export interface Pulsos {
-  malla: Mesh;
-  actualizar(t: number, intensidad: number): void;
-  soltar(): void;
+export interface Pulses {
+  mesh: Mesh;
+  update(t: number, intensity: number): void;
+  dispose(): void;
 }
 
-export function pulsos(): Pulsos {
-  const rnd = azar(0x7e11a5);
+export function pulses(): Pulses {
+  const rnd = rng(0x7e11a5);
 
-  const pistas: Punto[][] = [];
-  for (const h of buses()) pistas.push(...h.pistas);
+  const traces: Point[][] = [];
+  for (const h of buses()) traces.push(...h.traces);
 
   const pos: number[] = [];
   const ids: number[] = [];
   const idx: number[] = [];
   let v = 0;
 
-  pistas.forEach((p, id) => {
+  traces.forEach((p, id) => {
     for (let i = 1; i < p.length; i++) {
       const [x0, z0] = p[i - 1];
       const [x1, z1] = p[i];
       if (
-        enTaladro(x0, z0, 0.6) ||
-        enTaladro(x1, z1, 0.6) ||
-        enTaladro((x0 + x1) / 2, (z0 + z1) / 2, 0.6) ||
-        enTaladro((x0 * 3 + x1) / 4, (z0 * 3 + z1) / 4, 0.6) ||
-        enTaladro((x0 + x1 * 3) / 4, (z0 + z1 * 3) / 4, 0.6)
+        inHole(x0, z0, 0.6) ||
+        inHole(x1, z1, 0.6) ||
+        inHole((x0 + x1) / 2, (z0 + z1) / 2, 0.6) ||
+        inHole((x0 * 3 + x1) / 4, (z0 * 3 + z1) / 4, 0.6) ||
+        inHole((x0 + x1 * 3) / 4, (z0 + z1 * 3) / 4, 0.6)
       ) {
         continue;
       }
       let dx = x1 - x0;
       let dz = z1 - z0;
-      const largo = Math.hypot(dx, dz) || 1;
-      dx /= largo;
-      dz /= largo;
+      const len = Math.hypot(dx, dz) || 1;
+      dx /= len;
+      dz /= len;
 
-      const ex = dx * (ANCHO / 2);
-      const ez = dz * (ANCHO / 2);
-      const nx = -dz * (ANCHO / 2);
-      const nz = dx * (ANCHO / 2);
+      const ex = dx * (WIDTH / 2);
+      const ez = dz * (WIDTH / 2);
+      const nx = -dz * (WIDTH / 2);
+      const nz = dx * (WIDTH / 2);
 
       const ax = x0 - ex;
       const az = z0 - ez;
@@ -74,12 +74,12 @@ export function pulsos(): Pulsos {
       const bz = z1 + ez;
 
       pos.push(
-        ax - nx, ALTO, az - nz,
-        ax + nx, ALTO, az + nz,
-        bx + nx, ALTO, bz + nz,
-        bx - nx, ALTO, bz - nz,
+        ax - nx, LIFT, az - nz,
+        ax + nx, LIFT, az + nz,
+        bx + nx, LIFT, bz + nz,
+        bx - nx, LIFT, bz - nz,
       );
-      const u = (id + 0.5) / pistas.length;
+      const u = (id + 0.5) / traces.length;
       ids.push(u, 0.5, u, 0.5, u, 0.5, u, 0.5);
       idx.push(v, v + 1, v + 2, v, v + 2, v + 3);
       v += 4;
@@ -91,69 +91,69 @@ export function pulsos(): Pulsos {
   geo.setAttribute('uv', new Float32BufferAttribute(ids, 2));
   geo.setIndex(idx);
 
-  const datos = new Uint8Array(pistas.length * 4);
-  const tabla = new DataTexture(datos, pistas.length, 1, RGBAFormat);
-  tabla.magFilter = NearestFilter;
-  tabla.minFilter = NearestFilter;
-  tabla.generateMipmaps = false;
-  tabla.needsUpdate = true;
+  const data = new Uint8Array(traces.length * 4);
+  const table = new DataTexture(data, traces.length, 1, RGBAFormat);
+  table.magFilter = NearestFilter;
+  table.minFilter = NearestFilter;
+  table.generateMipmaps = false;
+  table.needsUpdate = true;
 
   const material = new MeshBasicNodeMaterial({
     blending: AdditiveBlending,
     depthWrite: false,
     transparent: true,
   });
-  const brillo = texture(tabla, uv()).r;
-  material.colorNode = color(TINTE).mul(brillo);
-  material.opacityNode = brillo;
+  const glow = texture(table, uv()).r;
+  material.colorNode = color(TINT).mul(glow);
+  material.opacityNode = glow;
 
-  const malla = new Mesh(geo, material);
-  malla.frustumCulled = false;
+  const mesh = new Mesh(geo, material);
+  mesh.frustumCulled = false;
 
-  const ciclos: Ciclo[] = pistas.map(() => ({
-    proxima: rnd() * 9,
-    desde: -99,
-    subida: 0.05 + rnd() * 0.09,
-    sostenido: 0.1 + rnd() * 0.24,
-    bajada: 0.5 + rnd() * 0.9,
-    pico: 0.34 + rnd() * 0.3,
+  const cycles: Cycle[] = traces.map(() => ({
+    next: rnd() * 9,
+    since: -99,
+    rise: 0.05 + rnd() * 0.09,
+    hold: 0.1 + rnd() * 0.24,
+    fall: 0.5 + rnd() * 0.9,
+    peak: 0.34 + rnd() * 0.3,
   }));
 
   return {
-    malla,
+    mesh,
 
-    actualizar(t, intensidad) {
-      for (let i = 0; i < ciclos.length; i++) {
-        const c = ciclos[i];
-        if (t >= c.proxima) {
-          c.desde = t;
-          c.proxima = t + (rnd() < 0.25 ? 0.2 + rnd() * 0.5 : 2.5 + rnd() * 9);
+    update(t, intensity) {
+      for (let i = 0; i < cycles.length; i++) {
+        const c = cycles[i];
+        if (t >= c.next) {
+          c.since = t;
+          c.next = t + (rnd() < 0.25 ? 0.2 + rnd() * 0.5 : 2.5 + rnd() * 9);
         }
 
-        const d = t - c.desde;
+        const d = t - c.since;
         let a = 0;
         if (d >= 0) {
-          if (d < c.subida) a = d / c.subida;
-          else if (d < c.subida + c.sostenido) a = 1;
+          if (d < c.rise) a = d / c.rise;
+          else if (d < c.rise + c.hold) a = 1;
           else {
-            const f = (d - c.subida - c.sostenido) / c.bajada;
+            const f = (d - c.rise - c.hold) / c.fall;
             a = f < 1 ? 1 - f * f : 0;
           }
         }
 
-        const val = Math.round(Math.min(1, a * c.pico * intensidad) * 255);
-        datos[i * 4] = val;
-        datos[i * 4 + 1] = val;
-        datos[i * 4 + 2] = val;
-        datos[i * 4 + 3] = 255;
+        const val = Math.round(Math.min(1, a * c.peak * intensity) * 255);
+        data[i * 4] = val;
+        data[i * 4 + 1] = val;
+        data[i * 4 + 2] = val;
+        data[i * 4 + 3] = 255;
       }
-      tabla.needsUpdate = true;
+      table.needsUpdate = true;
     },
 
-    soltar() {
+    dispose() {
       geo.dispose();
       material.dispose();
-      tabla.dispose();
+      table.dispose();
     },
   };
 }

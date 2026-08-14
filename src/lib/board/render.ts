@@ -1,19 +1,19 @@
 import { NeutralToneMapping, PCFSoftShadowMap, WebGPURenderer } from 'three/webgpu';
 
-export interface Motor {
+export interface Engine {
   renderer: WebGPURenderer;
   backend: 'webgpu' | 'webgl';
-  medir(): { w: number; h: number };
-  lienzo: HTMLCanvasElement;
-  mostrar(): void;
-  soltar(): void;
+  measure(): { w: number; h: number };
+  canvas: HTMLCanvasElement;
+  show(): void;
+  dispose(): void;
 }
 
-export async function motor(
+export async function engine(
   host: HTMLElement,
-  forzarGL = false,
-  alRedimensionar?: (w: number, h: number) => void,
-): Promise<Motor> {
+  forceGL = false,
+  onResize?: (w: number, h: number) => void,
+): Promise<Engine> {
   const canvas = document.createElement('canvas');
   canvas.style.cssText =
     'position:absolute;inset:0;width:100%;height:100%;display:block;opacity:0;transition:opacity .9s ease';
@@ -23,7 +23,7 @@ export async function motor(
     canvas,
     antialias: true,
     alpha: true,
-    forceWebGL: forzarGL,
+    forceWebGL: forceGL,
   });
   renderer.setClearColor(0x000000, 0);
   renderer.toneMapping = NeutralToneMapping;
@@ -37,36 +37,36 @@ export async function motor(
     ? 'webgpu'
     : 'webgl';
 
-  let ancho = 0;
-  let alto = 0;
+  let width = 0;
+  let height = 0;
 
-  const medir = () => {
+  const measure = () => {
     const r = host.getBoundingClientRect();
     const w = Math.max(1, Math.round(r.width));
     const h = Math.max(1, Math.round(r.height));
-    if (w === ancho && h === alto) return { w, h };
-    ancho = w;
-    alto = h;
+    if (w === width && h === height) return { w, h };
+    width = w;
+    height = h;
     renderer.setPixelRatio(Math.min(1.5, window.devicePixelRatio || 1));
     renderer.setSize(w, h, false);
-    alRedimensionar?.(w, h);
+    onResize?.(w, h);
     return { w, h };
   };
 
-  const obs = new ResizeObserver(() => medir());
+  const obs = new ResizeObserver(() => measure());
   obs.observe(host);
-  medir();
+  measure();
 
   return {
     renderer,
     backend,
-    medir,
-    lienzo: canvas,
+    measure,
+    canvas,
 
-    mostrar() {
+    show() {
       if (canvas.style.opacity !== '1') canvas.style.opacity = '1';
     },
-    soltar() {
+    dispose() {
       obs.disconnect();
       renderer.dispose();
       canvas.remove();

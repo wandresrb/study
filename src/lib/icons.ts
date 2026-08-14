@@ -135,11 +135,11 @@ const TRACK_ICON: Record<string, AstroComponent> = {
   'webgpu': MonitorCog,
 };
 
-export function iconoDe(trackId: string): AstroComponent {
+export function iconOf(trackId: string): AstroComponent {
   const Icon = TRACK_ICON[trackId];
   if (!Icon) {
     throw new Error(
-      `El track "${trackId}" no tiene icono. Añádelo a TRACK_ICON en src/lib/iconos.ts ` +
+      `El track "${trackId}" no tiene icono. Añádelo a TRACK_ICON en src/lib/icons.ts ` +
         `con su import de @lucide/astro/icons/<nombre>.`,
     );
   }
