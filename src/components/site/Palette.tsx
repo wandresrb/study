@@ -20,7 +20,7 @@ const LIMIT = 40;
 const SHORTCUTS: Entry[] = [
   ['Inicio', 'ir a', '/'],
   ['Centro de Estudios', 'ir a', '/cs/'],
-  ['Conceptos', 'ir a', '/conceptos/'],
+  ['Conceptos', 'ir a', '/concepts/'],
   ['Recursos', 'ir a', '/recursos/'],
   ['Sobre el sitio', 'ir a', '/about/'],
 ];
@@ -68,7 +68,7 @@ export default function Palette(props: Props) {
             url: `/guia/${id}/`,
           })),
         );
-        setExtras(data.concepts.map(([name, id]): Entry => [name, 'concepto', `/conceptos/${id}/`]));
+        setExtras(data.concepts.map(([name, id]): Entry => [name, 'concepto', `/concepts/${id}/`]));
       });
     }
     setQuery('');

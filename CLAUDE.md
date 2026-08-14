@@ -15,7 +15,33 @@ bun run preview
 bun run deploy     # astro build && wrangler deploy  → Cloudflare (sitio estático)
 ```
 
-No hay tests; la red son dos comandos. `bun run check` (`astro check`) cubre los 73 ficheros de
+No hay tests de código; la red son dos comandos — y un oráculo para los drills:
+`bun run verificar:drills [track]` ejecuta la `solucion` de cada `<Drill>` interactivo contra un
+`nvim --headless` real (o `vim --clean` si no hay nvim; `ORACULO_BIN` lo fuerza) y compara el
+buffer resultante con `objetivo`. **Un drill no se publica como interactivo si diverge**: o la
+solución está mal, o la emulación del navegador no cubre ese comando — en ambos casos se deja
+como accordion. La bandera `'tx'` de feedkeys no es opcional: sin la `t`, grabar macros captura
+un registro vacío.
+
+## Los drills interactivos y las familias de diagramas
+
+La capa interactiva del track de neovim (plan en `_PLAN-RUTA-INTERACTIVA.md`):
+
+- **`<Drill>`** (`components/content/Drill.astro`) tiene dos formas. Con `doc` + (`objetivo` |
+  `objetivoCursor`) monta un **Neovim emulado** (CodeMirror 6 + `@replit/codemirror-vim`) donde el
+  lector teclea de verdad; sin ellos cae al accordion clásico. Props: `cursor` `[línea 1-based,
+  col 0-based]`, `solucion` en teclas exactas (`ci"adiós<Esc>`), `presupuesto` (pulsaciones de la
+  óptima → dominio ★), `preparacion` (teclas ejecutadas al montar, para calentar registros).
+  El motor (`lib/vim/drill-engine.ts`, ~90 KB) se carga con `import()` al entrar el primer drill
+  en pantalla (`lib/vim/drill-mount.ts`, IntersectionObserver); la piel del terminal se tematiza
+  desde JS con `EditorView.theme`, no con CSS global.
+- **Progreso y SRS** en `lib/vim/progreso.ts` (localStorage `nvdios:v1`): dominio ○/✓/★ por drill,
+  racha, y cola de repaso 1/3/7/21 días que consume **`/neovim/dojo/`**. Completar todos los
+  drills de una página marca la lección como leída en el sistema de `lib/progress.ts`.
+- **Diagramas**: Mermaid está siendo sustituido por familias de componentes (`Pipeline`, `ModeMap`,
+  `KeyboardMap` — registradas en `guia/[...slug].astro` y en el linter). `ModeMap` es la máquina
+  de modos que responde a teclas reales. Mermaid sigue siendo válido en tracks no migrados.
+- En las lecciones, `[` y `]` navegan anterior/siguiente (salvo con el foco en un input o un drill). `bun run check` (`astro check`) cubre los 73 ficheros de
 código y hoy está **limpio: 0 errores, 0 warnings, 0 hints**. Ese cero es el listón; si tu cambio
 añade un hint, quítalo antes de seguir. `bun run lint:contenido [track]` cubre las ~5.100
 lecciones en segundos: frontmatter, `subject` contra la carpeta, `posicion` contra `level.order`,
@@ -342,10 +368,11 @@ Hub, sidebar y portada del track se generan a partir de eso. Comprueba con `bun 
 
 ## Estilo
 
-El código va **en inglés**: identificadores, comentarios, nombres de fichero, y también los `id` de
-elementos, clases propias y anclas (`#path`, no `#camino` — un `id` es código aunque asome en la
-URL). En español van la UI, el contenido y las rutas de página (`/guia/`, `/recursos/`) — es un
-sitio en español, no un código en español. La migración está a medias: `src/lib/board/`,
+El código va **en inglés**: identificadores, comentarios, nombres de fichero, los `id` de
+elementos, clases propias y anclas (`#path`, no `#camino`), **y las rutas** (`/concepts/`, no
+`/conceptos/`). En español van solo la UI y el contenido — es un sitio en español, no un código en
+español. Las rutas viejas en español (`/guia/`, `/recursos/`) son legado: se migran con redirects
+cuando se decida, no de tapadillo. La migración de código está a medias: `src/lib/board/`,
 `src/portada/`, `src/lib/iconos.ts` y `src/lib/escena.ts` siguen en español; al tocarlos, migra
 hacia el inglés, nunca al revés. Los mensajes de commit también en inglés (`feat(track): …`,
 `fix(neovim): …`).
