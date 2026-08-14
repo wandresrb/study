@@ -342,11 +342,13 @@ Hub, sidebar y portada del track se generan a partir de eso. Comprueba con `bun 
 
 ## Estilo
 
-El código va **en inglés**: identificadores, comentarios y nombres de fichero. En español van la UI,
-el contenido y las URLs — es un sitio en español, no un código en español. La migración está a
-medias: `src/lib/board/`, `src/portada/`, `src/lib/iconos.ts` y `src/lib/escena.ts` siguen en
-español; al tocarlos, migra hacia el inglés, nunca al revés. Los mensajes de commit también en
-inglés (`feat(track): …`, `fix(neovim): …`).
+El código va **en inglés**: identificadores, comentarios, nombres de fichero, y también los `id` de
+elementos, clases propias y anclas (`#path`, no `#camino` — un `id` es código aunque asome en la
+URL). En español van la UI, el contenido y las rutas de página (`/guia/`, `/recursos/`) — es un
+sitio en español, no un código en español. La migración está a medias: `src/lib/board/`,
+`src/portada/`, `src/lib/iconos.ts` y `src/lib/escena.ts` siguen en español; al tocarlos, migra
+hacia el inglés, nunca al revés. Los mensajes de commit también en inglés (`feat(track): …`,
+`fix(neovim): …`).
 
 **Comentarios: cortos.** Una o dos líneas, y solo cuando explican un *por qué* que no se deduce del
 código (una decisión contraintuitiva, una restricción de Astro, una colisión conocida). El repo
