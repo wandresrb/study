@@ -10,6 +10,8 @@ const DB = 'db/catalog.db';
 const COMPONENTS = new Set([
   'Callout', 'KeyCap', 'Kbd', 'Mermaid', 'Cards', 'Card', 'PluginCard',
   'Objetivos', 'Reto', 'Lead', 'Drill', 'Paso', 'Instalar',
+  'Predict', 'ModeMap', 'KeyboardMap', 'Pipeline',
+  'UndoTree', 'WindowLayout', 'CommandAnatomy',
   'Fragment',
 ]);
 
@@ -95,10 +97,13 @@ for (const track of folders) {
       warn(path, `posicion "${fm.posicion}" debería ser "${level}.${order}"`);
     }
 
-    const prose = text
+    let prose = text
       .slice(text.indexOf('\n---', 4) + 4)
       .replace(/^ {0,3}(```|~~~)[\s\S]*?^ {0,3}\1/gm, '')
       .replace(/`[^`\n]*`/g, '');
+    // Las expresiones JSX ({'ci"<Esc>'}, opciones={[…]}) son JS, no marcado:
+    // un <Esc> ahí dentro es texto. Se pelan de dentro afuera.
+    for (let i = 0; i < 6; i++) prose = prose.replace(/\{[^{}]*\}/g, '');
     for (const [, tag] of prose.matchAll(/<([A-Z]\w*)[\s/>]/g)) {
       if (!COMPONENTS.has(tag)) fail(path, `<${tag}> no está registrado en guia/[...slug].astro`);
     }
