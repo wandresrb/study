@@ -4,7 +4,7 @@ import { getConcepts, getTracks, lessonsOf } from '../../data/content';
 
 // The palette's lazy catalog: every lesson of every written track as compact
 // arrays [title, id, position], plus the concept pages as [name, id]. The
-// client derives the urls (/guia/{id}/, /concepts/{id}/) and folds titles
+// client derives the urls (/guide/{id}/, /concepts/{id}/) and folds titles
 // itself — shipping a folded copy would double the payload. Cache policy
 // lives in public/_headers (/idx/*).
 export const GET: APIRoute = () => {

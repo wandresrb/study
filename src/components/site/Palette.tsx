@@ -22,7 +22,7 @@ const SHORTCUTS: Entry[] = [
   ['Inicio', 'ir a', '/'],
   ['Centro de Estudios', 'ir a', '/cs/'],
   ['Conceptos', 'ir a', '/concepts/'],
-  ['Recursos', 'ir a', '/recursos/'],
+  ['Recursos', 'ir a', '/resources/'],
   ['Sobre el sitio', 'ir a', '/about/'],
 ];
 
@@ -66,7 +66,7 @@ export default function Palette(props: Props) {
             title,
             folded: fold(title),
             label: `${trackNames.get(id.split('/')[0]) ?? id.split('/')[0]} · ${position}`,
-            url: `/guia/${id}/`,
+            url: `/guide/${id}/`,
           })),
         );
         setExtras(data.concepts.map(([name, id]): Entry => [name, 'concepto', `/concepts/${id}/`]));

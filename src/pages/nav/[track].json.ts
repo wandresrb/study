@@ -18,7 +18,7 @@ export const GET: APIRoute = ({ params }) => {
       id: n.idx,
       items: lessons
         .filter((l) => l.level === n.idx)
-        .map((l) => ({ u: `/guia/${l.id}/`, t: l.title, n: l.position })),
+        .map((l) => ({ u: `/guide/${l.id}/`, t: l.title, n: l.position })),
     }))
     .filter((n) => n.items.length > 0);
 

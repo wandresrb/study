@@ -103,6 +103,6 @@ export async function toggleRead(id: string): Promise<boolean> {
   return !read;
 }
 
-// '/guia/rust/n39-generar-bindings/' → 'rust/n39-generar-bindings'
+// '/guide/rust/n39-generar-bindings/' → 'rust/n39-generar-bindings'
 export const lessonIdOf = (href: string): string =>
-  new URL(href, 'https://x').pathname.replace('/guia/', '').replace(/\/$/, '');
+  new URL(href, 'https://x').pathname.replace('/guide/', '').replace(/\/$/, '');
