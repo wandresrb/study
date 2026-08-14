@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync, readdirSync, rmSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, readdirSync, renameSync, rmSync, existsSync, mkdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 const GUIDE = 'src/content/guia';
@@ -43,9 +43,14 @@ function mdxFiles() {
 }
 
 if (!existsSync('db')) mkdirSync('db', { recursive: true });
-rmSync(OUT, { force: true });
 
-const db = new DatabaseSync(OUT);
+// Build into a private temp file and rename at the end: two concurrent runs
+// (a manual one and the dev server's watcher) must never write the same file,
+// and readers keep their open handle across the atomic swap.
+const TMP = `${OUT}.${process.pid}.tmp`;
+rmSync(TMP, { force: true });
+
+const db = new DatabaseSync(TMP);
 db.exec('PRAGMA journal_mode = OFF');
 db.exec(readFileSync(SCHEMA, 'utf8'));
 for (const f of readdirSync(SEEDS).sort()) db.exec(readFileSync(join(SEEDS, f), 'utf8'));
@@ -92,7 +97,7 @@ for (const file of files) {
 if (problems.length) {
   db.exec('ROLLBACK');
   db.close();
-  rmSync(OUT, { force: true });
+  rmSync(TMP, { force: true });
   console.error(`${problems.length} problems:\n  ` + problems.slice(0, 20).join('\n  '));
   process.exit(1);
 }
@@ -108,10 +113,10 @@ db.exec('ANALYZE');
 db.exec('VACUUM');
 
 const n = (q) => db.prepare(q).get().n;
-const size = (readFileSync(OUT).byteLength / 1024).toFixed(0);
-console.log(
-  `${OUT}  ${size} KB · ${n('SELECT count(*) n FROM track')} tracks · ` +
-    `${n('SELECT count(*) n FROM level')} levels · ${n('SELECT count(*) n FROM lesson')} lessons · ` +
-    `${n('SELECT count(*) n FROM teaches')} teaches`,
-);
+const summary =
+  `${OUT}  ${(readFileSync(TMP).byteLength / 1024).toFixed(0)} KB · ` +
+  `${n('SELECT count(*) n FROM track')} tracks · ${n('SELECT count(*) n FROM level')} levels · ` +
+  `${n('SELECT count(*) n FROM lesson')} lessons · ${n('SELECT count(*) n FROM teaches')} teaches`;
 db.close();
+renameSync(TMP, OUT);
+console.log(summary);

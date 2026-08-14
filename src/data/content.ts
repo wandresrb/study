@@ -109,6 +109,8 @@ const qConceptsTaughtBy = db.prepare(
   `SELECT te.concept, t.name FROM teaches te JOIN track t ON t.id = te.concept
    WHERE te.track = ? AND te.level = ? ORDER BY te.weight DESC, t.sort`,
 );
+const qAllTeaches = db.prepare('SELECT concept, track, level, weight FROM teaches ORDER BY concept, track, level');
+const qAllUnlocks = db.prepare('SELECT source, target FROM unlocks ORDER BY source, target');
 const qCheatsheet = db.prepare('SELECT meta, description, placeholder FROM cheatsheet WHERE track = ?');
 const qCheatsheetTracks = db.prepare('SELECT track FROM cheatsheet ORDER BY track');
 const qCheatsheetCats = db.prepare('SELECT sort, name, icon FROM cheatsheet_category WHERE track = ? ORDER BY sort');
@@ -315,6 +317,16 @@ export function conceptsTaughtBy(trackId: string, level: number): { id: string; 
     id: String(r.concept),
     name: String(r.name),
   }));
+}
+
+export function getTeaches(): [string, string, number, number][] {
+  return (qAllTeaches.all() as Row[]).map((r) => [
+    String(r.concept), String(r.track), Number(r.level), Number(r.weight),
+  ]);
+}
+
+export function getUnlocks(): [string, string][] {
+  return (qAllUnlocks.all() as Row[]).map((r) => [String(r.source), String(r.target)]);
 }
 
 export interface CheatsheetItem {
