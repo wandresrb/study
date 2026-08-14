@@ -1,10 +1,18 @@
 import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js';
 import { navigate } from 'astro:transitions/client';
+import { fold } from '../../lib/fold';
 
 type Entry = [string, string, string];
 
 interface Props {
   entries: Entry[];
+}
+
+interface LessonHit {
+  title: string;
+  folded: string;
+  label: string;
+  url: string;
 }
 
 const LIMIT = 40;
@@ -16,16 +24,26 @@ const SHORTCUTS: Entry[] = [
   ['Sobre el sitio', 'ir a', '/about/'],
 ];
 
-const fold = (s: string) =>
-  s
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '');
+// The full catalog is fetched once, and only when the palette first opens:
+// the inline entries (categories and tracks) cover the first paint.
+let catalog: Promise<[string, string, string][]> | undefined;
+const loadCatalog = () => {
+  catalog ??= fetch('/idx/catalog.json')
+    .then((r) => (r.ok ? r.json() : { lessons: [] }))
+    .then((data: { lessons: [string, string, string][] }) => data.lessons)
+    .catch(() => [] as [string, string, string][]);
+  return catalog;
+};
 
 export default function Palette(props: Props) {
   const [open, setOpen] = createSignal(false);
   const [query, setQuery] = createSignal('');
   const [cursor, setCursor] = createSignal(0);
+  const [lessons, setLessons] = createSignal<LessonHit[]>([]);
+
+  const trackNames = new Map(
+    props.entries.filter((e) => e[1] === 'tema').map((e) => [e[2].split('/')[1], e[0]]),
+  );
 
   let input: HTMLInputElement | undefined;
   let list: HTMLUListElement | undefined;
@@ -34,6 +52,18 @@ export default function Palette(props: Props) {
 
   const show = () => {
     lastFocused = document.activeElement as HTMLElement | null;
+    if (!lessons().length) {
+      loadCatalog().then((rows) =>
+        setLessons(
+          rows.map(([title, id, position]) => ({
+            title,
+            folded: fold(title),
+            label: `${trackNames.get(id.split('/')[0]) ?? id.split('/')[0]} · ${position}`,
+            url: `/guia/${id}/`,
+          })),
+        ),
+      );
+    }
     setQuery('');
     setCursor(0);
     setOpen(true);
@@ -51,15 +81,20 @@ export default function Palette(props: Props) {
 
     const shortcuts = SHORTCUTS.filter((s) => fold(s[0]).includes(q));
 
-    const scored: { entry: Entry; rank: number }[] = [];
+    const scored: { entry: Entry; rank: number; kind: number }[] = [];
     for (const entry of props.entries) {
       const name = fold(entry[0]);
       const at = name.indexOf(q);
-      if (at === 0) scored.push({ entry, rank: 0 });
-      else if (at > 0) scored.push({ entry, rank: 1 });
-      else if (fold(entry[1]).includes(q)) scored.push({ entry, rank: 2 });
+      if (at === 0) scored.push({ entry, rank: 0, kind: 0 });
+      else if (at > 0) scored.push({ entry, rank: 1, kind: 0 });
+      else if (fold(entry[1]).includes(q)) scored.push({ entry, rank: 2, kind: 0 });
     }
-    scored.sort((a, b) => a.rank - b.rank);
+    for (const l of lessons()) {
+      const at = l.folded.indexOf(q);
+      if (at < 0) continue;
+      scored.push({ entry: [l.title, l.label, l.url], rank: at === 0 ? 0 : 1, kind: 1 });
+    }
+    scored.sort((a, b) => a.rank - b.rank || a.kind - b.kind);
     return [...shortcuts, ...scored.slice(0, LIMIT).map((s) => s.entry)];
   };
 
@@ -187,7 +222,7 @@ export default function Palette(props: Props) {
               ref={input}
               value={query()}
               onInput={(e) => setQuery(e.currentTarget.value)}
-              placeholder="Busca una categoría o un tema…"
+              placeholder="Busca un tema o una lección…"
               role="combobox"
               aria-expanded="true"
               aria-controls="palette-list"
@@ -233,7 +268,7 @@ export default function Palette(props: Props) {
               <span>↑↓ moverse</span>
               <span>⏎ abrir</span>
               <span>esc cerrar</span>
-              <span class="ml-auto">{props.entries.length} destinos</span>
+              <span class="ml-auto">{props.entries.length + lessons().length} destinos</span>
             </p>
           </div>
         </div>
