@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js';
+import { Portal } from 'solid-js/web';
 import { navigate } from 'astro:transitions/client';
 import { fold } from '../../lib/fold';
 
@@ -214,6 +215,10 @@ export default function Palette(props: Props) {
       </button>
 
       <Show when={open()}>
+        {/* Portal to body: the header's backdrop-filter turns it into the
+            containing block for fixed descendants, which pinned the modal to
+            the header strip instead of the viewport. */}
+        <Portal>
         <div
           class="d-modal d-modal-open items-start pt-[12vh] backdrop-blur-[3px]"
           onClick={(e) => e.target === e.currentTarget && close()}
@@ -279,6 +284,7 @@ export default function Palette(props: Props) {
             </p>
           </div>
         </div>
+        </Portal>
       </Show>
     </>
   );
