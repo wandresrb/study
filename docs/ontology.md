@@ -79,20 +79,50 @@ categoría, sin una sola arista entre ambos.
 
 ## 5. Los tres estratos
 
-Sustituyen al eje `plano`:
+Sustituyen al eje `plano`, y el 14-08 quedaron **validados contra la disciplina**: no son la
+taxonomía estándar de ACM/IEEE (que es una lista plana de áreas de conocimiento), sino el marco
+principios / tecnologías / prácticas de Denning (*Great Principles of Computing*) — y las áreas
+ACM viven dentro de los estratos. Nombres finales: **Principios · Tecnologías · Herramientas**
+(«aplicaciones» quedó vetado: suena a apps).
 
 | estrato | qué es | quién cae aquí |
 | --- | --- | --- |
-| `concepto` | cierto sin importar la tecnología | matemática, ciencias de la computación, sistemas operativos, system design |
-| `implementación` | el concepto con la forma de una tecnología concreta | lenguajes, frontend, reactividad, móvil, kernel, cloud |
-| `herramienta` | con lo que se trabaja, no lo que se estudia | neovim, git, bash, tmux, fzf-ripgrep, dotfiles |
+| `principios` | cierto sin importar la tecnología | las 12 áreas del núcleo (§5b) |
+| `tecnologías` | el principio con la forma de una tecnología concreta | frontend, reactividad, lenguajes, móvil, kernel, cloud, local-first |
+| `herramientas` | con lo que se trabaja, no lo que se estudia | neovim, git, bash, tmux, fzf-ripgrep, dotfiles, devtools, build |
 
-«Implementación» dice de qué: una implementación *del concepto*. Es la relación
-interfaz→implementación, vocabulario de CS y no metáfora.
+La separación se aplicó de verdad el 14-08: `devtools` y `build` salieron de Frontend hacia
+Herramientas (son taller, no tecnología), y `local-first` bajó de System Design a Tecnologías —
+por el criterio del propio eje: tal como se enseña (OPFS, IndexedDB, SQLite WASM) no es cierto
+«sin importar la tecnología».
 
-El estrato `herramienta` recoge además lo que hoy cuelga fuera de la jerarquía justo porque no
+El estrato `herramientas` recoge además lo que hoy cuelga fuera de la jerarquía justo porque no
 encajaba: `/config/`, `/recursos/` y las 28 cheatsheets. Es lo único del sitio que se consulta a
 diario en vez de recorrerse una vez.
+
+## 5b. El núcleo completo y la regla del mapa
+
+Decisión del autor (14-08): **el mapa dibuja la disciplina entera; el contenido llega
+progresivamente; lo pendiente se ve como pendiente**. La caja «Ciencias de la Computación» se
+disolvió (eran cuatro áreas apiladas) y el núcleo quedó en 12 áreas:
+
+| área | conceptos |
+| --- | --- |
+| Matemática | discreta, lógica, álgebra lineal, probabilidad, teoría de números |
+| Teoría de la Computación | computabilidad y autómatas, complejidad |
+| Algoritmos y Estructuras de Datos | algoritmos, estructuras de datos |
+| Lenguajes y Tipos | teoría de lenguajes, teoría de tipos, programación reactiva |
+| Concurrencia y Distribuidos | concurrencia, sistemas distribuidos |
+| Sistemas Operativos | procesos, memoria virtual, ficheros, syscalls, microkernels, drivers |
+| Arquitectura de Computadores | **pendiente**: la CPU, jerarquía de memoria |
+| Redes | **pendiente**: TCP/IP, HTTP y la web |
+| Datos y Persistencia | **pendiente**: modelos de datos, bases de datos, transacciones |
+| Seguridad | **pendiente**: criptografía, seguridad de sistemas |
+| System Design | monolitos, microservicios, event-driven, consistencia, diseño de APIs |
+| IA y Aprendizaje | **pendiente**: aprendizaje automático |
+
+Los pendientes son tracks `planned`: visibles en el mapa como «por escribir», sin página y sin
+aristas hasta que existan.
 
 ## 6. Las dos relaciones
 
@@ -229,16 +259,20 @@ Tres decisiones que van con esto:
 Cerrado:
 
 - El mapa de `/cs/` es la pieza principal del sitio.
-- Tres estratos en vez de dos planos.
-- `ensena` y `abre` como relaciones de primera clase.
-- Los 30 tracks vacíos se convierten en conceptos con página propia (`/conceptos/…`).
+- Tres estratos, validados contra la disciplina y renombrados: Principios · Tecnologías ·
+  Herramientas (§5).
+- El mapa dibuja la disciplina entera; lo pendiente, visible como pendiente (§5b).
+- La caja «Ciencias de la Computación» disuelta en áreas reales; el núcleo, en 12 (§5b).
+- `devtools` y `build` a Herramientas; `local-first` a Tecnologías — System Design queda 100 %
+  conceptual.
+- `ensena` y `abre` como relaciones de primera clase; `ensena` podada (620→593, 15 a peso 2) y
+  `abre` con base mecánica de 68 aristas.
+- Los conceptos tienen página propia (`/concepts/{id}`) y su espectro de cobertura (`/concepts`).
 - La estructura va a SQLite con el `.sql` en git.
 
 Abierto:
 
-- Los pesos de las 620 aristas: revisión a mano, empezando por limpiar el nivel `0` de
-  `event-driven`.
-- El grafo `abre`: aún no existe, hay que escribirlo.
-- Si `system-design` es `concepto` o se parte (`monolitos`/`microservicios` son patrones;
-  `local-first`, con 291 lecciones, se comporta como implementación).
-- Fusionar `systems` y `cloud`, que tienen un track cada una.
+- La jerarquía visual del mapa: el rediseño total (tarea #14, sobre los mockups del autor).
+- La granularidad de las cajas de un solo track en Tecnologías (kernel, cloudflare, local-first).
+- La capa manual del grafo `abre`: qué abre qué entre conceptos, herramientas como llaves.
+- Los pesos finos de las aristas `ensena` (la poda gruesa ya está).

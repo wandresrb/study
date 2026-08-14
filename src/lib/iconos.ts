@@ -1,11 +1,13 @@
 import type { AstroComponent } from '@lucide/astro';
 
 import Activity from '@lucide/astro/icons/activity';
+import ArrowRightLeft from '@lucide/astro/icons/arrow-right-left';
 import Atom from '@lucide/astro/icons/atom';
 import Bird from '@lucide/astro/icons/bird';
 import Boxes from '@lucide/astro/icons/boxes';
 import Box from '@lucide/astro/icons/box';
 import Braces from '@lucide/astro/icons/braces';
+import Brain from '@lucide/astro/icons/brain';
 import BrickWall from '@lucide/astro/icons/brick-wall';
 import Brush from '@lucide/astro/icons/brush';
 import Bug from '@lucide/astro/icons/bug';
@@ -15,6 +17,8 @@ import Coffee from '@lucide/astro/icons/coffee';
 import Cog from '@lucide/astro/icons/cog';
 import Columns3 from '@lucide/astro/icons/columns-3';
 import Combine from '@lucide/astro/icons/combine';
+import Cpu from '@lucide/astro/icons/cpu';
+import Database from '@lucide/astro/icons/database';
 import Dices from '@lucide/astro/icons/dices';
 import DoorOpen from '@lucide/astro/icons/door-open';
 import FileCode from '@lucide/astro/icons/file-code';
@@ -46,6 +50,7 @@ import Rocket from '@lucide/astro/icons/rocket';
 import Scale from '@lucide/astro/icons/scale';
 import Search from '@lucide/astro/icons/search';
 import Shapes from '@lucide/astro/icons/shapes';
+import Shield from '@lucide/astro/icons/shield';
 import Smartphone from '@lucide/astro/icons/smartphone';
 import Sparkles from '@lucide/astro/icons/sparkles';
 import Split from '@lucide/astro/icons/split';
@@ -64,8 +69,11 @@ const TRACK_ICON: Record<string, AstroComponent> = {
   'algoritmos': Workflow,
   'android': Smartphone,
   'animacion': Sparkles,
+  'aprendizaje-automatico': Brain,
+  'arquitectura-cpu': Cpu,
   'astro': Rocket,
   'bash': Terminal,
+  'bases-datos': Database,
   'build': Package,
   'c23': FileCode,
   'canvas': Brush,
@@ -74,6 +82,7 @@ const TRACK_ICON: Record<string, AstroComponent> = {
   'computabilidad': CircleSlash,
   'concurrencia': Split,
   'consistencia': Scale,
+  'criptografia': KeyRound,
   'css': Paintbrush,
   'devtools': Bug,
   'diseno-apis': Link,
@@ -86,7 +95,9 @@ const TRACK_ICON: Record<string, AstroComponent> = {
   'flux': Repeat,
   'fzf-ripgrep': Search,
   'git': GitBranch,
+  'http-web': Globe,
   'ios': TabletSmartphone,
+  'jerarquia-memoria': MemoryStick,
   'kernel': Layers,
   'kotlin': Coffee,
   'local-first': HardDrive,
@@ -97,6 +108,7 @@ const TRACK_ICON: Record<string, AstroComponent> = {
   'memoria-virtual': MemoryStick,
   'microkernels': Puzzle,
   'microservicios': Boxes,
+  'modelos-datos': Boxes,
   'monolitos': BrickWall,
   'mvi': Orbit,
   'neovim': SquareTerminal,
@@ -106,17 +118,20 @@ const TRACK_ICON: Record<string, AstroComponent> = {
   'reactividad-fina': Network,
   'rendimiento': Gauge,
   'rust': Cog,
+  'seguridad-sistemas': Shield,
   'sistemas-distribuidos': Globe,
   'sistemas-ficheros': FolderTree,
   'solid': Atom,
   'swift': Bird,
   'syscalls': DoorOpen,
   'tca': Combine,
+  'tcp-ip': Network,
   'teoria-lenguajes': Braces,
   'teoria-numeros': KeyRound,
   'teoria-tipos': Shapes,
   'three': Box,
   'tmux': Columns3,
+  'transacciones': ArrowRightLeft,
   'webgpu': MonitorCog,
 };
 
