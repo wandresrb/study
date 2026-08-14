@@ -3,6 +3,8 @@ import { fileURLToPath } from 'node:url';
 import { defineConfig, fontProviders } from 'astro/config';
 import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
+import rehypeKatex from 'rehype-katex';
+import remarkMath from 'remark-math';
 
 import solidJs from '@astrojs/solid-js';
 
@@ -49,6 +51,11 @@ export default defineConfig({
   ],
 
   markdown: {
+    remarkPlugins: [remarkMath],
+    // La notación se resuelve en el build: sale HTML con clases de KaTeX y el
+    // navegador no descarga ni ejecuta nada. `throwOnError` para que una fórmula
+    // rota falle el build en vez de publicarse en rojo.
+    rehypePlugins: [[rehypeKatex, { throwOnError: true, strict: 'error' }]],
     shikiConfig: {
       theme: 'catppuccin-mocha',
       wrap: false,
