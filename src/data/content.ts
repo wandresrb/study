@@ -284,6 +284,13 @@ export function getConcepts(): Concept[] {
     });
 }
 
+// Declared but not yet indexed: visible as explicit gaps, no page of their own.
+export function getPlannedConcepts(): Concept[] {
+  return getTracks()
+    .filter((t) => t.status === 'planned')
+    .map((t) => ({ ...t, edges: 0, tracksTeaching: 0 }));
+}
+
 export interface TeachingLevel {
   track: string;
   trackName: string;
