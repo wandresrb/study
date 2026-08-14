@@ -1,0 +1,153 @@
+---
+title: "Corrutinas de Lua: convertir callbacks anidados en código lineal"
+description: "Encadenar tres operaciones de libuv produce tres niveles de anidamiento y un manejo de errores repetido en cada uno. Las corrutinas de Lua deshacen esa pirámide: yield suspende, resume reanuda, y con veinte líneas construyes el async y el await que usan plenary, nio y el propio núcleo. Cómo funciona el mecanismo por dentro y por qué encaja tan bien con un bucle de eventos de un solo hilo."
+subject: neovim
+level: 12
+order: 5
+posicion: "12.5"
+duracion: "20 min"
+---
+
+<Lead>
+Una operación asíncrona con `callback` se lee bien. Tres encadenadas se leen mal. Cinco, con su comprobación de error en cada nivel, producen una pirámide inclinada que nadie quiere mantener y en la que los errores se manejan cinco veces o ninguna. Lua trae desde su origen la herramienta exacta para deshacer esa pirámide, y no es una biblioteca ni un truco: son las **corrutinas**, funciones que pueden suspenderse en mitad de su ejecución y reanudarse después justo donde lo dejaron. Con ellas, `libuv` deja de imponerte una forma de escribir y vuelve a ser un detalle de implementación.
+</Lead>
+
+<Objetivos>
+
+- Reconocer la pirámide de `callbacks` y el coste real que impone al manejo de errores.
+- Manejar `coroutine.create`, `coroutine.resume`, `coroutine.yield` y `coroutine.running`.
+- Construir un `async` y un `await` propios sobre cualquier API de `callbacks`.
+- Situar el patrón en los plugins reales y conocer sus límites frente a `vim.schedule`.
+
+</Objetivos>
+
+## La pirámide y su coste
+
+Leer un fichero con `vim.uv` requiere abrir, consultar el tamaño, leer y cerrar. Cuatro operaciones, cada una con su `callback`.
+
+```lua
+local uv = vim.uv
+
+uv.fs_open("/tmp/datos.txt", "r", 438, function(err, fd)
+  if err then return end
+  uv.fs_fstat(fd, function(err2, stat)
+    if err2 then return uv.fs_close(fd, function() end) end
+    uv.fs_read(fd, stat.size, 0, function(err3, datos)
+      uv.fs_close(fd, function() end)
+      if err3 then return end
+      vim.schedule(function() vim.notify(#datos .. " bytes") end)
+    end)
+  end)
+end)
+```
+
+El anidamiento es feo, pero lo grave es otra cosa: el cierre del descriptor aparece dos veces y en un tercer camino de error se olvidaría sin que nada avise. La secuencia lógica es lineal —abre, mide, lee, cierra— y el código no lo parece. Esa distancia entre la intención y su forma es precisamente lo que las corrutinas eliminan.
+
+## Suspender y reanudar
+
+Una corrutina es una función con estado de ejecución propio. `coroutine.create` la envuelve sin arrancarla, `coroutine.resume` la pone en marcha o la reanuda, y `coroutine.yield` la suspende devolviendo el control a quien la reanudó. La clave es que al suspenderse **conserva todo**: variables locales, posición en el código, pila de llamadas.
+
+```lua
+local co = coroutine.create(function(a)
+  print("empiezo con", a)
+  local b = coroutine.yield()      -- se suspende aqui
+  print("me reanudaron con", b)
+  return a + b
+end)
+
+coroutine.resume(co, 10)           -- imprime: empiezo con 10
+coroutine.resume(co, 32)           -- imprime: me reanudaron con 32
+print(coroutine.status(co))        -- dead
+```
+
+Observa la simetría, que es el corazón del truco: el valor que pasas a `resume` es lo que **devuelve** el `yield`. Una corrutina puede, por tanto, suspenderse para pedir un dato y recibirlo como si fuera el resultado de una llamada normal. Si quien la reanuda es el `callback` de `libuv`, acabas de convertir una operación asíncrona en una línea que parece síncrona.
+
+<Mermaid code={`sequenceDiagram
+  participant U as Codigo usuario
+  participant C as Corrutina
+  participant L as libuv
+  U->>C: resume
+  C->>L: fs_open con callback que hara resume
+  C-->>U: yield suspende
+  Note over U,L: El bucle sigue girando libre
+  L->>C: callback resume con err y fd
+  C->>C: continua justo tras el yield
+  C-->>U: termina`} />
+
+## async y await en veinte líneas
+
+Con esa simetría se construye el patrón completo. `esperar` recibe una función asíncrona y sus argumentos, le añade como último argumento un `callback` que reanuda la corrutina actual, y se suspende. `async` simplemente arranca una función dentro de una corrutina.
+
+```lua
+local function esperar(fn, ...)
+  local co = coroutine.running()
+  local args = { ... }
+  args[#args + 1] = function(...)
+    coroutine.resume(co, ...)      -- lo que devuelva el callback sale del yield
+  end
+  fn(unpack(args))
+  return coroutine.yield()
+end
+
+local function async(cuerpo)
+  return function(...)
+    local co = coroutine.create(cuerpo)
+    local ok, err = coroutine.resume(co, ...)
+    if not ok then
+      vim.schedule(function() vim.notify(tostring(err), vim.log.levels.ERROR) end)
+    end
+  end
+end
+```
+
+Con esas dos funciones, la pirámide del principio se aplana hasta parecer código de toda la vida.
+
+```lua
+local leer_fichero = async(function(ruta)
+  local err, fd = esperar(uv.fs_open, ruta, "r", 438)
+  if err then error(err) end
+  local _, stat = esperar(uv.fs_fstat, fd)
+  local _, datos = esperar(uv.fs_read, fd, stat.size, 0)
+  esperar(uv.fs_close, fd)
+  vim.schedule(function() vim.notify(#datos .. " bytes") end)
+end)
+
+leer_fichero("/tmp/datos.txt")
+```
+
+Cuatro operaciones asíncronas, cero anidamiento, un solo camino de error y el cierre del descriptor escrito una única vez. Y nada de esto bloquea: entre cada línea el bucle de `libuv` sigue girando con total libertad.
+
+<Callout type="warn" title="Dentro de la corrutina sigues en fast event">
+Reanudar desde un `callback` de `libuv` significa que el código posterior al `yield` se ejecuta **en fast event context**. La regla de oro no desaparece por usar corrutinas: sigues necesitando `vim.schedule` para tocar la API. Las bibliotecas maduras resuelven esto ofreciendo un `await` que reanuda ya en contexto seguro, y por eso conviene usarlas en lugar de reinventarlas.
+</Callout>
+
+## Lo que usan los plugins reales
+
+Casi ninguna base de código escribe hoy su propio `async` desde cero. `plenary.async` popularizó el patrón y sigue siendo el más extendido; `nio` es la reencarnación moderna, con tareas cancelables, señales de sincronización y envoltorios listos de la API de Neovim. El propio núcleo expone `vim.system` con una interfaz que admite tanto `callback` como espera, y `vim.lsp` ha ido migrando internamente a formas parecidas. Distintas envolturas, un solo mecanismo por debajo: `coroutine.yield` y `coroutine.resume` sobre el bucle de `libuv`.
+
+<Cards>
+  <Card icon="🧰" title="plenary.async">
+    El clásico. Aporta `async.void`, `async.wrap` y utilidades para lanzar tareas en paralelo. Muy extendido, pero con una gestión de errores que envejece.
+  </Card>
+  <Card icon="🚦" title="nio">
+    Tareas de primera clase con cancelación, eventos, colas y semáforos, más envoltorios seguros de la API. La opción recomendable en código nuevo.
+  </Card>
+</Cards>
+
+Lo que una biblioteca madura te da y tus veinte líneas no cubren se resume en cuatro cosas: propagación correcta de errores a través del `yield`, cancelación de una tarea a medio vuelo, composición de varias tareas en paralelo con espera conjunta, y reanudación garantizada en contexto seguro. Ninguna es difícil por separado; todas juntas son un proyecto. Reimplementarlas es un ejercicio excelente y una decisión de mantenimiento discutible.
+
+<Callout type="warn" title="Los límites del mecanismo">
+Una corrutina no puede suspenderse a través de una frontera de C: si tu `yield` está dentro de un `callback` invocado desde código nativo, obtienes el error `attempt to yield across a C-call boundary`. Tampoco existe una forma de reanudar una corrutina muerta. Y como `coroutine.running` devuelve la corrutina actual, llamar a tu `esperar` desde fuera de una corrutina falla en silencio o revienta según cómo lo escribas: protégelo con una comprobación explícita.
+</Callout>
+
+<Callout type="dios" title="La corrutina no añade concurrencia: le devuelve la forma a la que ya tenías">
+Merece la pena precisar qué hace y qué no hace este patrón, porque el vocabulario prestado de otros lenguajes confunde. Una corrutina de Lua **no es un hilo**: no hay paralelismo, no hay preemción, no hay dos cosas ejecutándose a la vez. Sigues en el hilo único de la primera lección y sigues sujeto a que nada bloquee el bucle. Lo que la corrutina aporta es puramente sintáctico en su efecto y profundo en su naturaleza: separa el **momento** en que el código continúa del **lugar** donde está escrito. Con `callbacks`, la continuación de tu programa tiene que escribirse en otro sitio, dentro de otra función, con otro alcance léxico —y esa fragmentación es la que produce la pirámide, la duplicación del manejo de errores y la pérdida de las variables locales. Con una corrutina, la continuación **es la línea siguiente**, aunque se ejecute cien milisegundos después. Por eso el patrón encaja tan bien aquí y no es una importación forzada: un bucle de eventos ya define una noción natural de suspender y reanudar, y una corrutina es exactamente la primitiva del lenguaje que la expresa. Repara además en que esta correspondencia no es casual histórica sino estructural: `async` y `await` en JavaScript, Python o Rust son, por debajo, máquinas de estados que hacen lo mismo que hace `coroutine.yield`, solo que generadas por el compilador en lugar de escritas a mano. Lua tenía la primitiva desde 1993, antes de que existiera el problema que hoy resuelve. Cuando lees `local _, datos = esperar(uv.fs_read, fd, stat.size, 0)` y entiendes que esa línea suspende un flujo, deja correr el bucle entero y lo retoma intacto, has cerrado el círculo del nivel: el bucle de eventos, el `handle`, la frontera del contexto y la corrutina no son cuatro temas, sino cuatro vistas del mismo objeto.
+</Callout>
+
+<Reto title="Aplana la pirámide">
+1. Escribe con `callbacks` anidados la secuencia abrir, medir, leer y cerrar un fichero, y cuenta cuántas veces aparece el cierre en los caminos de error.
+2. Experimenta con `coroutine.create`, `resume` y `yield` pasando valores en ambas direcciones hasta que la simetría te resulte evidente.
+3. Implementa `esperar` y `async` tal como aparecen aquí y reescribe la lectura del fichero en forma lineal.
+4. Comprueba con `vim.in_fast_event` en qué contexto queda el código posterior a un `esperar` y justifica por qué necesitas `vim.schedule`.
+5. Sustituye tu implementación por `nio` o `plenary.async` y describe qué te da la biblioteca que tus veinte líneas no cubren.
+</Reto>

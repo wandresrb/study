@@ -1,0 +1,148 @@
+---
+title: "La regla de oro: vim.schedule y la frontera del fast event"
+description: "Dentro de un callback de libuv no puedes tocar la API de Neovim. El error E5560 y el concepto de fast event context explican por qué, y vim.schedule junto a vim.schedule_wrap son la única puerta legítima de vuelta al hilo principal. Qué sí es seguro hacer en el callback, cómo detectarlo con vim.in_fast_event, y por qué esta frontera es una garantía y no un obstáculo."
+subject: neovim
+level: 12
+order: 3
+posicion: "12.3"
+duracion: "18 min"
+---
+
+<Lead>
+Hay una sola regla en este nivel que, si la olvidas, tu plugin no funcionará mal: reventará. Dentro de un `callback` de `libuv` **no puedes llamar a la API de Neovim**. Ni `vim.api`, ni `vim.fn`, ni `vim.cmd`, ni siquiera un `vim.notify` inocente. Neovim llama a ese contexto *fast event context*, y el mensaje que recibes al violarlo es tan característico que acabarás reconociéndolo de un vistazo: `E5560`. La buena noticia es que la salida es una sola función, y una vez la interiorizas deja de ser una regla que recordar para convertirse en un reflejo.
+</Lead>
+
+<Objetivos>
+
+- Reconocer el *fast event context* y el error `E5560` que lo delata.
+- Devolver el control al hilo principal con `vim.schedule` y con `vim.schedule_wrap`.
+- Distinguir qué operaciones sí son seguras dentro de un `callback` de `libuv`.
+- Detectar el contexto en tiempo de ejecución con `vim.in_fast_event`.
+
+</Objetivos>
+
+## La frontera prohibida
+
+Un `callback` de `libuv` se ejecuta en un punto del bucle en el que Neovim puede estar a medio hacer casi cualquier cosa: procesando una tecla, redibujando, resolviendo un `autocmd`. Su estado interno no está necesariamente en un punto consistente, y por eso el núcleo bloquea el acceso.
+
+```lua
+local uv = vim.uv
+local t = uv.new_timer()
+
+t:start(100, 0, function()
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { "hola" })
+  -- E5560: nvim_buf_set_lines must not be called in a fast event context
+end)
+```
+
+El error no es un aviso ni un consejo: es una comprobación explícita del núcleo antes de ejecutar la función. Y lo peor de la variante silenciosa —usar `vim.fn` en lugar de `vim.api`— es que a veces parece funcionar durante una demo y falla en producción con un mensaje incomprensible, porque el estado interno era el adecuado por casualidad.
+
+El síntoma tiene además una dificultad añadida: el error se produce dentro de un `callback` de `libuv`, es decir, lejos del código que lo registró. La traza no apunta a la función que creó el `timer` ni al `autocmd` que la disparó, sino a una línea suelta sin contexto. Por eso los primeros encuentros con `E5560` se viven como un error espontáneo que aparece de la nada; en realidad aparece exactamente donde debe, solo que el punto de la culpa y el punto del fallo están separados en el tiempo.
+
+<Callout type="warn" title="No todas las llamadas prohibidas gritan igual">
+La comprobación cubre la API pública, pero no todo lo que rodea a la API. Escribir en una variable global de Lua, mutar una tabla compartida o llamar a una función de tu propio módulo que internamente usa `vim.fn` no dispara ninguna alarma en el borde: el error saldrá dos niveles más adentro, con un nombre de función que no reconoces. Cuando escribas utilidades reutilizables, decide y documenta en qué contexto pueden llamarse.
+</Callout>
+
+<Mermaid code={`flowchart LR
+  ev[Evento de libuv] --> cb[Callback en fast event]
+  cb -->|prohibido| api[API de Neovim buffers ventanas]
+  cb -->|permitido| puro[Lua puro y vim.uv]
+  cb --> sch[vim.schedule encola]
+  sch --> cola[Cola del hilo principal]
+  cola --> seguro[Contexto seguro]
+  seguro --> api
+  style api fill:#f38ba8,color:#11111b
+  style sch fill:#cba6f7,color:#11111b
+  style seguro fill:#a6e3a1,color:#11111b`} />
+
+## vim.schedule y vim.schedule_wrap
+
+`vim.schedule` recibe una función y la encola para que Neovim la ejecute **más tarde**, en el hilo principal y en un momento en el que el estado sí es consistente. No la ejecuta ahora; la aplaza. Con eso basta.
+
+```lua
+t:start(100, 0, function()
+  local calculo = 2 + 2            -- Lua puro: seguro aqui
+  vim.schedule(function()
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "resultado " .. calculo })
+  end)
+end)
+```
+
+Fíjate en que el cierre captura `calculo` sin problema: la función aplazada sigue viendo el entorno donde se creó. Ese es el patrón fundamental —calcula en el `callback`, aplica en el `schedule`— y cubre el noventa por ciento de los casos.
+
+Cuando lo que quieres es que **toda** la función viva en contexto seguro, `vim.schedule_wrap` te devuelve una versión envuelta que puedes pasar directamente donde se esperaba el `callback`.
+
+```lua
+t:start(100, 0, vim.schedule_wrap(function()
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { "todo el cuerpo es seguro" })
+  vim.notify("y esto tambien")
+end))
+```
+
+Existe además un pariente cercano que conviene no confundir. `vim.defer_fn(fn, ms)` combina un `timer` interno con un `vim.schedule`: ejecuta en contexto seguro **y** tras un retardo. `vim.schedule` no espera nada, solo aplaza al primer hueco disponible.
+
+| Función | Contexto seguro | Retardo |
+|---------|-----------------|---------|
+| `vim.schedule(fn)` | sí | ninguno, primer hueco libre |
+| `vim.schedule_wrap(fn)` | sí | ninguno, devuelve función envuelta |
+| `vim.defer_fn(fn, ms)` | sí | los milisegundos indicados |
+
+Usar `vim.defer_fn(fn, 0)` como sustituto de `vim.schedule` funciona, pero crea y destruye un `timer` en cada llamada para no ganar nada. En un `callback` que se dispara cientos de veces por segundo, esa diferencia sí se nota.
+
+<Callout type="tip" title="Envuelve en el borde, no en el interior">
+La costumbre más limpia es aplicar `vim.schedule_wrap` justo donde entregas el `callback` a `libuv`, no dispersar `vim.schedule` por dentro. Así el borde entre los dos mundos queda visible en una sola línea, y cualquiera que lea tu código sabe de inmediato en qué contexto está el cuerpo de la función.
+</Callout>
+
+## Qué sí puedes hacer dentro del callback
+
+La frontera prohíbe la API del editor, no Lua. Dentro de un `callback` de `libuv` sigues teniendo a tu disposición todo lo que no toca el estado del editor, y aprovecharlo es lo que hace que el patrón sea eficiente en lugar de un simple rodeo burocrático.
+
+| Operación | ¿Permitida en fast event? |
+|-----------|---------------------------|
+| Lua puro: tablas, cadenas, aritmética | sí |
+| Otras llamadas a `vim.uv` | sí |
+| `vim.schedule` y `vim.schedule_wrap` | sí |
+| `vim.inspect`, `vim.split`, `vim.tbl_map` | sí |
+| `vim.api` y `vim.fn` | no |
+| `vim.cmd`, `vim.notify`, `vim.opt` | no |
+
+La lista de la derecha no es arbitraria: todo lo permitido comparte una propiedad, no toca el estado del editor. `vim.split` manipula cadenas, `vim.tbl_map` recorre tablas, `vim.uv` habla con el sistema operativo. Ninguno pregunta por un buffer, una ventana o una opción. Esa es la regla de fondo, y sirve para clasificar cualquier función que no aparezca en la tabla: si necesita saber algo del editor para responder, está prohibida.
+
+Esto significa que el trabajo pesado de procesar datos —parsear la salida de un proceso, filtrar miles de líneas, construir la estructura final— debe ocurrir **dentro** del `callback`, y solo el resultado ya masticado cruza la frontera. Si aplazas todo con `vim.schedule`, has movido el coste al hilo principal y estás congelando el editor exactamente igual que antes.
+
+Si escribes una función que puede ser llamada desde ambos lados, `vim.in_fast_event()` te dice dónde estás y te permite adaptarte sin duplicar código.
+
+```lua
+local function avisar(msg)
+  if vim.in_fast_event() then
+    vim.schedule(function() vim.notify(msg) end)
+  else
+    vim.notify(msg)
+  end
+end
+```
+
+Hay dos matices que conviene tener presentes al usar `vim.schedule`. El primero es que **no garantiza inmediatez**: tu función entra en una cola que se vacía cuando el editor está en reposo, así que si el usuario mantiene una tecla pulsada puede tardar más de lo que esperabas. El segundo es que el orden se respeta —lo encolado primero se ejecuta primero— pero el contexto puede haber cambiado por completo entre el encolado y la ejecución.
+
+```lua
+-- Toda funcion aplazada debe revalidar sus supuestos
+vim.schedule(function()
+  if not vim.api.nvim_buf_is_valid(bufnr) then return end
+  if vim.api.nvim_get_current_buf() ~= bufnr then return end
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lineas)
+end)
+```
+
+Esa doble comprobación parece defensiva de más hasta el día en que un usuario cierra el buffer mientras tu trabajo estaba en vuelo y tu plugin escribe en un identificador que ya no existe. Aplazar es viajar al futuro, y el futuro no está obligado a parecerse al presente.
+
+<Callout type="dios" title="La frontera no te limita: te informa de dónde estás">
+Es tentador leer `E5560` como un obstáculo que Neovim te pone y `vim.schedule` como el conjuro para esquivarlo. Esa lectura es exactamente la contraria a la verdad. Recuerda de la primera lección que Neovim no tiene candados porque un solo hilo posee todo el estado; esa ausencia de sincronización solo es segura si además existe la garantía de que ningún código toca el estado **en un instante en que ese estado no es consistente**. Un `callback` de `libuv` se dispara en mitad de una vuelta del bucle, y en mitad de una vuelta el editor puede estar a medio aplicar un cambio de buffer, a medio resolver una cadena de `autocmds` o a medio calcular un redibujado. Permitir que ahí dentro llames a `nvim_buf_set_lines` no produciría un error diagnosticable: produciría corrupción, y de la peor especie, la que aparece una vez cada mil ejecuciones y no se reproduce jamás. `E5560` no es una prohibición arbitraria, es la conversión de ese fallo indetectable en un error inmediato, ruidoso y con nombre propio. Y `vim.schedule` no es un truco para saltarse la norma sino la implementación literal del contrato: encola tu función en la misma cola por la que pasan las teclas y los eventos, de modo que se ejecutará cuando el editor esté en reposo, entre operaciones y no dentro de una. Visto así, la regla de oro deja de ser una regla y se convierte en una descripción: hay dos contextos, uno para calcular y otro para aplicar, y `vim.schedule` es el puente unidireccional entre ellos. El día que este reparto te resulte obvio, habrás dejado de escribir Lua para Neovim y habrás empezado a escribir Neovim.
+</Callout>
+
+<Reto title="Cruza la frontera con criterio">
+1. Provoca `E5560` deliberadamente con un `timer` que llame a `vim.api.nvim_buf_set_lines` y lee el mensaje completo.
+2. Arregla el mismo código con `vim.schedule` envolviendo únicamente la llamada a la API.
+3. Reescríbelo con `vim.schedule_wrap` aplicado al entregar el `callback` y compara la legibilidad de ambas versiones.
+4. Escribe un `timer` que reciba una lista de mil cadenas, la filtre y ordene en el `callback`, y solo aplace la escritura del resultado; explica por qué ese reparto importa.
+5. Implementa una función que use `vim.in_fast_event` para comportarse correctamente tanto llamada desde un `autocmd` como desde un `callback` de `libuv`.
+</Reto>

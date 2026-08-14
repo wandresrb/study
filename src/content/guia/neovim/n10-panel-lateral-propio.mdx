@@ -1,0 +1,169 @@
+---
+title: "Caso real: un panel lateral que se actualiza solo"
+description: "Integración de todo el nivel en un plugin funcional: estado idempotente, superficie scratch en división lateral, render sin ensuciar el árbol de deshacer y actualización reactiva con autocmds, vim.schedule y antirrebote."
+subject: neovim
+level: 10
+order: 5
+posicion: "10.5"
+duracion: "22 min"
+---
+
+<Lead>
+Ya tienes las cuatro piezas: buffers por código, superficies sin archivo, ventanas configurables y consultas sin cambiar de contexto. Este capítulo las une en algo que se usa de verdad: un panel lateral que muestra información del buffer que estás editando y se actualiza solo mientras trabajas. El código completo cabe en cien líneas, pero cada decisión de diseño responde a un fallo concreto que verás en plugins reales.
+</Lead>
+
+<Objetivos>
+
+- Estructurar el estado de un plugin de forma idempotente y validada.
+- Construir la superficie combinando buffer scratch y división lateral fija.
+- Renderizar sin ensuciar el árbol de deshacer ni desplazar el cursor del usuario.
+- Reaccionar a eventos con antirrebote y limpiar los recursos al cerrar.
+
+</Objetivos>
+
+## Estado idempotente
+
+El plugin guarda dos identificadores y nada más. Cualquier función pública debe poder llamarse dos veces seguidas sin duplicar nada, y toda lectura del estado pasa antes por una validación, porque el usuario puede haber cerrado la ventana o borrado el buffer a tus espaldas.
+
+```lua
+local api = vim.api
+local M = { buf = nil, win = nil, grupo = nil, timer = nil }
+
+local function buf_vivo() return M.buf and api.nvim_buf_is_valid(M.buf) end
+local function win_viva() return M.win and api.nvim_win_is_valid(M.win) end
+```
+
+Esa pareja de predicados es el cimiento. Todo lo demás los llama antes de tocar nada, y con eso desaparece la clase entera de errores de identificador colgado.
+
+<Mermaid code={`flowchart TD
+  A[Usuario invoca el panel] --> B[Existe la ventana]
+  B -->|si| C[Cerrar y limpiar]
+  B -->|no| D[Crear buffer scratch si hace falta]
+  D --> E[Abrir division lateral fija]
+  E --> G[Render inicial y autocmds en un grupo]
+  G --> H[Eventos disparan render con antirrebote]
+  H --> G
+  C --> I[Borrar grupo y parar el temporizador]
+  style G fill:#a6e3a1,color:#11111b
+  style I fill:#f38ba8,color:#11111b`} />
+
+## La superficie
+
+El buffer se crea una sola vez y se reutiliza, con un `filetype` propio para que el usuario pueda escribir sus propias reglas sobre el panel. La ventana es una división a la derecha con anchura fija, y el detalle crítico es `winfixwidth`: sin él, cualquier `:split` posterior reequilibrará el espacio y tu panel de treinta y cuatro columnas quedará en la mitad.
+
+```lua
+local function crear_buf()
+  if buf_vivo() then return M.buf end
+  M.buf = api.nvim_create_buf(false, true)
+  vim.bo[M.buf].bufhidden = "hide"
+  vim.bo[M.buf].filetype  = "panelinfo"
+  vim.bo[M.buf].modifiable = false
+  vim.keymap.set("n", "q", function() M.cerrar() end,
+    { buffer = M.buf, nowait = true, desc = "cerrar el panel" })
+  return M.buf
+end
+
+local function crear_win()
+  M.win = api.nvim_open_win(crear_buf(), false,
+    { split = "right", win = 0, width = 34 })
+  local wo = vim.wo[M.win]
+  wo.winfixwidth, wo.number, wo.signcolumn = true, false, "no"
+  wo.wrap, wo.cursorline = false, true
+  wo.winhighlight = "Normal:NormalFloat"
+  return M.win
+end
+```
+
+Fíjate en el segundo argumento de `nvim_open_win`, puesto a `false`: la ventana se abre sin robarle el foco al usuario. Un panel informativo que te arranca del código en el que estabas es un panel que se desinstala el primer día.
+
+## Render sin daños colaterales
+
+La función de render recibe la ventana de origen —la que el usuario está mirando— y produce las líneas con APIs de destino explícito, sin saltar a ninguna parte. La escritura abre y cierra `modifiable`, limpia la marca `modified` y protege el cursor del propio panel: reemplazar todas las líneas coloca el cursor de cualquier ventana que muestre ese buffer en una posición arbitraria, y guardarlo evita que el panel dé saltos visuales en cada pulsación.
+
+```lua
+local function recolectar(origen)
+  if not api.nvim_win_is_valid(origen) then return {} end
+  local b = api.nvim_win_get_buf(origen)
+  local nombre = vim.fn.fnamemodify(api.nvim_buf_get_name(b), ":t")
+  local tipo = vim.bo[b].filetype
+  return {
+    "  PANEL", "",
+    "  buffer   " .. b,
+    "  archivo  " .. (nombre == "" and "sin nombre" or nombre),
+    "  tipo     " .. (tipo == "" and "ninguno" or tipo),
+    "  lineas   " .. api.nvim_buf_line_count(b),
+    "  cursor   " .. api.nvim_win_get_cursor(origen)[1],
+    "  ventana  " .. origen,
+  }
+end
+
+local function render(origen)
+  if not buf_vivo() or not win_viva() then return end
+  local lineas = recolectar(origen)
+  local cur = api.nvim_win_get_cursor(M.win)
+  vim.bo[M.buf].modifiable = true
+  api.nvim_buf_set_lines(M.buf, 0, -1, false, lineas)
+  vim.bo[M.buf].modifiable = false
+  vim.bo[M.buf].modified = false
+  api.nvim_win_set_cursor(M.win, { math.min(cur[1], math.max(#lineas, 1)), 0 })
+end
+```
+
+Sobre el árbol de deshacer: como el buffer es scratch y no `modifiable` de cara al usuario, su historial no le interesa a nadie. Aun así, si tu panel fuese editable, aquí es donde envolverías la escritura en `nvim_buf_call` con `undojoin` para que cien actualizaciones no se conviertan en cien niveles de deshacer.
+
+## Reactividad y limpieza
+
+Los autocomandos viven en un grupo propio con `clear` activado, lo que garantiza que reinstalarlos no los duplique. El guardián en la primera línea del callback es esencial: si el evento viene del propio panel, no hay nada que actualizar, y sin esa comprobación tendrías un bucle de realimentación.
+
+```lua
+local function programar(origen)
+  if M.timer then M.timer:stop() end
+  M.timer = vim.uv.new_timer()
+  M.timer:start(60, 0, vim.schedule_wrap(function() render(origen) end))
+end
+
+local function instalar()
+  M.grupo = api.nvim_create_augroup("PanelInfo", { clear = true })
+  api.nvim_create_autocmd(
+    { "CursorMoved", "BufEnter", "WinEnter", "TextChanged" },
+    { group = M.grupo, callback = function()
+        local w = api.nvim_get_current_win()
+        if w ~= M.win then programar(w) end
+      end })
+  api.nvim_create_autocmd("WinClosed", { group = M.grupo, callback = function(ev)
+      if tonumber(ev.match) == M.win then M.cerrar() end
+    end })
+end
+```
+
+El antirrebote de sesenta milisegundos no es cosmético: `CursorMoved` se dispara en cada pulsación de `j`, y con la tecla mantenida eso son decenas de renders por segundo. El temporizador colapsa la ráfaga en una sola actualización, y `vim.schedule_wrap` garantiza que la escritura ocurra en el bucle principal y no dentro del callback de libuv, donde la API no es segura. La limpieza cierra el círculo: un plugin que deja autocomandos vivos tras cerrar su ventana sigue costando tiempo en cada movimiento del cursor durante el resto de la sesión.
+
+```lua
+function M.cerrar()
+  if M.timer then M.timer:stop(); M.timer:close(); M.timer = nil end
+  if M.grupo then pcall(api.nvim_del_augroup_by_id, M.grupo); M.grupo = nil end
+  if win_viva() then api.nvim_win_close(M.win, true) end
+  M.win = nil
+end
+
+function M.alternar()
+  if win_viva() then return M.cerrar() end
+  local origen = api.nvim_get_current_win()
+  crear_win(); instalar(); render(origen)
+end
+
+api.nvim_create_user_command("PanelInfo", M.alternar, { desc = "alternar el panel" })
+return M
+```
+
+<Callout type="dios" title="Un plugin es un ciclo de vida, no un conjunto de funciones">
+El código que acabas de escribir tiene tres capas y solo una de ellas es visible. La primera es lo que el usuario ve: un panel con texto. La segunda es la superficie: un buffer y una ventana con sus contratos declarados en opciones. La tercera, la que decide si tu plugin es bueno o insoportable, es el ciclo de vida: qué se crea, qué se reutiliza, qué se destruye y, sobre todo, qué se desregistra. La mayoría de los plugins que la comunidad abandona no fallan por lógica incorrecta sino por esa tercera capa: autocomandos que sobreviven a su ventana, temporizadores que nunca se cierran, buffers que se acumulan invisibles, identificadores guardados sin validar. Escribe siempre la función de cierre antes que la de apertura. Si no sabes exactamente qué libera, todavía no sabes qué estás creando, y en un editor que el usuario deja abierto durante días esa deuda se cobra sin excepción.
+</Callout>
+
+<Reto title="Haz tuyo el panel">
+1. Monta el módulo completo en tu configuración y comprueba que `:PanelInfo` alterna sin duplicar buffers.
+2. Añade una línea con la posición del cursor en porcentaje del total y otra con el número de ventanas de la pestaña.
+3. Cambia el antirrebote a cero y mide con `vim.uv.hrtime` cuántos renders provoca mantener pulsada `j`.
+4. Convierte la división lateral en flotante con `nvim_win_set_config` sin reconstruir el buffer.
+5. Investiga: elimina el guardián que ignora eventos del propio panel y explica con precisión qué bucle aparece.
+</Reto>

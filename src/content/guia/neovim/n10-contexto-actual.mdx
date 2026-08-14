@@ -1,0 +1,163 @@
+---
+title: "El contexto actual: operar sin saltar de ventana"
+description: "Buffer, ventana y pestaña actuales como estado implícito del editor: por qué cambiar de contexto tiene efectos colaterales caros y cómo ejecutar código en otra ventana con nvim_win_call y nvim_buf_call sin moverse."
+subject: neovim
+level: 10
+order: 4
+posicion: "10.4"
+duracion: "18 min"
+---
+
+<Lead>
+Media API de Neovim funciona sobre un estado implícito: hay una pestaña actual, dentro de ella una ventana actual, y esa ventana determina cuál es el buffer actual. Ese estado es cómodo hasta que necesitas tocar algo que no está delante de ti. La respuesta ingenua es saltar allí, hacer el trabajo y volver. La respuesta correcta es no saltar nunca.
+</Lead>
+
+<Objetivos>
+
+- Entender la jerarquía pestaña, ventana y buffer, y quién determina a quién.
+- Enumerar los efectos colaterales reales de un cambio de contexto.
+- Ejecutar código en otra ventana o buffer con `nvim_win_call` y `nvim_buf_call`.
+- Preferir las APIs con destino explícito y saber cuándo no queda más remedio.
+
+</Objetivos>
+
+## Tres punteros encadenados
+
+El contexto no son tres variables independientes: es una cadena. La pestaña actual determina el conjunto de ventanas disponibles; la ventana actual determina el buffer actual. No puedes fijar el buffer actual sin que alguna ventana lo esté mostrando.
+
+```lua
+local api = vim.api
+
+local tab = api.nvim_get_current_tabpage()
+local win = api.nvim_get_current_win()
+local buf = api.nvim_get_current_buf()
+
+-- siempre cierto
+assert(buf == api.nvim_win_get_buf(win))
+```
+
+Los verbos para moverse tienen alcances distintos. `nvim_set_current_win` cambia la ventana actual y, si está en otra pestaña, cambia también la pestaña. `nvim_set_current_buf` no mueve la ventana: hace que la ventana actual muestre otro buffer, que es una operación mucho más destructiva de lo que parece, porque el usuario pierde de vista lo que tenía.
+
+<Mermaid code={`flowchart TD
+  T[Pestana actual] --> W[Ventana actual]
+  W --> B[Buffer actual derivado]
+  W --> C[Cursor y scroll y pliegues]
+  B --> O[Opciones locales de buffer]
+  W --> P[Opciones locales de ventana]
+  B --> N[El buffer no elige su ventana]
+  style B fill:#89b4fa,color:#11111b
+  style N fill:#f9e2af,color:#11111b`} />
+
+La pestaña añade un matiz que casi nadie considera: cada pestaña recuerda cuál era su ventana activa. Al volver a ella con `nvim_set_current_tabpage`, el foco regresa a esa ventana y no a la primera, lo que significa que hay estado de contexto guardado por pestaña además del global.
+
+```lua
+-- recorrer todas las pestanas sin cambiar a ninguna
+for _, t in ipairs(api.nvim_list_tabpages()) do
+  local activa = api.nvim_tabpage_get_win(t)
+  print(t, activa, api.nvim_buf_get_name(api.nvim_win_get_buf(activa)))
+end
+```
+
+En toda la API, el valor `0` es el alias del elemento actual. Es cómodo y es peligroso: un `0` escrito en una función que se ejecuta más tarde, dentro de un callback o de un `vim.schedule`, se resolverá contra el contexto de ese momento, que puede no ser el que tenías en mente. En código diferido, escribe siempre el identificador explícito.
+
+## Saltar sale caro
+
+Supón que quieres saber qué líneas son visibles en otra ventana. La solución tentadora es: guardo la ventana actual, salto, consulto, vuelvo. Funciona en las pruebas y falla en producción, porque cada salto arrastra una cola de efectos.
+
+Un cambio de ventana dispara `WinLeave`, `BufLeave`, `WinEnter` y `BufEnter`, además de `WinScrolled` si algo se desplaza. Cualquier plugin del usuario que escuche esos eventos —resaltado de la ventana activa, guardado automático, actualización de la línea de estado, sincronización con un depurador— se ejecutará dos veces por cada consulta tuya.
+
+Y hay estado que no se restaura solo aunque vuelvas:
+
+- La **jumplist** registra el salto, así que `<C-o>` del usuario deja de llevarle donde esperaba.
+- El **archivo alternativo**, el que se abre con `<C-^>`, cambia de valor.
+- La **marca de cambio** y la marca de última posición se reescriben.
+- La **vista** de la ventana visitada puede alterarse: pliegues abiertos, desplazamiento horizontal.
+- Si el usuario estaba en modo insertar o en un modo de operador, el salto lo interrumpe.
+
+Restaurar todo eso a mano es posible y es exactamente el tipo de código que nadie mantiene bien. La disciplina correcta es distinta: no saltes.
+
+## nvim_win_call y nvim_buf_call
+
+Neovim ofrece dos funciones que ejecutan una función Lua *como si* estuvieras en otra ventana o en otro buffer, y restauran el contexto al terminar, incluso si tu código lanza un error.
+
+```lua
+-- ejecutar en el contexto de otra ventana
+local topline = api.nvim_win_call(otra_win, function()
+  return vim.fn.line("w0")
+end)
+
+-- ejecutar en el contexto de otro buffer
+api.nvim_buf_call(otro_buf, function()
+  vim.cmd("silent! %s/\\s\\+$//e")
+end)
+```
+
+Dos propiedades las hacen distintas de un salto manual. La primera es que el valor devuelto por la función interior se propaga hacia fuera, lo que las convierte en expresiones y no en efectos. La segunda, y decisiva, es que el cambio de contexto es interno: no dispara la cascada de `WinEnter` y `BufEnter` que dispararía un cambio real, y la jumplist y el archivo alternativo quedan intactos.
+
+Hay límites que conviene conocer antes de tropezar con ellos. Dentro del callback no puedes cerrar la ventana en cuyo contexto estás, ni destruir el buffer, porque el restaurador necesita que sigan existiendo. Tampoco puedes hacer operaciones prohibidas por `textlock` si te llamaron desde un contexto restringido, como el callback de un `on_lines`. Y `nvim_buf_call` sobre un buffer no visible usa internamente una ventana de autocomando, con lo cual algunas consultas dependientes de ventana devolverán valores de esa ventana ficticia, no de una real.
+
+```lua
+-- patron seguro: decide fuera, actua dentro
+local objetivo = api.nvim_get_current_win()
+for _, w in ipairs(api.nvim_list_wins()) do
+  if w ~= objetivo and api.nvim_win_is_valid(w) then
+    local nombre = api.nvim_win_call(w, function()
+      return vim.fn.expand("%:t")
+    end)
+    print(w, nombre)
+  end
+end
+```
+
+## Casi nunca hace falta
+
+La regla que ordena todo el nivel es esta: `nvim_win_call` es la salida de emergencia, no la herramienta principal. La API moderna acepta destino explícito en prácticamente todo, y esas variantes son más rápidas, más legibles y no tienen efectos colaterales.
+
+```lua
+-- cursor de otra ventana, sin entrar en ella
+local fila, columna = unpack(api.nvim_win_get_cursor(otra_win))
+api.nvim_win_set_cursor(otra_win, { fila + 1, 0 })
+
+-- opciones con destino explicito
+local envuelve = api.nvim_get_option_value("wrap", { win = otra_win })
+local tipo     = api.nvim_get_option_value("filetype", { buf = otro_buf })
+
+-- texto sin cambiar de buffer
+local lineas = api.nvim_buf_get_lines(otro_buf, 0, -1, false)
+
+-- alto real del texto de una ventana, pliegues incluidos
+local altura = api.nvim_win_text_height(otra_win, {})
+```
+
+También muchas funciones de Vimscript aceptan hoy un identificador de ventana o de buffer como argumento, y `vim.fn.getwininfo(winid)` devuelve de una sola vez la primera y la última línea visibles, la anchura de la columna de texto y las coordenadas en pantalla.
+
+El criterio queda así de simple: si existe una variante con destino explícito, úsala. Reserva `nvim_win_call` para el código heredado de la era Vimscript que solo sabe leer la ventana actual, y `nvim_buf_call` para ejecutar comandos Ex cuyo alcance es el buffer actual y que no tienen equivalente en la API.
+
+Queda un caso legítimo más: cuando necesitas que un evento **no** se dispare aunque el cambio de contexto sea real. Para eso está `eventignore`, que suspende temporalmente los autocomandos indicados, y el campo `noautocmd` de `nvim_open_win`. Úsalos con moderación, porque silenciar eventos también silencia a los plugins del usuario que dependían de ellos.
+
+```lua
+local guardado = vim.o.eventignore
+vim.o.eventignore = "BufEnter,BufLeave,WinEnter,WinLeave"
+local ok, err = pcall(function()
+  api.nvim_set_current_win(otra_win)
+  vim.cmd("normal! zz")
+end)
+vim.o.eventignore = guardado
+if not ok then error(err) end
+```
+
+El `pcall` garantiza que `eventignore` se restaure aunque el cuerpo falle. Dejarlo activado por un error es de los fallos más difíciles de diagnosticar que puede provocar un plugin: a partir de ese momento el editor deja de reaccionar a nada y nada apunta a tu código.
+
+Cuando de verdad necesites que el usuario acabe en otro sitio, hazlo explícito y no lo disfraces: mueve el foco con `nvim_set_current_win` como acción deliberada, no como paso intermedio de una consulta.
+
+<Callout type="dios" title="El contexto implícito es deuda técnica heredada">
+Que exista un buffer actual y una ventana actual no es un rasgo de diseño elegante: es una herencia de una época en la que el editor era estrictamente monotarea y el estado global era la única forma de comunicar cosas entre comandos Ex. La API de Lua se construyó encima con una intención clara, visible en cada firma: todos los parámetros de destino son explícitos y el `0` es solo un atajo. Escribir código que salta de ventana es programar contra la capa de compatibilidad en lugar de contra la interfaz real. Y el coste no es teórico: en cuanto tu plugin convive con otros veinte que escuchan `BufEnter`, cada salto que haces multiplica el trabajo de todos ellos, y la latencia que el usuario percibe al mover el cursor no la produce ninguno en solitario sino la suma. La medida de calidad de un plugin en este nivel es cuántas veces cambia el contexto por segundo. El objetivo es cero.
+</Callout>
+
+<Reto title="Una consulta sin efectos colaterales">
+1. Escribe una función que devuelva, para cada ventana de la pestaña, su `winid` y el nombre corto de su buffer, sin usar `nvim_win_call`.
+2. Reescríbela usando `nvim_win_call` y compara la legibilidad y el número de líneas.
+3. Obtén el rango de líneas visibles de otra ventana con `vim.fn.getwininfo` y compáralo con hacerlo saltando.
+4. Añade un autocomando `BufEnter` que imprima un contador y comprueba cuántas veces se dispara con cada enfoque.
+5. Investiga: mide con `vim.uv.hrtime` mil consultas con destino explícito frente a mil con salto real.
+</Reto>

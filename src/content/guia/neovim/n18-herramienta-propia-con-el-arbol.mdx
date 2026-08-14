@@ -1,0 +1,210 @@
+---
+title: "Escribir tu propia herramienta sobre el árbol"
+description: "Construir un comando que analice el buffer con una query, calcule una métrica por función y actúe: diagnósticos, lista quickfix y texto virtual. Predicados y directivas propios, coste de las queries, inyecciones de lenguaje y reanálisis incremental sin bloquear el editor."
+subject: neovim
+level: 18
+order: 5
+posicion: "18.5"
+duracion: "22 min"
+---
+
+<Lead>
+Todo lo anterior —objetos, saltos, pliegues, refactorizaciones— son aplicaciones de una misma capacidad subyacente: dentro del editor hay un analizador sintáctico completo, actualizado tras cada pulsación, con una API pública en Lua. Esa capacidad no está reservada a los autores de plugins. Un buffer abierto es un programa parseado, y consultarlo cuesta unas pocas líneas; a partir de ahí, cualquier pregunta que sepas formular como patrón sintáctico se convierte en una herramienta propia. En este capítulo construimos una completa y funcional: un comando que calcula la complejidad ciclomática de cada función del buffer y la comunica por tres canales distintos, con la disciplina de coste e incrementalidad que exige ejecutar análisis dentro del bucle de un editor.
+</Lead>
+
+<Objetivos>
+
+- Compilar una query una sola vez y recorrer sus capturas acotando el rango analizado.
+- Filtrar dentro de la propia query con predicados y anotar resultados con directivas, incluidos los tuyos.
+- Publicar resultados como diagnósticos, como lista `quickfix` y como texto virtual con `extmarks`.
+- Reanalizar de forma incremental, respetar las inyecciones de lenguaje y no bloquear el editor.
+
+</Objetivos>
+
+## Anatomía de una herramienta de árbol
+
+Toda herramienta sigue el mismo esqueleto: obtener el parser, obtener la raíz, ejecutar una query y recorrer las capturas. La única decisión de diseño importante en este nivel es **dónde se compila la query**, porque compilarla en cada invocación desperdicia trabajo que es idéntico siempre.
+
+```lua
+-- Compilada una sola vez al cargar el modulo, no en cada llamada
+local QUERY = [[
+  (function_declaration) @funcion
+  [(if_statement) (elseif_statement) (while_statement) (for_statement)] @rama
+  (binary_expression operator: ["and" "or"]) @rama
+]]
+
+local cache = {}
+local function query_de(lang)
+  if cache[lang] == nil then
+    local ok, q = pcall(vim.treesitter.query.parse, lang, QUERY)
+    cache[lang] = ok and q or false
+  end
+  return cache[lang] or nil
+end
+```
+
+El recorrido entrega, para cada captura, su identificador y su nodo. Con los rangos de las funciones y los de las ramas, la métrica es una asignación de cada rama a la función más interna que la contiene.
+
+```lua
+local function analizar(buf)
+  -- get_parser devuelve nil si no hay parser; no lanza excepcion,
+  -- asi que ni pcall ni ninguna opcion de silenciado hacen falta.
+  local parser = vim.treesitter.get_parser(buf)
+  if not parser then return {} end
+
+  local q = query_de(parser:lang())
+  if not q then return {} end
+
+  local root = parser:parse()[1]:root()
+  local funciones, ramas = {}, {}
+  for id, nodo in q:iter_captures(root, buf) do
+    local sr, sc, er, ec = nodo:range()
+    local destino = q.captures[id] == "funcion" and funciones or ramas
+    destino[#destino + 1] = { sr = sr, sc = sc, er = er, ec = ec }
+  end
+
+  for _, f in ipairs(funciones) do
+    f.complejidad = 1                       -- un camino base, mas una por rama contenida
+    for _, r in ipairs(ramas) do
+      if r.sr >= f.sr and r.er <= f.er then f.complejidad = f.complejidad + 1 end
+    end
+  end
+  return funciones
+end
+```
+
+La asignación por contención es cuadrática y por eso conviene decir en voz alta cuándo importa: con centenares de funciones y miles de ramas, medir antes de optimizar; si hiciera falta, el recorrido ascendente por ancestros desde cada rama hasta su función contenedora es lineal y sustituye el bucle anidado.
+
+## Filtrar dentro de la query
+
+Escribir la lógica en Lua funciona, pero la query es un lenguaje declarativo con capacidad de filtrado propia, y usarla mantiene el análisis donde debe estar. Los **predicados** deciden si un emparejamiento cuenta; las **directivas** adjuntan metadatos al emparejamiento sin descartarlo.
+
+```lua
+-- Predicado propio: cierto si TODOS los nodos capturados superan cierta longitud.
+-- match asocia cada identificador de captura con una LISTA de nodos, siempre,
+-- aunque el patron no lleve cuantificadores.
+vim.treesitter.query.add_predicate("mas-largo-que?", function(match, _, buf, pred)
+  local nodos = match[pred[2]]
+  if not nodos or #nodos == 0 then return true end
+  local limite = tonumber(pred[3])
+  for _, nodo in ipairs(nodos) do
+    if #vim.treesitter.get_node_text(nodo, buf) <= limite then return false end
+  end
+  return true
+end, { force = true })
+```
+
+```scheme
+; Uso en la query, junto a un predicado estandar y una directiva
+((identifier) @id
+  (#mas-largo-que? @id 30)
+  (#not-eq? @id "self"))
+
+((function_declaration) @f
+  (#set! prioridad "alta"))
+```
+
+Los predicados estándar cubren casi todo lo habitual: igualdad de texto, pertenencia a un conjunto, subcadena, coincidencia con una expresión regular o con un patrón de Lua, y comprobación de ancestros. La negación con `not-` la obtienes gratis para cualquiera de ellos, incluido el tuyo; la variante `any-` no, esa está reservada a cuatro predicados del núcleo. La directiva de asignación adjunta pares clave y valor que recibes junto al emparejamiento, y es la vía limpia para etiquetar resultados sin duplicar la lógica en el código.
+
+La regla práctica es sencilla: si la condición es puramente sintáctica o textual, exprésala en la query; si requiere contar, agregar o mirar el estado del editor, hazlo en Lua. Y recuerda que casi todos los fallos de una herramienta de árbol son, en realidad, fallos de la query —un tipo de nodo que esa gramática nombra de otro modo—, así que depúrala con `:EditQuery` antes de sospechar del código Lua.
+
+## Actuar: tres canales de salida
+
+Con los datos calculados, publicarlos es un problema de interfaz, y Neovim ofrece tres mecanismos con propósitos distintos que conviene no confundir.
+
+```lua
+local ns = vim.api.nvim_create_namespace("complejidad")
+
+local function publicar(buf, funciones, umbral)
+  local diags, qf = {}, {}
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  for _, f in ipairs(funciones) do
+    local alto = f.complejidad > umbral
+    -- 1. texto virtual: informacion ambiental, siempre visible y sin exigir nada
+    vim.api.nvim_buf_set_extmark(buf, ns, f.sr, 0, {
+      virt_text = { { "cc " .. f.complejidad, alto and "WarningMsg" or "Comment" } },
+      virt_text_pos = "eol",
+    })
+    if alto then
+      -- 2. diagnostico: un juicio con severidad, junto a los del servidor
+      diags[#diags + 1] = { lnum = f.sr, col = f.sc, end_lnum = f.er, end_col = f.ec,
+        severity = vim.diagnostic.severity.WARN, source = "complejidad",
+        message = ("complejidad %d supera el umbral %d"):format(f.complejidad, umbral) }
+      -- 3. quickfix: una agenda navegable con :cnext
+      qf[#qf + 1] = { bufnr = buf, lnum = f.sr + 1, col = f.sc + 1, text = "cc " .. f.complejidad }
+    end
+  end
+
+  vim.diagnostic.set(ns, buf, diags)
+  if #qf > 0 then vim.fn.setqflist(qf, "r") end
+end
+
+vim.api.nvim_create_user_command("Complejidad", function(opts)
+  local buf = vim.api.nvim_get_current_buf()
+  publicar(buf, analizar(buf), tonumber(opts.args) or 10)
+end, { nargs = "?", desc = "complejidad ciclomatica por funcion" })
+```
+
+Cada canal responde a una intención distinta. El texto virtual es información ambiental: acompaña sin exigir nada. El diagnóstico es un juicio con severidad que se integra con los del servidor de lenguaje y aparece en el mismo sitio. La lista `quickfix` es una **agenda**: un conjunto de posiciones que vas a recorrer con `:cnext` y `:cprev` hasta agotarlo. Elegir mal el canal es el error de diseño más común en herramientas propias, y se nota enseguida: métricas informativas como diagnósticos producen ruido que acabas silenciando, y hallazgos accionables como texto virtual se quedan sin recorrer.
+
+<Mermaid code={`flowchart TB
+  a[Buffer] --> b[Parser incremental]
+  b --> c[Arbol de sintaxis]
+  c --> d[Query compilada una vez con capturas y rangos]
+  d --> f[Agregacion en Lua]
+  f --> g[Texto virtual con extmarks]
+  f --> h[Diagnosticos]
+  f --> i[Lista quickfix]
+  style c fill:#cba6f7,color:#11111b
+  style i fill:#a6e3a1,color:#11111b`} />
+
+## Incrementalidad, inyecciones y coste
+
+Analizar bajo demanda es fácil; analizar continuamente sin degradar la escritura exige tres cuidados. El primero es **no recalcularlo todo**: el parser notifica qué subárboles cambiaron tras una edición, y una herramienta seria reanaliza solo esas regiones, o al menos acota el recorrido a las líneas visibles pasando el rango al iterador en lugar de barrer el fichero entero. El segundo es **amortiguar**: enganchar el análisis a cada pulsación garantiza latencia perceptible en ficheros grandes, mientras que un temporizador que reinicia su cuenta con cada cambio y dispara al cesar la escritura resulta imperceptible. El tercero es **degradar con elegancia**: si no hay parser para ese lenguaje, si la query no compila o si el buffer supera un tamaño razonable, la herramienta debe no hacer nada en silencio en vez de fallar ruidosamente.
+
+```lua
+local timer = vim.uv.new_timer()
+vim.api.nvim_create_autocmd({ "TextChanged", "InsertLeave" }, {
+  callback = function(args)
+    timer:stop()
+    timer:start(300, 0, vim.schedule_wrap(function()
+      if vim.api.nvim_buf_is_valid(args.buf) then publicar(args.buf, analizar(args.buf), 10) end
+    end))
+  end,
+})
+```
+
+Queda un detalle que separa las herramientas correctas de las aproximadas: las **inyecciones**. Un buffer no siempre contiene un único lenguaje. Hay `SQL` dentro de cadenas de Lua, `JavaScript` y `CSS` dentro de `HTML`, bloques de código dentro de `Markdown`, y el árbol de un buffer es en realidad un bosque de árboles anidados gestionado por una estructura que los coordina. Recorrer solo la raíz del lenguaje principal ignora todo lo inyectado; recorrer el bosque completo, aplicando a cada árbol la query de *su* lenguaje, es lo que hace que la herramienta funcione también dentro de esos fragmentos.
+
+```lua
+-- El recorrido correcto: cada arbol con la query de SU lenguaje.
+-- for_each_tree entrega el arbol y el subparser al que pertenece, y desciende
+-- recursivamente por todas las regiones inyectadas.
+local function analizar_todo(buf)
+  local parser = vim.treesitter.get_parser(buf)
+  if not parser then return {} end
+  parser:parse(true)
+
+  local resultado = {}
+  parser:for_each_tree(function(arbol, subparser)
+    local q = query_de(subparser:lang())
+    if not q then return end
+    for id, nodo in q:iter_captures(arbol:root(), buf) do
+      resultado[#resultado + 1] = { captura = q.captures[id], rango = { nodo:range() } }
+    end
+  end)
+  return resultado
+end
+```
+
+<Callout type="dios" title="El editor deja de ser un editor y pasa a ser una plataforma de análisis de programas">
+Detente a considerar lo que acabas de construir, porque su importancia no está en la métrica sino en la categoría. Has escrito, en unas ochenta líneas y sin dependencias externas, un analizador estático que se ejecuta dentro del editor, sobre código que puede no compilar siquiera, con resultados en menos de un parpadeo y presentados en la interfaz que el usuario ya conoce. Hace quince años eso era un producto: requería su propio parser, su propio proceso, su propia integración y un equipo manteniéndolo. La razón por la que ahora cuesta una tarde es que Treesitter resolvió el problema difícil —analizar incrementalmente, en tiempo real y con tolerancia a errores, cualquier lenguaje que tenga gramática— y lo expuso como una biblioteca con una interfaz declarativa uniforme. A partir de ahí la asimetría económica se invierte: el coste marginal de una herramienta de análisis deja de ser el parser y pasa a ser tu criterio sobre qué merece la pena preguntar. Y esa es la consecuencia que de verdad cambia cómo trabajas. La mayoría de las convenciones que importan en un proyecto real no las cubre ningún `linter` genérico, porque son locales: que ninguna función de este módulo llame directamente a la capa de red, que todo manejador de error registre contexto, que ninguna prueba use el reloj del sistema, que las claves de configuración sigan un patrón. Cada una de esas reglas es una query de diez líneas y un recorrido, y cada una, automatizada, sustituye una revisión de código repetida indefinidamente por una advertencia en el momento exacto en que escribes la infracción. Ahí está el salto real de nivel: dejar de ser alguien que **usa** las herramientas de su editor para ser alguien que **fabrica** las que su proyecto concreto necesita, en el mismo lenguaje en que configura el editor, con el mismo árbol que ya está calculado, y sin salir del buffer. El árbol estaba ahí todo el tiempo, alimentando el resaltado; lo único que hacía falta era darse cuenta de que también podías preguntarle.
+</Callout>
+
+<Reto title="Tu propio analizador">
+1. Implementa el comando de complejidad para tu lenguaje principal y ajusta la query hasta que cuente correctamente las ramas de una estructura de selección múltiple.
+2. Sustituye el bucle cuadrático de asignación por un ascenso desde cada rama hasta su función contenedora, y compara ambos tiempos sobre un fichero grande.
+3. Añade un predicado propio que descarte las funciones de prueba por su nombre y verifica en el banco de pruebas de queries que empareja lo que esperas.
+4. Ofrece los tres canales de salida tras una opción del comando y argumenta, para tu caso, cuál debería ser el comportamiento por defecto.
+5. Recorre el bosque completo de árboles inyectados y comprueba que la herramienta analiza también un bloque de código embebido en otro lenguaje; después añade el temporizador y mide la latencia con y sin él.
+</Reto>
