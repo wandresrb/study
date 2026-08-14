@@ -90,6 +90,25 @@ const qTotals = db.prepare(
           (SELECT count(*) FROM track WHERE status = 'written') tracks
    FROM lesson`,
 );
+const qConceptCounts = db.prepare(
+  `SELECT concept, count(*) AS edges, count(DISTINCT track) AS tracks
+   FROM teaches GROUP BY concept`,
+);
+const qTeachingLevels = db.prepare(
+  `SELECT te.track, te.level, te.weight,
+          l.name AS level_name, l.subtitle AS level_subtitle,
+          t.name AS track_name, t.color_hex, t.grad_from, t.grad_to,
+          (SELECT path FROM lesson WHERE track = te.track AND level = te.level ORDER BY sort LIMIT 1) AS first
+   FROM teaches te
+   JOIN level l ON l.track = te.track AND l.idx = te.level
+   JOIN track t ON t.id = te.track
+   WHERE te.concept = ?
+   ORDER BY t.sort, te.level`,
+);
+const qConceptsTaughtBy = db.prepare(
+  `SELECT te.concept, t.name FROM teaches te JOIN track t ON t.id = te.concept
+   WHERE te.track = ? AND te.level = ? ORDER BY te.weight DESC, t.sort`,
+);
 const qCheatsheet = db.prepare('SELECT meta, description, placeholder FROM cheatsheet WHERE track = ?');
 const qCheatsheetTracks = db.prepare('SELECT track FROM cheatsheet ORDER BY track');
 const qCheatsheetCats = db.prepare('SELECT sort, name, icon FROM cheatsheet_category WHERE track = ? ORDER BY sort');
@@ -243,6 +262,58 @@ export function lessonsOf(trackId: string): Lesson[] {
     title: String(l.title),
     description: String(l.description),
     minutes: Number(l.minutes),
+  }));
+}
+
+export interface Concept extends Track {
+  edges: number;
+  tracksTeaching: number;
+}
+
+// The 30 concepts are the `indexed` tracks: no lessons of their own, but
+// teaches-edges into the levels that already teach them (docs/ontology.md §6).
+export function getConcepts(): Concept[] {
+  const counts = new Map((qConceptCounts.all() as Row[]).map((r) => [String(r.concept), r]));
+  return getTracks()
+    .filter((t) => t.status === 'indexed')
+    .map((t) => {
+      const c = counts.get(t.id);
+      return { ...t, edges: Number(c?.edges ?? 0), tracksTeaching: Number(c?.tracks ?? 0) };
+    });
+}
+
+export interface TeachingLevel {
+  track: string;
+  trackName: string;
+  level: number;
+  weight: number;
+  levelName: string;
+  levelSubtitle: string;
+  colorHex: string;
+  gradFrom: string;
+  gradTo: string;
+  firstLesson?: string;
+}
+
+export function teachingLevels(conceptId: string): TeachingLevel[] {
+  return (qTeachingLevels.all(conceptId) as Row[]).map((r) => ({
+    track: String(r.track),
+    trackName: String(r.track_name),
+    level: Number(r.level),
+    weight: Number(r.weight),
+    levelName: String(r.level_name),
+    levelSubtitle: String(r.level_subtitle),
+    colorHex: String(r.color_hex),
+    gradFrom: String(r.grad_from),
+    gradTo: String(r.grad_to),
+    firstLesson: (r.first as string | null) ?? undefined,
+  }));
+}
+
+export function conceptsTaughtBy(trackId: string, level: number): { id: string; name: string }[] {
+  return (qConceptsTaughtBy.all(trackId, level) as Row[]).map((r) => ({
+    id: String(r.concept),
+    name: String(r.name),
   }));
 }
 

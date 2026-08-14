@@ -24,14 +24,18 @@ const SHORTCUTS: Entry[] = [
   ['Sobre el sitio', 'ir a', '/about/'],
 ];
 
+interface CatalogData {
+  lessons: [string, string, string][];
+  concepts: [string, string][];
+}
+
 // The full catalog is fetched once, and only when the palette first opens:
 // the inline entries (categories and tracks) cover the first paint.
-let catalog: Promise<[string, string, string][]> | undefined;
+let catalog: Promise<CatalogData> | undefined;
 const loadCatalog = () => {
   catalog ??= fetch('/idx/catalog.json')
-    .then((r) => (r.ok ? r.json() : { lessons: [] }))
-    .then((data: { lessons: [string, string, string][] }) => data.lessons)
-    .catch(() => [] as [string, string, string][]);
+    .then((r) => (r.ok ? r.json() : { lessons: [], concepts: [] }))
+    .catch(() => ({ lessons: [], concepts: [] }) as CatalogData);
   return catalog;
 };
 
@@ -40,6 +44,7 @@ export default function Palette(props: Props) {
   const [query, setQuery] = createSignal('');
   const [cursor, setCursor] = createSignal(0);
   const [lessons, setLessons] = createSignal<LessonHit[]>([]);
+  const [extras, setExtras] = createSignal<Entry[]>([]);
 
   const trackNames = new Map(
     props.entries.filter((e) => e[1] === 'tema').map((e) => [e[2].split('/')[1], e[0]]),
@@ -53,16 +58,17 @@ export default function Palette(props: Props) {
   const show = () => {
     lastFocused = document.activeElement as HTMLElement | null;
     if (!lessons().length) {
-      loadCatalog().then((rows) =>
+      loadCatalog().then((data) => {
         setLessons(
-          rows.map(([title, id, position]) => ({
+          data.lessons.map(([title, id, position]) => ({
             title,
             folded: fold(title),
             label: `${trackNames.get(id.split('/')[0]) ?? id.split('/')[0]} · ${position}`,
             url: `/guia/${id}/`,
           })),
-        ),
-      );
+        );
+        setExtras(data.concepts.map(([name, id]): Entry => [name, 'concepto', `/conceptos/${id}/`]));
+      });
     }
     setQuery('');
     setCursor(0);
@@ -82,7 +88,7 @@ export default function Palette(props: Props) {
     const shortcuts = SHORTCUTS.filter((s) => fold(s[0]).includes(q));
 
     const scored: { entry: Entry; rank: number; kind: number }[] = [];
-    for (const entry of props.entries) {
+    for (const entry of [...props.entries, ...extras()]) {
       const name = fold(entry[0]);
       const at = name.indexOf(q);
       if (at === 0) scored.push({ entry, rank: 0, kind: 0 });
@@ -268,7 +274,7 @@ export default function Palette(props: Props) {
               <span>↑↓ moverse</span>
               <span>⏎ abrir</span>
               <span>esc cerrar</span>
-              <span class="ml-auto">{props.entries.length + lessons().length} destinos</span>
+              <span class="ml-auto">{props.entries.length + extras().length + lessons().length} destinos</span>
             </p>
           </div>
         </div>
