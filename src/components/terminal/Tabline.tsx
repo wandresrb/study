@@ -61,32 +61,28 @@ export default function Tabline(props: { active: string }) {
     if (list[i].id !== props.active) navigate(list[i].href);
   };
 
-  // gt / gT with a pending-g window, like the editor.
-  let pendingG = false;
+  // ]b / [b — nvim 0.11 defaults for :bnext/:bprev — with a pending window.
+  let pending: '[' | ']' | null = null;
   let pendingTimer: ReturnType<typeof setTimeout> | undefined;
   const onKey = (e: KeyboardEvent) => {
     const target = e.target as HTMLElement | null;
     if (target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target?.tagName ?? '')) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-    if (pendingG) {
-      pendingG = false;
+    if (pending) {
+      const dir = pending === ']' ? 1 : -1;
+      pending = null;
       clearTimeout(pendingTimer);
-      if (e.key === 't') {
+      if (e.key === 'b') {
         e.preventDefault();
-        cycle(1);
-        return;
-      }
-      if (e.key === 'T') {
-        e.preventDefault();
-        cycle(-1);
+        cycle(dir);
         return;
       }
     }
-    if (e.key === 'g') {
-      pendingG = true;
+    if (e.key === '[' || e.key === ']') {
+      pending = e.key;
       clearTimeout(pendingTimer);
-      pendingTimer = setTimeout(() => (pendingG = false), 600);
+      pendingTimer = setTimeout(() => (pending = null), 600);
     }
   };
 
