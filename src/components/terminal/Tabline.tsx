@@ -94,11 +94,14 @@ export default function Tabline(props: { active: string }) {
     onCleanup(() => document.removeEventListener('keydown', onKey));
   });
 
+  // Faithful to nvim's default tabline: one flat text line — TabLineSel on the
+  // active tab, TabLine on the rest, TabLineFill in between, and a single X at
+  // the far right that closes the current tab.
   return (
     <div
       role="tablist"
       aria-label="Tabs de la sesión"
-      class="flex items-end gap-px overflow-x-auto border-b border-border bg-mantle px-2 pt-1.5 font-mono text-sm"
+      class="flex items-stretch overflow-x-auto bg-mantle font-mono text-sm"
     >
       <For each={tabs()}>
         {(tab, i) => (
@@ -108,26 +111,24 @@ export default function Tabline(props: { active: string }) {
             aria-selected={tab.id === props.active}
             class={
               tab.id === props.active
-                ? 'group flex shrink-0 items-center gap-2 rounded-t-md border border-b-0 border-border bg-base px-3 py-1.5 text-text no-underline'
-                : 'group flex shrink-0 items-center gap-2 rounded-t-md px-3 py-1.5 text-overlay1 no-underline hover:bg-surface0/40 hover:text-subtext0'
+                ? 'flex shrink-0 items-center gap-2 bg-base px-4 py-1.5 font-semibold text-text no-underline'
+                : 'flex shrink-0 items-center gap-2 px-4 py-1.5 text-overlay1 no-underline hover:bg-surface0/40 hover:text-subtext0'
             }
           >
             <span class="text-2xs text-overlay0">{i() + 1}</span>
             {tab.title}
-            <button
-              type="button"
-              aria-label={`Cerrar ${tab.title}`}
-              onClick={(e) => close(tab.id, e)}
-              class="rounded px-0.5 text-overlay0 opacity-0 transition-opacity hover:bg-surface1 hover:text-text group-hover:opacity-100"
-            >
-              ×
-            </button>
           </a>
         )}
       </For>
-      <span class="ml-auto hidden shrink-0 items-center gap-1 pb-1.5 pr-2 font-mono text-2xs text-overlay0 sm:flex">
-        gt / gT para cambiar
-      </span>
+      <span class="flex-1"></span>
+      <button
+        type="button"
+        aria-label="Cerrar la tab actual"
+        onClick={(e) => close(props.active, e)}
+        class="shrink-0 px-3 py-1.5 text-overlay1 hover:bg-surface0/40 hover:text-red"
+      >
+        X
+      </button>
     </div>
   );
 }
