@@ -169,18 +169,18 @@ mano. Falsos positivos conocidos:
 | `sistemas-distribuidos` | 14 | 6 | local-first:20,24,25,26,27,43 · estado:16,19 · ios:13,23 · webgpu:8,39 · maquinas:21 · swift:27 |
 | `drivers-io` | 14 | 5 | kernel:15,27,28,29,31,33,34,36,42,55 · devtools:27 · lua:18 · rust:50 · webgpu:28 |
 | `bash` | 14 | 8 | neovim:4,13,20 · astro:17,26 · canvas:10,21 · css:38,40 · three:27,43 · cloudflare:4 · local-first:3 · webgpu:14 |
-| `teoria-numeros` | 12 | 8 | local-first:45,48,55 · build:25,36 · ios:17,26 · c23:16 · lua:6 · rust:19 · tca:26 · webgpu:36 |
+| `number-theory` | 12 | 8 | local-first:45,48,55 · build:25,36 · ios:17,26 · c23:16 · lua:6 · rust:19 · tca:26 · webgpu:36 |
 | `consistencia` | 12 | 9 | local-first:7,23,41 · cloudflare:17,22 · android:22 · build:5 · canvas:3 · estado:8 · ios:26 · reactividad-fina:5 · solid:7 |
-| `matematica-discreta` | 11 | 9 | build:11,17 · three:6,38 · android:16 · animacion:6 · css:7 · estado:23 · local-first:28 · reactividad-fina:2 · solid:10 |
-| `algebra-lineal` | 11 | 6 | three:2,3,4,6,13 · canvas:1,6 · cloudflare:29 · css:42 · local-first:22 · webgpu:37 |
+| `discrete-math` | 11 | 9 | build:11,17 · three:6,38 · android:16 · animacion:6 · css:7 · estado:23 · local-first:28 · reactividad-fina:2 · solid:10 |
+| `linear-algebra` | 11 | 6 | three:2,3,4,6,13 · canvas:1,6 · cloudflare:29 · css:42 · local-first:22 · webgpu:37 |
 | `microservicios` | 10 | 6 | three:13,17,26,28 · cloudflare:13,30 · android:21 · local-first:19 · neovim:19 · solid:35 |
 | `complejidad` | 7 | 6 | android:31,32 · estado:1 · ios:25 · kernel:49 · neovim:25 · swift:34 |
 | `microkernels` | 7 | 5 | kernel:1,52,53 · cloudflare:2 · lua:26 · rendimiento:28 · swift:23 |
 | `tmux` | 7 | 5 | devtools:0,3,24 · animacion:40 · astro:25 · maquinas:20 · solid:38 |
-| `logica` | 5 | 4 | rust:37,40 · estado:22 · maquinas:4 · neovim:17 |
+| `logic` | 5 | 4 | rust:37,40 · estado:22 · maquinas:4 · neovim:17 |
 | `git` | 4 | 3 | local-first:41,47 · kernel:3 · solid:7 |
 | `algoritmos` | 3 | 3 | css:16 · swift:6 · webgpu:34 |
-| `probabilidad` | 3 | 3 | ios:27 · neovim:5 · three:33 |
+| `probability` | 3 | 3 | ios:27 · neovim:5 · three:33 |
 | `computabilidad` | 2 | 2 | kotlin:6 · maquinas:9 |
 | `fzf-ripgrep` | 1 | 1 | neovim:4 |
 

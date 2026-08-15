@@ -1,19 +1,25 @@
 type Mermaid = typeof import('mermaid').default;
 
 let mermaid: Mermaid | null = null;
+// Theme the current initialize() ran against. Mermaid bakes colors into the
+// SVG, so a theme switch needs a re-init and a repaint, not just new CSS.
+let themed: string | null = null;
 
-async function pintar() {
-  const nodes = document.querySelectorAll<HTMLElement>('pre.mermaid:not([data-procesado])');
+async function paint() {
+  const nodes = document.querySelectorAll<HTMLElement>('pre.mermaid:not([data-drawn])');
   if (!nodes.length) return;
-  nodes.forEach((n) => n.setAttribute('data-procesado', ''));
+  // Mermaid replaces the <pre> contents with the SVG, so keep the source: it
+  // is the only way to redraw the same diagram under another palette.
+  nodes.forEach((n) => {
+    if (n.dataset.src === undefined) n.dataset.src = n.textContent ?? '';
+    n.setAttribute('data-drawn', '');
+  });
 
-  if (!mermaid) {
-    ({ default: mermaid } = await import('mermaid'));
+  if (!mermaid) ({ default: mermaid } = await import('mermaid'));
 
-    // Colors come from the active theme's tokens at first paint. Mermaid
-    // initializes once, so diagrams keep that palette until the next page
-    // load even if the theme switches afterwards — acceptable for a lazy,
-    // per-page renderer.
+  const theme = document.documentElement.dataset.theme ?? 'kanagawa';
+  if (themed !== theme) {
+    themed = theme;
     const css = getComputedStyle(document.documentElement);
     const v = (name: string) => css.getPropertyValue(name).trim();
     const crust = v('--crust');
@@ -133,4 +139,22 @@ async function pintar() {
   try { await mermaid.run({ nodes, suppressErrors: true }); } catch (e) { console.warn('mermaid', e); }
 }
 
-document.addEventListener('astro:page-load', pintar);
+/** Restores every rendered diagram to its source so paint() draws it again. */
+function repaint() {
+  const done = document.querySelectorAll<HTMLElement>('pre.mermaid[data-drawn]');
+  for (const n of done) {
+    if (n.dataset.src === undefined) continue;
+    n.textContent = n.dataset.src;
+    n.removeAttribute('data-drawn');
+    n.removeAttribute('data-processed');
+  }
+  if (done.length) void paint();
+}
+
+document.addEventListener('astro:page-load', paint);
+
+// Watch the attribute, not the switcher: the theme is written from the palette
+// and from the pre-paint script in BaseLayout, and later from whatever else.
+new MutationObserver(repaint).observe(document.documentElement, {
+  attributeFilter: ['data-theme'],
+});

@@ -40,23 +40,6 @@ export default function Console(props: { code: string }) {
 
   return (
     <div>
-      {}
-      <button
-        type="button"
-        aria-expanded={!collapsed()}
-        onClick={() => collapseConsole(!collapsed())}
-        class="flex cursor-pointer items-center gap-2 rounded-sm border border-overlay0 bg-mantle px-3 py-1.5 font-mono text-xs text-subtext0 transition-colors hover:text-text focus-visible:text-text"
-      >
-        <span
-          aria-hidden="true"
-          class="inline-block text-2xs transition-[rotate] duration-200"
-          classList={{ '-rotate-90': collapsed() }}
-        >
-          ▾
-        </span>
-        <span>main.rs</span>
-      </button>
-
       <div class="mt-3 grid gap-3" classList={{ hidden: collapsed() }}>
         <div class={`${PANEL} bg-mantle shadow-flotante`}>
           <p class={`${BAR} flex items-center gap-1.5 text-xs text-subtext0`}>
@@ -66,11 +49,8 @@ export default function Console(props: { code: string }) {
             <b class="ml-2 font-normal">main.rs</b>
           </p>
 
-          {}
-          {}
           <div class="editor" innerHTML={props.code} />
 
-          {}
           <p class="m-0 flex items-center gap-3 border-t border-surface1 bg-crust px-3.5 py-1.5 font-mono text-2xs text-overlay1">
             <b class="rounded-xs bg-blue px-2 py-0.5 font-semibold tracking-versalita text-crust">
               NORMAL
@@ -111,7 +91,7 @@ export default function Console(props: { code: string }) {
           type="button"
           onClick={run}
           disabled={phase() !== 'inicio'}
-          class="inline-flex cursor-pointer items-center gap-2.5 justify-self-start rounded-full border border-green/55 bg-green/12 px-4 py-2.5 font-mono text-sm text-green transition-colors hover:not-disabled:bg-green/20 focus-visible:bg-green/20 disabled:cursor-default disabled:opacity-45"
+          class="inline-flex cursor-pointer items-center gap-2.5 justify-self-start px-4 py-2.5 font-mono text-sm text-green transition-colors hover:not-disabled:bg-green/20 focus-visible:bg-green/20 disabled:cursor-default disabled:opacity-45"
         >
           <span aria-hidden="true" class="text-2xs">
             ▶

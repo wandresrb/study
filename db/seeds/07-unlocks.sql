@@ -5,8 +5,8 @@
 -- Falta la capa que solo puede escribir el autor: que abre que entre
 -- conceptos, y los tracks herramienta (neovim, git, bash) como llaves
 -- transversales.
-INSERT INTO unlocks VALUES ('algebra-lineal', 'canvas');
-INSERT INTO unlocks VALUES ('algebra-lineal', 'three');
+INSERT INTO unlocks VALUES ('linear-algebra', 'canvas');
+INSERT INTO unlocks VALUES ('linear-algebra', 'three');
 INSERT INTO unlocks VALUES ('bash', 'cloudflare');
 INSERT INTO unlocks VALUES ('bash', 'local-first');
 INSERT INTO unlocks VALUES ('bash', 'neovim');
@@ -35,8 +35,8 @@ INSERT INTO unlocks VALUES ('event-driven', 'android');
 INSERT INTO unlocks VALUES ('event-driven', 'maquinas');
 INSERT INTO unlocks VALUES ('fzf-ripgrep', 'neovim');
 INSERT INTO unlocks VALUES ('git', 'kernel');
-INSERT INTO unlocks VALUES ('logica', 'maquinas');
-INSERT INTO unlocks VALUES ('matematica-discreta', 'reactividad-fina');
+INSERT INTO unlocks VALUES ('logic', 'maquinas');
+INSERT INTO unlocks VALUES ('discrete-math', 'reactividad-fina');
 INSERT INTO unlocks VALUES ('memoria-virtual', 'c23');
 INSERT INTO unlocks VALUES ('memoria-virtual', 'flux');
 INSERT INTO unlocks VALUES ('memoria-virtual', 'rust');
@@ -45,7 +45,7 @@ INSERT INTO unlocks VALUES ('microkernels', 'cloudflare');
 INSERT INTO unlocks VALUES ('microkernels', 'kernel');
 INSERT INTO unlocks VALUES ('monolitos', 'build');
 INSERT INTO unlocks VALUES ('monolitos', 'kernel');
-INSERT INTO unlocks VALUES ('probabilidad', 'neovim');
+INSERT INTO unlocks VALUES ('probability', 'neovim');
 INSERT INTO unlocks VALUES ('procesos', 'android');
 INSERT INTO unlocks VALUES ('procesos', 'c23');
 INSERT INTO unlocks VALUES ('programacion-reactiva', 'elm');

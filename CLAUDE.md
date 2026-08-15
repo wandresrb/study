@@ -41,18 +41,27 @@ La capa interactiva del track de neovim (plan en `_PLAN-RUTA-INTERACTIVA.md`):
 - **Diagramas**: Mermaid está siendo sustituido por familias de componentes (`Pipeline`, `ModeMap`,
   `KeyboardMap` — registradas en `guide/[...slug].astro` y en el linter). `ModeMap` es la máquina
   de modos que responde a teclas reales. Mermaid sigue siendo válido en tracks no migrados.
-- En las lecciones, `[` y `]` navegan anterior/siguiente (salvo con el foco en un input o un drill). `bun run check` (`astro check`) cubre los 73 ficheros de
-código y hoy está **limpio: 0 errores, 0 warnings, 0 hints**. Ese cero es el listón; si tu cambio
-añade un hint, quítalo antes de seguir. `bun run lint:contenido [track]` cubre las ~5.100
-lecciones en segundos: frontmatter, `subject` contra la carpeta, `posicion` contra `level.order`,
-numeración sin huecos ni duplicados y componentes sin registrar en `guide/[...slug].astro` —que no
-dan error, salen como texto en la página—. Los `throw` de `src/data/contenido.ts` siguen saliendo
-solo en `bun run build`.
+- En las lecciones, `[` y `]` navegan anterior/siguiente (salvo con el foco en un input o un drill).
 
-El linter distingue **errores** (0 hoy, y así debe quedarse) de **avisos** (27 hoy, y son
-esperados): niveles declarados en `_niveles.json` que todavía no tienen lecciones —lua llega al 29—
-y seis `ontologia.mdx` con `posicion: "0"` en vez de `"0.1"`. No los «arregles» de paso: son estado
-del contenido, no del código.
+`bun run check` (`astro check`) cubre los 100 ficheros de código. **El listón es 0 errores,
+0 warnings, 0 hints**; si tu cambio añade uno, quítalo antes de seguir. Comprueba el estado *antes*
+de empezar: hoy no está en cero por trabajo en vuelo ajeno, y esos no son tuyos.
+
+`bun run lint:contenido [track]` cubre las 5.088 lecciones en segundos: reconstruye la base,
+valida frontmatter, `subject` contra la carpeta, `posicion` contra `level.order`, numeración sin
+huecos ni duplicados, componentes sin registrar en `guide/[...slug].astro` —que no dan error, salen
+como texto en la página— y `style … fill:#hex` dentro de un `<Mermaid>`. Los `throw` de
+`src/data/content.ts` siguen saliendo solo en `bun run build`.
+
+El linter distingue **errores** (0, y así debe quedarse) de **avisos** (65, y son esperados):
+niveles declarados en `db/seeds/04-levels.sql` que todavía no tienen lecciones, `ontologia.mdx` con
+`posicion: "0"` en vez de `"0.1"`, y la deuda de hex de neovim. No los «arregles» de paso: son
+estado del contenido, no del código.
+
+`bun run db` reconstruye `db/catalog.db` a mano (normalmente no hace falta: la integración
+`src/integrations/catalog.ts` lo hace sola en cada build y en cada cambio de `.mdx` en dev).
+`node scripts/strip-mermaid-hex.mjs [track] [--write]` quita los `style … fill:#hex` de los
+diagramas; sin `--write` solo mide.
 
 **El proyecto está fijado a TypeScript 6 a propósito. No lo subas a 7.** TS 7 es el port nativo en
 Go y no expone la API JS clásica (`typescript.js`); todo el ecosistema Volar la necesita, así que
@@ -69,30 +78,40 @@ Cloudflare limita el tamaño de un asset suelto.
 ## Arquitectura
 
 Sitio estático (Astro 7 + MDX). La marca es **wandres.dev**; la sección de estudio es el **Centro de
-Estudios · Ciencias de la Computación**, en `/cs/`. Hoy hay 58 tracks declarados, 28 con contenido,
-en 11 categorías. Todo sale de content collections; **no hay ningún fichero TS con la lista de
-temas** (`src/data/tracks.ts` ya no existe).
+Estudios · Ciencias de la Computación**, en `/cs/`. Hoy hay **68 tracks declarados, 29 con
+contenido, en 20 categorías** y 5.088 lecciones.
 
-«Nivel Dios» es el nombre del **último nivel** de un temario, no del sitio. Está en el `_niveles.json`
-de casi todos los temarios (kernel y rust usan «PhD»), y de ahí lo lee la portada del track. No lo
-uses como marca ni lo repongas en el chrome: ese fue justo el problema que se corrigió.
+«Nivel Dios» es el nombre del **último nivel** de un temario, no del sitio. Está en
+`db/seeds/04-levels.sql` para casi todos los temarios (kernel y rust usan «PhD»), y de ahí lo lee la
+portada del track. No lo uses como marca ni lo repongas en el chrome: ese fue justo el problema que
+se corrigió.
 
-### Las cinco colecciones (`src/content.config.ts`)
+### La estructura vive en SQLite; la prosa, en una content collection
+
+Es lo primero que hay que entender y lo que más ha confundido a las sesiones anteriores: **ya no hay
+cinco colecciones**. `src/content/tracks/`, `categorias/`, `cheatsheets/` y los `_niveles.json`
+**no existen**. Todo eso es SQL:
 
 ```
-categorias  ←—— tracks  ←—— guia          (una lección pertenece a un track)
-                    ↑—— niveles           (el temario del track, _niveles.json)
-                    ↑—— cheatsheets       (su referencia rápida)
+db/schema.sql        13 tablas: stratum, category, track, level, tag, lesson,
+                     teaches, unlocks, cheatsheet(+category,+item), track_feature, track_chip
+db/seeds/*.sql       01-strata … 07-unlocks — los datos escritos a mano
+db/catalog.db        ~6 MB, generada, fuera de git
 ```
 
-- `categorias/*.json` — agrupación del hub. `plano: 'nucleo' | 'aplicaciones'` decide la pestaña.
-- `tracks/*.json` — nombre, colores, `estado: disponible | proximamente`, `categoria` (referencia),
-  `ref` (páginas sueltas) y `extras` (bloques promocionales de su portada).
-- `guia/**/*.mdx` — las lecciones. El id de la entrada es la ruta relativa, y **cada track vive en su
-  carpeta** (`guia/<track>/`). Sin excepciones: neovim estaba en la raíz por herencia y se movió.
-- `niveles` — se carga desde `**/_niveles.json` dentro de `guia/`, con `generateId` que convierte la
-  carpeta en id de track.
-- `cheatsheets/*.json` — categorías de atajos; el enlace existe si existe la entrada, no se declara.
+`src/integrations/catalog.ts` corre `scripts/build-db.mjs` en `astro:config:setup` (y observa los
+`.mdx` en dev con debounce de 300 ms), así que la base se reconstruye sola. `build-db` aplica el
+esquema, los siete seeds, y luego **inserta las 5.088 lecciones parseando el frontmatter de los
+`.mdx`** — la tabla `lesson` no tiene seed. Valida campos obligatorios, que `(subject, level)`
+exista, y `PRAGMA foreign_key_check`; si algo falla hace ROLLBACK y el build cae.
+
+`status` de un track es `written | indexed | planned` (no `disponible`/`proximamente`). Un track
+`indexed` es **un concepto**: no tiene lecciones propias, pero `teaches` lo enlaza con los niveles
+ajenos que ya lo enseñan. Ver `docs/ontology.md`.
+
+La **única colección** que queda (`src/content.config.ts`) es `guia`: `**/*.mdx` con
+`retainBody: false`. El id de la entrada es la ruta relativa, y **cada track vive en su carpeta**
+(`guia/<track>/`). Sin excepciones: neovim estaba en la raíz por herencia y se movió.
 
 Convenciones que el esquema impone y conviene no romper:
 
@@ -104,18 +123,23 @@ Convenciones que el esquema impone y conviene no romper:
 - El contenido nunca nombra un icono ni un color de librería. Ver «Iconos».
 - `getCollection` no garantiza orden: el orden va en los datos (`orden`, `level`, `order`).
 
-### Consultas: `src/data/contenido.ts`
+### Consultas: `src/data/content.ts`
 
-Único acceso a las colecciones desde las páginas. No guarda datos, calcula lo derivable: color y
-cifra de cada nivel (paleta cíclica), agrupación del mapa por plano, minutos/horas desde `duracion`.
-Falla ruidosamente a propósito (`getTrack`, `getNiveles` lanzan) porque un dato ausente reaparecía
-como `undefined` a tres capas de distancia. `leccionesDe()` está memoizada: se llama ~10.000 veces
-por build.
+Único acceso a la base desde las páginas (`new DatabaseSync(DB_PATH, { readOnly: true })`, con
+`DB_PATH` inyectado por `vite.define`). **Es SQLite en build, nunca en el navegador**: el sitio es
+estático y la base no viaja al cliente. 22 sentencias preparadas al cargar el módulo.
 
-`Plano` no repite la lista de planos, la deriva: `Categoria['data']['plano']`, o sea el `z.enum` de
-`content.config.ts`. Como `getMapa()` devuelve un `Record<Plano, …>`, añadir un plano al esquema
-rompe su `return` hasta que alguien lo trate — que es lo que no pasó cuando existía un `entorno`
-fantasma que nadie pintaba.
+No guarda datos, calcula lo derivable: color y cifra de cada nivel (paleta cíclica), agrupación del
+mapa por estrato, minutos/horas desde `duracion`. Falla ruidosamente a propósito (`getTrack`,
+`getLevels` lanzan) porque un dato ausente reaparecía como `undefined` a tres capas de distancia.
+
+Las que importan: `getMap()`, `getTracks()`, `getTrack(id)`, `getLevels(trackId)`,
+`lessonsOf(trackId)`, `getTotals()`, `getConcepts()`, `teachingLevels(conceptId)`, y las dos crudas
+del grafo — `getTeaches()` (593 aristas concepto→nivel) y `getUnlocks()` (68 track→track).
+
+`src/data/contenido.ts` **ya no existe**: la página que quiera datos importa de `content.ts`. La
+excepción es `guide/[...slug].astro`, la única con las dos fuentes: la estructura de SQLite y la
+prosa de `getCollection('guia')`.
 
 ### Rutas (`src/pages/`)
 
@@ -140,7 +164,7 @@ una hora declarada en `public/_headers` (en salida estática Astro descarta las 
 necesitan el índice entero: desplegar un nivel y filtrar por texto.
 
 **`cacheKey` en `guide/[...slug].astro`**: cada lección hashea su propio `digest` *más* una firma del
-track entero (todas sus hermanas, el `_niveles.json` y el JSON del track). Hace falta porque la
+track entero (todas sus hermanas, más los campos del track y sus niveles leídos de la base). Hace falta porque la
 página pinta también el paginador y la cabecera de la barra lateral; con solo el digest propio,
 añadir una lección dejaba a las demás restauradas de caché con el paginador viejo. Si tocas lo que
 una lección muestra de su track, esa firma tiene que reflejarlo — aunque hoy el incremental esté
@@ -209,18 +233,21 @@ components/ui/        las primitivas: Button, Badge, Chip, Tile, Section, Stat, 
 ```
 
 Los componentes disponibles dentro del MDX se inyectan desde `guide/[...slug].astro`; **un componente
-nuevo hay que registrarlo ahí o el MDX no lo ve** (y no da error: sale como texto). El nombre con el
-que se escribe en el MDX es español y el fichero es inglés, así que no se deducen el uno del otro:
+nuevo hay que registrarlo ahí o el MDX no lo ve** (y no da error: sale como texto).
 
-| en el MDX | fichero |
-| --- | --- |
-| `Objetivos` | `content/Goals.astro` |
-| `Reto` | `content/Challenge.astro` |
-| `Paso` | `content/Step.astro` |
-| `Instalar` | `content/Install.astro` |
-| `Callout`, `KeyCap`/`Kbd`, `Mermaid`, `Cards`/`Card`, `PluginCard`, `Lead`, `Drill` | igual |
+**Un componente nuevo se nombra en inglés, y sus props también.** Cuatro se escriben en español en
+el MDX y son **legado, no precedente**: están en las 5.088 lecciones y renombrarlos costaría tocarlas
+todas. Los otros 16 registrados ya están en inglés.
 
-`scripts/lint-contenido.mjs` lleva esa lista en `COMPONENTES` **con los nombres del MDX**: si
+| en el MDX | fichero | |
+| --- | --- | --- |
+| `Objetivos` | `content/Goals.astro` | legado |
+| `Reto` | `content/Challenge.astro` | legado |
+| `Paso` | `content/Step.astro` | legado |
+| `Instalar` | `content/Install.astro` | legado |
+| `Callout`, `KeyCap`/`Kbd`, `Mermaid`, `Cards`/`Card`, `PluginCard`, `Lead`, `Drill`, `Predict`, `Pipeline`, `ModeMap`, `KeyboardMap`, `UndoTree`, `WindowLayout`, `CommandAnatomy` | igual | |
+
+`scripts/lint-contenido.mjs` lleva esa lista en `COMPONENTS` **con los nombres del MDX**: si
 registras uno nuevo, añádelo también ahí.
 
 ### Iconos: Lucide, importado por nombre
@@ -231,19 +258,19 @@ render). Existía un `lucide:cpu` dentro de los JSON y un renombrado de Lucide o
 contenido.
 
 La correspondencia track → icono vive en **`src/lib/icons.ts` y en ningún otro sitio**: un `import`
-por icono y un `TRACK_ICON` de 58 entradas, una por track. Va en `lib/` y no en `components/` porque
+por icono y un `TRACK_ICON` de 68 entradas, una por track. Va en `lib/` y no en `components/` porque
 no es un componente y ahí solo hay `.astro`/`.tsx`; no hay pega técnica porque los iconos de Lucide
 ya son `.ts`.
 
 Se accede por `iconOf(trackId)`, que **lanza** si falta la entrada, diciendo el track y el fichero.
-Es el patrón de `getTrack`/`getNiveles`: sin él, un track sin icono daba «Unable to render Icon», que
+Es el patrón de `getTrack`/`getLevels`: sin él, un track sin icono daba «Unable to render Icon», que
 no dice cuál. El `import type { AstroComponent } from '@lucide/astro'` de la cabecera parece un
 barril y no lo es — se borra en compilación—; los iconos siguen entrando uno a uno por su ruta.
 
-La red de verdad, sin embargo, es `lint:contenido`: cruza las claves del mapa contra
-`src/content/tracks/*.json` **en las dos direcciones**, así que caza tanto el track sin icono —en
-segundos, en vez de con un build de ~5.100 páginas— como la clave huérfana, que el build no ve nunca
-porque solo falla en la otra dirección (había una, `local-first-patron`).
+La red de verdad, sin embargo, es `lint:contenido`: cruza las claves del mapa contra la tabla
+`track` **en las dos direcciones**, así que caza tanto el track sin icono —en segundos, en vez de
+con un build de ~5.100 páginas— como la clave huérfana, que el build no ve nunca porque solo falla
+en la otra dirección (había una, `local-first-patron`).
 
 Lo demás del sistema sigue igual:
 
@@ -313,19 +340,27 @@ token por contenedor. En el HTML de una lección eso son cientos de atributos.
 Separada en tres capas, y el motor 3D no vive bajo el nombre de una página:
 
 ```
-src/lib/board/        el motor Three.js (~2.450 líneas en 14 módulos). Solo lo carga
+src/lib/board/        el motor Three.js (~2.450 líneas en 15 módulos). Solo lo carga
                       un import dinámico desde scroll.ts, cuando la capa se acerca.
-src/lib/escena.ts     el contrato entre motor y página: Escena, Montar y FIN.
-src/portada/          el pegamento: estado.ts (señales), guion.ts (los números),
-                      programa.ts (el snippet Rust + la salida), scroll.ts.
+src/lib/scene.ts      el contrato entre motor y página: Scene, Mount y END.
+src/home/             el pegamento: state.ts (señales), script.ts (los números),
+                      program.ts (el snippet Rust + la salida), scroll.ts.
 src/components/home/Layer.astro   la pantalla anclada y su recorrido.
 ```
 
-`FIN` (0.72) está en `lib/escena.ts` a propósito: el motor reparte sus fases con él y la página
+`END` (0.72) está en `lib/scene.ts` a propósito: el motor reparte sus fases con él y la página
 calcula con él los saltos de teclado. Si divergen, los saltos caen mal. Estuvo escrito tres veces.
+(Hoy `board/index.ts` vuelve a declarar `REST = 0.72` en vez de importarlo — es justo lo que el
+contrato pide no hacer.)
+
+Renderiza con `three/webgpu` (`WebGPURenderer`, fallback WebGL con `?gl`) y TSL para nodos simples:
+**no hay GLSL propio ni postprocesado**. Lo procedural de verdad está en CPU y en 2D — el ruteado de
+pistas (`traces.ts`), la siembra de componentes (`seeding.ts`) y el horneado de dos texturas 2048²
+en canvas (`mask.ts`). Solo `render.ts`, `environment.ts` y `scene.ts` (151 líneas) son genéricos;
+el resto nombra `dimm-a`, `cpuFanout`, `HEADER_PIN_PITCH`.
 
 Dos islas Solid, `home/Console.tsx` y `home/Stack.tsx`, comparten estado por señales de módulo en
-`portada/estado.ts` — sin contexto ni props cruzadas. El código de la consola se resalta **en el
+`src/home/state.ts` — sin contexto ni props cruzadas. El código de la consola se resalta **en el
 build** con `codeToHtml` y viaja como HTML. Solid solo se usa aquí y en `site/Palette.tsx` (⌘K); el
 resto del sitio es HTML con JS vanilla colgado de `astro:page-load`.
 
@@ -356,24 +391,30 @@ el orden es pedagógico, no alfabético. Para tocar la config, edita el `.lua`, 
 
 **Un track nuevo:**
 
-1. `src/content/tracks/<id>.json` — con `categoria` apuntando a una categoría existente y
-   `estado: 'proximamente'` hasta que tenga lecciones.
-2. `src/content/guia/<id>/_niveles.json` — el temario.
+1. `db/seeds/03-tracks.sql` — una fila en `track`, con `category` apuntando a una categoría existente
+   y `status: 'planned'` hasta que tenga lecciones.
+2. `db/seeds/04-levels.sql` — el temario: una fila por nivel en `level` (PK compuesta `track,idx`).
 3. `src/content/guia/<id>/*.mdx` — lecciones con `subject: <id>`, `level`, `order`, `posicion`.
 4. Su icono en `TRACK_ICON` (`src/lib/icons.ts`), con su `import` de
    `@lucide/astro/icons/<nombre>`. Sin esto falla el linter, y el render lanza.
-5. Opcional: `src/content/cheatsheets/<id>.json` (el enlace aparece solo).
+5. Opcional: `db/seeds/05-cheatsheets.sql` (el enlace aparece solo).
 
-Hub, sidebar y portada del track se generan a partir de eso. Comprueba con `bun run lint:contenido <id>`.
+Hub, sidebar y portada del track se generan a partir de eso. Comprueba con
+`bun run lint:contenido <id>`, que reconstruye la base antes de mirar nada.
 
 ## Estilo
 
-El código va **en inglés**: identificadores, comentarios, nombres de fichero, los `id` de
-elementos, clases propias y anclas (`#path`, no `#camino`), **y las rutas** (`/concepts/`, no
-`/conceptos/`). En español van solo la UI y el contenido — es un sitio en español, no un código en
-español. Las rutas viejas en español (`/guia/`, `/resources/`) son legado: se migran con redirects
-cuando se decida, no de tapadillo. La migración de código está a medias: `src/lib/board/`,
-`src/portada/`, `src/lib/icons.ts` y `src/lib/escena.ts` siguen en español; al tocarlos, migra
+El código va **en inglés**: identificadores, **comentarios**, nombres de fichero, los `id` de
+elementos, clases propias y anclas (`#path`, no `#camino`), **las rutas** (`/concepts/`, no
+`/conceptos/`), **las props de un componente** y **el nombre con el que se escribe en el MDX**. En
+español van solo la UI y el contenido — es un sitio en español, no un código en español.
+
+Los comentarios cuentan como código y es donde más se ha reincidido: un comentario nuevo en español
+es el mismo error que un identificador en español.
+
+Las rutas viejas en español (`/guia/`, `/resources/`) son legado: se migran con redirects cuando se
+decida, no de tapadillo. La migración está a medias — `src/lib/board/`, `src/lib/vim/` y los
+componentes de `content/` conservan identificadores y comentarios en español; al tocarlos, migra
 hacia el inglés, nunca al revés. Los mensajes de commit también en inglés (`feat(track): …`,
 `fix(neovim): …`), **de una línea: sin cuerpo narrativo y sin coautorías** — el historial no es un
 diario.

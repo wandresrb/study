@@ -15,6 +15,13 @@ const COMPONENTS = new Set([
   'Fragment',
 ]);
 
+// A `style X fill:#hex` wins over the themeVariables lib/mermaid.ts derives from
+// the tokens, so the diagram renders in another theme's palette. Color comes from
+// the theme, never from the content. neovim is the debt still to be cleaned.
+const MERMAID_BLOCK = /<Mermaid\s+code=\{`([\s\S]*?)`\}/g;
+const MERMAID_HEX = /^\s*style\s+\S+.*#[0-9a-fA-F]{3,8}/;
+const HEX_DEBT = new Set(['neovim']);
+
 const errors = [];
 const warnings = [];
 const fail = (f, m) => errors.push(`${f}: ${m}`);
@@ -72,6 +79,8 @@ for (const track of folders) {
   }
 
   const lessons = [];
+  let hexLines = 0;
+  let hexFiles = 0;
   for (const f of (await readdir(dir)).filter((f) => f.endsWith('.mdx'))) {
     const path = join(dir, f);
     const text = await readFile(path, 'utf8');
@@ -108,7 +117,22 @@ for (const track of folders) {
       if (!COMPONENTS.has(tag)) fail(path, `<${tag}> no está registrado en guide/[...slug].astro`);
     }
 
+    const hex = [...text.matchAll(MERMAID_BLOCK)]
+      .flatMap(([, code]) => code.split('\n'))
+      .filter((line) => MERMAID_HEX.test(line)).length;
+    if (hex) {
+      hexLines += hex;
+      hexFiles += 1;
+      if (!HEX_DEBT.has(track)) {
+        fail(path, `${hex} línea(s) "style … fill:#hex" en un <Mermaid>: el color lo pone el tema`);
+      }
+    }
+
     lessons.push({ path, level, order });
+  }
+
+  if (hexLines && HEX_DEBT.has(track)) {
+    warn(dir, `${hexLines} "style … fill:#hex" en ${hexFiles} lecciones: deuda pendiente de limpiar`);
   }
 
   const seen = new Map();
