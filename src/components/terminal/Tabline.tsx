@@ -45,6 +45,7 @@ export default function Tabline(props: { active: string }) {
   const close = (id: string, e: Event) => {
     e.preventDefault();
     e.stopPropagation();
+    if (!e.isTrusted) return; // never close a tab on synthetic clicks (HMR replays, extensions)
     // Closing the last tab reopens the default session: there is no "exit".
     let next = tabs().filter((t) => t.id !== id);
     if (!next.length) next = DEFAULT_TABS;
