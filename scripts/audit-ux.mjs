@@ -297,11 +297,23 @@ function probe({ aaText, aaLarge, minTarget }) {
   })();
 
   // — Overflow: a page that scrolls sideways is broken, not dense.
+  // Content inside its own scroller (a `pre`, a wide table) is meant to overflow
+  // there; only a box that pushes the page sideways is a defect.
+  const scrolls = (node) => {
+    for (let el = node.parentElement; el; el = el.parentElement) {
+      const ox = getComputedStyle(el).overflowX;
+      if (ox === 'auto' || ox === 'scroll' || ox === 'hidden' || ox === 'clip') return true;
+    }
+    return false;
+  };
+
   const overflow = [];
   const limit = document.documentElement.clientWidth;
   for (const el of painted) {
     const rect = el.getBoundingClientRect();
-    if (rect.right > limit + 1 && rect.width <= limit) overflow.push({ at: where(el), right: Math.round(rect.right) });
+    if (rect.right > limit + 1 && rect.width <= limit && !scrolls(el)) {
+      overflow.push({ at: where(el), right: Math.round(rect.right) });
+    }
   }
 
   return {
@@ -403,7 +415,15 @@ async function main() {
       page.on('console', (m) => m.type() === 'error' && consoleErrors.push(m.text().slice(0, 120)));
       page.on('pageerror', (e) => consoleErrors.push(`pageerror: ${e.message.slice(0, 120)}`));
       try {
-        await page.goto(BASE + route, { waitUntil: 'networkidle', timeout: 30000 });
+        const response = await page.goto(BASE + route, { waitUntil: 'networkidle', timeout: 30000 });
+        // A 500 still renders a document, and its missing landmarks read as
+        // findings instead of as the broken page it is. Fail loudly.
+        const status = response?.status() ?? 0;
+        if (status >= 400) {
+          report.pages.push({ route, viewport: viewport.name, error: `HTTP ${status}` });
+          await page.close();
+          continue;
+        }
         await page.evaluate(() => document.fonts.ready);
         const data = await page.evaluate(probe, { aaText: AA_TEXT, aaLarge: AA_LARGE, minTarget: MIN_TARGET });
         data.focus = await focusRing(page);
