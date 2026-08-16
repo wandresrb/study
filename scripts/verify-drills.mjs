@@ -37,14 +37,14 @@ try {
 /** Extrae los atributos de cada <Drill …> multilínea con doc y solucion. */
 function extraerDrills(texto, fichero) {
   const drills = [];
-  const re = /<Drill\b/g;
+  const re = /<Exercise\b/g;
   let m;
   while ((m = re.exec(texto))) {
     // la ventana del tag: hasta el ">" solo en su línea (drills interactivos),
     // el "/>" de un autocierre, el cierre </Drill> de un accordion, o el
     // siguiente <Drill — lo primero que llegue, para no mezclar drills
     const resto = texto.slice(m.index);
-    const limites = [/\n>\s*\n/, /\/>/, /<\/Drill>/, /(?!^)<Drill\b/m]
+    const limites = [/\n>\s*\n/, /\/>/, /<\/Exercise>/, /(?!^)<Exercise\b/m]
       .map((r) => resto.slice(1).search(r) + 1)
       .filter((i) => i > 0);
     if (limites.length === 0) continue;
@@ -57,17 +57,17 @@ function extraerDrills(texto, fichero) {
       return new Function(`return (${hit[1]})`)();
     };
     const doc = attr('doc');
-    const solucion = attr('solucion');
-    if (doc === undefined || solucion === undefined) continue;
+    const solution = attr('solution');
+    if (doc === undefined || solution === undefined) continue;
     drills.push({
-      fichero,
-      reto: /reto="([^"]*)"/.exec(tag)?.[1] ?? '(sin reto)',
+      file: fichero,
+      challenge: /challenge="([^"]*)"/.exec(tag)?.[1] ?? '(sin enunciado)',
       doc,
       cursor: attr('cursor') ?? [1, 0],
-      objetivo: attr('objetivo'),
-      objetivoCursor: attr('objetivoCursor'),
-      preparacion: attr('preparacion'),
-      solucion,
+      goal: attr('goal'),
+      goalCursor: attr('goalCursor'),
+      setup: attr('setup'),
+      solution,
     });
   }
   return drills;
@@ -97,7 +97,7 @@ for (const f of readdirSync(join(GUIA, track)).filter((f) => f.endsWith('.mdx'))
     const salida = join(dir, 'out.txt');
     const posicion = join(dir, 'pos.txt');
     writeFileSync(entrada, d.doc.endsWith('\n') || d.doc === '' ? d.doc : d.doc + '\n');
-    const teclas = aFeedkeys((d.preparacion ?? '') + d.solucion);
+    const teclas = aFeedkeys((d.setup ?? '') + d.solution);
     const [lin, col] = d.cursor;
     try {
       execFileSync(
@@ -115,17 +115,17 @@ for (const f of readdirSync(join(GUIA, track)).filter((f) => f.endsWith('.mdx'))
         { stdio: 'pipe', timeout: 10_000 },
       );
       const res = readFileSync(salida, 'utf8').replace(/\n$/, '');
-      const esperado = (d.objetivo ?? d.doc).replace(/\n$/, '');
+      const esperado = (d.goal ?? d.doc).replace(/\n$/, '');
       const [rl, rc] = readFileSync(posicion, 'utf8').trim().split(',').map(Number);
       const docOk = res === esperado;
-      const curOk = !d.objetivoCursor || (rl === d.objetivoCursor[0] && rc === d.objetivoCursor[1]);
+      const curOk = !d.goalCursor || (rl === d.goalCursor[0] && rc === d.goalCursor[1]);
       if (docOk && curOk) {
-        console.log(`✓ ${f} · ${d.reto.slice(0, 60)}`);
+        console.log(`✓ ${f} · ${d.challenge.slice(0, 60)}`);
       } else {
         mal += 1;
         console.error(`✗ ${f} · ${d.reto.slice(0, 60)}`);
         if (!docOk) console.error(`    buffer real:    ${JSON.stringify(res)}\n    buffer esperado: ${JSON.stringify(esperado)}`);
-        if (!curOk) console.error(`    cursor real: [${rl},${rc}] · esperado: [${d.objetivoCursor}]`);
+        if (!curOk) console.error(`    cursor real: [${rl},${rc}] · esperado: [${d.goalCursor}]`);
       }
     } catch (e) {
       mal += 1;

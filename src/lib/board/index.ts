@@ -5,8 +5,6 @@ import { build } from './board';
 import { engine } from './render';
 import { rig } from './rig';
 
-const REST = 0.72;
-
 const SINK = [END, 0.94] as const;
 
 const smooth = (t: number) => t * t * (3 - 2 * t);
@@ -28,7 +26,8 @@ export async function mount(host: HTMLElement): Promise<BoardScene> {
 
   host.dataset.backend = m.backend;
 
-  const state = { p: reduced ? REST : 0, intro: reduced ? 1 : 0 };
+  // END is also the resting pose: camera fully arrived, sinking not yet started.
+  const state = { p: reduced ? END : 0, intro: reduced ? 1 : 0 };
   const startTime = performance.now();
 
   let frames = 0;

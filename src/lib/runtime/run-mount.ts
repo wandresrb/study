@@ -1,6 +1,7 @@
 // Wires the buttons of a <Run> figure to an editor and a runtime. The runtime is
 // pulled on the first click: a lesson the reader never runs pays nothing for it.
-import { editorOf } from '../editor/mount';
+import { lazyMount } from '../editor/mount';
+import type { Editor, EditorOptions } from '../editor/core';
 import type { RunEvent, Runtime, Test, TestResult } from './types';
 
 type JsModule = typeof import('./js');
@@ -86,6 +87,21 @@ function reset(root: HTMLElement) {
   root.querySelector('[data-tests]')?.classList.add('hidden');
 }
 
+/** Mounts the code editor of an <Exercise code=…>. */
+async function setupEditor(host: HTMLElement): Promise<Editor | void> {
+  const raw = host.querySelector('script[type="application/json"]')?.textContent;
+  if (!raw) return;
+  const slot = host.querySelector<HTMLElement>('[data-editor-slot]') ?? host;
+  slot.textContent = ''; // drop the SSR fallback
+  const { create } = await import('../editor/core');
+  const editor = await create(slot, JSON.parse(raw) as EditorOptions);
+  originals.set(host, editor.doc);
+  return editor;
+}
+
+const { instanceOf } = lazyMount('[data-editor]', setupEditor);
+const editorOf = (host: HTMLElement) => instanceOf(host) as Editor | undefined;
+
 // Delegated once: figures come and go with every navigation.
 document.addEventListener('click', (e) => {
   const button = (e.target as HTMLElement | null)?.closest<HTMLButtonElement>('[data-action]');
@@ -95,12 +111,6 @@ document.addEventListener('click', (e) => {
   else if (button.dataset.action === 'reset') reset(root);
 });
 
-// The pristine text, captured once the editor exists, so ↻ has something to go back to.
-document.addEventListener('editor:ready', (e) => {
-  const host = e.target as HTMLElement;
-  const editor = editorOf(host);
-  if (editor && !originals.has(host)) originals.set(host, editor.doc);
-});
 
 document.addEventListener('astro:before-swap', () => {
   for (const root of document.querySelectorAll<HTMLElement>('[data-run]')) {

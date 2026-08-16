@@ -11,7 +11,7 @@ const COMPONENTS = new Set([
   'Callout', 'KeyCap', 'Kbd', 'Mermaid', 'Cards', 'Card', 'PluginCard',
   'Objetivos', 'Reto', 'Lead', 'Exercise', 'Paso', 'Instalar',
   'Predict', 'ModeMap', 'KeyboardMap', 'Pipeline',
-  'UndoTree', 'WindowLayout', 'CommandAnatomy', 'Run',
+  'UndoTree', 'WindowLayout', 'CommandAnatomy',
   'Fragment',
 ]);
 

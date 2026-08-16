@@ -1,174 +1,130 @@
-// Monta los drills interactivos de la página. Este módulo es ligero y se
-// carga siempre; el motor (CM6 + vim, ~90 KB) solo se descarga cuando el
-// primer drill entra en pantalla, y una sola vez por sesión de navegación.
-//
-// Con <ClientRouter/> los módulos corren UNA vez: todo cuelga de
-// astro:page-load y es idempotente (data-montado marca lo ya hecho).
+// Wires the vim exercises of a page to their DOM. Light and always loaded; the
+// engine (CM6 + vim, ~90 KB) only downloads when the first one comes into view.
 
 import { byLesson, complete, get, lessonIdOf, markRead } from '../learner';
-import type { DefDrill, Drill } from './engine';
+import { lazyMount } from '../editor/mount';
+import type { ExerciseDef, VimExercise } from './engine';
 
-type Motor = typeof import('./engine');
-let motor: Promise<Motor> | null = null;
-const cargarMotor = () => (motor ??= import('./engine'));
+type Engine = typeof import('./engine');
 
-const vivos = new WeakMap<HTMLElement, Drill>();
+let engine: Promise<Engine> | null = null;
+const loadEngine = () => (engine ??= import('./engine'));
 
-function montarUno(raiz: HTMLElement, api: Motor) {
-  const def = JSON.parse(raiz.querySelector('script[type="application/json"]')!.textContent!) as DefDrill;
-  const id = raiz.dataset.id!;
-  const reto = raiz.dataset.reto ?? '';
-  // The store holds every track, so a drill's hash is only unique per lesson.
+async function setup(root: HTMLElement): Promise<VimExercise> {
+  const api = await loadEngine();
+  const def = JSON.parse(
+    root.querySelector('script[type="application/json"]')!.textContent!,
+  ) as ExerciseDef;
+
+  const id = root.dataset.id!;
+  const challenge = root.dataset.challenge ?? '';
+  // The store holds every track, so the hash is only unique within its lesson.
   // Replayed out of context (the review page) the origin travels in data-*.
-  const lesson = raiz.dataset.lesson ?? lessonIdOf(location.href);
-  const drillId = raiz.dataset.itemId ?? `${lesson}#${id}`;
-  const term = raiz.querySelector<HTMLElement>('[data-term]')!;
-  term.querySelector('pre')?.remove(); // el fallback SSR: el editor lo sustituye
-  const modoEl = raiz.querySelector<HTMLElement>('[data-modo]')!;
-  const hudEl = raiz.querySelector<HTMLElement>('[data-hud]')!;
-  const estadoEl = raiz.querySelector<HTMLElement>('[data-estado]')!;
-  const pistaEl = raiz.querySelector<HTMLElement>('[data-pista]');
-  const explicaEl = raiz.querySelector<HTMLElement>('[data-explica]');
+  const lesson = root.dataset.lesson ?? lessonIdOf(location.href);
+  const itemId = root.dataset.itemId ?? `${lesson}#${id}`;
 
-  let usoPista = false;
+  const term = root.querySelector<HTMLElement>('[data-term]')!;
+  term.querySelector('pre')?.remove(); // the SSR fallback: the editor replaces it
+  const modeEl = root.querySelector<HTMLElement>('[data-mode]')!;
+  const hudEl = root.querySelector<HTMLElement>('[data-hud]')!;
+  const stateEl = root.querySelector<HTMLElement>('[data-state]')!;
+  const hintEl = root.querySelector<HTMLElement>('[data-hint]');
+  const whyEl = root.querySelector<HTMLElement>('[data-why]');
 
-  const pintarEstado = (dominio: number | undefined) => {
-    estadoEl.textContent = dominio === 2 ? '★' : dominio !== undefined ? '✓' : '○';
-    estadoEl.className =
+  let usedHint = false;
+
+  const paintState = (mastery: number | undefined) => {
+    stateEl.textContent = mastery === 2 ? '★' : mastery !== undefined ? '✓' : '○';
+    stateEl.className =
       'font-mono text-sm ' +
-      (dominio === 2 ? 'text-yellow' : dominio !== undefined ? 'text-green' : 'text-overlay0');
+      (mastery === 2 ? 'text-yellow' : mastery !== undefined ? 'text-green' : 'text-overlay0');
   };
-  void get(drillId).then((r) => pintarEstado(r?.mastery));
+  void get(itemId).then((r) => paintState(r?.mastery));
 
-  const drill = api.montar(term, def, {
-    onModo(modo) {
-      const m = modo.toUpperCase();
-      modoEl.textContent = m;
-      modoEl.dataset.valor = modo.split(' ')[0];
+  const exercise = await api.mount(term, def, {
+    onMode(mode) {
+      modeEl.textContent = mode.toUpperCase();
+      modeEl.dataset.value = mode.split(' ')[0];
     },
-    onTecla(tecla, total) {
-      if (!tecla) {
+    onKey(key) {
+      if (!key) {
         hudEl.replaceChildren();
         return;
       }
       const chip = document.createElement('kbd');
       chip.className =
         'rounded-xs border border-borde bg-mantle px-1 font-mono text-2xs text-subtext1';
-      chip.textContent = tecla;
+      chip.textContent = key;
       hudEl.append(chip);
       while (hudEl.childElementCount > 14) hudEl.firstElementChild!.remove();
-      void total;
     },
-    onExito({ pulsaciones }) {
-      const enPresupuesto = def.presupuesto !== undefined && pulsaciones <= def.presupuesto;
-      explicaEl?.removeAttribute('hidden');
-      raiz.dispatchEvent(new CustomEvent('drill:exito', { bubbles: true }));
-      celebrar(raiz, enPresupuesto);
+    onSolved({ keys }) {
+      const withinBudget = def.budget !== undefined && keys <= def.budget;
+      whyEl?.removeAttribute('hidden');
+      root.dispatchEvent(new CustomEvent('exercise:solved', { bubbles: true }));
+      celebrate(root, withinBudget);
       void (async () => {
-        await complete(drillId, {
+        await complete(itemId, {
           kind: 'exercise',
           lesson,
-          label: reto,
+          label: challenge,
           data: def,
-          noHint: !usoPista,
-          withinBudget: enPresupuesto,
+          noHint: !usedHint,
+          withinBudget,
         });
-        pintarEstado((await get(drillId))?.mastery);
-        // practicar marca la lección: si todos los drills de la página están
-        // hechos, cae el tick de leída
+        paintState((await get(itemId))?.mastery);
+        // practising marks the lesson: with every exercise on the page done,
+        // the read tick follows
         const total = document.querySelectorAll('[data-vim-exercise]').length;
-        const hechos = (await byLesson()).get(lesson)?.done ?? 0;
-        if (total > 0 && hechos >= total) void markRead(lesson);
+        const done = (await byLesson()).get(lesson)?.done ?? 0;
+        if (total > 0 && done >= total) void markRead(lesson);
       })();
     },
   });
-  vivos.set(raiz, drill);
-  // accesible desde el elemento: lo usan el dojo y las pruebas de navegador
-  (raiz as HTMLElement & { drill?: Drill }).drill = drill;
 
-  raiz.querySelector('[data-accion="reiniciar"]')?.addEventListener('click', () => {
-    drill.reiniciar();
-    drill.view.focus();
+  // Reachable from the element: the review page and browser checks use it.
+  (root as HTMLElement & { exercise?: VimExercise }).exercise = exercise;
+
+  root.querySelector('[data-action="reset"]')?.addEventListener('click', () => {
+    exercise.reset();
+    exercise.editor.focus();
   });
-  raiz.querySelector('[data-accion="pista"]')?.addEventListener('click', () => {
-    usoPista = true;
-    pistaEl?.toggleAttribute('hidden');
+  root.querySelector('[data-action="hint"]')?.addEventListener('click', () => {
+    usedHint = true;
+    hintEl?.toggleAttribute('hidden');
   });
-  raiz.querySelector('[data-accion="solucion"]')?.addEventListener('click', () => {
-    usoPista = true;
-    explicaEl?.removeAttribute('hidden');
-    void drill.reproducir();
+  root.querySelector('[data-action="solution"]')?.addEventListener('click', () => {
+    usedHint = true;
+    whyEl?.removeAttribute('hidden');
+    void exercise.replay();
   });
 
-  // El overlay de «haz clic para practicar»: evita robar el teclado al scroll
-  const velo = raiz.querySelector<HTMLElement>('[data-velo]');
-  velo?.addEventListener('click', () => {
-    velo.remove();
-    drill.view.focus();
+  // The «click to practise» overlay: keeps the keyboard from stealing the scroll.
+  const veil = root.querySelector<HTMLElement>('[data-veil]');
+  veil?.addEventListener('click', () => {
+    veil.remove();
+    exercise.editor.focus();
   });
+
+  return exercise;
 }
 
-/* Un acierto merece 200 ms de alegría, no confeti. GSAP ya está en el sitio
-   (la portada lo usa); se trae bajo demanda para no pagarlo en cada página. */
-async function celebrar(raiz: HTMLElement, estrella: boolean) {
+/* A win deserves 200 ms of joy, not confetti. GSAP is already in the site (the
+   home page uses it); it comes on demand so no lesson pays for it. */
+async function celebrate(root: HTMLElement, star: boolean) {
   if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   const { gsap } = await import('gsap');
-  const term = raiz.querySelector('[data-term]');
   gsap.fromTo(
-    term,
-    { boxShadow: `0 0 0 2px var(${estrella ? '--yellow' : '--green'})` },
+    root.querySelector('[data-term]'),
+    { boxShadow: `0 0 0 2px var(${star ? '--yellow' : '--green'})` },
     { boxShadow: '0 0 0 0px transparent', duration: 0.6, ease: 'power2.out' },
   );
   gsap.fromTo(
-    raiz.querySelector('[data-estado]'),
+    root.querySelector('[data-state]'),
     { scale: 1.6 },
     { scale: 1, duration: 0.35, ease: 'back.out(3)' },
   );
 }
 
-const montar = (el: HTMLElement) => {
-  if (el.dataset.montado) return;
-  el.dataset.montado = '1';
-  cargarMotor().then((api) => montarUno(el, api));
-};
-
-/** Monta lo que haya sin montar. Exportada: el dojo inyecta drills y la llama. */
-export function montarPendientes() {
-  const drills = document.querySelectorAll<HTMLElement>('[data-vim-exercise]:not([data-montado])');
-  if (drills.length === 0) return;
-
-  // Lo cercano se monta YA, por geometría: los IntersectionObserver se
-  // suspenden en pestañas ocultas y su primer disparo no es inmediato.
-  const margen = 300;
-  const lejanos: HTMLElement[] = [];
-  for (const d of drills) {
-    const r = d.getBoundingClientRect();
-    if (r.bottom > -margen && r.top < innerHeight + margen) montar(d);
-    else lejanos.push(d);
-  }
-  if (lejanos.length === 0) return;
-
-  const observador = new IntersectionObserver(
-    (entradas) => {
-      for (const e of entradas) {
-        if (!e.isIntersecting) continue;
-        observador.unobserve(e.target);
-        montar(e.target as HTMLElement);
-      }
-    },
-    { rootMargin: `${margen}px` },
-  );
-  lejanos.forEach((d) => observador.observe(d));
-}
-
-// El arranque no puede fiarse solo de astro:page-load: en la carga inicial
-// este módulo puede evaluarse DESPUÉS de que el evento ya disparó.
-if (document.readyState !== 'loading') montarPendientes();
-else document.addEventListener('DOMContentLoaded', () => montarPendientes(), { once: true });
-document.addEventListener('astro:page-load', montarPendientes);
-document.addEventListener('astro:before-swap', () => {
-  // CM engancha listeners al DOM que el swap va a tirar: limpieza explícita
-  document.querySelectorAll<HTMLElement>('[data-vim-exercise][data-montado]').forEach((el) => {
-    vivos.get(el)?.destruir();
-  });
-});
+/** Mounts what is still pending. Exported: the review page injects exercises. */
+export const { mountPending } = lazyMount('[data-vim-exercise]', setup);

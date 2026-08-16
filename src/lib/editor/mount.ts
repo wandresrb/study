@@ -1,74 +1,67 @@
-// Keeps core.ts out of every page that has no editor. Same shape as
-// lib/vim/mount.ts, which already proved it against the vim engine.
-import type { Editor, EditorOptions } from './core';
+// Lazy mounting, shared by everything that puts a heavy widget in a lesson.
+// Two rules it exists to enforce: a page pays nothing for a widget it does not
+// have, and nothing survives a <ClientRouter/> swap.
 
-type Core = typeof import('./core');
+type Teardown = { destroy(): void };
 
-let core: Promise<Core> | null = null;
-const loadCore = () => (core ??= import('./core'));
+const MARGIN = 300;
 
-const live = new WeakMap<HTMLElement, Editor>();
+/**
+ * Mounts `[selector]` elements when they come near the viewport, once each.
+ * Returns a function that mounts whatever is still pending — the review page
+ * injects exercises after load and calls it.
+ */
+export function lazyMount(selector: string, setup: (host: HTMLElement) => Promise<Teardown | void>) {
+  const live = new WeakMap<HTMLElement, Teardown>();
+  let observer: IntersectionObserver | null = null;
 
-/** The editor of a mounted host, for whoever drives it (a runner, the dojo). */
-export const editorOf = (host: HTMLElement): Editor | undefined => live.get(host);
+  const mountOne = (host: HTMLElement) => {
+    if (host.dataset.mounted) return;
+    host.dataset.mounted = '1';
+    void setup(host).then((instance) => {
+      if (instance) live.set(host, instance);
+    });
+  };
 
-async function mountOne(host: HTMLElement) {
-  if (host.dataset.mounted) return;
-  host.dataset.mounted = '1';
+  const mountPending = () => {
+    const pending = document.querySelectorAll<HTMLElement>(`${selector}:not([data-mounted])`);
+    if (!pending.length) return;
 
-  const raw = host.querySelector('script[type="application/json"]')?.textContent;
-  if (!raw) return;
-  const opts = JSON.parse(raw) as EditorOptions;
+    // Geometry first: observers are suspended in hidden tabs and their first
+    // callback is not immediate, so anything already near the viewport goes now.
+    const far: HTMLElement[] = [];
+    for (const host of pending) {
+      const r = host.getBoundingClientRect();
+      if (r.top < innerHeight + MARGIN && r.bottom > -MARGIN) mountOne(host);
+      else far.push(host);
+    }
+    if (!far.length) return;
 
-  const slot = host.querySelector<HTMLElement>('[data-editor-slot]') ?? host;
-  slot.textContent = ''; // drop the SSR fallback
+    observer ??= new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (!e.isIntersecting) continue;
+          observer!.unobserve(e.target);
+          mountOne(e.target as HTMLElement);
+        }
+      },
+      { rootMargin: `${MARGIN}px` },
+    );
+    for (const host of far) observer.observe(host);
+  };
 
-  const { create } = await loadCore();
-  live.set(host, await create(slot, opts));
-  host.dispatchEvent(new CustomEvent('editor:ready', { bubbles: true }));
+  // The initial load cannot rely on astro:page-load alone: this module may be
+  // evaluated after the event already fired.
+  if (document.readyState !== 'loading') mountPending();
+  else document.addEventListener('DOMContentLoaded', mountPending, { once: true });
+
+  document.addEventListener('astro:page-load', mountPending);
+  document.addEventListener('astro:before-swap', () => {
+    for (const host of document.querySelectorAll<HTMLElement>(`${selector}[data-mounted]`)) {
+      live.get(host)?.destroy();
+      live.delete(host);
+    }
+  });
+
+  return { mountPending, instanceOf: (host: HTMLElement) => live.get(host) };
 }
-
-let observer: IntersectionObserver | null = null;
-
-function mountPending() {
-  const pending = document.querySelectorAll<HTMLElement>('[data-editor]:not([data-mounted])');
-  if (!pending.length) return;
-
-  // Geometry first: observers are suspended in hidden tabs and their first
-  // callback is not immediate, so anything already near the viewport mounts now.
-  const margin = 300;
-  const rest: HTMLElement[] = [];
-  for (const host of pending) {
-    const r = host.getBoundingClientRect();
-    if (r.top < innerHeight + margin && r.bottom > -margin) void mountOne(host);
-    else rest.push(host);
-  }
-  if (!rest.length) return;
-
-  observer ??= new IntersectionObserver(
-    (entries) => {
-      for (const e of entries) {
-        if (!e.isIntersecting) continue;
-        observer!.unobserve(e.target);
-        void mountOne(e.target as HTMLElement);
-      }
-    },
-    { rootMargin: `${margin}px` },
-  );
-  for (const host of rest) observer.observe(host);
-}
-
-if (document.readyState !== 'loading') mountPending();
-else document.addEventListener('DOMContentLoaded', mountPending, { once: true });
-
-document.addEventListener('astro:page-load', mountPending);
-
-// The router swaps the document out; without this the views leak.
-document.addEventListener('astro:before-swap', () => {
-  for (const host of document.querySelectorAll<HTMLElement>('[data-editor][data-mounted]')) {
-    live.get(host)?.destroy();
-    live.delete(host);
-  }
-});
-
-export { mountPending };
