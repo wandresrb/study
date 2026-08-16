@@ -250,6 +250,21 @@ todas. Los otros 16 registrados ya están en inglés.
 `scripts/lint-contenido.mjs` lleva esa lista en `COMPONENTS` **con los nombres del MDX**: si
 registras uno nuevo, añádelo también ahí.
 
+**Trampa medida: MDX recorta la indentación de una expresión multilínea en un atributo.** Quita
+exactamente los espacios con los que está sangrado el atributo —dos, con el formato de siempre—, así
+que el código va alineado **con el atributo**, no con el margen:
+
+```mdx
+<Run
+  code={`function suma(a, b) {
+    return a + b;
+  }`} />
+```
+
+Eso llega como `function suma(a, b) {\n  return a + b;\n}`. Si el cuerpo se escribe a dos espacios
+llega pegado al margen. Es cosmético en un diagrama de Mermaid —los 3.586 del sitio perdieron su
+sangría y da igual—, pero en `<Run language="python">` **cambia el programa**.
+
 ### Iconos: Lucide, importado por nombre
 
 El contenido solo lleva su `id`; con qué se dibuja se decide en la página, con **imports directos**
