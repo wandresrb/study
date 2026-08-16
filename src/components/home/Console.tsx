@@ -78,7 +78,7 @@ export default function Console(props: { code: string }) {
 
           <div class="editor" innerHTML={props.code} />
 
-          <p class="m-0 flex items-center gap-3 border-t border-surface1 bg-crust px-3.5 py-1.5 font-mono text-2xs text-overlay1">
+          <p class="m-0 flex items-center gap-3 border-t border-surface1 bg-crust px-3.5 py-1.5 font-mono text-2xs text-subtext0">
             <b class="bg-blue px-2 py-0.5 font-semibold tracking-versalita text-crust">
               NORMAL
             </b>
@@ -89,7 +89,7 @@ export default function Console(props: { code: string }) {
         </div>
 
         <div class={`${PANEL} bg-crust`}>
-          <p class={`${BAR} flex items-baseline gap-2.5 text-2xs text-overlay1`}>
+          <p class={`${BAR} flex items-baseline gap-2.5 text-2xs text-subtext0`}>
             <b class="font-medium text-subtext0">zsh</b> <span>~/maquina</span>
           </p>
           <pre
@@ -106,7 +106,7 @@ export default function Console(props: { code: string }) {
             </For>
             {}
             <Show when={output().length === 0}>
-              <span class="text-overlay1">
+              <span class="text-subtext0">
                 ${' '}
                 <b class="inline-block h-[1em] w-[0.5em] translate-y-[0.15em] animate-parpadeo bg-subtext0" />
               </span>

@@ -33,26 +33,75 @@ const MIN_TARGET = 24;
 
 /** Everything measurable in one DOM pass. Serialized into the page: no closures. */
 function probe({ aaText, aaLarge, minTarget }) {
+  // Chrome hands back `oklab(...)` and `color-mix(...)`, not just `rgb()`. Parsing
+  // those numbers as if they were channels produced impossible ratios (a 1:1 on
+  // legible text). Painting one pixel makes the browser do the conversion.
+  const probeCanvas = document.createElement('canvas');
+  probeCanvas.width = probeCanvas.height = 1;
+  const ctx = probeCanvas.getContext('2d', { willReadFrequently: true });
+  const rgbCache = new Map();
+  const toRgb = (color) => {
+    if (rgbCache.has(color)) return rgbCache.get(color);
+    let out = null;
+    try {
+      ctx.clearRect(0, 0, 1, 1);
+      ctx.fillStyle = '#000';
+      ctx.fillStyle = color;
+      ctx.fillRect(0, 0, 1, 1);
+      const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
+      out = { r, g, b, a: a / 255 };
+    } catch {
+      out = null;
+    }
+    rgbCache.set(color, out);
+    return out;
+  };
+
+  // Alpha only means something against what is behind it.
+  const over = (fg, bg) => ({
+    r: fg.r * fg.a + bg.r * (1 - fg.a),
+    g: fg.g * fg.a + bg.g * (1 - fg.a),
+    b: fg.b * fg.a + bg.b * (1 - fg.a),
+    a: 1,
+  });
+
+  const relative = ({ r, g, b }) => {
+    const f = (v) => {
+      const c = v / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    };
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+  };
+
   const luminance = (color) => {
-    const parts = color.match(/[\d.]+/g);
-    if (!parts) return null;
-    if (parts.length > 3 && Number(parts[3]) === 0) return null;
-    const [r, g, b] = parts.slice(0, 3).map((value) => {
-      const channel = Number(value) / 255;
-      return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
-    });
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    const rgb = toRgb(color);
+    if (!rgb || rgb.a === 0) return null;
+    return relative(rgb);
   };
 
   // Walk up for the first painted background. A gradient leaves backgroundColor
   // transparent, so a naive walk-up would compare the text against an ancestor
   // it never sits on — that alone invented a 1.05:1 on a button that reads at
   // 8.7:1. Sample the gradient stops and let the caller take the worst.
+  // Only the first background layer sits behind the text: `background: a, b` paints
+  // `a` on top. Sampling every layer compared the chip labels against the ring
+  // gradient they never touch, which faked a 1:1 on 54 perfectly legible numbers.
+  const topLayer = (image) => {
+    let depth = 0;
+    for (let i = 0; i < image.length; i++) {
+      const c = image[i];
+      if (c === '(') depth++;
+      else if (c === ')') depth--;
+      else if (c === ',' && depth === 0) return image.slice(0, i);
+    }
+    return image;
+  };
+
   const backdrops = (node) => {
     for (let el = node; el; el = el.parentElement) {
       const style = getComputedStyle(el);
       if (style.backgroundImage && style.backgroundImage !== 'none') {
-        const stops = (style.backgroundImage.match(/rgba?\([^)]*\)/g) ?? []).filter(
+        const stops = (topLayer(style.backgroundImage).match(/rgba?\([^)]*\)/g) ?? []).filter(
           (c) => luminance(c) !== null,
         );
         if (stops.length) return stops;
@@ -63,10 +112,16 @@ function probe({ aaText, aaLarge, minTarget }) {
     return ['rgb(0, 0, 0)'];
   };
 
-  const contrast = (fg, bg) => {
-    const a = luminance(fg);
-    const b = luminance(bg);
-    if (a === null || b === null) return null;
+  const BLACK = { r: 0, g: 0, b: 0, a: 1 };
+  const contrast = (fgColor, bgColor) => {
+    const fg = toRgb(fgColor);
+    const bg = toRgb(bgColor);
+    if (!fg || !bg || fg.a === 0) return null;
+    // A translucent plate resolves against the page, which is dark here.
+    const plate = bg.a < 1 ? over(bg, BLACK) : bg;
+    const ink = fg.a < 1 ? over(fg, plate) : fg;
+    const a = relative(ink);
+    const b = relative(plate);
     return Number(((Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05)).toFixed(2));
   };
 

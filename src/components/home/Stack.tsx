@@ -22,15 +22,15 @@ export default function Stack() {
         {}
         <Show when={stack().length === 0}>
           <li class={`${SLOT} border border-dashed border-overlay0`}>
-            <span class="text-xs text-overlay2">0x0000</span>
-            <span class="ml-auto text-sm text-overlay2">ranura libre</span>
+            <span class="text-xs text-subtext0">0x0000</span>
+            <span class="ml-auto text-sm text-subtext0">ranura libre</span>
           </li>
         </Show>
 
         <For each={stack()}>
           {(layer, i) => (
             <li class={`${SLOT} border border-solid border-overlay1 bg-mantle`}>
-              <span class="text-xs text-overlay2">{layer.addr}</span>
+              <span class="text-xs text-subtext0">{layer.addr}</span>
               <span class="text-lg tracking-versalita text-text">{layer.name}</span>
               {}
               <Show when={i() === stack().length - 1}>

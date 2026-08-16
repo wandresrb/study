@@ -252,7 +252,7 @@ export default function Palette(props: Props) {
         type="button"
         onClick={show}
         aria-label="Buscar en el sitio"
-        class="inline-flex min-h-6 shrink-0 cursor-pointer items-center gap-2 rounded-full border border-borde bg-crust/60 px-3 py-1.5 text-sm text-overlay1 transition-colors hover:border-surface1 hover:text-subtext0"
+        class="inline-flex min-h-6 shrink-0 cursor-pointer items-center gap-2 rounded-full border border-borde bg-crust/60 px-3 py-1.5 text-sm text-subtext0 transition-colors hover:border-surface1 hover:text-text"
       >
         <span aria-hidden="true">⌕</span>
         <span class="hidden sm:inline">Buscar</span>
@@ -285,13 +285,13 @@ export default function Palette(props: Props) {
               aria-controls="palette-list"
               aria-autocomplete="list"
               aria-activedescendant={results().length ? optionId(cursor()) : undefined}
-              class="w-full border-0 border-b border-surface1 bg-transparent px-4 py-3.5 text-base text-text outline-none placeholder:text-overlay0"
+              class="w-full border-0 border-b border-surface1 bg-transparent px-4 py-3.5 text-base text-text outline-none placeholder:text-subtext0"
             />
 
             <Show
               when={results().length > 0}
               fallback={
-                <p class="m-0 px-4 py-6 text-sm text-overlay1">Nada para «{query()}».</p>
+                <p class="m-0 px-4 py-6 text-sm text-subtext0">Nada para «{query()}».</p>
               }
             >
               <ul
@@ -311,7 +311,7 @@ export default function Palette(props: Props) {
                       onMouseMove={() => setCursor(i())}
                       class="flex cursor-pointer items-baseline gap-3 rounded px-3 py-2 text-left aria-selected:bg-surface0/70"
                     >
-                      <span class="w-24 shrink-0 truncate font-mono text-2xs text-overlay1">
+                      <span class="w-24 shrink-0 truncate font-mono text-2xs text-subtext0">
                         {hit[1]}
                       </span>
                       <span class="truncate text-md text-subtext1">{hit[0]}</span>
@@ -321,7 +321,7 @@ export default function Palette(props: Props) {
               </ul>
             </Show>
 
-            <p class="m-0 flex items-center gap-4 border-t border-surface1 bg-crust px-4 py-2 font-mono text-2xs text-overlay0">
+            <p class="m-0 flex items-center gap-4 border-t border-surface1 bg-crust px-4 py-2 font-mono text-2xs text-subtext0">
               <span>↑↓ moverse</span>
               <span>⏎ abrir</span>
               <span>esc cerrar</span>
