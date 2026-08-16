@@ -1,0 +1,134 @@
+---
+title: "Barreras de CPU: smp_mb, smp_rmb, smp_wmb y el emparejamiento"
+description: "Domar al compilador no basta: la CPU también reordena. Las tres barreras de hardware, qué reordenamiento prohíbe cada una, la diferencia entre smp_ y las bare, y la regla de oro de que una barrera nunca va sola."
+subject: kernel
+level: 18
+order: 3
+position: "18.3"
+duration: "16 min"
+---
+
+<Lead>
+`READ_ONCE` (nivel 18.2) calla al compilador, pero no le dice nada al silicio. En un núcleo débil como ARM, el hardware sigue reordenando tus accesos a su gusto. Las barreras de CPU son instrucciones reales —*fences*— que restringen el motor fuera de orden y el store buffer. Y tienen una ley férrea: una barrera aislada no hace nada; solo sirve emparejada con otra en el núcleo contrario.
+</Lead>
+
+<Goals>
+
+- Conocer `smp_mb`, `smp_rmb` y `smp_wmb` y qué reordenamiento prohíbe cada una.
+- Distinguir las barreras `smp_` (entre núcleos) de las bare `mb` (MMIO).
+- Entender el emparejamiento y arreglar el flag+datos con `smp_wmb`/`smp_rmb`.
+- Conocer las dependencias de dirección y su papel en RCU.
+
+</Goals>
+
+## Del compilador al silicio
+
+`READ_ONCE` y `WRITE_ONCE` fuerzan una carga y una escritura reales, pero no imponen **orden** entre ellas en la CPU. En x86, por el TSO, sueles librarte; en ARM, POWER o RISC-V, no. Una barrera de CPU es una instrucción máquina que le prohíbe al núcleo completar accesos en cierto orden relativo. Modelamos el reordenamiento como cuatro casos según qué va antes y qué después: Carga-Carga, Carga-Escritura, Escritura-Carga y Escritura-Escritura.
+
+## Las tres barreras y qué ordenan
+
+<Cards>
+  <Card icon="🧱" title="smp_mb — barrera total">
+    Ordena todo acceso previo (cargas y escrituras) frente a todo acceso posterior. Prohíbe los cuatro reordenamientos. En x86 emite un `lock addl` sobre la pila o `mfence`; en arm64, `dmb ish`.
+  </Card>
+  <Card icon="📥" title="smp_rmb — barrera de lectura">
+    Ordena las cargas previas frente a las cargas posteriores (Carga-Carga). No dice nada de las escrituras. En x86 es solo `barrier()` porque el TSO ya ordena cargas; en arm64, `dmb ishld`.
+  </Card>
+  <Card icon="📤" title="smp_wmb — barrera de escritura">
+    Ordena las escrituras previas frente a las escrituras posteriores (Escritura-Escritura). No dice nada de las cargas. En x86 es solo `barrier()`; en arm64, `dmb ishst`.
+  </Card>
+</Cards>
+
+Que `smp_rmb` y `smp_wmb` sean casi gratis en x86 pero fences reales en ARM es precisamente por qué debes escribirlos siempre: tu código tiene que ser correcto en el modelo débil, aunque en tu portátil x86 no cuesten nada.
+
+## Qué emite cada arquitectura
+
+Para desmitificarlo, mira las definiciones reales. En x86 (`arch/x86/include/asm/barrier.h`), por el TSO, solo la barrera total cuesta una instrucción:
+
+```c
+/* x86-64: smp_mb drena el store buffer; las otras dos son solo compilador */
+#define __smp_mb()   asm volatile("lock; addl $0,-4(%%rsp)" ::: "memory", "cc")
+#define __smp_rmb()  barrier()
+#define __smp_wmb()  barrier()
+```
+
+En arm64 (`arch/arm64/include/asm/barrier.h`), débilmente ordenado, las tres emiten un `dmb` con distinto dominio de ordenación:
+
+```c
+#define __smp_mb()   dmb(ish)     /* inner shareable, total */
+#define __smp_rmb()  dmb(ishld)   /* solo carga-carga */
+#define __smp_wmb()  dmb(ishst)   /* solo escritura-escritura */
+```
+
+El mismo código C portable se traduce a "nada" o a un fence según dónde compile. Escribes para el peor caso; el mejor lo regala el hardware.
+
+## smp_ frente a las bare: entre núcleos o hacia el hardware
+
+El prefijo `smp_` tiene un significado preciso. En una compilación monoprocesador (`CONFIG_SMP=n`) estas barreras degeneran a `barrier()` —solo compilador— porque un único núcleo siempre ve sus propios accesos en orden. En SMP emiten el fence real. Es decir, `smp_mb` sirve para ordenar memoria **normal** entre núcleos.
+
+Las variantes desnudas `mb()`, `rmb()`, `wmb()` emiten el fence **siempre**, incluso en monoprocesador. Son para ordenar accesos a memoria de **dispositivo** (MMIO), donde el "otro observador" es un motor de DMA o el hardware. No uses `smp_*` para MMIO, ni las bare para coordinar núcleos: sería desperdicio en ambos sentidos.
+
+## El emparejamiento: una barrera nunca va sola
+
+Una barrera solo restringe el orden en que **un** núcleo hace visibles u observa sus accesos. Aislada no significa nada: debe **emparejarse** con una barrera en el otro núcleo. La de escritura del productor se empareja con la de lectura del consumidor. Así se arregla el flag+datos del nivel 18.1:
+
+```c
+/* CPU 0: productor */
+data = 42;
+smp_wmb();               /* empareja con smp_rmb de CPU 1  */
+WRITE_ONCE(ready, 1);    /* la escritura de data queda antes de esta */
+
+/* CPU 1: consumidor */
+while (READ_ONCE(ready) == 0)
+	cpu_relax();
+smp_rmb();               /* empareja con smp_wmb de CPU 0  */
+usar(data);              /* la carga de ready queda antes de esta */
+```
+
+Sin el `smp_wmb` del productor, `ready = 1` podría llegar a memoria antes que `data = 42`. Sin el `smp_rmb` del consumidor, CPU 1 podría cargar `data` antes de confirmar `ready`. Cada fence es **la mitad** del contrato; hacen falta los dos.
+
+<Mermaid code={`flowchart TB
+  subgraph W [CPU0 productor]
+    W1[escribe data 42] --> WB[smp_wmb] --> W2[escribe ready 1]
+  end
+  subgraph R [CPU1 consumidor]
+    R1[lee ready 1] --> RB[smp_rmb] --> R2[lee data 42]
+  end
+  WB -. se emparejan .- RB
+  W2 == ready visible ==> R1`} />
+
+<Callout type="info" title="Comenta siempre con quién empareja">
+Es norma del kernel que toda barrera lleve un comentario indicando **con qué otra barrera se empareja** y sobre qué variable. Una barrera sin pareja documentada es una señal de alarma en revisión: casi siempre es un bug o un adorno inútil. Grep por `pairs with` en el árbol y verás el patrón por todas partes.
+</Callout>
+
+## Barreras alrededor de atómicos
+
+Muchas operaciones atómicas de lectura-modificación-escritura (`atomic_inc`, `atomic_dec`) **no** ordenan memoria por sí solas en todas las arquitecturas: son relajadas salvo que uses una variante con sufijo. Para añadir orden a su alrededor sin pagar un `smp_mb` entero existen parejas específicas:
+
+```c
+smp_mb__before_atomic();   /* ordena los accesos previos frente al atómico */
+atomic_inc(&contador);
+smp_mb__after_atomic();    /* ordena el atómico frente a los accesos posteriores */
+```
+
+En x86 suelen ser gratis (el `lock` del atómico ya es barrera total); en ARM emiten justo el fence necesario. También existe `smp_store_mb(var, val)`, una escritura seguida de barrera total, habitual al soltar estado y necesitar orden Escritura-Carga después.
+
+## Dependencias de dirección: orden gratis
+
+En casi todas las arquitecturas (tras la retirada de Alpha) una **dependencia de dirección** aporta orden sin barrera: si cargas un puntero y luego lo desreferencias, el desreferenciado no puede adelantarse a la carga del puntero, porque el núcleo necesita la dirección para leer. Sobre esa garantía se construye `rcu_dereference` (nivel 18.4), y por eso los lectores de RCU (nivel 17) no necesitan `smp_rmb`. Alpha fue la única arquitectura que rompía esto y exigía `smp_read_barrier_depends`; ese caso se plegó dentro de `READ_ONCE` y quedó obsoleto.
+
+<Callout type="note" title="Cumulatividad: el orden se propaga en cadena">
+En arquitecturas sin *multi-copy atomicity* (como POWER), dos núcleos pueden ver las escrituras de un tercero en órdenes distintos. Las barreras de Linux garantizan **cumulatividad**: si A queda ordenado antes de B por una barrera, y C observa B con la barrera emparejada, entonces C ve también todo lo anterior a A. Esa transitividad es lo que permite encadenar productores y consumidores —el *message passing* de varios saltos— sin sorpresas. El LKMM la formaliza y los tests litmus ISA2 y WWC la verifican.
+</Callout>
+
+<Callout type="dios" title="Una barrera es una arista de happens-before tallada en silicio">
+La revelación de este nivel es que las barreras no van de velocidad: van de **visibilidad**. En un multinúcleo no existe un reloj global ni un "ahora" compartido; cada núcleo tiene su propia línea temporal y su propio orden de los eventos. Una barrera emparejada es el único modo de forzar una arista de *happens-before* que cruce de un núcleo a otro: es la relación de precedencia causal de Lamport, la misma de los sistemas distribuidos, grabada en el juego de instrucciones. Por eso una barrera aislada no significa nada, igual que un mensaje enviado sin nadie que lo reciba no sincroniza dos procesos: hacen falta las dos mitades, emisor y receptor, `smp_wmb` y `smp_rmb`, para tender el puente. Cuando interiorizas que programar concurrencia es **construir un orden parcial de eventos** entre relojes que no comparten tiempo, dejas de memorizar reglas y empiezas a deducirlas. Ese es el salto de sistemas distribuidos que el kernel te obliga a dar dentro de un solo chip.
+</Callout>
+
+<Challenge title="Empareja las dos mitades del contrato">
+1. Arregla tu flag+datos del nivel 18.1 con `smp_wmb`/`smp_rmb` más `READ_ONCE`/`WRITE_ONCE`.
+2. Para cada uno de los cuatro reordenamientos (Carga-Carga, Carga-Escritura, Escritura-Carga, Escritura-Escritura), di qué barrera lo prohíbe.
+3. Abre `arch/x86/include/asm/barrier.h` y `arch/arm64/include/asm/barrier.h` y compara las definiciones de `smp_mb`.
+4. Explica por qué `smp_rmb` es un simple `barrier()` en x86 pero un `dmb` en arm64.
+5. Localiza un par de barreras real en el kernel y señala sus dos mitades con el comentario `pairs with`.
+</Challenge>

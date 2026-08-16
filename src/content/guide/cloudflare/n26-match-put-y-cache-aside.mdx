@@ -1,0 +1,153 @@
+---
+title: "`match` y `put`: el patrón cache-aside"
+description: "Mirar la cache, trabajar solo si falla, guardar el resultado y devolverlo. Los tres pasos del cache-aside en un Worker: por qué `match` devuelve un valor opcional, por qué hay que clonar la `Response` antes de pasarla a `put`, y cómo `ctx.waitUntil` convierte la escritura en un coste invisible para el usuario."
+subject: cloudflare
+level: 26
+order: 2
+position: "26.2"
+duration: "18 min"
+---
+
+<Lead>
+El patrón que gobierna el noventa por ciento del uso serio de la Cache API cabe en una frase: mira la cache, trabaja solo si falla, guarda lo que costó trabajo. Se llama cache-aside porque la cache queda al lado del camino, no en medio: tu código sigue siendo el dueño de la lógica y consulta la cache como quien consulta un apunte propio, en lugar de esconderse detrás de un proxy que decide por él. La forma es engañosamente simple —tres llamadas, un condicional— y por eso mismo concentra una cantidad notable de errores sutiles: cuerpos de respuesta consumidos dos veces, escrituras que bloquean al usuario que ya podría haberse ido, y avalanchas de peticiones idénticas que atraviesan la cache a la vez porque ninguna había llegado todavía a guardarla.
+</Lead>
+
+<Goals>
+
+- Implementar el ciclo completo de cache-aside con `match`, el trabajo real y `put`.
+- Entender por qué el cuerpo de una `Response` se consume y cuándo hay que llamar a `clone`.
+- Usar `ctx.waitUntil` para que la escritura en cache no forme parte de la latencia percibida.
+- Reconocer la estampida de cache y las estrategias razonables para amortiguarla en el edge.
+
+</Goals>
+
+## Los tres pasos y su orden
+
+El ciclo canónico tiene una estructura fija que conviene memorizar como una figura, no como un fragmento de código. Primero se construye la clave —de momento, la propia petición—. Después se pregunta a la cache. Si hay respuesta, se devuelve y ahí termina todo: ni una consulta a la base de datos, ni una subpetición, ni un ciclo de CPU de más. Si no la hay, se hace el trabajo real, se guarda una copia y se entrega el resultado.
+
+```ts
+export default {
+  async fetch(request, env, ctx): Promise<Response> {
+    const cache = caches.default;
+
+    const acierto = await cache.match(request);
+    if (acierto) {
+      return new Response(acierto.body, acierto);
+    }
+
+    const filas = await env.DB.prepare("SELECT * FROM articulos").all();
+    const fresca = new Response(JSON.stringify(filas.results), {
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "public, s-maxage=300",
+      },
+    });
+
+    ctx.waitUntil(cache.put(request, fresca.clone()));
+    return fresca;
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+Ese `new Response(acierto.body, acierto)` del camino de acierto no es adorno: la respuesta que devuelve `match` llega con las cabeceras inmutables, así que si quieres añadir una marca de diagnóstico —un `x-cache` con el valor `HIT`, por ejemplo— necesitas reconstruirla. Devolver el objeto tal cual también es válido cuando no vas a tocar nada.
+
+El orden importa más de lo que parece. La consulta a la cache va antes de cualquier trabajo, incluida la validación de parámetros costosa o la apertura de una conexión; si algo se ejecuta antes del `match`, ese algo lo pagan también las peticiones que iban a acertar, y el ahorro se evapora en silencio. Por la misma razón, la escritura va al final y nunca condiciona lo que se devuelve: una respuesta correcta se entrega aunque el guardado falle.
+
+<Cards>
+  <Card icon="🔍" title="match">
+    Busca por clave en el centro de datos local. Devuelve la respuesta o nada. No lanza excepciones por ausencia: el vacío es un resultado legítimo.
+  </Card>
+  <Card icon="💾" title="put">
+    Guarda una copia consumiendo su cuerpo. Valida método, estado y cabeceras, y rechaza lo que no puede almacenar de forma segura.
+  </Card>
+  <Card icon="🧹" title="delete">
+    Borra la entrada en este emplazamiento y solo aquí. Útil para descartar una copia corrupta; inútil como invalidación global.
+  </Card>
+</Cards>
+
+## Por qué hay que clonar
+
+Una `Response` en el runtime del edge no contiene sus bytes: contiene un flujo, y un flujo se lee una vez. En cuanto `put` empieza a consumir ese cuerpo para almacenarlo, el cuerpo deja de estar disponible para el cliente, y si intentas devolver el mismo objeto obtienes un error de cuerpo ya usado. `clone` resuelve el problema duplicando el flujo en dos ramas que se consumen de forma independiente.
+
+El detalle importante es cuál de las dos ramas entregas a quién. La convención sana es guardar el clon y devolver el original, porque el runtime debe mantener en memoria la diferencia entre la rama más adelantada y la más rezagada: si el cliente lee despacio y la cache lee deprisa, esa diferencia crece. Entregando el original al cliente y el clon a la cache, la escritura marca el ritmo y el consumo se mantiene acotado. Con respuestas pequeñas da igual; con un cuerpo grande y una conexión móvil lenta, no.
+
+Cuando la respuesta la construyes tú a partir de datos que ya tienes en memoria, existe una alternativa más limpia que clonar: fabricar dos respuestas independientes desde la misma cadena o el mismo búfer. No hay flujo compartido, no hay presión de memoria por desincronización, y el código expresa mejor la intención de que son dos objetos con destinos distintos.
+
+```ts
+const cuerpo = JSON.stringify(datos);
+const cabeceras = { "content-type": "application/json", "cache-control": "public, s-maxage=300" };
+
+ctx.waitUntil(cache.put(clave, new Response(cuerpo, { headers: cabeceras })));
+return new Response(cuerpo, { headers: cabeceras });
+```
+
+<Callout type="tip" title="El clon se hace antes, no después">
+`response.clone()` solo funciona si el cuerpo aún está intacto. Clonar después de haber hecho `await response.json()` o `await response.text()` no sirve de nada: el flujo ya se agotó. Si necesitas inspeccionar el contenido y además cachearlo, clona primero y trabaja sobre el clon.
+</Callout>
+
+## `waitUntil`: el guardado no es problema del usuario
+
+Escribir en la cache tarda poco, pero no tarda cero, y ese tiempo cae íntegro dentro de la latencia que percibe quien está esperando la página. No hay ninguna razón para hacerle pagar ese coste: la respuesta ya está construida y es correcta con independencia de si el guardado triunfa o fracasa. Entregar la promesa de `put` a `ctx.waitUntil` es exactamente la herramienta que estudiaste en el nivel de los handlers programados, aplicada aquí a su caso más natural.
+
+```ts
+ctx.waitUntil(
+  cache.put(clave, fresca.clone()).catch((e) => {
+    console.error("no se pudo cachear", e);
+  }),
+);
+```
+
+Ese `catch` merece un comentario. `put` puede rechazar por motivos legítimos —una respuesta con `Set-Cookie`, un 206, un `Vary: *`—, y un rechazo no capturado dentro de `waitUntil` marca la invocación con una excepción aunque el usuario haya recibido su respuesta sin incidencias. Capturarlo y registrarlo convierte un fallo silencioso y ruidoso a la vez en una señal útil: sigues sirviendo bien, y además te enteras de que tu política de cache tiene un agujero.
+
+<Mermaid code={`sequenceDiagram
+  participant C as Cliente
+  participant W as Worker
+  participant K as Cache local
+  participant O as Origen o base de datos
+  C->>W: GET recurso
+  W->>K: match clave
+  K-->>W: vacio
+  W->>O: trabajo real
+  O-->>W: datos
+  W-->>C: Response inmediata
+  W->>K: put del clon en segundo plano`} />
+
+El diagrama deja ver la asimetría que buscamos: la flecha hacia el cliente sale antes que la escritura en cache. El usuario de la petición fallida paga el trabajo real —eso es inevitable— pero no paga además el favor que le está haciendo a los siguientes.
+
+## La estampida y otros fallos del camino frío
+
+Imagina que una entrada expira a mediodía en un centro de datos con mil peticiones por segundo sobre esa URL. Durante los milisegundos que tarda la primera petición en recalcular y guardar, las demás también encuentran la cache vacía y también recalculan. Eso es la estampida —o rebaño atronador—: un pico de carga sobre el origen provocado, paradójicamente, por el éxito de tu cache. Cuanto más popular es el recurso y más caro es generarlo, más daño hace.
+
+En el edge hay tres respuestas razonables y ninguna universal. La primera es delegar en `fetch` con opciones de cache en lugar de gestionar la Cache API a mano, porque el pipeline de Cloudflare agrupa peticiones concurrentes hacia el mismo recurso y evita en buena medida el problema. La segunda es servir contenido caducado mientras se revalida en segundo plano, de modo que ninguna petición espere jamás al recálculo. La tercera, para recursos verdaderamente caros, es serializar la regeneración en un Durable Object que actúe de guardián: solo uno recalcula, los demás esperan o reciben la versión anterior.
+
+La segunda estrategia es la que mejor relación entre esfuerzo y resultado ofrece, y se expresa con muy poco código: se guarda la entrada con una ventana de caducidad tolerada y se refresca por detrás cuando aparece vencida.
+
+```ts
+const acierto = await cache.match(clave);
+
+if (acierto) {
+  const edad = Number(acierto.headers.get("age") ?? "0");
+  if (edad > 300) {
+    ctx.waitUntil(regenerarYGuardar(clave, env, cache));
+  }
+  return acierto; // nadie espera al recalculo
+}
+```
+
+Quien pide recibe siempre una respuesta inmediata; el recálculo ocurre en la vida extendida del evento y sustituye la entrada para los siguientes. Has cambiado latencia por frescura de forma explícita y acotada, que es justo el tipo de compromiso que un sistema serio debe hacer a la vista y no por accidente.
+
+<Callout type="note" title="La estampida es local, y eso ayuda">
+Como cada centro de datos tiene su propia cache, una expiración simultánea en toda la red se traduce en muchas estampidas pequeñas y desacopladas en lugar de una gigantesca contra tu origen. No es una solución, pero sí un amortiguador real: el pico que ve tu base de datos es la suma de picos que ocurren en momentos ligeramente distintos, no un único frente.
+</Callout>
+
+<Callout type="dios" title="El cache-aside no es un truco de rendimiento, es una teoría del trabajo repetido">
+Detrás de esas tres llamadas hay una idea que reaparece en cada capa de la informática, del predictor de saltos del procesador a la memoización de un compilador: el trabajo más barato es el que no se hace, y el segundo más barato es el que se hizo una vez para muchos. Lo que distingue al ingeniero que aplica el patrón del que lo entiende es dónde pone la atención. El principiante mira la tasa de aciertos y celebra los números altos; el que ha sufrido mira el camino frío, porque el comportamiento de un sistema cacheado no lo define lo que ocurre cuando la cache acierta —eso es trivial— sino lo que ocurre cuando falla. Un sistema con un noventa y nueve por ciento de aciertos y un camino frío que tarda ocho segundos y satura la base de datos no es un sistema rápido: es un sistema que va rápido casi siempre y se cae del todo justo cuando más gente lo mira, porque las expiraciones y los despliegues tienden a coincidir precisamente con los picos de tráfico. De ahí que las decisiones interesantes del cache-aside no estén en `match` ni en `put`, sino en las preguntas que rodean al fallo: ¿cuántos pueden fallar a la vez?, ¿qué sirvo mientras recalculo?, ¿es aceptable dar un dato de hace un minuto en lugar de hacer esperar a alguien?, ¿puedo dejar que el primero que llegue pague por todos, o necesito que nadie pague? Esa última pregunta es la que separa el cache-aside ingenuo del diseño maduro, y su respuesta casi siempre pasa por aceptar algo incómodo: preferir un dato ligeramente viejo pero instantáneo a un dato perfecto pero lento. Toda arquitectura de alto rendimiento acaba siendo, en el fondo, una negociación explícita con la obsolescencia; cachear es aprender a negociarla en voz alta en lugar de fingir que no existe.
+</Callout>
+
+<Challenge title="Construye un cache-aside que aguante">
+1. Implementa el ciclo completo sobre una consulta lenta a D1 y mide la diferencia de latencia entre la primera petición y la segunda desde el mismo centro de datos.
+2. Añade una cabecera `x-cache` con los valores `HIT` y `MISS` reconstruyendo la respuesta, y comprueba que la de acierto no admite mutación directa de cabeceras.
+3. Elimina a propósito el `clone` y describe el error exacto que obtienes; después elimina el `waitUntil` y razona qué cambia en la latencia percibida.
+4. Provoca una estampida lanzando doscientas peticiones concurrentes justo tras una expiración y observa cuántas llegan al origen.
+5. Rediseña el mismo endpoint para servir la versión caducada mientras revalida en segundo plano, y explica qué garantía has sacrificado a cambio.
+</Challenge>

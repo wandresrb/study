@@ -1,0 +1,131 @@
+---
+title: "select y poll: readiness que no escala"
+description: "La E/S basada en disponibilidad tal como la ofrecieron las primeras llamadas de multiplexación: select con su fd_set y su límite FD_SETSIZE de 1024, poll con su array de struct pollfd sin ese tope, y la razón estructural por la que ninguna escala: cada llamada es O(n) porque el kernel no recuerda nada entre invocaciones y debes reconstruir e inscribir el conjunto de interés entero cada vez."
+subject: kernel
+level: 39
+order: 2
+position: "39.2"
+duration: "16 min"
+---
+
+<Lead>
+`select` llegó con 4.2BSD en 1983 y `poll` con System V poco después; durante décadas fueron la única forma portable de que un hilo esperase sobre varios descriptores. Ambos entregan lo prometido —te dicen cuáles de tus fds están listos— y ambos comparten el defecto que los condenó a escala grande: cada llamada cuesta O(n) sobre el total de descriptores vigilados, tengas uno activo o diez mil dormidos. Entender por qué ese coste es estructural, y no un detalle de implementación, es entender exactamente qué problema vino a resolver `epoll`.
+</Lead>
+
+<Goals>
+
+- Usar `select` con `fd_set` y `poll` con un array de `struct pollfd`.
+- Conocer el límite `FD_SETSIZE` de 1024 de `select` y por qué `poll` no lo padece.
+- Ver los dos costes O(n): copiar el conjunto en cada llamada y recorrer todos los fds.
+- Comprender que el kernel no recuerda nada entre llamadas: reconstruyes el interés cada vez.
+
+</Goals>
+
+## select: el conjunto de descriptores como mapa de bits
+
+`select` representa el interés con un `fd_set`, un mapa de bits de tamaño fijo `FD_SETSIZE`, que en Linux vale 1024. Manipulas los bits con `FD_ZERO`, `FD_SET`, `FD_CLR` y consultas el resultado con `FD_ISSET`. El primer argumento, `nfds`, es el descriptor más alto más uno: le dice al kernel cuántos bits recorrer.
+
+```c
+/* select: reconstruir el conjunto en CADA iteracion */
+fd_set rset;
+struct timeval tv;
+int maxfd = calcular_max(conns);
+
+for (;;) {
+	FD_ZERO(&rset);
+	for (int i = 0; i < nconns; i++)
+		FD_SET(conns[i].fd, &rset);   /* el kernel destruye el conjunto: hay que rehacerlo */
+
+	tv.tv_sec = 1; tv.tv_usec = 0;    /* Linux tambien reescribe tv: hay que resetearlo */
+
+	int listos = select(maxfd + 1, &rset, NULL, NULL, &tv);
+	if (listos < 0) { if (errno == EINTR) continue; break; }
+
+	for (int i = 0; i < nconns; i++)
+		if (FD_ISSET(conns[i].fd, &rset))   /* recorrer TODOS para hallar los pocos listos */
+			atender(&conns[i]);
+}
+```
+
+`select` arrastra tres trampas. Modifica los conjuntos en el sitio —a la vuelta contienen solo los listos—, así que hay que reconstruirlos en cada iteración; en Linux también reescribe el `timeout` con el tiempo restante, obligando a reponerlo; y sobre todo, un descriptor cuyo número iguale o supere `FD_SETSIZE` desborda el mapa de bits y corrompe la pila, un comportamiento indefinido que ningún casteo arregla. Ese tope de 1024 es una barrera dura contra el propio problema C10k.
+
+## poll: el array de pollfd sin tope fijo
+
+`poll` sustituye el mapa de bits por un array de estructuras, una por descriptor, y con ello elimina el límite de 1024. Cada `struct pollfd` separa lo que pides de lo que recibes: tú rellenas `events`, el kernel rellena `revents`.
+
+```c
+struct pollfd {
+	int   fd;        /* descriptor a vigilar          */
+	short events;    /* lo que pido: POLLIN, POLLOUT   */
+	short revents;   /* lo que el kernel devuelve      */
+};
+```
+
+```c
+/* poll: sin limite de 1024, pero aun pasas y recorres el array entero */
+struct pollfd fds[MAX];
+for (int i = 0; i < nconns; i++) {
+	fds[i].fd     = conns[i].fd;
+	fds[i].events = POLLIN;
+	fds[i].revents = 0;
+}
+
+int listos = poll(fds, nconns, 1000);   /* timeout en milisegundos, no lo reescribe */
+if (listos > 0)
+	for (int i = 0; i < nconns; i++)
+		if (fds[i].revents & POLLIN)       /* de nuevo, recorrer los N para hallar los listos */
+			atender(&conns[i]);
+```
+
+Como `events` y `revents` son campos distintos, no hace falta reconstruir el interés en cada vuelta: basta poner `revents` a cero. Es una mejora ergonómica real sobre `select`, y `poll` distingue además condiciones que `select` mezcla, como `POLLHUP` para el cierre o `POLLERR` para el error. Pero el coste de fondo no cambia: sigues entregando el array completo en cada llamada y sigues recorriéndolo entero a la vuelta.
+
+Tres condiciones de `revents` son de salida pura: no puedes pedirlas en `events`, pero el kernel las entrega y hay que atenderlas. `POLLHUP` señala que el par cerró su extremo, `POLLERR` un error del descriptor y `POLLNVAL` que el fd no es válido, casi siempre un fallo de tu propia contabilidad. Ignorarlas es un error clásico: un socket con `POLLHUP` que solo compruebas contra `POLLIN` se queda vivo para siempre en tu conjunto, girando sin que nadie lo cierre.
+
+## Por qué O(n): el kernel padece amnesia
+
+El defecto es estructural, no de código. Cada llamada a `select` o `poll` paga varios recorridos de longitud `n` sobre el conjunto vigilado. El kernel copia desde espacio de usuario el conjunto entero; recorre los `n` descriptores invocando el `f_op->poll` de cada uno para inscribirse en su cola de espera y leer su disponibilidad; si nada está listo, duerme; al despertar, **vuelve** a recorrer los `n` para ver cuál se activó; copia el resultado de vuelta; y aún te toca a ti recorrer los `n` para encontrar los pocos con `revents`.
+
+```c
+/* fs/select.c, esquema de do_poll: en cada llamada se recorre TODO el conjunto */
+for (;;) {
+	for (i = 0; i < n; i++)
+		mask = vfs_poll(fds[i].file, &table);  /* f_op->poll: inscribe y consulta, O(n) */
+	if (hay_listos || agotado_el_timeout)
+		break;
+	schedule_timeout(...);                     /* duerme; al despertar recorre otra vez */
+}
+poll_freewait(&table);   /* al volver, DESINSCRIBE todo: nada persiste entre llamadas */
+```
+
+La clave está en la última línea: al regresar, `poll_freewait` deshace todas las inscripciones en las colas de espera. El kernel no guarda ninguna memoria de tu conjunto de interés; en la próxima llamada empiezas de cero. Con diez mil descriptores y uno solo activo, realizas del orden de diez mil unidades de trabajo por cada evento útil. El coste escala con **lo que vigilas**, no con **lo que ocurre**, y esa es la definición precisa del muro contra el que chocan `select` y `poll`.
+
+<Mermaid code={`sequenceDiagram
+  participant U as Userspace
+  participant K as Kernel
+  U->>K: poll con N descriptores
+  K->>K: recorre los N e inscribe en cada cola
+  K-->>U: duerme hasta que alguno este listo
+  K->>K: despierta y recorre los N otra vez
+  K-->>U: devuelve el array con revents
+  U->>U: recorre los N buscando los listos
+  Note over U,K: al volver el kernel desinscribe todo`} />
+
+<Callout type="warn" title="El descriptor 1024 es una mina en select">
+Con `select`, abrir muchos fds hace que sus números crezcan, y en cuanto uno alcanza `FD_SETSIZE` el `FD_SET` escribe fuera del `fd_set` y corrompe la pila. No es un error que salte: es comportamiento indefinido silencioso. Redefinir `FD_SETSIZE` no es portable ni fiable. La regla práctica es tajante: si un programa puede superar el millar de descriptores, `select` queda descartado de raíz y se usa `poll` o, mejor, `epoll`.
+</Callout>
+
+<Callout type="info" title="pselect y ppoll: el timeout atómico con señales">
+Existe una variante de cada uno, `pselect` y `ppoll`, que añade un argumento de máscara de señales aplicado de forma atómica durante la espera. Resuelven una carrera clásica: comprobar una bandera puesta por un manejador de señal y luego dormirse en `select` abre una ventana en la que la señal puede colarse justo entre ambos pasos y perderse para siempre. `ppoll` desbloquea las señales solo mientras duerme y las vuelve a bloquear al despertar, cerrando esa ventana. Es exactamente el mismo problema que `signalfd` disuelve por otra vía en el nivel 39.5, convirtiendo la señal en un descriptor legible.
+</Callout>
+
+<Callout type="dios" title="La amnesia del kernel es el precio de una API sin estado">
+Levanta la vista del array de `pollfd` y mira la forma del contrato, porque el coste O(n) no es un fallo de implementación que alguien podría optimizar: es la consecuencia inevitable de un diseño sin estado. `select` y `poll` son funciones puras sobre el conjunto que les pasas: no dejan huella en el kernel, no recuerdan a quién vigilabas la vez anterior, no saben que casi nada ha cambiado desde hace un microsegundo. Cada llamada es una conversación que empieza presentándose de nuevo, describiendo el interés entero como si fuera la primera vez, y el kernel, obediente y desmemoriado, vuelve a inscribirse en las mil colas, vuelve a interrogar los mil descriptores y vuelve a olvidarlo todo al regresar. Ese olvido tiene una virtud —la API es trivial de razonar, sin objetos que crear ni liberar— pero cobra su precio en trabajo redundante proporcional al tamaño del interés, cuando lo único que de verdad ha cambiado es un puñado de fds. La lección profunda es que *el estado que no guarda el kernel lo paga el usuario en cada llamada*, y que la escalabilidad de un sistema de eventos depende de dónde vive la memoria del interés. `epoll` no inventa una forma más rápida de recorrer: mueve la memoria del interés al kernel para no recorrer en absoluto. Cuando entiendas que el enemigo era la amnesia y no la lentitud, la solución del siguiente nivel te parecerá no un truco, sino la única respuesta posible.
+</Callout>
+
+<Challenge title="Toca el muro O(n) con tus manos">
+1. Escribe el bucle de `select` completo y explica las dos cosas que el kernel reescribe en cada llamada y que te obligan a reponer antes de la siguiente.
+2. Reescríbelo con `poll` y argumenta qué reconstrucción te ahorra la separación entre `events` y `revents`.
+3. Provoca en `select` el uso de un descriptor por encima de 1024 y razona por qué el resultado es corrupción de pila y no un error limpio.
+4. Con diez mil conexiones y una sola activa por segundo, calcula cuántas invocaciones a `f_op->poll` ejecuta el kernel por evento útil.
+5. Explica, citando `poll_freewait`, por qué el kernel no puede amortizar el coste entre dos llamadas consecutivas de `poll`.
+</Challenge>

@@ -252,7 +252,7 @@ export default function Palette(props: Props) {
         type="button"
         onClick={show}
         aria-label="Buscar en el sitio"
-        class="inline-flex shrink-0 cursor-pointer items-center gap-2 rounded-full border border-borde bg-crust/60 px-3 py-1.5 font-mono text-sm text-overlay1 transition-colors hover:border-surface1 hover:text-subtext0"
+        class="inline-flex shrink-0 cursor-pointer items-center gap-2 rounded-full border border-line bg-crust/60 px-3 py-1.5 font-mono text-sm text-overlay1 transition-colors hover:border-surface1 hover:text-subtext0"
       >
         <span aria-hidden="true">⌕</span>
         <span class="hidden sm:inline">Buscar</span>
@@ -273,7 +273,7 @@ export default function Palette(props: Props) {
             role="dialog"
             aria-modal="true"
             aria-label="Buscar"
-            class="d-modal-box flex max-h-[70vh] w-full max-w-medida flex-col overflow-hidden border border-overlay0 bg-mantle p-0 shadow-modal"
+            class="d-modal-box flex max-h-[70vh] w-full max-w-measure flex-col overflow-hidden border border-overlay0 bg-mantle p-0 shadow-modal"
           >
             <input
               ref={input}

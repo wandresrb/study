@@ -1,0 +1,162 @@
+---
+title: "Dispositivo perdido y uncapturederror: las dos redes globales"
+description: "Por qué device.lost resuelve en vez de rechazar, por qué un dispositivo perdido nunca se recupera, cómo escribir una inicialización idempotente y qué hacer en el último recurso."
+subject: webgpu
+level: 44
+order: 2
+position: "44.2"
+duration: "18 min"
+---
+
+<Lead>
+Los error scopes cubren lo que tú decides cubrir. Por debajo hay dos mecanismos que no dependen de que te acuerdes de nada: una promesa que se resuelve cuando el dispositivo muere y un evento que dispara cuando un error escapa de todos los scopes abiertos. Son las dos únicas señales que tienes en producción, en la máquina de un usuario que no va a abrir la consola, y las dos se diseñaron con una forma poco intuitiva que hace que la mayoría del código las use mal.
+</Lead>
+
+<Goals>
+
+- Usar `device.lost` sabiendo que resuelve y nunca rechaza, y distinguir sus dos razones.
+- Escribir una inicialización idempotente capaz de recrear todos los recursos tras una pérdida.
+- Provocar una pérdida a propósito para verificar la recuperación sin esperar a que ocurra.
+- Instrumentar `uncapturederror` con limitación de ritmo y clasificación por tipo de error.
+
+</Goals>
+
+## `device.lost` resuelve, no rechaza
+
+`GPUDevice` expone una propiedad `lost` que es una promesa. La primera sorpresa es que esa promesa **se resuelve**, no se rechaza. Perder el dispositivo no es una excepción: es un resultado. La promesa se crea con el dispositivo, se queda pendiente mientras todo va bien, y cuando el dispositivo muere resuelve con un `GPUDeviceLostInfo` que tiene exactamente dos propiedades, `reason` y `message`.
+
+Que resuelva en vez de rechazar tiene una razón práctica y no es capricho. Una promesa rechazada que nadie observa produce un `unhandled rejection` en la consola y, en según qué entornos, en el registro de errores del navegador. La promesa `lost` de un dispositivo que se destruye al cerrar la pestaña se rechazaría en el 100% de las sesiones. Al resolver, el código que no la observa simplemente no se entera, y el que la observa lo hace con un `then` normal.
+
+`reason` solo tiene dos valores posibles:
+
+| `reason` | Cuándo | Qué debes hacer |
+|---|---|---|
+| `"destroyed"` | Has llamado tú a `device.destroy()` | Nada. Es tu propia decisión llegando de vuelta |
+| `"unknown"` | Todo lo demás | Recrear el dispositivo entero |
+
+Ese `"unknown"` es una bolsa deliberadamente opaca, y dentro caben cosas muy distintas: el driver se ha reiniciado tras un cuelgue, el sistema ha cambiado de GPU —el portátil pasa de la integrada a la dedicada, o al revés, al enchufar la corriente—, el sistema operativo ha disparado un TDR porque un compute shader tuyo se pasó del tiempo máximo permitido para una operación, o la plataforma ha decidido soltar el contexto de GPU de una pestaña que llevaba rato en segundo plano. La especificación no te dice cuál de estas es porque la implementación tampoco lo sabe con fiabilidad, y porque tu reacción correcta es la misma en todos los casos. El `message` sí suele traer texto del backend, y merece la pena registrarlo tal cual aunque no lo interpretes.
+
+## Recrear no es recuperar
+
+Aquí está el punto que más código se salta: **un dispositivo perdido no se recupera**. No hay `device.restore()`, no hay reintento, no hay nada que revivir. Todos los objetos creados a partir de ese dispositivo —buffers, texturas, samplers, bind groups, pipelines, módulos de shader, la propia configuración del canvas— quedan muertos con él. Ninguno se puede reutilizar, ni siquiera los que son puramente descriptivos como un `GPUBindGroupLayout`.
+
+Lo que hay que hacer es pedir un dispositivo nuevo con `requestAdapter` y `requestDevice`, y volver a crear absolutamente todo. Y como eso es exactamente lo que hace tu código de arranque, la forma correcta de estructurarlo es una función de inicialización **idempotente**: que se pueda llamar dos veces sin dejar estado sucio, que no dependa de variables inicializadas en la carga del módulo, y que devuelva un conjunto de recursos completamente nuevo.
+
+```ts
+let device: GPUDevice | null = null;
+let recursos: Recursos | null = null;
+let intentos = 0;
+
+async function inicializar(canvas: HTMLCanvasElement): Promise<void> {
+  const adaptador = await navigator.gpu?.requestAdapter();
+  if (!adaptador) throw new Error("sin adaptador WebGPU");
+
+  device = await adaptador.requestDevice({ label: "device-principal" });
+  vigilarPerdida(canvas);
+
+  const contexto = canvas.getContext("webgpu")!;
+  contexto.configure({
+    device,
+    format: navigator.gpu.getPreferredCanvasFormat(),
+    alphaMode: "premultiplied",
+  });
+
+  // Todo, sin excepción: no hay nada del dispositivo anterior que sobreviva.
+  recursos = crearRecursos(device);
+  arrancarBucle(device, contexto, recursos);
+  intentos = 0;
+}
+
+function vigilarPerdida(canvas: HTMLCanvasElement): void {
+  const d = device!;
+  d.lost.then(async (info) => {
+    console.warn(`[webgpu] dispositivo perdido (${info.reason}): ${info.message}`);
+
+    pararBucle();
+    liberarRecursos(recursos);
+    recursos = null;
+    device = null;
+
+    // Lo has matado tú. Rehacerlo sería un bucle infinito.
+    if (info.reason === "destroyed") return;
+
+    if (++intentos > 4) {
+      mostrarFallback("No se ha podido restablecer el acceso a la GPU.");
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 300 * 2 ** intentos));
+    await inicializar(canvas);
+  });
+}
+```
+
+Tres decisiones de ese código merecen justificación. La comprobación de `"destroyed"` es obligatoria: sin ella, llamar a `destroy()` al desmontar el componente dispara una reinicialización que crea un dispositivo que nadie usa. El contador con espera creciente existe porque tras un reinicio de driver `requestAdapter` puede tardar segundos en devolver algo utilizable, y reintentar en bucle apretado durante ese hueco solo consigue agotar los intentos. Y `vigilarPerdida` se registra **antes** de configurar el canvas, porque un dispositivo puede llegar ya perdido y quieres enterarte igual.
+
+Probar esto no requiere esperar a que un usuario tenga un cuelgue de driver. `device.destroy()` produce una pérdida real con razón `"destroyed"`, y aunque tu manejador la ignore por diseño, sirve para verificar que la fase de limpieza funciona: que el bucle para, que los recursos se liberan y que no queda ningún `requestAnimationFrame` vivo llamando a un dispositivo muerto. Para probar el camino completo de recreación, invoca el manejador con una razón sintética:
+
+```ts
+// Solo en desarrollo: fuerza el camino de recuperación completo.
+(globalThis as any).matarGPU = () => {
+  pararBucle();
+  liberarRecursos(recursos);
+  recursos = null;
+  device?.destroy();
+  device = null;
+  inicializar(canvasActual);
+};
+```
+
+Si tras escribir `matarGPU()` en la consola la escena vuelve exactamente igual, con el mismo estado de cámara y el mismo contenido, tienes la recuperación resuelta. Si vuelve con las texturas en negro o la cámara reseteada, tienes acoplamiento entre el estado de la aplicación y el estado de la GPU, que es justo el bug que este ejercicio existe para encontrar.
+
+## `uncapturederror`, la red que lo cubre todo
+
+Cuando un error se genera y ningún scope de la pila coincide con su tipo, sale del sistema de scopes y se dispara un evento `uncapturederror` sobre el dispositivo. El objeto del evento es un `GPUUncapturedErrorEvent` y lo único que necesitas de él es la propiedad `error`, que trae el `GPUError` correspondiente.
+
+```ts
+let emitidos = 0;
+let ventana = 0;
+
+device.addEventListener("uncapturederror", (evento) => {
+  const error = evento.error;
+
+  const ahora = performance.now();
+  if (ahora - ventana > 1000) {
+    ventana = ahora;
+    emitidos = 0;
+  }
+  emitidos += 1;
+  if (emitidos > 5) return;
+  if (emitidos === 5) {
+    console.error("[webgpu] más de 5 errores en un segundo, silenciando el resto");
+    return;
+  }
+
+  const tipo =
+    error instanceof GPUValidationError ? "validation"
+    : error instanceof GPUOutOfMemoryError ? "out-of-memory"
+    : "internal";
+
+  console.error(`[webgpu] ${tipo}: ${error.message}`);
+  telemetria("webgpu_error", { tipo, mensaje: error.message.slice(0, 400) });
+});
+```
+
+La limitación de ritmo no es opcional. Un error de validación dentro del bucle de fotogramas dispara este evento **sesenta veces por segundo**, y sin freno consigues tres cosas malas a la vez: la consola inutilizable, el hilo principal ocupado formateando cadenas, y si además envías telemetría, un usuario generando miles de peticiones por minuto contra tu servidor. Cinco por segundo y un mensaje de corte es un compromiso razonable.
+
+Sobre la telemetría, dos avisos. El primero es que los mensajes de error de WebGPU pueden incluir las etiquetas de tus objetos y fragmentos de código WGSL; si esas cadenas contienen algo sensible, recórtalas o filtra. El segundo es que el mismo bug produce mensajes con texto distinto en Chrome y en Firefox, porque Dawn y wgpu redactan sus diagnósticos por separado, así que agrupar eventos por el texto exacto del mensaje te va a partir cada incidencia en dos. Agrupa por tipo y por etiqueta, no por mensaje.
+
+Y una regla de oro: `uncapturederror` es una red de seguridad, no un mecanismo de control de flujo. No lo uses para decidir si una asignación ha funcionado —para eso están [los error scopes](/guia/webgpu/n44-error-scopes/)—, porque el evento llega de forma asíncrona, sin relación con la llamada que lo causó y sin manera de saber cuál fue.
+
+## Qué mata el dispositivo y qué solo invalida un objeto
+
+Es la distinción que ordena todo lo anterior, y conviene tenerla explícita porque los dos casos se parecen desde fuera: en ambos la pantalla se queda en negro.
+
+Un **error de validación o de memoria** no mata nada. El dispositivo sigue vivo y perfectamente utilizable; lo único que ocurre es que un objeto concreto ha nacido inválido y contagia a todo lo que se construya sobre él. Un buffer de vértices inválido produce una malla que no se dibuja mientras el resto de la escena sigue apareciendo. La recuperación es local: arreglas el descriptor, recreas ese recurso, y ya está. Nadie tiene que reiniciar nada.
+
+Una **pérdida de dispositivo** mata todo. Y su síntoma más traicionero es que no produce errores: las llamadas sobre un dispositivo perdido no lanzan, no generan eventos de `uncapturederror`, y `popErrorScope()` sobre él resuelve a `null`. Tu código sigue ejecutando el bucle de fotogramas, encolando comandos y midiendo tiempos como si tal cosa, y lo único que falla es que en la pantalla no cambia un solo píxel.
+
+De ahí sale una regla de diagnóstico que ahorra mucho tiempo: **si la pantalla se queda congelada y la consola está muda, sospecha del dispositivo antes que del shader**. Un `device.lost.then` que escriba una línea en consola convierte ese silencio en un diagnóstico inmediato, y es la primera línea que hay que poner en cualquier proyecto de WebGPU.
+
+<Callout type="dios" title="requestDevice() puede darte un dispositivo que ya está muerto, y no te lo va a decir">
+Existe una asimetría en el arranque que rompe la intuición de cualquiera que venga de WebGL. `requestAdapter()` sí puede resolver a `null` cuando no hay hardware utilizable, y todo el mundo comprueba eso. Pero `requestDevice()` **no rechaza cuando la creación del dispositivo falla por motivos del sistema**: resuelve con un `GPUDevice` de aspecto normal que ya está perdido, con su promesa `lost` ya resuelta y razón `"unknown"`. La decisión es coherente con el resto del diseño —los fallos de GPU no son excepciones— pero significa que el patrón que todo el mundo escribe, un `try` alrededor de `requestDevice` con un `catch` que muestra el mensaje de «tu navegador no soporta WebGPU», **nunca se ejecuta en el caso que importa**. Lo que ves en su lugar es una aplicación que arranca sin quejarse, crea sus mil recursos sin un solo error, entra en el bucle de fotogramas y pinta negro para siempre. Y como todos esos recursos se crearon sobre un dispositivo muerto, tampoco hay errores de validación que te den una pista: sobre un dispositivo perdido, la validación deja de emitir. La única forma de detectarlo es registrar el manejador de `lost` inmediatamente después de `requestDevice`, antes de crear nada, y tratar una resolución que llega en los primeros milisegundos como lo que es: un fallo de arranque, no una pérdida en caliente. Un truco barato para distinguirlos: guarda `performance.now()` justo después de obtener el dispositivo y compáralo dentro del manejador. Si la pérdida llega antes de que hayas dibujado tu primer fotograma, no reintentes en bucle —muy probablemente vas a obtener el mismo resultado— y cae directamente al camino de WebGL2 o al mensaje al usuario.
+</Callout>

@@ -1,0 +1,159 @@
+---
+title: "Compilar para un microcontrolador: toolchain, enlazador y binario"
+description: "La cadena completa desde el fuente Swift hasta el chip: elegir el triple de destino, las banderas que el modo exige, el guion de enlazado y su mapa de memoria, el punto de entrada real de un firmware, los símbolos de C que hay que aportar y cómo leer el ELF resultante sección por sección para saber dónde se fue cada kilobyte."
+subject: swift
+level: 31
+order: 3
+position: "31.3"
+duration: "21 min"
+---
+
+<Lead>
+Compilar Swift para un microcontrolador tiene poco de místico y mucho de contabilidad. No hay sistema operativo que cargue tu programa, no hay cargador que resuelva símbolos, no hay memoria virtual que oculte dónde acaba la RAM: hay una dirección física donde el procesador empieza a leer al arrancar, y tu trabajo consiste en garantizar que en esa dirección haya exactamente lo que el fabricante del chip prometió. Swift aporta el código y renuncia a casi todo lo demás; el arranque, el mapa de memoria y la colocación de las secciones siguen siendo responsabilidad de la misma cadena de herramientas de C que llevaba treinta años haciéndolo. Entender ese reparto es la diferencia entre un firmware que parpadea y un fichero objeto que nadie sabe dónde poner.
+</Lead>
+
+<Goals>
+
+- Componer la invocación completa del compilador para un objetivo sin sistema operativo.
+- Interpretar un guion de enlazado y explicar cómo se colocan `.text`, `.rodata`, `.data` y `.bss`.
+- Identificar el punto de entrada real de un firmware y qué símbolos de C debe aportar el proyecto.
+- Auditar el ELF resultante con las herramientas de LLVM para atribuir el tamaño a sus causas.
+
+</Goals>
+
+## El toolchain y el objetivo
+
+Hacen falta dos cadenas de herramientas y conviene tenerlo claro desde el principio. La primera es el toolchain de Swift, que compila el fuente y produce un fichero objeto. La segunda es una cadena de C para el mismo destino, que aporta el arranque, la biblioteca de C reducida y, sobre todo, el enlazador. Swift no trae enlazador para bare metal ni pretende traerlo.
+
+El objetivo se declara con un triple que termina en `none-none-eabi`, y esa doble negación es literal: ni proveedor ni sistema operativo. El primer campo fija la arquitectura y con ella el conjunto de instrucciones disponible.
+
+```bash
+# Cortex-M0 y M0+ : Raspberry Pi Pico, muchos STM32 de la serie F0
+swiftc -target armv6m-none-none-eabi \
+       -enable-experimental-feature Embedded \
+       -wmo -Osize \
+       -Xcc -mcpu=cortex-m0plus -Xcc -mfloat-abi=soft \
+       -Xfrontend -function-sections \
+       -c Firmware.swift -o Firmware.o
+```
+
+Cada bandera responde a una necesidad concreta. La característica experimental activa el modo. `-wmo` es obligatorio porque sin él no hay especialización total. `-Osize` prioriza el tamaño sobre la velocidad, que en flash es casi siempre el compromiso correcto. Las banderas que empiezan por `-Xcc` viajan al clang que Swift usa por debajo para procesar las cabeceras de C y deben coincidir exactamente con las que use tu proyecto de C, o el enlazador se quejará de ABI incompatible. Y `-function-sections` coloca cada función en su propia sección para que el enlazador pueda descartar las que nadie llama.
+
+Para RISC-V de 32 bits, que es el terreno del ESP32-C6 y compañía, el triple cambia y el resto del razonamiento no.
+
+```bash
+swiftc -target riscv32-none-none-eabi \
+       -enable-experimental-feature Embedded \
+       -wmo -Osize \
+       -Xcc -march=rv32imac -Xcc -mabi=ilp32 \
+       -c Firmware.swift -o Firmware.o
+```
+
+<Callout type="tip" title="Con paquetes, la misma idea en otro sitio">
+Si organizas el proyecto con Swift Package Manager, las mismas banderas viven en el manifiesto, dentro de `swiftSettings`, combinando `enableExperimentalFeature` con `unsafeFlags`. El resultado es idéntico y la ventaja es que el módulo compartido con la aplicación puede declararse una sola vez y compilarse con dos configuraciones distintas. La integración con las herramientas del fabricante suele hacerse desde CMake, invocando al compilador de Swift como un paso más y entregando el objeto al enlazador del SDK.
+</Callout>
+
+## El enlazador manda
+
+El fichero objeto que sale de Swift no sabe nada de direcciones. Quien decide dónde va cada cosa es el guion de enlazado, y ese guion es el documento más importante del proyecto porque codifica el mapa de memoria físico del chip.
+
+```
+MEMORY {
+  FLASH (rx)  : ORIGIN = 0x10000000, LENGTH = 2048K
+  RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 264K
+}
+
+SECTIONS {
+  .vectors : { KEEP(*(.vectors)) } > FLASH
+  .text    : { *(.text*) *(.rodata*) } > FLASH
+  .data    : { *(.data*) } > RAM AT> FLASH
+  .bss     : { *(.bss*) *(COMMON) } > RAM
+}
+```
+
+La lectura de ese fragmento explica media asignatura. El código y las constantes van a flash, que es memoria de solo lectura durante la ejecución. Las variables globales con valor inicial distinto de cero viven en RAM pero su contenido inicial tiene que estar grabado en flash, y de ahí viene el `AT>`: la sección tiene una dirección de ejecución en RAM y otra de carga en flash. Las variables que empiezan a cero no ocupan flash en absoluto, solo reservan RAM. Y la tabla de vectores se marca con `KEEP` porque nadie la llama desde el código y sin esa marca el recolector de secciones muertas la eliminaría, dejando un chip que arranca leyendo basura.
+
+El arranque no lo escribe Swift. Al energizarse, el procesador lee la primera entrada de la tabla de vectores para inicializar el puntero de pila y la segunda para saltar al manejador de reinicio, que es una rutina en C o en ensamblador que copia `.data` de flash a RAM, pone `.bss` a cero, configura el reloj y solo entonces llama a `main`.
+
+```swift
+@_cdecl("main")
+func main() -> Int32 {
+    configurarReloj()
+    let led = Pin(numero: 25).comoSalida()
+    while true {
+        led.alternar()
+        esperar(ms: 500)
+    }
+}
+```
+
+El atributo `@_cdecl` es la pieza que cierra el círculo: obliga a que el símbolo se exporte sin decorar, con el nombre exacto y la convención de llamada de C, que es lo que el arranque espera encontrar. Sin él, el nombre del símbolo estaría decorado con la codificación de Swift y el enlazador no lo encontraría jamás.
+
+<Cards>
+  <Card icon="🧭" title="Triple">
+    Arquitectura sin sistema operativo. Decide instrucciones, ABI y qué asume el compilador.
+  </Card>
+  <Card icon="🗺️" title="Guion">
+    Regiones de memoria y colocación de secciones. Es el mapa físico del chip escrito en texto.
+  </Card>
+  <Card icon="🚀" title="Arranque">
+    Tabla de vectores, copia de datos, puesta a cero y salto. Todo en C, antes de que Swift respire.
+  </Card>
+</Cards>
+
+## Los símbolos que hay que aportar
+
+Embedded Swift no depende de una biblioteca de C completa, pero tampoco flota en el vacío. Hay un puñado de símbolos que el código generado puede pedir y que alguien debe proporcionar, normalmente una biblioteca de C reducida como picolibc o newlib, o bien implementaciones propias.
+
+Las funciones de memoria elementales, copiar y rellenar bloques, las emite el compilador como llamadas y hacen falta siempre. El asignador dinámico hace falta **solo si asignas**, y ahí está la decisión de diseño más importante del firmware: instanciar una clase, hacer crecer un `Array`, capturar en un cierre que escapa o construir un existencial ligado a clase requieren montículo. Si te propones escribir firmware sin asignación dinámica, el conjunto de herramientas es amplio —estructuras, tuplas, enumerados, búferes sobre almacenamiento estático— y la recompensa es que el enlazador nunca te pedirá un asignador.
+
+<Callout type="warn" title="El asignador que se cuela sin avisar">
+El caso clásico es una función que devuelve un `Array` construido al vuelo, o una cadena interpolada dentro de un mensaje de traza. El código parece inocente y arrastra al enlazador la petición de un montículo entero. Cuando el mapa muestre un asignador que no esperabas, busca el camino de llamadas hacia atrás desde su símbolo: casi siempre hay una sola línea culpable.
+</Callout>
+
+<Mermaid code={`flowchart TB
+  a[Firmware.swift]
+  b[Arranque y SDK en C]
+  a -->|swiftc modo embebido| c[Firmware.o]
+  b -->|clang o gcc| d[startup.o y libc reducida]
+  c --> e[Enlazador con guion y gc-sections]
+  d --> e
+  e --> f[firmware.elf con secciones y simbolos]
+  f -->|objcopy| g[firmware.bin o uf2]
+  f -->|llvm-size y mapa| h[Auditoria de tamano]
+  g --> i[Grabar por probe-rs u openocd]`} />
+
+## Leer el binario
+
+El ELF resultante se audita con las mismas herramientas que se usan para C, y esa continuidad es una de las ventajas prácticas del enfoque. La primera pregunta siempre es cómo se reparte el tamaño entre las secciones.
+
+```bash
+llvm-size -A firmware.elf                 # bytes por seccion
+llvm-nm --size-sort --print-size firmware.elf | tail -30
+llvm-objdump -d --demangle firmware.elf | less
+```
+
+La segunda pregunta es qué símbolo concreto se comió el flash, y ahí aparece la particularidad de Swift: los nombres van decorados con una codificación que incluye módulo, tipo y firma. Los símbolos que empiezan por el prefijo de Swift se descodifican con `swift demangle`, y cuando aparecen varios nombres que solo difieren en el tipo del parámetro genérico estás viendo la especialización con sus propios ojos: un cuerpo por instanciación, tal como el modo prometió.
+
+La tercera pregunta la responde el mapa del enlazador, que se pide con `-Wl,-Map=firmware.map` y que explica no solo cuánto ocupa cada objeto sino **por qué** entró en el binario: qué referencia lo trajo. Es la herramienta definitiva cuando algo pesa y no se sabe quién lo llamó.
+
+```bash
+llvm-objcopy -O binary firmware.elf firmware.bin
+probe-rs download --chip RP2040 firmware.elf
+```
+
+<Callout type="dios" title="El binario no miente y esa es la lección">
+Trabajar en modo embebido cambia una relación que en el escritorio está rota: la que hay entre lo que escribes y lo que se ejecuta. En una aplicación normal el binario es un objeto opaco de decenas de megabytes que nadie inspecciona, el compilador puede permitirse ser generoso porque nadie audita su generosidad, y el programador razona sobre el fuente como si el fuente fuese el programa. En un microcontrolador el binario es pequeño, está entero delante de ti, se puede desensamblar en una tarde y cada byte tiene un dueño identificable por su símbolo. Esa transparencia tiene un efecto pedagógico que ninguna documentación consigue: cuando una línea de Swift aparentemente inofensiva multiplica por tres el tamaño de una sección, la relación entre abstracción y coste deja de ser una creencia y pasa a ser una medición reproducible. Aprendes que un genérico usado con seis tipos son seis cuerpos porque los cuentas en el mapa, no porque alguien te lo dijera. Aprendes qué construcciones exigen montículo porque el enlazador se niega a terminar sin un asignador, no porque lo leyeras en una guía. Y aprendes, sobre todo, que el enlazador es el único componente de la cadena que tiene la imagen completa del programa y por tanto el único que puede responder honestamente a la pregunta de qué has construido en realidad. Quien adquiere el hábito de leer mapas de enlazado no lo pierde al volver al escritorio: simplemente descubre que allí también había respuestas disponibles y que nadie se molestaba en pedirlas.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+Se necesitan dos cadenas: la de Swift para compilar y la de C para arrancar y enlazar. El triple termina en `none-none-eabi` y las banderas `-Xcc` deben coincidir con las del proyecto de C. El guion de enlazado define las regiones y coloca `.text` y `.rodata` en flash, `.data` en RAM con carga desde flash y `.bss` en RAM sin ocupar flash. El punto de entrada se expone con `@_cdecl`. El montículo solo hace falta si asignas. El ELF se audita con `llvm-size`, `llvm-nm`, `llvm-objdump` y el mapa del enlazador.
+</Callout>
+
+<Challenge title="Del fuente al chip, contando bytes">
+1. Compila el mismo fuente con `-Osize` y con `-O` y compara sección por sección con `llvm-size -A`.
+2. Añade una interpolación de cadena en una función de traza y localiza en el mapa qué símbolos nuevos aparecieron.
+3. Elimina toda asignación dinámica de un programa pequeño y comprueba que el enlazador ya no reclama un asignador.
+4. Descodifica los diez símbolos más grandes del binario y clasifica cuántos son instanciaciones distintas del mismo genérico.
+5. Modifica el guion de enlazado para reducir la región de RAM a la mitad y explica qué error produce el enlazador y por qué.
+</Challenge>

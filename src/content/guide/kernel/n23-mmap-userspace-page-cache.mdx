@@ -1,0 +1,139 @@
+---
+title: "mmap desde userspace: del syscall al page cache"
+description: "mmap es el syscall que hay detrás de malloc, las librerías compartidas y la E/S sin copias. Desde userspace es una línea; dentro, el kernel casi no hace nada: solo registra la intención creando una VMA. Recorremos do_mmap y mmap_region, la diferencia entre mapeo anónimo y de fichero, y cómo el mapeo de fichero se enlaza con el page cache."
+subject: kernel
+level: 23
+order: 2
+position: "23.2"
+duration: "16 min"
+---
+
+<Lead>
+`mmap` es uno de los syscalls más versátiles de Unix: sostiene `malloc`, la carga de ejecutables y librerías, la memoria compartida y la E/S sin copias. Desde userspace es una sola llamada. Y lo sorprendente es lo poco que hace el kernel al recibirla: no reserva memoria física, no lee del disco, no toca una sola página. Solo anota la intención en una VMA nueva y vuelve. Todo el trabajo real se aplaza al primer acceso.
+</Lead>
+
+<Goals>
+
+- Seguir el camino de `mmap` desde el syscall hasta `mmap_region`.
+- Distinguir el mapeo anónimo del respaldado por fichero.
+- Entender que `mmap` no asigna memoria física: solo crea una VMA.
+- Ligar el mapeo de fichero con el page cache y `address_space`.
+
+</Goals>
+
+## El syscall que no mueve memoria
+
+La firma de `mmap` combina cuatro decisiones: dónde (`addr`, casi siempre `NULL` para que elija el kernel), cuánto (`length`), con qué permisos (`prot`) y de qué tipo (`flags`, más `fd` y `offset` si hay fichero).
+
+```c
+void *addr = mmap(NULL, length,
+                  PROT_READ | PROT_WRITE,       /* -> vm_page_prot / VM_* */
+                  MAP_PRIVATE | MAP_ANONYMOUS,  /* privado, sin fichero */
+                  -1, 0);
+```
+
+Dentro del kernel, el camino es directo: `sys_mmap` deriva en `ksys_mmap_pgoff`, que llama a `vm_mmap_pgoff`, y este a `do_mmap`, que termina en `mmap_region`. La secuencia es: traducir `prot` y `flags` a `vm_flags`, buscar un hueco libre en el espacio (`get_unmapped_area`, que recorre el maple tree del nivel 23.1 buscando una brecha), crear la VMA —o **fusionarla** con una adyacente compatible— e insertarla en el árbol. Ni una página física se asigna aquí.
+
+```c
+/* do_mmap traduce los flags de usuario a flags de VMA (mm/mmap.c) */
+vm_flags |= calc_vm_prot_bits(prot, pkey) |    /* PROT_* -> VM_READ/WRITE/EXEC */
+            calc_vm_flag_bits(file, flags) |    /* MAP_* -> VM_SHARED, etc. */
+            mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+```
+
+## Anónimo frente a fichero
+
+El valor de `fd` bifurca el comportamiento en dos grandes familias, que estudiaremos en detalle en el nivel 23.5.
+
+<Cards>
+  <Card icon="🕳️" title="Anónimo: MAP_ANONYMOUS">
+    `vm_file` queda a `NULL`. No hay respaldo en disco; las páginas se rellenan a ceros bajo demanda y, si hay presión, van al swap. Es la materia prima del heap y las pilas.
+  </Card>
+  <Card icon="📄" title="Fichero: fd válido">
+    `vm_file` apunta al `struct file`. El contenido se toma del fichero a través del page cache. Es como se cargan ejecutables, librerías y como se hace E/S mapeada.
+  </Card>
+</Cards>
+
+Para un mapeo de fichero, `do_mmap` invoca `call_mmap`, que llama al método del sistema de ficheros:
+
+```c
+/* call_mmap termina llamando al f_op del fichero */
+static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	return file->f_op->mmap(file, vma);
+}
+```
+
+Un sistema de ficheros típico apenas hace dos cosas en su `.mmap`: fija `vma->vm_ops` con sus callbacks de fallo y comprueba que el modo de mapeo es compatible. Para un fichero regular, ese `vm_ops` es `generic_file_vm_ops`, cuyo `.fault` es `filemap_fault`: el nexo con el page cache.
+
+```c
+/* fs/ext4/file.c: el .mmap de ext4 es minimalista */
+static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	/* ...comprobaciones de DAX y journal... */
+	vma->vm_ops = &ext4_file_vm_ops;   /* instala .fault, .page_mkwrite... */
+	return 0;
+}
+```
+
+## El page cache: la memoria de un fichero
+
+Aquí está la pieza clave. Cuando mapeas un fichero, las páginas de tu VMA no son copias privadas: son las páginas del **page cache**, la caché unificada donde el kernel guarda en RAM el contenido de los ficheros. Cada inodo abierto tiene un `struct address_space` (`file->f_mapping`) que indexa sus folios de página en un **XArray** (`i_pages`), ordenados por su desplazamiento en el fichero.
+
+```c
+struct address_space {
+	struct inode        *host;      /* el inodo dueno */
+	struct xarray       i_pages;    /* folios cacheados, indexados por pgoff */
+	const struct address_space_operations *a_ops; /* readpage, writepage... */
+	unsigned long       nrpages;    /* folios residentes ahora mismo */
+	/* ... */
+};
+```
+
+La correspondencia es aritmética: una dirección virtual `addr` dentro de la VMA cae en el folio del page cache con índice `vma->vm_pgoff + (addr - vma->vm_start) / PAGE_SIZE`. Cuando dos procesos mapean el mismo fichero, sus VMAs distintas apuntan a los **mismos** folios del page cache. Por eso mapear `libc.so` cien veces no gasta cien copias de RAM: hay una sola, compartida, y de ahí que las librerías compartidas lo sean de verdad.
+
+<Mermaid code={`flowchart LR
+  P1[Proceso A: VMA vm_pgoff 0] --> PC[page cache: address_space i_pages]
+  P2[Proceso B: VMA vm_pgoff 0] --> PC
+  PC --> F1[folio indice 0]
+  PC --> F2[folio indice 1]
+  F1 --> D[bloque en disco via a_ops readahead]
+  class PC t-blue
+  class D t-yellow`} />
+
+Este es también el mecanismo de la E/S sin copias: leer un fichero con `read` copia del page cache a un buffer de usuario; mapearlo con `mmap` **elimina** esa copia, porque el proceso lee directamente de las páginas del cache mapeadas en su espacio. El precio es que la primera lectura de cada página provocará un fallo (nivel 23.3) que traerá el bloque del disco.
+
+<Callout type="info" title="El futuro: mmap_prepare en lugar de mmap">
+El hook clásico `f_op->mmap` recibe la VMA ya construida y puede manipularla de formas peligrosas. En kernels recientes se está migrando hacia `f_op->mmap_prepare`, que recibe un descriptor `struct vm_area_desc` **antes** de crear la VMA, restringiendo lo que un driver o sistema de ficheros puede cambiar y cerrando toda una clase de errores. Si escribes código nuevo en Linux 7.x, comprueba cuál de los dos hooks espera tu subsistema.
+</Callout>
+
+## munmap y la vida de la VMA
+
+`munmap` es la operación inversa: quita un rango del espacio. Y aquí es donde el maple tree del nivel 23.1 se gana el sueldo, porque desmapear no siempre borra una VMA entera. Si el rango cae en **medio** de una VMA, hay que **partirla** en dos; si un `mmap` nuevo queda pegado a una VMA existente con flags idénticos y continuidad de `vm_pgoff`, el kernel las **fusiona** en una sola para no inflar `map_count`.
+
+```c
+/* munmap: quita las PTE del rango y parte o borra VMAs (mm/vma.c) */
+int do_vmi_munmap(struct vma_iterator *vmi, struct mm_struct *mm,
+                  unsigned long start, size_t len,
+                  struct list_head *uf, bool unlock);
+```
+
+El trabajo interno es doble: se derriban las entradas de tabla de páginas del rango (`unmap_region`, que libera los folios cuyo refcount cae a cero) y se ajusta el árbol de VMAs, partiendo o eliminando según toque. Desde userspace no ves nada de esa cirugía:
+
+```c
+munmap(addr, length);   /* libera PTE; parte, funde o borra VMAs segun el caso */
+```
+
+Esta fusión automática es la razón de que `map_count` se mantenga modesto aunque un proceso haga miles de `mmap` contiguos: el kernel colapsa lo colindante y compatible en una sola VMA. Cuando ves un proceso con cientos de VMAs en `/proc/PID/maps`, cada una representa una discontinuidad real de permisos o de respaldo que impidió la fusión.
+
+<Callout type="dios" title="mmap disuelve la frontera entre memoria y almacenamiento">
+La revelación de este nivel es que `mmap` no es una función de memoria ni de ficheros: es el punto donde ambas dejan de ser cosas distintas. Un fichero, para el kernel moderno, no es "datos en el disco": es un `address_space`, un conjunto de folios que residen en RAM cuando hacen falta y se respaldan en disco cuando sobran. `read` y `write` acceden a ese conjunto copiando; `mmap` accede al mismo conjunto mapeándolo directo en el espacio del proceso. Son dos ventanas a la misma caché. De ahí brota una idea que reorganiza la manera de pensar los sistemas: la memoria virtual **es** una capa de caché sobre el almacenamiento, y el page cache es su corazón. La página que tu proceso toca al desreferenciar un puntero mapeado y el bloque que el disco entregó son, tras el primer fallo, el mismo objeto físico en RAM. Cuando ves esta unidad, entiendes de golpe por qué las librerías compartidas ahorran memoria, por qué `mmap` da E/S sin copias, por qué un fichero muy leído es rapidísimo aunque viva en un disco lento, y por qué el kernel gasta con gusto casi toda la RAM libre en cachear ficheros: no la está desperdiciando, la está usando como lo que es, el nivel rápido de una jerarquía de almacenamiento. `mmap` es la costura invisible que cose esa jerarquía en una sola tela.
+</Callout>
+
+<Challenge title="Comparte una página entre dos procesos">
+1. Traza con `strace` el `mmap` que hace tu `malloc` para una petición grande e identifica los flags `MAP_PRIVATE | MAP_ANONYMOUS`.
+2. Mapea un mismo fichero desde dos procesos con `MAP_SHARED`, escribe desde uno y verifica que el otro ve el cambio; explica por qué comparten folios del page cache.
+3. Sigue en el fuente la cadena `sys_mmap` hasta `mmap_region` y localiza dónde se llama a `call_mmap` solo para mapeos de fichero.
+4. Explica la relación `vma->vm_pgoff` con el índice del folio en `address_space->i_pages`.
+5. Argumenta por qué `mmap` de un fichero da E/S sin copias frente a `read`, y qué coste se paga en el primer acceso.
+</Challenge>

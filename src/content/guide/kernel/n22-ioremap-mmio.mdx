@@ -1,0 +1,136 @@
+---
+title: "ioremap y MMIO: mapear registros de dispositivo al kernel"
+description: "Cómo ioremap trae los registros de un dispositivo (MMIO) al espacio de direcciones del kernel, por qué el mapeo es no cacheable, y por qué se accede con readl/writel en lugar de desreferenciar el puntero: anotación __iomem, orden de barreras, ancho de acceso exacto y endianness."
+subject: kernel
+level: 22
+order: 4
+position: "22.4"
+duration: "16 min"
+---
+
+<Lead>
+Un dispositivo expone sus registros como direcciones físicas: escribir en cierta dirección arranca una transferencia, leer de otra devuelve un estado. Eso es MMIO, memoria mapeada de entrada/salida. Para tocarlo desde el kernel hay que traerlo al espacio virtual con `ioremap`, y luego —esto es lo crucial— accederlo con `readl`/`writel`, nunca desreferenciando el puntero. Esas rutinas no son una formalidad: son la frontera entre la abstracción de «memoria» y un dispositivo físico.
+</Lead>
+
+<Goals>
+
+- Mapear un rango MMIO al kernel con `ioremap` y sus variantes `devm_`.
+- Entender por qué el mapeo MMIO es no cacheable y qué significa el tipo `__iomem`.
+- Justificar por qué `readl`/`writel` son obligatorios frente a desreferenciar.
+- Conocer las barreras, el ancho de acceso y la endianness que los accesores garantizan.
+
+</Goals>
+
+## De la dirección física al puntero __iomem
+
+Los registros de un dispositivo viven en el espacio de direcciones físicas, típicamente detrás de un BAR de PCI (nivel 30). No están en la RAM ni en el direct map, así que el kernel no tiene una vista previa de ellos: hay que **mapearlos explícitamente** en la zona vmalloc/ioremap. `ioremap` construye las tablas de páginas para ese rango físico y devuelve un cookie del tipo `void __iomem *`:
+
+```c
+#include <linux/io.h>
+
+void __iomem *ioremap(phys_addr_t phys, size_t size);   /* mapeo no cacheable */
+void __iomem *ioremap_wc(phys_addr_t phys, size_t size); /* write-combining (framebuffers) */
+void iounmap(void __iomem *addr);
+```
+
+En un driver real casi nunca llamas a `ioremap` a pelo: usas las variantes gestionadas, que liberan el mapeo solas al desligarse el dispositivo y evitan fugas:
+
+```c
+struct resource *res;
+void __iomem *regs;
+
+res  = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+regs = devm_ioremap_resource(&pdev->dev, res);  /* mapea y libera con el device */
+if (IS_ERR(regs))
+	return PTR_ERR(regs);
+```
+
+El mapeo es **no cacheable** por decreto: si la CPU cacheara un registro de estado, leería un valor rancio de caché en lugar de preguntarle al dispositivo, y una escritura podría quedarse en caché sin llegar nunca al hardware. MMIO parece memoria, pero no lo es: cada acceso tiene que viajar hasta el dispositivo.
+
+## Por qué readl y writel, y no un puntero
+
+La tentación es tratar `regs` como un `u32 *` y escribir `*(regs + off) = val`. Está mal por cinco razones simultáneas, y por eso el tipo `__iomem` existe: para que `sparse` (nivel 9) marque como error cualquier desreferencia directa.
+
+```c
+#define REG_STATUS  0x00
+#define REG_CTRL    0x04
+#define CMD_START   BIT(0)
+
+u32 st = readl(regs + REG_STATUS);   /* correcto */
+writel(CMD_START, regs + REG_CTRL);  /* correcto */
+
+/* u32 st = *(volatile u32 *)(regs + REG_STATUS);   PROHIBIDO: sparse lo delata */
+```
+
+<Cards>
+  <Card icon="🔒" title="Tipo y sparse">
+    `__iomem` marca el puntero como «espacio de E/S». `sparse` prohíbe mezclarlo con punteros normales y desreferenciarlo: obliga a pasar por los accesores.
+  </Card>
+  <Card icon="🔀" title="Endianness">
+    `readl`/`writel` convierten a little-endian (`le32_to_cpu`). Los registros PCI son LE; el accesor hace que el driver funcione igual en un host big-endian.
+  </Card>
+  <Card icon="🧱" title="Barreras">
+    Incluyen las barreras que ordenan el MMIO frente a la memoria normal y frente a otros accesos MMIO. En arm64 eso es imprescindible; un `volatile` desnudo no las emite.
+  </Card>
+  <Card icon="📏" title="Ancho exacto">
+    Garantizan una única instrucción del ancho pedido. El compilador podría partir o fusionar un acceso normal; a un registro de 32 bits eso lo rompe.
+  </Card>
+</Cards>
+
+El quinto motivo engloba a los demás: `volatile` calla al compilador, pero **no le dice nada a la CPU**. En una arquitectura de orden débil como arm64, el hardware puede reordenar tus accesos MMIO entre sí o frente a la memoria normal. `readl` y `writel` llevan dentro las barreras justas (grosso modo, `writel` ordena antes de escribir y `readl` ordena después de leer) para que la secuencia «prepara el búfer, luego lanza el comando» llegue al dispositivo en ese orden y no al revés.
+
+## La familia de accesores
+
+Hay un accesor por ancho, y variantes según el compromiso entre orden y velocidad:
+
+```c
+u8  readb(a);   u16 readw(a);   u32 readl(a);   u64 readq(a);
+void writeb(v,a); void writew(v,a); void writel(v,a); void writeq(v,a);
+
+u32 v = readl_relaxed(a);   /* sin barreras: mas rapido, tu ordenas a mano */
+u32 b = ioread32be(a);      /* registro big-endian explicito */
+```
+
+Las variantes `_relaxed` omiten las barreras: sirven en ráfagas donde tú garantizas el orden con una barrera explícita al final, evitando pagar una por acceso. `ioread32`/`iowrite32` son un peldaño más abstracto: aceptan tanto MMIO como el viejo espacio de puertos (`inb`/`outb`) de x86, hoy casi extinto frente al MMIO.
+
+Un patrón que conviene tener grabado es el ciclo leer-modificar-escribir sobre un registro de bits, omnipresente al configurar hardware:
+
+```c
+u32 v = readl(regs + REG_CTRL);
+v &= ~CTRL_MASK;        /* limpia el campo */
+v |= CTRL_MODE_FAST;    /* fija el nuevo valor */
+writel(v, regs + REG_CTRL);
+```
+
+Nada de esto es atómico frente a otro núcleo ni frente al propio dispositivo: si dos hilos tocan el mismo registro necesitas un lock (nivel 15). `readl`/`writel` ordenan y estrechan cada acceso, pero no serializan la secuencia.
+
+<Callout type="warn" title="Las escrituras MMIO son posted: lee de vuelta para confirmar">
+`writel` es *posted*: la escritura se lanza al bus y la CPU sigue sin esperar a que el dispositivo la haya visto. Si necesitas certeza de que un registro ya está escrito —por ejemplo, antes de dormir esperando una interrupción— haz una **lectura de vuelta** de un registro del mismo dispositivo: la lectura no puede completarse hasta que el bus haya drenado la escritura previa. Este `readl` de confirmación es un patrón universal en los drivers. (El antiguo `mmiowb`, que forzaba el orden de escrituras MMIO entre CPUs, se plegó dentro de `spin_unlock` y ya no se escribe a mano.)
+</Callout>
+
+<Callout type="info" title="ioremap no es para la RAM">
+`ioremap` mapea física que **no** es RAM del sistema: registros, framebuffers, memoria de dispositivo. Nunca lo uses para acceder a RAM normal —para eso está el direct map, ya mapeado— ni para volver «cacheable» un búfer. Y a la inversa: nunca accedas a un rango MMIO a través del direct map con `phys_to_virt`, porque ese camino es cacheable y romperá la semántica del dispositivo. Cada tipo de memoria tiene su ruta y mezclarlas corrompe silenciosamente el estado del hardware.
+</Callout>
+
+## Cachés, write-combining y el viejo espacio de puertos
+
+`ioremap` a secas produce un mapeo **fuertemente no cacheable** (`UC`): cada acceso llega al dispositivo en orden y sin fusionarse, que es justo lo que quieren los registros de control. Pero para memoria de dispositivo que se comporta *como* RAM —un framebuffer, un búfer de una GPU— esa política es lenta: cada píxel escrito sería una transacción de bus. Para eso está `ioremap_wc`, que pide un mapeo **write-combining**: la CPU acumula escrituras contiguas en un búfer y las vuelca en ráfagas grandes, multiplicando el ancho de banda a cambio de perder el orden estricto. Elegir entre `ioremap` e `ioremap_wc` es elegir entre orden y rendimiento según qué haya detrás de la dirección.
+
+```c
+void __iomem *fb  = ioremap_wc(bar_phys, bar_len);   /* framebuffer: rafagas */
+void __iomem *reg = ioremap(ctrl_phys, ctrl_len);    /* registros: UC estricto */
+```
+
+Y queda un vestigio histórico: el **espacio de puertos** de x86, accedido con `inb`/`outb` sobre un espacio de E/S separado de la memoria, herencia del PC de IBM. Casi todo el hardware moderno expone sus registros por MMIO y no por puertos, pero los accesores portables `ioread32`/`iowrite32` abstraen ambos, de modo que un mismo driver funcione tanto si el recurso es MMIO como si es un puerto legado. En arquitecturas sin espacio de puertos, este se emula sobre una ventana MMIO fija.
+
+<Callout type="dios" title="readl es una declaración de que esto no es memoria">
+Aquí está el vuelco conceptual del nivel. `readl(regs)` **parece** una carga de memoria, pero no lo es: es un mensaje enviado a un dispositivo físico que puede tener efectos secundarios —vaciar una FIFO, reconocer una interrupción, disparar una transferencia— por el mero hecho de ser leído. Todas las triquiñuelas que vuelven rápida a la RAM son aquí veneno: la caché serviría datos rancios, la especulación lanzaría comandos fantasma, la fusión de accesos convertiría dos escrituras de registro en una, el reordenamiento lanzaría el comando antes de preparar los datos. El accesor `readl`/`writel` es la aduana entre dos mundos que comparten el mismo tipo `void *` pero obedecen físicas opuestas: el mundo von Neumann de la memoria, donde leer no tiene consecuencias y el orden da igual, y el mundo de los dispositivos, donde cada acceso es un acto y su orden es la diferencia entre un driver correcto y uno que corrompe el hardware. Cuando escribes `readl` no estás leyendo una variable: estás cruzando esa frontera con los papeles en regla.
+</Callout>
+
+<Challenge title="Habla con un dispositivo de mentira">
+1. En QEMU añade un dispositivo `edu` (`-device edu`) y escribe un driver PCI que mapee su BAR 0 con `pcim_iomap_regions`.
+2. Lee el registro de identificación con `readl` y verifica el valor mágico esperado; provoca deliberadamente el error de `sparse` desreferenciando el puntero y observa el aviso.
+3. Escribe el registro de cómputo factorial del `edu` con `writel` y sondea el bit de estado con `readl` hasta que termine.
+4. Sustituye una ráfaga de accesos por sus variantes `_relaxed` con una barrera al final y razona por qué sigue siendo correcto en arm64.
+5. Explica por qué una lectura de vuelta confirma una escritura *posted* y cuándo lo necesitas de verdad.
+</Challenge>

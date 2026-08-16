@@ -1,0 +1,127 @@
+---
+title: "workgroupBarrier y storageBarrier: qué garantiza cada una"
+description: "Las dos barreras de WGSL, la diferencia entre sincronizar ejecución y publicar memoria, y el requisito de control de flujo uniforme."
+subject: webgpu
+level: 32
+order: 2
+position: "32.2"
+duration: "20 min"
+---
+
+<Lead>
+Una barrera hace dos cosas a la vez y casi todo el mundo solo conoce una. Sincroniza la ejecución: ninguna invocación del grupo pasa de la barrera hasta que todas han llegado. Y ordena la memoria: todo lo que se escribió antes de la barrera es visible para todas las invocaciones después de ella. Sin la primera propiedad, el algoritmo se descoordina. Sin la segunda, cada invocación ve su propia versión del pasado. Las dos funciones de WGSL que las proporcionan se diferencian exactamente en sobre qué memoria actúan.
+</Lead>
+
+<Goals>
+
+- Distinguir la componente de ejecución y la componente de memoria de una barrera.
+- Elegir entre `workgroupBarrier`, `storageBarrier` y `textureBarrier` según el recurso.
+- Aplicar el requisito de control de flujo uniforme sin excepciones.
+- Usar `workgroupUniformLoad` para difundir un valor a todo el grupo.
+
+</Goals>
+
+## Las dos mitades de una barrera
+
+La mitad de **ejecución** es la que se entiende sola: es un punto de encuentro. Todas las invocaciones del workgroup se paran ahí hasta que llega la última, y entonces siguen todas. En el hardware esto no es tan caro como parece, porque las invocaciones de un mismo grupo SIMD ya van sincronizadas por construcción; el coste real es sincronizar los distintos grupos SIMD que forman el workgroup, y con 64 invocaciones sobre warps de 32 son solo dos.
+
+La mitad de **memoria** es la que produce los bugs. Una GPU reordena accesos, mantiene escrituras en cachés y colas de escritura, y no garantiza por sí sola que lo que la invocación 5 escribió sea visible para la invocación 12. La barrera actúa como valla: obliga a completar las escrituras pendientes en el address space afectado y a invalidar las lecturas cacheadas, de modo que después de la barrera todos ven lo mismo.
+
+Y ahí está la diferencia entre las dos funciones. Ambas hacen la mitad de ejecución de forma idéntica. Se diferencian en **qué address space ordenan**:
+
+| función | ordena | ejecución |
+|---|---|---|
+| `workgroupBarrier()` | address space `workgroup` | sincroniza el grupo |
+| `storageBarrier()` | address space `storage` | sincroniza el grupo |
+| `textureBarrier()` | texturas de almacenamiento | sincroniza el grupo |
+
+Ninguna de las tres toma argumentos ni devuelve nada. Y ninguna de las tres tiene el menor efecto fuera del workgroup: `storageBarrier` no sincroniza workgroups distintos, por mucho que su nombre sugiera memoria global. Ese malentendido es tan frecuente y tan grave que tiene [su propia lección](/guia/webgpu/n32-la-frontera-entre-workgroups/).
+
+Se pueden combinar. Si un tramo de código escribe tanto en memoria compartida como en un storage buffer y quieres publicar las dos cosas, llamas a las dos:
+
+```wgsl
+tile[li] = entrada[gid.x];
+resultados[gid.x] = calculo(li);
+workgroupBarrier();
+storageBarrier();
+// aqui todos ven tanto tile como resultados
+```
+
+## El requisito de control de flujo uniforme
+
+Esta es la regla dura: **una barrera debe ejecutarse en control de flujo uniforme dentro del workgroup**. Uniforme significa que la decisión de llegar a esa barrera, y el número de veces que se llega, es el mismo para todas las invocaciones del grupo.
+
+Si una parte del grupo entra en un `if` que contiene una barrera y otra no, las que entran se quedan esperando a compañeras que nunca van a aparecer. WGSL declara ese caso comportamiento indefinido; en la práctica se manifiesta como resultados corruptos o como un cuelgue del dispositivo que el navegador termina cortando con una pérdida de contexto.
+
+```wgsl
+// MAL: la barrera depende de los datos.
+if (entrada[gid.x] > 0.0) {
+  tile[li] = entrada[gid.x];
+  workgroupBarrier();          // indefinido
+}
+
+// BIEN: la condicion decide que se escribe, no si se sincroniza.
+var v = 0.0;
+if (entrada[gid.x] > 0.0) { v = entrada[gid.x]; }
+tile[li] = v;
+workgroupBarrier();            // todas llegan siempre
+```
+
+Lo mismo con los bucles. La barrera puede estar dentro de un bucle, pero el número de iteraciones tiene que ser el mismo para todas las invocaciones:
+
+```wgsl
+// BIEN: los limites son constantes del modulo.
+for (var s: u32 = TAM / 2u; s > 0u; s >>= 1u) {
+  if (li < s) { parcial[li] += parcial[li + s]; }
+  workgroupBarrier();          // fuera del if, dentro del for uniforme
+}
+
+// MAL: cada invocacion itera un numero distinto de veces.
+for (var k: u32 = 0u; k < vecinos[gid.x]; k = k + 1u) {
+  acumular(k);
+  workgroupBarrier();          // indefinido
+}
+```
+
+Y el corolario que ya apareció al [colocar el guardia](/guia/webgpu/n31-mapear-el-dominio-y-el-guardia/): un `return` temprano hace no uniforme todo lo que viene después. En un kernel con barreras no se sale antes de tiempo; se carga el elemento neutro y se participa.
+
+Hay un caso legítimo que confunde: la barrera dentro de un `if (li == 0u)` está prohibida, pero la barrera **antes o después** de ese bloque está perfectamente bien. El patrón habitual de "una invocación hace algo especial y luego todas lo ven" se escribe así:
+
+```wgsl
+if (li == 0u) {
+  total = suma;                // solo una escribe
+}
+workgroupBarrier();            // todas sincronizan
+let t = total;                 // todas leen el mismo valor
+```
+
+## workgroupUniformLoad
+
+Existe un caso concreto en el que el patrón anterior no basta y WGSL da una función específica: cuando el valor leído de memoria compartida va a usarse como **condición de control de flujo uniforme**, por ejemplo como límite de un bucle que contiene otra barrera.
+
+El compilador no puede demostrar por análisis estático que el valor leído sea igual en todas las invocaciones, aunque tú sepas que lo es. `workgroupUniformLoad` resuelve las dos cosas de golpe: hace la barrera y devuelve un valor que el análisis de uniformidad acepta como uniforme.
+
+```wgsl
+var<workgroup> cuantos: u32;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_index) li: u32) {
+  if (li == 0u) { cuantos = calcularCuantos(); }
+
+  // Barrera + lectura, y el resultado es uniforme para el analizador.
+  let n = workgroupUniformLoad(&cuantos);
+
+  for (var k: u32 = 0u; k < n; k = k + 1u) {
+    trabajo(k);
+    workgroupBarrier();        // legal: n es uniforme
+  }
+}
+```
+
+Sin `workgroupUniformLoad`, ese bucle no compilaría: el compilador rechazaría la barrera por no poder garantizar la uniformidad del límite. Es la herramienta correcta para cualquier algoritmo cuyo número de pasos lo decide el propio grupo en ejecución, como una búsqueda con terminación temprana o un recorrido de estructura de datos.
+
+Toma un puntero al address space `workgroup` y devuelve el valor apuntado. No sirve para punteros a `storage`; para eso hay que combinar `storageBarrier` con una lectura y aceptar que el análisis de uniformidad no te va a dejar usar el resultado como condición de una barrera posterior.
+
+<Callout type="dios" title="La barrera no basta: hace falta una barrera antes de escribir, no solo despues">
+El patrón que casi todo el mundo escribe la primera vez es "escribo, barrera, leo", y es correcto para una sola pasada. En cuanto hay un bucle, falta una barrera. El caso clásico es el scan de Hillis-Steele sobre un único array compartido: cada paso lee `buf[i - offset]` y escribe `buf[i]`. Si solo pones la barrera después de escribir, en la iteración siguiente hay invocaciones que ya han escrito su nueva `buf[i]` mientras otras todavía no han leído la vieja `buf[i - offset]` de ese mismo paso. El resultado no es "un poco impreciso": es distinto en cada ejecución, y en una máquina con warps de 64 puede salir siempre bien mientras en una de 32 sale siempre mal, porque dentro de un mismo grupo SIMD el lockstep te salva por accidente. Por eso el bucle de un scan en sitio necesita **dos** barreras por iteración: una entre la lectura y la escritura, y otra entre la escritura y la lectura del paso siguiente. La forma de detectar este bug sin hardware exótico es sistemática: por cada dato en memoria compartida, dibuja el grafo de quién lo lee y quién lo escribe en cada paso; si existe algún par lectura-escritura del mismo paso sin una barrera entre medias, tienes una carrera, aunque los resultados salgan bien mil veces seguidas. La alternativa que evita el problema entero es el doble buffer: leer siempre de un array y escribir siempre en el otro, intercambiándolos cada paso. Cuesta el doble de memoria compartida y solo necesita una barrera por paso, y en la práctica suele ganar.
+</Callout>

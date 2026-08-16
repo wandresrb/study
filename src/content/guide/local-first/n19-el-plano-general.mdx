@@ -1,0 +1,145 @@
+---
+title: "El plano general: dónde vive cada pieza"
+description: "El diagrama que resume trece niveles: un único escritor abre la base dentro de un Worker, las pestañas le hablan por RPC, los avisos vuelven por difusión y la interfaz lee de una proyección materializada."
+subject: local-first
+level: 19
+order: 1
+position: "19.1"
+duration: "17 min"
+---
+
+<Lead>
+Llevas trece niveles acumulando piezas sueltas: el inventario de almacenamientos del navegador, las transacciones de IndexedDB y su autocierre, el sistema de ficheros privado del origen, el manejador síncrono que solo existe dentro de un Worker, el bloqueo exclusivo que rompe la segunda pestaña, el presupuesto de cuota que nadie te garantiza y el peaje que cobra cada cruce entre hilos. Ninguna de esas piezas es una arquitectura. Este nivel las ensambla en una sola, y conviene decir de entrada que no es una arquitectura que alguien haya elegido por elegancia ni por gusto: es la única forma que sobrevive a las restricciones que has ido aceptando una por una. El plano que verás aquí no se diseña. Se deduce.
+</Lead>
+
+<Goals>
+
+- Situar los cuatro contextos de ejecución del patrón y las tres fronteras que los separan.
+- Leer el plano completo: dónde vive la base, quién la abre, por dónde entran las lecturas y por dónde salen los avisos.
+- Enunciar los cuatro invariantes que hacen correcto el patrón y reconocer qué se rompe al violar cada uno.
+- Distinguir las variantes legítimas de las simplificaciones que solo aplazan el problema.
+
+</Goals>
+
+## Cuatro contextos y tres fronteras
+
+Lo primero que hay que ver es que en una aplicación local-first madura no hay un programa: hay cuatro contextos de ejecución con memorias disjuntas, y todo el diseño consiste en decidir qué atraviesa las fronteras que los separan.
+
+El **disco** es el sistema de ficheros privado del origen, un almacén de bytes durable, compartido por todas las pestañas y sin ninguna noción de quién lo usa. El **Worker de datos** es el único contexto donde el motor está instanciado y donde ese almacén se abre; ahí dentro, y solo ahí dentro, la entrada y salida es síncrona. El **hilo principal de la pestaña que hospeda al Worker** es el que puede hablar con él directamente. Y los **hilos principales de las demás pestañas** son contextos completos de tu aplicación que no tienen ningún acceso al motor y dependen enteramente de que alguien les reenvíe lo que necesitan.
+
+Entre esos cuatro contextos hay tres fronteras, y cada una cobra en una moneda distinta. La frontera del **disco** se paga en operaciones de bloque y es la única donde el coste guarda relación con el volumen de datos que de verdad tocas. La frontera del **hilo** se paga en clonado estructurado y en tiempo de espera en la cola del destino, y su coste depende del tamaño y de la forma del mensaje, nunca del trabajo útil. La frontera de la **pestaña** se paga en lo mismo que la anterior más un salto adicional, porque una pestaña seguidora no habla con el motor sino con otra pestaña que a su vez habla con el motor.
+
+Esa asimetría explica casi todos los errores de diseño del patrón. La intuición traída del desarrollo convencional dice que el disco es lo caro y que la memoria es gratis. Aquí es al revés: el disco está a microsegundos y las fronteras de memoria están a fracciones de milisegundo que se multiplican por cada mensaje. Quien optimiza consultas antes de contar cruces está optimizando la parte barata.
+
+Falta por situar un quinto contexto que muchos proyectos ya tienen sin haberlo pensado: el trabajador de servicio que intercepta las peticiones de red para que la aplicación cargue sin conexión. Es un contexto de ejecución más, con su propio ciclo de vida, que puede arrancarse y detenerse por decisión del navegador y que sobrevive a todas las pestañas. Su lugar correcto en este plano es estrictamente el de servir el código y los recursos, nunca el de tocar los datos: en el momento en que abre la base se convierte en un segundo escritor, con la agravante de que puede despertar cuando no hay ninguna pestaña abierta y de que su terminación es aún menos predecible que la de un Worker dedicado. La separación entre servir la aplicación y poseer los datos es la que mantiene ese contexto fuera del problema.
+
+Hay además una asimetría de **duración** que conviene tener presente porque decide dónde puede vivir cada cosa. Los tres contextos de ejecución son efímeros y mueren sin avisar: una pestaña se cierra, un Worker lo termina el sistema por presión de memoria, y ninguno de los dos tiene garantizado ejecutar código de despedida. El disco, en cambio, sobrevive a todos ellos y a la sesión entera del navegador. De ahí se sigue una regla sencilla y muy útil: cualquier cosa cuya pérdida sea inaceptable tiene que haber llegado al disco antes de que la pantalla diga que se ha guardado, y cualquier cosa que viva en memoria hay que poder reconstruirla desde el disco sin preguntarle nada a nadie.
+
+## El plano completo
+
+<Mermaid code={`flowchart TB
+  A[Pestana lider interfaz] -->|peticiones RPC| W[Worker unico con el motor]
+  B[Pestana seguidora interfaz] -->|peticiones por difusion| A
+  W -->|acceso sincrono| D[Sistema de ficheros del origen]
+  D -->|paginas| W
+  W -->|avisos de cambio| PA[Proyeccion local de la lider]
+  W -->|avisos de cambio| PB[Proyeccion local de la seguidora]
+  PA -->|lectura sincrona en el render| A
+  PB -->|lectura sincrona en el render| B
+  class W t-blue
+  class D t-yellow
+  class PA t-green
+  class PB t-green`} />
+
+Léelo siguiendo los cuatro caminos que lo componen. El **camino de apertura** ocurre una sola vez por sesión: una pestaña gana el bloqueo con nombre, arranca el Worker, este descarga e instancia el motor, abre el fichero, comprueba el esquema, migra si hace falta y anuncia que está listo. El **camino de escritura** va siempre en la misma dirección: la interfaz emite una intención, esa intención llega al único escritor, se aplica en una transacción y produce un aviso. El **camino de lectura de interfaz** no cruza ninguna frontera: el componente lee de la proyección que vive en su propia memoria y se pinta de forma síncrona. Y el **camino de aviso** es el que cierra el ciclo: el escritor cuenta a todo el mundo qué cambió, y cada proyección decide qué necesita refrescar.
+
+La pregunta de quién abre la base la responde un bloqueo con nombre, y merece la pena ver lo compacto que resulta el mecanismo, porque su brevedad esconde todo lo que el navegador está haciendo por ti.
+
+```js
+// Quien gana el bloqueo se convierte en el escritor de todo el origen
+navigator.locks.request('base-lider', { mode: 'exclusive' }, async () => {
+  const worker = new Worker('/datos.worker.js', { type: 'module' });
+  await esperarListo(worker);
+  atenderPeticionesDeSeguidoras(worker);   // proxy sobre el canal de difusion
+  await new Promise(() => {});             // retener el liderazgo mientras viva
+});
+```
+
+La promesa que nunca resuelve retiene el bloqueo hasta que la pestaña muera, y la liberación en ese instante la garantiza el navegador y no tu código: esa garantía es exactamente la propiedad que el manejador de fichero no ofrece, y la razón de combinar las dos interfaces en lugar de usar solo una. Las demás pestañas quedan encoladas en la misma petición, y una de ellas entrará automáticamente cuando la líder desaparezca, sin que nadie tenga que detectar ninguna muerte ni votar nada.
+
+Mientras tanto, una seguidora no se queda esperando: arranca de inmediato por el camino del proxy, con la particularidad de que su cliente de datos apunta a un canal de difusión en lugar de a un Worker y de que cada respuesta llega con un salto más. Esa simetría —la misma interfaz de datos con dos transportes distintos por debajo— es lo que permite que el resto de la aplicación no sepa nunca en qué pestaña está corriendo, y conviene defenderla con cierto celo: el día que un componente pregunte si es la líder, el patrón ha empezado a filtrarse hacia arriba y ya no volverá a bajar.
+
+<Cards>
+  <Card icon="🏗️" title="El disco no sabe nada">
+    El almacén es pasivo: no notifica, no arbitra y no distingue entre pestañas. Toda la coordinación que necesites la pones tú por encima, porque debajo no hay nadie.
+  </Card>
+  <Card icon="🔒" title="El Worker es la autoridad">
+    Es el único que abre el fichero, el único que ve el esquema, el único que ejecuta migraciones y el único que puede afirmar cuál es el estado actual. Todo lo demás son copias con retraso.
+  </Card>
+  <Card icon="🧭" title="El canal transporta intenciones">
+    Por la frontera no cruzan objetos vivos ni referencias: cruzan copias de mensajes que describen qué se quiere hacer o qué ha ocurrido. Diseñar ese vocabulario es diseñar la aplicación.
+  </Card>
+  <Card icon="🖼️" title="La proyección hace posible el render">
+    Un fragmento del estado materializado en el hilo de la interfaz es lo que devuelve la lectura síncrona que la frontera te había quitado. No es una caché opcional: es una capa del patrón.
+  </Card>
+</Cards>
+
+<Callout type="note" title="El camino de la seguidora no es un caso raro">
+Es el más frecuente en cuanto la aplicación se usa de verdad, porque la gente abre pestañas nuevas continuamente y casi nunca cierra la anterior. Aun así, es el camino que casi todo el mundo implementa al final, mal probado y con la mitad de las rutas de error sin cubrir, porque durante el desarrollo se trabaja siempre con una sola pestaña recién recargada. La consecuencia es predecible: una aplicación que funciona impecablemente en el equipo de quien la escribió y falla de forma intermitente en el de quien la usa. Prueba siempre con dos pestañas abiertas y cierra la líder a mitad de una operación.
+</Callout>
+
+## Los cuatro invariantes
+
+Un patrón arquitectónico se entiende mejor por lo que prohíbe que por lo que permite. Estos cuatro invariantes son lo que separa la arquitectura de una colección de trucos, y cada uno tiene un modo de fallo característico cuando se viola.
+
+**Uno: un solo contexto abre el fichero.** Viene directamente de la exclusividad del manejador síncrono, pero seguiría siendo deseable aunque esa exclusividad no existiera, porque dos motores con cachés de páginas independientes sobre el mismo fichero es la definición de corrupción. Al violarlo no obtienes un error claro: obtienes una segunda pestaña que no arranca, o algo peor si el motor que elegiste no se protege.
+
+**Dos: ninguna lectura del render cruza una frontera.** Un componente que se pinta no puede esperar. Al violarlo aparecen estados de carga en todas partes, cascadas de peticiones encadenadas y un parpadeo permanente que ningún usuario asocia con una base de datos que está a cuatro milímetros.
+
+**Tres: toda escritura es una intención, no una mutación.** La interfaz no modifica el estado autoritativo porque no lo tiene delante; envía una descripción de lo que quiere y espera confirmación. Al violarlo —normalmente escribiendo primero en la proyección y avisando después— tu copia local y el disco divergen en cuanto una operación falla, y nadie se entera hasta mucho más tarde.
+
+```js
+// Mal: la interfaz muta su copia y avisa despues
+proyeccion.notas.push(nueva);
+db.crearNota(nueva);                        // si falla, nadie deshace nada
+
+// Bien: intencion, marca provisional y confirmacion explicita
+const marca = proyeccion.anadirProvisional(nueva);
+db.crearNota(nueva).then(
+  () => proyeccion.confirmar(marca),
+  () => proyeccion.revertir(marca),
+);
+```
+
+La diferencia entre ambos fragmentos no es de estilo. En el primero, la proyección afirma algo que quizá nunca ocurrió y no tiene forma de retractarse; en el segundo, la proyección distingue entre lo que sabe y lo que espera, que es la única distinción que permite mostrar respuesta inmediata sin mentir. Esa marca provisional es además el punto donde encajará después la resolución de conflictos, cuando la confirmación deje de venir de un escritor local y empiece a venir de otros dispositivos.
+
+**Cuatro: todo aviso viaja en un solo sentido y lleva versión.** Los avisos no se responden ni se negocian: se emiten. Y llevan un número creciente para que un receptor pueda detectar que se ha perdido alguno y resincronizarse en lugar de seguir mostrando un estado incompleto sin saberlo. Al violarlo, la ausencia de un aviso es indistinguible de la ausencia de cambios.
+
+<Callout type="warn" title="La proyección no es una optimización que puedas dejar para después">
+Es tentador arrancar el proyecto pidiendo datos al Worker desde cada componente y prometerse añadir una caché más adelante. No funciona así: la proyección determina la forma de tu API de datos, porque una operación pensada para materializar una vista completa no se parece en nada a una pensada para responder a un componente suelto. Añadirla al final significa reescribir la frontera entera, y con ella todos los estados de carga que habías repartido por la interfaz. Es la decisión que hay que tomar en la primera semana.
+</Callout>
+
+## Las variantes legítimas
+
+El plano admite variaciones reales, y conviene distinguirlas de las simplificaciones que solo aplazan el trabajo.
+
+- **Worker compartido.** Donde está disponible colapsa la frontera de pestaña: hay una sola instancia por origen y cada pestaña recibe su propio puerto, sin líder, sin proxy y sin salto adicional. Es la variante más limpia y la que menos código pide, pero su disponibilidad no es uniforme, así que no puedes construir sobre ella sin un plan alternativo que sea exactamente el patrón de líder.
+- **Worker dedicado con elección de líder.** El caso general y el que hay que saber implementar. Cuesta un salto más para las seguidoras y una máquina de estados para el relevo, y a cambio funciona en todas partes.
+- **Sin motor embebido.** Con IndexedDB directamente no hay exclusividad de fichero y cada pestaña puede abrir la base, de modo que el invariante primero deja de venir impuesto por la plataforma. Sigue conviniendo respetarlo, pero ahora por motivos de coherencia y de coste, no de corrupción, y eso cambia el análisis: puedes permitirte varias pestañas leyendo en paralelo mientras concentras las escrituras.
+- **Sin Worker en absoluto.** Es una decisión legítima por debajo de cierto volumen y con cierto perfil de acceso. Deja de serlo en el momento en que una operación bloquea el hilo principal más allá del presupuesto de un fotograma, y ese momento llega antes de lo que la gente espera.
+
+Lo que **no** es una variante, aunque se presente como tal, es abrir la base desde cada pestaña y confiar en que las escrituras no coincidan. No es una simplificación del patrón: es el patrón sin su invariante principal, y su modo de fallo no es un error visible sino la divergencia silenciosa entre lo que dos pestañas creen que hay guardado. Tampoco lo es reenviar consultas crudas del lenguaje de la base desde la interfaz al Worker, que convierte el protocolo en una superficie infinita imposible de versionar y hace que cualquier cambio de esquema rompa pestañas antiguas de formas impredecibles.
+
+Elegir variante es, en el fondo, elegir dónde quieres pagar. El Worker compartido paga en compatibilidad, el líder con bloqueo paga en código de coordinación, prescindir del motor embebido paga en capacidad de consulta y prescindir del Worker paga en fluidez de la interfaz. Ninguna de las cuatro es gratis y las cuatro son defendibles; lo que no es defendible es no haber elegido, porque entonces la elección la hará el primer usuario que abra una segunda pestaña.
+
+<Callout type="dios" title="Has reconstruido cliente y servidor dentro de una sola pestaña">
+Mira el plano otra vez y quítale los nombres del navegador. Lo que queda es un servicio con estado que posee el almacenamiento y arbitra las escrituras, varios clientes sin autoridad que mantienen proyecciones locales de lo que necesitan mostrar, un protocolo de peticiones y respuestas correlacionadas entre ellos, un canal de notificaciones para invalidar esas proyecciones, y un mecanismo de elección de líder porque el servicio tiene que existir en un único ejemplar. Eso es, término por término, la arquitectura cliente-servidor que local-first prometía desmontar, replegada dentro de una única pestaña y reducida en tres órdenes de magnitud. La ironía es completa y merece pensarse despacio, porque no es una casualidad ni un fracaso del enfoque: es que la estructura del problema no dependía de la distancia. Siempre que existe un recurso que solo puede tener un dueño en cada instante, y varios interesados que no comparten memoria con ese dueño, aparecen las mismas cinco preguntas —quién manda, cómo se pide, cómo se contesta, cómo se avisa y qué pasa cuando el que manda desaparece— y las respuestas conocidas son las mismas, cambiando únicamente la escala de las constantes. Lo que local-first elimina de verdad no es la arquitectura cliente-servidor sino su **dependencia de la red**: la autoridad sigue existiendo, pero pasa a estar dentro del dispositivo del usuario, donde nunca se cae, nunca cobra por transferencia y nunca deja de responder porque un centro de datos tenga un mal día. Ese es el intercambio real que has firmado a lo largo de trece niveles, y conviene enunciarlo sin rodeos: no has eliminado la complejidad distribuida, la has trasladado a un lugar donde tú la controlas por completo. Los cuatro niveles siguientes de este track existen porque esa autoridad local, en cuanto hay más de un dispositivo, deja de poder ser única, y entonces ninguna elección de líder sirve. Ahí empieza el problema de verdad.
+</Callout>
+
+<Challenge title="Dibuja tu propio plano">
+1. Coge tu aplicación actual y sitúa cada módulo en uno de los cuatro contextos. Anota los que hoy no estarían en ninguno porque hacen dos cosas a la vez.
+2. Marca en tu código todos los puntos donde una lectura cruza una frontera durante el render. Cada uno es una violación del segundo invariante.
+3. Escribe la lista de intenciones que tu interfaz puede emitir. Si supera la docena, probablemente estás exponiendo la base de datos en lugar de un vocabulario de dominio.
+4. Comprueba si tus avisos de cambio llevan un número creciente. Si no lo llevan, escribe cómo detectaría hoy una pestaña que se ha perdido uno.
+5. Decide de forma explícita y por escrito qué variante del patrón usas y qué harías si la plataforma te quitara la que has elegido.
+</Challenge>

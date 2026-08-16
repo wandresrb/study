@@ -1,0 +1,134 @@
+---
+title: "Weak de T: referencias débiles para romper ciclos"
+description: "El conteo de referencias tiene un talón de Aquiles: los ciclos. Si `A` sostiene un `Rc` a `B` y `B` un `Rc` a `A`, ningún contador llega nunca a cero y la memoria se fuga. `Weak<T>` es la cura: una referencia que **no** cuenta para mantener vivo el dato. Para usarla debes `upgrade`, que puede fallar. Es como se modelan los punteros hacia atrás: fuerte hacia abajo, débil hacia arriba."
+subject: rust
+level: 25
+order: 4
+position: "25.4"
+duration: "20 min"
+---
+
+<Lead>
+El conteo de referencias es local y elegante, pero tiene un punto ciego fatal: los **ciclos**. Si `A` posee un `Rc` hacia `B` y `B` posee un `Rc` hacia `A`, cada uno mantiene vivo al otro; sus contadores nunca bajan a cero, sus destructores nunca corren y la memoria se fuga —sin que el borrow checker diga una palabra, porque no hay nada inseguro, solo algo que no muere—. `Weak<T>` es el antídoto: una referencia **no poseedora** que no incrementa el contador fuerte y, por tanto, no impide que el dato muera. A cambio, no puedes usarla directamente: debes *ascenderla* a un `Rc` con `upgrade`, operación que puede devolver `None` si el valor ya se fue. Así se modelan los punteros hacia atrás sin crear ciclos.
+</Lead>
+
+<Goals>
+
+- Diagnosticar un ciclo de `Rc` que nunca se libera y reconocerlo como una fuga de memoria.
+- Crear referencias débiles con `Rc::downgrade`, que no cuentan para mantener vivo el dato.
+- Recuperar el acceso con `Weak::upgrade`, que devuelve un `Option`.
+- Modelar relaciones padre-hijo: propiedad fuerte hacia abajo, referencia débil hacia arriba.
+
+</Goals>
+
+## El ciclo que nunca muere
+
+Construyamos dos nodos que se apunten mutuamente. Necesitamos `RefCell` para poder enlazarlos después de crearlos (mutabilidad interior):
+
+```rust
+use std::rc::Rc;
+use std::cell::RefCell;
+
+struct Nodo {
+    valor: i32,
+    enlace: RefCell<Option<Rc<Nodo>>>,
+}
+
+fn main() {
+    let a = Rc::new(Nodo { valor: 1, enlace: RefCell::new(None) });
+    let b = Rc::new(Nodo { valor: 2, enlace: RefCell::new(None) });
+
+    *a.enlace.borrow_mut() = Some(Rc::clone(&b));  // a -> b
+    *b.enlace.borrow_mut() = Some(Rc::clone(&a));  // b -> a, el ciclo
+
+    println!("cuenta de a = {}", Rc::strong_count(&a)); // 2
+    println!("cuenta de b = {}", Rc::strong_count(&b)); // 2
+} // a y b salen de scope: cada cuenta baja de 2 a 1, nunca a 0. Fuga.
+```
+
+Al final del `main`, el `Drop` de la variable `a` baja su cuenta de 2 a 1 —pero `b` todavía sostiene la otra participación—, y lo mismo con `b`. Ambos se quedan en 1, ninguno llega a cero, ningún destructor corre: los dos nodos quedan varados en el heap hasta que el proceso muere.
+
+<Mermaid code={`flowchart LR
+  a[Nodo a cuenta 2] -->|Rc fuerte| b[Nodo b cuenta 2]
+  b -->|Rc fuerte| a
+  class a t-red
+  class b t-red`} />
+
+<Callout type="info" title="Una fuga es segura, pero sigue siendo un bug">
+Rust garantiza que no habrá *use-after-free* ni *data races*, pero **no** garantiza que no haya fugas: perder memoria es seguro. Un ciclo de `Rc`, un `Box::leak`, un `std::mem::forget` deliberado: todos filtran memoria sin cometer ninguna violación de seguridad. Por eso el compilador no te detiene aquí; el ciclo es un error de *lógica*, no de *seguridad*, y su reparación es diseño tuyo, no obligación del borrow checker.
+</Callout>
+
+## Weak: una referencia que no cuenta
+
+Cada `Rc` mantiene, en realidad, **dos** contadores: el fuerte y el débil. Solo el fuerte decide si el valor sigue vivo. `Rc::downgrade(&rc)` produce un `Weak<T>` incrementando el contador **débil**, nunca el fuerte. Un `Weak` no posee el dato: el valor puede destruirse mientras aún existan `Weak` apuntándolo, y esos débiles simplemente pasan a no apuntar a nada. (La asignación no se recicla del todo hasta que también los débiles desaparecen, pero el valor `T` en sí ya se ha destruido.)
+
+## upgrade: pedir acceso, que puede fallar
+
+Como el valor puede haberse ido, no puedes desreferenciar un `Weak` sin más. `Weak::upgrade` devuelve `Option<Rc<T>>`: `Some` —incrementando temporalmente la cuenta fuerte— si el valor sigue vivo, y `None` si ya fue destruido. Esa firma es la clave de la seguridad: te **obliga** a reconocer, en cada acceso, que aquello a lo que apuntas quizá ya no exista.
+
+```rust
+use std::rc::Rc;
+
+fn main() {
+    let fuerte = Rc::new(42);
+    let debil = Rc::downgrade(&fuerte);
+
+    println!("{:?}", debil.upgrade());  // Some(42): el valor vive
+    drop(fuerte);                       // cae el ultimo dueno fuerte
+    println!("{:?}", debil.upgrade());  // None: el valor ya no existe
+}
+```
+
+Donde en C un puntero hacia atrás que sobrevive a su objetivo es un puntero colgante —y su uso, comportamiento indefinido—, en Rust `Weak::upgrade` convierte esa catástrofe en un `Option` que estás forzado a manejar.
+
+## El patrón padre-hijo
+
+El caso real donde todo esto encaja es un árbol en el que cada hijo conoce a su padre. Si ambas direcciones fueran `Rc`, cada pareja padre-hijo sería un ciclo y el árbol entero se fugaría. La solución codifica la **dirección de la propiedad** en el tipo: el padre posee a los hijos con `Rc` (fuerte, hacia abajo); el hijo referencia al padre con `Weak` (débil, hacia arriba). El árbol mantiene vivos a sus descendientes; el puntero hacia atrás no mantiene vivo al ancestro.
+
+```rust
+use std::rc::{Rc, Weak};
+use std::cell::RefCell;
+
+struct Nodo {
+    valor: i32,
+    padre: RefCell<Weak<Nodo>>,        // hacia arriba: debil, no cuenta
+    hijos: RefCell<Vec<Rc<Nodo>>>,     // hacia abajo: fuerte, posee
+}
+
+fn main() {
+    let hoja = Rc::new(Nodo {
+        valor: 3,
+        padre: RefCell::new(Weak::new()),
+        hijos: RefCell::new(vec![]),
+    });
+    let rama = Rc::new(Nodo {
+        valor: 5,
+        padre: RefCell::new(Weak::new()),
+        hijos: RefCell::new(vec![Rc::clone(&hoja)]),
+    });
+    *hoja.padre.borrow_mut() = Rc::downgrade(&rama);  // enlace debil hacia el padre
+
+    // subir de la hoja al padre, reconociendo que podria no existir:
+    if let Some(p) = hoja.padre.borrow().upgrade() {
+        println!("el padre de la hoja vale {}", p.valor);   // 5
+    }
+}
+```
+
+`Weak::new` fabrica un débil vacío que ya devuelve `None` al ascender: el hueco perfecto para "aún no tengo padre". Cuando el árbol se destruye, `rama` cae, su cuenta fuerte llega a cero —la referencia débil desde `hoja` no la retenía— y todo se libera limpiamente.
+
+<Callout type="dios" title="Weak codifica la dirección de la propiedad, y convierte el puntero colgante en un Option">
+El problema del ciclo enseña algo que suele pasar desapercibido: el conteo de referencias **no es** recolección de basura. Un recolector por rastreo vería el ciclo `A`–`B` como lo que es —basura inalcanzable desde las raíces del programa— y lo liberaría sin dudar, porque razona globalmente sobre alcanzabilidad. `Rc` no puede: su regla es puramente local —"me mantienen vivo mis dueños fuertes"— y esa localidad, que le daba determinismo y coste cero, es exactamente lo que le impide ver que dos objetos que se sostienen mutuamente están, en conjunto, muertos para el resto del mundo. `Rc` cambió la omnisciencia del GC por la inmediatez del contador, y el ciclo es la factura de ese cambio. `Weak` es la forma en que Rust recupera la corrección sin renunciar al modelo: en vez de añadir un rastreador global, te pide que **declares la topología de la propiedad** distinguiendo dos clases de referencia. Fuerte significa *yo lo mantengo vivo*; débil significa *yo solo lo observo*. Con esa distinción, un grafo con ciclos se descompone en un esqueleto de aristas fuertes —que debe ser acíclico, un árbol o un DAG de propiedad— más aristas débiles para los caminos de vuelta, que no cuentan. La propiedad vuelve a ser un orden sin ciclos, y la responsabilidad de que lo sea es tuya, hecha explícita en cada tipo. Y hay una segunda genialidad, más silenciosa: como el observador no mantiene vivo a lo observado, lo observado puede morir primero, y `upgrade` te obliga a mirar esa posibilidad de frente en cada acceso, devolviendo `Option`. El puntero hacia atrás que sobrevive a su objetivo —fuente clásica de *use-after-free* en cualquier lenguaje con punteros crudos— deja de ser una bomba de relojería y se vuelve un `None` que el compilador te exige contemplar. `Weak` no es un parche para una carencia de `Rc`: es la afirmación de que la propiedad tiene dirección, de que esa dirección debe ser acíclica, y de que observar algo nunca debería darte el poder de mantenerlo vivo.
+</Callout>
+
+<Callout type="note" title="Lo esencial de Weak">
+Un ciclo de `Rc` fuga memoria porque los contadores fuertes nunca llegan a cero; es seguro pero es un bug de lógica. `Rc::downgrade` crea un `Weak<T>` que incrementa el contador **débil**, no el fuerte, así que no impide la destrucción del dato. No se desreferencia directamente: `Weak::upgrade` devuelve `Option<Rc<T>>`, `Some` si el valor vive y `None` si ya murió. El patrón idiomático para grafos con vuelta atrás es propiedad fuerte hacia abajo (`Rc`) y referencia débil hacia arriba (`Weak`), lo que mantiene el esqueleto de propiedad acíclico.
+</Callout>
+
+<Challenge title="Rompe el ciclo">
+1. Construye el ciclo `a ↔ b` con `Rc` y `RefCell`, imprime ambas cuentas fuertes y añade un `Drop` con `println!` a `Nodo` para comprobar que **nunca** se ejecuta. Explica por qué.
+2. Crea un `Rc`, obtén un `Weak` con `downgrade`, haz `drop` del `Rc` y muestra que `upgrade` pasa de `Some` a `None`. ¿Qué contador movió `downgrade`?
+3. Reescribe el árbol padre-hijo con `hijos: Vec<Rc<Nodo>>` y `padre: Weak<Nodo>`, enlaza una hoja a una rama y sube de la hoja al padre con `upgrade`.
+4. Cambia el `Weak` del padre por un `Rc` y demuestra que reaparece la fuga: añade el `Drop` con `println!` y verifica que deja de imprimirse.
+5. Explica, con tus palabras, por qué el conteo de referencias no puede liberar ciclos y un GC por rastreo sí, y qué compra Rust a cambio de esa limitación.
+</Challenge>

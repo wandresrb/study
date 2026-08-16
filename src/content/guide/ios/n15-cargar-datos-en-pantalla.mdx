@@ -1,0 +1,169 @@
+---
+title: "Cargar datos en una pantalla sin mentir al usuario"
+description: "Modelar los estados de carga como un tipo en vez de como banderas sueltas, integrar refrescos con refreshable, y eliminar el doble disparo que duplica peticiones sin que nadie lo note."
+subject: ios
+level: 15
+order: 3
+position: "15.3"
+duration: "15 min"
+---
+
+<Lead>
+Cargar una lista desde la red parece el ejercicio más simple del mundo, y es donde se acumulan más bugs por metro cuadrado de código. La razón es que casi nadie modela el problema: se declaran tres banderas independientes, se cruzan los dedos y se descubre en producción que existe un estado donde la app muestra a la vez un spinner, un mensaje de error y una lista vacía. La solución no es más cuidado, es un tipo mejor.
+</Lead>
+
+<Goals>
+
+- Modelar la carga con un `enum` que haga imposibles los estados imposibles.
+- Escribir el ciclo completo de carga dentro de una vista con `.task`.
+- Integrar `refreshable` respetando la semántica del gesto.
+- Detectar y eliminar el doble disparo de peticiones.
+
+</Goals>
+
+## Estados imposibles, tipos imposibles
+
+El punto de partida habitual son tres propiedades sueltas: un booleano de carga, un array de resultados y un error opcional. Tres variables independientes generan ocho combinaciones, de las cuales solo cuatro tienen sentido. Las otras cuatro no son teóricas: aparecen en cuanto hay dos peticiones solapadas o un error que nadie limpió.
+
+Un `enum` con valores asociados colapsa ese espacio hasta dejar solo lo representable:
+
+```swift
+enum Carga<Valor> {
+    case inicial
+    case cargando
+    case exito(Valor)
+    case fallo(Error)
+
+    var valor: Valor? {
+        if case .exito(let v) = self { return v }
+        return nil
+    }
+}
+```
+
+Distinguir `inicial` de `cargando` no es purismo. `inicial` es "todavía no he pedido nada" y admite una pantalla de bienvenida; `cargando` es "estoy pidiendo" y exige un indicador. Fundirlos obliga a mostrar un spinner en una pantalla que aún no ha hecho nada, que es exactamente lo que se ve en tantas apps al abrirlas.
+
+En la vista, el `switch` se vuelve exhaustivo y el compilador te obliga a decidir qué se pinta en cada rama:
+
+```swift
+struct ListaView: View {
+    @State private var estado: Carga<[Item]> = .inicial
+
+    var body: some View {
+        switch estado {
+        case .inicial, .cargando:
+            ProgressView().task { await cargar() }
+        case .exito(let items):
+            List(items) { ItemRow(item: $0) }
+        case .fallo(let error):
+            ErrorView(error: error) { Task { await cargar() } }
+        }
+    }
+}
+```
+
+<Callout type="dios" title="Un tipo bien elegido no documenta la corrección: la impone">
+La diferencia entre tres booleanos y un `enum` no es estilística. Con banderas sueltas, la invariante "no puedo estar cargando y haber fallado a la vez" existe únicamente en la cabeza de quien escribió el código, y se pierde en la primera revisión que haga otra persona un martes por la tarde. Con un `enum`, esa invariante está en el sistema de tipos y sobrevive a todas las refactorizaciones futuras: nadie puede construir el estado prohibido porque el constructor no existe. Esto es *making illegal states unrepresentable* llevado a la interfaz, y su beneficio compuesto es que el compilador se convierte en el revisor más constante del equipo. Cada `switch` exhaustivo que te obliga a escribir es una pregunta que alguien tenía que hacerse —qué ve el usuario aquí— y que sin el tipo se habría quedado sin responder hasta el informe de un usuario molesto.
+</Callout>
+
+## El ciclo de carga, entero
+
+Con el estado bien tipado, la función de carga se vuelve casi mecánica. Vive en el actor principal, marca el inicio, sale a por los datos y vuelve a publicar. Lo único que exige atención es la cancelación.
+
+```swift
+@MainActor
+func cargar() async {
+    estado = .cargando
+    do {
+        let items = try await api.listar()
+        estado = .exito(items)
+    } catch is CancellationError {
+        estado = .inicial              // la vista se fue: no es un fallo
+    } catch {
+        estado = .fallo(error)
+    }
+}
+```
+
+Separar `CancellationError` del resto es importante y casi siempre se olvida. Si el usuario navega atrás mientras carga, la tarea se cancela y la petición lanza; tratar eso como un error real deja la pantalla con un mensaje rojo que aparecerá la próxima vez que se abra. La cancelación no es un fallo: es una retirada ordenada.
+
+Cuando la carga es paginada, el estado necesita un matiz más: hay datos válidos **y** se está cargando más. Ahí el `enum` plano se queda corto y conviene un `struct` con el valor actual más una bandera acotada.
+
+```swift
+struct Pagina<Valor> {
+    var items: [Valor] = []
+    var siguiente: String?
+    var cargandoMas = false
+}
+```
+
+## refreshable y la semántica del gesto
+
+`refreshable` no es un botón de recarga: tiene un contrato temporal. SwiftUI mantiene el indicador de arrastre visible **hasta que el cierre asíncrono retorna**. Si retornas antes de que lleguen los datos, el indicador desaparece con la lista todavía vieja y el usuario cree que no ha pasado nada.
+
+```swift
+List(items) { ItemRow(item: $0) }
+    .refreshable {
+        await recargar()      // el spinner vive lo que viva este await
+    }
+```
+
+Eso implica una regla poco obvia: dentro de `refreshable` **no** debes poner el estado en `.cargando`. El gesto ya tiene su propio indicador; cambiar el estado destruiría la lista visible y la sustituiría por un `ProgressView`, produciendo el parpadeo más feo del catálogo. Un refresco debe conservar lo que hay hasta que llegue lo nuevo:
+
+```swift
+@MainActor
+func recargar() async {
+    do {
+        estado = .exito(try await api.listar())   // sustitución atómica
+    } catch is CancellationError {
+        // el usuario soltó y se fue: no tocamos nada
+    } catch {
+        // mantener los datos viejos y avisar aparte
+        mensaje = error.localizedDescription
+    }
+}
+```
+
+<Mermaid code={`stateDiagram-v2
+  [*] --> Inicial
+  Inicial --> Cargando: task inicial
+  Cargando --> Exito: llegan datos
+  Cargando --> Fallo: error real
+  Cargando --> Inicial: cancelacion
+  Exito --> Exito: refreshable conserva la lista
+  Fallo --> Cargando: reintento del usuario`} />
+
+## El doble disparo
+
+Es el fallo más silencioso de esta lección: la pantalla pide dos veces lo mismo. No se ve, no rompe nada visible y duplica el tráfico, el gasto de servidor y la batería. Tiene tres causas recurrentes.
+
+<Cards>
+  <Card icon="🌀" title="task más onAppear">
+    Migrar a `.task` sin borrar el `onAppear` antiguo deja dos disparos. Suena a despiste, y es la causa número uno en bases de código con historia.
+  </Card>
+  <Card icon="🔁" title="Reaparición de la vista">
+    En un `TabView` o al volver de una pila de navegación, la vista se reconstruye y el `.task` corre otra vez. Si ya tienes datos, no deberías repetir la petición.
+  </Card>
+  <Card icon="🎯" title="Identidad inestable">
+    Un `.task(id:)` cuyo identificador se recalcula en cada render dispara sin parar. El identificador debe ser un valor estable, no un objeto recién creado.
+  </Card>
+</Cards>
+
+La defensa correcta no es un booleano `yaCargue`, que es otra bandera suelta reintroducida por la puerta de atrás, sino una guarda sobre el propio estado:
+
+```swift
+.task {
+    guard case .inicial = estado else { return }
+    await cargar()
+}
+```
+
+Así la pregunta "hace falta cargar" se responde consultando la única fuente de verdad que ya tenías. Si el estado es `.exito`, la vista reaparecida se pinta al instante con los datos que ya conocía y el usuario refresca cuando quiera.
+
+<Challenge title="Modela la carga de verdad">
+1. Sustituye las banderas sueltas de una pantalla tuya por un `enum` de carga con cuatro casos.
+2. Convierte el cuerpo de la vista en un `switch` exhaustivo y decide qué se pinta en cada rama.
+3. Captura `CancellationError` por separado y comprueba que salir de la pantalla ya no deja un error visible.
+4. Añade `refreshable` conservando la lista vieja durante el refresco, sin volver a `.cargando`.
+5. Provoca el doble disparo a propósito con un `onAppear` extra, obsérvalo con un `print` y elimínalo con la guarda sobre el estado.
+</Challenge>

@@ -8,13 +8,13 @@ const watchPhase = () => {
   disposePhase = createRoot((dispose) => {
     createEffect(() => {
       const f = phase();
-      // data-fase feeds the portada:/arrancando: variants in theme.css; keep the name.
-      document.documentElement.dataset.fase = f;
+      // data-phase feeds the home:/booting: variants in theme.css; keep the name.
+      document.documentElement.dataset.phase = f;
       const scn = host && mounted.get(host);
 
-      if (f === 'corriendo') {
+      if (f === 'running') {
         scn?.start?.();
-      } else if (f === 'inicio') {
+      } else if (f === 'start') {
         scn?.reset?.();
         window.scrollTo({ top: 0, behavior: 'auto' });
         progress = -1;
@@ -101,7 +101,7 @@ const onKeydown = (e: KeyboardEvent) => {
   if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-  if (phase() !== 'corriendo') return;
+  if (phase() !== 'running') return;
 
   switch (e.key) {
     case 'j':
@@ -189,7 +189,7 @@ document.addEventListener('astro:before-swap', destroyAll);
 document.addEventListener('astro:before-swap', () => {
   disposePhase?.();
   disposePhase = null;
-  delete document.documentElement.dataset.fase;
+  delete document.documentElement.dataset.phase;
 });
 
 document.addEventListener('astro:page-load', () => {
@@ -205,7 +205,7 @@ document.addEventListener('astro:page-load', () => {
   if (reduced() && stack().length === 0) {
     push('HARDWARE');
     collapseConsole(true);
-    goTo('corriendo');
+    goTo('running');
   }
   watchPhase();
   measure();

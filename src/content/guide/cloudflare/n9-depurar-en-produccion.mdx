@@ -1,0 +1,132 @@
+---
+title: "Trazar y depurar en producción sin degradar el rendimiento"
+description: "La síntesis del nivel: los tres pilares de la observabilidad mapeados a las herramientas de Cloudflare, cómo correlacionar una petición a través del cf-ray y trace ids, y el patrón para instrumentar generosamente sin pagar la factura en latencia usando ctx.waitUntil y derivando la telemetría pesada fuera del camino crítico."
+subject: cloudflare
+level: 9
+order: 5
+position: "9.5"
+duration: "16 min"
+---
+
+<Lead>
+Llegas al final del nivel con cuatro herramientas en la mano: la ventana en vivo de `tail`, la historia persistente de Workers Logs, la telemetría a medida de Analytics Engine y las trazas legibles de los source maps. Falta la disciplina que las une. Depurar en producción en el edge no es adjuntar un debugger —eso ya vimos que es imposible— sino diseñar un sistema que se explique a sí mismo, y hacerlo con una restricción brutal: cada gramo de instrumentación cuesta CPU y latencia que tus usuarios pagan. La maestría de la observabilidad es esta paradoja resuelta: ver mucho, costar poco. Instrumentación tan barata que puedas dejarla siempre encendida, porque la telemetría que apagas para ganar rendimiento es exactamente la que te faltará durante el incidente.
+</Lead>
+
+<Goals>
+
+- Mapear los tres pilares de la observabilidad a las herramientas concretas de Cloudflare.
+- Usar `console.log` estructurado y gestionar excepciones para dejar un rastro accionable.
+- Correlacionar una petición a través del `cf-ray` y de un trace id propagado.
+- Instrumentar sin degradar: mover el coste fuera del camino crítico con `ctx.waitUntil`.
+
+</Goals>
+
+## Los tres pilares en la caja de Cloudflare
+
+La observabilidad clásica se articula en tres pilares, y este nivel te ha dado una herramienta para cada uno. No son intercambiables: cada uno responde una pregunta que los otros responden mal.
+
+<Cards>
+  <Card icon="📜" title="Logs">
+    Qué pasó en una invocación concreta, paso a paso. Los responde Workers Logs (persistente) y `wrangler tail` (en vivo).
+  </Card>
+  <Card icon="📊" title="Métricas">
+    Cuál es la forma agregada de todas las invocaciones: sumas, medias, percentiles. Las responde Analytics Engine.
+  </Card>
+  <Card icon="🧵" title="Trazas">
+    Cómo se conecta una petición consigo misma a través de servicios y subrequests. Las reconstruyes correlacionando por un identificador común.
+  </Card>
+</Cards>
+
+Un incidente real se investiga saltando entre los tres: una métrica en Analytics Engine te dice *que* la latencia subió en una ruta, un log en Workers Logs te dice *qué* pasó en las invocaciones lentas, y la traza correlacionada te dice *dónde* —en qué salto, en qué servicio— se fue el tiempo. Ninguno solo basta.
+
+## `console.log` y excepciones: el rastro básico
+
+El rastro más básico ya lo conoces: `console.log`, `console.warn` y `console.error` los captura tanto `tail` como Workers Logs. La disciplina, de la lección de Workers Logs, es registrar **objetos estructurados** y no frases, para poder consultarlos por campo. A eso se suma la gestión de excepciones, que en un Worker tiene reglas propias.
+
+```ts
+export default {
+  async fetch(request, env, ctx) {
+    const rayId = request.headers.get("cf-ray") ?? "sin-ray";
+    try {
+      return await manejar(request, env);
+    } catch (err) {
+      // Registra el error ENTERO: la plataforma remapea su traza con el source map
+      console.error({ evento: "fallo", rayId, err });
+      // Decide con intencion: propagar (outcome error) o degradar con gracia
+      return new Response("Algo salio mal", { status: 500 });
+    }
+  },
+};
+```
+
+Una excepción no capturada convierte la invocación en un `outcome` de tipo error, visible al instante con `wrangler tail --status error`. Capturarla te da la oportunidad de añadir contexto —el `rayId`, qué operación fallaba— antes de decidir si la propagas o devuelves una respuesta degradada. Registra siempre el objeto de error completo, no solo su mensaje: así la plataforma puede remapear su traza con el source map que subiste en la lección anterior.
+
+## Correlacionar: el `cf-ray` y el trace id
+
+Un log suelto cuenta un fragmento; el valor aparece cuando puedes coser todos los fragmentos de una misma petición. Cloudflare asigna a cada petición un identificador único, el `cf-ray`, disponible en la cabecera del mismo nombre. Si lo incluyes en cada línea de log, puedes filtrar por él en Workers Logs y reconstruir la historia completa de esa invocación.
+
+El salto a **traza distribuida** llega cuando tu Worker llama a otros —service bindings, subrequests, otro Worker—. Propaga un trace id por una cabecera y regístralo en cada eslabón: entonces una sola consulta por ese id te devuelve el recorrido entero a través de todos los servicios, que es lo más parecido a un depurador distribuido que el edge permite.
+
+```ts
+// Genera un trace id al entrar y propagalo a cada subrequest
+const traceId = request.headers.get("x-trace-id") ?? crypto.randomUUID();
+const upstream = await fetch(destino, {
+  headers: { "x-trace-id": traceId },
+});
+console.log({ evento: "subrequest", traceId, estado: upstream.status });
+```
+
+<Mermaid code={`flowchart TD
+  Q[incidente la latencia subio] --> M[metricas en Analytics Engine]
+  M -->|que ruta y cuando| L[logs en Workers Logs filtrados por cf-ray]
+  L -->|que paso dentro| T[traza por trace id entre servicios]
+  T -->|donde se fue el tiempo| R[causa raiz]
+  class M t-yellow
+  class L t-blue
+  class T t-mauve
+  class R t-green`} />
+
+## Instrumentar sin degradar: el efecto observador
+
+Aquí está la restricción que lo gobierna todo. Cada `console.log` consume tiempo de CPU, y hay límites por invocación —al número de líneas y a su tamaño— que un logging exuberante puede rozar. Peor aún: si escribes telemetría de forma bloqueante en el camino de la respuesta, esa latencia la sufre el usuario. Medir perturba lo medido, y en un Worker perturbar significa ir más lento.
+
+El patrón que resuelve la tensión tiene tres movimientos:
+
+```ts
+export default {
+  async fetch(request, env, ctx) {
+    const inicio = Date.now();
+    const respuesta = await manejar(request, env);
+
+    // 1. La telemetria pesada va a Analytics Engine (no bloqueante, casi gratis)
+    env.AE.writeDataPoint({
+      indexes: [new URL(request.url).pathname],
+      doubles: [Date.now() - inicio],
+    });
+
+    // 2. El trabajo diferido se hace con waitUntil: DESPUES de responder
+    ctx.waitUntil(registrarAuditoria(request, respuesta));
+
+    // 3. Devuelve ya; el usuario no espera a la instrumentacion
+    return respuesta;
+  },
+};
+```
+
+Primero, deriva la telemetría de alto volumen a Analytics Engine, cuya escritura es fuego y olvido. Segundo, todo lo que no tenga que ocurrir antes de responder —enviar una auditoría, reenviar un log— envuélvelo en `ctx.waitUntil()`, que mantiene el isolate vivo para terminar ese trabajo **después** de que la respuesta ya viajó al usuario. Tercero, reserva Workers Logs para lo que de verdad quieres consultar, y controla su volumen con el `head_sampling_rate`. El resultado es instrumentación que el usuario no paga en latencia y que tu factura no paga en exceso.
+
+<Callout type="warn" title="La instrumentación que apagas es la que faltará">
+Existe la tentación de instrumentar poco "para no degradar" y encender más telemetría solo cuando aparece un problema. Es una trampa: los problemas no avisan, y cuando llegan, el rastro de los minutos previos —el que explicaría la causa— no existe porque lo tenías apagado. La disciplina correcta es la inversa: haz la instrumentación tan barata (Analytics Engine, `waitUntil`, muestreo) que puedas permitirte dejarla siempre encendida. Una observabilidad que solo enciendes en emergencias es una observabilidad que nunca está cuando la emergencia ocurre.
+</Callout>
+
+<Callout type="dios" title="Observar es diseñar un sistema que se explique solo, y pagar su coste sin que se note">
+El nivel entero orbita alrededor de una renuncia que ya no puede deshacerse: en el edge no hay una máquina a la que entrar, no hay un proceso al que engancharse, no hay un mundo que detener. Tu código vive en cientos de sitios, en isolates que nacen y mueren en milisegundos, y la única forma de saber qué hace es que él mismo te lo cuente mientras corre. Depurar deja de ser un acto de intervención —parar, mirar, tocar— y se convierte en un acto de inferencia: reconstruir lo que pasó a partir de las señales que el sistema emitió. Y aquí está el giro que separa al aficionado del ingeniero: esas señales no aparecen solas, las diseñas tú, de antemano, cuando el sistema todavía funciona y no hay ninguna urgencia que te obligue. La observabilidad no es una herramienta que sacas durante el incidente, es una propiedad que construiste antes: un sistema observable es uno que fue diseñado para explicarse solo, con logs estructurados que se consultan, métricas agregadas que revelan la forma del todo, trazas que cosen una petición a través de cada salto, y errores que hablan tu idioma porque subiste el mapa que los traduce. Pero observar tiene un coste ineludible —medir perturba y consume—, y ahí vive la última competencia del nivel: mover ese coste fuera del camino que el usuario recorre. `ctx.waitUntil` empuja el trabajo detrás de la respuesta; Analytics Engine cobra casi nada por escribir; el muestreo elige cuánta realidad registrar. El objetivo no es medir sin coste, que es imposible, sino pagar el coste donde no se note, para que la instrumentación sea tan barata que jamás tengas que apagarla. Porque la verdad final de la observabilidad es esta: no sirve la que tienes cuando todo va bien, sino la que sigue encendida cuando todo se rompe, y solo sigue encendida la que fue barata desde el principio. Diseña sistemas que se expliquen solos, hazlo antes de necesitarlo, y paga su precio donde el usuario no lo vea. Eso es depurar en el edge, y es, en el fondo, depurar cualquier sistema distribuido que merezca ese nombre.
+</Callout>
+
+<Challenge title="Instrumenta un Worker que se explique solo">
+1. Toma un Worker con al menos una subrequest y genera un trace id al entrar, propágalo por cabecera y regístralo en cada eslabón con logs estructurados.
+2. Incluye el `cf-ray` en cada línea de log y comprueba en Workers Logs que puedes reconstruir una invocación completa filtrando por él.
+3. Mide la latencia con `writeDataPoint` en Analytics Engine y compárala con hacerlo mediante un `console.log`: razona cuál pesa más en el camino crítico.
+4. Envuelve una tarea de auditoría en `ctx.waitUntil` y verifica que la respuesta al usuario no espera a que termine.
+5. Provoca un error, captúralo añadiendo el trace id y el `rayId`, y sigue el rastro entero desde la métrica agregada hasta la traza remapeada, recorriendo los tres pilares.
+</Challenge>

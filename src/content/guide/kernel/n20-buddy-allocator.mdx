@@ -1,0 +1,141 @@
+---
+title: "El buddy allocator: bloques, fusión y fragmentación"
+description: "El asignador de páginas de Linux agrupa marcos en bloques de 2 elevado a n páginas ordenados por orden. Cómo parte un bloque grande para servir uno pequeño, cómo fusiona dos compañeros libres al liberar, y por qué la fragmentación externa es su enemigo natural."
+subject: kernel
+level: 20
+order: 2
+position: "20.2"
+duration: "16 min"
+---
+
+<Lead>
+El buddy allocator es el asignador de páginas físicas de Linux: la fuente última de la que beben slab, vmalloc y el page cache. Su idea es de una simplicidad brutal —gestionar la memoria en bloques de 2^n páginas y emparejar cada bloque con su compañero— y de esa idea nacen a la vez su velocidad, su capacidad de defragmentar y su talón de Aquiles.
+</Lead>
+
+<Goals>
+
+- Entender cómo el buddy organiza la memoria libre en listas por orden.
+- Seguir el reparto (split) de un bloque grande para servir uno pequeño.
+- Seguir la fusión (coalescing) de dos compañeros al liberar.
+- Reconocer la fragmentación externa y las defensas del kernel contra ella.
+
+</Goals>
+
+## Orden, bloques y compañeros
+
+El buddy mantiene, en cada zona, una lista de bloques libres por cada **orden**. Un bloque de orden `n` son exactamente 2^n páginas físicamente contiguas y alineadas a esa potencia. El orden 0 es una página; el orden 10 —máximo por defecto— son 1024 páginas, o 4 MiB:
+
+```c
+/* include/linux/mmzone.h */
+struct free_area {
+	struct list_head	free_list[MIGRATE_TYPES];
+	unsigned long		nr_free;
+};
+
+struct zone {
+	/* ... */
+	struct free_area	free_area[NR_PAGE_ORDERS];  /* MAX_PAGE_ORDER + 1 */
+	/* ... */
+};
+```
+
+`NR_PAGE_ORDERS` es `MAX_PAGE_ORDER + 1`, y `MAX_PAGE_ORDER` vale 10 por defecto. Cada `free_area[o]` encadena por el campo `lru` todos los bloques libres de orden `o`.
+
+El nombre del asignador viene de aquí: cada bloque de orden `o` tiene un único **compañero** (buddy), el bloque adyacente con el que, unidos, forman un bloque alineado de orden `o+1`. Su PFN se calcula con un solo XOR:
+
+```c
+/* mm/page_alloc.c */
+static inline unsigned long
+__find_buddy_pfn(unsigned long page_pfn, unsigned int order)
+{
+	return page_pfn ^ (1 << order);
+}
+```
+
+Invertir el bit número `order` del PFN salta exactamente al compañero: si tienes el bloque par, obtienes el impar de al lado, y viceversa. Esa aritmética de un ciclo es la razón de ser del buddy.
+
+## Repartir: de un bloque grande a uno pequeño
+
+Cuando pides un bloque de orden `low` y esa lista está vacía, el asignador sube de orden en orden hasta hallar un bloque libre, lo saca de su lista y lo **parte** por la mitad repetidamente. Cada mitad sobrante se devuelve a la lista del orden inferior; la otra sigue bajando hasta alcanzar el orden pedido:
+
+```c
+/* mm/page_alloc.c — reparto de un bloque de orden high a orden low (simplificado) */
+static inline void expand(struct zone *zone, struct page *page,
+			  int low, int high, int migratetype)
+{
+	unsigned long size = 1 << high;
+
+	while (high > low) {
+		high--;
+		size >>= 1;
+		/* la mitad alta vuelve a la lista libre del orden inferior */
+		add_to_free_list(&page[size], zone, high, migratetype);
+		set_buddy_order(&page[size], high);
+	}
+}
+```
+
+Pedir una sola página cuando solo hay un bloque de orden 4 disponible genera, como residuo, un bloque libre de orden 3, uno de orden 2, uno de orden 1 y uno de orden 0. El buddy prefiere fragmentar el bloque más pequeño que sirva, para conservar intactos los grandes.
+
+<Mermaid code={`flowchart TD
+  O3[bloque libre orden 3 con 8 paginas] -->|split| A2[orden 2 sigue bajando]
+  O3 -->|residuo| B2[orden 2 vuelve a la lista libre]
+  A2 -->|split| A1[orden 1 sigue bajando]
+  A2 -->|residuo| B1[orden 1 vuelve a la lista libre]
+  A1 -->|split| USO[orden 0 pagina entregada]
+  A1 -->|residuo| B0[orden 0 vuelve a la lista libre]`} />
+
+## Fusionar: el reflejo al liberar
+
+La operación inversa es la que da al buddy su magia antifragmentación. Al liberar un bloque, el asignador mira si su compañero también está libre y es del mismo orden; si lo está, los **fusiona** en un bloque del doble de tamaño, y repite la comprobación subiendo de orden mientras pueda:
+
+```c
+/* mm/page_alloc.c — nucleo de __free_one_page (simplificado) */
+while (order < MAX_PAGE_ORDER) {
+	buddy_pfn = __find_buddy_pfn(pfn, order);
+	buddy = page + (buddy_pfn - pfn);
+
+	if (!page_is_buddy(page, buddy, order))
+		break;			/* el companero no esta libre: paramos */
+
+	del_page_from_free_list(buddy, zone, order);
+	combined_pfn = buddy_pfn & pfn;		/* PFN del bloque fusionado */
+	page = page + (combined_pfn - pfn);
+	pfn = combined_pfn;
+	order++;			/* subimos e intentamos de nuevo */
+}
+set_buddy_order(page, order);
+add_to_free_list(page, zone, order, migratetype);
+```
+
+`page_is_buddy()` es el guardián: solo acepta la fusión si el compañero tiene puesto el flag `PageBuddy` (está en una lista libre), es exactamente del mismo orden y pertenece a la misma zona. Gracias a esta fusión, un patrón de reservas y liberaciones vuelve a dejar la memoria en bloques grandes en cuanto los compañeros coinciden libres, sin ningún barrido explícito.
+
+## Fragmentación externa: el enemigo natural
+
+El buddy elimina casi toda la fragmentación **interna** (el desperdicio dentro de un bloque, acotado a menos de una página por asignación en el peor caso). Su enemigo es la fragmentación **externa**: hay muchas páginas libres, pero dispersas, de modo que ningún conjunto de compañeros llega a fusionarse en el bloque grande que alguien necesita. Puedes tener el 40% de la RAM libre y aun así fallar al pedir un bloque de orden 4.
+
+Linux se defiende con dos armas. La primera es agrupar por **tipo de migración** (`MIGRATE_UNMOVABLE`, `MIGRATE_MOVABLE`, `MIGRATE_RECLAIMABLE`): cada `free_area` tiene una lista por tipo, y el asignador mantiene las páginas movibles juntas y separadas de las inamovibles, de forma que las movibles puedan reubicarse en bloque. La segunda es la **compactación**: el hilo `kcompactd` y la compactación directa migran páginas movibles para liberar bloques contiguos grandes bajo demanda. Puedes auscultar el estado de las listas libres en `/proc/buddyinfo`, que imprime, por zona, cuántos bloques libres hay en cada orden:
+
+```bash
+$ cat /proc/buddyinfo
+Node 0, zone   Normal   1834   1290    742    301    118   44   12    3   1   0   0
+#                        ord0   ord1   ord2   ord3  ...                       ord10
+```
+
+Una fila con números altos a la izquierda y ceros a la derecha es el retrato de la fragmentación externa: abundan las páginas sueltas, escasean los bloques grandes.
+
+<Callout type="info" title="El pageblock y /proc/pagetypeinfo">
+El tipo de migración no se guarda por página, sino por **pageblock**: un tramo grande —típicamente el tamaño de una página enorme, 2 MiB en x86-64— que comparte un mismo `MIGRATE_*`. Agrupar en bloques tan grandes es lo que permite que la compactación reúna extensiones contiguas de páginas movibles. Puedes ver el desglose con `cat /proc/pagetypeinfo`, que muestra, por zona y por orden, cuántos bloques libres hay de cada tipo de migración: una lente más fina que `/proc/buddyinfo` para diagnosticar por qué falla una asignación de orden alto pese a haber memoria libre.
+</Callout>
+
+<Callout type="dios" title="Un XOR sostiene la memoria del planeta">
+Mira la fusión de nuevo y date cuenta de lo que estás viendo: la contabilidad de toda la memoria física de Linux —desde un router doméstico hasta un servidor con terabytes— descansa sobre la identidad `buddy_pfn = pfn ^ (1 << order)`. Esa sola línea garantiza que el compañero de un bloque es único, que fusionar es asociativo y que un bloque alineado de orden `n` solo puede formarse de una manera. No hay tablas auxiliares, no hay búsqueda: el orden se guarda en `page->private`, el flag `PageBuddy` marca lo libre, y un XOR encuentra al vecino. De esa economía nacen las tres propiedades que hacen viable un sistema operativo de propósito general: asignación en tiempo casi constante, defragmentación automática al liberar y un límite duro y demostrable a la fragmentación interna. Y de la misma economía nace su límite: la fragmentación externa, que el kernel no puede abolir, solo combatir con migración y compactación. Entender esta tensión —simplicidad radical a cambio de una fragilidad acotada— es entender por qué encima del buddy hicieron falta slab para los objetos pequeños y compactación para las páginas enormes. El buddy no es un detalle de implementación: es la decisión de diseño de la que cuelga todo el subsistema de memoria.
+</Callout>
+
+<Challenge title="Observa al buddy partir y fusionar">
+1. Lee `/proc/buddyinfo` en reposo y anota el perfil de órdenes de la zona Normal.
+2. Desde un módulo, reserva un bloque grande con `alloc_pages(GFP_KERNEL, 4)` y vuelve a leer `/proc/buddyinfo`: localiza la fila que cambió.
+3. Libera el bloque con `__free_pages(page, 4)` y comprueba cómo la fusión reconstruye órdenes altos.
+4. Escribe en papel el PFN del compañero de un bloque de orden 2 cuyo primer PFN sea 0x3C000, aplicando el XOR.
+5. Provoca fragmentación reservando muchas páginas de orden 0 salteadas y observa cómo caen los órdenes altos en `/proc/buddyinfo`.
+</Challenge>

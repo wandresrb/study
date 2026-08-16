@@ -1,0 +1,165 @@
+---
+title: "El ecosistema: bpftrace, libbpf, CO-RE y el mundo real"
+description: "De la exploración a la producción: bpftrace para responder preguntas en una línea, BCC como framework histórico, y libbpf con CO-RE (Compile Once Run Everywhere) para binarios portables entre kernels gracias a BTF. Y los usos reales que hoy sostienen la nube: Cilium, Falco, balanceadores y observabilidad."
+subject: kernel
+level: 50
+order: 5
+position: "50.5"
+duration: "16 min"
+---
+
+<Lead>
+Ya sabes qué es la máquina virtual, cómo se demuestra segura, dónde se engancha y cómo guarda estado. Falta lo que convierte todo eso en algo que un ingeniero usa a diario: el ecosistema. Aquí conviven tres capas de abstracción —desde una línea de `bpftrace` que responde una pregunta en segundos hasta un binario de producción con `libbpf` que corre idéntico en miles de kernels distintos— y una tecnología, CO-RE, que resolvió el problema que durante años impidió que eBPF saliera del laboratorio. Y por encima de todo, los sistemas reales que ya no se entienden sin eBPF: la red de Kubernetes, la seguridad en tiempo de ejecución, los balanceadores de la nube.
+</Lead>
+
+<Goals>
+
+- Situar las tres capas del ecosistema: `bpftrace`, BCC y `libbpf`.
+- Escribir observabilidad de una línea con `bpftrace`.
+- Entender CO-RE y BTF: por qué un binario compilado una vez corre en cualquier kernel.
+- Reconocer los usos reales que sostienen la infraestructura moderna.
+
+</Goals>
+
+## Tres capas de abstracción
+
+El ecosistema se ordena por cuánta ceremonia exige. En lo más alto, `bpftrace`: un lenguaje de dominio específico, heredero de DTrace y `awk`, para escribir observabilidad en una sola línea. En medio, BCC —la *BPF Compiler Collection*—, un framework en Python y C++ que compila C en el arranque y trae decenas de herramientas legendarias como `execsnoop` o `biolatency`; su talón de Aquiles es que necesita un compilador y las cabeceras del kernel *en la máquina de destino*, en tiempo de ejecución. Y en la base, `libbpf`: la biblioteca C canónica, que vive en el árbol del kernel y carga programas portables sin compilar nada en destino. La regla práctica: `bpftrace` para explorar, `libbpf` para producir.
+
+## bpftrace: observabilidad de una línea
+
+Cuando quieres una respuesta ya —qué proceso abre qué fichero, cómo se distribuyen los tamaños de lectura, dónde gasta la CPU— `bpftrace` es imbatible. Compila tu expresión a bytecode eBPF, lo carga, agrega en mapas y te da el resultado:
+
+```bash
+# quién abre qué fichero, en vivo
+bpftrace -e 'tracepoint:syscalls:sys_enter_openat {
+    printf("%-16s %s\n", comm, str(args.filename)); }'
+
+# histograma del tamaño de las lecturas de fichero
+bpftrace -e 'kprobe:vfs_read { @ = hist(arg2); }'
+
+# perfil de CPU: pilas del kernel muestreadas a 99 Hz
+bpftrace -e 'profile:hz:99 { @[kstack] = count(); }'
+```
+
+La salida es igual de directa. El histograma anterior, que agrega en un mapa del kernel y se dibuja al terminar, tiene esta forma:
+
+```text
+@:
+[16, 32)          12 |@@@                                     |
+[32, 64)           4 |@                                       |
+[64, 128)        128 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[128, 256)        96 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@            |
+[256, 512)        21 |@@@@@@                                  |
+```
+
+Cada una de esas líneas de `bpftrace` es un programa eBPF completo —con su verificación, su JIT y sus mapas— comprimido en una sintaxis que cabe en un tuit. Esa es la potencia de la capa alta: el poder del kernel programable sin escribir una sola línea de C.
+
+## BCC: el framework que lo empezó todo
+
+Cuando una pregunta no cabe en una línea pero tampoco justifica un binario de producción, la capa intermedia es BCC. Combina un fragmento de C para el kernel con un guion en Python que lo compila al vuelo, lo carga, gestiona los mapas y presenta los resultados. Es el marco que popularizó eBPF y del que salieron las herramientas de observabilidad más usadas del mundo Linux:
+
+```python
+from bcc import BPF
+
+programa = r"""
+int cuenta_exec(void *ctx) {
+    bpf_trace_printk("execve\n");
+    return 0;
+}
+"""
+
+b = BPF(text=programa)
+b.attach_kprobe(event=b.get_syscall_fnname("execve"), fn_name="cuenta_exec")
+b.trace_print()   # imprime lo que el kernel emite por bpf_trace_printk
+```
+
+Su comodidad tiene un precio: BCC arrastra Clang y LLVM *en la máquina de destino* y compila en cada arranque, lo que consume memoria, tarda y exige tener a mano las cabeceras del kernel. Ese defecto es, precisamente, el que la siguiente capa vino a corregir.
+
+## CO-RE: compila una vez, corre en cualquier kernel
+
+El gran problema histórico de eBPF era la portabilidad. Un programa lee campos de estructuras internas del kernel, y el desplazamiento de esos campos cambia entre versiones y configuraciones. BCC lo resolvía compilando en cada máquina, con el compilador y las cabeceras presentes en destino: lento, frágil y pesado. **CO-RE** —*Compile Once, Run Everywhere*— lo resolvió de raíz, y descansa en tres piezas.
+
+La primera es **BTF**, el *BPF Type Format*: información de tipos compacta que el kernel moderno publica de sí mismo en `/sys/kernel/btf/vmlinux` cuando se compila con `CONFIG_DEBUG_INFO_BTF`. La segunda es `vmlinux.h`, un único cabezal generado desde ese BTF que contiene *todos* los tipos del kernel sin necesidad de sus fuentes:
+
+```bash
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+clang -O2 -g -target bpf -c minimal.bpf.c -o minimal.bpf.o
+bpftool gen skeleton minimal.bpf.o > minimal.skel.h
+```
+
+La tercera son las **reubicaciones**: cuando lees un campo con `BPF_CORE_READ`, el compilador no fija el desplazamiento, sino que anota *qué campo* querías. Al cargar, `libbpf` compara con el BTF del kernel real y reescribe cada acceso con el desplazamiento correcto de esa máquina concreta:
+
+```c
+/* el desplazamiento de i_ino se resuelve al cargar, no al compilar */
+u64 inodo = BPF_CORE_READ(file, f_inode, i_ino);
+```
+
+<Mermaid code={`flowchart LR
+  B[BTF del kernel destino] --> H[vmlinux.h generado]
+  H --> K[clang compila una sola vez]
+  K --> O[objeto bpf con reubicaciones CO-RE]
+  O --> L[libbpf reajusta desplazamientos al cargar]
+  L --> R[el mismo binario corre en cualquier kernel]`} />
+
+El resultado es un binario pequeño, sin compilador ni cabeceras en destino, que se carga en un kernel de 2019 o en uno de 2026 y funciona en ambos. `libbpf` genera además un *esqueleto* —el `.skel.h`— que da al programa de usuario funciones tipadas para abrir, cargar y enganchar:
+
+```c
+#include "minimal.skel.h"
+
+int main(void)
+{
+	struct minimal_bpf *skel = minimal_bpf__open_and_load();  /* verifica y reubica */
+	if (!skel)
+		return 1;
+	if (minimal_bpf__attach(skel))         /* engancha cada SEC() a su gancho */
+		goto limpiar;
+
+	/* ... consumir el ring buffer hasta recibir señal de parada ... */
+
+limpiar:
+	minimal_bpf__destroy(skel);
+	return 0;
+}
+```
+
+El esqueleto separa el ciclo de vida en etapas nítidas: `open` lee el objeto y prepara la configuración, `load` dispara la verificación y las reubicaciones CO-RE, `attach` engancha cada programa a su gancho, y `destroy` lo desmonta todo. Entre `open` y `load` puedes ajustar parámetros —redimensionar mapas, fijar variables globales de solo lectura que el verificador tratará como constantes—, lo que permite el mismo binario configurable sin recompilar. Y si prefieres Rust a C, `libbpf-rs` y el marco Aya ofrecen la misma potencia con las garantías de tipos y memoria de ese lenguaje.
+
+## De la herramienta al ecosistema: usos reales
+
+eBPF dejó de ser una curiosidad hace años; hoy es infraestructura crítica. En la red de contenedores, **Cilium** implementa el plano de datos de Kubernetes enteramente en eBPF, sustituyendo a `kube-proxy` y a las cadenas de `iptables` por programas XDP y tc; su componente Hubble da observabilidad de red y Tetragon aplica políticas de seguridad. En seguridad en tiempo de ejecución, **Falco** detecta comportamientos anómalos de llamadas al sistema. En balanceo de carga, **Katran** de Meta reparte millones de conexiones con XDP, y **Cloudflare** mitiga ataques de denegación de servicio descartando paquetes en el driver antes de que toquen la pila.
+
+La observabilidad vive un renacimiento paralelo. Perfiladores continuos como **Parca** y **Pixie** muestrean pilas con eBPF para dibujar dónde gasta CPU una flota entera sin instrumentar el código, y proyectos como **Grafana Beyla** extraen métricas de aplicaciones —latencias, tasas, trazas— sin tocar sus binarios. El patrón es siempre el mismo: un programa que agrega en el kernel y un plano de control que lee el resultado, exactamente la arquitectura de mapas del nivel anterior. Que industrias que compiten entre sí —proveedores de nube, fabricantes de seguridad, plataformas de observabilidad— convergieran todas en la misma base no es casualidad: es la señal de que eBPF resolvió un problema estructural que ninguna de ellas podía resolver por su cuenta.
+
+<Cards>
+  <Card icon="🕸️" title="Red y conectividad">
+    Cilium reemplaza `kube-proxy` e `iptables` en Kubernetes; Katran y los balanceadores de la nube reparten carga con XDP a velocidad de línea.
+  </Card>
+  <Card icon="🛡️" title="Seguridad">
+    Falco y Tetragon observan y aplican políticas sobre llamadas al sistema y hooks LSM, detectando y bloqueando comportamientos indebidos en caliente.
+  </Card>
+  <Card icon="🔭" title="Observabilidad">
+    Perfiladores continuos como Parca, y las herramientas de BCC y `bpftrace`, miden latencias, pilas y E/S sin recompilar ni reiniciar nada.
+  </Card>
+  <Card icon="⚙️" title="Plataforma">
+    `systemd` controla el acceso a dispositivos por cgroup con eBPF; la contabilidad de tráfico y mil integraciones más lo dan ya por sentado.
+  </Card>
+</Cards>
+
+<Callout type="info" title="bpftool, la navaja suiza">
+Bajo todo el ecosistema está `bpftool`: inspecciona programas y mapas cargados (`bpftool prog`, `bpftool map`), vuelca el BTF del kernel, genera esqueletos y cabezales, y sondea qué características de eBPF soporta tu kernel con `bpftool feature probe`. Es la herramienta que usarás para ver qué corre de verdad dentro del núcleo.
+</Callout>
+
+<Callout type="note" title="eBPF ya no es solo de Linux">
+La tecnología maduró hasta institucionalizarse. La eBPF Foundation, bajo la Linux Foundation, agrupa a Meta, Google, Isovalent, Microsoft y Netflix para gobernar el proyecto y estandarizar la máquina virtual como una especificación independiente del sistema operativo. Existe ya un tiempo de ejecución de eBPF para Windows, y el bytecode se trata como un formato portable con derecho propio. Lo que nació como un filtro de paquetes de Unix va camino de ser un estándar de cómputo seguro en el kernel, sea cual sea ese kernel.
+</Callout>
+
+<Callout type="dios" title="eBPF es Linux aprendiendo a reprogramarse a sí mismo sin detenerse">
+Alza la vista y contempla el arco completo que acabas de recorrer, porque cierra no solo este nivel sino la idea entera del track. Empezaste el kernel como algo que se compila: un artefacto monolítico que, para cambiar, había que reconstruir y reiniciar, deteniendo el mundo. eBPF es la culminación de un movimiento opuesto: el kernel que se reprograma en caliente, sin pararse, sin arriesgarse, mientras sirve tráfico de producción. Y las cinco piezas de este nivel encajan ahora en una sola figura. La máquina virtual da un sustrato de cómputo universal; el verificador convierte la confianza en demostración y permite ejecutar código ajeno en anillo 0; los ganchos ofrecen puntos de injerto por todo el núcleo; los mapas cosen el plano de datos rápido del kernel con el plano de control flexible del usuario; y el ecosistema —CO-RE, `libbpf`, `bpftrace`— hace que todo eso sea portable, distribuible y usable por millones de personas. Junta las cinco y tienes algo que no existía en la informática de sistemas: una forma segura, dinámica y universal de extender el sistema operativo desde fuera, que las mayores infraestructuras del planeta ya dan por sentada. Por eso la red de Kubernetes, la seguridad de los contenedores, los balanceadores de la nube y la observabilidad moderna convergieron todos, sin ponerse de acuerdo, en la misma tecnología. No fue una moda: fue el reconocimiento colectivo de que el kernel había dejado de ser una fortaleza cerrada para volverse una plataforma programable, y de que quien dominara esa plataforma dominaría la próxima década de la infraestructura. Has llegado al final del mapa que empezó en el primer módulo. El kernel ya no es para ti una caja negra que se configura, sino un sistema vivo que puedes leer, extender y reprogramar con seguridad demostrada. Eso, y no otra cosa, es ser nivel dios del kernel de Linux.
+</Callout>
+
+<Challenge title="Del one-liner al binario de producción">
+1. Responde tres preguntas de tu sistema con `bpftrace`: qué ficheros se abren más, cómo se distribuye la latencia de un `kprobe` que elijas, y dónde gasta la CPU con un perfil de pilas.
+2. Genera `vmlinux.h` con `bpftool btf dump`, compila un programa mínimo con CO-RE y produce su esqueleto con `bpftool gen skeleton`.
+3. Escribe el cargador con `libbpf` usando el esqueleto, engánchalo y consume su ring buffer; luego cópialo a otra máquina con distinto kernel y demuestra que corre sin recompilar.
+4. Elige un sistema real —Cilium, Falco o un balanceador XDP— y explica cuál de las cinco piezas de este nivel (máquina, verificador, ganchos, mapas, ecosistema) sostiene cada una de sus capacidades.
+</Challenge>

@@ -1,0 +1,152 @@
+---
+title: "Un wrapper seguro sobre una API C: imposible de usar mal"
+description: "El patrón central, completo y en funcionamiento: envolver una API C cruda —un manejador opaco con crear, usar y liberar— en un tipo Rust cuyo `Drop`, `NonNull` y firmas con `&self` y `&mut self` hacen que el doble free, el use-after-free y el puntero nulo sean imposibles de expresar desde código seguro. Rust 2024 con `unsafe extern`."
+subject: rust
+level: 40
+order: 3
+position: "40.3"
+duration: "24 min"
+---
+
+<Lead>
+Una API C típica es un campo de minas: te da un manejador opaco con una función `crear`, te obliga a llamar a `liberar` exactamente una vez, y castiga con comportamiento indefinido cualquier desliz —liberar dos veces, usar tras liberar, olvidar comprobar el nulo—. En C esas obligaciones viven en la cabeza del programador y en los comentarios. En Rust las trasladamos al sistema de tipos: un `Drop` que libera una sola vez, un `NonNull` que descarta el nulo en la frontera, y firmas con `&self` y `&mut self` que dejan que el borrow checker prohíba el use-after-free. El resultado es un tipo cuya API pública es, literalmente, imposible de usar mal. Este es el patrón central, completo y en funcionamiento.
+</Lead>
+
+<Goals>
+
+- Declarar una API C con `unsafe extern "C"` y un tipo opaco, al estilo Rust 2024.
+- Envolver el manejador en un `NonNull` que elimina el nulo en el constructor.
+- Liberar el recurso exactamente una vez desde `Drop`, sin doble free ni fugas.
+- Argumentar por qué cada categoría de error C se vuelve inexpresable en la API segura.
+
+</Goals>
+
+## La API C cruda
+
+Supongamos una librería en C que ofrece un almacén clave-valor a través de un contexto opaco. Su cabecera declara cuatro funciones y un tipo del que no conocemos el interior. En Rust 2024 los bloques `extern` son `unsafe extern`, porque enlazar con símbolos externos es en sí una promesa que el compilador no puede verificar:
+
+```rust
+use std::ptr::NonNull;
+
+// Tipo opaco: solo lo manejamos por puntero, nunca por valor.
+#[repr(C)]
+struct Contexto {
+    _priv: [u8; 0],
+}
+
+unsafe extern "C" {
+    fn ctx_new() -> *mut Contexto;
+    fn ctx_free(c: *mut Contexto);
+    fn ctx_put(c: *mut Contexto, clave: u32, valor: u32) -> i32;
+    fn ctx_get(c: *const Contexto, clave: u32, salida: *mut u32) -> i32;
+}
+```
+
+Usar estas funciones directamente exige `unsafe` en cada llamada y recuerda cada contrato de memoria a mano. Nuestro trabajo es envolverlas una sola vez.
+
+## El wrapper que posee el recurso
+
+El tipo público guarda el manejador como `NonNull<Contexto>` —jamás un puntero que pudiera ser nulo— y el campo es **privado**, la frontera que impide manipularlo desde fuera:
+
+```rust
+pub struct Almacen {
+    ptr: NonNull<Contexto>,
+}
+
+impl Almacen {
+    pub fn new() -> Option<Almacen> {
+        // SAFETY: ctx_new no tiene precondiciones; devuelve null si falla
+        let bruto = unsafe { ctx_new() };
+        // NonNull::new convierte el nulo en None: el error C se vuelve un Option
+        NonNull::new(bruto).map(|ptr| Almacen { ptr })
+    }
+
+    pub fn insertar(&mut self, clave: u32, valor: u32) -> bool {
+        // SAFETY: ptr viene de ctx_new y sigue vivo (Drop no ha corrido);
+        // &mut self da el acceso exclusivo que la API C presupone
+        unsafe { ctx_put(self.ptr.as_ptr(), clave, valor) == 0 }
+    }
+
+    pub fn obtener(&self, clave: u32) -> Option<u32> {
+        let mut salida = 0u32;
+        // SAFETY: ptr valido; &raw mut salida apunta a un u32 escribible
+        let codigo = unsafe { ctx_get(self.ptr.as_ptr(), clave, &raw mut salida) };
+        (codigo == 0).then_some(salida)
+    }
+}
+
+impl Drop for Almacen {
+    fn drop(&mut self) {
+        // SAFETY: ptr viene de ctx_new y no se libero antes; se libera una sola vez
+        unsafe { ctx_free(self.ptr.as_ptr()); }
+    }
+}
+```
+
+Fíjate en `&raw mut salida`: el operador de referencia cruda de Rust 2024, que obtiene un `*mut u32` sin pasar por una referencia intermedia. Y observa que ninguna firma pública contiene `unsafe`: quien use `Almacen` escribe Rust seguro de principio a fin.
+
+## Por qué cada error C se vuelve inexpresable
+
+<Cards>
+  <Card icon="♻️" title="Doble liberación: imposible">
+    `ctx_free` solo se llama desde `Drop`, y `Drop` corre una vez por valor. El campo `ptr` es privado, así que nadie puede liberar a mano. Mover el `Almacen` transfiere la propiedad; el enlace antiguo queda inutilizable.
+  </Card>
+  <Card icon="⛓️" title="Use-after-free: imposible">
+    Tras mover o soltar el `Almacen`, el borrow checker prohíbe volver a usarlo. No hay forma de conservar el manejador crudo: nunca se expone.
+  </Card>
+  <Card icon="🕳️" title="Puntero nulo: imposible">
+    El constructor convierte el nulo en `None` con `NonNull::new`. Si tienes un `Almacen`, tienes un puntero válido, garantizado por el tipo.
+  </Card>
+  <Card icon="🔀" title="Aliasing indebido: imposible">
+    Mutar exige `&mut self`, es decir, acceso exclusivo. El borrow checker impide que dos partes del programa muten el mismo contexto a la vez, que es justo lo que la API C daba por sentado sin poder exigirlo.
+  </Card>
+</Cards>
+
+La clave está en que cada garantía no es una convención ni un comentario: es una propiedad del tipo que el compilador verifica. El usuario **no puede** escribir el programa incorrecto porque el código sencillamente no compila.
+
+```rust
+fn ejemplo() {
+    let mut a = Almacen::new().expect("sin memoria");
+    a.insertar(1, 100);
+    let b = a;                 // la propiedad se mueve a b
+    // a.insertar(2, 200);     // ERROR de compilacion: a fue movido
+    assert_eq!(b.obtener(1), Some(100));
+} // aqui corre Drop de b: ctx_free una sola vez, sin fuga
+```
+
+<Callout type="info" title="Send y Sync: el default seguro que casi nunca debes tocar">
+Como `Almacen` contiene un `NonNull`, que es `!Send` y `!Sync`, el propio `Almacen` hereda ese `!Send + !Sync` automáticamente. Es el default correcto: Rust asume que un recurso C **no** es seguro de compartir entre hilos mientras no se demuestre lo contrario. Solo si la documentación de la librería garantiza la seguridad en concurrencia deberías añadir `unsafe impl Send for Almacen {}` —y esa palabra `unsafe` es la señal de que estás firmando una promesa que el compilador no puede comprobar por ti—. No la firmes a la ligera.
+</Callout>
+
+<Callout type="tip" title="Atar el préstamo a la vida del padre con PhantomData">
+Si tu wrapper entrega punteros internos —un cursor, una vista sobre datos que posee el contexto— el peligro renace: ese puntero no debe sobrevivir al `Almacen`. La solución idiomática es devolver una referencia con lifetime atado al padre, o un tipo con `PhantomData<&'a Almacen>`, de modo que el borrow checker impida que la vista dure más que el contexto que la respalda. Así extiendes el patrón: no solo el recurso raíz, también sus derivados quedan gobernados por lifetimes.
+</Callout>
+
+<Mermaid code={`flowchart LR
+  subgraph C[API C cruda]
+    N1[ctx_new devuelve puntero o nulo] --> U1[usar exige recordar cada contrato]
+    U1 --> F1[liberar a mano exactamente una vez]
+  end
+  subgraph R[Wrapper Rust seguro]
+    N2[new devuelve Option NonNull] --> U2[metodos con self y mut self]
+    U2 --> F2[Drop libera una sola vez automatico]
+  end
+  C -->|se encapsula en| R
+  class C t-red
+  class R t-green`} />
+
+<Callout type="dios" title="RAII es la reificación de la propiedad: el tipo se convierte en la prueba de que el contrato C se honra en cada camino">
+Lo que has construido merece ser visto por lo que es: una traducción de un contrato informal —el que vive en la documentación de la librería C— a un teorema que el compilador demuestra por ti en cada ejecución posible. En C, la corrección de este código depende de una conjunción frágil: que el programador recuerde comprobar el nulo, que libere una vez y solo una, que no use el manejador tras liberarlo, que no lo comparta entre hilos si la librería no lo permite. Cada uno de esos "que" es un punto de fallo, y la suma de todos ellos, repetida en cada sitio de uso, es la razón por la que las fugas y los doble free son endémicos en el software de sistemas. Rust no te pide ser más cuidadoso: te pide **codificar el contrato en el tipo una sola vez** y deja que la estructura del lenguaje lo imponga en todas partes. El `Drop` es la propiedad hecha mecanismo: la garantía de que "este recurso se libera exactamente cuando su dueño muere" deja de ser una promesa y se convierte en una consecuencia de la semántica de movimiento. El `NonNull` es la ausencia de nulo hecha tipo: no un chequeo que recuerdas, sino una propiedad que no puedes perder. Y las firmas con `&self` y `&mut self` son el aliasing hecho gramática: el acceso exclusivo que la API C suponía sin poder exigir, aquí lo exige el borrow checker en tu nombre. La consecuencia es epistemológica, no solo práctica: para confiar en que este wrapper es correcto no necesitas auditar a sus usuarios —pueden ser un millón y ninguno escribe `unsafe`—, basta con auditar las pocas líneas del núcleo. Has convertido una propiedad distribuida e inverificable en una propiedad local y demostrada. Eso es lo que significa, en su forma más pura, envolver lo inseguro en lo seguro: no esconder el peligro, sino domesticarlo tras una frontera que ninguna mano legítima puede cruzar.
+</Callout>
+
+<Callout type="note" title="Lo esencial del wrapper seguro">
+En Rust 2024 declaras la API con `unsafe extern "C"` y un tipo opaco (`_priv: [u8; 0]`). Guardas el manejador en un `NonNull` privado: el constructor convierte el nulo en `None`, `Drop` llama a `ctx_free` una sola vez, y los métodos usan `&self` o `&mut self`. Con eso, el doble free, el use-after-free, el puntero nulo y el aliasing indebido se vuelven inexpresables desde código seguro. El campo `!Send + !Sync` por defecto es el correcto; solo un `unsafe impl` documentado lo cambia. Para punteros internos, ata el préstamo con lifetimes o `PhantomData`.
+</Callout>
+
+<Challenge title="Haz imposible el uso incorrecto">
+1. Declara la API C con `unsafe extern "C"` y explica por qué en Rust 2024 el bloque `extern` lleva `unsafe`.
+2. Implementa `Almacen` con `NonNull` y `Drop`. Escribe el programa que intenta usar `a` tras `let b = a;` y transcribe el error del compilador.
+3. Justifica con una frase cada casilla del cuadro: por qué el doble free, el use-after-free, el nulo y el aliasing son inexpresables.
+4. Añade un `unsafe impl Send for Almacen {}` y redacta el comentario `// SAFETY:` que lo justificaría. ¿Qué tendría que garantizar la librería C para que fuera honesto?
+5. Diseña un método `cursor(&self)` que devuelva una vista con lifetime atado a `&self`. Explica qué error evita ese lifetime respecto a devolver un puntero crudo.
+</Challenge>

@@ -1,0 +1,141 @@
+---
+title: "Descriptores USB y la enumeración"
+description: "Cómo un dispositivo USB se describe a sí mismo con un árbol de descriptores (device, configuration, interface, endpoint) que lleva en ROM, la coreografía de la enumeración por la que el host lo lee y le asigna una dirección, y cómo un driver accede a esos descriptores con interface->cur_altsetting y los helpers usb_endpoint_*."
+subject: kernel
+level: 31
+order: 2
+position: "31.2"
+duration: "15 min"
+---
+
+<Lead>
+Un dispositivo USB no necesita que instales nada porque trae su propio manual grabado en ROM: un árbol de descriptores que responde a las dos únicas preguntas del host, quién eres y qué sabes hacer. La enumeración es la coreografía por la que el host lee ese árbol, asigna una dirección y elige un driver, todo antes de que fluya un solo byte de datos reales. Descriptores y enumeración son las dos caras de la autodescripción que hace universal a USB.
+</Lead>
+
+<Goals>
+
+- Conocer la jerarquía de descriptores: device, configuration, interface, endpoint y strings.
+- Leer los campos clave de cada descriptor y por qué van en little-endian.
+- Seguir la coreografía de la enumeración paso a paso.
+- Acceder a los descriptores desde un driver con `interface->cur_altsetting` y los helpers `usb_endpoint_*`.
+
+</Goals>
+
+## La jerarquía de descriptores
+
+En la raíz está el **descriptor de dispositivo**, uno solo por aparato. Declara la identidad (`idVendor`, `idProduct`, `bcdDevice`), la clase, el tamaño máximo de paquete del endpoint 0 y cuántas configuraciones ofrece. Colgando de él, uno o más **descriptores de configuración**, y aquí hay un detalle físico crucial: al pedir una configuración, el dispositivo devuelve un **bloque contiguo** que incluye, uno tras otro, la configuración, sus interfaces y los endpoints de cada interfaz. El campo `wTotalLength` dice cuántos bytes ocupa el bloque entero.
+
+```c
+/* include/uapi/linux/usb/ch9.h — el descriptor raiz, 18 bytes */
+struct usb_device_descriptor {
+	__u8  bLength;
+	__u8  bDescriptorType;     /* USB_DT_DEVICE = 0x01 */
+	__le16 bcdUSB;             /* version del estandar, p. ej. 0x0320 */
+	__u8  bDeviceClass;
+	__u8  bDeviceSubClass;
+	__u8  bDeviceProtocol;
+	__u8  bMaxPacketSize0;     /* tam. maximo del endpoint 0 */
+	__le16 idVendor;
+	__le16 idProduct;
+	__le16 bcdDevice;
+	__u8  iManufacturer;       /* indice a un string descriptor */
+	__u8  iProduct;
+	__u8  iSerialNumber;
+	__u8  bNumConfigurations;
+} __attribute__ ((packed));
+```
+
+Los **string descriptors** guardan los textos legibles (fabricante, producto, número de serie) en UTF-16LE, referenciados por índice desde los demás descriptores. No son datos: son etiquetas para humanos.
+
+## Little-endian y los campos que importan
+
+Todo campo multibyte viaja por el cable en **little-endian**, sin importar la arquitectura del host; por eso el kernel los tipa como `__le16` y obliga a convertirlos con `le16_to_cpu` antes de usarlos como enteros (nivel 3.2 sobre endianness). Los tres campos que más manejarás viven en el **descriptor de endpoint**:
+
+```c
+struct usb_endpoint_descriptor {
+	__u8  bLength;
+	__u8  bDescriptorType;    /* USB_DT_ENDPOINT = 0x05 */
+	__u8  bEndpointAddress;   /* bit 7 = direccion, bits 0..3 = numero */
+	__u8  bmAttributes;       /* bits 0..1 = tipo de transferencia */
+	__le16 wMaxPacketSize;    /* bytes por paquete */
+	__u8  bInterval;          /* periodo de sondeo (int/iso) */
+} __attribute__ ((packed));
+```
+
+`bEndpointAddress` empaqueta dos cosas: el bit 7 marca la dirección (activo, `IN`, del dispositivo al host; apagado, `OUT`), y los cuatro bits bajos, el número de endpoint. `bmAttributes` codifica en sus dos bits bajos cuál de los cuatro tipos de transferencia habla este endpoint (nivel 31.5). Y `bInterval` fija cada cuánto lo sondea el host. La interfaz que contiene esos endpoints se describe así:
+
+```c
+struct usb_interface_descriptor {
+	__u8  bLength;
+	__u8  bDescriptorType;    /* USB_DT_INTERFACE = 0x04 */
+	__u8  bInterfaceNumber;
+	__u8  bAlternateSetting;
+	__u8  bNumEndpoints;      /* sin contar el endpoint 0 */
+	__u8  bInterfaceClass;    /* HID, Mass Storage, Audio... */
+	__u8  bInterfaceSubClass;
+	__u8  bInterfaceProtocol;
+	__u8  iInterface;
+} __attribute__ ((packed));
+```
+
+## La enumeración paso a paso
+
+Cuando el hub detecta una conexión, avisa al host y arranca una secuencia estricta de peticiones de control sobre el endpoint 0 (nivel 31.5). El dispositivo empieza mudo en la dirección por defecto 0 y termina configurado y con dirección propia.
+
+<Mermaid code={`sequenceDiagram
+  participant H as Host xHCI
+  participant D as Dispositivo
+  H->>D: Reset del puerto
+  H->>D: GET_DESCRIPTOR device primeros 8 bytes
+  D-->>H: bMaxPacketSize0
+  H->>D: SET_ADDRESS asigna 1..127
+  H->>D: GET_DESCRIPTOR device completo
+  H->>D: GET_DESCRIPTOR configuration wTotalLength
+  D-->>H: bloque config mas interfaces mas endpoints
+  H->>D: SET_CONFIGURATION activa la config`} />
+
+Tras el reset, el host lee los primeros ocho bytes del descriptor de dispositivo solo para averiguar `bMaxPacketSize0`, porque de ese tamaño depende cómo trocear las peticiones siguientes. Luego asigna la dirección con `SET_ADDRESS`, relee los descriptores completos, y el hilo de trabajo del hub (`hub_wq` dentro de `usbcore`) construye el `struct usb_device`, empareja un driver por cada interfaz según la `usb_device_id` table (nivel 31.3) y termina con `SET_CONFIGURATION`, que deja al dispositivo en estado *configured* y listo para transferir datos.
+
+## Leer descriptores desde el driver
+
+Cuando `usbcore` llama a tu `.probe`, la enumeración ya ocurrió: recibes la interfaz con su *alternate setting* activo en `intf->cur_altsetting`, y desde ahí recorres los endpoints. Los helpers `usb_endpoint_*` evitan manosear bits a mano:
+
+```c
+struct usb_host_interface *alt = intf->cur_altsetting;
+struct usb_endpoint_descriptor *epd;
+int i;
+
+for (i = 0; i < alt->desc.bNumEndpoints; i++) {
+	epd = &alt->endpoint[i].desc;
+	if (usb_endpoint_is_bulk_in(epd))
+		dev_info(&intf->dev, "bulk-in ep 0x%02x, mps %u\n",
+			 epd->bEndpointAddress, usb_endpoint_maxp(epd));
+}
+```
+
+En un driver moderno rara vez escribes ese bucle: `usb_find_common_endpoints` localiza de una vez los endpoints bulk e interrupt de la interfaz, devolviendo `-errno` si falta alguno esperado:
+
+```c
+struct usb_endpoint_descriptor *bulk_in, *bulk_out;
+int ret;
+
+ret = usb_find_common_endpoints(intf->cur_altsetting,
+				&bulk_in, &bulk_out, NULL, NULL);
+if (ret)
+	return ret;   /* la interfaz no tiene el par bulk esperado */
+```
+
+<Callout type="tip" title="Nunca leas un __le16 como entero directo">
+Programar el dispositivo con `epd->wMaxPacketSize` sin pasar por `le16_to_cpu` (o por el helper `usb_endpoint_maxp`, que ya convierte) funciona en x86 por casualidad y se rompe en un SoC big-endian. Los descriptores son datos del cable; trátalos siempre como little-endian.
+</Callout>
+
+<Callout type="dios" title="La autodescripción es la idea que hace universal a USB">
+Da un paso atrás y mira la maquinaria completa. Un solo controlador xHCI, con un solo driver `usbcore`, gobierna dispositivos que sus autores jamás previeron: teclados que aún no existían cuando se escribió el kernel, cámaras de fabricantes desconocidos, medidores de laboratorio hechos a mano. ¿Cómo es posible sin un driver por aparato escrito de antemano? Porque el conocimiento no vive en el host: vive en el dispositivo, grabado en su árbol de descriptores. El aparato llega diciendo "soy clase HID, subclase teclado, tengo un endpoint interrupt-in que sondeas cada 10 milisegundos", y el host solo tiene que saber leer esa gramática común. La enumeración es el ritual por el que esa autodescripción se vuelve efectiva: reset, pregunta, dirección, configuración. Es el mismo principio que hiciste tuyo con `file_operations` en el nivel 13 —un objeto que se describe mediante una tabla estándar y así encaja en una maquinaria genérica— pero llevado al plano físico y elevado a protocolo de bus. Cuando entiendes que un descriptor no es un formato aburrido sino un contrato de autodescripción, el plug and play deja de ser magia y se revela como lo que es: la consecuencia inevitable de haber puesto el manual dentro del propio dispositivo.
+</Callout>
+
+<Challenge title="Decodifica un dispositivo real">
+1. Ejecuta `lsusb -v` sobre un dispositivo tuyo y localiza `idVendor`, `idProduct`, `bNumConfigurations` y `wTotalLength`.
+2. Toma un `bEndpointAddress` como `0x81` y descompónlo: dirección (bit 7) y número (bits bajos). Repite con un `0x02`.
+3. Cuenta las interfaces de la configuración activa y, para cada endpoint, deduce su tipo a partir de `bmAttributes`.
+4. Activa `usbmon` o mira `dmesg` al conectar el dispositivo y correlaciona lo que ves con los pasos reset, `SET_ADDRESS` y `SET_CONFIGURATION`.
+</Challenge>

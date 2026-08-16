@@ -1,0 +1,156 @@
+---
+title: "Procesar medios: Core Image, Vision y el hilo principal"
+description: "Core Image como grafo perezoso que se compila en una sola pasada, Vision para reconocer texto y objetos con sus coordenadas normalizadas, y por qué ambos son síncronos y bloqueantes: dónde ponerlos para no perder fotogramas."
+subject: ios
+level: 14
+order: 5
+position: "14.5"
+duration: "17 min"
+---
+
+<Lead>
+Filtrar una foto y reconocer lo que hay en ella son, desde el punto de vista de la interfaz, el mismo problema: una operación que puede tardar cientos de milisegundos y que si la invocas donde no debes convierte una app fluida en una que se atasca. Core Image y Vision son, además, engañosos en direcciones opuestas: uno parece caro y es perezoso, el otro parece asíncrono y es bloqueante. Entender exactamente cuándo se paga cada uno es todo el contenido de esta lección.
+</Lead>
+
+<Goals>
+
+- Entender `CIImage` como receta y no como imagen.
+- Reutilizar el `CIContext` y elegir el punto de render.
+- Usar Vision con sus coordenadas normalizadas.
+- Sacar ambos del actor principal y cancelarlos.
+
+</Goals>
+
+## Core Image: un grafo, no una imagen
+
+El malentendido fundacional de Core Image es creer que `CIImage` contiene píxeles. No contiene ninguno. Es una **receta**: una referencia a un origen más la lista de operaciones pendientes. Encadenar filtros no calcula nada.
+
+```swift
+import CoreImage
+import CoreImage.CIFilterBuiltins
+
+// Caro de construir: uno para toda la app, nunca uno por operacion.
+let contexto = CIContext(options: [.cacheIntermediates: false])
+
+func revelar(_ cg: CGImage) -> CGImage? {
+    let entrada = CIImage(cgImage: cg)
+
+    let exposicion = CIFilter.exposureAdjust()
+    exposicion.inputImage = entrada
+    exposicion.ev = 0.4
+
+    let color = CIFilter.vibrance()
+    color.inputImage = exposicion.outputImage
+    color.amount = 0.6
+
+    let vineta = CIFilter.vignette()
+    vineta.inputImage = color.outputImage
+    vineta.intensity = 0.8
+    vineta.radius = 1.5
+
+    guard let receta = vineta.outputImage else { return nil }
+    return contexto.createCGImage(receta, from: receta.extent)   // aqui se paga TODO
+}
+```
+
+Hasta la penúltima línea no se ha tocado un solo píxel. En `createCGImage`, Core Image analiza el grafo completo, **fusiona** las tres operaciones en un único programa de kernel y lo ejecuta en una sola pasada sobre la GPU. Tres filtros no cuestan tres recorridos de la imagen: cuestan uno.
+
+De ahí salen las dos reglas prácticas. La primera: **no renderices en medio de la cadena**. Si conviertes a `CGImage` entre filtro y filtro para "ver cómo va", rompes la fusión y multiplicas el coste. La segunda: **el `CIContext` se crea una vez**. Construirlo compila kernels y reserva recursos gráficos; hacerlo dentro de la función que filtra es el error que convierte un procesado de 8 ms en uno de 200 ms.
+
+<Callout type="tip" title="El extent infinito muerde">
+Algunos filtros producen imágenes de extensión infinita: los generadores, los desenfoques que sangran más allá del borde, `CIFilter.constantColorGenerator`. Pedirle a `createCGImage` un rectángulo infinito falla o intenta reservar memoria absurda. Recorta siempre con un extent conocido, típicamente el de la imagen de entrada, y usa `.clamped(to:)` antes de desenfocar para que el borde no se vuelva transparente.
+</Callout>
+
+## Vision: reconocer, con las coordenadas al revés
+
+Vision ejecuta modelos ya entrenados de Apple: texto, caras, cuerpos, rectángulos, códigos, animales, segmentación de sujeto. La forma clásica es un `VNImageRequestHandler` sobre el que ejecutas peticiones.
+
+```swift
+import Vision
+
+func textos(en cg: CGImage) throws -> [String] {
+    let peticion = VNRecognizeTextRequest()
+    peticion.recognitionLevel = .accurate          // .fast para vídeo en vivo
+    peticion.recognitionLanguages = ["es-ES", "en-US"]
+    peticion.usesLanguageCorrection = true
+
+    let manejador = VNImageRequestHandler(cgImage: cg, orientation: .up)
+    try manejador.perform([peticion])              // sincrono y bloqueante
+
+    return (peticion.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+}
+```
+
+Dos observaciones de fondo. La primera es que `perform` **bloquea el hilo llamante**: no hay cierre, no hay `await`, no hay magia. La API moderna en Swift, con tipos como `RecognizeTextRequest` y un `perform(on:)` asíncrono, arregla la ergonomía pero no cambia la naturaleza del trabajo.
+
+La segunda es el sistema de coordenadas, origen de una cantidad desproporcionada de bugs. Vision devuelve rectángulos **normalizados** entre 0 y 1, con el origen en la **esquina inferior izquierda**, herencia de Core Graphics. SwiftUI dibuja con el origen arriba a la izquierda. Si superpones un recuadro tal cual, aparece reflejado verticalmente:
+
+```swift
+func aPantalla(_ normalizado: CGRect, en tamano: CGSize) -> CGRect {
+    let r = VNImageRectForNormalizedRect(normalizado, Int(tamano.width), Int(tamano.height))
+    return CGRect(x: r.minX, y: tamano.height - r.maxY, width: r.width, height: r.height)
+}
+```
+
+<Cards>
+  <Card icon="🔤" title="Texto">
+    `VNRecognizeTextRequest`. Nivel `.accurate` para documentos, `.fast` para vídeo. Los idiomas declarados cambian el resultado de verdad.
+  </Card>
+  <Card icon="🙂" title="Caras y cuerpos">
+    Rectángulos, puntos de referencia, poses. Base de recortes inteligentes y de encuadres automáticos.
+  </Card>
+  <Card icon="✂️" title="Sujeto">
+    `VNGenerateForegroundInstanceMaskRequest` produce la máscara del sujeto principal: es el mecanismo del recorte que ofrece Fotos.
+  </Card>
+  <Card icon="🔗" title="Composición">
+    La salida de Vision alimenta a Core Image: una máscara se convierte en `CIImage` y desenfoca justo el fondo.
+  </Card>
+</Cards>
+
+## Fuera del actor principal, y cancelable
+
+Ambas APIs son síncronas y bloqueantes. Si las llamas desde una vista o desde un modelo aislado en `@MainActor`, bloqueas el actor principal, y el presupuesto entre fotogramas son 16 ms a 60 Hz u 8 ms a 120 Hz. Un reconocimiento de texto sobre una foto grande se lleva dos órdenes de magnitud más que eso.
+
+```swift
+@concurrent
+nonisolated func analizar(_ cg: CGImage) async throws -> [String] {
+    try Task.checkCancellation()          // antes de empezar lo caro
+    return try textos(en: cg)
+}
+```
+
+`nonisolated` saca la función del actor que la contiene y `@concurrent` garantiza que se ejecute en el grupo de hilos concurrente en vez de heredar el ejecutor de quien llama. Sin ese par, una función `async` declarada dentro de un tipo `@MainActor` sigue corriendo en el hilo principal y no habrás resuelto nada: la clave es que `async` describe suspensión, no paralelismo.
+
+La cancelación importa más de lo que parece. En una vista de cámara o en un campo de búsqueda visual generas peticiones a un ritmo que el procesamiento no puede seguir, y cada una que ya no sirve es CPU robada a la siguiente. `Task.checkCancellation()` antes del trabajo pesado, `alwaysDiscardsLateVideoFrames` activado en la salida de vídeo, y una sola petición en vuelo por vez.
+
+<Callout type="dios" title="Lo perezoso no es gratis: solo cambia dónde se paga la factura">
+Core Image y Vision comparten una estructura que aparece una y otra vez en la ingeniería: separar la **descripción** del trabajo de su **ejecución**. Encadenas filtros, construyes peticiones, compones grafos, y todo parece instantáneo porque no ha ocurrido nada. Después hay un punto —`createCGImage`, `perform`— donde la factura entera se cobra de golpe.
+
+Esa separación es lo que hace posibles las optimizaciones globales: como Core Image ve el grafo completo antes de ejecutar nada, puede fusionar diez filtros en un solo kernel, eliminar operaciones cuyo resultado no se usa y elegir GPU, CPU o Neural Engine según el caso. Ningún sistema que evaluase paso a paso podría hacerlo. Es exactamente la misma idea que hay detrás del `body` de SwiftUI —describes la interfaz, el framework decide qué redibujar— y detrás de un plan de consulta de una base de datos.
+
+Pero la contrapartida es igual de estructural, y es donde se estrella el que solo ha aprendido la parte bonita: **como el coste ya no está donde escribiste el código, tu intuición sobre el rendimiento deja de funcionar**. El perfilador te señala una línea, `createCGImage`, que no es la culpable de nada; la culpa está repartida entre las quince líneas anteriores que construyeron el grafo. Por eso la habilidad que de verdad separa aquí a un profesional no es conocer los filtros, sino saber **elegir el punto de render**: cuántos hay, en qué hilo ocurren, con qué resolución, y qué se descarta antes de llegar. Programar con APIs perezosas es, en el fondo, administrar conscientemente el momento en que se paga.
+</Callout>
+
+<Mermaid code={`flowchart LR
+  A[CGImage reducido] --> B[CIImage receta]
+  B --> C[Cadena de filtros sin coste]
+  C --> D[CIContext createCGImage]
+  A --> E[VNImageRequestHandler perform]
+  E --> F[Resultados normalizados]
+  F --> G[Conversion a coordenadas de pantalla]
+  D --> H[Actor principal solo para mostrar]
+  G --> H
+  class D t-yellow
+  class E t-yellow
+  class H t-green`} />
+
+Fíjate en el primer nodo: la entrada es la imagen **ya reducida** de la lección 14.2. Filtrar o analizar a resolución completa cuando vas a mostrar 300 puntos es pagar veinte veces por un resultado que nadie va a ver. El pipeline de medios es uno solo, de la descarga al píxel, y cada lección de este nivel gobierna un tramo.
+
+<Challenge title="Un pipeline completo y honesto">
+1. Encadena tres filtros de Core Image y mide el tiempo con un solo `createCGImage` al final; después renderiza entre filtro y filtro y compara.
+2. Crea el `CIContext` dentro de la función de filtrado y mide otra vez. Explica la diferencia.
+3. Reconoce el texto de una foto de un recibo y superpón los rectángulos en SwiftUI. Hazlo primero sin convertir coordenadas para ver el reflejo, y arréglalo después.
+4. Mueve el análisis a una función `nonisolated` marcada `@concurrent` y comprueba con Instruments que ya no ocupa el hilo principal.
+5. Encadena Vision y Core Image: obtén la máscara del sujeto y desenfoca solo el fondo.
+6. Añade cancelación y comprueba, con un campo de búsqueda que dispare por cada pulsación, que solo sobrevive la última petición.
+</Challenge>

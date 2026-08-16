@@ -1,0 +1,135 @@
+---
+title: "ElectricSQL: el pivote a solo lectura y las cuatro escrituras que te quedan"
+description: "Electric renunció en 2024 al CRDT en el cliente y se quedó con una sola cosa hecha muy bien, emitir filas de Postgres por HTTP, dejando deliberadamente en tus manos todo el camino de escritura."
+subject: local-first
+level: 53
+order: 2
+position: "53.2"
+duration: "22 min"
+---
+
+<Lead>
+La historia de ElectricSQL es la más instructiva del sector porque es la de un proyecto que renunció en público a la mitad de su ambición y salió reforzado. La primera Electric quería ser el sistema completo: base de datos embebida en el cliente, CRDT para converger, sincronización bidireccional, todo resuelto. Aquello funcionaba en las demostraciones y se volvía inmanejable en producción, y en 2024 el equipo hizo lo que casi nadie hace: reescribir el producto para que hiciera **una sola cosa**. La Electric de hoy es un servicio que emite filas de Postgres a los clientes por HTTP y no sabe nada de escrituras. Esa amputación deliberada le dio dos cosas que el diseño anterior nunca habría tenido —una operación trivialmente cacheable en cualquier CDN y una superficie conceptual que cabe en una tarde— al precio de devolverte a ti un problema entero, el del camino de escritura, que ahora tienes que resolver eligiendo entre patrones que su propia documentación se molesta en enumerar y comparar.
+</Lead>
+
+<Goals>
+
+- Entender el registro de forma como estructura y por qué su consumo es tan simple.
+- Explicar por qué el modo en vivo se cachea bien y qué papel juega la colisión de peticiones.
+- Elegir con criterio entre los cuatro patrones de escritura documentados por el proyecto.
+- Reconocer las dos complejidades que Electric te devuelve intactas: la fusión y la reversión.
+
+</Goals>
+
+Lo primero que conviene fijar es el vocabulario, porque Electric usa una palabra propia para su unidad de sincronización. Una **forma** es una vista filtrada sobre una tabla de Postgres que el servicio mantiene al día. No la defines por adelantado en un fichero de configuración: la pides, y el servicio la crea al vuelo consultando Postgres y convirtiendo el resultado en operaciones de inserción. La consecuencia práctica es que no existe una fase de despliegue de reglas de sincronización, y eso simplifica el ciclo de desarrollo de una manera que se nota desde el primer día.
+
+## El registro de forma: un log, no un estado
+
+Lo que el cliente recibe cuando sincroniza una forma no es una tabla ni un documento, sino un **registro de operaciones lógicas** sobre esa forma. La documentación lo llama registro de forma y lo compara con el flujo de replicación lógica de Postgres, con la diferencia de que en lugar de recibir todas las operaciones de la base recibes solo las que afectan a tu forma. Materializar el valor actual a partir de ese registro es responsabilidad del cliente.
+
+```sh
+# Peticion inicial: dame el log entero de esta forma
+curl -i 'http://localhost:3000/v1/shape?table=todos&offset=-1'
+
+# Modo en vivo: la conexion queda abierta esperando novedades
+curl -i 'http://localhost:3000/v1/shape?table=todos&live=true&handle=...&offset=0_0'
+```
+
+La primera petición lleva un desplazamiento con valor menos uno, que significa *dame el log entero desde el principio*. Si el log no cabe en una respuesta, el servidor devuelve un lote y una cabecera con el desplazamiento siguiente, y el cliente pagina hasta agotarlo. Al final aparece un mensaje de control que anuncia que el cliente está al día, y a partir de ahí puede pasar al modo en vivo. Existe un segundo mensaje de control, el que ordena **volver a sincronizar desde cero**, y su existencia es una declaración de intenciones: Electric prefiere pedir al cliente que tire su copia y empiece de nuevo antes que intentar reparaciones sutiles cuyo estado final nadie pueda demostrar.
+
+<Mermaid code={`flowchart TD
+  A[peticion inicial con desplazamiento menos uno] --> B[el servicio consulta postgres y crea el log]
+  B --> C{cabe en una respuesta}
+  C -->|no| D[lote mas cabecera de desplazamiento] --> A
+  C -->|si| E[mensaje de control al dia]
+  E --> F[modo en vivo]
+  F --> G[espera larga o eventos enviados por el servidor]
+  G --> H[nuevas operaciones] --> F
+  E -.-> I[mensaje de control volver a sincronizar]
+  I --> A
+  class E t-green
+  class I t-red
+  class F t-blue`} />
+
+Un detalle que revela la mentalidad del diseño: los valores del registro viajan como cadenas formateadas según la configuración de presentación de Postgres, y la especificación abierta del servicio documenta exactamente cuál es esa configuración. No hay serialización propia ni tipos inventados. Quien quiera escribir un cliente en un lenguaje sin soporte oficial —el proyecto anima explícitamente a hacerlo— solo necesita saber leer JSON y aplicar el mismo conversor de tipos que aplicaría al leer de Postgres.
+
+```json
+// Entrada del registro de forma
+{ "headers": { "operation": "insert" }, "key": "1", "value": { "id": "1", "title": "Hola" } }
+
+// Mensajes de control: al dia, y volver a sincronizar desde cero
+{ "headers": { "control": "up-to-date" } }
+{ "headers": { "control": "must-refetch" } }
+```
+
+El servicio ha ido incorporando modos que refinan esa mecánica sin cambiarla de raíz. Se puede pedir el registro **sin instantánea inicial**, de modo que el cliente solo reciba lo que ocurra a partir de ese momento, útil cuando el estado inicial llega por otra vía o simplemente no interesa. Se puede arrancar *desde ahora* para saltarse toda la historia. Y sobre ese modo sin instantánea se pueden pedir **instantáneas parciales** con filtro, orden y límite, que la documentación recomienda solicitar por POST porque las cláusulas de filtrado con muchos parámetros revientan la longitud máxima de una URL. Todo ello son extensiones del mismo mecanismo: pedir un trozo de log e indicar por dónde vas.
+
+El modo en vivo admite dos transportes. El clásico es la espera larga: el cliente pide con el parámetro de vivo y el servidor retiene la conexión hasta que haya datos o venza un tiempo. El añadido posterior son los eventos enviados por el servidor, que evitan reconectar tras cada mensaje y bajan la latencia cuando los mensajes son pequeños y frecuentes. La documentación advierte de que esa segunda vía exige que ningún proxy intermedio almacene la respuesta antes de reenviarla, y describe el remedio para los servidores más comunes; el cliente oficial además detecta que la conexión se cierra de inmediato y, tras varios intentos, vuelve por sí solo a la espera larga.
+
+<Callout type="tip" title="La verdadera innovación de Electric no es el protocolo, es que sea HTTP corriente">
+Todo lo anterior podría describirse como una elección técnica menor, y sería un error leerlo así. Al modelar la sincronización como peticiones HTTP con etiquetas de entidad y cabeceras de control de caché, Electric consigue tres cosas de golpe que ningún protocolo binario sobre sockets consigue sin trabajo adicional. La primera es que la sincronización inicial se sirve desde el borde de la red: un cliente nuevo que pide una forma popular recibe el lote desde el CDN sin tocar el servicio ni Postgres. La segunda es que el navegador cachea esas respuestas por sí mismo, de modo que volver a una pantalla ya visitada es instantáneo y funciona incluso sin almacén local persistente. Y la tercera es la **colisión de peticiones**: los proxies saben agrupar múltiples peticiones idénticas en una sola hacia el origen, y como en modo en vivo todos los clientes de una forma están esperando exactamente el mismo recurso, esa agrupación ocurre sola. Es la razón por la que el proyecto puede afirmar que soporta un número muy alto de clientes concurrentes con carga mínima en el servicio y ninguna en Postgres: no es que haya optimizado sus conexiones, es que ha delegado el problema en una infraestructura que lleva treinta años resolviéndolo.
+</Callout>
+
+## Lo que te devuelven: cuatro patrones de escritura
+
+Aquí está la mitad honesta del pivote. La documentación lo dice con todas las letras: Electric hace sincronización del camino de lectura, no del de escritura, y no proporciona ni prescribe una solución para devolver datos a Postgres. Su filosofía es componer con tu pila existente. Lo que sí ofrece es una guía que enumera cuatro patrones ordenados de menos a más potente, con su código y sus contrapartidas.
+
+<Cards>
+  <Card icon="🌐" title="1. Escrituras en línea">
+    Sincronizas con Electric y escribes con tu API de siempre. La red vuelve al camino de escritura y no hay funcionamiento sin conexión, pero es trivial y sirve para paneles, análisis y todo lo que ya requiere estar conectado.
+  </Card>
+  <Card icon="✨" title="2. Estado optimista simple">
+    Añades estado optimista en el componente mientras la petición viaja y hasta que el cambio vuelve por la forma. Quita la red del camino de interacción a coste bajo, pero el estado no se comparte entre componentes ni sobrevive a una recarga.
+  </Card>
+  <Card icon="🗄️" title="3. Estado optimista compartido y persistente">
+    El estado optimista vive en un almacén reactivo persistente. Todos los componentes lo ven, sobrevive a recargas y permite revertir escrituras individuales con su contexto delante. Es, según la propia guía, el punto más equilibrado del espacio.
+  </Card>
+  <Card icon="🧩" title="4. Sincronización a través de la base de datos">
+    Una base embebida guarda lo sincronizado y lo local en tablas separadas, una vista las combina y unos disparadores llevan un registro de cambios que una utilidad envía al servidor. Experiencia local pura, a cambio de un esquema complejo y de perder el contexto al revertir.
+  </Card>
+</Cards>
+
+```ts
+// Patron 3: el estado optimista vive fuera del componente y sobrevive a la recarga
+const estadoOptimista = proxyMap(JSON.parse(localStorage.getItem(CLAVE) ?? "[]"));
+subscribe(estadoOptimista, () => {
+  localStorage.setItem(CLAVE, JSON.stringify([...estadoOptimista]));
+});
+
+// La escritura local se retira cuando vuelve por la forma, no cuando responde la API
+async function emparejar(stream, escritura) {
+  await matchStream(stream, [escritura.operacion], porIdentificador(escritura));
+  estadoOptimista.delete(escritura.id);
+}
+```
+
+Que el proyecto documente cuatro caminos en lugar de imponer uno no es indecisión: es la consecuencia lógica de haber decidido no ocuparse del asunto. Y conviene apreciar el valor pedagógico del gesto, porque esos cuatro patrones no son específicos de Electric. Son **el espacio completo de soluciones al problema de la escritura optimista**, y cualquier equipo que construya sobre cualquier motor acabará ocupando uno de esos cuatro puntos, lo sepa o no.
+
+Fíjate además en un detalle del tercer patrón que es la clave de que funcione bien y que casi nadie implementa por su cuenta: el estado optimista **no se retira cuando la API responde, sino cuando el cambio vuelve por el flujo de sincronización**. Retirarlo al responder la API produce un parpadeo, porque durante unos milisegundos la escritura ya no está en lo local y todavía no ha llegado por la forma. Esperar a que vuelva cuesta un poco más de código y elimina el parpadeo por completo. Es la clase de detalle que separa una demostración de un producto.
+
+Una recomendación de seguridad que la guía repite y que conviene no saltarse: aunque la API HTTP se documente como si el navegador hablara directamente con el servicio, en producción las peticiones deben pasar por tu backend, que es donde se autentica al usuario y se decide qué formas puede pedir. Exponer el servicio directamente equivale a publicar un lector universal de tus tablas.
+
+<Callout type="warn" title="Los dos problemas que ningún patrón elimina y que ahora son tuyos">
+La propia guía marca como sección avanzada las dos complejidades que aparecen en cuanto guardas escrituras locales. La primera es la **lógica de fusión**: cuando un cambio entra por el flujo de sincronización, hay que decidir qué ocurre con el estado optimista que se solapa, y la respuesta se complica porque ese cambio puede venir de otro usuario, otro dispositivo u otra pestaña. Los patrones tercero y cuarto de la guía no se limitan a borrar lo local: rebasan lo local sobre lo sincronizado para no perder lo que el usuario acababa de hacer. La segunda es la **reversión**: si el servidor rechaza una escritura hecha sin conexión, alguien tiene que deshacerla y probablemente avisar. La estrategia mínima es borrar todo lo local, que es lo que hace el ejemplo del cuarto patrón y que la guía califica de ingenua; las estrategias buenas —marcar la escritura como rechazada para resolución manual, o borrar solo lo que dependía causalmente de ella— exigen conservar información que el patrón cuarto dificulta precisamente porque aleja la escritura de su contexto.
+</Callout>
+
+## Qué simplifica de verdad y qué no
+
+Puesto en la balanza, el pivote de Electric simplifica cuatro cosas y ninguna de ellas es cosmética. Elimina el CRDT del cliente, y con él la clase entera de problemas que ocupa quince niveles de este track: metadatos que crecen, lápidas que no se pueden tirar, compactación, historia que pesa. Elimina el despliegue de reglas de sincronización, porque las formas se piden y se crean solas. Elimina la infraestructura de tiempo real, porque el transporte es HTTP y el escalado lo hace el CDN. Y elimina la base de datos embebida del camino obligatorio: puedes usar una si quieres, pero el cliente por defecto materializa la forma en memoria y el navegador se encarga de cachear.
+
+Hay un dato empírico que la propia guía recoge y que conviene tener presente antes de sobredimensionar la maquinaria de fusión. Adam Wiggins, uno de los autores del ensayo fundacional sobre local-first, informó tras operar a escala una herramienta de lienzo colaborativo que los conflictos reales son **extremadamente infrecuentes** y que se mitigan bien con recursos de producto como mostrar quién está editando qué. La conclusión que la guía extrae es sensata y va contra el instinto del ingeniero: las estrategias romas —borrar lo local y volver a sincronizar— son mucho más fáciles de implementar y razonar, y resultan perfectamente adecuadas para la mayoría de las aplicaciones. Construir rebasado fino antes de haber medido la tasa de conflictos es optimizar un caso que quizá no existe.
+
+Lo que no simplifica es todo lo que ocurre después de que el usuario pulse algo. Ahí sigues tú, con tu API, tu validación, tu política de conflictos y tu estrategia de reversión. La pregunta que hay que hacerse antes de adoptar Electric no es si su modelo de lectura es bueno —lo es, y es probablemente el más elegante del sector— sino si el patrón de escritura que tu aplicación necesita es uno de los dos primeros, en cuyo caso el trabajo es menor, o uno de los dos últimos, en cuyo caso estarás construyendo a mano lo que otros motores traen puesto.
+
+<Callout type="dios" title="Renunciar a la mitad del problema fue lo que convirtió a Electric en una pieza componible">
+Hay una lectura de este pivote que se queda en la superficie —Electric hacía demasiado, se le fue de las manos, recortó— y hay otra que explica por qué el resultado es mejor que el original y por qué conviene entenderla aunque nunca uses este motor. La primera Electric intentaba ser un **sistema**: definía cómo guardabas los datos en el cliente, cómo convergían, cómo se escribían y cómo se resolvían los conflictos. Un sistema así solo puede adoptarse entero, y adoptarlo entero significa reescribir tu aplicación alrededor de él y aceptar sus decisiones sobre asuntos que quizá tú ya tenías resueltos de otra manera. La Electric de hoy no es un sistema sino un **componente**: hace una cosa, tiene una interfaz estrecha y no opina sobre lo que hay a su alrededor. Y esa estrechez es lo que le permite aparecer donde el sistema completo jamás habría entrado. Fíjate en la evidencia: Electric es hoy uno de los orígenes de datos que TanStack DB conecta a sus colecciones, convive con TanStack Query en la misma aplicación, se enchufa a almacenes reactivos de cinco marcos distintos y se integra con la API REST que ya tenías. Ninguna de esas composiciones era posible cuando el proyecto quería ser dueño del cliente entero. La lección de ingeniería es incómoda porque va contra el instinto de todo equipo de producto, que es resolverle al usuario el problema completo: **la potencia de una pieza de infraestructura es inversamente proporcional a la cantidad de decisiones que te obliga a delegarle**. Un motor que resuelve la escritura, la lectura, el almacenamiento, la convergencia y los permisos es más cómodo el primer día y más difícil de reemplazar el año siguiente, porque lo has dejado entrar en cinco sitios. Un motor que solo emite filas es más trabajo el primer día y, cuando cambien las circunstancias —y cambiarán—, se sustituye tocando un módulo. Al elegir motor en la última lección de este nivel, esa pregunta —cuántas decisiones estoy delegando y cuántas de ellas podría querer recuperar— vale más que cualquier comparación de rendimiento.
+</Callout>
+
+<Challenge title="Construye los cuatro caminos de escritura sobre la misma forma">
+1. Levanta Electric contra un Postgres de prueba y sincroniza una forma filtrada sin declarar nada por adelantado.
+2. Observa en el inspector de red la primera petición con desplazamiento menos uno, la paginación y el mensaje de control de estar al día.
+3. Implementa el patrón de escrituras en línea y mide con la red degradada cuánto tarda la interfaz en reflejar el cambio.
+4. Añade estado optimista de componente y comprueba qué ocurre exactamente al recargar la página con una escritura en vuelo.
+5. Mueve ese estado a un almacén persistente compartido y escribe la lógica que lo colapsa cuando el cambio vuelve por la forma.
+6. Fuerza un rechazo del servidor y decide por escrito tu estrategia de reversión antes de implementarla.
+</Challenge>

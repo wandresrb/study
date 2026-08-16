@@ -1,0 +1,149 @@
+---
+title: "Medir: el endpoint que se come el presupuesto"
+description: "Optimizar sin medir es superstición, y en el edge la medición tiene una trampa concreta: dentro de un Worker el reloj no avanza durante la ejecución síncrona, de modo que cronometrar tu propio código con temporizadores devuelve ceros. Recorremos los tres planos de medida —analytics agregado, logs por invocación con el CPU real que informa la plataforma, y telemetría propia con Analytics Engine—, cómo etiquetar cada invocación por ruta para atribuir consumo, y por qué el ranking que importa no es el de volumen ni el de coste unitario sino el de su producto."
+subject: cloudflare
+level: 40
+order: 4
+position: "40.4"
+duration: "17 min"
+---
+
+<Lead>
+Toda la teoría de coste y latencia de las lecciones anteriores es inútil sin una respuesta a una pregunta muy concreta y sorprendentemente difícil: de todo lo que gasta tu proyecto, qué parte gasta cada ruta. La intuición del equipo casi nunca acierta, porque el endpoint que más ruido hace en las reuniones rara vez es el que se lleva el presupuesto; suele ser una llamada aburrida, de volumen alto y coste unitario mediano, que nadie mira porque nunca ha fallado. Encontrarla exige medir, y medir en el edge tiene una particularidad que descoloca al recién llegado: el reloj que usarías para cronometrar no avanza mientras tu código se ejecuta.
+</Lead>
+
+<Goals>
+
+- Distinguir los tres planos de medida y saber qué pregunta responde cada uno.
+- Entender por qué el reloj no avanza durante la ejecución síncrona y qué implica al medir.
+- Etiquetar invocaciones por ruta para atribuir consumo a cada endpoint.
+- Construir el ranking de gasto real, que es volumen multiplicado por coste unitario.
+
+</Goals>
+
+## Tres planos de medida, tres preguntas distintas
+
+El primer plano es el **agregado**: el panel de analíticas de la plataforma, que responde cuántas peticiones ha habido, con qué tasa de error, con qué distribución de duración y de CPU. Es el plano de la salud general y sirve para detectar que algo cambió, nunca para saber qué. Su virtud es que existe sin que hagas nada; su límite es que agrega, y agregar es precisamente perder la información que buscas. Aun así conviene mirarlo a diario, porque la forma de las distribuciones dice mucho: una de CPU con dos jorobas revela que hay dos poblaciones de peticiones mezcladas, típicamente una barata y frecuente y otra cara y minoritaria, y esa observación sola ya orienta la investigación antes de escribir una línea de telemetría.
+
+El segundo plano es la **invocación individual**: los logs en vivo con `wrangler tail` y los registros persistidos, donde cada evento trae, además de tus mensajes, el consumo real que la plataforma midió para esa petición concreta. Ahí aparece el dato de oro, el `cpuTime` que se te va a facturar, junto al tiempo de reloj y al desenlace de la invocación. Es el plano del diagnóstico fino, y su límite es el volumen: nadie inspecciona a mano un millón de eventos. Ese límite tiene además una vertiente económica que conviene no ignorar: registrar tiene coste, tanto de CPU al construir el mensaje como de almacenamiento al conservarlo, de modo que escribir en cada petición un objeto grande con todo el contexto es una forma silenciosa de gastar dinero en observar el gasto. Los mensajes cortos, estructurados y muestreados cuando el volumen lo exige son la única forma sostenible de registrar en un servicio con tráfico serio.
+
+Los tres planos no compiten, se encadenan: el agregado detecta, la telemetría propia localiza y los logs diagnostican. Saltarse el segundo eslabón es el motivo por el que tantas investigaciones se atascan, porque se pasa de una gráfica que dice que algo subió a inspeccionar peticiones sueltas sin saber cuáles inspeccionar, y ese salto se recorre por corazonadas.
+
+El tercer plano es la **telemetría propia**, escrita por ti con Analytics Engine y consultada después con SQL. Es el único plano que puede responder preguntas que ninguna herramienta genérica anticipó —cuánto consume la ruta de exportación cuando el cliente es de pago, qué endpoint duplicó su CPU tras el último despliegue— porque las dimensiones las eliges tú.
+
+<Mermaid code={`flowchart LR
+  A[invocacion] --> B[panel agregado]
+  A --> C[logs por invocacion con cpuTime]
+  A --> D[Analytics Engine con etiquetas propias]
+  B --> E[algo cambio]
+  C --> F[que pasa en esta peticion]
+  D --> G[quien se come el presupuesto]
+  class G t-green`} />
+
+<Callout type="warn" title="Dentro de un Worker el reloj no avanza mientras ejecutas">
+Por razones de seguridad frente a ataques de canal lateral basados en temporización, `Date.now` devuelve el mismo valor durante toda la ejecución síncrona y solo se actualiza cuando ocurre entrada o salida. Envolver un bucle entre dos lecturas del reloj devuelve cero por muy pesado que sea el bucle. Lo que sí mide esa diferencia es el tiempo de espera de red, es decir, tiempo de pared, que es justamente lo que no se factura. El `CPU time` real lo aporta la plataforma en los eventos de log, no tu código.
+</Callout>
+
+## Atribuir el consumo a cada ruta
+
+Como el reloj interno no sirve para cronometrar cómputo, la estrategia correcta es otra: **etiquetar** cada invocación con la información que permita agrupar después, y dejar que la plataforma aporte la cifra de CPU. Se escribe un punto de datos por petición con la ruta normalizada, el método, el estado de la respuesta y las magnitudes que expliquen el consumo —el tamaño del cuerpo procesado, el número de `subrequests`, el número de filas devueltas—, y se consulta más tarde con SQL.
+
+```ts
+export default {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(req.url);
+    const ruta = normalizar(url.pathname); // /pedidos/8f21 pasa a ser /pedidos/:id
+    const res = await enrutar(req, env, ctx);
+
+    ctx.waitUntil(
+      env.TELEMETRIA.writeDataPoint({
+        indexes: [ruta],
+        blobs: [req.method, String(res.status), req.cf?.colo ?? "desconocido"],
+        doubles: [1, Number(res.headers.get("x-bytes") ?? 0)],
+      }),
+    );
+    return res;
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+Antes de instrumentar conviene decidir con qué dimensiones se va a poder cruzar después, porque añadir una columna a posteriori no rescata el histórico. Las tres que casi nunca sobran son la ruta normalizada, la clase de cliente —anónimo, autenticado, integrador— y la versión desplegada; con esas tres se responden la mayoría de las preguntas que un equipo acaba haciéndose, incluida la más incómoda de todas, que es si el crecimiento del gasto viene del negocio o de una regresión.
+
+Dos detalles hacen que esto funcione o fracase. El primero es **normalizar la ruta**: si etiquetas con la URL literal, cada identificador crea su propia serie y el agregado se vuelve inservible por explosión de cardinalidad. La etiqueta debe ser el patrón, no la instancia. El segundo es que el punto de datos va dentro de `ctx.waitUntil`, porque escribirlo después de responder lo saca de la ruta crítica; su CPU se factura igual, pero el usuario no la espera.
+
+Lo que sí puede medir tu código, y conviene aprovechar, es el **tiempo de pared alrededor de las esperas**, porque el reloj sí avanza cuando ocurre entrada o salida. Eso no sirve para atribuir CPU, pero sirve para algo distinto y muy útil: saber qué `subrequest` es la lenta cuando una ruta tarda demasiado.
+
+```ts
+const t0 = Date.now();
+const datos = await fetch(URL_ORIGEN); // el reloj avanza al esperar
+const esperaOrigen = Date.now() - t0;  // tiempo de pared, no de CPU
+```
+
+Con eso, la consulta que importa es una agregación por ruta. Y aquí hay que recordar el muestreo adaptativo: Analytics Engine puede muestrear bajo volumen alto, así que toda suma debe ponderarse por el intervalo de muestreo para no subestimar sistemáticamente el tráfico más intenso, que es exactamente el que estás investigando.
+
+```sql
+SELECT index1 AS ruta,
+       SUM(_sample_interval) AS peticiones,
+       SUM(double2 * _sample_interval) AS bytes_procesados
+FROM TELEMETRIA
+WHERE timestamp > NOW() - INTERVAL '1' DAY
+GROUP BY ruta
+ORDER BY peticiones DESC
+```
+
+El resultado de esa consulta se cruza después con el `cpuTime` que dan los logs para las mismas rutas, y de ese cruce sale la única tabla que de verdad decide dónde invertir esfuerzo.
+
+Ese cruce se puede automatizar hasta cierto punto, pero conviene mantenerlo explícito al principio. Cada mitad tiene su propio sesgo: la telemetría propia cuenta lo que decidiste contar y los logs traen la cifra oficial pero sin tus etiquetas, así que al unirlas hay que comprobar que ambos lados hablan del mismo periodo, del mismo entorno y de la misma versión. Un cruce descuidado produce tablas convincentes y falsas, que son bastante peores que no tener tabla.
+
+<Callout type="tip" title="Mide siempre una magnitud explicativa, no solo el contador">
+Saber que una ruta consume mucho no dice qué hacer; saber que consume mucho **y** que procesa cargas de trescientos kilobytes de media sí. Registra junto al contador una o dos magnitudes que expliquen el consumo: bytes deserializados, filas devueltas, número de `subrequests`. Sin ellas tendrás un ranking de sospechosos sin pruebas, y el diagnóstico se hará por conjeturas.
+</Callout>
+
+Queda un consejo de higiene sobre la propia instrumentación: el punto de datos debe escribirse en un único lugar del código, típicamente el envoltorio que enruta, y no esparcido por cada manejador. Repartirlo garantiza que alguien olvide alguna ruta, que las etiquetas diverjan con el tiempo y que la comparación entre endpoints acabe siendo imposible. Una sola llamada bien colocada mide todo el servicio y no hay que recordar añadirla al crear una ruta nueva.
+
+## El ranking que importa es el producto
+
+El error de análisis más frecuente consiste en mirar una sola columna. Quien ordena por número de peticiones persigue el endpoint más popular, que muchas veces es trivialísimo y consume una fracción de milisegundo. Quien ordena por CPU media persigue el endpoint más pesado, que muchas veces se invoca doce veces al día desde un panel interno. Ninguno de los dos está mirando el presupuesto: **el gasto es el producto de ambas columnas**, y ese producto casi siempre corona a una ruta que no destaca en ninguna de las dos por separado.
+
+| Ruta | Peticiones diarias | CPU media | Gasto relativo |
+| --- | --- | --- | --- |
+| `/api/ping` | 4.000.000 | 0,2 ms | Medio |
+| `/api/informe` | 900 | 180 ms | Bajo |
+| `/api/catalogo` | 700.000 | 9 ms | Muy alto |
+| `/api/sesion` | 1.200.000 | 1,1 ms | Alto |
+
+La misma aritmética tiene una segunda lectura, útil para decidir dónde no invertir. Optimizar `/api/informe` de ciento ochenta a noventa milisegundos suena espectacular en una demostración y ahorra una cantidad irrisoria, porque se invoca novecientas veces; recortar un milisegundo en `/api/sesion` pasa desapercibido en cualquier medición individual y ahorra más que aquello. El instinto de ingeniería empuja hacia el caso llamativo, y el presupuesto vive en el aburrido.
+
+En la tabla, la ruta que se lleva el presupuesto es `/api/catalogo`, que no es ni la más popular ni la más lenta. Es el perfil clásico del devorador silencioso: volumen alto y coste unitario suficiente para que el producto se dispare, sin ninguna característica llamativa que atraiga la atención de nadie. Y suele tener además la mejor propiedad posible para quien optimiza: al ser el mismo contenido para muchos usuarios, casi siempre es cacheable, de modo que la corrección es una cabecera y no una refactorización.
+
+Ese hallazgo se generaliza en una heurística que ahorra mucho tiempo: las rutas que encabezan el ranking de gasto suelen ser, precisamente por su volumen, las más repetitivas, y lo repetitivo es lo más fácil de cachear o de precalcular. Es una coincidencia afortunada del modelo y significa que la primera investigación seria del gasto casi siempre termina en una solución barata, no en un rediseño.
+
+Hay una dimensión más que conviene registrar desde el principio y que casi nadie añade a tiempo: la **versión desplegada**. Con ella, la misma consulta agrupada por versión convierte la telemetría en un detector de regresiones, capaz de mostrar que una ruta duplicó su consumo el martes por la tarde y que ese martes coincide con un despliegue concreto. Sin ella, la subida aparece como una tendencia difusa que se atribuye al crecimiento del tráfico, que es la explicación cómoda y casi siempre falsa.
+
+Una vez identificada la ruta, el diagnóstico se completa mirando sus invocaciones individuales con `wrangler tail`, filtrando por esa ruta y leyendo el `cpuTime` real junto a las magnitudes explicativas. Ahí es donde se descubre que el consumo no era del enrutado sino de un `JSON.parse` de doscientos kilobytes, o de una ordenación en memoria que la base podía hacer con un índice.
+
+El ciclo se cierra con una disciplina sencilla y poco practicada: anotar la cifra antes de tocar nada y volver a medirla después. Una optimización sin línea base no es una mejora demostrada, es una creencia, y en un sistema donde el gasto depende de tantas variables simultáneas —tráfico, tamaño de cargas, tasa de acierto de caché— las creencias envejecen fatal. Registrar el antes y el después convierte cada intervención en evidencia acumulada sobre cómo se comporta tu sistema, que a la larga vale más que cualquiera de las mejoras concretas.
+
+<Cards>
+  <Card icon="🧭" title="Cada plano, una pregunta">
+    El panel dice que algo cambió, los logs dicen qué pasa en una petición, tu telemetría dice quién gasta.
+  </Card>
+  <Card icon="⏱️" title="No cronometres tu codigo">
+    El reloj no avanza durante la ejecución síncrona. El `CPU time` te lo da la plataforma, no un temporizador.
+  </Card>
+  <Card icon="✖️" title="Volumen por coste unitario">
+    El presupuesto se lo lleva el producto de ambas columnas, casi nunca el máximo de una sola.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Medir es elegir un modelo del sistema, y el modelo determina que problemas puedes ver">
+Instrumentar parece una tarea mecánica —añadir contadores donde haga falta— y es en realidad un acto de modelado con consecuencias profundas, porque las dimensiones que eliges registrar definen exactamente el conjunto de preguntas que podrás hacerte después, y cierran para siempre las demás. Si etiquetas por ruta, podrás encontrar la ruta cara; si no etiquetas por tipo de cliente, jamás descubrirás que el noventa por ciento del consumo lo genera un único integrador que descarga el catálogo entero cada minuto, y no porque el dato no exista, sino porque decidiste no darle una columna. Esa asimetría entre lo que se puede ver y lo que no explica por qué tantos equipos optimizan durante meses el componente equivocado con datos impecables: sus datos eran correctos y su modelo estaba incompleto. En el edge esta lección se agudiza por una razón técnica muy concreta y muy instructiva: la magnitud que pagas, el tiempo de procesador, es la única que tu propio código no puede observar, porque el reloj está deliberadamente congelado durante la ejecución síncrona para cerrar canales laterales de temporización. Esa imposibilidad, que al principio irrita, es en el fondo una lección de arquitectura de la medición: te obliga a separar dos responsabilidades que en un servidor se mezclaban alegremente. La plataforma aporta la **cifra**, porque es la única que puede medirla sin comprometer el aislamiento; tú aportas el **contexto**, las etiquetas que dicen a qué ruta, a qué cliente y a qué versión pertenece esa cifra. El análisis útil no vive en ninguna de las dos mitades, vive en su unión, y por eso los equipos que solo miran el panel agregado nunca encuentran nada accionable y los que solo escriben logs se ahogan en detalle sin poder sumar. Interiorizar esto cambia el momento en que se instrumenta: se deja de añadir telemetría cuando ya hay un problema —cuando es tarde y no hay histórico con el que comparar— y se empieza a añadirla al escribir cada ruta, con las dos o tres dimensiones que explicarían su consumo, porque medir bien no es una reacción ante la factura sino la condición previa para poder razonar sobre ella.
+</Callout>
+
+<Challenge title="Encuentra a tu devorador silencioso">
+1. Instrumenta tres rutas con `writeDataPoint` usando la ruta normalizada como índice y una magnitud explicativa.
+2. Explica por qué etiquetar con la URL literal en vez de con el patrón arruina el agregado.
+3. Escribe la consulta que ordena por gasto estimado y no por volumen, ponderando por el intervalo de muestreo.
+4. Usa `wrangler tail` sobre la ruta que salga primera y localiza en su código la línea que explica el `cpuTime`.
+5. Argumenta qué dimensión te falta hoy y qué pregunta concreta no puedes responder por no haberla registrado.
+</Challenge>

@@ -1,0 +1,129 @@
+---
+title: "struct file y file_operations: el archivo abierto"
+description: "El `struct file` representa un archivo abierto por un proceso, con su propio offset y sus flags, y su tabla de `file_operations` es la vtable que atienden read, write, mmap e ioctl. Cómo se relaciona con el descriptor de archivo, por qué cada open crea uno nuevo, y cómo el char device del nivel 13 clava aquí sus operaciones."
+subject: kernel
+level: 37
+order: 4
+position: "37.4"
+duration: "15 min"
+---
+
+<Lead>
+El inodo es el archivo; la dentry es su nombre. Pero ninguno de los dos sabe *dónde estás leyendo ahora mismo*. Esa información —el offset actual, los flags de apertura, si abriste para leer o escribir— pertenece a un tercer objeto que nace con cada `open()` y muere con cada `close()`: el `struct file`. Es el archivo *abierto*, la sesión de un proceso con un inodo. Y su tabla de `file_operations` es la que de verdad ejecuta `read` y `write`. Aquí cierra el círculo que abriste en el nivel 13: la tabla que escribiste para tu char device era, sin que lo supieras, una vtable del VFS.
+</Lead>
+
+<Goals>
+
+- Entender el `struct file` como un archivo abierto, con offset y flags propios de cada apertura.
+- Distinguir el descriptor de archivo (`fd`) del `struct file` y de la tabla de descriptores.
+- Reconocer `file_operations` como la vtable del archivo abierto y sus métodos clave.
+- Conectar el char device del nivel 13 con el VFS: cómo `chrdev_open` instala las `file_operations` del driver.
+
+</Goals>
+
+## El archivo abierto y su offset
+
+Cada `open()` que triunfa asigna un `struct file`. En los núcleos actuales su disposición está afinada al milímetro para caber en pocas líneas de caché:
+
+```c
+/* include/linux/fs.h (muy recortado) */
+struct file {
+	file_ref_t                 f_ref;        /* refcount moderno, antes f_count */
+	fmode_t                    f_mode;       /* FMODE_READ, FMODE_WRITE... */
+	const struct file_operations *f_op;      /* la vtable del archivo abierto */
+	struct address_space      *f_mapping;    /* el page cache del inodo */
+	void                      *private_data; /* estado privado del driver */
+	struct inode              *f_inode;      /* el inodo abierto */
+	unsigned int               f_flags;      /* O_NONBLOCK, O_APPEND... */
+	const struct cred         *f_cred;       /* credenciales del que abrio */
+	struct path                f_path;       /* dentry mas vfsmount */
+	loff_t                     f_pos;        /* EL offset actual de lectura */
+	struct file_ra_state       f_ra;         /* estado de readahead */
+};
+```
+
+El campo que justifica la existencia del objeto es `f_pos`: el offset donde caerá el próximo `read` o `write`. Por eso el offset **no** puede vivir en el inodo: dos procesos que abren el mismo archivo tienen cada uno su propio `struct file` con su propio `f_pos`, y avanzan de forma independiente. `f_op` es la vtable; `f_mapping` es el atajo al page cache del inodo (nivel 24); y `private_data` es el bolsillo donde tu driver guarda estado por-apertura, como ya usaste en el nivel 13.
+
+El `struct file` vive por conteo de referencias. `fget` toma una referencia y `fput` la suelta; cuando `f_ref` cae a cero, `__fput` ejecuta la limpieza. Ahí es donde el VFS llama a `f_op->release` —la función que escribiste en el nivel 13— exactamente una vez, cuando se cierra el **último** descriptor que apuntaba a ese archivo abierto. Por eso `close()` no siempre dispara `release`: si otro `fd` clonado por `dup` sigue vivo, la referencia no llega a cero. En los núcleos recientes `f_ref` es un `file_ref_t`, un contador con un sesgo que detecta el paso a cero sin operaciones atómicas caras en el camino común, y `__fput` se difiere a una tarea con `task_work` para no correr en contextos delicados.
+
+## fd, struct file y la tabla de descriptores
+
+El número que maneja el espacio de usuario —el `fd`— no es el `struct file`: es un índice en la tabla de descriptores del proceso, que apunta al `struct file`. Esta indirección explica comportamientos clásicos de Unix:
+
+<Mermaid code={`flowchart LR
+  P[Proceso] --> FDT[tabla de descriptores]
+  FDT -->|fd 0| F0[struct file A]
+  FDT -->|fd 1| F1[struct file B]
+  FDT -->|fd 3| F1
+  F0 -->|f_inode| I1[inode]
+  F1 -->|f_inode| I2[inode]`} />
+
+Un `dup()` copia la entrada de la tabla: dos `fd` apuntan al **mismo** `struct file`, comparten `f_pos`, y escribir por uno avanza el offset del otro. En cambio, dos `open()` del mismo archivo crean `struct file` distintos con offsets independientes. Y un `fork()` copia la tabla de descriptores entera pero comparte los `struct file`: por eso padre e hijo comparten posición en `stdout`. Toda esa semántica se deduce de un único hecho: quién comparte el `struct file` y quién no.
+
+## file_operations: la vtable del archivo abierto
+
+La tabla que gobierna qué ocurre en cada syscall sobre el archivo abierto es `file_operations`. Es la más rica del VFS porque es la que ve el espacio de usuario:
+
+```c
+/* include/linux/fs.h (recortado) */
+struct file_operations {
+	struct module *owner;
+	loff_t  (*llseek)(struct file *, loff_t, int);
+	ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
+	ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
+	ssize_t (*read_iter)(struct kiocb *, struct iov_iter *);   /* forma vectorial */
+	ssize_t (*write_iter)(struct kiocb *, struct iov_iter *);
+	int     (*iterate_shared)(struct file *, struct dir_context *); /* readdir */
+	__poll_t (*poll)(struct file *, struct poll_table_struct *);
+	long    (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
+	int     (*mmap)(struct file *, struct vm_area_struct *);
+	int     (*open)(struct inode *, struct file *);
+	int     (*release)(struct inode *, struct file *);
+	int     (*fsync)(struct file *, loff_t, loff_t, int datasync);
+};
+```
+
+Hay dos familias de lectura. `read` es la forma simple que implementaste en el nivel 13, con un puntero de usuario y un tamaño. `read_iter` es la moderna: recibe un `iov_iter` que abstrae el destino (uno o varios búferes, incluso páginas del propio núcleo) y es la que usa el page cache genérico. Un sistema de archivos serio implementa `read_iter`; un char device sencillo se conforma con `read`. El VFS prueba una y luego la otra, como viste en `vfs_read` del nivel 37.1.
+
+## El char device del nivel 13, cerrado por dentro
+
+En el nivel 13 escribiste una `file_operations` y la registraste en un `struct cdev`. Ahora puedes ver cómo el VFS la enchufa. Cuando abres un nodo de char device, el inodo lleva en `i_fop` no tus operaciones, sino unas genéricas del subsistema, `def_chr_fops`, cuyo único trabajo es hacer de trampolín:
+
+```c
+/* fs/char_dev.c */
+static const struct file_operations def_chr_fops = {
+	.open  = chrdev_open,
+	.llseek = noop_llseek,
+};
+
+static int chrdev_open(struct inode *inode, struct file *filp)
+{
+	struct cdev *p = inode->i_cdev;          /* el cdev del nivel 13 */
+	const struct file_operations *fops;
+
+	fops = fops_get(p->ops);                 /* TUS operaciones del driver */
+	replace_fops(filp, fops);                /* filp->f_op = fops */
+
+	if (filp->f_op->open)
+		return filp->f_op->open(inode, filp);  /* llama a tu mi_open */
+	return 0;
+}
+```
+
+La línea decisiva es `replace_fops(filp, fops)`: sustituye la `f_op` genérica del `struct file` por la tabla concreta de tu driver. A partir de ese instante, cada `read` sobre ese descriptor entra por `filp->f_op->read`, que es tu `mi_read`. El `def_chr_fops` es un arranque que existe solo para descubrir el `cdev` correcto —porque un mismo major agrupa muchos minors, cada uno con posiblemente otro driver— e intercambiar la vtable. El polimorfismo del VFS se resuelve en tiempo de apertura, no de registro.
+
+<Callout type="info" title="private_data es tu estado por apertura">
+`chrdev_open` llama a tu `open`, y ahí es donde sueles guardar en `filp->private_data` el puntero a la estructura de tu dispositivo (recuperada del `cdev` con `container_of`). En los siguientes `read`, `write` e `ioctl` de ese descriptor, `filp->private_data` te devuelve tu contexto sin búsquedas globales. Es el patrón canónico de todo driver de carácter.
+</Callout>
+
+<Callout type="dios" title="El struct file es el verbo; el inodo es el sustantivo">
+Reúne los tres objetos y mira la gramática que forman. El inodo es el sustantivo: la cosa, el archivo que existe con independencia de que alguien lo mire. La dentry es el nombre propio con que lo invocas. Y el `struct file` es el verbo en gerundio: el *estar leyéndolo*, la acción en curso de un proceso concreto sobre esa cosa. Esta separación entre lo que una cosa es y lo que le está pasando ahora es lo que permite que mil procesos abran `/etc/passwd` a la vez sin pisarse: comparten un solo inodo —una sola copia de los datos y metadatos, un solo page cache— pero cada uno lleva su propio `struct file` con su propio `f_pos`, su propia posición en la lectura, sus propios flags. Fundir el offset en el inodo destruiría esa concurrencia; ponerlo en el descriptor de usuario impediría que `dup` y `fork` compartieran posición cuando deben. El `struct file` es exactamente la capa que faltaba: ni tan compartida como el inodo ni tan privada como el `fd`, sino el objeto de granularidad justa que captura *una apertura*. Y cuando entiendes que su `f_op` no está fijada por el inodo sino que puede ser reemplazada en el `open` —como hace `chrdev_open` con tu driver—, comprendes el último grado de libertad del VFS: no solo cada tipo de objeto elige sus operaciones, sino que cada apertura concreta puede elegir las suyas. Ahí es donde tu código del nivel 13 se enganchó, sin ceremonia, a la maquinaria universal de los archivos.
+</Callout>
+
+<Challenge title="Rastrea el archivo abierto">
+1. Con `ls -l /proc/self/fd`, observa cómo los descriptores de un proceso apuntan a archivos, tuberías y sockets, todos como `struct file`.
+2. Escribe un programa que abra el mismo archivo dos veces y demuestre que cada descriptor tiene su propio `f_pos`; luego repítelo con `dup` y muestra que comparten offset.
+3. En tu char device del nivel 13, guarda un puntero en `filp->private_data` durante `open` y recupéralo en `read`.
+4. En las fuentes, sigue `chrdev_open` hasta `replace_fops` y explica por qué la `f_op` del inodo no es directamente la del driver.
+5. Razona por qué `read_iter` y no `read` es la operación que implementan los sistemas de archivos que se apoyan en el page cache.
+</Challenge>

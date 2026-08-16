@@ -1,0 +1,108 @@
+---
+title: "Storage texture o storage buffer: el criterio real"
+description: "Por qué la disposición en mosaico del hardware de texturas gana en accesos con localidad 2D, qué gana el buffer a cambio, y las cuatro preguntas que resuelven la decisión."
+subject: webgpu
+level: 23
+order: 5
+position: "23.5"
+duration: "18 min"
+---
+
+<Lead>
+Los dos recursos guardan lo mismo: memoria escribible desde un shader. La diferencia está en cómo el hardware la coloca y la cachea. Una textura vive en un formato de mosaico que hace que los vecinos en dos dimensiones estén cerca en memoria; un buffer es lineal, y los vecinos verticales están separados por una fila entera. Cuando el algoritmo tiene localidad espacial bidimensional, esa diferencia se mide en factores, no en porcentajes.
+</Lead>
+
+<Goals>
+
+- Explicar la disposición en mosaico y por qué favorece los accesos con vecindad 2D.
+- Calcular cuántas líneas de caché toca un kernel de 3×3 en cada representación.
+- Enumerar lo que un storage buffer permite y una storage texture no.
+- Aplicar las cuatro preguntas que deciden entre uno y otro.
+
+</Goals>
+
+## El mosaico
+
+Un buffer es lineal: el elemento `i` está en el byte `i × stride`, y punto. Si representas una imagen de 1024 de ancho como un buffer y accedes al texel `(x, y)` en el índice `y * 1024 + x`, entonces `(x, y)` y `(x, y+1)` están separados por 4096 bytes.
+
+Una textura no se guarda así. El hardware la coloca en **mosaicos**: bloques de, típicamente, 4×4 u 8×8 texels que se almacenan de forma contigua, y los mosaicos se ordenan a su vez en algún recorrido que preserva la localidad, a menudo una curva de Morton. La consecuencia es que `(x, y)` y `(x, y+1)` suelen estar en la misma línea de caché, o en la siguiente.
+
+La cuenta concreta, con un kernel de 3×3 sobre `rgba8unorm` y líneas de caché de 128 bytes:
+
+**Como buffer lineal.** Las nueve muestras están en tres filas separadas por 4096 bytes. Cada fila contiene tres texels contiguos, 12 bytes, dentro de una línea. Total: **3 líneas de caché** por fragmento, y las tres muy separadas en memoria, lo que además carga el TLB.
+
+**Como textura en mosaico de 8×8.** Un bloque de 8×8 texels de 4 bytes son 256 bytes, o sea dos líneas. Las nueve muestras del kernel caen casi siempre dentro del mismo mosaico. Total: **1 o 2 líneas**, contiguas.
+
+En un shader donde ese kernel se aplica a cada uno de los ocho millones de fragmentos de una pantalla 4K, la diferencia entre tres fallos de caché dispersos y uno o dos contiguos es del orden del doble de tiempo. Y hay una segunda ventaja: las invocaciones vecinas de un mismo workgroup comparten los mosaicos que ya están en caché, mientras que en la representación lineal cada fila que se lee sirve solo a las invocaciones de esa fila.
+
+<Callout type="info" title="La disposición no está expuesta y no puede estarlo">
+WebGPU no te dice qué mosaico usa el hardware ni te deja elegirlo, y esa opacidad es deliberada: la disposición óptima depende de la arquitectura, y exponerla haría que el código escrito para una GPU fuera lento en otra. Lo único que puedes hacer es usar el tipo de recurso correcto y dejar que la implementación aplique la disposición que conoce.
+</Callout>
+
+## Lo que gana el buffer
+
+El buffer no es el perdedor de esta comparación: gana en cuatro cosas que la textura no puede ofrecer.
+
+**Operaciones atómicas.** `array<atomic<u32>>` permite `atomicAdd`, `atomicMax` y compañía. Las storage textures no tienen equivalente en WebGPU. Cualquier algoritmo de dispersión con acumulación —histogramas, voxelización, contadores por celda— tiene que ser un buffer.
+
+**Cualquier layout.** Una struct por elemento con los campos que quieras, en los formatos que quieras. La textura te limita a los [dieciséis formatos permitidos](/guia/webgpu/n23-los-formatos-permitidos/) y a cuatro canales como mucho.
+
+**Tamaño y forma libres.** Un buffer de 128 MiB con la indexación que decidas. Una textura está acotada por `maxTextureDimension2D`, que garantiza 8192, y por su forma rectangular.
+
+**Visibilidad desde vertex.** Un buffer `read-only-storage` se lee desde el vertex shader; una storage texture no es visible desde esa etapa en ningún modo.
+
+Y hay una quinta que a menudo decide: un buffer se puede leer de vuelta a la CPU con `copyBufferToBuffer` y `mapAsync` sin restricciones de alineación de filas, mientras que sacar una textura exige `copyTextureToBuffer` con la regla de `bytesPerRow` múltiplo de 256, que obliga a rellenar y a desempaquetar.
+
+## Las cuatro preguntas
+
+**¿Hace falta atomicidad?** Si dos invocaciones pueden escribir la misma posición y el resultado tiene que ser la suma o el máximo, es un buffer. Sin discusión.
+
+**¿El acceso tiene localidad bidimensional?** Si cada invocación lee un vecindario 2D alrededor de su posición —cualquier convolución, cualquier estarcido, cualquier búsqueda de gradiente—, es una textura.
+
+**¿El resultado se va a muestrear con filtrado?** Si después hay que leerlo con `textureSample` y filtro bilineal, es una textura, porque un buffer obligaría a implementar la interpolación a mano y a leer cuatro veces.
+
+**¿El layout cabe en un formato permitido?** Si necesitas guardar seis floats por posición, o un `u32` y dos `f16`, la textura no llega y el buffer sí. Hay un truco intermedio —varias texturas paralelas, una por grupo de canales— que a veces gana igualmente por la localidad.
+
+Cuando las respuestas se contradicen, la que más pesa suele ser la primera: la falta de atómicos sobre imágenes es absoluta, mientras que la pérdida de localidad de un buffer es cuantitativa y a veces tolerable.
+
+## El caso mixto que aparece a menudo
+
+Muchos algoritmos serios usan los dos. El patrón típico es acumular en un buffer atómico y presentar en una textura:
+
+```wgsl
+// Pass 1: dispersión con acumulación. Necesita atómicos -> buffer.
+@group(0) @binding(0) var<storage, read_write> acumulador : array<atomic<u32>>;
+@group(0) @binding(1) var<uniform> dims : vec2<u32>;
+
+@compute @workgroup_size(64)
+fn acumular(@builtin(global_invocation_id) id : vec3<u32>) {
+  let p = calcularPosicion(id.x);            // posición arbitraria en pantalla
+  if (any(p >= dims)) { return; }
+  atomicAdd(&acumulador[p.y * dims.x + p.x], 1u);
+}
+```
+
+```wgsl
+// Pass 2: normalizar y volcar a textura. Acceso local -> storage texture.
+@group(0) @binding(0) var<storage, read> acumulador : array<u32>;
+@group(0) @binding(1) var salida : texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn presentar(@builtin(global_invocation_id) id : vec3<u32>) {
+  let tam = textureDimensions(salida);
+  if (any(id.xy >= tam)) { return; }
+  let n = f32(acumulador[id.y * tam.x + id.x]);
+  let v = log(1.0 + n) / log(1.0 + 1000.0);
+  textureStore(salida, vec2<i32>(id.xy), vec4<f32>(v, v, v, 1.0));
+}
+```
+
+Dos passes, dos recursos, cada uno donde su fortaleza está. La copia intermedia cuesta una lectura y una escritura de la imagen entera, que es barato comparado con perder la atomicidad o con perder el filtrado posterior.
+
+<Callout type="dios" title="El experimento que zanja la discusión cuesta veinte minutos">
+Toda esta comparación se puede sustituir por una medición, y merece la pena hacerla una vez en la vida para tener la intuición calibrada. Escribe el mismo algoritmo —un desenfoque de caja de 5×5, por ejemplo— dos veces: una leyendo y escribiendo storage textures, otra leyendo y escribiendo storage buffers con indexación `y * ancho + x`. Mismo tamaño, mismo tamaño de workgroup, mismos cálculos. Mide con timestamp queries sobre una imagen de 2048×2048. En la mayoría de las GPUs verás que la versión con textura es entre 1,5 y 3 veces más rápida, y en algunas móviles con arquitectura de tiles la diferencia es mayor. Después repite el experimento con un algoritmo sin localidad —cada invocación lee una posición aleatoria— y verás que la ventaja desaparece o se invierte. Ese par de números es más útil que cualquier regla, porque te dice cuánto de la ventaja es real en **tu** hardware objetivo, y a partir de ahí las decisiones de arquitectura dejan de ser cuestión de fe.
+</Callout>
+
+<Challenge>
+Implementa el experimento del callout. Después añade una tercera variante: buffer pero con indexación en orden de Morton, calculando el índice con entrelazado de bits de x e y. Compárala con las dos anteriores; el resultado te dirá cuánto de la ventaja de la textura viene de la disposición y cuánto del hardware de acceso.
+</Challenge>

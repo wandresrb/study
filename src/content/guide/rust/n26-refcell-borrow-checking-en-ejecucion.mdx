@@ -1,0 +1,142 @@
+---
+title: "`RefCell<T>`: el borrow checker mudado a tiempo de ejecución"
+description: "`RefCell<T>` sí presta referencias al interior con `borrow` y `borrow_mut`, pero comprueba la regla muchos-lectores-XOR-un-escritor en tiempo de EJECUCIÓN, no de compilación. Lleva un contador de préstamos vivos; si pides un préstamo mutable mientras hay otro activo, hace `panic`. Es el trade-off central: cambias la rigidez del análisis estático por flexibilidad dinámica, al precio de un chequeo en cada acceso y el riesgo de abortar."
+subject: rust
+level: 26
+order: 3
+position: "26.3"
+duration: "19 min"
+---
+
+<Lead>
+`Cell` compraba su seguridad renunciando a las referencias. `RefCell<T>` no está dispuesto a renunciar a ellas: te deja obtener un `&T` con `borrow` y un `&mut T` con `borrow_mut`, prestar el interior como haría el borrow checker. Pero entonces vuelve el peligro que `Cell` había abolido —el *aliasing*—, y hay que vigilarlo. La jugada de `RefCell` es genial por lo simple: hace cumplir la misma regla de siempre, *muchos lectores XOR un escritor*, pero la comprueba **en tiempo de ejecución**. Lleva un contador de préstamos vivos y, si pides algo que la violaría, no compila mal: hace `panic`. Has mudado el borrow checker de la compilación a la ejecución.
+</Lead>
+
+<Goals>
+
+- Prestar el interior con `borrow` y `borrow_mut`, y entender los guardas `Ref` y `RefMut`.
+- Explicar el contador de préstamos y cuándo dispara un `panic`.
+- Contrastar el chequeo estático (rígido, sin coste) con el dinámico (flexible, con riesgo).
+- Usar `try_borrow` y mantener los guardas vivos el menor tiempo posible.
+
+</Goals>
+
+## Prestar el interior, contando
+
+`RefCell<T>` expone dos métodos que devuelven no una referencia cruda, sino un **guarda** RAII que envuelve la referencia y lleva la cuenta del préstamo:
+
+```rust
+use std::cell::RefCell;
+
+let c = RefCell::new(vec![1, 2, 3]);
+
+{
+    let lectura = c.borrow();            // Ref<Vec<i32>>: un lector
+    println!("largo: {}", lectura.len());
+}                                        // aqui se suelta `lectura`, baja el contador
+
+{
+    let mut escritura = c.borrow_mut();  // RefMut<Vec<i32>>: el escritor
+    escritura.push(4);                   // muta a traves de un &RefCell
+}
+assert_eq!(c.borrow().len(), 4);
+```
+
+`borrow` devuelve un `Ref<T>` que se comporta como `&T` por `Deref`; `borrow_mut` devuelve un `RefMut<T>` que actúa como `&mut T`. Mientras el guarda vive, el préstamo cuenta como activo; cuando se destruye —al salir de su ámbito—, su `Drop` restaura el contador. El préstamo dura exactamente lo que dura el guarda.
+
+## El contador y el panic
+
+Dentro, `RefCell` guarda una bandera que resume el estado de préstamos: cuántos lectores hay, o si hay un escritor. Cada `borrow`/`borrow_mut` consulta esa bandera antes de conceder el préstamo, y aplica la regla de siempre:
+
+```rust
+use std::cell::RefCell;
+
+let c = RefCell::new(0);
+
+let a = c.borrow();
+let b = c.borrow();          // OK: dos lectores conviven
+println!("{} {}", *a, *b);
+
+// let m = c.borrow_mut();   // PANIC: already borrowed
+//                           // hay lectores vivos; no se puede prestar mutable
+```
+
+Si pides `borrow_mut` habiendo lectores vivos, o cualquier préstamo habiendo un escritor vivo, `RefCell` no puede satisfacerlo sin romper el invariante, así que **aborta con `panic`** (un mensaje del estilo `already borrowed` o `already mutably borrowed`). No es un fallo de memoria: es `RefCell` deteniéndote *antes* de que lo sea. La violación de las reglas de préstamo, que con `&`/`&mut` es un error de compilación, con `RefCell` es un error de ejecución.
+
+<Mermaid code={`flowchart TB
+  libre[Sin prestamos] -->|borrow| lectores[N lectores activos]
+  libre -->|borrow_mut| escritor[Un escritor activo]
+  lectores -->|otro borrow| lectores
+  lectores -->|borrow_mut ahora| panico[panic already borrowed]
+  escritor -->|cualquier borrow| panico
+  lectores -->|se sueltan los Ref| libre
+  escritor -->|se suelta el RefMut| libre
+  class libre t-green
+  class panico t-red
+  class escritor t-blue`} />
+
+## El trade-off: compilación frente a ejecución
+
+Esta es la decisión de ingeniería que define el nivel. El chequeo estático del borrow checker es *conservador*: rechaza programas correctos que no sabe demostrar seguros, pero cuando acepta, la garantía es total y gratis. `RefCell` invierte el trato: acepta patrones de préstamo que el análisis estático no puede seguir —grafos, callbacks, estructuras cuya forma de acceso solo se conoce en ejecución—, pero paga con un chequeo en cada `borrow` y con la posibilidad de un `panic` si te equivocas.
+
+```rust
+use std::cell::RefCell;
+
+// Patron que el borrow checker estatico rechazaria, y RefCell permite:
+fn observar(datos: &RefCell<Vec<i32>>) {
+    if datos.borrow().is_empty() {       // lector efimero, ya soltado
+        datos.borrow_mut().push(0);      // ahora el escritor, sin solaparse
+    }
+}
+```
+
+La clave está en *no solapar* los guardas: cada préstamo vive lo mínimo. Cuando el análisis estático te viene grande —porque la disciplina de aliasing es real pero no la puedes expresar en tipos—, `RefCell` te deja demostrarla dinámicamente en su lugar.
+
+## Un caso real: memoizar lo que no es Copy
+
+Donde `Cell` se quedaba corta —cachear un resultado que no es `Copy`— empieza el dominio natural de `RefCell`. Un `RefCell<Option<String>>` guarda el valor perezoso y presta el interior sin copiarlo entero:
+
+```rust
+use std::cell::RefCell;
+
+struct Informe {
+    fuente: String,
+    render: RefCell<Option<String>>,
+}
+
+impl Informe {
+    fn texto(&self) -> String {                       // &self, y cachea dentro
+        if self.render.borrow().is_none() {           // lector efimero, ya soltado
+            let caro = format!("== {} ==", self.fuente);
+            *self.render.borrow_mut() = Some(caro);    // escritor, sin lector vivo
+        }
+        self.render.borrow().clone().unwrap()
+    }
+}
+```
+
+Fíjate en la coreografía de préstamos: el `borrow` del `is_none` muere en su propia expresión antes de que llegue el `borrow_mut`, y por eso no se solapan. Si en su lugar escribieras `if let Some(_) = self.render.borrow()` con un `borrow_mut` dentro, el `Ref` del `if let` seguiría vivo en el cuerpo y tendrías el `panic` clásico. Con `RefCell`, *ordenar los préstamos en el tiempo* es parte del diseño, no un detalle.
+
+<Callout type="warn" title="El panic casi siempre es un guarda que vive de más">
+El error clásico con `RefCell` es sostener un `Ref` o `RefMut` más tiempo del necesario y luego pedir otro préstamo mientras el primero sigue vivo. `let r = c.borrow(); ...; c.borrow_mut();` explota porque `r` no se ha soltado. La cura es acortar la vida del guarda: mételo en un bloque `{ }`, o consume su valor de inmediato con algo como `let n = *c.borrow();` para tipos `Copy`. Trata cada guarda como un préstamo caro que hay que devolver cuanto antes.
+</Callout>
+
+<Callout type="tip" title="try_borrow, y los primos modernos OnceCell y LazyCell">
+Si prefieres manejar el conflicto sin abortar, `try_borrow` y `try_borrow_mut` devuelven un `Result` en vez de hacer `panic`, y decides tú qué hacer ante el `Err`. Y para el caso concretísimo de *inicializar una vez y solo leer después* —una caché que se rellena en el primer acceso—, la biblioteca estándar moderna ofrece `OnceCell<T>` y `LazyCell<T>`, más precisos y sin riesgo de `panic` por doble préstamo que un `RefCell` usado como perezoso. Elige la herramienta con la garantía más estrecha que te sirva.
+</Callout>
+
+<Callout type="dios" title="Mudar una propiedad estática a dinámica: cambiar el momento de la prueba, no la verdad probada">
+Lo que hace `RefCell` es una de esas operaciones conceptuales que, una vez la ves, reconoces por todas partes en la informática: **reificar** una comprobación que vivía en el compilador y convertirla en un valor que existe y se consulta en ejecución. El borrow checker es un demostrador de teoremas que corre una vez, en tu máquina, sobre el texto del programa: prueba, para *todas* las ejecuciones posibles, que los préstamos no se solapan. `RefCell` toma esa misma proposición —muchos lectores XOR un escritor— y en lugar de demostrarla universalmente de antemano, la *verifica puntualmente* en cada `borrow`, sobre la ejecución concreta que está ocurriendo. La verdad probada es idéntica; lo que cambia es el cuándo y el alcance: de "para siempre y para todos los caminos, antes de ejecutar" a "aquí y ahora, para este camino, mientras ejecuta". Y ese desplazamiento tiene un precio y una ganancia perfectamente simétricos. La ganancia es expresividad: hay disciplinas de aliasing genuinamente seguras que ningún análisis estático decidible puede reconocer —el borrow checker, como todo verificador que termina, es incompleto y rechaza correctos—, y `RefCell` las acepta porque no necesita razonar sobre todos los futuros, solo mirar el presente. El precio es doble: un coste en ejecución, el contador que se lee y actualiza en cada préstamo, y una nueva clase de fallo, el `panic`, que traslada a la ejecución un error que con `&mut` habrías visto en compilación. Elegir entre `&mut` y `RefCell` es, por tanto, elegir *cuándo quieres enterarte de tus errores de aliasing*: temprano, rígido y gratis, o tarde, flexible y con riesgo de abortar. No hay una respuesta correcta universal; hay una correcta para cada situación, y madurar en Rust es, en buena parte, afinar ese juicio. `RefCell` no es una derrota del sistema de tipos: es el sistema de tipos ofreciéndote, con honestidad, mover la frontera de la prueba cuando el análisis estático se queda corto sin que la seguridad ceda un milímetro.
+</Callout>
+
+<Callout type="note" title="Lo esencial de RefCell">
+`RefCell<T>` presta el interior con `borrow` (un `Ref`, como `&T`) y `borrow_mut` (un `RefMut`, como `&mut T`), guardas RAII que llevan la cuenta del préstamo mientras viven. Un contador interno hace cumplir muchos-lectores-XOR-un-escritor en tiempo de ejecución: violarla es un `panic`, no un error de compilación. El trade-off es flexibilidad dinámica a cambio de un chequeo por acceso y el riesgo de abortar; el fallo típico es un guarda que vive de más. Usa `try_borrow` para no abortar, y `OnceCell`/`LazyCell` para inicialización perezosa. Es `!Sync`.
+</Callout>
+
+<Challenge title="Presta con red y sin ella">
+1. Sobre `RefCell::new(vec![1,2,3])`, obtén un `borrow`, lee su `len` en un bloque, y en otro bloque haz `borrow_mut().push(4)`. Explica por qué separarlos en bloques es imprescindible.
+2. Provoca a propósito el `panic`: pide `borrow` y, sin soltarlo, `borrow_mut`. Lee el mensaje y explica qué invariante protegió el abort.
+3. Reescribe el caso anterior con `try_borrow_mut` para que, en vez de abortar, imprima un aviso ante el `Err`.
+4. Argumenta con un ejemplo por qué hay disciplinas de préstamo seguras que el borrow checker estático rechaza y `RefCell` acepta.
+5. Explica en qué se parecen y en qué difieren el chequeo del borrow checker y el de `RefCell`, usando las palabras "conservador", "incompleto" y "en ejecución".
+</Challenge>

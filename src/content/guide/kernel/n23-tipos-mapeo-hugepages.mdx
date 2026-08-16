@@ -1,0 +1,142 @@
+---
+title: "Tipos de mapeo: anónimo, fichero, privado, compartido y hugepages"
+description: "Dos ejes independientes —respaldo (anónimo o fichero) y visibilidad (privado con COW o compartido con MAP_SHARED)— dan cuatro cuadrantes que explican todo mapeo de un proceso. Después, las páginas grandes cambian la granularidad para aliviar la presión sobre el TLB: hugetlb reservado y explícito frente a THP transparente y automático."
+subject: kernel
+level: 23
+order: 5
+position: "23.5"
+duration: "17 min"
+---
+
+<Lead>
+Todo mapeo de un proceso se clasifica en dos ejes independientes. El primero es el **respaldo**: anónimo (sin fichero, materia prima del heap) o respaldado por fichero (contenido del page cache). El segundo es la **visibilidad**: privado (`MAP_PRIVATE`, con copy-on-write) o compartido (`MAP_SHARED`, cambios visibles a todos). Cuatro cuadrantes que agotan las posibilidades. Y sobre ellos, un segundo mando: el tamaño de página, que las hugepages agrandan para descongestionar el TLB.
+</Lead>
+
+<Goals>
+
+- Clasificar todo mapeo en los ejes respaldo y visibilidad.
+- Entender cuándo las escrituras se propagan al fichero y cuándo no.
+- Distinguir hugetlb (reservado, explícito) de THP (transparente, automático).
+- Razonar por qué las páginas grandes alivian la presión sobre el TLB.
+
+</Goals>
+
+## Dos ejes, cuatro cuadrantes
+
+Cruzar respaldo con visibilidad da la tabla que explica cada línea de `/proc/PID/maps`.
+
+<Cards>
+  <Card icon="📈" title="Anónimo privado">
+    Heap, pilas, `malloc` grande, BSS. Respaldo en swap. Cada página es privada; con COW tras `fork`. Es el mapeo por defecto de `MAP_ANONYMOUS | MAP_PRIVATE`.
+  </Card>
+  <Card icon="🔗" title="Anónimo compartido">
+    Memoria compartida entre procesos emparentados (`MAP_ANONYMOUS | MAP_SHARED`) o vía `shmem`/`tmpfs`. Respaldo en tmpfs y swap. IPC de memoria pura.
+  </Card>
+  <Card icon="📖" title="Fichero privado">
+    Texto y datos de ejecutables y librerías. `MAP_PRIVATE` de un fichero: lees del page cache, pero al escribir se hace COW y el cambio **no** vuelve al disco.
+  </Card>
+  <Card icon="💾" title="Fichero compartido">
+    `MAP_SHARED` de un fichero: las escrituras van al page cache y de ahí, por writeback, al disco. Es la E/S mapeada persistente y la vía de compartir un fichero entre procesos.
+  </Card>
+</Cards>
+
+La clave está en las diagonales. El **respaldo** decide de dónde salen las páginas y adónde se expulsan bajo presión: lo anónimo va al swap, lo de fichero se reescribe a su fichero o se descarta si está limpio. La **visibilidad** decide qué pasa al escribir: en privado, la escritura te aparta con una copia propia (el COW del nivel 23.3); en compartido, la escritura es visible para todos los que mapean lo mismo.
+
+## Privado con COW frente a compartido
+
+El contraste operativo se ve en el respaldo por fichero. Con `MAP_PRIVATE`, tu proceso arranca leyendo los folios del page cache, pero la primera escritura dispara copy-on-write: se crea una página **anónima** privada con tu cambio, invisible para el fichero y para los demás. Así se cargan las secciones de datos de un ejecutable: parten del fichero, pero las modificaciones del proceso no lo tocan.
+
+Con `MAP_SHARED`, no hay copia: escribes sobre el propio folio del page cache. Todos los que mapean el fichero ven el cambio, y el kernel lo marca sucio para que el writeback lo persista.
+
+```c
+/* Fichero compartido: la escritura persiste en disco */
+void *s = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+memcpy(s, datos, len);
+msync(s, len, MS_SYNC);          /* fuerza el writeback al disco ahora */
+
+/* Fichero privado: la escritura se queda en una copia anonima */
+void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+p[0] = 0x7f;                     /* COW: el fichero en disco no cambia */
+```
+
+Para el mapeo compartido de fichero, el `.page_mkwrite` de `vm_ops` es el gancho que el kernel invoca cuando una página limpia se va a ensuciar: da al sistema de ficheros la ocasión de asignar bloques o registrar el cambio en el journal antes de permitir la escritura.
+
+## Hugepages: menos entradas de TLB
+
+Cada traducción de dirección virtual a física la resuelve la MMU consultando el **TLB** (translation lookaside buffer), una caché diminuta y rapidísima de traducciones. A la granularidad estándar de 4 KiB, una entrada de TLB cubre 4 KiB: un proceso que recorra un gigabyte necesitaría 262144 entradas distintas, muchísimas más de las que caben. Cada fallo de TLB obliga a **caminar la tabla de páginas** —cuatro accesos a memoria en x86-64— antes de traducir.
+
+Una **hugepage** de 2 MiB resuelve esto por dos vías a la vez. Primero, una sola entrada de TLB cubre 2 MiB: quinientas doce veces más alcance por entrada, así que la misma TLB direcciona muchísima más memoria sin fallar. Segundo, la página grande se mapea en un nivel superior de la tabla (en el `pmd`, saltándose el nivel de `pte`), lo que **acorta el camino** de traducción. Menos entradas y caminos más cortos: doble alivio.
+
+<Mermaid code={`flowchart LR
+  subgraph BASE [Pagina base 4 KiB]
+    B1[1 entrada TLB cubre 4 KiB] --> B2[512 entradas por cada 2 MiB]
+  end
+  subgraph HUGE [Hugepage 2 MiB]
+    H1[1 entrada TLB cubre 2 MiB] --> H2[mapeo en el nivel PMD]
+  end
+  BASE -. mismo trabajo con .-> HUGE
+  class BASE t-red
+  class HUGE t-green`} />
+
+Hay dos mecanismos para conseguirlas, con filosofías opuestas.
+
+**HugeTLB** es explícito y reservado. Se aparta un fondo de páginas grandes al arrancar o en caliente (`/proc/sys/vm/nr_hugepages`), y se piden con `MAP_HUGETLB` o montando `hugetlbfs`. Estas páginas están garantizadas, nunca se parten y nunca van al swap. El precio es la rigidez: reservas por adelantado, y lo que no uses no lo aprovecha nadie más.
+
+```c
+/* Hugepage explicita de 2 MiB, del fondo reservado */
+void *p = mmap(NULL, 2UL << 20, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
+               -1, 0);
+```
+
+**THP** (transparent huge pages) es automático. El kernel promueve por su cuenta 512 páginas base contiguas a una hugepage de 2 MiB: al fallar, si puede, ya entrega una grande, y un hilo de fondo, `khugepaged`, **colapsa** en caliente regiones de páginas pequeñas en grandes. Se gobierna en `/sys/kernel/mm/transparent_hugepage/enabled` con tres modos: `always`, `madvise` (solo donde el programa lo pida con `madvise(MADV_HUGEPAGE)`) y `never`.
+
+```c
+/* THP: pide al kernel que use paginas grandes en esta region si puede */
+void *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+madvise(p, len, MADV_HUGEPAGE);
+```
+
+<Cards>
+  <Card icon="🏛️" title="HugeTLB">
+    Reservado, explícito, garantizado. No se parte ni va al swap. Ideal para bases de datos y VMs que quieren control total. Rígido: reservas por adelantado.
+  </Card>
+  <Card icon="🪄" title="THP">
+    Transparente y automático vía `khugepaged` y `MADV_HUGEPAGE`. Flexible, sin reservas. Puede sufrir picos de latencia al colapsar y compactar.
+  </Card>
+</Cards>
+
+En Linux 7.x el panorama se ha refinado con **mTHP** (multi-size THP): además de la de 2 MiB, el kernel maneja tamaños intermedios (16 KiB, 64 KiB...) con controles por tamaño en `/sys/kernel/mm/transparent_hugepage/hugepages-*kB/`, acercando el beneficio del TLB a cargas que no llegaban a llenar una página de 2 MiB entera.
+
+<Callout type="warn" title="THP always no siempre gana">
+Las hugepages transparentes no son gratis. Colapsar y **compactar** memoria para formar los 2 MiB contiguos consume CPU y puede provocar picos de latencia justo en el peor momento. Y una región apenas usada promovida a hugepage desperdicia memoria: si tocas 8 KiB pero recibes 2 MiB, sobran 2040 KiB. Por eso muchas cargas latency-sensitive prefieren el modo `madvise` —hugepages solo donde el programa las pide a conciencia— antes que `always`. Medir siempre: THP ayuda a lo que barre mucha memoria de forma predecible, y estorba a lo que hace accesos dispersos y pequeños.
+</Callout>
+
+## Ver los cuadrantes en smaps
+
+Los cuatro cuadrantes dejan de ser teoría en `/proc/PID/smaps`, que desglosa cada VMA con contadores precisos. Ahí se lee lo que de verdad ocupa un proceso.
+
+```bash
+grep -A6 'libc.so' /proc/self/smaps
+# Rss:            1580 kB
+# Pss:              47 kB   <- coste real: compartido dividido entre quienes comparten
+# Shared_Clean:   1560 kB   <- paginas de fichero compartidas del page cache
+# Private_Dirty:    20 kB   <- copias anonimas propias tras COW
+# Swap:              0 kB
+# KernelPageSize:    4 kB   <- seria 2048 kB si fuera una hugepage
+```
+
+El campo decisivo es `Pss` (proportional set size): reparte cada página compartida entre todos los procesos que la mapean, y es la única métrica honesta de "cuánta memoria cuesta *este* proceso", la respuesta a la pregunta que dejamos abierta en el nivel 23.1. Un `Shared_Clean` alto delata mapeos de fichero compartidos —librerías, ejecutables—; un `Private_Dirty` alto son las páginas anónimas o las copias COW que solo este proceso posee. Y `KernelPageSize` a 2048 kB confirma que la región usa hugepages.
+
+<Callout type="dios" title="La memoria virtual es una jerarquía de mentiras afinables, y la granularidad es el mando maestro">
+Corona aquí el nivel entero recogiendo el hilo. Empezamos con `mm_struct` prometiendo un espacio que no existe (23.1); vimos `mmap` registrar la promesa sin entregarla (23.2); vimos el fallo de página entregarla justo a tiempo y compartirla con COW (23.3); la pusimos en manos de un driver (23.4); y ahora clasificamos toda la fauna y ajustamos su grano. Retrocede y contempla la estructura completa: la memoria virtual es una **pila de abstracciones**, cada una una mentira útil sobre la de abajo. La VMA miente sobre qué memoria tienes; la tabla de páginas traduce esa mentira a marcos reales; el TLB cachea la traducción para que la mentira sea rápida; el page cache respalda los marcos con almacenamiento para que quepan más de los que existen; el swap y el writeback expulsan lo que no cabe. Y `mmap` es el único cincel que talla toda esta pila desde userspace: con cuatro flags eliges respaldo y visibilidad, y con el tamaño de página eliges el punto de equilibrio entre flexibilidad y eficiencia de traducción. Los cuadrantes no son casos que memorizar: son las cuatro maneras en que las dos preguntas fundamentales —de dónde salen mis páginas, quién más las ve— pueden responderse. Y las hugepages enseñan la lección más profunda de todas: no existe una granularidad correcta. Páginas pequeñas dan flexibilidad y desperdician TLB; páginas grandes ahorran TLB y desperdician memoria y latencia. El diseñador de sistemas no busca el tamaño óptimo, porque no lo hay: busca el que casa con el patrón de acceso de *esta* carga. Cuando ves la memoria virtual así —no como un mecanismo que aprender, sino como una jerarquía de compromisos que afinar— dejas de ser usuario del subsistema de memoria y empiezas a ser su ingeniero.
+</Callout>
+
+<Challenge title="Recorre los cuatro cuadrantes y afina el grano">
+1. Para cada cuadrante (anónimo/fichero por privado/compartido), da un ejemplo real de `/proc/self/maps` y di dónde se expulsa bajo presión de memoria.
+2. Demuestra con un programa que una escritura en `MAP_PRIVATE` de un fichero no altera el disco, y que en `MAP_SHARED` sí (con `msync`).
+3. Reserva hugepages con `nr_hugepages`, mapea 2 MiB con `MAP_HUGETLB` y confírmalo en `/proc/PID/smaps` mirando `KernelPageSize`.
+4. Compara `hugetlb` y `THP` en garantía, flexibilidad y coste de latencia; explica cuándo elegir `madvise` frente a `always`.
+5. Calcula cuántas entradas de TLB necesita recorrer 1 GiB con páginas de 4 KiB frente a hugepages de 2 MiB, y explica el segundo beneficio: el camino de traducción más corto.
+</Challenge>

@@ -1,0 +1,150 @@
+---
+title: "Cache de respuestas: no pagues dos veces lo mismo"
+description: "Si dos usuarios envían exactamente el mismo prompt, pagas dos inferencias idénticas y ambos esperan lo mismo. La caché del gateway rompe esa repetición: guarda la respuesta y la sirve desde la red sin tocar al proveedor. Vemos cómo se construye la clave de caché y por qué la coincidencia debe ser exacta, cómo se afina con `cf-aig-cache-ttl` y `cf-aig-skip-cache`, cuándo cachear es seguro y cuándo servir una respuesta guardada es directamente un error de corrección."
+subject: cloudflare
+level: 30
+order: 2
+position: "30.2"
+duration: "16 min"
+---
+
+<Lead>
+En una CDN clásica cachear es casi una obviedad: el mismo archivo para todo el mundo, servido desde el borde. Con un modelo de lenguaje la tentación es la misma y las consecuencias son mucho mayores, porque lo que ahorras no es ancho de banda sino inferencia pagada por token y segundos de espera. Pero también es mucho más fácil equivocarse: una respuesta de LLM parece contenido estático y a menudo no lo es. Este capítulo va de las dos caras de esa moneda: cómo se activa la caché y, sobre todo, cómo saber si lo que estás a punto de cachear se puede cachear.
+</Lead>
+
+<Goals>
+
+- Cuantificar qué se ahorra exactamente al cachear: coste de tokens y latencia de generación.
+- Entender cómo se construye la clave de caché y por qué exige coincidencia exacta.
+- Manejar `cf-aig-cache-ttl`, `cf-aig-skip-cache` y `cf-aig-cache-key` para afinar por petición.
+- Distinguir los casos donde cachear es seguro de aquellos donde rompe la corrección o filtra contexto.
+
+</Goals>
+
+## Lo que se ahorra de verdad
+
+Un acierto de caché no es una optimización marginal: es la eliminación completa del trabajo. La petición no llega al proveedor, no se generan tokens y por tanto no se factura nada de inferencia; y como la respuesta sale de la red de Cloudflare, la latencia cae de segundos a decenas de milisegundos. Es el único mecanismo de este nivel que mejora coste y velocidad a la vez, sin compromiso entre ambos.
+
+Hay un tercer beneficio que se nota solo cuando las cosas van mal: una petición que no llega al proveedor tampoco consume su cuota, así que la caché es de paso un amortiguador frente a los límites que él te impone y frente a sus malos momentos. Bajo una avalancha de tráfico repetido, un sistema con caché mantiene la calma mientras el mismo sistema sin ella se estrella contra el techo del proveedor.
+
+La magnitud del ahorro depende por completo de una propiedad de tu tráfico que rara vez se mide: la **tasa de repetición de prompts**. En un asistente conversacional abierto es baja, porque cada usuario escribe algo distinto. En un bot de soporte con respuestas guiadas, en una clasificación de tickets con etiquetas fijas, en una traducción de cadenas de interfaz o en una demo pública que todo el mundo prueba con el ejemplo sugerido, esa tasa se dispara.
+
+Y hay una asimetría que suele pasar inadvertida: la repetición no se reparte de forma uniforme, se concentra. En casi cualquier producto real un puñado diminuto de peticiones acapara una fracción desproporcionada del volumen —las preguntas frecuentes de verdad, el ejemplo que sale en la documentación, el botón que todo el mundo pulsa al entrar—. Eso significa que no necesitas una tasa de repetición alta en general para que la caché sea rentable: necesitas que la cola corta exista, y casi siempre existe. Conviene además notar que la caché es de red, no por usuario: el primer visitante paga la inferencia y todos los siguientes la aprovechan, así que su valor crece con tu tráfico en lugar de diluirse.
+
+Solo la caché de esta lección tiene la propiedad de ser gratis en ambos ejes. Todo lo demás que veremos en este nivel implica algún compromiso: limitar protege el bolsillo a costa de rechazar peticiones, reintentar mejora la fiabilidad a costa de la latencia, registrar da visibilidad a costa de almacenamiento. Cachear, cuando es correcto hacerlo, no cuesta nada de nada.
+
+Conviene acotar el alcance antes de entusiasmarse: hoy se cachean respuestas de texto e imagen, y solo ante peticiones idénticas. No hay todavía búsqueda semántica, así que dos maneras distintas de formular la misma pregunta son, para la caché, dos preguntas distintas. Eso sitúa el terreno donde brilla —conjuntos de prompts acotados, opciones guiadas, entradas generadas por tu propio código— y donde apenas rasca, que es la conversación libre.
+
+Activar la caché por defecto es una casilla en la configuración del gateway, o el campo `cache_ttl` si lo creas por API. A partir de ahí toda petición que la admita pasa por ella, y cada respuesta trae la cabecera `cf-aig-cache-status` con el valor `HIT` o `MISS`, que es tu instrumento de medida.
+
+```bash
+# la respuesta trae cf-aig-cache-status para saber si vino de cache
+curl -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/ai/v1/chat/completions" \
+  --header "Authorization: Bearer $CF_API_TOKEN" \
+  --header "Content-Type: application/json" \
+  --header "cf-aig-cache-ttl: 3600" \
+  --data '{
+    "model": "openai/gpt-4.1-mini",
+    "messages": [{ "role": "user", "content": "Que es un CDN en dos frases" }]
+  }'
+```
+
+<Callout type="info" title="La caché es volátil, no un almacén">
+Dos peticiones idénticas lanzadas a la vez pueden fallar ambas: la primera no ha terminado de poblar la caché cuando llega la segunda. La caché de `AI Gateway` es un acelerador oportunista, no una base de datos. Si necesitas la garantía de calcular algo una sola vez, eso es un problema de coordinación y se resuelve con un `Durable Object`, no aquí.
+</Callout>
+
+## La clave de caché: coincidencia exacta
+
+Aquí está el detalle que decide si tu tasa de aciertos será del cuarenta por ciento o del cero. La clave se construye concatenando el proveedor, el `endpoint`, el modelo, la cabecera de autenticación del proveedor y **el cuerpo completo de la petición**, y aplicando `SHA-256` al resultado. Coincidencia exacta significa exacta: una coma distinta, un valor de `temperature` diferente, una herramienta más en la lista o una marca de tiempo inyectada en el prompt de sistema producen una clave nueva y, por tanto, un fallo garantizado.
+
+<Mermaid code={`flowchart TB
+  REQ[Peticion entrante] --> KEY[Clave SHA256 de proveedor endpoint modelo auth y cuerpo]
+  KEY --> LOOK{Existe en cache}
+  LOOK -- HIT --> FAST[Respuesta en milisegundos sin coste de tokens]
+  LOOK -- MISS --> PROV[Se llama al proveedor y se paga la inferencia]
+  PROV --> STORE[Se guarda segun el TTL]
+  class FAST t-green
+  class PROV t-peach`} />
+
+La consecuencia práctica es que **cachear bien es sobre todo higiene del cuerpo de la petición**. Si tu prompt de sistema incluye la fecha y la hora actuales, acabas de garantizar que ninguna petición se repita jamás. Si envías un identificador de traza dentro del cuerpo, lo mismo. Todo lo que varíe entre peticiones equivalentes debe salir del cuerpo o aceptarás no cachear nunca.
+
+Que la clave incluya la cabecera de autenticación del proveedor tiene además una lectura de seguridad que conviene tener clara: dos claves distintas nunca comparten entradas de caché, así que el aislamiento entre integraciones que usan credenciales separadas es automático. Lo que no aísla es a tus propios usuarios, porque todos ellos comparten la misma clave hacia el proveedor. Esa es exactamente la frontera del riesgo y volveremos a ella al hablar de seguridad.
+
+Otra consecuencia menos evidente es que la caché **es del gateway, no de la aplicación**. Dos servicios distintos que envíen la misma petición con la misma credencial comparten aciertos sin coordinarse ni saber el uno del otro. Eso multiplica el valor de haber concentrado el tráfico: cuantas más partes de tu producto atraviesen la misma puerta, más se alimentan mutuamente los aciertos.
+
+Cuando esa higiene no es posible, existe la vía de escape: `cf-aig-cache-key` te deja imponer tu propia clave e ignorar el cuerpo real. Es una herramienta de precisión y de riesgo, porque tú asumes la responsabilidad de que todas las peticiones que compartan clave merezcan de verdad la misma respuesta.
+
+```bash
+# clave propia: dos peticiones con cuerpos distintos compartiran respuesta
+curl -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/ai/v1/chat/completions" \
+  --header "Authorization: Bearer $CF_API_TOKEN" \
+  --header "Content-Type: application/json" \
+  --header "cf-aig-cache-key: faq-devoluciones-v3" \
+  --header "cf-aig-cache-ttl: 86400" \
+  --data '{ "model": "openai/gpt-4.1-mini", "messages": [] }'
+```
+
+El `TTL` admite desde sesenta segundos hasta un mes, y `cf-aig-skip-cache` puesto a `true` fuerza el viaje al proveedor para esa petición concreta, útil cuando el usuario pulsa un botón de regenerar y espera explícitamente una respuesta nueva.
+
+Elegir ese `TTL` es una decisión más rica de lo que parece, porque en realidad estás fijando cuánta obsolescencia acepta tu producto. Un valor corto captura las ráfagas —el pico de gente que llega a la vez desde el mismo enlace— sin comprometerse a nada a largo plazo, y es casi siempre la elección segura por defecto. Un valor largo solo tiene sentido cuando puedes afirmar que la respuesta correcta no cambia en ese plazo, lo que en la práctica exige que ni el contenido de origen ni el prompt ni el modelo se muevan. Y como el modelo sí se mueve —los proveedores actualizan versiones—, un mes de `TTL` puede significar servir durante semanas la voz de un modelo que ya jubilaste.
+
+## Cuándo es seguro y cuándo no
+
+La pregunta correcta no es si la respuesta cambiará, sino si **la respuesta depende de algo que no está en la clave**. Si toda la información que determina la salida viaja en el cuerpo, cachear es seguro. Si hay contexto oculto —la identidad del usuario resuelta por una cabecera, unos permisos, la hora, un documento recuperado aparte— entonces dos peticiones con cuerpo idéntico merecen respuestas distintas y la caché te servirá la equivocada.
+
+Ese criterio tiene una virtud: convierte una intuición difusa sobre privacidad en una comprobación mecánica que puedes hacer leyendo el código. Enumera todo lo que la respuesta usa. Táchalo si viaja en el cuerpo. Lo que quede sin tachar es tu lista de razones para no cachear, o tu lista de cosas que tienes que meter en el cuerpo o en la clave antes de hacerlo.
+
+<Cards>
+  <Card icon="✅" title="Cachea sin miedo">
+    Preguntas frecuentes con respuestas guiadas, clasificación con etiquetas fijas, traducción de cadenas de interfaz, resúmenes de un documento inmutable, `embeddings` de contenido estático.
+  </Card>
+  <Card icon="🚫" title="No caches nunca">
+    Respuestas que dependen de identidad o permisos, datos que cambian solos, agentes que ejecutan herramientas con efectos, y cualquier salida donde una respuesta ajena sería una fuga.
+  </Card>
+  <Card icon="⚠️" title="Piénsatelo">
+    Generación creativa con `temperature` alta: cachear congela una muestra concreta y el usuario percibirá que el sistema se repite. Ahorras dinero a costa de la variedad que prometiste.
+  </Card>
+  <Card icon="⏱️" title="Ajusta el TTL, no lo apagues">
+    Si el contenido envejece pero no en segundos, un `TTL` corto captura las ráfagas de repetición sin servir nada rancio. Un minuto ya elimina la mayor parte del pico.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="El error de corrección más caro">
+Imagina un prompt de sistema que dice "responde según el plan del usuario" y una identidad que resuelves fuera del cuerpo. Dos usuarios de planes distintos envían el mismo texto: el cuerpo es idéntico, la clave es idéntica, y el segundo recibe la respuesta calculada para el primero. No es un fallo de la caché, es un fallo de modelado: metiste una variable en el sistema sin meterla en la clave. La regla es simple y no admite excepciones —todo lo que influye en la respuesta tiene que estar en la clave, o no puedes cachear.
+</Callout>
+
+## Medir el ahorro en lugar de suponerlo
+
+Una caché activada no es una caché que funcione, y la diferencia entre ambas cosas se mide con un solo número: la proporción de respuestas que llegan con `cf-aig-cache-status` en `HIT`. Ese dato aparece en los logs del gateway, se puede filtrar por modelo y por función, y es el primer sitio donde mirar cuando el ahorro prometido no aparece en la factura.
+
+Interpretar ese número exige separar dos magnitudes que se confunden constantemente. El **ahorro potencial** es qué fracción de tu tráfico son peticiones semánticamente repetidas; depende de tu producto y no lo cambias tocando configuración. El **ahorro capturado** es qué fracción de esas repeticiones llegan además a compartir clave; depende por completo de la higiene del cuerpo de la petición. Una distancia grande entre ambos no significa que la caché no sirva para tu caso: significa que estás inyectando ruido variable en peticiones que deberían ser idénticas.
+
+```ts
+// instrumenta el acierto para poder decidir con datos
+const respuesta = await fetch(url, opciones);
+const estado = respuesta.headers.get("cf-aig-cache-status");
+
+ctx.waitUntil(
+  env.METRICAS.writeDataPoint({
+    blobs: [funcion, modelo, estado ?? "desconocido"],
+    doubles: [Date.now() - inicio],
+    indexes: [funcion],
+  }),
+);
+```
+
+Y hay un tercer número, el más importante de los tres y el que casi nadie calcula: el ahorro **en dinero**, no en peticiones. Una tasa de aciertos del sesenta por ciento concentrada en tu modelo más barato mueve mucho menos la factura que una del diez por ciento sobre el modelo de razonamiento con contextos enormes. Ordena siempre tus esfuerzos de cacheabilidad por coste evitado y no por volumen evitado; casi nunca coinciden.
+
+Ese orden tiene además una consecuencia agradable sobre la latencia. Los aciertos que más dinero ahorran suelen ser los de las peticiones más pesadas, que son también las más lentas, así que optimizar por coste evitado mejora de paso justo la cola de la distribución que peor experiencia da. Es de las pocas veces en ingeniería en que el criterio económico y el criterio de experiencia apuntan sin esfuerzo al mismo sitio.
+
+<Callout type="dios" title="Cachear inferencia es admitir que gran parte de la inteligencia que pagas es repetición">
+Hay algo casi filosófico en cachear la salida de un modelo de lenguaje, y merece la pena mirarlo de frente porque cambia cómo diseñas el producto. Estamos acostumbrados a pensar la IA como generación: cada respuesta es un acto creativo irrepetible, y por eso pagarla cada vez parece justo. La caché desmiente esa historia con datos. En cuanto mides tu tráfico real descubres que una fracción enorme de las llamadas no pide creación, pide **recuperación**: la misma pregunta frecuente, la misma clasificación de un texto que ya viste, la misma traducción de la misma cadena, el mismo resumen del mismo documento. Para todas ellas el modelo no está pensando, está recordando de forma carísima algo que ya calculó, y lo hace porque le hemos pedido que lo haga sin memoria. La caché es, literalmente, devolverle esa memoria por fuera. Y en cuanto asumes esa mirada, la decisión de arquitectura se invierte: en lugar de preguntarte qué puedes cachear de tu diseño actual, empiezas a diseñar para que se pueda cachear. Sacas la fecha del prompt de sistema. Estabilizas el orden de las herramientas. Separas la parte determinista de la petición de la parte personalizada, para que la primera acumule aciertos aunque la segunda no. Fijas `temperature` a cero donde la variedad no aporta nada y la reservas donde sí. Ese ejercicio no solo abarata: te obliga a explicitar de qué depende realmente cada respuesta de tu sistema, que es exactamente la pregunta que la caché castiga sin piedad si la respondes mal. Por eso la caché es a la vez la función más simple del gateway y la que más disciplina impone: no puedes cachear correctamente lo que no has entendido, y al final acabas entendiendo tu propio producto mejor que antes de intentarlo.
+</Callout>
+
+<Challenge title="Diseña para el acierto de caché">
+1. Toma tus prompts en producción y busca todo lo que varía entre peticiones equivalentes: fechas, identificadores de traza, orden de herramientas. Eso es tu tasa de acierto perdida.
+2. Estima tu tasa de repetición real y calcula qué parte de la factura de IA desaparecería con una caché perfecta.
+3. Elige una llamada segura de cachear y otra que no lo sea, y argumenta la diferencia usando el criterio del contexto oculto.
+4. Fija un `TTL` justificado para la primera: explica por qué ese número y no el doble ni la mitad.
+5. Describe un escenario concreto en tu producto donde `cf-aig-cache-key` mejoraría los aciertos, y qué tendrías que garantizar para que no fuese un riesgo.
+</Challenge>

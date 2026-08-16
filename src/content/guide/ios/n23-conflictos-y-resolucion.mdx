@@ -1,0 +1,152 @@
+---
+title: "Conflictos: cuando dos dispositivos editan lo mismo"
+description: "Un conflicto no es un error del sistema sino la manifestación inevitable de haber aceptado escrituras concurrentes sin coordinación previa. Esta lección explica cómo CloudKit detecta la divergencia mediante control de concurrencia optimista, qué anomalías concretas produce cada política de resolución, por qué la fusión por campo que aplica SwiftData genera estados que ningún usuario escribió, y cómo elegir un modelo de datos que convierta la mayoría de los conflictos en algo que ya no puede ocurrir."
+subject: ios
+level: 23
+order: 3
+position: "23.3"
+duration: "22 min"
+---
+
+<Lead>
+La pregunta con la que casi todo el mundo se acerca a este tema —cómo resuelvo los conflictos— contiene ya el error que después cuesta caro, porque presupone que existe una respuesta correcta y que basta con encontrarla. No existe. Un conflicto es el nombre que le damos a una situación en la que dos intenciones legítimas y simultáneas resultan incompatibles, y ningún algoritmo puede saber cuál de las dos representa mejor lo que el usuario quería. Lo único que un sistema puede ofrecer es un menú de anomalías: la política que descarta trabajo, la que fabrica estados intermedios, la que interrumpe al usuario y la que evita el problema cambiando la forma del dato. Escoger entre ellas es una decisión de producto disfrazada de decisión técnica, y el trabajo del ingeniero consiste en hacer visible ese menú en lugar de dejar que lo elija el valor por defecto.
+</Lead>
+
+<Goals>
+
+- Explicar la detección de divergencia mediante etiquetas de cambio y control de concurrencia optimista.
+- Comparar las políticas de guardado y nombrar la anomalía concreta que produce cada una.
+- Implementar una fusión de tres vías con el registro del servidor, el del cliente y el antepasado común.
+- Rediseñar el modelo para que las operaciones sean conmutativas e idempotentes y el conflicto desaparezca.
+
+</Goals>
+
+## Cómo se detecta la divergencia
+
+CloudKit no bloquea nada. Cada registro lleva una etiqueta de cambio que el servidor incrementa en cada escritura aceptada, y el cliente que quiere modificarlo envía la etiqueta que conocía. Si coincide con la que el servidor tiene, la escritura entra y la etiqueta avanza; si no coincide, alguien escribió en medio y la operación se rechaza con un error específico. Es control de concurrencia optimista en su forma más pura: se asume que el choque es raro, se detecta después del hecho y se paga solo cuando ocurre.
+
+Ese rechazo no llega vacío, y ahí está la clave de todo lo que sigue. La información del error contiene tres versiones del mismo registro: la que hay ahora en el servidor, la que tú intentabas escribir y el antepasado común, es decir, el estado desde el que tú partías. Con esas tres es posible hacer una fusión de tres vías igual que hace un sistema de control de versiones con el código, distinguiendo qué campos cambió cada parte y detectando únicamente como conflicto real aquellos que ambas tocaron.
+
+<Mermaid code={`flowchart TB
+  a[Cliente intenta guardar con su etiqueta de cambio] --> b[El servidor compara etiquetas]
+  b --> ok[Coinciden: escritura aceptada y etiqueta avanza]
+  b --> ko[No coinciden: error de registro cambiado]
+  ko --> t[El error trae servidor cliente y antepasado]
+  t --> d[Comparar campo a campo contra el antepasado]
+  d --> u[Solo uno cambio el campo: tomar ese valor]
+  d --> c[Ambos cambiaron el campo: conflicto real]
+  c --> p[Politica de dominio o decision del usuario]
+  p --> r[Reintentar con la etiqueta nueva del servidor]`} />
+
+El reintento merece una nota, porque es donde se cuelan los fallos sutiles. Después de fusionar hay que volver a enviar usando la etiqueta que trajo el registro del servidor, no la original; y esa segunda escritura puede fallar otra vez si un tercer dispositivo se adelantó. El bucle debe estar acotado, ser idempotente y no depender de que la fusión sea rápida, porque en un dispositivo lento con muchos registros en conflicto la operación puede repetirse varias veces antes de converger.
+
+## Las políticas y su anomalía
+
+Existen tres políticas de guardado y cada una compra algo a cambio de un tipo de daño distinto. La primera, la que verifica que el registro del servidor no haya cambiado, es la única que **detecta** el conflicto en lugar de ocultarlo, y por eso es la única aceptable cuando el dato importa. Su coste es que obliga a escribir el código de reconciliación.
+
+<Cards>
+  <Card icon="🛡️" title="Verificar sin cambios">
+    Rechaza la escritura si el servidor avanzó. No pierde nada sin avisar, pero exige implementar la fusión. Es la opción correcta por defecto.
+  </Card>
+  <Card icon="🧩" title="Solo campos modificados">
+    Escribe únicamente las claves que el cliente tocó. Converge sin intervención, a cambio de producir estados combinados que nadie escribió.
+  </Card>
+  <Card icon="💥" title="Todas las claves">
+    Sobrescribe el registro entero con la versión del cliente. Es la última escritura gana en su forma más destructiva: borra silenciosamente el trabajo ajeno.
+  </Card>
+</Cards>
+
+La segunda política es la que aplica el espejo de SwiftData, y conviene entender exactamente qué produce porque es el comportamiento que la mayoría de las apps tendrá sin haberlo elegido. Al fusionar campo a campo y quedarse con la última escritura de cada uno por separado, el resultado puede ser un objeto que combina fragmentos de dos intenciones distintas. El ejemplo canónico es una tarea que un dispositivo marca como completada mientras el otro la reprograma para la semana siguiente: el resultado es una tarea completada y a la vez aplazada, un estado que ninguno de los dos usuarios pidió y que puede violar una invariante del dominio.
+
+```swift
+do {
+    _ = try await db.modifyRecords(saving: [registro], deleting: [],
+                                   savePolicy: .ifServerRecordUnchanged, atomically: true)
+} catch let error as CKError where error.code == .serverRecordChanged {
+    guard
+        let servidor = error.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord,
+        let cliente = error.userInfo[CKRecordChangedErrorClientRecordKey] as? CKRecord,
+        let ancestro = error.userInfo[CKRecordChangedErrorAncestorRecordKey] as? CKRecord
+    else { throw error }
+
+    let fusionado = fusionar(servidor: servidor, cliente: cliente, ancestro: ancestro)
+    _ = try await db.modifyRecords(saving: [fusionado], deleting: [],
+                                   savePolicy: .ifServerRecordUnchanged, atomically: true)
+}
+```
+
+Un detalle que sorprende a quien viene de bases de datos locales: las marcas de tiempo que decide el servidor no ordenan los sucesos del mundo, ordenan las llegadas. Un dispositivo sin conexión durante tres días sube sus cambios el cuarto y sus escrituras parecen las más recientes aunque expresen intenciones antiguas. Cualquier política basada en la última escritura hereda ese sesgo, y compensarlo con relojes del cliente es peor, porque los relojes de dos dispositivos no coinciden y el usuario puede alterarlos.
+
+```swift
+func fusionar(servidor: CKRecord, cliente: CKRecord, ancestro: CKRecord) -> CKRecord {
+    let salida = servidor                      // partimos de la version viva del servidor
+    for clave in cliente.allKeys() {
+        let base = ancestro[clave] as? NSObject
+        let mio = cliente[clave] as? NSObject
+        let suyo = servidor[clave] as? NSObject
+        if mio != base && suyo == base {
+            salida[clave] = cliente[clave]     // solo yo cambie este campo: mi valor manda
+        } else if mio != base && suyo != base && mio != suyo {
+            salida[clave] = resolverDominio(clave: clave, mio: cliente, suyo: servidor)
+        }
+    }
+    return salida
+}
+```
+
+## Modelar para que el conflicto no exista
+
+La observación más productiva de todo el tema es que la mayoría de los conflictos no son inherentes al dominio sino artefactos del modelado. Aparecen porque se ha elegido representar el estado como un valor mutable compartido, y desaparecen si se representa como una acumulación de operaciones conmutativas. Es la misma idea que sostiene los tipos replicados sin conflicto, y no hace falta importar una biblioteca para aprovechar el noventa por ciento de su beneficio.
+
+Tres transformaciones cubren casi todos los casos reales. La primera es **afinar el grano**: si dos usuarios editan campos distintos del mismo objeto y esos campos son independientes, sepáralos en registros distintos y el choque deja de existir, porque la unidad de conflicto es el registro. La segunda es **sustituir el estado por eventos**: en lugar de un campo con el total, una colección de aportaciones que solo crece y cuyo total se calcula al leer; dos dispositivos que añaden a la vez producen dos filas y ninguna se pierde. La tercera es **hacer conmutativas las operaciones**: un contador que cada dispositivo incrementa en su propia partida, y cuyo valor es la suma de todas, converge sin coordinación.
+
+<Callout type="info" title="El borrado necesita una lápida">
+En un sistema donde los cambios llegan desordenados, borrar quitando la fila es ambiguo: un dispositivo que no vio el borrado y luego edita el objeto lo resucita. La solución habitual es marcar en lugar de eliminar, con una marca de borrado que se propaga como cualquier otro campo y gana siempre frente a una edición. La limpieza real se hace más tarde, cuando ha pasado tiempo suficiente para que ningún cliente razonable siga trayendo cambios antiguos.
+</Callout>
+
+```swift
+// Estado mutable: dos incrementos simultaneos pierden uno de los dos
+@Model final class Album { var visitas: Int = 0 }
+
+// Operaciones acumuladas: cada dispositivo escribe su propia partida y nadie pisa a nadie
+@Model final class ParteDeVisitas {
+    var album: UUID = UUID()
+    var dispositivo: UUID = UUID()      // clave: una fila por origen
+    var total: Int = 0
+    init() {}
+}
+
+func visitasDe(_ album: UUID, en partes: [ParteDeVisitas]) -> Int {
+    partes.filter { $0.album == album }.reduce(0) { $0 + $1.total }
+}
+```
+
+Ese fragmento condensa la idea entera. El primer modelo tiene un único lugar donde escribir y por tanto un conflicto garantizado en cuanto hay concurrencia; el segundo reparte la escritura por origen, de modo que dos dispositivos nunca tocan la misma fila y la suma converge al valor correcto sin coordinación ni fusión. El precio es una lectura ligeramente más cara y unos cuantos registros más, que es exactamente el tipo de coste que conviene pagar: predecible, acotado y sin casos raros.
+
+Los conjuntos merecen mención aparte porque son la estructura donde el modelado ingenuo falla de forma más visible. Guardar una lista de etiquetas como una única propiedad con un array significa que dos dispositivos que añaden etiquetas distintas producen un conflicto en el que una de las dos adiciones desaparece. Guardar cada pertenencia como un registro propio con su marca de borrado convierte esas mismas dos operaciones en dos escrituras independientes que no se tocan. El coste es más registros y una consulta al leer; el beneficio es que una clase entera de pérdida de datos deja de ser posible.
+
+## Cuando hay que decidir de verdad
+
+Queda un residuo irreducible: campos donde dos ediciones simultáneas son genuinamente incompatibles y ninguna fusión automática es defendible. Un texto largo redactado por dos personas, un precio, un estado que gobierna un flujo de trabajo. Para ese residuo hay tres respuestas honestas y ninguna es automática. Se puede preferir una de las dos según una regla del dominio explicable al usuario, se pueden conservar ambas versiones bifurcando el objeto, o se puede preguntar.
+
+Preguntar es la opción que más se descarta por miedo a molestar y la que mejor funciona cuando se aplica con criterio, porque el usuario dispone de un contexto que el sistema no tiene. La condición para que no resulte insufrible es que sea excepcional: si el diseño produce conflictos con frecuencia, el problema está en el modelo y ninguna interfaz de resolución lo arreglará. Bifurcar es la alternativa cuando interrumpir no es viable, y tiene la virtud de no destruir nada, a cambio de trasladar al usuario la tarea de limpiar después.
+
+<Callout type="tip" title="Registrar antes que resolver">
+Antes de escribir una sola línea de resolución conviene instrumentar la detección. Contar cuántos conflictos ocurren, sobre qué tipos de registro y sobre qué campos concretos convierte una discusión de opiniones en un dato. En la mayoría de las apps la medición revela que los conflictos se concentran en dos o tres campos, y que rediseñar esos campos elimina más problemas que cualquier algoritmo de fusión general.
+</Callout>
+
+<Callout type="dios" title="No existe la resolución correcta: existe la elección explícita de qué anomalía aceptas">
+Todo este asunto se aclara de golpe al reconocer que un sistema que acepta escrituras mientras está particionado ha renunciado, por definición, a la consistencia fuerte, y que esa renuncia no se compensa después con astucia sino que se administra. La consecuencia es que no hay una solución técnica al conflicto: hay un conjunto de anomalías posibles y hay que escoger cuál resulta tolerable en tu dominio. La última escritura gana produce **pérdida silenciosa de trabajo**, aceptable en una preferencia de interfaz e inadmisible en el cuerpo de un documento. La fusión por campo produce **estados que nadie escribió**, aceptable cuando los campos son independientes y peligrosa cuando existen invariantes que los relacionan, porque el sistema puede fabricar combinaciones que tu propia lógica considera imposibles. Preguntar al usuario produce **fricción**, aceptable si es rara y devastadora si es cotidiana. Bifurcar produce **duplicados**, aceptable cuando limpiar es fácil. Y hay una quinta opción, casi siempre la mejor y casi siempre la última que se considera, que consiste en cambiar la pregunta: rediseñar el dato de modo que las operaciones concurrentes sean conmutativas e idempotentes y la anomalía deje de existir. Ese cambio de perspectiva —de resolver conflictos a diseñar para que no los haya— es lo que separa una app que sincroniza de una que sincroniza bien, y explica por qué las herramientas colaborativas que funcionan invirtieron su esfuerzo en la estructura de datos y no en el algoritmo de fusión. La pregunta que hay que hacerse ante cada campo del modelo no es cómo lo fusiono, sino qué pasa si dos personas lo tocan a la vez y por qué he elegido que el dato tenga una forma que lo permite.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+La divergencia se detecta con etiquetas de cambio y control optimista, y el error trae las tres versiones necesarias para una fusión de tres vías. Verificar que el servidor no cambió es la única política que no pierde datos en silencio; la fusión por campo converge sola pero fabrica estados combinados; sobrescribir todas las claves destruye trabajo ajeno. Las marcas de tiempo ordenan llegadas, no intenciones. Y la palanca más rentable no es el algoritmo de fusión sino el modelo: grano fino, operaciones acumuladas, conmutatividad e idempotencia convierten la mayoría de los conflictos en algo que ya no puede ocurrir.
+</Callout>
+
+<Challenge title="Provocar, medir y eliminar conflictos">
+1. Con dos dispositivos sin conexión, edita campos distintos del mismo objeto, restablece la red y describe el estado resultante frente al que cada usuario esperaba.
+2. Repite el experimento editando el mismo campo y comprueba qué versión sobrevive y qué relación tiene con el momento real de la edición.
+3. Implementa la fusión de tres vías completa sobre un tipo de registro, incluyendo el reintento acotado con la etiqueta actualizada.
+4. Rediseña la estructura más conflictiva de tu modelo como colección de registros independientes con lápida y vuelve a ejecutar los dos primeros experimentos.
+5. Instrumenta un contador de conflictos por tipo y por campo, déjalo una semana en uso real y decide con esos datos dónde merece la pena resolver y dónde rediseñar.
+</Challenge>

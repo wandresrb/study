@@ -1,0 +1,151 @@
+---
+title: "`ctx.waitUntil`: prolongar la vida del evento"
+description: "Una promesa que nadie espera muere cuando el handler retorna. ctx.waitUntil es el mecanismo con el que el runtime se compromete a mantener vivo el isolate hasta que tu trabajo asíncrono termine, sin bloquear la respuesta, y el techo de unos quince minutos que ninguna invocación de cron puede rebasar."
+subject: cloudflare
+level: 12
+order: 3
+position: "12.3"
+duration: "14 min"
+---
+
+<Lead>
+Cierras el handler, retornas, y el isolate se apaga: ese es el contrato tácito del edge, tu Worker vive lo justo para hacer su trabajo y desaparece. Pero, ¿qué ocurre con esa promesa que lanzaste y no esperaste —el registro de telemetría, la escritura diferida, la notificación— que aún no ha terminado cuando el handler retorna? Muere con él. `ctx.waitUntil` es la única forma de decirle al runtime «todavía no me apagues»: le entregas una promesa y él se compromete a mantener el evento vivo hasta que se resuelva. En `fetch` te deja responder ya y seguir trabajando en segundo plano; en `scheduled`, donde no hay respuesta que devolver, es lo que separa el trabajo que se completa del que se trunca a medias.
+</Lead>
+
+<Goals>
+
+- Entender por qué una promesa que no se espera muere cuando el handler retorna.
+- Usar `ctx.waitUntil` en `fetch` para devolver la `Response` y seguir trabajando en segundo plano.
+- Aplicarlo en `scheduled` para lanzar trabajo asíncrono sin encadenarlo en serie.
+- Separar tiempo de CPU de tiempo de reloj y situar el techo de unos quince minutos por invocación.
+
+</Goals>
+
+## La promesa huérfana
+
+El modelo del edge es implacable con el tiempo: un isolate se materializa para atender un evento y se descarta en cuanto ese evento concluye. El runtime considera concluido el evento cuando la promesa que devuelve tu handler se resuelve. Todo lo que quede pendiente y no esté enganchado a esa promesa se queda huérfano —no se rechaza, simplemente se congela— y su continuación puede no ejecutarse jamás.
+
+```ts
+export default {
+  async scheduled(controller, env, ctx) {
+    // MAL: promesa suelta, nadie la espera
+    registrarMetrica(env, "cron-ok"); // devuelve una Promise ignorada
+  },
+};
+```
+
+El handler es `async`, pero retorna de inmediato tras disparar `registrarMetrica` sin aguardarla. Su promesa se resuelve, el runtime da por terminado el evento y el `fetch` o el `put` que vivían dentro de esa métrica pueden no completarse nunca. En un servidor de Node tradicional este «dispara y olvida» suele funcionar porque el proceso permanece vivo y absorbe el trabajo pendiente. En el edge el proceso es tu isolate, y se evapora. Lo insidioso es que en local, con `wrangler dev`, muchas veces sí termina —el servidor de desarrollo tarda más en apagarse— y llegas a producción convencido de que funciona. El fallo aflora solo bajo la disciplina real del runtime, cuando el isolate se descarta en cuanto tu handler retorna: entonces el trabajo huérfano se pierde de forma intermitente y dificilísima de reproducir.
+
+<Callout type="warn" title="El await tampoco es gratis en scheduled">
+Podrías pensar que basta con `await registrarMetrica(...)`. Y es cierto: al esperarla, la promesa del handler no se resuelve hasta que la métrica termina, así que el runtime aguarda. Pero eso serializa todo tu trabajo en una sola cadena secuencial. Si la telemetría no debe frenar la tarea principal —o quieres varias cosas en paralelo—, `await` es la herramienta equivocada: bloquea donde no hace falta.
+</Callout>
+
+## `waitUntil`: el runtime se compromete a esperar
+
+`ctx.waitUntil` recibe una promesa y la registra en el `ExecutionContext`. A partir de ahí, el runtime extiende la vida del evento hasta que esa promesa —y el propio handler— se asienten. Es la diferencia entre trabajo huérfano y trabajo garantizado.
+
+```ts
+export default {
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(registrarMetrica(env, "cron-ok"));
+  },
+};
+```
+
+Puedes llamarlo tantas veces como quieras; cada promesa entregada se rastrea por separado. No devuelve nada útil y no lo esperas: aguardarlo anularía su propósito. En `fetch` esto habilita el patrón canónico —responder ya y seguir después—:
+
+```ts
+export default {
+  async fetch(request, env, ctx): Promise<Response> {
+    const res = new Response("ok");
+    ctx.waitUntil(auditar(env, request)); // sigue tras responder
+    return res; // el cliente recibe la respuesta de inmediato
+  },
+};
+```
+
+Nada te obliga a un solo `waitUntil`: puedes registrar varias promesas —el runtime las rastrea todas— o agrupar el trabajo de fondo en una sola con `Promise.all` cuando quieres tratarlo como una unidad con un único punto de fallo.
+
+```ts
+ctx.waitUntil(
+  Promise.all([
+    auditar(env, request),
+    invalidarCache(env),
+    notificar(env),
+  ]).catch((e) => console.error("trabajo de fondo fallo", e)),
+);
+```
+
+<Mermaid code={`flowchart LR
+  Trabajo[lanzas trabajo asincrono] --> WU[ctx.waitUntil lo registra]
+  WU --> Retorna[el handler retorna]
+  Retorna --> Espera[el runtime mantiene vivo el isolate]
+  Espera --> Fin[la promesa se resuelve y el isolate se descarta]`} />
+
+Visualmente, el patrón es una promesa que sobrevive al `return`: el handler ya retornó, pero el evento sigue vivo porque tú lo pediste, y solo entonces el isolate se apaga.
+
+<Callout type="note" title="waitUntil no captura tus errores">
+Una promesa que rechaza dentro de `ctx.waitUntil` no interrumpe el flujo de tu handler ni tu `Response`: se registra aparte y puede marcar la invocación con una excepción, pero tu control de flujo ni se entera. Si necesitas manejar ese fallo, envuelve el trabajo en un `try/catch` propio antes de entregarlo.
+</Callout>
+
+Conviene fijar la intuición correcta: `waitUntil` no lanza el trabajo —eso ya lo hiciste tú al invocar la función asíncrona—, solo le pide al runtime que no dé el evento por cerrado hasta que esa promesa se asiente. Es una declaración de pendientes, no un planificador de tareas.
+
+## `await` o `waitUntil`: cuándo cada uno
+
+No compiten: cooperan. La regla es la dependencia. Si el paso siguiente necesita el resultado, lo esperas; si el trabajo es un satélite independiente cuyo desenlace te importa pero cuyo valor no consumes, lo entregas a `waitUntil`.
+
+<Cards>
+  <Card icon="⛓️" title="await">
+    Cuando el paso siguiente depende del resultado, o cuando algo debe terminar antes de continuar. Serializa a propósito.
+  </Card>
+  <Card icon="🛰️" title="waitUntil">
+    Cuando el trabajo es independiente: no necesitas su valor, pero sí que se complete. No bloquea la línea principal.
+  </Card>
+  <Card icon="🤝" title="ambos">
+    El patrón habitual: `await` para la tarea principal y `ctx.waitUntil` para la telemetría que la acompaña.
+  </Card>
+</Cards>
+
+Así, un `scheduled` maduro suele hacer su trabajo esencial con `await` —porque debe terminar y porque los pasos se encadenan— y despacha lo accesorio con `ctx.waitUntil`, dejando que el runtime cargue con la espera de esos satélites sin frenar el hilo central.
+
+```ts
+async scheduled(controller, env, ctx) {
+  const resumen = await procesarLote(env);       // esencial: se espera
+  ctx.waitUntil(publicarMetricas(env, resumen)); // accesorio: en paralelo
+}
+```
+
+El resultado es un handler que hace lo justo en su camino crítico y confía al runtime la finalización de todo lo demás: veloz donde importa, completo donde hace falta.
+
+<Callout type="tip" title="La telemetría nunca va en la ruta crítica">
+Si envías métricas o trazas con `await` y el servicio de telemetría se ralentiza o cae, tu tarea principal se ralentiza o cae con él: has acoplado lo esencial a lo accesorio. Entregar esa telemetría a `ctx.waitUntil` la desacopla —corre a su ritmo y su fallo, bien capturado, no arrastra al trabajo que importa—. La regla de oro: lo accesorio va en `waitUntil`, jamás en la línea principal.
+</Callout>
+
+## El techo de los quince minutos
+
+Ese compromiso del runtime no es infinito. Toda invocación —lo que devuelve tu handler más todo lo registrado en `waitUntil`— consume del mismo presupuesto, y conviene distinguir dos relojes. El **tiempo de CPU** mide solo el cómputo activo; lo configuras con `limits.cpu_ms` y se agota en segundos o pocos minutos. El **tiempo de reloj** mide el total, incluidas las esperas de red a una API, a D1 o a KV, y para una invocación de `scheduled` ronda un techo de quince minutos que tú no fijas.
+
+```jsonc
+{
+  "limits": { "cpu_ms": 300000 } // 5 min de CPU; el reloj sigue topado aparte
+}
+```
+
+Un cron que pasa el noventa por ciento del tiempo esperando respuestas de red gasta muy poca CPU, pero puede acercarse peligrosamente al techo de reloj. Cuando la promesa registrada no se resuelve dentro de ese margen, el runtime corta la invocación y el trabajo pendiente se pierde. La consecuencia de diseño es directa: el cron sirve para lotes acotados; si el trabajo pudiera exceder los quince minutos, hay que trocearlo —paginar, encolar en Queues, o delegar en un Workflow—, tema que retomamos al elegir entre Workflow, Queue o cron. Y como el corte es abrupto y sin aviso, el diseño prudente asume que puede ocurrir: haz el trabajo idempotente y guarda tu avance —un cursor en KV o D1— para que la siguiente ejecución retome donde la anterior quedó, en lugar de empezar de cero o, peor aún, dejar el estado a medio escribir.
+
+Un ejemplo aclara la distinción entre los dos relojes: si tu handler consume diez segundos de CPU pero espera catorce minutos a que una API lenta conteste, subir `cpu_ms` no te salva —el problema no es el cómputo, es el reloj de pared—; lo que te salva es partir el trabajo en piezas que quepan holgadas bajo el techo.
+
+<Callout type="info" title="waitUntil no compra tiempo extra">
+Un malentendido común es creer que `ctx.waitUntil` alarga los límites de la invocación. No lo hace: prolonga la vida del evento para que el trabajo ya lanzado pueda terminar, pero ese trabajo cuenta contra el mismo presupuesto de tiempo. `waitUntil` evita que abandones una promesa; no te regala minutos.
+</Callout>
+
+<Callout type="dios" title="En el edge no hay proceso que absorba el trabajo de fondo">
+El instinto del backend clásico es que el trabajo de fondo es casi gratis: lanzas una promesa, sigues con lo tuyo, y el proceso —siempre encendido— la termina tarde o temprano. En el edge esa red de seguridad no existe. Tu «proceso» es un isolate efímero que el runtime destruye en cuanto cree que has terminado, y no tiene forma de adivinar que aún te queda trabajo salvo que se lo digas. `ctx.waitUntil` es exactamente ese acto de decírselo: convierte el «dispara y olvida» —una mentira sobre computación efímera— en un contrato explícito y, sobre todo, acotado. Y ahí está el segundo salto. Un demonio `cron` en una máquina virtual puede correr durante horas sin que nadie lo cuestione; tú, no. El techo de quince minutos no es una limitación arbitraria que sortear, es una restricción que reorienta tu arquitectura: te obliga a pensar en unidades de trabajo idempotentes, reanudables y troceadas en lugar de en monolitos que rezan por terminar a tiempo. Cuando interiorizas que el isolate no es un servidor y que la vida del evento es un recurso que tú administras, dejas de preguntar «¿cómo hago que mi cron corra más rato?» y empiezas a preguntar «¿cómo parto esto en piezas a las que no les importe cuánto dura el conjunto?». Esa segunda pregunta es la que construye pipelines que aguantan el crecimiento de los datos; la primera solo pospone el día en que el trabajo empieza a truncarse en silencio.
+</Callout>
+
+<Challenge title="Domina la vida del evento">
+1. Explica con tus palabras por qué `registrarMetrica(env)` sin `await` ni `waitUntil` puede no ejecutarse nunca en el edge, y por qué en un servidor de Node tradicional suele funcionar igualmente.
+2. Reescribe un `scheduled` que haga el trabajo principal con `await` y envíe la telemetría con `ctx.waitUntil`, en paralelo.
+3. Un cron sincroniza cincuenta mil filas y a veces supera los quince minutos: describe dos formas de rediseñarlo para no chocar con el techo.
+4. Razona la diferencia entre tiempo de CPU y tiempo de reloj para un cron que pasa el noventa y cinco por ciento del tiempo esperando respuestas de una API externa.
+</Challenge>

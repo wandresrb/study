@@ -1,0 +1,195 @@
+---
+title: "Acortar el procesamiento: separar la respuesta visual del trabajo pesado"
+description: "El patrón que divide un manejador en la parte que el usuario ve de inmediato y la que puede esperar, cómo se implementa con cesión antes de renderizar, y los errores que hacen que el patrón no funcione."
+subject: rendimiento
+level: 21
+order: 3
+position: "21.3"
+duration: "19 min"
+---
+
+<Lead>
+La duración del procesamiento es el tiempo de tu código dentro del manejador, y su optimización tiene una particularidad frente a las otras dos partes del INP: casi nunca consiste en hacer el trabajo más rápido. Consiste en hacer **menos trabajo antes del primer pintado** y el resto después. El usuario no necesita el resultado completo en el primer fotograma; necesita saber que su acción se registró. Separar esas dos cosas es la técnica más rentable de todo este nivel.
+</Lead>
+
+<Goals>
+
+- Clasificar el trabajo de un manejador en respuesta visual, trabajo esencial y trabajo diferible.
+- Implementar el patrón de ceder antes de renderizar.
+- Reconocer los tres errores que hacen que el patrón no produzca mejora.
+- Auditar los oyentes múltiples registrados sobre un mismo elemento.
+
+</Goals>
+
+## La clasificación del trabajo
+
+Ante un manejador lento, el primer paso es separar su contenido en tres categorías.
+
+**Respuesta visual.** Lo mínimo para que el usuario sepa que su acción se registró: cambiar el estado del botón, marcar la pestaña activa, mostrar el indicador, cerrar el menú. Casi siempre es una o dos escrituras al DOM y cuesta menos de un milisegundo.
+
+**Trabajo esencial.** Lo que produce el resultado que el usuario pidió: filtrar la lista, calcular el total, abrir el panel con contenido. Tiene que ocurrir, y puede ser caro.
+
+**Trabajo diferible.** Todo lo demás: enviar telemetría, guardar en almacenamiento local, precargar lo siguiente, actualizar un contador secundario, registrar en un sistema de sesiones. No afecta a lo que el usuario ve ahora.
+
+Un manejador típico sin optimizar mezcla los tres en orden arbitrario:
+
+```js
+// 320 ms de procesamiento, todo antes del primer pintado
+filtro.addEventListener('change', (e) => {
+  analitica.evento('filtro_cambiado', { valor: e.target.value });   // diferible, 25 ms
+  localStorage.setItem('ultimoFiltro', e.target.value);             // diferible, 8 ms
+  const resultado = filtrarYOrdenar(productos, e.target.value);     // esencial, 180 ms
+  renderizarLista(resultado);                                       // esencial, 95 ms
+  actualizarContador(resultado.length);                             // visual, 1 ms
+  precargarSiguientePagina(resultado);                              // diferible, 12 ms
+});
+```
+
+## El patrón de ceder antes de renderizar
+
+La reescritura tiene tres bloques, en este orden:
+
+```js
+import { ceder } from './planificacion.js';
+
+filtro.addEventListener('change', async (e) => {
+  const valor = e.target.value;
+
+  // 1. RESPUESTA VISUAL: sincrona, minima, antes de cualquier cesion
+  lista.dataset.estado = 'filtrando';
+  contador.textContent = '…';
+
+  // 2. Ceder: el navegador pinta la respuesta visual AHORA
+  await ceder();
+
+  // 3. TRABAJO ESENCIAL: ya fuera de la interaccion medida
+  const resultado = filtrarYOrdenar(productos, valor);
+  renderizarLista(resultado);
+  contador.textContent = String(resultado.length);
+  delete lista.dataset.estado;
+
+  // 4. TRABAJO DIFERIBLE: con prioridad baja, sin prisa
+  programar(() => {
+    analitica.evento('filtro_cambiado', { valor });
+    localStorage.setItem('ultimoFiltro', valor);
+    precargarSiguientePagina(resultado);
+  }, { priority: 'background' });
+});
+```
+
+El efecto sobre la métrica es grande y conviene entender exactamente por qué. La interacción se mide desde la pulsación hasta el **siguiente fotograma pintado**. Con la cesión colocada justo después de la respuesta visual, ese siguiente fotograma contiene el estado de «filtrando», y la interacción **termina ahí**: unos pocos milisegundos. Los 300 restantes ocurren después y no cuentan para el INP.
+
+Y no es hacer trampa con la métrica: es exactamente lo que la métrica pretende medir. El usuario ha recibido confirmación visual en 8 milisegundos en lugar de en 320. Su percepción de la respuesta ha mejorado de forma real.
+
+Hay una variante sin `scheduler` que funciona en todos los navegadores y que a veces es preferible porque garantiza que el pintado ha ocurrido:
+
+```js
+function trasElPintado(fn) {
+  requestAnimationFrame(() => {
+    // Dentro del rAF: el fotograma se va a componer. Un setTimeout desde aqui
+    // se ejecuta despues de que ese fotograma este presentado.
+    setTimeout(fn, 0);
+  });
+}
+```
+
+Ese es el patrón de doble paso que la gente conoce como doble fotograma. La combinación de `requestAnimationFrame` y `setTimeout` es más fiable que dos `requestAnimationFrame` anidados para este propósito concreto, porque el segundo `rAF` se ejecuta **antes** del pintado del siguiente fotograma, no después.
+
+## Los tres errores que anulan el patrón
+
+**Error uno: ceder antes de la respuesta visual.** Si el `await` está al principio del manejador, la interacción sigue midiendo hasta que llegue el primer cambio visual, que ahora está después de la cesión. No has ganado nada y has añadido una cesión.
+
+```js
+// MAL: se cede antes de cambiar nada. El primer pintado sigue conteniendo el resultado.
+elemento.addEventListener('click', async () => {
+  await ceder();
+  hacerTodoElTrabajo();
+});
+```
+
+**Error dos: la respuesta visual no produce un cambio pintable.** Cambiar una propiedad de un objeto de estado no es una respuesta visual; el navegador no tiene nada que pintar. Con marcos que renderizan de forma asíncrona, un cambio de estado antes de ceder puede no haberse aplicado al DOM cuando el fotograma se compone. La respuesta visual tiene que ser un cambio que llegue al DOM antes de la cesión, y con marcos asíncronos eso exige la primitiva de descarga síncrona del marco o una escritura directa al DOM.
+
+**Error tres: el trabajo diferido bloquea la siguiente interacción.** Has movido 300 milisegundos fuera de esta interacción y los has puesto justo donde el usuario va a hacer el siguiente clic. Ahora el retraso de entrada de la interacción siguiente es de 300 milisegundos y el INP no ha mejorado, solo se ha desplazado. La solución es que ese trabajo diferido esté **troceado con cesión** y tenga prioridad baja.
+
+Ese tercer error es el más común y el más difícil de ver, porque la métrica que empeora no es la que estabas mirando.
+
+## Los oyentes múltiples
+
+Una causa de procesamiento largo que no está en tu manejador: **hay más manejadores de los que crees**.
+
+Todos los oyentes registrados para un evento se ejecutan en la misma tarea. Un clic en un botón dentro de una tarjeta dentro de un formulario puede disparar el oyente del botón, dos oyentes delegados en el contenedor, uno en el documento para cerrar menús abiertos, y uno de la biblioteca de analítica que registra todos los clics.
+
+La forma de verlos, en la consola del navegador, sobre un elemento seleccionado en el inspector:
+
+```js
+// $0 es el elemento seleccionado en el panel de elementos
+getEventListeners($0);
+// Y los heredados por propagacion, subiendo por los ancestros
+let n = $0;
+while (n) { const l = getEventListeners(n); if (Object.keys(l).length) console.log(n, l); n = n.parentElement; }
+```
+
+`getEventListeners` es una utilidad de la consola, no una API del lenguaje: no se puede usar en código.
+
+Lo que suele aparecer: dos o tres oyentes que registró una biblioteca de terceros sobre el documento, capturando **todos** los clics de la página para su propia contabilidad. Cada uno con su coste, sumado a todas las interacciones del sitio. Es una de las razones por las que el coste de un script de terceros no se limita a su carga.
+
+<Callout type="dios" title="Con marcos de renderizado asíncrono, la respuesta visual necesita una descarga síncrona, y ahí está el matiz que hace fallar el patrón">
+El patrón de separar respuesta visual y trabajo pesado se explica siempre con manipulación directa del DOM, donde funciona sin más. Con un marco que agrupa las actualizaciones y renderiza de forma asíncrona, hay un paso adicional sin el cual el patrón no hace nada, y es la causa número uno de que alguien lo implemente y no vea mejora.
+
+El problema: cuando cambias el estado del marco para mostrar el indicador de carga, el marco **encola** la actualización para procesarla en su propio momento. Si cedes inmediatamente después, el navegador pinta un fotograma en el que ese cambio todavía no ha llegado al DOM. La interacción sigue midiendo hasta el fotograma que sí lo contiene, y no has ganado nada.
+
+La solución es forzar que la actualización de la respuesta visual se aplique de forma síncrona antes de ceder. La primitiva existe en los marcos principales con nombres distintos, y en todos hay que usarla con cuidado porque desactiva la agrupación:
+
+```js
+// React: flushSync fuerza la aplicacion sincrona de este cambio
+import { flushSync } from 'react-dom';
+
+async function alFiltrar(valor) {
+  flushSync(() => setEstado('filtrando'));   // llega al DOM ya
+  await ceder();                              // el navegador pinta el indicador
+  const resultado = filtrarYOrdenar(datos, valor);
+  setEstado('listo');
+  setResultado(resultado);
+}
+```
+
+```js
+// Vue: esperar al siguiente ciclo de actualizacion antes de ceder
+import { nextTick } from 'vue';
+
+async function alFiltrar(valor) {
+  estado.value = 'filtrando';
+  await nextTick();        // el cambio esta en el DOM
+  await ceder();           // y ahora se puede pintar
+  resultado.value = filtrarYOrdenar(datos, valor);
+  estado.value = 'listo';
+}
+```
+
+Tres advertencias sobre esto.
+
+**La descarga síncrona es cara si el cambio es grande.** Aplicar de forma síncrona un cambio que reconcilia medio árbol es peor que no hacerlo. Úsala **solo para el cambio mínimo de respuesta visual**, nunca para el resultado.
+
+**No la uses dentro de un bucle.** Descargar síncronamente en cada iteración anula toda la agrupación del marco y multiplica el trabajo de renderizado.
+
+**Y comprueba que de verdad funcionó.** La forma honesta es medir: instrumenta la interacción con `performance.measure` desde el evento hasta el primer `requestAnimationFrame` posterior, y verifica que el indicador está en el DOM en ese momento.
+
+```js
+elemento.addEventListener('click', async (e) => {
+  const t0 = e.timeStamp;
+  flushSync(() => setEstado('cargando'));
+  requestAnimationFrame(() => {
+    performance.measure('respuesta visual', { start: t0, end: performance.now() });
+    console.assert(document.querySelector('[data-estado="cargando"]'), 'el indicador no llego al DOM');
+  });
+  await ceder();
+  /* ... */
+});
+```
+
+Si esa medida sale por encima de 50 milisegundos o el aserto falla, la respuesta visual no está donde crees y el patrón no está funcionando.
+</Callout>
+
+<Challenge>
+Coge el manejador más lento de tu aplicación según los datos de campo. Clasifica cada línea de su contenido en las tres categorías y anota el coste estimado de cada una. Reescríbelo con el patrón completo y mide tres cifras antes y después: la duración del procesamiento de esa interacción, el retraso de entrada de la interacción **siguiente**, y el INP global. Si la segunda cifra empeoró, el trabajo diferido necesita troceado.
+</Challenge>

@@ -1,0 +1,117 @@
+---
+title: "Texturas 3D: volúmenes, LUTs y niebla"
+description: "En qué se diferencia una textura 3D de un array de capas, cómo se sube un volumen con rowsPerImage, el coste de memoria que impone, y los tres usos donde compensa."
+subject: webgpu
+level: 22
+order: 4
+position: "22.4"
+duration: "16 min"
+---
+
+<Lead>
+Una textura 3D es un volumen de texels con filtrado trilineal en las tres dimensiones. La diferencia con un array de capas es una sola y lo cambia todo: la tercera coordenada **se interpola**. Eso la convierte en la estructura correcta para tres cosas muy concretas —tablas de color, campos de niebla y datos volumétricos— y en una mala idea para casi todo lo demás, porque su coste de memoria crece con el cubo del lado.
+</Lead>
+
+<Goals>
+
+- Crear una textura 3D y distinguirla de un array de capas en el descriptor.
+- Subir un volumen con `writeTexture` calculando `bytesPerRow` y `rowsPerImage`.
+- Muestrear con `texture_3d` y entender qué interpola el hardware.
+- Aplicar el patrón de LUT de color y el de campo de niebla.
+
+</Goals>
+
+## Crear y llenar
+
+El descriptor cambia solo en `dimension`, pero las restricciones que arrastra son varias:
+
+```js
+const volumen = device.createTexture({
+  label: 'niebla volumetrica',
+  size: [160, 90, 64],           // ancho, alto, profundidad
+  format: 'rgba16float',
+  dimension: '3d',
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+});
+```
+
+Con `dimension: '3d'`, el `sampleCount` tiene que ser 1, el formato no puede ser comprimido ni de profundidad, y las tres dimensiones se acotan con `maxTextureDimension3D`, cuyo mínimo garantizado es **2048** —bastante menor que el de las 2D, que es 8192—. Los mipmaps, si los pides, reducen las tres dimensiones a la vez, así que el máximo se calcula sobre las tres.
+
+Y `RENDER_ATTACHMENT` no está permitido en texturas 3D: la validación exige `dimension: '2d'` para ese uso. Para escribir en un volumen desde la GPU, el camino es una storage texture con `viewDimension: '3d'` y un compute shader, que es el tema del [nivel 23](/guia/webgpu/n23-que-es-una-storage-texture/).
+
+Para subir datos desde la CPU, `rowsPerImage` deja de ser opcional porque hay más de un slice:
+
+```js
+const [ancho, alto, prof] = [160, 90, 64];
+const datos = new Uint16Array(ancho * alto * prof * 4);   // rgba16float
+// ... rellenar datos ...
+
+device.queue.writeTexture(
+  { texture: volumen },
+  datos,
+  {
+    bytesPerRow:  ancho * 4 * 2,   // 4 canales × 2 bytes por canal
+    rowsPerImage: alto,            // filas por slice
+  },
+  [ancho, alto, prof],
+);
+```
+
+La disposición de los datos de origen es la natural: x varía más rápido, después y, después z. El texel en `(x, y, z)` está en el byte `z * rowsPerImage * bytesPerRow + y * bytesPerRow + x * bytesPorTexel`.
+
+## Muestrear
+
+El tipo es `texture_3d<f32>` y la coordenada es un `vec3<f32>` normalizado en las tres dimensiones:
+
+```wgsl
+@group(0) @binding(0) var volumen : texture_3d<f32>;
+@group(0) @binding(1) var smp     : sampler;
+
+let muestra = textureSample(volumen, smp, vec3<f32>(u, v, w));
+```
+
+Con `magFilter` y `minFilter` en `'linear'`, el hardware interpola entre los **ocho** texels que rodean el punto: filtrado trilineal en el espacio, distinto del filtrado trilineal entre mips. Esa interpolación en la tercera dimensión es exactamente lo que un array de capas no hace, y es la única razón para elegir 3D.
+
+El `addressModeW` del sampler pasa a tener efecto y controla qué ocurre fuera del rango en la tercera coordenada.
+
+<Callout type="warn" title="El coste de memoria crece con el cubo">
+Una textura 2D de 1024×1024 en `rgba8unorm` ocupa 4 MiB. Una 3D de 1024×1024×1024 en el mismo formato ocuparía 4 GiB, muy por encima de cualquier presupuesto y del límite de 2048 por dimensión. Las texturas 3D útiles son pequeñas: 32×32×32 para una LUT de color, 160×90×64 para un campo de niebla ajustado a la pantalla, 128 al cubo para un campo de distancias. Si estás pensando en una 3D de 512 al cubo, replantea el problema.
+</Callout>
+
+## Los tres usos que compensan
+
+**La LUT de gradación de color.** Es el uso más frecuente y el más rentable. Una tabla de 32×32×32 en `rgba8unorm` ocupa 128 KiB y transforma cualquier color de entrada en uno de salida con una sola muestra trilineal. Cualquier corrección de color —curvas, saturación, virados, look cinematográfico— se precalcula en la tabla y el shader la aplica gratis:
+
+```wgsl
+@group(0) @binding(4) var lut    : texture_3d<f32>;
+@group(0) @binding(5) var lutSmp : sampler;
+
+fn gradar(color : vec3<f32>) -> vec3<f32> {
+  // Corrección de medio texel: la tabla mapea [0,1] a los centros de los texels.
+  let n = 32.0;
+  let escala = (n - 1.0) / n;
+  let sesgo  = 1.0 / (2.0 * n);
+  let uvw = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)) * escala + sesgo;
+  return textureSample(lut, lutSmp, uvw).rgb;
+}
+```
+
+La corrección de medio texel es obligatoria y se olvida siempre. Sin ella, la tabla se muestrea desde el borde de los texels extremos en vez de desde su centro, y los colores saturados salen desplazados. El sampler tiene que ser `'clamp-to-edge'` en las tres direcciones.
+
+**El campo de niebla volumétrica.** Un froxel grid: una rejilla alineada con el frustum de la cámara donde cada celda guarda la densidad y la luz dispersada. Un compute shader la rellena, otro acumula a lo largo del eje de profundidad, y el shader de la escena muestrea la posición del fragmento en ese volumen. Las dimensiones típicas son la resolución de pantalla dividida por ocho en x e y, y de 64 a 128 slices en z distribuidos exponencialmente.
+
+**Los campos de distancia.** Un SDF volumétrico para colisiones, para oclusión ambiental o para renderizado por ray marching. Aquí el filtrado trilineal es esencial: la distancia interpolada entre texels es una aproximación razonable de la distancia real, cosa que no ocurriría con muestreo puntual.
+
+## Lo que no debe ser una textura 3D
+
+**Un array de texturas de material.** Si el índice es discreto y no quieres interpolar entre imágenes, es un [array de capas](/guia/webgpu/n22-texture-arrays/), y usar 3D produce mezclas indeseadas entre materiales vecinos.
+
+**Una secuencia de fotogramas.** Mismo razonamiento: interpolar entre el fotograma 3 y el 4 no suele ser lo que quieres, y si lo es, mezclar dos muestras de un array te da control sobre el factor.
+
+**Un atlas de sombras.** Las cascadas se seleccionan con un índice discreto.
+
+La regla es de una línea: **si la tercera coordenada es un índice, es un array; si es una posición, es un volumen**.
+
+<Callout type="dios" title="La LUT 3D es la optimización con mejor relación que existe en post-proceso">
+Merece insistir en el primer caso porque su rentabilidad es desproporcionada. Cualquier cadena de operaciones de color por píxel —tonemapping, corrección de gamma, balance de blancos, saturación selectiva, curvas por canal, un LUT de película— es una función de tres entradas a tres salidas, sin memoria y sin dependencia del vecindario. Toda esa cadena, por larga que sea, se puede precalcular en una tabla de 32 al cubo y aplicarse con una sola muestra trilineal. En un shader de post-proceso que corre a 4K son ocho millones de fragmentos: la diferencia entre veinte instrucciones de aritmética por fragmento y una muestra de textura de 128 KiB que cabe entera en caché es de milisegundos completos. Y el beneficio secundario es mayor todavía: el artista de color trabaja en su herramienta habitual, exporta un `.cube`, y el motor no necesita implementar nada. La única precaución es la corrección de medio texel y usar suficientes niveles —32 es el estándar, 16 produce banding visible en degradados suaves—.
+</Callout>

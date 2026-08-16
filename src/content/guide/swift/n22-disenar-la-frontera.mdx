@@ -1,0 +1,172 @@
+---
+title: "Diseñar la frontera: envolver C con un tipo que se cuida solo"
+description: "Del descriptor crudo al tipo Swift que posee su recurso. Propiedad y liberación determinista con `deinit`, errores traducidos, buffers de salida, contexto opaco para devoluciones de llamada con `Unmanaged`, vidas extendidas y la decisión de aislamiento. La lección donde la interoperabilidad se convierte en diseño de API."
+subject: swift
+level: 22
+order: 5
+position: "22.5"
+duration: "22 min"
+---
+
+<Lead>
+Las cuatro lecciones anteriores describían mecanismos. Esta describe un oficio. Importar una librería en C te deja delante un puñado de funciones libres, punteros opacos y códigos de error: una API correcta en su propio lenguaje y radicalmente ajena al resto de tu programa, donde nadie libera nada a mano, los errores se lanzan y el compilador demuestra propiedades. El trabajo consiste en construir la capa —normalmente delgada, siempre deliberada— que convierte ese puñado de símbolos en un tipo Swift que posee su recurso, lo libera cuando debe, traduce los fallos al canal correcto y hace imposibles por construcción los errores que la API en C permitía cometer. Hecha bien, esa capa se escribe una vez y desaparece de la conversación para siempre.
+</Lead>
+
+<Goals>
+
+- Reconocer las invariantes que una cabecera en C no puede expresar y que el envoltorio debe garantizar.
+- Construir un tipo que posea un recurso y lo libere de forma determinista en su `deinit`.
+- Traducir códigos de error, buffers de salida y devoluciones de llamada con contexto opaco.
+- Decidir el aislamiento del envoltorio y evitar los fallos de vida prematura.
+
+</Goals>
+
+## El contrato que la cabecera no escribe
+
+Partamos de una API típica. Todo lo que necesitas saber está en cinco líneas, y casi nada de lo que importa está escrito en ellas:
+
+```c
+typedef struct Zctx Zctx;
+Zctx  *zctx_new(void);
+void   zctx_free(Zctx *ctx);
+int    zctx_compress(Zctx *ctx, const uint8_t *in, size_t n,
+                     uint8_t *out, size_t cap, size_t *escritos);
+```
+
+La documentación —si existe— añade lo demás: que cada contexto creado debe liberarse exactamente una vez, que usarlo después de liberarlo es comportamiento indefinido, que no es seguro compartirlo entre hilos, que el buffer de salida debe tener holgura suficiente, que el código devuelto es cero en el éxito. Cinco invariantes que el tipo `OpaquePointer` importado no expresa y que, mientras vivan solo en la documentación, alguien acabará violando bajo presión de un plazo.
+
+El envoltorio es el lugar donde esas invariantes dejan de ser advertencias y se convierten en propiedades del programa. Y hay un criterio para saber si el envoltorio está bien hecho: **el usuario del tipo Swift no debería poder escribir ninguno de los errores que la API en C permitía**.
+
+## Un tipo que posee el recurso
+
+La herramienta central es la destrucción determinista. Una clase Swift libera su recurso en `deinit` en el instante en que desaparece su última referencia, sin recolector de basura de por medio, de modo que el patrón de adquisición en la inicialización que C++ resolvió con destructores está disponible aquí sin ceremonia.
+
+```swift
+public final class Compresor {
+    private let ctx: OpaquePointer
+
+    public init() throws {
+        guard let c = zctx_new() else { throw ErrorZ.sinMemoria }
+        ctx = c
+    }
+
+    deinit { zctx_free(ctx) }
+}
+```
+
+Tres decisiones caben en esas líneas. El puntero es `private`, así que nadie fuera puede quedárselo ni liberarlo por su cuenta. El inicializador **lanza** en vez de devolver un opcional, con lo que un objeto a medio construir no existe. Y la liberación no es un método público que alguien pueda llamar dos veces: es un `deinit`, que el compilador ejecuta una sola vez por instancia.
+
+Los errores se traducen en la frontera y no más allá. Un código de retorno entero es información perfectamente buena, pero solo en el punto de la llamada; propagarlo hacia dentro del programa contagia el estilo de C a capas que no tienen por qué conocerlo.
+
+```swift
+public enum ErrorZ: Error {
+    case sinMemoria, entradaCorrupta, buferPequeno, desconocido(Int32)
+
+    init(codigo: Int32) {
+        switch codigo {
+        case -1: self = .entradaCorrupta
+        case -2: self = .buferPequeno
+        default: self = .desconocido(codigo)
+        }
+    }
+}
+```
+
+Los buffers de salida son el otro patrón recurrente, y el idioma correcto combina la reserva de un array Swift con el préstamo acotado que vimos en la primera lección:
+
+```swift
+extension Compresor {
+    public func comprimir(_ datos: [UInt8]) throws -> [UInt8] {
+        var salida = [UInt8](repeating: 0, count: datos.count + 64)
+        var escritos = 0
+        let rc = datos.withUnsafeBufferPointer { entrada in
+            salida.withUnsafeMutableBufferPointer { destino in
+                zctx_compress(ctx, entrada.baseAddress, entrada.count,
+                              destino.baseAddress, destino.count, &escritos)
+            }
+        }
+        guard rc == 0 else { throw ErrorZ(codigo: rc) }
+        salida.removeLast(salida.count - escritos)
+        return salida
+    }
+}
+```
+
+<Callout type="tip" title="Cuando no quieras pagar una clase">
+Un `struct` marcado como `~Copyable` también admite `deinit` y ofrece destrucción determinista sin asignar un objeto en el montón ni contar referencias. Es la elección adecuada para envoltorios pequeños de vida claramente acotada —un buffer, un descriptor, un bloqueo tomado—, donde además la no copiabilidad impide por construcción que dos valores acaben creyéndose dueños del mismo recurso.
+</Callout>
+
+## Devoluciones de llamada y contexto opaco
+
+El patrón de C para las devoluciones de llamada es un puntero a función acompañado de un puntero a datos del usuario. En Swift, un puntero a función se importa como una clausura `@convention(c)`, y esas clausuras **no pueden capturar nada**: son código sin entorno. El puente entre ese código sin entorno y tu objeto es precisamente el puntero opaco, y quien lo maneja es `Unmanaged`.
+
+```swift
+final class Caja {
+    let alRecibir: (String) -> Void
+    init(_ f: @escaping (String) -> Void) { alRecibir = f }
+}
+
+// dentro de la clase Compresor, junto a ctx: private var caja: Caja?
+public func observar(_ manejador: @escaping (String) -> Void) {
+    let nueva = Caja(manejador)
+    caja = nueva                                        // el envoltorio la retiene
+    let opaco = Unmanaged.passUnretained(nueva).toOpaque()
+    zctx_set_logger(ctx, { mensaje, usuario in
+        guard let mensaje, let usuario else { return }
+        let caja = Unmanaged<Caja>.fromOpaque(usuario).takeUnretainedValue()
+        caja.alRecibir(String(cString: mensaje))
+    }, opaco)
+}
+```
+
+La regla que gobierna este código es de contabilidad de referencias, y solo hay dos formas coherentes de llevarla. O bien **el envoltorio retiene la caja** y pasa a C una referencia sin retener, como arriba, en cuyo caso la vida de la devolución de llamada queda atada a la del envoltorio. O bien **se entrega la propiedad a C** con `passRetained`, y entonces existe obligatoriamente una función de baja que recupere esa referencia con `takeRetainedValue` para liberarla. Mezclar ambas es un fallo de uso después de liberar o una fuga, según el lado por el que se falle.
+
+<Callout type="warn" title="La vida que termina antes de la llamada">
+Swift puede liberar un objeto en cuanto deja de usarlo, y eso incluye liberarlo **mientras** una función en C sigue trabajando con un puntero que salió de él. Si pasas `ctx` a una llamada larga y no vuelves a tocar `self`, el optimizador está en su derecho de ejecutar el `deinit` antes de que la llamada retorne. El remedio es explícito y se escribe `withExtendedLifetime(self)` alrededor de la llamada; conviene aplicarlo siempre que el puntero sobreviva al ámbito sintáctico de la expresión que lo produjo.
+</Callout>
+
+## La frontera como unidad de diseño
+
+Queda una invariante que no hemos cubierto y que hoy es la que más cara se paga: la de hilos. Ninguna cabecera en C dice si un contexto puede cruzar tareas, y el compilador de Swift, bajo concurrencia estricta, va a exigir una respuesta. Hay tres respuestas legítimas y una ilegítima muy extendida.
+
+Si la librería es reentrante y no guarda estado compartido, el envoltorio puede declararse `@unchecked Sendable` con un comentario que explique en qué documentación se apoya esa afirmación. Si la librería exige serialización, la respuesta correcta es un `actor`, o un envoltorio que aísle todas sus operaciones tras una cola propia. Y si el recurso pertenece de verdad a un hilo concreto —contextos gráficos, ciertas bibliotecas de interfaz—, el envoltorio se marca con el actor global correspondiente. La respuesta ilegítima es silenciar el diagnóstico sin haber leído qué promete la librería.
+
+<Cards>
+  <Card icon="🔒" title="Propiedad única">
+    Un dueño, una liberación, en `deinit`. Nada de métodos públicos de cierre que puedan llamarse dos veces.
+  </Card>
+  <Card icon="🎯" title="Errores en el canal correcto">
+    El código entero muere en la frontera y sale un error de Swift con casos con nombre.
+  </Card>
+  <Card icon="⏳" title="Vidas explícitas">
+    Punteros prestados solo dentro del cierre que los presta, y `withExtendedLifetime` cuando la llamada dura.
+  </Card>
+  <Card icon="🧵" title="Aislamiento decidido">
+    Actor, actor global o `Sendable` justificado; nunca un diagnóstico silenciado sin leer la documentación.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TB
+  C[API en C con punteros y codigos] --> W[Tipo Swift envoltorio]
+  W --> P[Propiedad y deinit determinista]
+  W --> E[Traduccion de errores a enum]
+  W --> B[Buffers prestados en cierres acotados]
+  W --> A[Aislamiento declarado]
+  P --> API[Superficie segura para el resto del programa]
+  E --> API
+  B --> API
+  A --> API
+  class W t-mauve
+  class API t-green`} />
+
+<Callout type="dios" title="Un envoltorio no oculta la inseguridad: la concentra">
+Existe una idea equivocada y muy cómoda sobre lo que hace una capa de este tipo: que envuelve código inseguro para volverlo seguro, como si la seguridad fuese una propiedad que se aplica por fuera. No es eso lo que ocurre, y la diferencia importa. El código inseguro sigue estando exactamente igual de inseguro después de envolverlo; lo que cambia es **su distribución**. Antes, cualquiera de las mil llamadas a la librería repartidas por el programa podía liberar dos veces, pasar un buffer corto o retener un puntero de más, y verificar el programa exigía revisar las mil. Después, todo eso vive en sesenta líneas revisables de una sentada, y el resto del programa manipula un tipo cuya API no ofrece ninguna forma de cometer esos errores. Esa es la operación real: no eliminar la inseguridad, sino **reducir su superficie a un perímetro auditable**, y sostener sobre él un contrato que el compilador pueda comprobar en todas partes menos ahí dentro. Es exactamente el mismo movimiento que hace el núcleo de un sistema operativo con las instrucciones privilegiadas, o una biblioteca de colecciones con la aritmética de punteros: alguien tiene que escribir el código peligroso, y la ingeniería consiste en decidir cuánta gente tendrá que leerlo. De ahí sale también el criterio para saber si tu frontera está bien puesta. Cuenta cuántas líneas de tu proyecto podrían provocar un fallo de memoria si estuvieran mal escritas. Si el número crece cuando el proyecto crece, no tienes una frontera: tienes una API en C repartida por todas partes con sintaxis de Swift. Si el número se queda quieto mientras el proyecto se multiplica, la frontera existe, y todo lo que has aprendido en este nivel —el mapeo de tipos, las anotaciones, la disciplina de préstamo, la propiedad, el aislamiento— estaba al servicio de conseguir ese único número constante.
+</Callout>
+
+<Challenge title="Construye tu perímetro">
+1. Elige una librería en C pequeña con un recurso que crear y liberar, e impórtala en un paquete SwiftPM con su mapa de módulo.
+2. Escribe el envoltorio con inicializador que lanza y liberación en `deinit`, y demuestra con trazas que se libera una sola vez.
+3. Traduce la tabla de códigos de error a un `enum` con casos con nombre y un caso de reserva para lo desconocido.
+4. Implementa una devolución de llamada con contexto opaco y escribe las dos variantes de contabilidad, con referencia retenida y sin retener, explicando cuándo usar cada una.
+5. Activa la concurrencia estricta, justifica el aislamiento de tu envoltorio y escríbelo después como `struct` no copiable para comparar ambos diseños.
+</Challenge>

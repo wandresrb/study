@@ -1,0 +1,138 @@
+---
+title: "KVM: cómo Linux se vuelve hipervisor"
+description: "El módulo que transforma un kernel de propósito general en un hipervisor de tipo 1: la arquitectura de kvm.ko sobre kvm-intel y kvm-amd, el bucle de ejecución del vcpu que alterna VM entry y VM exit, la paginación anidada EPT/NPT que traduce dos veces cada dirección sin intervención del hipervisor, y la razón última por la que el código del invitado corre a velocidad casi nativa sobre el metal."
+subject: kernel
+level: 53
+order: 2
+position: "53.2"
+duration: "17 min"
+---
+
+<Lead>
+KVM no es un producto ni un proceso: son unos pocos miles de líneas de C dentro del árbol del kernel que, al cargarse como módulo, le enseñan a Linux a operar la extensión de virtualización del procesador. No hay un hipervisor aparte esperando debajo; hay un kernel normal que, cuando se lo piden, hace `VMLAUNCH` y presta la CPU a un invitado. La genialidad del diseño de Avi Kivity en 2007 fue negarse a reescribir un hipervisor entero: el planificador, la gestión de memoria y los drivers de Linux ya existían y eran excelentes, así que KVM solo aporta lo único que Linux no tenía —saber hablar con `VMX` y `SVM`— y delega en el kernel todo lo demás. Un vcpu no es más que un hilo que, en vez de ejecutar código de usuario, ejecuta código de invitado.
+</Lead>
+
+<Goals>
+
+- Entender que KVM es un módulo del kernel, no un sistema separado, y cómo se estructura.
+- Recorrer el bucle de ejecución del vcpu y su alternancia entre VM entry y VM exit.
+- Comprender la paginación anidada `EPT`/`NPT` y por qué elimina las tablas sombra.
+- Explicar por qué el código del invitado corre a velocidad casi nativa.
+
+</Goals>
+
+## KVM es un módulo, no un sistema aparte
+
+Al arrancar, KVM se materializa en dos capas de módulos. La superior, `kvm.ko`, contiene la lógica independiente de la arquitectura: la gestión de las máquinas virtuales, de los vcpus y de la memoria. La inferior es específica del fabricante: `kvm-intel.ko` para VT-x, `kvm-amd.ko` para AMD-V. Esta separación deja el grueso del código compartido y aísla en un puñado de ficheros lo que cambia entre `VMX` y `SVM`.
+
+```bash
+# las dos capas cargadas: el núcleo común y el backend del fabricante
+lsmod | grep kvm
+# kvm_intel   378880  6
+# kvm        1146880  1 kvm_intel
+```
+
+El puente entre ambas capas es una tabla de operaciones, exactamente el mismo patrón de polimorfismo que ya viste en el VFS y en el modelo de drivers. La capa común llama a `kvm_x86_ops.run` sin saber si por debajo hay un `VMLAUNCH` de Intel o un `VMRUN` de AMD:
+
+```c
+/* arch/x86/include/asm/kvm_host.h: la interfaz que cada fabricante rellena */
+struct kvm_x86_ops {
+	const char *name;
+	int  (*vcpu_create)(struct kvm_vcpu *vcpu);
+	void (*vcpu_free)(struct kvm_vcpu *vcpu);
+	int  (*vcpu_run)(struct kvm_vcpu *vcpu);   /* vmx_vcpu_run o svm_vcpu_run */
+	int  (*handle_exit)(struct kvm_vcpu *vcpu, fastpath_t fp);
+	void (*run)(struct kvm_vcpu *vcpu);
+	/* decenas de operaciones mas: set_cr0, get_msr, run_flush_tlb ... */
+};
+```
+
+## El bucle de ejecución del vcpu
+
+El corazón de KVM es un bucle. Cuando el espacio de usuario ejecuta la ioctl `KVM_RUN` sobre un vcpu (nivel 53.3), entra en el kernel y cae en `vcpu_run`, que gira indefinidamente: prepara el estado, hace VM entry, el invitado corre, se produce un VM exit, KVM decide si puede resolverlo internamente o si debe devolver el control al espacio de usuario. Despojado de detalles, el esqueleto de `arch/x86/kvm/x86.c` es este:
+
+```c
+static int vcpu_run(struct kvm_vcpu *vcpu)
+{
+	int r;
+
+	for (;;) {
+		if (kvm_vcpu_running(vcpu))
+			r = vcpu_enter_guest(vcpu);   /* VM entry + guest + VM exit */
+		else
+			r = vcpu_block(vcpu);         /* el vcpu esta detenido */
+
+		if (r <= 0)
+			break;                        /* hay que salir al espacio de usuario */
+
+		/* si podemos, atendemos aqui y seguimos sin volver a QEMU */
+		if (signal_pending(current)) {
+			vcpu->run->exit_reason = KVM_EXIT_INTR;
+			r = -EINTR;
+			break;
+		}
+		cond_resched();                       /* somos un hilo: cedemos la CPU */
+	}
+	return r;
+}
+```
+
+La frase clave es `cond_resched()`. El vcpu es un hilo del kernel de Linux como cualquier otro: el planificador CFS/EEVDF puede apartarlo, migrarlo entre CPUs o preemptarlo. Cuando decimos "el invitado corre" en realidad corre un hilo del anfitrión que, dentro de `vcpu_enter_guest`, hizo VM entry. Dentro de esa función se guarda el estado del anfitrión, se carga el del invitado en el `VMCS` y se salta al metal:
+
+```c
+/* muy simplificado: el world switch dentro de vcpu_enter_guest */
+guest_state_enter_irqoff();
+kvm_x86_call(vcpu_run)(vcpu);      /* VMLAUNCH/VMRESUME: aqui corre el invitado */
+guest_state_exit_irqoff();         /* volvemos tras el VM exit */
+exit_reason = kvm_x86_call(handle_exit)(vcpu, ...);
+```
+
+Entre esas dos líneas transcurre el tiempo del invitado, invisible para `top`: para el anfitrión es un único hilo ocupado en el kernel.
+
+Tras el VM exit, `handle_exit` consulta el motivo en el `VMCS` y lo despacha por una tabla indexada por número de razón. La mayoría de los exits ni siquiera llegan al espacio de usuario: KVM los resuelve dentro del kernel —un fallo de EPT que asigna una página, la lectura de un `MSR` emulado, una interrupción externa— y vuelve a entrar sin despertar a QEMU. Solo lo que KVM no sabe o no debe emular se reenvía al espacio de usuario rellenando `kvm_run->exit_reason` (nivel 53.3).
+
+```c
+/* arch/x86/kvm/vmx/vmx.c: tabla indexada por la razón del VM exit */
+static int (*const kvm_vmx_exit_handlers[])(struct kvm_vcpu *) = {
+	[EXIT_REASON_EXCEPTION_NMI]      = handle_exception_nmi,
+	[EXIT_REASON_EXTERNAL_INTERRUPT] = handle_external_interrupt,
+	[EXIT_REASON_IO_INSTRUCTION]     = handle_io,          /* puede ir a userspace */
+	[EXIT_REASON_EPT_VIOLATION]      = handle_ept_violation, /* resuelto en el kernel */
+	[EXIT_REASON_HLT]                = handle_halt,
+	/* ... decenas de razones más ... */
+};
+```
+
+## EPT y NPT: la paginación anidada
+
+El problema más difícil de virtualizar no es la CPU sino la memoria. El invitado cree que sus direcciones físicas —las *guest physical addresses*, GPA— son reales, pero no lo son: hay que traducirlas a las físicas de verdad del anfitrión, las *host physical addresses*, HPA. Antes del hardware moderno esto se resolvía con **tablas sombra**: KVM mantenía una tabla de páginas paralela que mapeaba directamente la dirección virtual del invitado a la HPA, y atrapaba cada modificación que el invitado hacía a *sus* tablas para mantener la sombra sincronizada. Correcto, pero carísimo: cada `mov` a `CR3` y cada fallo de página del invitado era un VM exit.
+
+Intel `EPT` (Extended Page Tables) y AMD `NPT` (Nested Page Tables) llevan la segunda traducción al hardware. Ahora la MMU realiza un *paseo bidimensional*: para cada nivel de las tablas del invitado que traduce GVA→GPA, camina a su vez las tablas EPT que traducen GPA→HPA. El invitado gestiona sus propias tablas de páginas con total libertad, sin que ningún `mov CR3` provoque VM exit, porque su `CR3` apunta a memoria que él controla; KVM solo administra la segunda tabla, la de EPT.
+
+<Mermaid code={`flowchart LR
+  GVA[Direccion virtual del invitado] --> GPT[Tablas de pagina del invitado]
+  GPT --> GPA[Direccion fisica del invitado GPA]
+  GPA --> EPT[Tablas EPT o NPT gestionadas por KVM]
+  EPT --> HPA[Direccion fisica real del anfitrion HPA]`} />
+
+El TLB cachea la traducción combinada GVA→HPA, así que en el caso caliente no hay ni un paseo ni el otro. Solo cuando la GPA no está mapeada en las EPT se produce un **EPT violation**: un VM exit que KVM atiende asignando la página del anfitrión que respalda esa GPA, exactamente igual que un fallo de página normal pero un nivel más arriba. La memoria del invitado no es más que memoria virtual de un proceso del anfitrión —el proceso QEMU—, así que se pagina, se hace *swap* y se comparte con las mismas herramientas que cualquier otra región.
+
+## Por qué corre casi nativo
+
+Aquí converge todo. En el trap-and-emulate clásico, o peor en la traducción binaria, cada instrucción privilegiada del invitado costaba trampas, emulación e incluso reescritura. Con VT-x/AMD-V el invitado ejecuta sus instrucciones **directamente sobre la CPU física**, en su propio anillo 0, sin intérprete de por medio. La aritmética, los saltos, las llamadas, los accesos a memoria: todo es código nativo corriendo al reloj del procesador. Solo las operaciones que el hipervisor eligió interceptar —ciertos accesos a `MSR`, la E/S a puertos, las EPT violations— provocan un VM exit, y el precio de la virtualización se reduce a la frecuencia de esos exits. La disciplina de todo el diseño de KVM y de `virtio` (nivel 53.4) es una sola: minimizar los VM exits, porque cada uno cuesta miles de ciclos de guardar y restaurar estado.
+
+<Callout type="tip" title="Mide los VM exits con kvm_stat">
+La herramienta `kvm_stat` (o los tracepoints `kvm:kvm_exit`) muestra en vivo cuántos VM exits ocurren y por qué. Un invitado con E/S emulada a la antigua dispara cientos de miles por segundo; el mismo invitado con `virtio` y `vhost` los reduce en uno o dos órdenes de magnitud. Aprender a leer esa tabla es aprender a diagnosticar dónde se va el rendimiento de una máquina virtual.
+</Callout>
+
+<Callout type="dios" title="KVM no es un hipervisor con un kernel: es un kernel que además es hipervisor">
+Piensa en lo que acaba de invertirse respecto a toda la industria anterior. Xen, VMware ESXi, Hyper-V nacieron como hipervisores: primero se escribió el multiplexor de máquinas y luego, a regañadientes, hubo que dotarlo de un planificador, de gestión de memoria, de drivers para hablar con los discos y las redes reales. Reinventaron, peor y desde cero, medio sistema operativo, porque un hipervisor que reparte hardware necesita justo las capacidades que un sistema operativo ya tiene. Avi Kivity vio la asimetría y la explotó al revés. En vez de añadir un kernel a un hipervisor, añadió un hipervisor a un kernel. Linux ya tenía el mejor planificador, la mejor gestión de memoria, los mejores drivers del mundo, pulidos por miles de desarrolladores durante quince años; lo único que le faltaba era saber decir `VMLAUNCH`. KVM aporta exactamente eso y nada más, apenas unos miles de líneas, y deja que un vcpu sea un `struct task_struct` como los que ya planificas, que la memoria del invitado sea un `mmap` como los que ya paginas, que un VM exit por E/S se resuelva mandando el trabajo a un hilo como los que ya despachas. Por eso KVM ganó: no compitió con Linux, se montó sobre él. Y esa decisión encierra una lección que trasciende la virtualización: la potencia no está en construir un sistema nuevo para cada problema, sino en reconocer que el problema nuevo es el viejo con otro sombrero, y prestarle la maquinaria que ya funciona. El invitado que crees ejecutar en un hipervisor lo estás ejecutando, en realidad, dentro del mismo Linux que corre tu terminal.
+</Callout>
+
+<Challenge title="Observa a Linux comportarse como hipervisor">
+1. Carga los módulos y verifica las dos capas con `lsmod | grep kvm`; identifica cuál depende de cuál y por qué.
+2. Arranca una máquina virtual sencilla y localiza su proceso con `ps`; comprueba que cada vcpu aparece como un hilo del anfitrión.
+3. Ejecuta `kvm_stat` durante unos segundos y clasifica los tres motivos de VM exit más frecuentes.
+4. Explica en cuatro líneas la diferencia entre tablas sombra y `EPT`/`NPT`, y por qué las segundas eliminan los VM exit por cada `mov CR3` del invitado.
+5. Razona por qué la memoria de un invitado puede sufrir *swap* del anfitrión, y qué implica eso para el aislamiento de rendimiento entre máquinas virtuales.
+</Challenge>

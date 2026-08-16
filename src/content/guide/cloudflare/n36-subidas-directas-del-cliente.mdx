@@ -1,0 +1,169 @@
+---
+title: "Subidas directas: que el cliente suba sin pasar por tu servidor"
+description: "Aceptar ficheros grandes a través de tu propio servidor es la peor arquitectura posible: pagas dos veces el tráfico, ocupas una petición durante minutos y conviertes tu backend en el cuello de botella de cada carga. Las subidas directas invierten el flujo con una URL de un solo uso. Vemos cómo se pide esa URL para Images y para Stream, qué es un registro en borrador y qué la reserva de duración, cuándo hace falta el protocolo reanudable tus y por qué la pieza que emite el enlace es en realidad el punto donde se aplica toda tu política de autorización y cuota."
+subject: cloudflare
+level: 36
+order: 4
+position: "36.4"
+duration: "18 min"
+---
+
+<Lead>
+Hay una decisión de arquitectura que casi todo el mundo toma sin darse cuenta y casi siempre mal: cuando un usuario sube una foto o un vídeo, ¿por dónde pasan esos bytes? La respuesta por inercia es que pasan por tu servidor, porque es donde vive la lógica y donde están las credenciales. Y es la peor opción disponible: pagas el tráfico de entrada y el de salida hacia el proveedor, mantienes una petición abierta durante minutos, arriesgas tiempos de espera agotados y conviertes tu backend en el punto de estrangulamiento de una operación que no necesita nada de él. Las subidas directas invierten el flujo con un artefacto sencillo y muy afilado: una URL de un solo uso, emitida por ti, que el cliente usa sin poseer ninguna credencial.
+</Lead>
+
+<Goals>
+
+- Explicar por qué el proxy de subidas a través del backend es una decisión cara y frágil.
+- Pedir una URL de un solo uso para `Images` y entender qué es un registro en borrador.
+- Pedir una subida directa para `Stream`, fijar la duración máxima y elegir entre `POST` simple y `tus`.
+- Situar la autorización, la cuota y las restricciones en el momento de emitir el enlace.
+
+</Goals>
+
+## El coste de pasar por tu servidor
+
+Enumeremos el daño con precisión, porque el argumento suele darse por sabido y no lo está. Primero, el tráfico se paga dos veces: entra a tu infraestructura y vuelve a salir hacia el almacenamiento. Segundo, ocupas un proceso o una conexión durante todo el tiempo que dure la carga, que en una conexión móvil mediocre y un vídeo de medio gigabyte son minutos; multiplícalo por la concurrencia de una hora punta y tienes un plan de capacidad dictado por la peor red de tus usuarios. Tercero, hereda todos los límites de tu capa de entrada —tamaño máximo de cuerpo, tiempo de espera del balanceador— y esos límites suelen aparecer en producción, no en pruebas.
+
+Y hay un cuarto motivo que no es de coste sino de forma, y es el más importante. En un Worker, el proxy de subida es directamente hostil al modelo de ejecución: mantener un cuerpo enorme atravesando un isolate con límites de memoria y de tiempo de CPU es luchar contra la plataforma en lugar de usarla. La solución no es aumentar límites: es no tocar los bytes.
+
+<Mermaid code={`sequenceDiagram
+  participant C as cliente
+  participant W as tu worker
+  participant P as images o stream
+  C->>W: quiero subir un fichero
+  W->>W: autentica al usuario y comprueba cuota
+  W->>P: pide una url de un solo uso con restricciones
+  P-->>W: url unica mas identificador futuro
+  W-->>C: solo la url
+  C->>P: sube los bytes directamente
+  P-->>W: webhook cuando el recurso esta listo`} />
+
+Fíjate en lo que ocurre en ese diagrama: tu código participa dos veces y ninguna de ellas toca un byte del fichero. Interviene al principio, para decidir si esta persona puede subir y con qué límites, y al final, para enterarse de que el recurso existe. En medio, los bytes viajan por el camino más corto entre el dispositivo del usuario y el almacenamiento.
+
+## Images: una URL de un solo uso y un registro en borrador
+
+El gesto es una llamada al punto de subida directa, que no sube nada: reserva. Devuelve dos cosas —el identificador que la imagen tendrá cuando exista y la URL a la que el cliente debe enviarla— y crea al mismo tiempo un registro en estado de borrador que todavía no aparece en tu listado de imágenes.
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const usuario = await autenticar(request, env);
+    if (!usuario) return new Response("No autorizado", { status: 401 });
+    if (await cuotaAgotada(usuario, env)) return new Response("Cuota agotada", { status: 429 });
+
+    const respuesta = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${env.CUENTA}/images/v2/direct_upload`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.TOKEN}` },
+        body: formulario({
+          requireSignedURLs: "true",
+          metadata: JSON.stringify({ usuario: usuario.id }),
+          expiry: new Date(Date.now() + 10 * 60_000).toISOString(),
+        }),
+      },
+    );
+
+    const { result } = await respuesta.json<RespuestaSubida>();
+    await registrarPendiente(usuario, result.id, env);
+    return Response.json({ uploadURL: result.uploadURL });
+  },
+};
+```
+
+Del lado del cliente no hay nada que aprender: un formulario ordinario con un campo de fichero que apunta a esa dirección basta, y no viaja ninguna credencial en él.
+
+```html
+<form action="URL_DE_UN_SOLO_USO" method="post" enctype="multipart/form-data">
+  <input type="file" name="file" />
+  <input type="submit" value="Subir" />
+</form>
+```
+
+Tres detalles marcan la diferencia entre una integración correcta y una que da problemas al mes. El primero es la caducidad: el enlace vive treinta minutos por defecto, y puedes fijarla entre dos minutos y seis horas. Corta es mejor, porque el enlace es una capacidad y una capacidad que dura poco tiene menos superficie. El segundo es el campo de borrador: mientras el usuario no haya subido nada, el registro existe con esa marca y no ensucia tu listado, lo que te da un estado intermedio explícito en vez de una ausencia ambigua. Y el tercero es que puedes fijar un identificador propio en vez del generado, con una contrapartida que hay que conocer: una imagen con identificador a medida no puede exigir URL firmada.
+
+<Callout type="tip" title="Los metadatos son tu hilo de vuelta">
+Los metadatos que adjuntas al emitir el enlace nunca se comparten con el visitante, y son el sitio natural para escribir a qué usuario, a qué formulario o a qué entidad de tu dominio pertenecerá el fichero. Cuando llegue el webhook de que el recurso está listo, ese dato es lo que te permite cerrar el círculo sin mantener una tabla de correspondencias frágil.
+</Callout>
+
+## Stream: reserva de duración y subidas reanudables
+
+Con vídeo el patrón es el mismo pero aparece una obligación nueva, y es de facturación. Como Stream cobra el almacenamiento por minutos comprados por adelantado, al emitir el enlace tienes que declarar la duración máxima que reservas para esa subida. Esos minutos se descuentan de tu saldo en el acto y se liberan cuando el vídeo real se procesa —quedándose la duración verdadera—, cuando el enlace caduca sin usarse, o cuando la codificación falla.
+
+```ts
+const subida = await env.STREAM.createDirectUpload({ maxDurationSeconds: 600 });
+return Response.json({ uploadURL: subida.uploadURL, uid: subida.uid });
+```
+
+El binding resuelve el caso ordinario sin token ni llamada autenticada. Pero hay un umbral que decide la arquitectura del cliente: un `POST` simple admite hasta doscientos megabytes, y por encima de eso —o cuando la conexión del usuario es dudosa aunque el fichero sea menor— hay que usar el protocolo reanudable `tus`, que trocea la carga y permite retomarla donde se cortó en vez de empezar de cero.
+
+La variante reanudable tiene una forma distinta que conviene no descubrir a medias. Tu Worker llama al punto de creación indicando que el usuario final será quien suba, reenviando las cabeceras que el protocolo exige —la versión, la longitud total del fichero y los metadatos—, y la URL de un solo uso no llega en el cuerpo de la respuesta sino en la cabecera de ubicación. Para que el navegador del usuario pueda leerla, hay que exponerla explícitamente en las cabeceras de intercambio de origen cruzado.
+
+```ts
+const destino = await fetch(
+  `https://api.cloudflare.com/client/v4/accounts/${env.CUENTA}/stream?direct_user=true`,
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.TOKEN}`,
+      "Tus-Resumable": "1.0.0",
+      "Upload-Length": request.headers.get("Upload-Length")!,
+      "Upload-Metadata": request.headers.get("Upload-Metadata")!,
+    },
+  },
+);
+
+return new Response(null, {
+  headers: {
+    Location: destino.headers.get("Location")!,
+    "Access-Control-Expose-Headers": "Location",
+    "Access-Control-Allow-Origin": "https://mi-app.ejemplo.com",
+  },
+});
+```
+
+Las restricciones viajan aquí dentro de la cabecera de metadatos, con una sintaxis peculiar que causa errores silenciosos si se improvisa: pares de clave y valor donde el valor va codificado en base64, la clave se separa del valor por un espacio —nunca por un signo de igualdad— y los pares se unen con comas sin espacios. Solo se leen en la primera petición, la que hace tu Worker; en las siguientes se ignoran.
+
+| Aspecto | Subida directa de `Images` | Subida directa de `Stream` |
+| --- | --- | --- |
+| Qué devuelve | Identificador futuro \| URL de un solo uso | Identificador futuro \| URL de un solo uso |
+| Restricción principal | Caducidad entre dos minutos y seis horas | Duración máxima reservada del saldo |
+| Estado intermedio | Registro en borrador hasta que llegan bytes | Reserva de minutos hasta procesar o caducar |
+| Límite de tamaño | El del formato admitido | Doscientos megabytes con `POST` simple |
+| Ficheros grandes | No aplica en la práctica | Obligatorio el protocolo `tus` |
+
+## El punto donde vive tu política
+
+Queda la idea que ordena la lección. La URL de un solo uso parece un truco de rendimiento y es en realidad un mecanismo de autorización, porque el instante en que la emites es el único instante en que tu código puede decir que no. Después ya no hay a quién preguntar: quien tenga el enlace subirá.
+
+Por eso todo lo que sea política se decide ahí. Quién es este usuario y si su sesión es válida. Cuántas subidas lleva hoy y si le queda cupo. Qué duración máxima merece según su plan. Cuánto tiempo debe vivir el enlace. Si el recurso nacerá público o exigiendo firma. A qué entidad de tu dominio quedará asociado, escrito en los metadatos. Un Worker es el lugar natural para esa decisión porque está en el borde, responde en milisegundos y no necesita ver un solo byte del fichero para tomarla.
+
+Y del otro lado del proceso queda una regla que evita la clase de error más común: no confíes en que el cliente te avise de que terminó. Un navegador se cierra, una pestaña se recarga, una red se cae justo al final. La confirmación fiable llega por webhook desde el proveedor, o consultando el estado con el identificador que guardaste al emitir el enlace. Todo lo que tu interfaz cuente al usuario mientras tanto es optimismo, y debe estar marcado como tal.
+
+<Cards>
+  <Card icon="🎟️" title="Un enlace es una capacidad">
+    No lleva identidad ni permisos consultables. Autoriza por sí mismo, así que su valor está en durar poco y admitir poco.
+  </Card>
+  <Card icon="📝" title="Borrador y reserva">
+    El recurso existe antes de tener bytes. Ese estado intermedio explícito es lo que te deja construir una interfaz honesta.
+  </Card>
+  <Card icon="🧗" title="Reanudable cuando toca">
+    Por encima del umbral de tamaño o con redes malas, el protocolo troceado deja de ser una mejora y pasa a ser el requisito.
+  </Card>
+  <Card icon="🔔" title="La verdad llega por webhook">
+    El cliente puede desaparecer en cualquier momento. El estado real lo confirma el proveedor, no la pestaña del usuario.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Emitir un enlace de un solo uso es mover la frontera de confianza del transporte al momento de la decisión">
+Lo que hay debajo de este patrón es uno de los movimientos más profundos de la ingeniería de sistemas distribuidos, y merece nombrarse: la sustitución de la mediación continua por la delegación acotada. El modelo mental heredado dice que un servidor protege un recurso estando en medio de todos los accesos a él, de modo que la autorización se comprueba en cada operación y la confianza se renueva a cada paso. Ese diseño es intuitivo y tiene un defecto estructural: obliga a que el guardián esté en el camino de los datos, y por tanto obliga a dimensionar al guardián por el volumen de datos en vez de por el volumen de decisiones. Cuando lo que atraviesa son formularios de dos kilobytes, la diferencia es invisible; cuando son vídeos de medio gigabyte, es la diferencia entre un servicio y una flota. La URL de un solo uso rompe esa ligadura al separar limpiamente dos cosas que estaban fusionadas: quién decide y por dónde pasan los bytes. La decisión se toma una vez, en tu código, con todo el contexto disponible —identidad, plan, cupo, reglas de negocio— y se materializa en un objeto opaco, corto y desechable que ya lleva codificados sus propios límites. A partir de ahí el transporte ocurre sin ti, y el hecho de que ocurra sin ti no es una pérdida de control sino la prueba de que el control estaba en el sitio correcto. Reconocerás el patrón en todas partes en cuanto le pongas nombre, porque es el mismo de las URL presignadas de un almacén de objetos, el de los tokens de acceso de vida corta frente a las sesiones consultables, el de los tickets de un sistema de autenticación distribuida y, en el fondo, el mismo de los `bindings` que llevas veinte niveles usando: una capacidad es una autorización que viaja, en lugar de un permiso que se pregunta. Y como toda capacidad, tiene su disciplina propia, que es exactamente la contraria a la de las contraseñas: no puedes revocarla con facilidad, así que la seguridad no viene de vigilarla sino de emitirla con el alcance más estrecho y la vida más corta que el caso tolere. El ingeniero que interioriza esto deja de preguntarse cómo proteger un endpoint de subida y empieza a preguntarse qué es lo peor que puede hacer alguien que tenga este enlace durante los próximos diez minutos, que es la pregunta correcta y la única cuya respuesta puedes controlar del todo.
+</Callout>
+
+<Challenge title="Saca los bytes de tu servidor">
+1. Escribe un Worker que autentique al usuario, compruebe una cuota diaria y devuelva una URL de subida de imagen válida solo cinco minutos.
+2. Escribe en los metadatos el identificador del usuario y de la entidad de destino. Cierra el círculo con un webhook que asocie la imagen sin consultar en bucle.
+3. Emite una subida directa de vídeo con duración máxima de diez minutos, comprueba el descuento en tu saldo de almacenamiento y deja caducar el enlace sin usarlo. Verifica que la reserva se libera.
+4. Sube un fichero de más de doscientos megabytes con `POST` simple, observa el fallo, y repítelo con un cliente reanudable. Corta la red a mitad y comprueba que se retoma.
+5. Enumera por escrito todas las decisiones que tu Worker toma en el instante de emitir el enlace, y para cada una responde qué pasa si te la saltas.
+</Challenge>

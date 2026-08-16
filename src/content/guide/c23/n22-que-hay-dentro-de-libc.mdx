@@ -1,0 +1,151 @@
+---
+title: "Qué hay dentro de libc"
+description: "El arranque que ocurre antes de main, el buffering de stdio, el asignador que convierte brk y mmap en punteros, y los envoltorios que traducen las syscalls: las cuatro piezas que sostienen todo programa en C."
+subject: c23
+level: 22
+order: 2
+position: "22.2"
+duration: "18 min"
+---
+
+<Lead>
+Escribes `main` y crees que ahí empieza tu programa. No empieza ahí: cuando la primera línea de `main` se ejecuta, la libc ya reconstruyó los argumentos desde la pila, montó el almacenamiento por hilo, sembró el canario de pila, ejecutó constructores ajenos y dejó tres flujos abiertos. Abrir esa caja no es curiosidad arqueológica: explica por qué un `printf` no aparece cuando esperas, por qué `free` no devuelve memoria al sistema y por qué medir tiempo puede no costar una llamada al kernel.
+</Lead>
+
+<Goals>
+
+- Reconstruir la secuencia de arranque desde el punto de entrada del ELF hasta `main`.
+- Explicar los tres modos de buffering de `stdio` y sus patologías clásicas.
+- Describir cómo el asignador traduce peticiones en `brk` y `mmap`, y por qué liberar no encoge la memoria residente.
+- Distinguir qué funciones de la libc son envoltorios de syscalls y qué añaden encima.
+
+</Goals>
+
+## Las cuatro piezas
+
+Una libc no es un saco de funciones sueltas. Es un runtime con responsabilidades bien separadas, y casi todo lo que te sorprenderá de ella cae en una de cuatro categorías.
+
+<Cards>
+  <Card icon="🚀" title="Arranque y salida">
+    El código que corre antes de `main` y después de `return`: argumentos, entorno, almacenamiento por hilo, constructores, destructores y vaciado de flujos.
+  </Card>
+  <Card icon="📄" title="Entrada y salida con buffer">
+    `stdio` y su tipo opaco `FILE`, con una política de buffering que decide cuándo tus bytes llegan de verdad al kernel.
+  </Card>
+  <Card icon="🧱" title="Asignador dinámico">
+    `malloc`, `free` y `realloc` sobre `brk` y `mmap`, con arenas, bins y umbrales que gobiernan la fragmentación.
+  </Card>
+  <Card icon="🔌" title="Envoltorios de syscalls">
+    La traducción del contrato del kernel al contrato de C: valores de retorno, `errno`, cancelación y atajos como el vDSO.
+  </Card>
+</Cards>
+
+## El arranque antes de `main`
+
+El campo `e_entry` de la cabecera ELF no apunta a `main`, sino a `_start`, un símbolo que aporta el objeto de arranque `crt1.o` y que el enlazador añade sin que lo pidas. Compruébalo:
+
+```bash
+readelf -h ./prog | grep Entry     # direccion de _start, no de main
+nm -C ./prog | grep -E '_start|main'
+```
+
+Y ni siquiera `_start` es lo primero. Si el binario es dinámico, su cabecera contiene un segmento `INTERP` con la ruta del **enlazador dinámico**, y el kernel carga y ejecuta ese intérprete antes que a tu programa. Es él quien mapea las bibliotecas compartidas que necesitas, aplica las reubicaciones, procesa `LD_PRELOAD` y decide si resolver los símbolos de función de golpe o de forma perezosa, dejando que la primera llamada a través de la tabla de enlace pase por el resolutor. Solo cuando todo está en su sitio salta a `_start`.
+
+```bash
+readelf -l ./prog | grep -A1 INTERP    # el interprete que corre antes que tu
+LD_DEBUG=bindings ./prog 2>&1 | head   # cada simbolo resuelto, uno por linea
+```
+
+`_start` no recibe parámetros al modo de C: el kernel le entrega el control con la pila ya preparada, y en la cima están `argc`, el vector `argv`, el vector `envp` y a continuación el **vector auxiliar**, una tabla de pares clave-valor donde el kernel deja el tamaño de página, la dirección del vDSO, la semilla `AT_RANDOM` y los identificadores de usuario. `_start` lee eso, alinea la pila como exige la ABI y llama a `__libc_start_main`, que es donde vive el trabajo real.
+
+Ese arranque hace, en orden aproximado: inicializar el almacenamiento local por hilo, sembrar el canario de pila con bytes de `AT_RANDOM`, registrar el destructor de la imagen, ejecutar los punteros a función de la sección `init_array`, y solo entonces llamar a `main`. Al volver, envuelve el resultado en `exit`.
+
+<Mermaid code={`flowchart TD
+  A[Kernel carga el ELF y salta al entry point] --> B[_start en crt1.o]
+  B --> C[__libc_start_main]
+  C --> D[TLS, canario de pila y vector auxiliar]
+  D --> E[Constructores de init_array]
+  E --> F[main]
+  F --> G[exit ejecuta atexit y vacia stdio]
+  class F t-green
+  class G t-yellow`} />
+
+Los constructores no son teóricos: cualquier función marcada con el atributo `constructor` entra en esa sección y corre antes que tu primera línea.
+
+```c
+#include <stdio.h>
+
+__attribute__((constructor)) static void antes(void) {
+    puts("esto se imprime antes que main");
+}
+
+__attribute__((destructor)) static void despues(void) {
+    puts("esto se imprime al salir por exit, no por _exit");
+}
+
+int main(void) { puts("main"); }
+```
+
+La salida es igual de estructurada. `exit` ejecuta en orden inverso las funciones registradas con `atexit`, corre los destructores y **vacía los flujos de `stdio`**. `_exit` invoca la syscall directamente y no hace nada de eso. Esa diferencia, que parece un detalle de estilo, es la causa de la mitad de los mensajes perdidos en programas que abortan.
+
+## `stdio` y el buffer que decide lo que ves
+
+`FILE` es un tipo opaco: dentro hay un descriptor, un buffer, punteros de posición y, en `glibc`, un cerrojo recursivo. La política de buffering se fija al abrir el flujo y depende de si el destino es un terminal:
+
+- **Completo** cuando escribes a un archivo o a una tubería: los bytes salen cuando el buffer se llena.
+- **Por líneas** cuando `stdout` es un terminal interactivo: cada salto de línea provoca un vaciado.
+- **Sin buffer** siempre en `stderr`, para que los errores no se pierdan al abortar.
+
+De ahí sale el desconcierto clásico: un programa que imprime bien en la terminal y no imprime nada cuando rediriges su salida a un archivo y lo matas a mitad. No es que no ejecutara los `printf`; es que sus bytes murieron en un buffer de usuario que nunca llegó a `write`.
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);   // antes de cualquier E/S sobre el flujo
+    printf("visible al instante\n");
+    if (fork() == 0) _exit(0);          // sin buffer no hay salida duplicada
+}
+```
+
+Dos consecuencias de nivel profesional. La primera: `fork` **duplica el buffer sin vaciar**, así que padre e hijo emiten las mismas líneas dos veces si el flujo estaba en modo completo; por eso la regla es `fflush` antes de bifurcar, y `fflush(NULL)` vacía todos los flujos de salida de una vez. La segunda: en `glibc` cada `putc` toma y suelta un cerrojo para ser seguro entre hilos, y las variantes `putc_unlocked` o `fwrite_unlocked` existen precisamente para saltárselo dentro de una región protegida por `flockfile`. En bucles de millones de caracteres la diferencia es de un orden de magnitud.
+
+Un matiz que casi nadie conoce: el tamaño del buffer no es una constante caprichosa. Al abrir el flujo, la libc consulta el campo `st_blksize` que devuelve `fstat` y dimensiona el buffer según el tamaño de bloque preferido del sistema de archivos. Por eso el mismo programa hace un número distinto de llamadas a `write` según dónde escriba, y por eso ajustar el buffer a mano con `setvbuf` puede mejorar o empeorar el rendimiento según el destino. Y hay una regla de uso estricta: `setvbuf` solo es válido **antes de la primera operación** sobre el flujo; después, el comportamiento es indefinido.
+
+## El asignador y los envoltorios
+
+`malloc` no es una syscall. Es un gestor en espacio de usuario que pide memoria al kernel **al por mayor** y la reparte al detalle. El asignador de `glibc`, heredero de ptmalloc2, mantiene una arena principal que crece moviendo el fin del segmento de datos con `brk`, arenas adicionales por hilo para reducir la contención, y una caché por hilo, el tcache, que sirve los tamaños pequeños sin tocar cerrojo alguno. Las peticiones grandes, por encima de un umbral dinámico que arranca en 128 KiB, se satisfacen con un `mmap` anónimo propio que se devuelve al sistema en su `free`.
+
+```bash
+strace -e trace=brk,mmap,munmap ./prog   # cuenta cuantas veces se pide memoria de verdad
+MALLOC_ARENA_MAX=2 ./prog                # limita las arenas por hilo sin recompilar
+```
+
+Aquí está la observación que separa a quien entiende el sistema: **`free` casi nunca devuelve memoria al kernel**. Marca el bloque como reutilizable y lo encadena en un bin. Solo si el bloque libre contiguo a la cima de la arena supera el umbral de recorte, o si venía de `mmap`, el proceso reduce su huella. Por eso un servidor puede liberarlo todo y seguir mostrando una memoria residente enorme: no hay fuga, hay fragmentación y un asignador comportándose como debe. `musl`, con su asignador `mallocng`, toma decisiones distintas —más endurecido frente a corrupción, con metadatos separados de los datos y peor rendimiento en ráfagas multihilo—, y esa divergencia es medible en cualquier benchmark de asignación intensiva.
+
+La cuarta pieza es la más delgada y la más importante: los envoltorios. El kernel de Linux no devuelve `-1` ni toca `errno`; devuelve el código de error negado, en el rango de `-4095` a `-1`. El envoltorio detecta ese rango, devuelve `-1` y coloca el valor positivo en `errno`. Nada más. Pero no toda función de la libc es un envoltorio: `strlen` no habla con nadie, `printf` formatea antes de llamar a `write`, y `clock_gettime` a menudo **no entra al kernel** porque se resuelve en el vDSO, una página que el kernel proyecta en tu espacio de direcciones con código y datos de tiempo ya listos. Y a la inversa, hay syscalls sin envoltorio para las que necesitas la puerta genérica:
+
+```c
+#include <sys/syscall.h>
+#include <unistd.h>
+
+long tid = syscall(SYS_gettid);   // sin envoltorio dedicado en glibc antiguas
+```
+
+Los envoltorios añaden además dos comportamientos que el kernel no da. Uno es la gestión de la interrupción: si llega una señal durante una llamada lenta, el kernel la aborta con `EINTR`, y salvo que el manejador se registrara con reinicio automático, es tu código quien debe reintentar. El otro son los **puntos de cancelación** de `pthreads`: envoltorios como `read` o `poll` comprueban si el hilo tiene una cancelación pendiente y ejecutan el desenrollado antes de bloquear. Nada de eso está en la syscall; lo pone la libc, y por eso invocar `syscall` directamente te salta esas garantías junto con el resto.
+
+<Callout type="tip" title="Interponerse en la capa">
+Como la libc dinámica se resuelve en tiempo de ejecución, puedes **sustituir sus funciones sin recompilar nada**. Una biblioteca compartida cargada con `LD_PRELOAD` se sitúa antes que la libc en el orden de búsqueda de símbolos, así que tu `malloc` gana al suyo y puedes contar asignaciones, inyectar fallos o trazar E/S en un binario ajeno. Recuperas la implementación original con `dlsym` y `RTLD_NEXT`. Sobre este mecanismo están construidos los perfiladores de heap y buena parte de las herramientas de depuración de memoria, y también es la razón de que un binario estático sea inmune a ellas: no hay tabla que interponer.
+</Callout>
+
+<Callout type="dios" title="La libc es un runtime, y todo runtime tiene política">
+El salto conceptual es dejar de ver la libc como un catálogo de funciones y verla como lo que es: **un runtime que impone políticas por ti**. Buffering es política: alguien decidió que escribir a una tubería se acumule y a un terminal no. El asignador es política: alguien decidió cuándo pedir al kernel, cuánto retener y qué umbral separa `brk` de `mmap`. El arranque es política: alguien decidió que existan constructores, que haya un canario, que `exit` vacíe flujos y `_exit` no. Ninguna de esas decisiones está en el estándar de C; el estándar solo describe el comportamiento observable. Por eso el mismo programa, idéntico byte a byte en su fuente, cambia de rendimiento, de huella de memoria y hasta de salida visible según contra qué libc lo enlaces. Y por eso puedes intervenir: `setvbuf` te devuelve la política de buffering, `mallopt` la del asignador, el enlazado estático la del arranque, y compilar freestanding las elimina todas y te obliga a escribirlas tú. Quien no ve esta capa cree que C es lento o rápido, o que un programa gotea memoria. Quien la ve sabe qué componente tomó qué decisión y dónde ir a cambiarla.
+</Callout>
+
+<Challenge title="Abre la caja">
+1. Añade una función `constructor` y otra `destructor` a un programa y comprueba su orden; luego cambia `return` por `_exit(0)` y observa cuál deja de ejecutarse.
+2. Escribe un bucle que imprima sin salto de línea, redirige la salida a un archivo y mata el proceso con `SIGKILL`; repite tras un `setvbuf` sin buffer y explica la diferencia.
+3. Ejecuta `strace -e trace=brk,mmap` sobre un programa que haga un millón de `malloc` de 32 bytes y cuenta cuántas peticiones reales al kernel se produjeron.
+4. Compara con `ltrace` y `strace` una llamada a `clock_gettime` y determina si tu sistema la resuelve en el vDSO o entra al kernel.
+</Challenge>

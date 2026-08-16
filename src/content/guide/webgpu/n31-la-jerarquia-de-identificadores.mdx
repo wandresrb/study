@@ -1,0 +1,145 @@
+---
+title: "La jerarquía de identificadores de una invocación"
+description: "Los cinco builtins que sitúan a una invocación dentro del grid, cómo se derivan unos de otros, y cuál usar en cada caso."
+subject: webgpu
+level: 31
+order: 2
+position: "31.2"
+duration: "18 min"
+---
+
+<Lead>
+Un compute shader se ejecuta idéntico en cada invocación. Lo único que distingue una de otra son los identificadores que el hardware le entrega al entrar, y de esos identificadores sale todo: qué elemento del array te toca, en qué celda de la memoria compartida escribes, si eres la invocación que consolida el resultado del grupo. Elegir mal el identificador es el bug silencioso más común del cómputo en GPU, porque el shader compila, se ejecuta, y produce un array a medio llenar.
+</Lead>
+
+<Goals>
+
+- Enumerar los cinco builtins de la etapa de cómputo y el tipo exacto de cada uno.
+- Derivar `global_invocation_id` y `local_invocation_index` a partir de los demás.
+- Elegir el identificador correcto según el recurso al que se indexa.
+- Reconocer los errores clásicos de indexación en dispatches de dos y tres dimensiones.
+
+</Goals>
+
+## Los cinco builtins
+
+WGSL expone en la etapa de cómputo cinco valores de entrada. Tres son vectores de tres componentes sin signo, `vec3u`; dos son escalares `u32`.
+
+| builtin | tipo | qué contiene |
+|---|---|---|
+| `workgroup_id` | `vec3u` | posición del workgroup dentro del dispatch |
+| `num_workgroups` | `vec3u` | los argumentos que pasaste a `dispatchWorkgroups` |
+| `local_invocation_id` | `vec3u` | posición de la invocación dentro de su workgroup |
+| `local_invocation_index` | `u32` | la misma posición, aplanada a un escalar |
+| `global_invocation_id` | `vec3u` | posición de la invocación dentro del dispatch entero |
+
+Se declaran como parámetros de la función de entrada, en cualquier orden y solo los que necesites. El compilador no reserva registros para los que no pides.
+
+```wgsl
+@compute @workgroup_size(8, 8)
+fn main(
+  @builtin(workgroup_id)          wid: vec3u,
+  @builtin(local_invocation_id)   lid: vec3u,
+  @builtin(local_invocation_index) li: u32,
+  @builtin(global_invocation_id)  gid: vec3u,
+  @builtin(num_workgroups)        nwg: vec3u,
+) {
+  // ...
+}
+```
+
+## Cómo se derivan unos de otros
+
+Solo dos de los cinco son primitivos: `workgroup_id` y `local_invocation_id`. Los otros tres son funciones exactas de esos dos y del tamaño del workgroup, y merece la pena saberse las fórmulas porque explican los errores.
+
+El identificador global es la suma del desplazamiento del grupo y la posición dentro del grupo:
+
+```wgsl
+// Con @workgroup_size(sx, sy, sz):
+global_invocation_id = workgroup_id * vec3u(sx, sy, sz) + local_invocation_id
+```
+
+El índice local aplana el vector local con **la componente x variando más rápido**:
+
+```wgsl
+local_invocation_index = local_invocation_id.x
+                       + local_invocation_id.y * sx
+                       + local_invocation_id.z * sx * sy
+```
+
+Ese orden importa. Si declaras `@workgroup_size(8, 8)` y usas `local_invocation_index` para indexar un array de memoria compartida de 64 elementos, las invocaciones con la misma `y` y `x` consecutiva caen en posiciones consecutivas del array. Es exactamente el orden que quieres para que las lecturas de memoria de un warp sean contiguas, y es el motivo por el que el índice aplanado no es `y * sx + x` al revés.
+
+`num_workgroups` no se deriva de nada: es una copia literal de los tres argumentos del dispatch, y es el único modo que tiene el shader de saber cuántos workgroups hay en total. En un dispatch indirecto, donde los argumentos los escribió otro shader en un buffer, es la única fuente de esa información.
+
+## Cuál usar para qué
+
+La regla es corta: **el identificador global indexa recursos globales, el local indexa recursos del workgroup, y el de workgroup indexa resultados por grupo**.
+
+```wgsl
+const WG: u32 = 64u;
+var<workgroup> parcial: array<f32, WG>;
+
+@group(0) @binding(0) var<storage, read>       datos:    array<f32>;
+@group(0) @binding(1) var<storage, read_write> porGrupo: array<f32>;
+
+@compute @workgroup_size(WG)
+fn main(
+  @builtin(global_invocation_id)   gid: vec3u,
+  @builtin(local_invocation_index) li:  u32,
+  @builtin(workgroup_id)           wid: vec3u,
+) {
+  // global -> array en storage
+  var v = 0.0;
+  if (gid.x < arrayLength(&datos)) { v = datos[gid.x]; }
+
+  // local -> array en memoria workgroup
+  parcial[li] = v;
+  workgroupBarrier();
+
+  // reduccion en arbol, omitida aqui
+
+  // workgroup -> un resultado por grupo
+  if (li == 0u) { porGrupo[wid.x] = parcial[0]; }
+}
+```
+
+Confundir `gid.x` con `li` en el array de memoria compartida es el error número uno: con un solo workgroup funciona perfectamente, porque `gid.x` y `li` coinciden, y en cuanto lanzas dos workgroups el segundo escribe fuera de rango. En WGSL una escritura fuera de rango en el address space `workgroup` no revienta: se descarta o se recorta según la implementación, así que no hay ningún mensaje de error. Simplemente el resultado es basura a partir del segundo grupo.
+
+El error número dos es usar `wid.x` como si fuera un índice de elemento. `wid.x` va de cero a `num_workgroups.x - 1`, que con 64 invocaciones por grupo es 64 veces menor que el número de elementos.
+
+## Dispatches de dos y tres dimensiones
+
+Las tres dimensiones existen por una razón concreta: mapear dominios que son naturalmente 2D o 3D sin hacer aritmética de índices a mano y, sobre todo, sin destruir la localidad de los accesos a memoria.
+
+Para procesar una imagen de 1920 por 1080 con un workgroup de 8 por 8:
+
+```js
+const WGX = 8, WGY = 8;
+pass.dispatchWorkgroups(
+  Math.ceil(1920 / WGX),   // 240
+  Math.ceil(1080 / WGY),   // 135
+);
+```
+
+```wgsl
+@group(0) @binding(0) var origen:  texture_2d<f32>;
+@group(0) @binding(1) var destino: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let dims = textureDimensions(destino);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let c = textureLoad(origen, vec2i(gid.xy), 0);
+  textureStore(destino, vec2i(gid.xy), vec4f(1.0 - c.rgb, c.a));
+}
+```
+
+Fíjate en que `1080 / 8` da 135 exacto pero `1920 / 8` da 240 exacto también, y aun así el guardia sigue ahí. Es deliberado: en cuanto la imagen deje de ser múltiplo de ocho, y ocurrirá, el guardia es lo único que impide escribir fuera. Un bloque de 8 por 8 sobre un dominio arbitrario deja hasta 63 invocaciones sobrantes en cada borde.
+
+El grupo de 8 por 8 son 64 invocaciones, el mismo número que un `@workgroup_size(64)` de una dimensión, pero la diferencia de rendimiento en una operación con vecindad —un desenfoque, un filtro de convolución— es enorme: un bloque cuadrado tiene un perímetro mucho menor que una tira, así que la cantidad de píxeles de halo que hay que leer por píxel útil es mucho más pequeña. Con una tira de 64 por 1, un filtro de radio 1 lee 3 filas de 66 píxeles para producir 64; con un bloque de 8 por 8 lee 100 píxeles para producir 64. Ese razonamiento vuelve completo en [las convoluciones](/guia/webgpu/n37-convoluciones-en-compute/).
+
+La tercera dimensión del dispatch, `z`, existe para volúmenes: texturas 3D, rejillas de simulación, tandas de matrices. Su límite es más bajo que el de las otras dos en el tamaño de workgroup, y eso condiciona el diseño, como se ve al [elegir el tamaño de workgroup](/guia/webgpu/n31-workgroup-size-en-tres-dimensiones/).
+
+<Callout type="dios" title="global_invocation_id miente en cuanto el dominio no es multiplo del workgroup">
+Hay una tentación permanente de tratar `global_invocation_id.x` como "el índice del elemento" y olvidarse. Es falso, y la razón es estructural: `global_invocation_id` está construido a partir de `workgroup_id`, y `workgroup_id` llega hasta `num_workgroups - 1`, que tú calculaste con un techo. Si tienes 1000 elementos y un workgroup de 64, lanzas 16 workgroups, que son 1024 invocaciones. Las 24 últimas tienen un `gid.x` perfectamente válido entre 1000 y 1023 y ningún elemento que les corresponda. En un storage buffer WebGPU aplica robustez de acceso: la lectura fuera de rango devuelve ceros y la escritura se descarta, así que **no revienta nada** y el bug sobrevive. Y cuando el mismo patrón lo aplicas a un buffer donde sí caben los 1024 elementos porque lo redondeaste al alineamiento, esas 24 invocaciones escriben basura en memoria válida que después alguien lee. La consecuencia práctica no es solo poner el guardia: es que **el guardia tiene que comparar contra el tamaño lógico, no contra el tamaño del buffer**, y por eso `arrayLength(&datos)` es traicionero cuando el buffer está sobredimensionado. Lo correcto en cualquier kernel que no procese siempre el buffer entero es pasar el conteo real en un uniform y comparar contra él.
+</Callout>

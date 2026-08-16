@@ -1,0 +1,132 @@
+---
+title: "struct address_space: la cache de cada archivo"
+description: "Cada inodo tiene su propia cache asociada mediante un `struct address_space`, cuya XArray indexa los folios por offset y cuyas `address_space_operations` conectan el page cache genérico con cada sistema de archivos concreto."
+subject: kernel
+level: 24
+order: 2
+position: "24.2"
+duration: "15 min"
+---
+
+<Lead>
+El page cache no es un único diccionario global: es una cache **por inodo**. Cada archivo abierto tiene detrás un `struct address_space` que reúne sus folios, los indexa por offset con una XArray, y guarda el juego de operaciones que sabe cómo llenarlos desde el disco y bajarlos de vuelta. Entender esta estructura es entender dónde vive físicamente el contenido de cada archivo en la RAM.
+</Lead>
+
+<Goals>
+
+- Ver cómo un inodo apunta a su `struct address_space` y qué guarda esta.
+- Entender la XArray `i_pages` que indexa los folios por offset.
+- Recorrer las `address_space_operations` clave del camino de E/S.
+- Comprender por qué esta indirección es el polimorfismo del VFS.
+
+</Goals>
+
+## Un mapa de páginas por inodo
+
+Todo inodo en memoria (`struct inode`) lleva empotrado un `struct address_space` en su campo `i_data`, y su `i_mapping` apunta a él. Ese `address_space` es el hogar de todos los folios cacheados de ese archivo. La estructura es deliberadamente compacta:
+
+```c
+/* include/linux/fs.h (recortado) */
+struct address_space {
+	struct inode		*host;      /* el inodo dueño de esta cache */
+	struct xarray		i_pages;    /* los folios, indexados por offset */
+	struct rw_semaphore	invalidate_lock;
+	gfp_t			gfp_mask;   /* como asignar folios para esta cache */
+	unsigned long		nrpages;    /* numero de paginas cacheadas */
+	pgoff_t			writeback_index;
+	const struct address_space_operations *a_ops;
+	unsigned long		flags;
+	errseq_t		wb_err;     /* errores de writeback para fsync */
+	struct rb_root_cached	i_mmap;     /* mapeos VM de este archivo */
+};
+```
+
+El puntero `host` cierra el círculo: desde un folio llegas a su `mapping`, y desde el `mapping` al inodo dueño. `nrpages` es cuántas páginas de este archivo están cacheadas ahora mismo; sumado sobre todos los inodos, se aproxima al `Cached` de `/proc/meminfo`. Y `a_ops` es la tabla de funciones que distingue un archivo ext4 de uno xfs o de un tmpfs.
+
+## La XArray que indexa los folios
+
+El corazón del `address_space` es `i_pages`, una **XArray**: un array asociativo disperso que mapea un índice de página (el offset del archivo dividido por `PAGE_SIZE`) al folio que cachea ese trozo. La XArray sustituyó al viejo *radix tree* del page cache; conserva su estructura en árbol de radio 64 pero ofrece una API más limpia, iteradores y bloqueo integrado.
+
+```c
+/* buscar el folio en el offset 'index', o NULL si no esta cacheado */
+struct folio *folio = filemap_get_folio(mapping, index);
+
+/* variante todopoderosa: busca y, con FGP_CREAT, crea si falta */
+folio = __filemap_get_folio(mapping, index,
+                            FGP_LOCK | FGP_CREAT, mapping_gfp_mask(mapping));
+```
+
+<Mermaid code={`flowchart TD
+  I[struct inode] -->|i_mapping| A[struct address_space]
+  A -->|host| I
+  A -->|a_ops| O[address_space_operations]
+  A -->|i_pages| X[XArray indexada por offset]
+  X --> F0[folio index 0]
+  X --> F1[folio index 4]
+  X --> F2[folio index 47]`} />
+
+La XArray permite **búsqueda sin bloqueo** bajo RCU: el camino rápido de lectura localiza un folio sin tomar ningún candado de escritura, apoyándose en la garantía de existencia de RCU (nivel 17). Además guarda *marcas* por entrada que aceleran barridos enteros sin recorrer todo el árbol:
+
+```c
+/* marcas que la XArray mantiene por folio */
+PAGECACHE_TAG_DIRTY       /* folio modificado, pendiente de writeback */
+PAGECACHE_TAG_WRITEBACK   /* folio ahora mismo bajando a disco */
+PAGECACHE_TAG_TOWRITE     /* seleccionado para el barrido de writeback en curso */
+```
+
+Gracias a esas marcas, el hilo de writeback (nivel 24.4) encuentra los folios sucios de un archivo de gigabytes sin inspeccionar los millones de folios limpios: pregunta a la XArray solo por los marcados como `DIRTY`.
+
+## address_space_operations: la costura con el sistema de archivos
+
+El page cache es genérico, pero llenar un folio desde el disco depende del formato en disco de cada sistema de archivos. Esa dependencia se resuelve con `a_ops`, una tabla de punteros a función que cada sistema de archivos rellena:
+
+```c
+/* include/linux/fs.h (recortado) */
+struct address_space_operations {
+	int  (*read_folio)(struct file *, struct folio *);
+	void (*readahead)(struct readahead_control *);
+	int  (*writepages)(struct address_space *, struct writeback_control *);
+	bool (*dirty_folio)(struct address_space *, struct folio *);
+	int  (*write_begin)(struct file *, struct address_space *, loff_t pos,
+	                    unsigned len, struct folio **, void **fsdata);
+	int  (*write_end)(struct file *, struct address_space *, loff_t pos,
+	                  unsigned len, unsigned copied, struct folio *, void *fsdata);
+	ssize_t (*direct_IO)(struct kiocb *, struct iov_iter *);
+	int  (*migrate_folio)(struct address_space *, struct folio *dst,
+	                      struct folio *src, enum migrate_mode);
+	void (*invalidate_folio)(struct folio *, size_t offset, size_t len);
+	bool (*release_folio)(struct folio *, gfp_t);
+};
+```
+
+Cada campo es un verbo del ciclo de vida de un folio. `read_folio` llena uno leyendo del disco; `readahead` llena varios por adelantado; `writepages` baja los sucios; `write_begin` y `write_end` enmarcan una escritura bufferizada; `dirty_folio` marca un folio como sucio; `direct_IO` implementa el salto del cache; `migrate_folio` permite mover el folio a otra zona de memoria durante la compactación. Nota que el viejo `writepage` (una página a la vez) ha sido retirado en favor de `writepages`, que opera por lotes y aprovecha las marcas de la XArray.
+
+```c
+/* así llena ext4 un folio bajo demanda */
+static const struct address_space_operations ext4_aops = {
+	.read_folio     = ext4_read_folio,
+	.readahead      = ext4_readahead,
+	.writepages     = ext4_writepages,
+	.dirty_folio    = ext4_dirty_folio,
+	.write_begin    = ext4_write_begin,
+	.write_end      = ext4_write_end,
+	.direct_IO      = noop_direct_IO,
+	.migrate_folio  = buffer_migrate_folio,
+};
+```
+
+<Callout type="info" title="iomap: la fontanería moderna">
+Los sistemas de archivos recientes (xfs, y cada vez más ext4, btrfs) no escriben a mano cada operación: delegan en la capa `iomap`, que implementa `read_folio`, `readahead` y `writepages` de forma genérica a partir de una función que traduce offset de archivo a extensión en disco. `iomap` fue diseñada desde el principio en torno a folios grandes y a la E/S por extensiones, y es la dirección hacia la que converge el árbol.
+</Callout>
+
+<Callout type="dios" title="El address_space es el polimorfismo del VFS escrito en C">
+Aquí está la elegancia estructural del kernel. El código del page cache —buscar un folio, marcar uno sucio, orquestar un readahead, disparar un writeback— es enorme, genérico y no sabe absolutamente nada de ext4, xfs, btrfs, NFS o tmpfs. Cómo puede manejarlos a todos con el mismo código es la pregunta, y la respuesta es `a_ops`: cada sistema de archivos aporta su propia tabla de operaciones, y el núcleo genérico invoca `mapping->a_ops->read_folio(...)` sin saber ni querer saber qué hay al otro lado. Eso es exactamente una *vtable* de programación orientada a objetos, implementada a mano con punteros a función en C. El `struct address_space` es el objeto; sus datos son la XArray de folios; sus métodos son las `address_space_operations`. Un archivo en NFS y uno en un SSD NVMe comparten cada línea del camino de lectura hasta el último instante, cuando el `read_folio` concreto decide si el dato viene de la red o de un comando NVMe. Esta única indirección es lo que permite que Linux soporte decenas de sistemas de archivos sin duplicar la lógica de cache, y es el patrón que reconocerás una y otra vez por todo el VFS.
+</Callout>
+
+<Challenge title="Diseca un address_space">
+1. En las fuentes, sigue `struct inode` hasta `i_mapping` e `i_data`, y confirma que `i_mapping` apunta al `address_space` empotrado.
+2. Localiza la definición de `ext4_aops` y compárala con la de `shmem_aops` (tmpfs): ¿qué operaciones cambian y por qué?
+3. Explica qué garantiza la búsqueda RCU de `filemap_get_folio` sin tomar candados de escritura.
+4. Enumera las tres marcas de la XArray y di qué barrido acelera cada una.
+5. Argumenta por qué `a_ops` es funcionalmente una tabla de métodos virtuales.
+</Challenge>

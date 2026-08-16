@@ -1,0 +1,152 @@
+---
+title: "Las capas por dentro: de netif_receive_skb al socket"
+description: "Cómo el kernel materializa las capas: `netif_receive_skb` y el despacho por `packet_type`, `eth_type_trans` cerrando L2, `ip_rcv` enrutando en L3, y la tabla `inet_protos` entregando a `tcp_v4_rcv` o `udp_rcv` en L4. El ascenso resulta ser una cascada de tablas: leer un campo, buscarlo, llamar al siguiente."
+subject: kernel
+level: 43
+order: 4
+position: "43.4"
+duration: "19 min"
+---
+
+<Lead>
+Ya sabes que un paquete sube, y que lo hace sin copiarse. Ahora la pregunta fina: ¿quién decide, en cada frontera, hacia dónde sigue? El paquete llega crudo a `netif_receive_skb` y tiene que convertirse, escalón a escalón, en bytes entregados al socket correcto de la aplicación correcta. Nadie codificó ese camino a fuego. En cada capa ocurre el mismo gesto —leer un campo, buscarlo en una tabla, llamar al manejador que salga— y de esa repetición humilde emerge toda la torre de protocolos. Vamos a ver el mecanismo real que hace que Ethernet lleve a IP, IP a TCP, y TCP a tu `recv`.
+</Lead>
+
+<Goals>
+
+- Seguir `netif_receive_skb` y el despacho por `packet_type` hacia el manejador de L3.
+- Ver cómo `eth_type_trans` cierra L2 y fija `skb->protocol`.
+- Entender el enrutado de `ip_rcv`: entrega local frente a reenvío.
+- Alcanzar L4 por la tabla `inet_protos` hasta `tcp_v4_rcv` o `udp_rcv`.
+
+</Goals>
+
+## netif_receive_skb: la puerta de entrada a la pila
+
+Cuando el driver entrega el paquete con `napi_gro_receive`, este acaba en `__netif_receive_skb_core`, el corazón del despacho. Ahí ocurren dos cosas: primero, el skb se ofrece a los *taps* globales —los oyentes `AF_PACKET` como `tcpdump`—; después, se busca el manejador del protocolo de red que indica `skb->protocol` y se le entrega.
+
+```c
+/* Nucleo del despacho de recepcion (net/core/dev.c, esencia simplificada) */
+type = skb->protocol;
+list_for_each_entry_rcu(ptype, &ptype_base[ntohs(type) & PTYPE_HASH_MASK], list) {
+	if (ptype->type == type && (!ptype->dev || ptype->dev == skb->dev)) {
+		if (pt_prev)
+			deliver_skb(skb, pt_prev, orig_dev);  /* al consumidor anterior */
+		pt_prev = ptype;                              /* recuerda este */
+	}
+}
+if (pt_prev)
+	ret = pt_prev->func(skb, skb->dev, pt_prev, orig_dev);  /* p. ej. ip_rcv */
+```
+
+La astucia del `pt_prev` diferido evita clonar cuando hay un solo consumidor: solo si hay más de uno se llama a `deliver_skb`, que incrementa `skb->users` para compartirlo. El último consumidor recibe el skb sin coste extra. La tabla `ptype_base` es un hash de listas de `struct packet_type`, y ahí está la clave de la extensibilidad.
+
+## De L2 a L3: eth_type_trans y el despacho por packet_type
+
+El driver ya llamó a `eth_type_trans`: esa función leyó la cabecera Ethernet, la retiró con un `skb_pull`, fijó `skb->pkt_type` —unicast, broadcast, a otro host— y devolvió el `EtherType` en `skb->protocol`, ya en orden de red. Ese valor es la llave que abre la tabla. IPv4 registró su manejador al arrancar:
+
+```c
+/* net/ipv4/af_inet.c: IPv4 se inscribe como consumidor de tramas ETH_P_IP */
+static struct packet_type ip_packet_type __read_mostly = {
+	.type		= cpu_to_be16(ETH_P_IP),
+	.func		= ip_rcv,           /* manejador de un solo skb */
+	.list_func	= ip_list_rcv,      /* recepcion en lote, amortiza el coste */
+};
+
+dev_add_pack(&ip_packet_type);          /* lo enchufa a ptype_base */
+```
+
+`dev_add_pack` es la puerta que cualquiera puede usar: un protocolo experimental de L3, cargado como módulo, se inscribe con su propio `EtherType` y empieza a recibir tramas sin tocar una línea del core. La pila no tiene los protocolos cableados; los **descubre** en una tabla que se puebla en tiempo de ejecución.
+
+## L3: ip_rcv valida, decide y enruta
+
+`ip_rcv` es el manejador de IPv4. Primero valida sin piedad —versión, longitud de cabecera, checksum, que la longitud declarada quepa—; luego cruza el primer hook de netfilter, `NF_INET_PRE_ROUTING`, y solo si sobrevive continúa hacia la decisión de ruta.
+
+```c
+int ip_rcv(struct sk_buff *skb, struct net_device *dev,
+	   struct packet_type *pt, struct net_device *orig_dev)
+{
+	struct net *net = dev_net(dev);
+
+	skb = ip_rcv_core(skb, net);        /* version, ihl, checksum, longitud */
+	if (!skb)
+		return NET_RX_DROP;
+
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING, net, NULL, skb, dev, NULL,
+		       ip_rcv_finish);      /* si el hook acepta, sigue aqui */
+}
+```
+
+`ip_rcv_finish` llama a `ip_route_input`, que consulta la tabla de rutas y **rellena el destino** del skb con la función de entrada adecuada. Aquí se bifurca el destino del paquete: si la dirección es nuestra, la ruta apunta a `ip_local_deliver`; si es para otro y el reenvío está activo, apunta a `ip_forward`.
+
+```c
+/* Entrega local: reensambla fragmentos y cruza el hook LOCAL_IN antes de subir a L4 */
+int ip_local_deliver(struct sk_buff *skb)
+{
+	struct net *net = dev_net(skb->dev);
+
+	if (ip_is_fragment(ip_hdr(skb))) {
+		if (ip_defrag(net, skb, IP_DEFRAG_LOCAL_DELIVER))
+			return 0;               /* aun faltan fragmentos: espera */
+	}
+
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_LOCAL_IN, net, NULL, skb, skb->dev, NULL,
+		       ip_local_deliver_finish);
+}
+```
+
+Que la decisión local-frente-a-reenvío sea una consulta a la tabla de rutas, y no un `if` en el código, es lo que convierte a Linux en router: activar `net.ipv4.ip_forward` no cambia el flujo, cambia lo que la ruta escribe en el destino del skb.
+
+## De L3 a L4: inet_protos y el manejador final
+
+Superado `LOCAL_IN`, `ip_local_deliver_finish` mira el campo protocolo de la cabecera IP —6 para TCP, 17 para UDP— y lo usa como índice en `inet_protos`, la tabla de protocolos de transporte.
+
+```c
+/* El campo protocolo de IP indexa la tabla de L4; el handler es tcp_v4_rcv o udp_rcv */
+void ip_protocol_deliver_rcu(struct net *net, struct sk_buff *skb, int protocol)
+{
+	const struct net_protocol *ipprot;
+
+	ipprot = rcu_dereference(inet_protos[protocol]);
+	if (ipprot)
+		ipprot->handler(skb);       /* entra en L4 */
+	else
+		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PROT_UNREACH, 0);
+}
+```
+
+Igual que L3 se inscribió con `dev_add_pack`, L4 se inscribe con `inet_add_protocol`:
+
+```c
+static const struct net_protocol tcp_protocol = {
+	.handler	= tcp_v4_rcv,
+	.err_handler	= tcp_v4_err,
+	.no_policy	= 1,
+};
+
+inet_add_protocol(&tcp_protocol, IPPROTO_TCP);
+inet_add_protocol(&udp_protocol, IPPROTO_UDP);
+```
+
+`tcp_v4_rcv` hace el último demux: busca con `__inet_lookup_skb` el socket dueño del cuádruple —IP y puerto de origen y destino—, encola el segmento y llama a `sk_data_ready`, que despierta al proceso dormido en `recvmsg`. Cuatro tablas, cuatro búsquedas, y el byte que entró crudo por el cable termina en el búfer exacto que tu aplicación pedía.
+
+<Mermaid code={`flowchart TB
+  A[netif_receive_skb] --> B[eth_type_trans fija skb protocol] --> C[ptype_base busca por EtherType] --> D[ip_rcv valida y enruta]
+  D --> E[ruta local ip_local_deliver] --> F[inet_protos por campo protocolo] --> G[tcp_v4_rcv busca el socket] --> H[cola del socket despierta la app]
+  D --> I[ruta ajena ip_forward reenvia]`} />
+
+<Callout type="info" title="El reensamblado vive en L3, no en el driver">
+Un detalle que sorprende: la fragmentación IP se rehace en `ip_local_deliver`, ya dentro de L3, no en la NIC ni en el driver. El hardware entrega fragmentos sueltos como paquetes independientes, y es `ip_defrag` quien los retiene en una tabla hasta reunir la datagram completa antes de subir a L4. Por eso un cortafuegos que filtre en `LOCAL_IN` ve el paquete ya reensamblado, pero uno que actúe en `PRE_ROUTING` puede toparse con fragmentos —una distinción que importa, y mucho, al escribir reglas.
+</Callout>
+
+<Callout type="dios" title="La torre de protocolos es una escalera de demultiplexores">
+Da un paso atrás y contempla el patrón, porque una vez lo ves ya no puedes dejar de verlo. En cada frontera entre capas ocurre exactamente el mismo acto, repetido con distintos nombres: se lee **un campo** del paquete, se usa ese campo como **llave en una tabla**, y la tabla devuelve **a quién llamar** a continuación. El `EtherType` de la trama Ethernet indexa `ptype_base` y elige a `ip_rcv`. El campo protocolo de la cabecera IP indexa `inet_protos` y elige a `tcp_v4_rcv`. El par de puertos indexa la tabla de sockets y elige tu `struct sock`. Tres capas, tres demultiplexores, tres búsquedas idénticas en forma aunque distintas en contenido. La pila de red no es una jerarquía de estratos con lógica especial en cada uno: es una **escalera de demux**, donde subir un escalón siempre significa lo mismo —leer, buscar, despachar— y la única diferencia entre L2, L3 y L4 es qué campo se lee y en qué tabla se busca. Y aquí está la consecuencia que lo cambia todo: como cada escalón es una tabla poblada en tiempo de ejecución por `dev_add_pack`, `inet_add_protocol` o `bind`, la torre entera es **abierta**. Puedes inscribir un protocolo de red nuevo, un transporte experimental, un socket que escucha en un puerto, sin recompilar el kernel ni tocar el core, porque el core no conoce los protocolos: conoce el mecanismo de despacho, y los protocolos se presentan solos. Esta es la razón profunda de que Linux haya podido absorber tres décadas de protocolos —de IPv6 a SCTP a MPTCP a los que aún no existen— sin reescribir su núcleo: no implementó una torre, implementó la regla que hace crecer torres. Cuando entiendes que el ascenso por la pila es un mismo gesto repetido sobre tablas extensibles, has entendido por qué la red del kernel es a la vez rápida, uniforme e infinitamente ampliable.
+</Callout>
+
+<Challenge title="Demuxea la pila con tus propias trazas">
+1. Con `ftrace`, sigue una sesión `curl` desde `ip_rcv` hasta `tcp_v4_rcv` y anota cada función de frontera del ascenso.
+2. Localiza en las fuentes las llamadas a `dev_add_pack` de IPv4 e IPv6 y explica cómo el mismo `netif_receive_skb` sirve a los dos por el `EtherType`.
+3. Escribe un módulo que registre un `packet_type` con `dev_add_pack` para `ETH_P_ALL` y cuente todas las tramas que ve; compáralo con lo que hace `tcpdump`.
+4. Activa `net.ipv4.ip_forward`, comprueba con trazas que un paquete ajeno toma la rama `ip_forward` en vez de `ip_local_deliver`, y explica qué campo del skb cambió la decisión.
+5. Razona por qué un filtro en `PRE_ROUTING` puede ver fragmentos y uno en `LOCAL_IN` no, apoyándote en dónde ocurre `ip_defrag`.
+</Challenge>

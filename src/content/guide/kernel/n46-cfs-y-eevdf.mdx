@@ -1,0 +1,151 @@
+---
+title: "CFS y su sucesor EEVDF: tiempo virtual, equidad y latencia"
+description: "La idea de tiempo virtual como moneda de la equidad en CFS, la grieta que CFS nunca cerró (la latencia), y EEVDF, el Earliest Eligible Virtual Deadline First que desde Linux 6.6 en 2023 es el planificador por defecto. Lag y elegibilidad, plazo virtual y petición de rodaja, el árbol rojo-negro aumentado, y por qué el nuevo algoritmo reemplazó a una década de heurísticas acumuladas."
+subject: kernel
+level: 46
+order: 3
+position: "46.3"
+duration: "18 min"
+---
+
+<Lead>
+Durante dieciséis años, la clase fair de Linux fue CFS, el Completely Fair Scheduler, y su idea central era hermosa: medir el tiempo no en segundos sino en una moneda virtual ponderada por la prioridad, y correr siempre a quien menos ha gastado. Pero la equidad perfecta en el reparto no dice nada sobre la latencia —con qué prontitud una tarea recién despierta consigue la CPU—, y esa grieta obligó a CFS a acumular una década de heurísticas frágiles. En 2023 EEVDF cerró la grieta cambiando la regla de decisión sin tirar el tiempo virtual: no "quién ha corrido menos", sino "quién tiene deuda y necesita correr antes".
+</Lead>
+
+<Goals>
+
+- Entender el tiempo virtual `vruntime` como moneda de la equidad ponderada por peso.
+- Identificar la grieta de CFS: no sabía expresar latencia sin heurísticas.
+- Comprender EEVDF: elegibilidad por `lag` y elección por plazo virtual.
+- Ver cómo el árbol rojo-negro aumentado elige en tiempo logarítmico.
+
+</Goals>
+
+## CFS: tiempo virtual y equidad
+
+CFS parte de un ideal imposible: un procesador que corre a las `n` tareas listas simultáneamente, cada una a `1/n` de la velocidad. Como el hardware no puede, CFS lo aproxima con el **tiempo virtual**, `vruntime`. Cada tarea acumula tiempo virtual a un ritmo inversamente proporcional a su peso: la que más pesa (mayor prioridad) ve avanzar su `vruntime` más despacio, y por eso el planificador, que siempre elige el `vruntime` menor, la corre más a menudo.
+
+```c
+/* kernel/sched/fair.c: el vruntime avanza escalado por el peso */
+static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
+{
+	if (unlikely(se->load.weight != NICE_0_LOAD))
+		delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
+	return delta;   /* delta_virtual = delta_real * 1024 / peso */
+}
+```
+
+Una tarea a `nice 0` tiene peso `NICE_0_LOAD` (1024), así que su tiempo virtual avanza a la par del real. Una a `nice -5`, mucho más pesada, ve su `vruntime` avanzar lento y acapara CPU; una a `nice +5`, ligera, lo ve correr y cede el turno enseguida. CFS guardaba todas las tareas listas en un árbol rojo-negro ordenado por `vruntime` y elegía siempre el nodo más a la izquierda: el que menos tiempo virtual había gastado. Equidad como propiedad emergente de una regla codiciosa.
+
+## La grieta de CFS: la latencia
+
+El problema es que "quién ha corrido menos" no responde "quién debe correr **ya**". Una tarea de audio que despierta cada pocos milisegundos, consume poquísima CPU y necesita responder rápido no cabe bien en el modelo: acumula poco `vruntime`, sí, pero CFS no tenía forma limpia de decir "a esta córrela pronto aunque brevemente". Para tapar el hueco fueron apareciendo heurísticas:
+
+```c
+/* Perillas heuristicas de la era CFS, todas eliminadas por EEVDF */
+sysctl_sched_latency;            /* periodo objetivo (~6 ms) */
+sysctl_sched_min_granularity;    /* rodaja minima (~0.75 ms) */
+sysctl_sched_wakeup_granularity; /* cuanto adelanto exige expulsar al que corre */
+/* mas: GENTLE_FAIR_SLEEPERS, creditos de sleeper, START_DEBIT... */
+```
+
+Cada perilla resolvía un caso y estropeaba otro. Peor: la petición recurrente de una `latency-nice` —una prioridad de latencia independiente de la de CPU— no encajaba en el esquema sin más parches. CFS repartía la CPU con justicia, pero la latencia era un efecto secundario de heurísticas que interactuaban de forma difícil de razonar. Hacía falta un algoritmo que tratara la latencia como un parámetro de primera clase.
+
+## EEVDF: elegibilidad y plazo virtual
+
+EEVDF —Earliest Eligible Virtual Deadline First, de un artículo de Stoica y Abdel-Wahab de 1995— entró en **Linux 6.6 (octubre de 2023)** y es desde entonces el planificador fair por defecto. Conserva el `vruntime` pero añade dos conceptos y con ellos una regla de decisión nueva. La `struct sched_entity` creció para alojarlos:
+
+```c
+struct sched_entity {
+	struct load_weight	load;         /* peso, derivado de nice */
+	struct rb_node		run_node;
+	u64			deadline;     /* plazo virtual: la clave del arbol */
+	u64			min_vruntime; /* aumento: minimo del subarbol */
+	u64			vruntime;     /* tiempo virtual consumido */
+	s64			vlag;         /* lag virtual: deuda de servicio */
+	u64			slice;        /* r_i: la rodaja pedida (latencia) */
+	u64			sum_exec_runtime;
+	struct sched_avg	avg;          /* PELT: seguimiento de carga */
+};
+```
+
+El primer concepto es el **lag** (`vlag`): la diferencia entre el servicio que una tarea *debería* haber recibido según su peso y el que *recibió* de verdad. Un lag positivo significa que se le debe CPU; uno negativo, que ya recibió de más. De ahí la **elegibilidad**: una tarea es elegible solo cuando su lag no es negativo, es decir, cuando va a la par o por detrás de su cuota justa. Las tareas sobreservidas quedan **inelegibles** hasta que el tiempo virtual medio las alcanza. La equidad deja de ser emergente y se vuelve una barrera dura.
+
+```c
+/* Elegible si su vruntime no adelanta al vruntime medio ponderado del rq */
+int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	return vruntime_eligible(cfs_rq, se->vruntime);
+}
+```
+
+El segundo concepto es el **plazo virtual**. Cada tarea pide una rodaja `r_i` (su `slice`, la latencia que tolera), y su plazo virtual es el tiempo virtual en que se volvió elegible más esa petición escalada por su peso. Entre todas las elegibles, EEVDF corre la de **plazo más temprano**:
+
+```c
+/* Al agotar el plazo, se calcula el siguiente: eligible + peticion/peso */
+static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	if ((s64)(se->vruntime - se->deadline) < 0)
+		return;                          /* aun dentro de su plazo */
+
+	se->slice    = sysctl_sched_base_slice;               /* la peticion r_i */
+	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
+
+	if (cfs_rq->nr_running > 1)
+		resched_curr(rq_of(cfs_rq));     /* reevaluar quien debe correr */
+}
+```
+
+Aquí está la perilla de latencia que CFS nunca tuvo: `slice` es la petición `r_i`, con valor por defecto `sysctl_sched_base_slice` (ajustable en `/sys/kernel/debug/sched/base_slice_ns`) y configurable **por tarea** con `sched_setattr` y el campo de rodaja. Una petición pequeña produce un plazo cercano: la tarea corre pronto pero poco tiempo, ideal para audio o interactividad. Una petición grande produce un plazo lejano: corre menos a menudo pero en tandas largas, ideal para *batch*. La misma equidad de fondo, dos comportamientos de latencia opuestos, elegidos con un número.
+
+## Cómo elige EEVDF: el árbol aumentado
+
+CFS elegía el nodo más a la izquierda del árbol —el `vruntime` mínimo— en `O(1)` amortizado. EEVDF necesita el plazo más temprano **entre los elegibles**, dos condiciones a la vez, y lo resuelve con un árbol rojo-negro **aumentado**: ordenado por `deadline`, cada nodo guarda además en `min_vruntime` el `vruntime` mínimo de su subárbol. Con ese aumento, `pick_eevdf` puede podar ramas enteras de tareas inelegibles y hallar el mejor candidato en `O(log n)`, sin recorrerlas todas.
+
+```c
+/* kernel/sched/fair.c (esencia): el plazo mas temprano que sea elegible */
+static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+{
+	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
+	struct sched_entity *best = NULL;
+
+	while (node) {
+		struct sched_entity *se = __node_2_se(node);
+
+		/* Si el subarbol izquierdo tiene algun elegible, ir alli:
+		 * contiene el plazo mas temprano posible */
+		if (left_child_elegible(node))
+			node = node->rb_left;
+		else if (entity_eligible(cfs_rq, se)) {
+			best = se;               /* candidato: plazo mas temprano elegible */
+			node = node->rb_right;
+		} else
+			node = node->rb_right;
+	}
+	return best;
+}
+```
+
+<Mermaid code={`flowchart TD
+  T[Tarea se vuelve runnable] --> L[Calcular vruntime lag y plazo virtual]
+  L --> G[Filtro de elegibilidad: solo lag no negativo]
+  G --> P[Entre los elegibles, el plazo virtual mas temprano]
+  P --> R[Esa tarea corre su rodaja pedida]
+  R --> U[Al agotar el plazo, recalcular y reencolar]
+  U --> G`} />
+
+<Callout type="info" title="EEVDF no tiró el vruntime: cambió la pregunta">
+La maquinaria de tiempo virtual, peso y PELT es la misma que en CFS. Lo que cambió es la regla de selección: de "el `vruntime` mínimo, sin más" a "el plazo virtual más temprano entre los que aún tienen derecho a correr". Por eso la migración fue evolutiva y no una reescritura: mismo esqueleto, mejor criterio, y una perilla de latencia que antes había que emular con heurísticas.
+</Callout>
+
+<Callout type="dios" title="De la codicia a la deuda: cuando la equidad se vuelve demostrable">
+Detente en el cambio conceptual, porque es más profundo que una optimización. CFS encarnaba una filosofía codiciosa e implícita: corre siempre a quien menos ha gastado, y confía en que, repetido sin fin, el reparto tienda a la justicia. Funcionaba, pero la equidad era una propiedad *emergente* —cierta en el límite, difícil de acotar en cualquier instante concreto— y la latencia, un residuo que solo se domaba a fuerza de heurísticas superpuestas que nadie podía razonar en conjunto. EEVDF invierte la lógica. Introduce el lag, que es literalmente una **contabilidad de deuda**: en todo momento el sistema sabe, para cada tarea, cuánto servicio se le debe o cuánto recibió de más, y convierte esa cuenta en una barrera dura —solo corre quien no está en números rojos con su cuota—. La equidad deja de esperarse a que emerja: se **impone** como invariante, tarea a tarea, instante a instante. Y sobre esa base de justicia demostrable, el plazo virtual añade una segunda dimensión ortogonal, la latencia, expresada como una promesa —"correré antes de este plazo"— que cada tarea puede pedir a su medida. Lo que antes eran dos objetivos en tensión resueltos por parches ahora son dos ejes independientes de un mismo cálculo limpio: cuánta CPU mereces lo fija el peso, con qué prontitud la recibes lo fija tu petición de rodaja. Cuando comprendes que el planificador pasó de repartir por codicia a repartir por contabilidad de deudas y promesas de plazo, entiendes por qué reemplazar el corazón de Linux tras dieciséis años no fue un capricho, sino la sustitución de una intuición que funcionaba por una teoría que se puede probar.
+</Callout>
+
+<Challenge title="Mide la equidad y la latencia por separado">
+1. Lee `/sys/kernel/debug/sched/base_slice_ns`, cámbialo y observa con `perf sched` cómo varían la frecuencia de cambio y la latencia de despertar.
+2. Lanza dos cargas iguales con `nice` distinto y comprueba en `/proc/PID/schedstat` que el reparto de CPU sigue el cociente de pesos de la tabla.
+3. Con `sched_setattr` fija una rodaja pequeña a una tarea interactiva y una grande a una de *batch*, y explica el plazo virtual resultante de cada una.
+4. Describe con tus palabras qué es el `vlag` de una tarea y por qué una con lag negativo queda temporalmente inelegible.
+5. Argumenta por qué `pick_eevdf` necesita el árbol aumentado con `min_vruntime` para lograr `O(log n)` y qué pasaría con una lista enlazada simple.
+</Challenge>

@@ -8,7 +8,7 @@
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const GUIDE = 'src/content/guia';
+const GUIDE = 'src/content/guide';
 
 // One single invocation form across the 5,088 lessons: <Mermaid code={`...`}
 const BLOCK = /<Mermaid\s+code=\{`([\s\S]*?)`\}/g;

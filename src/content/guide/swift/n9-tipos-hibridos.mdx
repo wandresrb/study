@@ -1,0 +1,157 @@
+---
+title: "Tipos híbridos: el struct que contiene una clase"
+description: "Por qué la copia de un `struct` se detiene en la primera referencia, dónde aparecen los híbridos accidentales, y cómo restaurar la semántica de valor con copy-on-write manual."
+subject: swift
+level: 9
+order: 5
+position: "9.5"
+duration: "18 min"
+---
+
+<Lead>
+Un `struct` que contiene una `class` sigue siendo un `struct` para el compilador: se copia al asignarlo, obliga a `mutating` para escribir en él y respeta `let` al pie de la letra. Y sin embargo ha dejado de comportarse como un valor. La copia duplica fielmente sus propiedades, pero una de ellas es un puntero, y duplicar un puntero no duplica lo apuntado. El tipo es de valor por fuera y de referencia por dentro, no hay ninguna palabra clave que lo anuncie, y el compilador no te va a avisar.
+</Lead>
+
+<Goals>
+
+- Explicar por qué la copia de un `struct` se detiene en la primera propiedad de tipo referencia.
+- Detectar híbridos accidentales: closures, existenciales, tipos puenteados y punteros.
+- Restaurar la semántica de valor con copy-on-write manual e `isKnownUniquelyReferenced`.
+- Distinguir el híbrido correcto por diseño del defecto silencioso.
+
+</Goals>
+
+## La copia se detiene en la referencia
+
+El mecanismo ya lo conoces: asignar copia el valor de cada propiedad almacenada. Cuando la propiedad es una referencia, su valor **es** el puntero, y eso es lo que se duplica.
+
+```swift
+final class Buffer { var datos: [Int] = [] }
+
+struct Documento {
+    var titulo: String
+    var buffer: Buffer          // una referencia dentro de un valor
+}
+
+var a = Documento(titulo: "Informe", buffer: Buffer())
+var b = a
+b.titulo = "Borrador"
+b.buffer.datos.append(1)
+
+print(a.titulo)                 // "Informe"  ← el String sí se copió
+print(a.buffer.datos)           // [1]        ← el Buffer no
+```
+
+La mitad del tipo obedece la semántica de valor y la otra mitad no. Peor aún: el compilador considera que escribir a través del puntero no modifica la estructura, así que ni siquiera hace falta `var`.
+
+```swift
+let congelado = a
+congelado.buffer.datos.append(2)   // COMPILA: no se muta el struct, se muta el objeto
+print(a.buffer.datos)              // [1, 2]
+```
+
+Aquí se rompe la promesa central del lenguaje. `let` sigue significando exactamente lo que decía —el binding no cambia, las propiedades del agregado no cambian—, pero el estado observable del programa sí cambia, y cambia a través de una constante. La garantía de inmutabilidad era transitiva sobre valores; sobre referencias no lo es.
+
+## Híbridos accidentales
+
+El caso anterior es visible: la palabra `Buffer` está ahí, y sabes que es una clase. Los peligrosos son aquellos en los que ninguna línea menciona una clase.
+
+```swift
+struct Formulario {
+    var texto: String = ""
+    var alCambiar: () -> Void = {}          // los closures son tipos de referencia
+}
+
+protocol Almacen { func guardar(_ s: String) }
+
+struct Editor {
+    var contenido: String
+    var almacen: any Almacen                // ¿struct o class? el tipo no lo dice
+}
+```
+
+Un closure es un objeto en el montículo que además **captura por referencia** las variables que usa: dos copias del `Formulario` comparten el mismo contexto capturado. Un existencial como `any Almacen` hereda la semántica del conformante concreto, que puede ser una clase decidida en otro módulo; el tipo del campo no revela nada. La lista de sospechosos habituales es corta y vale la pena memorizarla:
+
+- Closures y funciones almacenadas como propiedades.
+- Existenciales `any P` y `AnyObject` cuyo conformante real es una clase.
+- Tipos de Objective-C y de Core Foundation: `NSMutableArray`, `NSCache`, `UIImage`, `CGContext`.
+- Punteros no seguros y búferes: `UnsafeMutablePointer`, `UnsafeMutableBufferPointer`.
+- Cualquier `struct` de terceros que a su vez contenga uno de los anteriores. El problema es transitivo.
+
+<Mermaid code={`flowchart TB
+  s[Se copia un struct] --> p1[Propiedad de valor: se duplica en profundidad]
+  s --> p2[Propiedad de referencia: se duplica solo el puntero]
+  p2 --> comp[Objeto compartido por las dos copias]
+  comp --> rot[Semantica de valor rota si el objeto es mutable]
+  comp --> ok[Semantica intacta si el objeto es inmutable]`} />
+
+## Restaurar el valor: copy-on-write a mano
+
+Si la referencia está ahí por rendimiento —un búfer grande que no quieres duplicar en cada asignación—, la solución no es eliminarla sino **esconderla detrás de una comprobación de unicidad**. Es exactamente lo que hacen `Array`, `String` y `Data`, y puedes reproducirlo en veinte líneas.
+
+```swift
+struct Lienzo {
+    private final class Almacen {
+        var pixeles: [UInt8]
+        init(_ p: [UInt8]) { pixeles = p }
+        func copia() -> Almacen { Almacen(pixeles) }
+    }
+
+    private var almacen: Almacen
+
+    init(pixeles: [UInt8]) { almacen = Almacen(pixeles) }
+
+    private mutating func asegurarUnico() {
+        if !isKnownUniquelyReferenced(&almacen) {
+            almacen = almacen.copia()          // alguien más lo comparte: duplicar
+        }
+    }
+
+    mutating func pintar(_ i: Int, _ v: UInt8) {
+        asegurarUnico()
+        almacen.pixeles[i] = v
+    }
+
+    var muestra: [UInt8] { almacen.pixeles }   // lectura: nunca copia
+}
+```
+
+Tres condiciones sostienen la corrección de este patrón, y las tres son fáciles de romper. La clase de almacenamiento debe ser `private` y no filtrarse jamás hacia fuera: si algún método devuelve el `Almacen`, la comprobación de unicidad seguirá diciendo la verdad sobre el número de referencias, pero esas referencias externas verán mutaciones que no deberían. El argumento de `isKnownUniquelyReferenced` tiene que ser una propiedad `var` pasada como `inout` —de ahí que `asegurarUnico` sea `mutating`—. Y la función devuelve siempre `false` para clases de Objective-C, así que el almacenamiento debe ser una clase Swift nativa.
+
+<Callout type="warn" title="La comprobación de unicidad no cuenta lo que crees">
+`isKnownUniquelyReferenced` mira el contador de referencias fuertes en ese instante. Una referencia `weak` o `unowned` viva no lo incrementa, de modo que un observador débil puede seguir mirando un almacenamiento que tú acabas de considerar exclusivo. Y una captura temporal en un closure o una variable local intermedia sí lo incrementan, provocando copias defensivas innecesarias. Diseña el tipo para que la única referencia fuerte al almacenamiento sea la propiedad del `struct`.
+</Callout>
+
+## Cuándo el híbrido es correcto
+
+No todo `struct` con una clase dentro es un error. Hay dos casos en los que la semántica de valor sobrevive intacta y uno en el que compartir es justamente el objetivo.
+
+El primero es el copy-on-write que acabas de escribir: la referencia existe, pero ninguna escritura la comparte. El segundo es la **referencia inmutable**: si la clase es `final` y todas sus propiedades son `let`, compartir la instancia es indistinguible de haberla copiado, porque nadie puede observar un cambio que no puede ocurrir. Un `struct` que contiene un objeto congelado sigue teniendo semántica de valor a todos los efectos observables.
+
+```swift
+final class Fuente {                    // inmutable: compartirla es inofensivo
+    let nombre: String
+    let tamano: Double
+    init(nombre: String, tamano: Double) { self.nombre = nombre; self.tamano = tamano }
+}
+
+struct Estilo { var color: Int; var fuente: Fuente }   // sigue siendo un valor
+```
+
+El tercer caso es el envoltorio deliberado de un servicio: una estructura que guarda una `URLSession`, un registrador o un cliente de base de datos. Ahí lo compartido es una entidad con identidad genuina, y la estructura solo le da forma de valor a su fachada. Es correcto siempre que lo declares y que el objeto sea seguro frente a accesos concurrentes.
+
+<Callout type="dios" title="La semántica de valor es transitiva, y por eso no la declara ninguna palabra clave">
+Un tipo tiene semántica de valor si, y solo si, todas sus partes almacenadas la tienen. La propiedad es **emergente**: no reside en la palabra `struct`, sino en la clausura transitiva de todo lo alcanzable y mutable desde sus propiedades. Escribir `struct` te da garantías locales —copia de las propiedades, `mutating` obligatorio, `let` respetado— y esas garantías son ciertas siempre; lo que no puedes deducir de ellas es la propiedad global, porque basta un puntero mutable en el nivel doce del árbol para invalidarla entera. Y aquí está la parte incómoda: el compilador no comprueba nada de esto. Ni te avisa, ni tiene forma de hacerlo con la información que le das. Ahora bien, Swift ya construyó una vez el verificador de esa clausura transitiva, aunque con otro nombre: `Sendable`. Preguntar si un tipo puede cruzar sin peligro un límite de aislamiento es preguntar exactamente si su estado alcanzable es inmutable o exclusivo, es decir, si su semántica es de valor. Por eso un híbrido roto casi siempre falla la comprobación de concurrencia estricta, y por eso el error de `Sendable` que te aparece en una estructura aparentemente inocente no es una molestia del sistema de tipos: es el compilador diciéndote, tarde y en otro idioma, que tu valor nunca fue un valor.
+</Callout>
+
+<Callout type="note" title="Lo esencial de los híbridos">
+La copia de un `struct` duplica sus propiedades y se detiene en la primera referencia; a partir de ahí, las copias comparten. Los híbridos accidentales llegan por closures, existenciales, tipos puenteados y punteros, y ninguno se anuncia en la declaración. Si la referencia está por rendimiento, escóndela tras `isKnownUniquelyReferenced`; si el objeto es inmutable o es un servicio compartido a propósito, el híbrido es legítimo. Activa la concurrencia estricta y deja que `Sendable` audite por ti.
+</Callout>
+
+<Challenge title="Caza el híbrido">
+1. Escribe una estructura con una propiedad de clase, cópiala y demuestra que una constante puede alterar el estado observable.
+2. Añade un closure como propiedad de una estructura, captura una variable local y comprueba qué comparten dos copias.
+3. Implementa el `Lienzo` completo con copy-on-write y registra con un contador cuántas veces se duplica el almacenamiento.
+4. Filtra el almacenamiento privado devolviéndolo desde un método y explica exactamente qué garantía se rompe.
+5. Activa la comprobación de concurrencia estricta en un módulo y anota qué estructuras fallan `Sendable` y por qué.
+</Challenge>

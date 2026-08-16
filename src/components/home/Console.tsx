@@ -22,7 +22,7 @@ function RunButton() {
   let timers: number[] = [];
 
   const run = () => {
-    if (phase() !== 'inicio') return;
+    if (phase() !== 'start') return;
     clearOutput();
 
     for (const l of OUTPUT) {
@@ -34,7 +34,7 @@ function RunButton() {
       window.setTimeout(() => {
         push('HARDWARE');
         collapseConsole(true);
-        goTo('corriendo');
+        goTo('running');
         timers = [];
       }, last + AFTER_OUTPUT),
     );
@@ -44,7 +44,7 @@ function RunButton() {
     <button
       type="button"
       onClick={run}
-      disabled={phase() !== 'inicio'}
+      disabled={phase() !== 'start'}
       class="inline-flex cursor-pointer items-center gap-2.5 justify-self-start px-4 py-2.5 font-mono text-sm text-green transition-colors bg-green/20 focus-visible:bg-green/20 disabled:cursor-default disabled:opacity-45"
     >
       <span aria-hidden="true" class="text-2xs">
@@ -79,7 +79,7 @@ export default function Console(props: { code: string }) {
           <div class="editor" innerHTML={props.code} />
 
           <p class="m-0 flex items-center gap-3 border-t border-surface1 bg-crust px-3.5 py-1.5 font-mono text-2xs text-overlay1">
-            <b class="bg-blue px-2 py-0.5 font-semibold tracking-versalita text-crust">
+            <b class="bg-blue px-2 py-0.5 font-semibold tracking-smallcaps text-crust">
               NORMAL
             </b>
             <span class="text-subtext0">main.rs</span>
@@ -108,7 +108,7 @@ export default function Console(props: { code: string }) {
             <Show when={output().length === 0}>
               <span class="text-overlay1">
                 ${' '}
-                <b class="inline-block h-[1em] w-[0.5em] translate-y-[0.15em] animate-parpadeo bg-subtext0" />
+                <b class="inline-block h-[1em] w-[0.5em] translate-y-[0.15em] animate-blink bg-subtext0" />
               </span>
             </Show>
           </pre>

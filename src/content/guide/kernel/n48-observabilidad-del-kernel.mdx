@@ -1,0 +1,133 @@
+---
+title: "Observabilidad del kernel: ver sin detener ni recompilar"
+description: "Por qué en producción necesitas inspeccionar qué hace el kernel en caliente, sin reiniciar, sin recompilar y sin congelar la máquina, y cómo se ordenan las cuatro capas del trazado moderno: tracepoints como fuentes, y ftrace, perf y eBPF como consumidores que las explotan con coste casi nulo."
+subject: kernel
+level: 48
+order: 1
+position: "48.1"
+duration: "14 min"
+---
+
+<Lead>
+Son las tres de la madrugada y un servicio que atiende cien mil peticiones por segundo empieza a acumular latencia en la cola de un disco. No puedes adjuntar `gdb`: congelaría los mil hilos y tiraría el acuerdo de nivel de servicio. No puedes recompilar con un `printk` nuevo: reconstruir y reiniciar significa perder justo el estado que quieres diagnosticar. Y aun así necesitas ver, ahora mismo y sobre la máquina viva, qué función se atasca. Esa tensión —observar un sistema en producción sin detenerlo ni tocar su binario— es el problema que fundó toda la infraestructura de trazado del kernel de Linux.
+</Lead>
+
+<Goals>
+
+- Entender por qué en producción no puedes recompilar, reiniciar ni congelar la máquina para diagnosticar.
+- Situar las cuatro capas del trazado: tracepoints, `ftrace`, `perf` y eBPF, y distinguir fuente de consumidor.
+- Comprender por qué la instrumentación estática cuesta casi nada mientras está apagada.
+- Elegir la herramienta según la pregunta: contar, seguir la ejecución, muestrear o programar en caliente.
+
+</Goals>
+
+## El problema: la máquina no se puede parar
+
+El instrumento de las cavernas es el `printk`: insertas una línea, recompilas, reinicias y rezas. Sirve para un driver que estás escribiendo en tu laboratorio, pero es inútil sobre un kernel en producción por tres razones simultáneas.
+
+```c
+static int mi_funcion_caliente(struct request *rq)
+{
+	pr_info("entrando con %u bytes\n", blk_rq_bytes(rq)); /* recompilar + reiniciar */
+	/* ... y ademas cada llamada serializa en el lock de la consola ... */
+	return procesar(rq);
+}
+```
+
+Primero, exige reconstruir la imagen y reiniciar, con lo que destruyes el estado que investigabas. Segundo, inunda el `dmesg` de miles de líneas por segundo. Y tercero —lo más sutil—, cada `pr_info` serializa en el lock del buffer de log y en la consola, de modo que **altera el propio timing** que pretendes medir: es el efecto del observador convertido en artefacto de rendimiento. Un depurador clásico es aún peor: parar el mundo con `gdb` en una máquina de producción no es diagnóstico, es una caída provocada.
+
+Lo que hace falta es un instrumento que ya esté compilado dentro del kernel, que se pueda encender y apagar en caliente desde el espacio de usuario, que no cueste nada mientras está apagado y que escriba en un buffer circular sin lock global. Ese instrumento existe, y de hecho existen cuatro, en capas.
+
+## Las cuatro capas de la observabilidad
+
+Conviene separar dos preguntas que a menudo se confunden: **de dónde salen los datos** y **quién los recoge y agrega**. Las fuentes son puntos de instrumentación colocados en el código; los consumidores son los marcos que los activan, muestran y procesan.
+
+```bash
+# CONTAR: cuantas veces ocurre un evento, con perf y los contadores del hardware
+perf stat -e 'block:block_rq_issue' -a sleep 5
+
+# SEGUIR: que funciones se ejecutan y en que orden, con ftrace via trace-cmd
+trace-cmd record -p function_graph -g submit_bio sleep 1
+
+# MUESTREAR: donde arde la CPU ahora mismo, con perf a 99 Hz
+perf record -F 99 -a -g sleep 5
+
+# PROGRAMAR: agregar dentro del kernel sin sacar cada evento, con eBPF
+bpftrace -e 'tracepoint:block:block_rq_issue { @[comm] = count(); }'
+```
+
+Los **tracepoints** son ganchos con nombre que los desarrolladores del kernel colocan en sitios clave (planificador, interrupciones, bloque, red). Los **hooks de función** que inserta el compilador y las **kprobes** dinámicas completan las fuentes. Sobre ellas se apoyan tres consumidores: **`ftrace`**, el trazador integrado que sigue funciones y eventos hacia un buffer por CPU; **`perf`**, que muestrea con la unidad de monitorización del procesador y lee tracepoints; y **eBPF**, que ejecuta programas verificados dentro del kernel y agrega los datos en mapas antes de sacarlos.
+
+<Mermaid code={`flowchart TB
+  subgraph Fuentes
+    TP[tracepoints estaticos]
+    FN[hooks de funcion fentry]
+    KP[kprobes dinamicas]
+  end
+  subgraph Consumidores
+    FT[ftrace]
+    PF[perf]
+    BPF[eBPF]
+  end
+  TP --> FT
+  TP --> PF
+  TP --> BPF
+  FN --> FT
+  KP --> PF
+  KP --> BPF`} />
+
+<Cards>
+  <Card icon="🔢" title="Contar">
+    Cuántas veces ocurre algo: fallos de página, cambios de contexto, peticiones de bloque. Los eventos y los contadores del hardware, agregados por `perf stat`, responden con coste ínfimo.
+  </Card>
+  <Card icon="🔍" title="Seguir">
+    Qué funciones se ejecutan y en qué orden, con su anidamiento y su duración. El terreno de `ftrace` y de `function_graph`.
+  </Card>
+  <Card icon="📸" title="Muestrear">
+    Dónde arde la CPU: `perf record` interrumpe a intervalos fijos y apila la pila, dibujando un mapa de calor sin trazar cada llamada.
+  </Card>
+  <Card icon="🧮" title="Programar">
+    Agregar dentro del kernel y sacar solo el resumen: eBPF ejecuta un programa verificado en cada evento y acumula en mapas.
+  </Card>
+</Cards>
+
+## Coste cero: static keys y parcheo de nops
+
+La razón por la que esta instrumentación puede vivir permanentemente en un kernel de producción es que, apagada, **no ejecuta nada**. Un tracepoint no es un `if` sobre una variable global: es una rama muerta gobernada por una *static key* (jump label) que el kernel parchea a nivel de instrucción máquina.
+
+```c
+/* Lo que el macro TRACE_EVENT genera para cada tracepoint: */
+static inline void trace_sched_switch(bool preempt,
+		struct task_struct *prev, struct task_struct *next,
+		unsigned int prev_state)
+{
+	if (static_branch_unlikely(&__tracepoint_sched_switch.key))
+		__traceiter_sched_switch(NULL, preempt, prev, next, prev_state);
+}
+```
+
+Mientras nadie lo active, `static_branch_unlikely` está parcheado como un salto incondicional que evita el cuerpo, o directamente como un `nop`: cero coste, ni una comparación. Cuando activas el evento, el kernel reescribe esa instrucción en caliente para que la rama se tome. La misma idea sostiene el trazado de funciones: con `CONFIG_DYNAMIC_FTRACE`, el compilador inserta una llamada a `__fentry__` al entrar en cada función, y en el arranque `ftrace` reescribe **todas** esas llamadas como `nop`. Trazar una función es volver a convertir su `nop` en una llamada al trampolín. Por eso puedes tener un kernel con decenas de miles de puntos de traza y coste imperceptible: hasta que enciendes uno, no son más que instrucciones vacías.
+
+```bash
+# cuantos sitios de funcion puede trazar ftrace, y cuantos hay activos ahora
+wc -l /sys/kernel/tracing/available_filter_functions   # decenas de miles
+wc -l /sys/kernel/tracing/enabled_functions            # 0 si no trazas nada
+```
+
+Decenas de miles de sitios candidatos y, en reposo, cero activos: esa es la definición operativa de coste nulo apagado. El trazado no es una capa que se ejecuta y se salta con un `if`, sino código que **no existe** hasta que lo pides y que el kernel materializa reescribiendo sus propias instrucciones en caliente.
+
+<Callout type="info" title="Trazar no es depurar">
+Un depurador te deja parar y examinar un instante congelado; el trazado te deja ver el flujo sin pararlo. Son epistemologías opuestas: `gdb` responde a que ocurre aqui y ahora si detengo el tiempo; `ftrace` responde a que ha ido ocurriendo mientras el sistema seguia vivo. En producción, casi siempre necesitas lo segundo.
+</Callout>
+
+<Callout type="dios" title="La observabilidad es una teoría del conocimiento sobre un sistema vivo">
+Detente en el giro conceptual que acabas de cruzar, porque cambia tu relación con el kernel. Durante casi cincuenta niveles fuiste el autor: escribías el código, lo compilabas, controlabas cada línea. Ahora te sitúas en la posición contraria, la del interrogador de un sistema que ya está corriendo y al que no puedes ni parar ni reescribir. La pregunta deja de ser cómo hago que el kernel haga esto y pasa a ser cómo averiguo qué está haciendo el kernel sin perturbar lo que hace. Y esa pregunta impone una física: cualquier medición cuesta, y un instrumento que cuesta demasiado deja de medir el sistema para medirse a sí mismo. De ahí brota, con necesidad lógica, todo el diseño que verás en este nivel. El buffer circular por CPU existe porque un lock global contaminaría el timing. Las static keys existen porque una instrumentación permanente solo es viable si apagada es un `nop`. La separación entre fuente y consumidor existe porque el mismo punto de traza debe servir a `ftrace`, a `perf` y a eBPF sin saber cuál lo mira. No memorices las herramientas como una lista de comandos: interiorízalas como la respuesta de ingeniería a una restricción epistemológica dura —conocer un sistema sin alterarlo— y cada archivo de `tracefs`, cada filtro, cada latency tracer dejará de ser arbitrario para convertirse en la consecuencia obvia de ese único imperativo.
+</Callout>
+
+<Challenge title="Diagnostica sin tocar el binario">
+1. Enumera, para un pico de latencia en un disco, tres cosas que `printk` no te permitiría hacer y que sí te permite el trazado en caliente.
+2. Ejecuta las cuatro líneas del panorama en tu máquina e identifica cuál responde a contar, cuál a seguir, cuál a muestrear y cuál a programar.
+3. Abre `include/trace/events/sched.h` y localiza la definición del tracepoint `sched_switch`; explica en tres líneas por qué apagado no ejecuta ninguna comparación.
+4. Argumenta por qué un buffer de traza con un lock global sería inservible en una máquina de 128 núcleos bajo carga.
+5. Razona en qué caso, pese a todo, un `printk` bien puesto sigue siendo la herramienta correcta.
+</Challenge>

@@ -1,0 +1,158 @@
+---
+title: "Consultas: parámetros, Flow y suspend functions"
+description: "Una @Query no es solo SQL: es una firma que decide si la llamada bloquea, suspende u observa. Parámetros enlazados, retorno reactivo con Flow y la invalidación por tabla que hay detrás de cada emisión."
+subject: android
+level: 16
+order: 2
+position: "16.2"
+duration: "18 min"
+---
+
+<Lead>
+En Room, el tipo de retorno de un método de DAO no es un detalle de estilo: es una declaración sobre el modelo de ejecución. Devolver `List<Nota>` significa bloquear el hilo llamante; marcarlo `suspend` significa ceder ese hilo mientras el disco trabaja; devolver `Flow<List<Nota>>` significa renunciar a preguntar y pasar a ser notificado. Tres firmas, tres contratos de concurrencia distintos, todos generados por el mismo procesador a partir de la misma cadena de SQL. Aprender consultas en Room es aprender a elegir la firma correcta.
+</Lead>
+
+<Goals>
+
+- Escribir consultas con parámetros enlazados, colecciones y proyecciones parciales.
+- Distinguir cuándo una consulta debe ser `suspend` y cuándo puede ser síncrona.
+- Devolver `Flow` para observar cambios y entender qué dispara cada emisión.
+- Conocer el mecanismo de invalidación por tabla y sus efectos secundarios.
+
+</Goals>
+
+## Parámetros, proyecciones y lo que el compilador comprueba
+
+Los parámetros de un método de DAO se enlazan por nombre dentro del SQL con dos puntos. Room los convierte en argumentos posicionales de una sentencia preparada, de modo que la inyección de SQL es estructuralmente imposible: el valor nunca se concatena, viaja por un canal separado del texto de la consulta.
+
+```kotlin
+@Dao
+interface NotaDao {
+
+    @Query("SELECT * FROM notas WHERE id = :id")
+    suspend fun porId(id: Long): Nota?
+
+    @Query("SELECT * FROM notas WHERE titulo LIKE '%' || :texto || '%' ORDER BY creada_en DESC")
+    suspend fun buscar(texto: String): List<Nota>
+
+    @Query("SELECT * FROM notas WHERE id IN (:ids)")
+    suspend fun porIds(ids: List<Long>): List<Nota>
+
+    @Query("SELECT COUNT(*) FROM notas WHERE archivada = 0")
+    suspend fun contarActivas(): Int
+}
+```
+
+El tercer caso merece atención: al pasar una colección, Room expande el marcador en tantos interrogantes como elementos tenga la lista y prepara la sentencia en tiempo de ejecución. Es cómodo, pero significa que cada tamaño de lista distinto produce una sentencia distinta y anula la reutilización de la caché de sentencias preparadas de SQLite. Con listas de miles de elementos, conviene trocear.
+
+Room admite además **proyecciones parciales**: si solo necesitas dos columnas, declara un POJO con esas dos propiedades y devuélvelo. No hace falta que sea una entidad.
+
+```kotlin
+data class ResumenNota(
+    val id: Long,
+    @ColumnInfo(name = "titulo") val titulo: String,
+)
+
+@Query("SELECT id, titulo FROM notas ORDER BY titulo")
+suspend fun resumenes(): List<ResumenNota>
+```
+
+Traer solo lo que se pinta reduce lectura de disco, presión de memoria y trabajo de mapeo. Y si el POJO tiene un campo que la consulta no devuelve, Room lo avisa en compilación.
+
+<Callout type="tip" title="Cuidado con SELECT * en listas grandes">
+`SELECT *` es cómodo mientras la entidad tiene cinco columnas. En cuanto aparece un campo de texto largo o un blob, cada fila arrastra ese peso aunque la pantalla solo muestre el título. Las proyecciones parciales no son micro optimización: son la diferencia entre cargar kilobytes y cargar megabytes.
+</Callout>
+
+## suspend: ceder el hilo en vez de bloquearlo
+
+Un acceso a disco puede tardar milisegundos o decenas de milisegundos. Ejecutarlo en el hilo principal es una violación directa del presupuesto de fotograma, y Room lo impide: si declaras una consulta síncrona y la invocas desde el hilo principal, lanza una excepción en tiempo de ejecución en lugar de dejarte producir jank.
+
+La solución idiomática es marcar el método como `suspend`. Room genera entonces una implementación que ejecuta la consulta en su propio ejecutor de entrada y salida y reanuda la corrutina con el resultado.
+
+```kotlin
+class NotaRepository(private val dao: NotaDao) {
+
+    suspend fun cargar(id: Long): Nota? = dao.porId(id)   // no bloquea el llamante
+}
+```
+
+Dos consecuencias importantes y poco conocidas. La primera: **no necesitas envolver la llamada en `withContext` de entrada y salida**. Room ya cambia de contexto internamente hacia el ejecutor de la base de datos; añadir otro salto solo suma latencia y confusión. La segunda: al ser una función de suspensión, la consulta es **cancelable**. Si el ámbito de corrutina muere mientras la consulta está en cola, Room la descarta antes de ejecutarla.
+
+<Callout type="warn" title="Cuándo sigue teniendo sentido una consulta síncrona">
+Los métodos no suspendidos siguen siendo legítimos en dos escenarios: dentro de una migración, donde no hay corrutinas, y en tests instrumentados con `allowMainThreadQueries`, una concesión que jamás debe llegar a producción. Fuera de ahí, una consulta síncrona en el hilo principal es un fallo de diseño que Room te señalará lanzando.
+</Callout>
+
+## Flow: dejar de preguntar y empezar a ser notificado
+
+El salto conceptual del nivel es este. Una consulta `suspend` responde a la pregunta "qué hay ahora". Una consulta que devuelve `Flow` responde a otra distinta: "avísame siempre que esto cambie". No es azúcar sintáctico sobre un sondeo periódico: es un mecanismo de invalidación real.
+
+```kotlin
+@Query("SELECT * FROM notas WHERE archivada = 0 ORDER BY creada_en DESC")
+fun observarActivas(): Flow<List<Nota>>
+```
+
+El método **no** es `suspend`: devolver un `Flow` es una operación fría e instantánea que no toca el disco. El trabajo ocurre al recolectarlo. Al suscribirte, Room ejecuta la consulta, emite el primer resultado y registra un observador sobre las tablas implicadas. Cuando alguien escribe en cualquiera de ellas, Room reejecuta la consulta y emite la nueva lista.
+
+<Mermaid code={`sequenceDiagram
+  participant UI as Capa de UI
+  participant F as Flow del DAO
+  participant IT as InvalidationTracker
+  participant DB as SQLite
+  UI->>F: collect
+  F->>DB: ejecuta la consulta
+  DB-->>F: primera lista
+  F-->>UI: emite estado inicial
+  Note over IT,DB: un trigger marca la tabla notas como sucia
+  IT->>F: la tabla notas ha cambiado
+  F->>DB: reejecuta la consulta
+  DB-->>F: lista nueva
+  F-->>UI: emite estado actualizado`} />
+
+El mecanismo se llama `InvalidationTracker`. Room crea triggers de SQLite sobre cada tabla observada que escriben en una tabla interna de control; un observador consulta esa tabla y notifica a los flujos afectados. Como el registro está dentro de la base, funciona incluso si la escritura viene de otro DAO o de una sentencia arbitraria.
+
+La granularidad es la clave: la invalidación es **por tabla, no por fila ni por consulta**. Cualquier escritura en `notas` invalida todos los flujos que lean `notas`, aunque la fila modificada no aparezca en el resultado. La consulta se reejecuta y se emite de nuevo, potencialmente con una lista idéntica.
+
+```kotlin
+val estado: StateFlow<List<Nota>> = dao.observarActivas()
+    .distinctUntilChanged()          // corta emisiones con contenido idéntico
+    .flowOn(Dispatchers.Default)     // el mapeo pesado, fuera del hilo principal
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+```
+
+<Callout type="info" title="Operadores que compensan la granularidad de tabla">
+`distinctUntilChanged` evita recomponer cuando la lista reemitida es igual a la anterior, siempre que la entidad sea una `data class` con `equals` estructural. `conflate` descarta emisiones intermedias cuando la UI va por detrás. Y `stateIn` con `WhileSubscribed` cancela la observación cuando la pantalla se va, evitando reejecuciones invisibles.
+</Callout>
+
+## Un DAO que combina las tres firmas
+
+En una app real las tres formas conviven, y elegir bien es cuestión de responder a una sola pregunta: quién necesita el dato y durante cuánto tiempo.
+
+```kotlin
+@Dao
+interface NotaDao {
+
+    // Estado continuo para la pantalla: la UI se redibuja sola.
+    @Query("SELECT id, titulo FROM notas WHERE archivada = 0 ORDER BY creada_en DESC")
+    fun observarResumenes(): Flow<List<ResumenNota>>
+
+    // Lectura puntual para una acción del usuario o un caso de uso.
+    @Query("SELECT * FROM notas WHERE id = :id")
+    suspend fun porId(id: Long): Nota?
+
+    // Sin suspend ni Flow: solo dentro de migraciones o de otra transacción.
+    @Query("SELECT COUNT(*) FROM notas")
+    fun contarBloqueante(): Int
+}
+```
+
+<Callout type="dios" title="El tipo de retorno como declaración de dependencia temporal">
+Hay una idea profunda escondida en algo tan trivial como una firma de método. En la API antigua de SQLite en Android, toda lectura era un evento puntual: preguntabas y obtenías una foto. Si el dato cambiaba después, tu pantalla mentía y nadie te lo decía; el trabajo de detectarlo recaía en el programador, que acababa emitiendo broadcasts, invalidando cachés a mano o simplemente recargando en cada `onResume`. Ese era el pecado original: la aplicación era responsable de mantener sincronizadas dos copias de la verdad, la del disco y la de la pantalla, sin ninguna ayuda del sistema. Room reformula el problema en lugar de aliviarlo. Al permitir que una consulta devuelva un `Flow`, deja de tratar la lectura como un evento y la trata como una **dependencia declarada**: esta pantalla depende de estas tablas, y el sistema se encarga de propagar los cambios. Es exactamente la misma inversión de control que Compose aplica a la UI —no repintas, declaras de qué depende lo pintado— y que la reactividad aplica al estado. Que ambas piezas encajen tan bien no es casualidad: comparten filosofía. Y de ahí se deduce la regla práctica que gobierna el diseño de un DAO. Un `Flow` no es "la versión moderna" de una consulta y `suspend` no es "la versión vieja": expresan relaciones temporales distintas. Usa `Flow` cuando la pantalla deba reflejar la verdad mientras exista; usa `suspend` cuando necesites una respuesta para decidir algo aquí y ahora. Confundirlos produce los dos patrones tóxicos clásicos: recolectar un flujo para leer un único valor y cancelarlo, o recargar a mano una lista que ya sabía cómo actualizarse sola.
+</Callout>
+
+<Challenge title="Elegir la firma correcta">
+1. Escribe tres versiones de la misma consulta —síncrona, `suspend` y con `Flow`— e invoca cada una desde donde corresponda, comprobando qué ocurre al llamar a la síncrona desde el hilo principal.
+2. Define un POJO de proyección con dos columnas y sustituye un `SELECT *` por él; mide la diferencia en una tabla con un campo de texto largo.
+3. Recolecta un `Flow` de la tabla `notas` e inserta una fila que **no** cumpla el `WHERE` de la consulta; observa que hay reemisión y explica por qué.
+4. Añade `distinctUntilChanged` y repite el experimento anterior; razona qué condición debe cumplir la entidad para que el operador funcione.
+5. Convierte el flujo en un `StateFlow` con `stateIn` y `WhileSubscribed`, y verifica con logs que la observación se detiene al abandonar la pantalla.
+</Challenge>

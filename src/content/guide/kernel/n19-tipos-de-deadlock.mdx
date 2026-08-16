@@ -1,0 +1,140 @@
+---
+title: "Los tres rostros del deadlock"
+description: "Antes de cazar deadlocks con herramientas hay que reconocerlos: el auto-deadlock por doble adquisición, la inversión ABBA entre dos hilos, y el deadlock de IRQ que interrumpe una sección crítica. Los tres patrones canónicos, con código real."
+subject: kernel
+level: 19
+order: 1
+position: "19.1"
+duration: "14 min"
+---
+
+<Lead>
+Un deadlock no es un bug cualquiera: la máquina no falla, simplemente deja de avanzar, con hilos esperándose en un círculo perfecto del que nadie sale. Casi todos los deadlocks del kernel son variaciones de tres patrones. Reconocerlos a simple vista es el requisito para entender la herramienta que los caza sola en el próximo nivel: lockdep.
+</Lead>
+
+<Goals>
+
+- Reconocer el auto-deadlock por doble adquisición.
+- Entender la inversión de orden ABBA entre dos hilos.
+- Diagnosticar el deadlock de IRQ y por qué existe `spin_lock_irqsave()`.
+- Interiorizar la regla del orden global de adquisición.
+
+</Goals>
+
+## El auto-deadlock: pedir un lock que ya tienes
+
+El más simple. Un hilo adquiere un lock no recursivo que ya posee. Un `spinlock` gira para siempre en la misma CPU; un `mutex` duerme para siempre esperándose a sí mismo. Suele colarse a través de una función auxiliar que también bloquea:
+
+```c
+static void actualizar_estado(struct dispositivo *dev)
+{
+	spin_lock(&dev->lock);        /* segunda adquisicion */
+	dev->estado = LISTO;
+	spin_unlock(&dev->lock);
+}
+
+void procesar(struct dispositivo *dev)
+{
+	spin_lock(&dev->lock);        /* primera adquisicion */
+	dev->pendiente = false;
+	actualizar_estado(dev);       /* AUTO-DEADLOCK: dev->lock ya esta tomado */
+	spin_unlock(&dev->lock);
+}
+```
+
+El kernel llama a esto *lock recursion deadlock*. La cura es de diseño: separar la lógica que asume el lock tomado (a menudo con sufijo `_locked`) de la que lo adquiere, y no volver a bloquear nunca dentro de la sección crítica.
+
+## ABBA: dos locks, dos hilos, orden inverso
+
+Dos hilos toman los mismos dos locks pero en orden opuesto. Si el planificador los intercala en el peor momento, cada uno retiene lo que el otro necesita:
+
+```c
+/* Hilo 1: transferir de A hacia B */
+spin_lock(&a->lock);
+spin_lock(&b->lock);
+mover(a, b);
+spin_unlock(&b->lock);
+spin_unlock(&a->lock);
+```
+
+```c
+/* Hilo 2: transferir de B hacia A  (orden inverso) */
+spin_lock(&b->lock);
+spin_lock(&a->lock);          /* cierra el circulo con el Hilo 1 */
+mover(b, a);
+spin_unlock(&a->lock);
+spin_unlock(&b->lock);
+```
+
+Es el *deadly embrace*. Fíjate en lo pérfido: cada hilo por separado es correcto; el bug solo existe en su combinación, y solo con un timing concreto. Puedes ejecutar este código un millón de veces sin fallo y colgar la máquina en producción a las tres de la mañana.
+
+<Mermaid code={`flowchart LR
+  H1[Hilo 1 retiene lock_a] -->|espera lock_b| H2[Hilo 2 retiene lock_b]
+  H2 -->|espera lock_a| H1`} />
+
+La regla de oro que rompe todo ciclo ABBA: **un orden global de adquisición**. Si en todo el kernel los locks se toman siempre en el mismo orden, no puede formarse un círculo. Cuando los dos objetos son del mismo tipo y no hay jerarquía natural, se ordena por dirección de memoria:
+
+```c
+void transferir(struct cuenta *x, struct cuenta *y)
+{
+	struct cuenta *primero = x, *segundo = y;
+
+	if (primero > segundo)                /* orden estable y total */
+		swap(primero, segundo);
+
+	spin_lock(&primero->lock);
+	spin_lock(&segundo->lock);
+	/* ... */
+	spin_unlock(&segundo->lock);
+	spin_unlock(&primero->lock);
+}
+```
+
+## El deadlock de IRQ: interrumpido en plena sección crítica
+
+Aquí el segundo "hilo" es una interrupción. Un hilo en contexto de proceso toma un `spinlock` con las IRQs habilitadas. Antes de soltarlo, llega en esa misma CPU la interrupción del dispositivo, y su manejador pide el mismo lock. El manejador gira esperando un lock que solo puede liberar el código que él acaba de interrumpir: deadlock en una sola CPU, sin necesidad de un segundo núcleo.
+
+```c
+/* contexto de proceso: IRQs habilitadas */
+spin_lock(&dev->lock);
+/*  <-- aqui llega la IRQ del dispositivo en esta misma CPU --> */
+dev->contador++;
+spin_unlock(&dev->lock);
+
+/* manejador de IRQ, en la misma CPU: */
+static irqreturn_t mi_isr(int irq, void *data)
+{
+	struct dispositivo *dev = data;
+	spin_lock(&dev->lock);        /* espera un lock que su propia CPU retiene */
+	dev->eventos++;
+	spin_unlock(&dev->lock);
+	return IRQ_HANDLED;
+}
+```
+
+La solución es deshabilitar las IRQs locales mientras se retiene un lock que también toca la interrupción:
+
+```c
+unsigned long flags;
+
+spin_lock_irqsave(&dev->lock, flags);   /* IRQs locales off + lock */
+dev->contador++;
+spin_unlock_irqrestore(&dev->lock, flags);
+```
+
+En el vocabulario de lockdep, ese lock es *hardirq-safe* (lo toma un manejador de hardirq), y por tanto en contexto de proceso jamás debe tomarse *hardirq-unsafe*, es decir, con las IRQs habilitadas. Mezclar ambos usos es exactamente la inversión que la herramienta persigue.
+
+## Variantes: softirq, lectores y contexto
+
+Los tres patrones tienen primos que conviene reconocer. El deadlock de softirq es idéntico al de hardirq pero con un *bottom half* como interruptor: si a un lock lo toca un softirq, en contexto de proceso hay que usar `spin_lock_bh()`. Los rwlocks añaden su propio veneno: un lector no recursivo puede bloquearse contra un escritor **en espera**, no solo contra uno que ya retiene el lock, de modo que dos secciones de lectura mal ordenadas también pueden abrazarse. Y existe un deadlock de contexto más sutil: dormir dentro de una sección atómica —tomar un `mutex` mientras retienes un `spinlock`— cuelga con la misma firmeza, y es justo lo que vigila el descriptor de contexto de espera que aparece en los informes del próximo nivel.
+
+<Callout type="dios" title="Los tres son el mismo bug: un ciclo en el grafo de espera">
+Mira los tres patrones a la vez y verás que son una sola idea. El auto-deadlock es un ciclo de longitud uno: A espera a A. El ABBA es un ciclo de longitud dos: A espera a B espera a A. El deadlock de IRQ es un ABBA donde uno de los dos "hilos" es un contexto de interrupción que puede aparecer en cualquier instante. En los tres casos existe un **grafo de dependencias de locks** —una arista por cada "tomé Y mientras retenía X"— y el deadlock es, matemáticamente, un ciclo en ese grafo. Esa es la observación que lo cambia todo: si el kernel construyera ese grafo mientras corre y buscara ciclos, podría advertirte del deadlock aunque el timing fatal no llegue a darse jamás durante la prueba. No hace falta reproducir la condición de carrera: basta con haber recorrido cada arista una vez. Eso es precisamente lo que hace lockdep, y por eso el resto del nivel se dedica a él. Aprende a ver el grafo detrás del código y habrás ganado la intuición que separa a quien teme la concurrencia de quien la domina.
+</Callout>
+
+<Challenge title="Provoca y clasifica los tres deadlocks">
+1. Escribe un módulo con una función que se auto-bloquee vía una auxiliar que vuelve a bloquear; observa el cuelgue en una VM.
+2. Monta un ABBA con dos `spinlock` y dos hilos (`kthread`), y luego arréglalo ordenando por dirección.
+3. Toma un `spinlock` con `spin_lock()` en un `ioctl` y el mismo lock en un manejador de IRQ; razona por qué `spin_lock_irqsave()` lo evita.
+4. Dibuja el grafo de espera de cada caso y localiza el ciclo.
+</Challenge>

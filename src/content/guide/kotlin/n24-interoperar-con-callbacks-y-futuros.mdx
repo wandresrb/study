@@ -1,0 +1,150 @@
+---
+title: "Interoperar: de la llamada de vuelta a la suspensión"
+description: "Convertir una API basada en llamadas de vuelta o en futuros a una función suspendida es la operación de frontera más frecuente y la que más contratos silenciosos incumple. Esta lección detalla suspendCancellableCoroutine, la obligación de reanudar exactamente una vez, la adaptación de un futuro, y las dos direcciones en que la cancelación debe viajar para que la envoltura no filtre trabajo ni recursos."
+subject: kotlin
+level: 24
+order: 5
+position: "24.5"
+duration: "22 min"
+---
+
+<Lead>
+Ningún sistema real está hecho solo de funciones suspendidas. Debajo hay siempre un cliente de red con oyentes, un controlador que devuelve un futuro, un sensor que llama a un método cuando tiene datos o una biblioteca escrita hace diez años que nunca oyó hablar de continuaciones. La frontera entre ese mundo y el de las corrutinas se cruza con una única primitiva, y la primitiva es engañosamente pequeña: entrega el objeto que representa el resto de la computación y espera a que alguien lo reanude. Toda la dificultad está en que ese objeto impone un contrato estricto que el mundo de las llamadas de vuelta no conoce ni respeta, porque las llamadas de vuelta pueden invocarse dos veces, no invocarse nunca, o llegar mucho después de que a nadie le importe. Escribir bien una envoltura consiste exactamente en absorber esa diferencia sin dejar que se filtre, y en asegurarse de que la cancelación viaja hasta el otro lado en lugar de quedarse a mitad de camino.
+</Lead>
+
+<Goals>
+
+- Transformar una API de llamadas de vuelta en una función suspendida usando `suspendCancellableCoroutine`.
+- Enunciar el contrato de reanudación única y reconocer los tres modos de incumplirlo.
+- Adaptar un futuro de la plataforma respetando su terminación normal, su fallo y su cancelación.
+- Propagar la cancelación hacia la API subyacente y liberar los recursos que llegan tarde.
+
+</Goals>
+
+## Del oyente a la continuación
+
+La primitiva suspende la corrutina actual y entrega al bloque un objeto que representa su continuación. El bloque no debe devolver nada útil: su trabajo es registrar el oyente, lanzar la petición y salir. Cuando la API subyacente responda, la reanudación con un valor o con una excepción hará que la función suspendida devuelva o lance, como si nunca hubiera existido una llamada de vuelta.
+
+```kotlin
+suspend fun ubicacionActual(cliente: ClienteUbicacion): Ubicacion =
+    suspendCancellableCoroutine { cont ->
+        val oyente = object : OyenteUbicacion {
+            override fun onResultado(u: Ubicacion) = cont.resume(u)
+            override fun onError(e: Throwable) = cont.resumeWithException(e)
+        }
+        cliente.solicitar(oyente)
+        cont.invokeOnCancellation { cliente.cancelar(oyente) }
+    }
+```
+
+Existe una variante sin cancelación en la librería estándar y conviene saber por qué casi nunca es la adecuada. Esa variante entrega una continuación que no admite reacción alguna ante la cancelación: si la corrutina se cancela mientras la petición está en vuelo, nadie avisa a la API subyacente, la petición sigue consumiendo red o batería y el resultado acabará descartado en silencio. La versión cancelable existe precisamente para cerrar ese agujero, y elegir la otra es aceptar una fuga por defecto.
+
+<Mermaid code={`flowchart TD
+  A[Funcion suspendida] --> B[Se suspende y entrega la continuacion]
+  B --> C[Registro del oyente y peticion]
+  C --> D{Que llega primero}
+  D -->|resultado| E[resume con el valor]
+  D -->|error| F[resumeWithException]
+  D -->|cancelacion| G[invokeOnCancellation]
+  G --> H[Se cancela la peticion subyacente]
+  E --> I[La corrutina continua]
+  F --> I`} />
+
+## El contrato de la reanudación única
+
+Una continuación se reanuda exactamente una vez. Reanudarla dos veces no produce un resultado duplicado sino un error de estado ilegal, porque el objeto ya no representa nada: la computación siguió adelante y no hay ningún sitio al que volver. Esta regla choca de frente con la realidad de muchas APIs antiguas, que invocan la llamada de vuelta de éxito y después la de error, o que reintentan internamente y notifican dos veces el mismo evento.
+
+```kotlin
+suspend fun descargar(url: String): ByteArray =
+    suspendCancellableCoroutine { cont ->
+        api.descargar(url, object : Callback {
+            override fun onExito(datos: ByteArray) {
+                if (cont.isActive) cont.resume(datos)     // guarda de seguridad
+            }
+            override fun onFallo(e: Throwable) {
+                cont.resumeWithException(e)
+            }
+        })
+    }
+```
+
+Cuando la API es notoriamente poco fiable y no basta con consultar el estado, existe una vía más estricta que separa la decisión de la ejecución. Primero se pide un testigo que confirma si la reanudación es posible, y solo si el testigo existe se completa. El resultado es que dos llegadas simultáneas desde hilos distintos no compiten: la primera obtiene el testigo y la segunda recibe una negativa que puedes registrar como anomalía en lugar de convertirla en una excepción a distancia.
+
+```kotlin
+val testigo = cont.tryResume(valor)
+if (testigo != null) cont.completeResume(testigo)
+else registrar.advertir("respuesta duplicada descartada")
+```
+
+Hay tres formas de incumplir el contrato y cada una tiene su remedio. La primera es reanudar dos veces, y se resuelve consultando el estado antes o usando la variante que devuelve un testigo de reanudación en lugar de lanzar. La segunda es no reanudar nunca, cuando la API pierde el oyente o el error se traga en algún sitio; esa corrutina queda suspendida para siempre, sostiene su ámbito padre y solo la cancelación la libera, así que la defensa es un tiempo máximo de espera explícito en el llamante. La tercera es reanudar desde un contexto inesperado, algo que no es un fallo pero sí una sorpresa: la corrutina se reanudará en el dispatcher que le corresponde, no en el hilo que llamó a la reanudación.
+
+<Callout type="tip" title="Registra el oyente antes de armar la cancelación, pero arma la cancelación siempre">
+El orden dentro del bloque importa poco salvo en un punto: si la corrutina ya estaba cancelada al entrar, el registro de la reacción a la cancelación se ejecuta de inmediato. Escribir la petición primero y la reacción después garantiza que existe algo que cancelar cuando esa reacción corra. Lo que nunca es aceptable es omitirla, porque entonces la envoltura convierte una cancelación limpia en una petición zombi.
+</Callout>
+
+## Adaptar un futuro
+
+Un futuro de la plataforma ya representa un resultado pendiente, así que la adaptación es más corta pero tiene tres detalles que se escapan. El primero es que su terminación notifica valor y error por el mismo canal, y hay que decidir cuál de los dos se propaga. El segundo es que su propia cancelación se manifiesta como un tipo de excepción específico que conviene traducir a la excepción de cancelación de corrutinas para que la concurrencia estructurada la entienda. El tercero es que la cancelación de la corrutina debe cancelar el futuro, o el trabajo seguirá vivo al otro lado.
+
+```kotlin
+suspend fun <T> CompletableFuture<T>.esperar(): T =
+    suspendCancellableCoroutine { cont ->
+        whenComplete { valor, error ->
+            when {
+                error == null -> cont.resume(valor)
+                error is CancellationException -> cont.cancel(error)
+                else -> cont.resumeWithException(error.cause ?: error)
+            }
+        }
+        cont.invokeOnCancellation { cancel(true) }
+    }
+```
+
+La traducción de la cancelación merece detenerse un instante. Un futuro cancelado y una corrutina cancelada expresan el mismo hecho, pero si el primero se propaga como excepción ordinaria el árbol de trabajos lo interpretará como un fallo y lo hará subir cancelando a los hermanos. Convertirlo en cancelación de la corrutina restaura la equivalencia y evita que un cierre limpio se registre como incidente.
+
+Antes de escribir una envoltura conviene comprobar si ya existe. La propia librería incluye integraciones para los futuros de la plataforma, para varios clientes de red y para los servicios de ejecución, y esas integraciones ya han resuelto los casos límite que esta lección enumera. Escribir la envoltura a mano es un ejercicio excelente para entender el mecanismo y una decisión discutible cuando hay una versión mantenida disponible.
+
+<Cards>
+  <Card icon="🔁" title="Un solo valor">
+    Llamada de vuelta que responde una vez y termina. Es el caso de `suspendCancellableCoroutine` y el que cubre esta lección.
+  </Card>
+  <Card icon="🌊" title="Varios valores">
+    Oyente que emite muchas veces. No cabe en una continuación única: la herramienta es un constructor de flujo con canal, que se estudia en el nivel de `Flow`.
+  </Card>
+  <Card icon="🧹" title="Recurso que llega tarde">
+    Si el valor reanudado hay que cerrarlo, usa la reanudación con acción de descarte para liberarlo cuando la corrutina ya no esté ahí para recibirlo.
+  </Card>
+  <Card icon="🧪" title="Prueba la cancelación">
+    Una envoltura sin una prueba que cancele a mitad de vuelo está sin verificar en la mitad de su superficie. Es la prueba que más defectos encuentra.
+  </Card>
+</Cards>
+
+## La cancelación viaja en las dos direcciones
+
+La dirección de ida es la que ya hemos cubierto: cancelar la corrutina debe cancelar la operación subyacente. La dirección de vuelta es más sutil y se olvida casi siempre. Puede ocurrir que la llamada de vuelta llegue con un resultado válido justo después de que la corrutina fuese cancelada; la reanudación se ignora, y si ese resultado era un recurso que alguien debe cerrar, se ha filtrado. Para eso existe una forma de reanudación que acepta una acción de descarte, invocada solo cuando el valor no llega a entregarse.
+
+```kotlin
+suspend fun abrirConexion(pool: Pool): Conexion =
+    suspendCancellableCoroutine { cont ->
+        pool.pedir { conexion ->
+            cont.resume(conexion) { _, noEntregada, _ -> noEntregada.close() }
+        }
+        cont.invokeOnCancellation { pool.abortarPeticion() }
+    }
+```
+
+La ventana en la que esto ocurre es minúscula y por eso el defecto es tan escurridizo. Entre el instante en que el árbol de trabajos marca la corrutina como cancelada y el instante en que la llamada de vuelta entrega su resultado pueden pasar microsegundos, y durante esos microsegundos ambos hechos son ciertos a la vez: la corrutina ya no existe y el recurso ya se ha reservado. Ninguna prueba escrita con tiempos redondos alcanza esa ventana; solo la alcanza una prueba que cancele deliberadamente en mitad de la operación, repetida muchas veces.
+
+Queda una última precaución que no es de corrección sino de rendimiento. La reacción a la cancelación se ejecuta en un contexto indeterminado y sin ninguna garantía sobre el hilo, así que debe ser corta, no lanzar y no bloquear. Si la limpieza requiere trabajo real, lo correcto es que esa reacción se limite a señalar la intención y que el trabajo lo haga una corrutina lanzada en un ámbito de vida más larga, nunca en el que acaba de cancelarse.
+
+<Callout type="dios" title="Una envoltura no traduce una API: asume la responsabilidad de que el mundo de fuera cumpla un contrato que no conoce">
+Es tentador ver estas envolturas como fontanería trivial, cuatro líneas que cambian una forma sintáctica por otra, y esa lectura explica por qué tantas están mal escritas y por qué sus defectos son de los más difíciles de perseguir. Lo que realmente ocurre en esas cuatro líneas es un cambio de régimen de responsabilidad. Dentro del mundo de las corrutinas hay invariantes fuertes y verificables: cada tarea tiene un padre, la cancelación se propaga hacia abajo, los fallos suben, ningún trabajo sobrevive al ámbito que lo creó y toda espera libera su hilo. Fuera hay una llamada de vuelta que puede dispararse dos veces, un futuro que puede quedar pendiente para siempre, un oyente que nadie desregistra y una petición de red que seguirá consumiendo batería mucho después de que la pantalla que la pidió haya desaparecido. La envoltura es el único punto donde esos dos regímenes se tocan, y por tanto es el único punto donde alguien puede garantizar que las invariantes del interior siguen siendo ciertas pese a lo que haga el exterior. Si la envoltura no consulta el estado antes de reanudar, una llamada de vuelta duplicada se convierte en un error de estado ilegal lanzado desde un hilo ajeno, en un sitio del código sin ninguna relación aparente con la causa. Si no arma la reacción a la cancelación, la concurrencia estructurada deja de ser cierta en ese punto: el árbol de trabajos dirá que todo terminó mientras una petición sigue en vuelo, y la mentira será tanto más peligrosa cuanto más confíes en el modelo. Si no traduce la cancelación del otro lado a la excepción que la librería entiende, un cierre normal se registrará como un fallo y disparará alertas. Y si no libera el valor que llega tarde, habrás construido una fuga que solo aparece bajo cancelaciones frecuentes, es decir, exactamente en producción y nunca en pruebas tranquilas. La conclusión no es que estas envolturas sean difíciles, porque no lo son, sino que son densas: concentran en un espacio mínimo todas las decisiones que hacen que el resto del sistema pueda razonarse. Merecen escribirse despacio, revisarse con la misma atención que un cerrojo y probarse siempre con una cancelación a mitad de vuelo, que es la prueba que descubre casi todo lo que falta.
+</Callout>
+
+<Challenge title="Envuelve y rompe tu envoltura">
+1. Adapta una API de llamadas de vuelta real a una función suspendida y verifica con trazas que la operación subyacente se cancela al cancelar la corrutina.
+2. Escribe deliberadamente una llamada de vuelta que responda dos veces y observa el error; corrígelo consultando el estado antes de reanudar.
+3. Simula una llamada de vuelta que nunca responde y demuestra que solo un tiempo máximo de espera o la cancelación liberan la corrutina.
+4. Adapta un futuro traduciendo sus tres terminaciones y comprueba que la cancelación del futuro no se registra como fallo.
+5. Reanuda con un recurso que debe cerrarse, cancela la corrutina un instante antes y demuestra que la acción de descarte lo libera.
+</Challenge>

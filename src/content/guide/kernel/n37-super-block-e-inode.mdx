@@ -1,0 +1,150 @@
+---
+title: "super_block e inode: el montaje y el archivo"
+description: "El `struct super_block` representa un sistema de archivos montado y sus operaciones globales; el `struct inode` representa un archivo o directorio con todos sus metadatos y ninguno de sus nombres. Cómo se asignan, cómo el inodo en memoria envuelve al inodo en disco y por qué el inodo no sabe cómo se llama."
+subject: kernel
+level: 37
+order: 2
+position: "37.2"
+duration: "16 min"
+---
+
+<Lead>
+Cuando montas un volumen, el núcleo construye un objeto que lo representa entero: el `super_block`, con su tamaño de bloque, su raíz y la tabla de operaciones que sabe crear y destruir inodos. Y por cada archivo o directorio de ese volumen existe, o puede existir, un `struct inode`: la encarnación en memoria de sus metadatos. El inodo es el corazón del VFS, el objeto que de verdad *es* el archivo. Y esconde una sorpresa que reorganiza toda tu intuición sobre los sistemas de archivos: el inodo no tiene nombre.
+</Lead>
+
+<Goals>
+
+- Entender el `super_block` como el objeto de un sistema de archivos montado y sus `super_operations`.
+- Diseccionar el `struct inode` y distinguir metadatos de datos.
+- Ver cómo el inodo en memoria envuelve al inodo específico del sistema de archivos con `container_of`.
+- Comprender por qué el inodo no guarda su nombre y qué implica para los enlaces duros.
+
+</Goals>
+
+## El superbloque: un montaje hecho objeto
+
+Un `super_block` nace en cada montaje y muere en cada desmontaje. Reúne lo que es global al volumen: la geometría, la raíz del árbol de dentries y el puntero a las operaciones que crean y destruyen sus inodos:
+
+```c
+/* include/linux/fs.h (recortado) */
+struct super_block {
+	dev_t                    s_dev;          /* dispositivo, indice de busqueda */
+	unsigned long            s_blocksize;    /* tamano de bloque en bytes */
+	loff_t                   s_maxbytes;     /* tamano maximo de archivo */
+	struct file_system_type *s_type;         /* que formato es */
+	const struct super_operations *s_op;     /* la vtable global */
+	unsigned long            s_magic;        /* numero magico del formato */
+	struct dentry           *s_root;         /* dentry de la raiz del montaje */
+	struct block_device     *s_bdev;         /* dispositivo de bloques, si lo hay */
+	struct list_head         s_inodes;       /* todos los inodos de este sb */
+	void                    *s_fs_info;      /* datos privados del fs */
+};
+```
+
+El campo decisivo es `s_fs_info`: un puntero opaco donde cada sistema de archivos cuelga su propio estado en memoria del superbloque (para ext4, un `struct ext4_sb_info` con los grupos de bloques, el mapa de bits, el journal). El VFS jamás lo mira; es territorio privado del formato. Y `s_op` es la tabla que gobierna el ciclo de vida de los inodos de este montaje:
+
+```c
+/* include/linux/fs.h (recortado) */
+struct super_operations {
+	struct inode *(*alloc_inode)(struct super_block *sb);  /* reservar en memoria */
+	void (*free_inode)(struct inode *);                    /* liberar via RCU */
+	int  (*write_inode)(struct inode *, struct writeback_control *);
+	void (*evict_inode)(struct inode *);                   /* expulsar del cache */
+	int  (*statfs)(struct dentry *, struct kstatfs *);     /* datos para df */
+	int  (*sync_fs)(struct super_block *sb, int wait);
+	int  (*show_options)(struct seq_file *, struct dentry *);
+};
+```
+
+## El inodo: metadatos sin nombre
+
+El `struct inode` es el objeto que representa un archivo o directorio concreto. Contiene todo lo que `stat()` te devuelve —y mucho más— pero fíjate en lo que **no** contiene:
+
+```c
+/* include/linux/fs.h (muy recortado) */
+struct inode {
+	umode_t                 i_mode;      /* tipo y permisos */
+	kuid_t                  i_uid;       /* dueno */
+	kgid_t                  i_gid;       /* grupo */
+	const struct inode_operations *i_op; /* vtable de metadatos */
+	struct super_block     *i_sb;        /* a que montaje pertenece */
+	struct address_space   *i_mapping;   /* su page cache (nivel 24) */
+	unsigned long           i_ino;       /* numero de inodo, unico en el sb */
+	const unsigned int      i_nlink;     /* cuantos nombres lo apuntan */
+	loff_t                  i_size;      /* tamano en bytes */
+	blkcnt_t                i_blocks;    /* bloques ocupados */
+	atomic_t                i_count;     /* referencias en memoria */
+	const struct file_operations *i_fop; /* fops por defecto al abrir */
+	struct address_space    i_data;      /* el address_space empotrado */
+	union {
+		struct cdev    *i_cdev;      /* si es un char device (nivel 13) */
+		char           *i_link;      /* si es un enlace simbolico */
+	};
+	void                   *i_private;   /* datos privados del fs o driver */
+};
+```
+
+No hay ningún campo `i_name`. El inodo se identifica por su número `i_ino` dentro de su superbloque, nunca por una cadena. Sabe cuántos nombres lo apuntan (`i_nlink`), pero no cuáles: los nombres viven en las dentries del nivel 37.3. Observa también `i_fop`, la tabla de `file_operations` que se instalará por defecto cuando alguien abra este inodo; en un char device es aquí donde el subsistema clava las operaciones del driver.
+
+Las marcas de tiempo, que antes eran campos directos, hoy se manipulan con accessors (`inode_get_ctime`, `inode_set_ctime_current`) porque los núcleos recientes introdujeron marcas de grano múltiple; acceder al campo crudo es un error de estilo que el árbol persigue.
+
+## El inodo VFS envuelto en el inodo del formato
+
+El `struct inode` es genérico, pero cada sistema de archivos necesita colgar de él sus propios datos: para ext4, los punteros a bloques y las banderas del formato. El patrón es empotrar el inodo VFS dentro de una estructura mayor y navegar entre ambos con `container_of`:
+
+```c
+/* fs/ext4/ext4.h (esquema) */
+struct ext4_inode_info {
+	__le32          i_data[15];      /* punteros directos e indirectos */
+	__u32           i_flags;
+	/* ... mucho estado especifico de ext4 ... */
+	struct inode    vfs_inode;       /* el inodo generico, empotrado */
+};
+
+/* del inodo generico al especifico, coste cero */
+static inline struct ext4_inode_info *EXT4_I(struct inode *inode)
+{
+	return container_of(inode, struct ext4_inode_info, vfs_inode);
+}
+```
+
+Aquí encaja `alloc_inode` de las `super_operations`: cuando el VFS necesita un inodo nuevo, no reserva un `struct inode` pelado, sino que llama al `alloc_inode` del sistema de archivos, que asigna el `ext4_inode_info` completo desde su propia `kmem_cache` (nivel 21) y devuelve la dirección de `vfs_inode`. El VFS solo ve la parte genérica; el formato, la estructura entera. Es el mismo truco de empotramiento que viste con `address_space` en el nivel 24.
+
+<Mermaid code={`flowchart LR
+  SB[super_block] -->|s_op| SOP[super_operations]
+  SB -->|s_inodes| I[struct inode]
+  I -->|i_sb| SB
+  I -->|i_op| IOP[inode_operations]
+  I -->|i_mapping| AS[address_space page cache]
+  I -.empotrado en.-> FI[ext4_inode_info]`} />
+
+## El caché de inodos y el ciclo de vida
+
+Los inodos activos viven en el **icache**, una tabla hash indexada por la pareja superbloque más `i_ino`. Traer un inodo a memoria es `iget`; soltar una referencia es `iput`. Cuando `i_count` llega a cero, el inodo pasa a una lista LRU desde la que el reclaim (nivel 25) puede expulsarlo si además `i_nlink` es cero o hay presión de memoria; ese es el momento en que se llama a `evict_inode`:
+
+```c
+struct inode *inode = iget_locked(sb, ino);  /* busca en el icache o reserva */
+if (inode->i_state & I_NEW) {
+	/* recien reservado: hay que llenarlo desde el disco */
+	ext4_read_inode(inode);                /* lee el inodo on-disk */
+	unlock_new_inode(inode);               /* publicalo, ya es visible */
+}
+/* ... usar el inodo ... */
+iput(inode);                                   /* suelta la referencia */
+```
+
+<Callout type="warn" title="Inodo en disco frente a inodo en memoria">
+No confundas el `struct inode` del VFS con el inodo *on-disk* (`struct ext4_inode`, un registro compacto de bytes en el dispositivo). El primero es la representación viva y rica en memoria; el segundo es la fila persistente que se lee al traerlo y se reescribe con `write_inode` al ensuciarlo. El VFS solo entiende el primero; convertir entre ambos es trabajo exclusivo del sistema de archivos.
+</Callout>
+
+<Callout type="dios" title="El inodo es el archivo; el nombre es un accidente">
+Detente en la ausencia del campo `i_name`, porque encierra la idea más contraintuitiva de todo el subsistema. En tu modelo mental cotidiano, un archivo *es* su ruta: `/home/ana/carta.txt`. Pero para el núcleo esa ecuación es falsa. El archivo es el inodo —un número y un montón de metadatos— y el nombre es solo una de las posibles etiquetas que apuntan a él, guardada aparte, en una entrada de directorio. Un enlace duro no es una copia ni un atajo: es literalmente un segundo nombre para el mismo inodo, y por eso `i_nlink` cuenta nombres, no archivos. De ahí se deduce, con necesidad lógica, todo el comportamiento que de otro modo parecería caprichoso: borrar un archivo se llama `unlink` y no `delete` porque lo que haces es quitar *un nombre*, no destruir el inodo; el inodo solo muere cuando cae su último nombre (`i_nlink` a cero) y además nadie lo tiene abierto (`i_count` a cero), razón por la cual un programa puede seguir leyendo tranquilamente un archivo que ya fue borrado del directorio. Separar la identidad del archivo de su nombre no es un detalle de implementación: es la decisión que hace posibles los enlaces duros, el borrado seguro de archivos en uso y la existencia misma de la dcache como una capa de nombres desmontable y reconstruible sobre un mundo de inodos que no los necesitan. El nombre es efímero y plural; el inodo es la cosa.
+</Callout>
+
+<Challenge title="Interroga a los inodos">
+1. Con `stat archivo`, identifica el número de inodo (`i_ino`) y el contador de enlaces (`i_nlink`).
+2. Crea un enlace duro con `ln origen copia` y comprueba que ambos nombres comparten el mismo número de inodo y que `i_nlink` subió a dos.
+3. Abre un archivo con un programa, bórralo con `rm` mientras sigue abierto y demuestra que aún puedes leerlo: explica el estado de `i_nlink` e `i_count`.
+4. En las fuentes, sigue `EXT4_I` y localiza dónde `vfs_inode` está empotrado en `ext4_inode_info`.
+5. Razona por qué `alloc_inode` es una operación del superbloque y no una función genérica del VFS.
+</Challenge>

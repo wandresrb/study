@@ -1,0 +1,148 @@
+---
+title: "runTest y el reloj que no existe"
+description: "Un test de código suspendido que tarde lo que tarda el código en producción no es un test riguroso sino un test lento, y la lentitud acaba erosionando la suite hasta que nadie la ejecuta. Esta lección explica el reloj virtual del planificador de pruebas y por qué permite que una espera de veinticuatro horas se resuelva en microsegundos sin falsear nada, delimita con precisión la frontera donde ese reloj deja de aplicarse, y argumenta por qué runBlocking no es una alternativa aceptable: no salta los retardos, no existe fuera de la JVM, no detecta corrutinas huérfanas y convierte cualquier problema de terminación en un cuelgue silencioso."
+subject: kotlin
+level: 36
+order: 2
+position: "36.2"
+duration: "24 min"
+---
+
+<Lead>
+La primera vez que uno escribe un test sobre una función suspendida, el compilador exige un contexto de corrutina y la respuesta obvia es envolverlo en `runBlocking`, que compila, pasa y parece resolver el problema. Lo que en realidad ha ocurrido es que has aceptado tres cosas sin darte cuenta: que el test va a esperar en tiempo real cada `delay` que ejecute el código, que va a bloquear un hilo mientras tanto, y que si alguna corrutina hija se queda colgada el test no fallará con un mensaje sino que se quedará parado hasta que alguien mate el proceso. `runTest` existe para negar esas tres cosas a la vez, y la pieza que lo hace posible es un reloj que no mide nada.
+</Lead>
+
+<Goals>
+
+- Explicar cómo el planificador de pruebas sustituye el paso del tiempo por un contador de tiempo virtual y qué implica para `delay`.
+- Delimitar la frontera exacta donde el tiempo virtual deja de aplicarse y el test vuelve a esperar de verdad.
+- Enumerar las cuatro razones por las que `runBlocking` es inadecuado en un test de corrutinas.
+- Distinguir el ámbito principal del ámbito de fondo y saber qué corrutinas pertenecen a cada uno.
+
+</Goals>
+
+## Un reloj que se adelanta en vez de esperar
+
+El corazón de `kotlinx-coroutines-test` es el planificador de pruebas, una cola de tareas ordenada por el instante virtual en que deben ejecutarse. Cuando una corrutina llama a `delay`, no se registra un temporizador del sistema: se inserta una entrada en esa cola con la marca `tiempoActual + retardo`. Y cuando el planificador se queda sin tareas pendientes para el instante presente, en lugar de dormir hace lo único que puede hacer sin mentir, que es mover el reloj hasta la siguiente tarea programada y ejecutarla.
+
+```kotlin
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.delay
+import kotlin.test.Test
+import kotlin.test.assertEquals
+
+class ReintentoTest {
+    @Test
+    fun agotaLosReintentosConEsperaExponencial() = runTest {
+        val servicio = ServicioInestable(fallosAntesDeExito = 3)
+
+        val resultado = conReintentos(intentos = 4, baseMs = 1_000) { servicio.pedir() }
+
+        assertEquals("ok", resultado)
+        assertEquals(7_000, currentTime)   // 1s + 2s + 4s, sin esperar nada
+    }
+}
+```
+
+Ese test comprueba una política de reintentos con espera exponencial que en producción tardaría siete segundos, y se ejecuta en menos de un milisegundo. Lo notable no es la velocidad sino que la aserción sobre `currentTime` convierte el tiempo en un valor observable: puedes afirmar que la espera acumulada fue exactamente la esperada, algo que en tiempo real solo podrías comprobar con tolerancias y que por tanto sería una aserción débil y propensa a fallos intermitentes.
+
+La frontera de ese mecanismo es precisa y hay que tenerla presente. El reloj virtual pertenece al planificador, y el planificador solo gobierna a las corrutinas que se ejecutan en un dispatcher construido sobre él. En cuanto el código bajo prueba salta a un dispatcher real, la suspensión que ocurra allí es una suspensión de verdad, con temporizadores de verdad y espera de verdad.
+
+```kotlin
+suspend fun sincronizar() {
+    withContext(Dispatchers.IO) {   // fuera del alcance del planificador
+        delay(30_000)               // treinta segundos reales, también en el test
+    }
+}
+```
+
+<Callout type="warn" title="Bloquear tampoco se salta">
+El tiempo virtual salta suspensiones, no bloqueos. Una llamada a `Thread.sleep`, una lectura sincrónica de red o un `join` sobre un hilo detienen el hilo del test durante lo que tarden, y ninguna función del planificador los puede acelerar.
+</Callout>
+
+## Por qué runBlocking es la herramienta equivocada
+
+La objeción habitual es que `runBlocking` funciona. Funciona en el sentido en que un test que pasa es un test que funciona, pero acumula cuatro defectos que solo se manifiestan cuando la suite ya es grande y cambiarla es caro.
+
+<Cards>
+  <Card icon="🐢" title="Espera de verdad">
+    Cada `delay` del código bajo prueba se paga en tiempo de reloj. Una suite con doscientos tests de reintentos y expiraciones pasa de segundos a minutos, y una suite que tarda minutos se ejecuta cada vez menos.
+  </Card>
+  <Card icon="🧵" title="Bloquea un hilo">
+    En la JVM inmoviliza el hilo del runner; en Kotlin/JS la función ni siquiera existe, de modo que un test escrito así no puede vivir en `commonTest`.
+  </Card>
+  <Card icon="👻" title="No delata huérfanas">
+    Si una corrutina hija queda esperando para siempre, `runBlocking` espera con ella. El síntoma es un test colgado sin mensaje, no un fallo con diagnóstico.
+  </Card>
+  <Card icon="🎲" title="Ordenación real">
+    El orden de ejecución depende del planificador del sistema operativo, así que los fallos por concurrencia aparecen una vez de cada cien ejecuciones y en la máquina de otro.
+  </Card>
+</Cards>
+
+`runTest` responde a los cuatro. Sustituye la espera por el salto de reloj, no bloquea porque en la JVM devuelve tras completar y en JS devuelve una promesa que el runner encadena, espera a que todas las corrutinas hijas del ámbito terminen antes de dar el test por bueno, y ejecuta todo sobre un dispatcher determinista de un solo hilo virtual.
+
+Ese tipo de retorno merece atención porque es la causa de un error frecuente. La función devuelve un `TestResult`, un tipo cuya representación depende de la plataforma, y en JS y Wasm ese valor es la promesa que el runner necesita para saber cuándo ha terminado el test. Si lo descartas, el test acaba antes de haber empezado.
+
+```kotlin
+// Correcto: el TestResult se devuelve al runner
+@Test
+fun correcto() = runTest { assertEquals(2, sumar(1, 1)) }
+
+// Incorrecto: en JS y Wasm el runner no espera y el test pasa sin comprobar nada
+@Test
+fun incorrecto() {
+    runTest { assertEquals(2, sumar(1, 1)) }
+}
+```
+
+<Mermaid code={`flowchart TD
+  A[Cuerpo del test] --> B[Planificador de pruebas]
+  B --> C{Hay tareas para el instante actual}
+  C -->|Si| D[Ejecutar la siguiente tarea]
+  D --> C
+  C -->|No| E{Queda alguna tarea futura}
+  E -->|Si| F[Adelantar el reloj virtual hasta ella]
+  F --> D
+  E -->|No| G[Esperar a las corrutinas hijas del ambito]
+  G --> H[Fallar si alguna sigue viva o el limite real expira]`} />
+
+## Terminación, ámbito de fondo y límite real
+
+Al salir del cuerpo del test, `runTest` no da la prueba por terminada de inmediato: espera a que todas las corrutinas lanzadas en el ámbito del test hayan completado. Esa espera es una comprobación disfrazada, porque una corrutina que nunca termina delata una fuga en el código bajo prueba. Pero hay una categoría legítima de corrutinas que jamás terminan por diseño —un recolector de un flujo infinito, un observador de estado, un bucle de sondeo— y para ellas existe un ámbito distinto.
+
+```kotlin
+@Test
+fun observaLosCambiosDeEstado() = runTest {
+    val vistos = mutableListOf<Estado>()
+
+    // Colector infinito: vive en backgroundScope y se cancela al acabar el test
+    backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+        modelo.estado.collect { vistos += it }
+    }
+
+    modelo.pulsar()
+    advanceUntilIdle()
+
+    assertEquals(listOf(Estado.Inicial, Estado.Pulsado), vistos)
+}
+```
+
+La distinción es conceptual y no una comodidad: lo que lanzas en el ámbito del test es trabajo cuya terminación forma parte de lo que estás comprobando; lo que lanzas en el ámbito de fondo es andamiaje que existe para observar y que debe desaparecer sin ceremonia cuando el test acaba.
+
+Queda una última salvaguarda, y esta sí mide tiempo real. `runTest` acepta un parámetro de límite, con un valor por defecto de diez segundos, que se cuenta con el reloj del sistema y aborta el test si se supera. Existe precisamente porque el tiempo virtual no protege de los bloqueos: si el código bajo prueba se queda esperando en un candado o en una llamada sincrónica, el planificador no puede adelantar nada y sin ese límite el test se colgaría igual que con `runBlocking`.
+
+<Callout type="tip" title="Un fallo por límite es un diagnóstico">
+Cuando `runTest` aborta por límite, el mensaje incluye el estado de las corrutinas vivas. Léelo antes de subir el valor: casi siempre señala un bloqueo real o un dispatcher de producción colado en una ruta que creías bajo control.
+</Callout>
+
+<Callout type="dios" title="El tiempo virtual no acelera los tests: elimina el tiempo de la lista de cosas sobre las que un test puede mentir">
+La lectura superficial del reloj virtual es que sirve para que la suite corra rápido, y esa lectura, siendo cierta, deja fuera lo importante. En un test que espera de verdad, el tiempo entra como una fuente de incertidumbre imposible de controlar: la máquina de integración continua va cargada, el recolector de basura decide actuar, el planificador del sistema operativo reparte el hilo de otra manera, y el resultado es que la única forma de escribir aserciones sobre plazos es con tolerancias generosas. Una tolerancia generosa es una aserción que no afirma casi nada, y con el tiempo se convierte en una aserción que oculta regresiones reales: si compruebas que la operación tardó menos de dos segundos, no detectarás nunca el día que pase de trescientos a novecientos milisegundos. El reloj virtual cambia la naturaleza del problema en lugar de mitigarlo, porque el tiempo deja de ser una magnitud medida para pasar a ser un valor determinista y observable. La afirmación de que la política de reintentos esperó exactamente siete mil milisegundos no es una aproximación tolerante: es una igualdad exacta que fallará el día que alguien cambie la base exponencial, y fallará siempre, en todas las máquinas, con el mismo mensaje. Esa transformación arrastra un efecto de diseño que trasciende los tests. Para que el reloj virtual gobierne el código bajo prueba, ese código no puede tener dentro un dispatcher fijado ni una llamada bloqueante escondida: cada salto a `Dispatchers.IO` codificado a fuego, cada `Thread.sleep` heredado, cada cliente sincrónico envuelto sin cuidado abre un agujero por donde el tiempo real se cuela y el test vuelve a ser lento e inestable. Dicho de otro modo, la testabilidad temporal no es una propiedad que se añada escribiendo mejores tests, sino una consecuencia observable de que las dependencias asíncronas estén correctamente inyectadas. Cuando un test resiste el reloj virtual, lo que acabas de demostrar no es que la suite sea rápida: es que el código no tiene dependencias ocultas con la infraestructura, y eso es exactamente lo que querías saber.
+</Callout>
+
+<Challenge title="Domar el reloj">
+1. Escribe una función con espera exponencial y tres reintentos y compruébala con `runTest`, afirmando el valor exacto de `currentTime` al final. Mide cuánto tarda el test real.
+2. Reescribe el mismo test con `runBlocking` y compara los tiempos de ejecución. Multiplica la diferencia por el número de tests que tendrías en una suite realista.
+3. Introduce un `withContext` hacia un dispatcher de producción dentro de la función bajo prueba y observa cómo el test empieza a tardar. Arréglalo inyectando el dispatcher.
+4. Lanza en el cuerpo del test una corrutina que recolecte un flujo infinito y comprueba el mensaje de error que produce `runTest`. Muévela a `backgroundScope` y verifica que desaparece.
+5. Provoca un bloqueo real con una espera sobre un candado nunca liberado y estudia el diagnóstico del límite temporal. Explica en dos frases por qué el planificador no pudo salvarte en ese caso.
+</Challenge>

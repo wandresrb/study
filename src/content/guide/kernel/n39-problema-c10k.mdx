@@ -1,0 +1,142 @@
+---
+title: "El problema C10k: un hilo para miles de conexiones"
+description: "Por qué el modelo de un hilo por conexión se derrumba mucho antes de los diez mil clientes, en qué se distingue la E/S bloqueante de la no bloqueante, por qué sondear en bucle malgasta un núcleo entero, y cómo nace la idea de bloquearse sobre un conjunto de descriptores hasta que alguno esté listo, apoyada en la cola de espera y la máscara de disponibilidad que el kernel mantiene bajo cada fd."
+subject: kernel
+level: 39
+order: 1
+position: "39.1"
+duration: "14 min"
+---
+
+<Lead>
+Un servidor web en 2026 no atiende a diez clientes: mantiene abiertas cientos de miles de conexiones simultáneas, la mayoría inactivas casi todo el tiempo, esperando el siguiente byte. El modelo ingenuo —un hilo por conexión, cada uno dormido en su `read`— se derrumba mucho antes de llegar ahí: el planificador se ahoga, las pilas devoran gigabytes y la CPU se va en cambios de contexto. El problema C10k, bautizado por Dan Kegel a finales de los noventa, planteó la pregunta que define toda la E/S de red moderna: ¿cómo hace un solo hilo para vigilar miles de descriptores a la vez y despertar solo cuando alguno tiene trabajo?
+</Lead>
+
+<Goals>
+
+- Entender por qué el modelo de un hilo por conexión no escala a miles de fds.
+- Distinguir la E/S bloqueante de la no bloqueante con `O_NONBLOCK` y por qué sondear en bucle quema la CPU.
+- Formular la idea central: bloquearse sobre un conjunto de descriptores hasta que **alguno** esté listo.
+- Ver qué significa "listo" desde el kernel: la cola de espera y la máscara de `f_op->poll` bajo cada fd.
+
+</Goals>
+
+## Un hilo por conexión: el modelo que no escala
+
+El diseño más natural asigna un hilo a cada cliente y deja que ese hilo se bloquee en su propio `read`. Es correcto y fácil de razonar, y por eso todo el mundo lo escribe primero.
+
+```c
+/* modelo clasico: un hilo bloqueado por cada conexion */
+for (;;) {
+	int cfd = accept(lfd, NULL, NULL);   /* bloquea hasta que llega un cliente */
+	if (cfd < 0)
+		continue;
+	pthread_create(&t, NULL, atender, arg_con(cfd));  /* un hilo mas */
+}
+
+static void *atender(void *arg)
+{
+	int cfd = fd_de(arg);
+	char buf[4096];
+
+	for (;;) {
+		ssize_t n = read(cfd, buf, sizeof(buf));  /* el hilo existe solo para dormir aqui */
+		if (n <= 0)
+			break;
+		procesar(buf, n);
+	}
+	close(cfd);
+	return NULL;
+}
+```
+
+El coste no es la CPU mientras los hilos duermen, sino lo que cada hilo reserva por el mero hecho de existir. En x86-64 cada uno arrastra una pila de kernel de 16 KiB clavada en memoria física, un `task_struct`, una entrada en las estructuras del planificador y una pila de usuario de varios megabytes reservada en el espacio de direcciones. Cien mil hilos son gigabytes de pilas y un planificador cuyas colas ya no caben en caché. Y cuando muchas conexiones se activan a la vez, el sistema paga una tormenta de despertares y cambios de contexto. El hilo, en este modelo, no es más que un cursor caro aparcado sobre un único descriptor bloqueante.
+
+## E/S bloqueante contra E/S por readiness
+
+Por defecto un descriptor es bloqueante: `read` duerme al hilo hasta que hay datos. La bandera `O_NONBLOCK` invierte ese contrato: `read` y `accept` regresan al instante con `-1` y `errno` igual a `EAGAIN` si no hay nada que entregar.
+
+```c
+/* volver el descriptor no bloqueante: read/accept devuelven EAGAIN en vez de dormir */
+int flags = fcntl(cfd, F_GETFL, 0);
+fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
+```
+
+Pero el modo no bloqueante por sí solo tienta con el peor patrón posible, el sondeo activo:
+
+```c
+/* ANTIPATRON: sondeo activo, quema un nucleo entero para nada */
+for (;;) {
+	ssize_t n = read(cfd, buf, sizeof(buf));
+	if (n < 0 && errno == EAGAIN)
+		continue;   /* gira sin dormir jamas: 100% de un nucleo */
+	/* ... */
+}
+```
+
+`O_NONBLOCK` solo responde a "¿está listo **este** fd ahora mismo?". Tenemos miles, y girar sobre todos ellos consume el núcleo entero sin realizar trabajo útil. Lo que falta es una llamada al sistema que reciba **muchos** descriptores y duerma al hilo hasta que al menos uno esté listo. A eso se le llama notificación por disponibilidad, o E/S basada en *readiness*, y es exactamente lo que ofrecen `select`, `poll` y `epoll`.
+
+## Qué significa "listo": la cola de espera bajo cada fd
+
+Aquí conviene mirar desde el kernel, porque "listo" tiene una definición precisa. Un socket está listo para leer cuando su búfer de recepción contiene bytes, o un fin de conexión, o un error; está listo para escribir cuando su búfer de envío tiene hueco. Todo archivo que se pueda multiplexar implementa `f_op->poll`, cuya doble tarea es inscribir a quien espera en la cola del fd con `poll_wait` y devolver una máscara de disponibilidad actual.
+
+```c
+/* lado del kernel: todo fd multiplexable expone f_op->poll */
+static __poll_t mi_poll(struct file *f, struct poll_table_struct *pt)
+{
+	struct mi_dev *d = f->private_data;
+	__poll_t mask = 0;
+
+	poll_wait(f, &d->rwq, pt);           /* inscribe al que espera en la cola */
+	if (hay_datos(d))
+		mask |= EPOLLIN | EPOLLRDNORM;   /* legible ahora mismo */
+	if (hay_hueco(d))
+		mask |= EPOLLOUT | EPOLLWRNORM;  /* escribible ahora mismo */
+	return mask;
+}
+```
+
+Una llamada de multiplexación recorre todos los fds que le pasas, invoca el `f_op->poll` de cada uno para inscribirse en su cola **y** recoger la disponibilidad presente; si ninguno está listo, se duerme, y cualquier despertar en cualquiera de esas colas la revive. Sobre esta maquinaria común se apoyan por igual `select`, `poll` y `epoll`: la única diferencia entre ellos es lo eficientemente que gestionan esa inscripción, y de esa diferencia trata el resto del nivel.
+
+<Mermaid code={`flowchart TB
+  subgraph Un hilo por conexion
+    A1[accept] --> T1[hilo 1 dormido en read]
+    A1 --> T2[hilo 2 dormido en read]
+    A1 --> T3[hilo N dormido en read]
+  end
+  subgraph Un solo hilo multiplexado
+    L[bucle de eventos] -->|espera readiness| K[kernel vigila N fds]
+    K -->|fd listo| L
+  end`} />
+
+## select, poll y epoll: el mapa del nivel
+
+Existen tres respuestas históricas a la pregunta de esperar sobre muchos fds, y el resto del nivel las recorre en orden de madurez. Las tres se apoyan en el mismo `f_op->poll` del kernel; se diferencian solo en cómo gestionan el conjunto de interés, y esa diferencia lo decide todo a escala grande.
+
+<Cards>
+  <Card icon="📼" title="select (1983)">
+    Un mapa de bits de 1024 descriptores como máximo. Portable hasta el hueso, pero O(n) por llamada y con un tope que choca de frente con el C10k.
+  </Card>
+  <Card icon="📇" title="poll">
+    Un array de `struct pollfd` sin límite de 1024. Ergonomía algo mejor, mismo coste O(n): sigues entregando y recorriendo el conjunto entero en cada llamada.
+  </Card>
+  <Card icon="⚡" title="epoll">
+    Un objeto persistente en el kernel. Registras una vez y recibes solo los listos: O(1) por evento. La respuesta de Linux al C10k y el motor de la web moderna.
+  </Card>
+</Cards>
+
+<Callout type="info" title="De C10k a C10M">
+Kegel planteó diez mil conexiones; el hardware de 2026 empuja hacia los diez millones. A esa escala ni siquiera `epoll` basta y aparecen técnicas de plano de datos que esquivan el kernel: `AF_XDP`, `io_uring` con sondeo dedicado, pilas en espacio de usuario sobre `DPDK`. Todas comparten la lección de este nivel —un solo hilo atiende multitudes— llevada hasta su extremo. Aquí construimos el cimiento; el nivel 40 sube un peldaño más.
+</Callout>
+
+<Callout type="dios" title="El C10k disuelve la identidad entre el hilo y aquello que espera">
+Detente en lo que el problema C10k rompe de verdad, porque no es una cuestión de rendimiento sino de ontología del control. Durante toda la programación clásica, un hilo **es** aquello que espera: el flujo de ejecución y la cosa esperada están fundidos, de modo que para aguardar mil eventos hacen falta mil flujos, uno clavado en cada `read`. Ese acoplamiento parece una ley de la naturaleza porque el modelo bloqueante lo impone: la única forma de esperar un byte es que alguien se duerma sobre él, y dormirse es algo que solo un hilo sabe hacer. La E/S multiplexada nace de negar esa identidad. Separa el *quién ejecuta* del *qué se espera*, y al separarlos revela que la espera no era una propiedad del hilo sino del descriptor: cada fd ya lleva su propia cola de espera dentro del kernel, su propio `f_op->poll` capaz de decir si tiene trabajo. Un solo hilo puede entonces suscribirse a mil colas a la vez y ser despertado por cualquiera de ellas, porque despertar nunca fue mover un flujo concreto, sino señalar que una condición se cumplió. Cuando interiorizas que el hilo era un cursor y no una necesidad, entiendes que toda la programación asíncrona —`select`, `epoll`, los bucles de eventos, `async/await`, las corrutinas— es una sola idea repetida: devolver a los descriptores la espera que el modelo bloqueante les había robado, para que un puñado de hilos baste allí donde antes hacían falta legiones. El resto del nivel es la ingeniería de esa devolución.
+</Callout>
+
+<Challenge title="Mide el techo del modelo bloqueante">
+1. Escribe el servidor de un hilo por conexión de este nivel y estima, con tu `ulimit -s`, cuánta memoria virtual reservarían cien mil hilos solo en pilas de usuario.
+2. Convierte un socket a `O_NONBLOCK` con `fcntl` y comprueba que un `read` sin datos devuelve `-1` con `errno` igual a `EAGAIN`.
+3. Escribe a propósito el bucle de sondeo activo y mide con `top` cómo un solo cliente inactivo dispara un núcleo al 100%.
+4. Explica, en tres líneas, por qué el coste del modelo bloqueante no es la CPU mientras los hilos duermen, sino la memoria y las tormentas de despertar.
+5. Argumenta qué propiedad del descriptor —y no del hilo— hace posible que un único flujo espere sobre miles de fds a la vez.
+</Challenge>

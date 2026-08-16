@@ -1,0 +1,153 @@
+---
+title: "Diseñar con actores: granularidad, cuellos de botella y falsas soluciones"
+description: "Un actor por clase es un antipatrón; un actor por invariante es un diseño. Cómo elegir el tamaño del dominio, cómo detectar el actor que serializa medio programa y cómo reconocer los casos en que la respuesta correcta nunca fue un actor."
+subject: swift
+level: 24
+order: 5
+position: "24.5"
+duration: "20 min"
+---
+
+<Lead>
+Las cuatro lecciones anteriores describen un mecanismo; esta trata de la decisión. Y la decisión importa más, porque el compilador comprueba que tu programa no tiene carreras de datos pero no comprueba que tu reparto de dominios tenga sentido. Un sistema puede estar libre de carreras y ser lento, difícil de razonar y propenso a errores de lógica: basta con haber puesto un actor donde bastaba un valor inmutable, o con haber concentrado en una sola instancia un estado que en realidad eran doce estados independientes. Diseñar con actores consiste en responder tres preguntas —qué invariantes existen, cuántos dominios hacen falta para sostenerlas y cuánta serialización estás dispuesto a pagar— antes de escribir la primera palabra clave.
+</Lead>
+
+<Goals>
+
+- Elegir la granularidad de un actor a partir de las invariantes del dominio, no de la estructura de clases heredada.
+- Diagnosticar un actor cuello de botella y aplicar particionado, agrupación o extracción de cómputo.
+- Distinguir los casos en que un candado, un valor inmutable o la concurrencia estructurada resuelven mejor el problema.
+- Evaluar el coste real de cruzar una frontera de aislamiento y de dividir un dominio en varios.
+
+</Goals>
+
+## Un actor por invariante
+
+La pregunta correcta no es «¿qué objetos deberían ser actores?» sino «¿qué conjuntos de datos deben cambiar juntos para seguir siendo coherentes?». Cada respuesta es un dominio. Si dos campos deben mantener una relación entre sí, viven en el mismo actor; si nunca se consultan a la vez, separarlos es gratis y duplica el paralelismo.
+
+```swift
+// Antipatron: el actor sin invariante, heredado de una clase con candado
+actor Servicios {
+    var sesion: Sesion?
+    var carrito: [Articulo] = []
+    var cacheImagenes: [URL: Datos] = [:]
+    var metricas: [String: Int] = [:]
+}
+```
+
+Ese actor no protege ninguna invariante: protege un cajón. Sus cuatro campos no se relacionan entre sí, así que cada acceso a las métricas serializa injustamente con cada acceso al carrito. La versión correcta son cuatro dominios independientes, o tres y un valor inmutable, según qué necesite mutar de verdad.
+
+El criterio inverso también existe y falla igual de feo: partir un dominio que sí tenía invariante obliga a coordinar dos actores, y coordinar dos actores exige un `await` en medio, y ese `await` es justo la grieta por la que se escapa la coherencia. Si retirar de una cuenta e ingresar en otra debe ser atómico, esas dos cuentas no pueden ser dos actores; el dominio es el libro mayor, no la cuenta.
+
+<Cards>
+  <Card icon="🧩" title="Divide cuando">
+    Los datos son independientes, las operaciones no se solapan y el paralelismo real compensa. Cada dominio nuevo es paralelismo ganado.
+  </Card>
+  <Card icon="🔗" title="Une cuando">
+    Existe una invariante que debe sostenerse entre varias piezas. Coordinar dominios con `await` no da atomicidad: la rompe.
+  </Card>
+</Cards>
+
+## El actor cuello de botella
+
+Un actor es un ejecutor serie. Todo lo que entra en él se ordena en fila, y en cuanto ese dominio recibe más trabajo del que puede despachar, el resto del programa espera turno por muy paralela que sea la máquina. El síntoma es característico: al añadir núcleos, el rendimiento no mejora.
+
+```swift
+// Sintoma: trabajo pesado ejecutandose DENTRO del turno del actor
+actor Indice {
+    private var mapa: [String: [Int]] = [:]
+
+    func indexar(_ documento: String) {
+        let tokens = analizarMorfologicamente(documento)   // 40 ms de CPU pura
+        for (t, pos) in tokens { mapa[t, default: []].append(pos) }
+    }
+}
+
+// Correccion: el computo fuera, la mutacion dentro
+actor Indice2 {
+    private var mapa: [String: [Int]] = [:]
+
+    nonisolated func preparar(_ documento: String) -> [(String, Int)] {
+        analizarMorfologicamente(documento)                // paralelizable
+    }
+
+    func fusionar(_ tokens: [(String, Int)]) {
+        for (t, pos) in tokens { mapa[t, default: []].append(pos) }
+    }
+}
+```
+
+La regla general es que dentro del turno debe ocurrir solo lo que necesita el estado protegido. Todo lo demás —parsear, comprimir, calcular, formatear— es cómputo puro que puede hacerse en paralelo antes de pedir turno. Cuando aun así el dominio sigue saturado, quedan dos técnicas clásicas. La primera es *particionar por clave*: en vez de un actor, un vector de actores y una función de dispersión que reparta las claves entre ellos, con lo que el paralelismo crece linealmente mientras las operaciones no crucen particiones.
+
+```swift
+struct IndiceParticionado: Sendable {
+    private let particiones: [Indice2]
+
+    init(grado: Int = ProcessInfo.processInfo.activeProcessorCount) {
+        particiones = (0..<grado).map { _ in Indice2() }
+    }
+
+    private func particion(para clave: String) -> Indice2 {
+        particiones[abs(clave.hashValue) % particiones.count]
+    }
+
+    func registrar(_ clave: String, _ pos: Int) async {
+        await particion(para: clave).fusionar([(clave, pos)])
+    }
+}
+```
+
+La segunda técnica es *agrupar*: acumular escrituras en un flujo y aplicarlas por lotes, cambiando muchos cruces de frontera por uno solo. Ambas comparten un mismo supuesto, y conviene hacerlo explícito antes de adoptarlas: solo funcionan si las operaciones son independientes entre claves. En cuanto aparece una consulta que abarca todas las particiones —un recuento global, una instantánea coherente— la partición deja de ser gratuita y hay que decidir si esa consulta necesita ver un estado consistente o le basta con una aproximación.
+
+<Mermaid code={`flowchart TB
+  q{Necesitas estado mutable compartido entre tareas} -->|no| v[Usa valores inmutables y concurrencia estructurada]
+  q -->|si| s{La seccion critica suspende con await}
+  s -->|no y es muy corta| mx[Un Mutex es mas barato y no rompe atomicidad]
+  s -->|si| a{Cuantas invariantes independientes hay}
+  a -->|una| act[Un actor por invariante]
+  a -->|muchas| part[Varios actores o particion por clave]
+  class v t-green
+  class act t-blue
+  class mx t-yellow`} />
+
+## Cuando la respuesta no era un actor
+
+Tres situaciones frecuentes en las que introducir un actor empeora el diseño en vez de mejorarlo.
+
+La primera es el **estado que podía ser inmutable**. Si un valor se calcula una vez y luego solo se lee, no necesita dominio: necesita ser una constante de un tipo `Sendable`. Un actor añade suspensiones a cada lectura para proteger algo que nadie va a escribir.
+
+La segunda es la **sección crítica corta y sin suspensión**. Cuando el trabajo protegido son unas pocas instrucciones que no llaman a nada asíncrono, un candado moderno resulta más barato que un cruce de dominio, y además conserva la atomicidad de todo el bloque en vez de fragmentarla en cada `await`:
+
+```swift
+import Synchronization
+
+final class Contadores: Sendable {
+    private let estado = Mutex<[String: Int]>([:])
+
+    func incrementar(_ clave: String) {
+        estado.withLock { $0[clave, default: 0] += 1 }   // sin suspension, atomico
+    }
+}
+```
+
+La tercera es el **actor usado como cola de trabajo**. Un actor no ejecuta nada en paralelo: si lo que buscas es repartir cómputo entre núcleos, la herramienta es un grupo de tareas, no un dominio de aislamiento. Meter trabajo pesado en un actor con la esperanza de «sacarlo del hilo principal» solo cambia un cuello de botella por otro.
+
+<Callout type="tip" title="Antes de crear un dominio, cuenta los cruces">
+Estima cuántas veces por segundo se cruzará la frontera del actor en la operación más común de tu programa. Un cruce cuesta una suspensión, una reprogramación y una posible pérdida de localidad de caché. Si la respuesta son miles de cruces para proteger tres campos, el diseño está pidiendo otra cosa.
+</Callout>
+
+<Callout type="dios" title="El aislamiento no es gratis: es una decisión de arquitectura">
+Conviene enunciar sin rodeos el hecho que casi nunca se dice: cada actor que añades es una región de tu programa que renuncia al paralelismo interno a cambio de una garantía. Ese intercambio tiene la forma exacta de la ley de Amdahl, con la particularidad de que aquí la fracción serial no viene impuesta por el algoritmo, sino elegida por ti en el momento de decidir dónde poner la palabra clave. Un actor que concentra el diez por ciento del trabajo del sistema fija un techo de aceleración de diez, y ningún número de núcleos lo superará. Por eso el reparto de dominios es una decisión de arquitectura del mismo rango que el reparto en módulos o el diseño del esquema de datos, y merece el mismo tipo de análisis: qué se toca junto, con qué frecuencia, bajo qué invariante. Hay además una segunda dimensión que se olvida todavía más. Cada frontera de aislamiento es también una frontera de razonamiento: al cruzarla se pierde la atomicidad, se exige `Sendable`, y toda invariante que abarcase ambos lados deja de estar garantizada por construcción. Multiplicar dominios reduce la contención y aumenta el número de invariantes que quedan sin custodio; concentrarlos hace lo contrario. La respuesta correcta no es un número universal, sino el resultado de mapear las invariantes reales del problema, y ese mapa —no el modelo de objetos que heredaste— es lo que debería determinar la forma concurrente del programa. Dicho de la manera más útil posible: si no sabes enunciar en una frase qué invariante protege un actor tuyo, ese actor todavía no existe como decisión, solo como sintaxis.
+</Callout>
+
+<Callout type="note" title="Orden de trabajo">
+Primero enuncia las invariantes. Después agrupa los datos que las sostienen. Después decide el mecanismo: constante, candado o actor. Y solo al final mide, porque hasta entonces no hay nada estable que medir.
+</Callout>
+
+<Challenge title="Rediseña un subsistema">
+1. Toma un actor de tu código con más de tres propiedades y escribe la invariante de cada una. Separa las que no comparten ninguna.
+2. Instrumenta una operación típica contando los cruces de frontera de aislamiento que provoca. Reduce ese número a la mitad sin cambiar el comportamiento.
+3. Localiza cómputo puro ejecutándose dentro de un turno y sácalo a un miembro `nonisolated`. Mide antes y después con varios núcleos activos.
+4. Sustituye por un `Mutex` un actor cuyo cuerpo no contenga ningún `await` y argumenta qué ganas y qué pierdes con el cambio.
+5. Diseña la versión particionada de un índice compartido, decide qué ocurre con las operaciones que abarcan varias particiones y explica qué invariante dejas de poder garantizar.
+</Challenge>

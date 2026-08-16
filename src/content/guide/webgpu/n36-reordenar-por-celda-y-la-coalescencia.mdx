@@ -1,0 +1,87 @@
+---
+title: "Reordenar por celda y la coalescencia de memoria"
+description: "Por qué un array de índices no basta, cuánto tráfico ahorra reordenar los datos de verdad, y cuándo compensa hacerlo cada frame."
+subject: webgpu
+level: 36
+order: 4
+position: "36.4"
+duration: "18 min"
+---
+
+<Lead>
+Con el array de índices agrupados por celda, la búsqueda de vecinos ya funciona: para cada vecino se lee su índice y con él se accede al array de partículas. Ese segundo acceso es una indirección, y una indirección en GPU no cuesta una instrucción más: cuesta que las 32 invocaciones de un warp lean posiciones dispersas de VRAM en vez de un bloque contiguo, lo cual multiplica por varios el número de transacciones de memoria. Reordenar físicamente los datos elimina la indirección y con ella el problema, a cambio de una pasada extra que hay que justificar.
+</Lead>
+
+<Goals>
+
+- Cuantificar el coste de la indirección en transacciones de memoria.
+- Escribir el kernel de reordenación y el patrón de doble buffer que necesita.
+- Decidir entre reordenar los datos o quedarse con el array de índices.
+- Combinar la reordenación con un orden de celdas que preserve la localidad.
+
+</Goals>
+
+## Qué cuesta la indirección
+
+Una transacción de memoria de una GPU trae un bloque alineado, típicamente de 128 bytes. Si las 32 invocaciones de un warp leen 32 valores de 4 bytes consecutivos, el hardware hace una transacción y usa los 128 bytes. Si leen 32 valores dispersos, hace hasta 32 transacciones y usa 4 bytes de cada 128.
+
+Con el array de índices, el bucle de vecinos lee `ordenado[k]` de forma perfectamente contigua —eso está bien— y después lee `parts[j]` con `j` arbitrario. Ahí está la dispersión. Y como la estructura de partícula ocupa 32 bytes, cada lectura dispersa trae 128 bytes de los que usa 32: un aprovechamiento del 25 por ciento en el mejor caso, y peor si los vecinos están repartidos por todo el array.
+
+Con los datos reordenados, las partículas de una misma celda son contiguas en memoria. El bucle de vecinos recorre `parts[k]` con `k` consecutivo, y las transacciones se aprovechan enteras. En un kernel de SPH, donde cada partícula lee unas 84 vecinas, esa diferencia es la mayor parte del tiempo de ejecución.
+
+| disposición | bytes traídos por vecino | aprovechamiento |
+|---|---|---|
+| índice + indirección | hasta 128 | 25% o menos |
+| datos reordenados | 32 amortizados | cerca del 100% |
+
+Las mediciones que he visto en implementaciones de SPH sitúan la mejora entre dos y cuatro veces en el kernel de vecinos, que suele ser el 70 por ciento del frame. Es de las optimizaciones con mejor relación entre esfuerzo y resultado de toda la simulación.
+
+## El kernel de reordenación
+
+Es una recolección: cada invocación de destino lee de dónde viene y copia.
+
+```wgsl
+struct Particula { pos: vec3f, vida: f32, vel: vec3f, masa: f32 };
+
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read>       ordenado: array<u32>;
+@group(0) @binding(2) var<storage, read>       origen:   array<Particula>;
+@group(0) @binding(3) var<storage, read_write> destino:  array<Particula>;
+
+@compute @workgroup_size(64)
+fn reordenar(@builtin(global_invocation_id) gid: vec3u) {
+  let k = gid.x;
+  if (k >= p.conteo) { return; }
+  destino[k] = origen[ordenado[k]];
+}
+```
+
+La dirección importa. Escrito así —recolección, con el destino contiguo y el origen disperso— las escrituras son perfectamente coalescentes y solo las lecturas están dispersas. La versión contraria —dispersión, `destino[ordenado[k]] = origen[k]`— tendría lecturas coalescentes y escrituras dispersas, y en casi todo el hardware la escritura dispersa es más cara que la lectura dispersa, porque no hay nada que prebuscar y las transacciones parciales obligan a leer-modificar-escribir. **Recolectar, no dispersar**, siempre que se pueda elegir.
+
+Como origen y destino son buffers distintos, hace falta doble buffer y hay que intercambiarlos cada frame, con la mecánica de bind groups alternos que ya conoces. Y una consecuencia práctica: el array `ordenado` deja de hacer falta después de la reordenación, así que la búsqueda de vecinos solo necesita `inicios`.
+
+Si el estado está repartido en varios buffers, la reordenación tiene que aplicarse a todos ellos con el mismo `ordenado`. Se puede hacer en un solo kernel que lea y escriba los tres pares, lo cual es mejor que tres kernels porque el `ordenado[k]` se lee una sola vez.
+
+## Reordenar o no
+
+La pasada de reordenación cuesta una lectura dispersa y una escritura secuencial del estado completo: con un millón de partículas y 32 bytes, unos 64 megabytes de tráfico. La pregunta es si lo que ahorra en el kernel de vecinos lo compensa.
+
+**Compensa claramente** cuando cada partícula recorre muchos vecinos, que es el caso de SPH —del orden de 80— y de cualquier fuerza de largo alcance dentro del radio. Ahí el kernel de vecinos hace ochenta lecturas dispersas por partícula y la reordenación las convierte en secuenciales; ahorras ochenta veces lo que gastas.
+
+**No compensa** cuando la interacción es esporádica. Una detección de colisiones entre partículas que casi nunca chocan recorre pocos candidatos y sale antes; ahí la reordenación es un coste fijo por una ganancia pequeña.
+
+**Compensa a medias** cuando hay varios kernels que recorren vecinos en el mismo frame. Un SPH tiene al menos dos —densidad y fuerzas— y a veces tres. Como la reordenación se paga una vez y beneficia a todos, cuantos más kernels de vecinos haya, más clara es la decisión.
+
+Hay una vía intermedia que funciona muy bien y se usa poco: **reordenar cada N frames en vez de cada frame**. Entre reordenaciones, las partículas se mueven poco, así que el array sigue estando casi ordenado por celda y la localidad se degrada despacio. Con `N` igual a 4 u 8, el coste de la reordenación se divide por ese factor y la pérdida de localidad es pequeña. La complicación es que el array `ordenado` sí hay que reconstruirlo cada frame, así que en los frames sin reordenación se vuelve a la indirección, aunque a una indirección **local**, porque el índice apunta a una posición cercana. Ese matiz es lo que hace que la técnica funcione: una indirección a 100 posiciones de distancia se sirve de la caché; una a un millón, no.
+
+## El orden de las celdas también importa
+
+Reordenar las partículas por celda las agrupa dentro de cada celda, pero el orden **entre** celdas lo decide el índice de celda. Con el índice lineal `x + y·GX + z·GX·GY`, las celdas vecinas en `z` están separadas por `GX·GY` posiciones en el array de celdas, y las partículas que contienen quedan igual de lejos en el array reordenado.
+
+Eso importa porque el bucle de vecinos recorre 27 celdas, no una. Aunque cada celda sea internamente contigua, saltar entre las nueve tiras de celdas contiguas es exactamente el patrón que la caché no aguanta con rejillas grandes.
+
+La solución es indexar las celdas con un código de Morton, como se apuntaba al [definir la rejilla](/guia/webgpu/n36-el-hash-grid-uniforme/). Con la curva Z, las 27 celdas de una vecindad ocupan un rango mucho más compacto del índice, y tras la reordenación las partículas vecinas quedan próximas en memoria de verdad. La ganancia se suma a la de la reordenación en vez de solaparse con ella, porque atacan dos niveles distintos de localidad: una agrupa dentro de la celda y la otra agrupa las celdas entre sí.
+
+<Callout type="dios" title="Reordenar es un counting sort completo, y por eso este nivel no necesita el sort del nivel anterior">
+Merece la pena pararse a ver qué se ha construido, porque es la respuesta a una pregunta que queda flotando desde el nivel de ordenación. La cadena completa —contar por celda, escanear los conteos, dispersar los índices, reordenar los datos— es exactamente un **counting sort estable con la celda como clave**, ni más ni menos. No se ha usado un bitonic sort, ni un radix sort, ni una sola comparación entre elementos. Y sin embargo casi toda la literatura de fluidos en GPU describe este paso como "ordenar las partículas por celda" y muchas implementaciones usan efectivamente un radix sort de propósito general sobre el índice de celda. Funciona, y es entre dos y cuatro veces más caro de lo necesario: un radix sort de 32 bits hace ocho pasadas sobre el array, y aquí basta una, porque el rango de la clave —el número de celdas— es conocido y la memoria para el histograma cabe. Cuando el número de celdas es tan grande que el histograma no cabe, entonces sí el radix sort es la respuesta, y ese cruce está alrededor de los diez millones de celdas. La lección general, que vale mucho más allá de esta cadena concreta, es que **cuando la clave tiene un rango conocido y acotado, ordenar es contar**, y contar es una pasada. Reconocer esa situación ahorra un orden de magnitud, y aparece más veces de las que parece: agrupar por material, por nivel de detalle, por cubo de profundidad, por tipo de objeto. En todos esos casos el reflejo de llamar a un sort es caro y equivocado.
+</Callout>

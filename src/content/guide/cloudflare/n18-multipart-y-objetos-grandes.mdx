@@ -1,0 +1,133 @@
+---
+title: "Multipart y objetos grandes"
+description: "Un solo put sube hasta 5 GiB; más allá, y hasta el techo de 5 TiB por objeto, hay que partir el fichero. La subida multipart trocea un objeto en partes que viajan independientes, en paralelo y con reintento por trozo, y luego se ensamblan en el destino. Vemos el límite del put único, cómo hacer streaming del cuerpo sin bufferizar, y la mecánica de crear la subida, subir cada parte y completarla, con sus reglas de tamaño."
+subject: cloudflare
+level: 18
+order: 3
+position: "18.3"
+duration: "16 min"
+---
+
+<Lead>
+Servir un objeto grande es fácil: es un flujo que atraviesa el Worker. Subirlo es lo difícil, porque una subida es frágil por naturaleza —un fichero de varios gigabytes por una red imperfecta es una apuesta a que nada se corte en diez minutos—. R2 ofrece dos caminos según el tamaño. Para lo pequeño y mediano, un `put` de una sola tacada. Para lo grande, la subida multipart: partes el fichero en trozos que viajan por separado, se reintentan solos si fallan, pueden ir en paralelo, y solo al final se ensamblan en un único objeto. Entender cuándo cruzar de un modo al otro, y por qué el multipart existe, es entender cómo se mueven los bytes grandes por internet.
+</Lead>
+
+<Goals>
+
+- Situar los límites: hasta 5 GiB en un `put` único y hasta 5 TiB por objeto vía multipart.
+- Hacer streaming del cuerpo de una petición directamente a `put` sin bufferizarlo en el isolate.
+- Ejecutar una subida multipart con `createMultipartUpload`, `uploadPart` y `complete`.
+- Aplicar las reglas de tamaño: mínimo 5 MiB por parte salvo la última, máximo 10 000 partes.
+
+</Goals>
+
+## El techo de un solo `put`
+
+La operación más simple, `put`, cubre la inmensa mayoría de los casos: sube un objeto en una única petición, hasta un tope de 5 GiB. Pero cuidado con una trampa del edge: si construyes el cuerpo cargándolo entero en memoria —leyendo la petición a un `ArrayBuffer` antes de subirlo— chocas mucho antes con los límites del propio Worker, no con los de R2. La subida grande solo funciona si haces streaming.
+
+La buena noticia es que `put` acepta un `ReadableStream`, y el cuerpo de una petición entrante ya es uno. Puedes encadenar la entrada del cliente directamente a la salida hacia R2, de modo que los bytes fluyan a través del Worker sin acumularse en él:
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // request.body es un ReadableStream: no se bufferiza nada en el isolate.
+    const objeto = await env.BUCKET.put("subida.bin", request.body, {
+      httpMetadata: { contentType: request.headers.get("content-type") ?? "application/octet-stream" },
+    });
+    return Response.json({ clave: objeto.key, tamano: objeto.size });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+Aquí conviene separar dos límites que se confunden. El de R2 dice: un objeto pesa como mucho 5 TiB, y un `put` único mueve como mucho 5 GiB. El del Worker dice: el cuerpo de una petición entrante tiene su propio tope, y la memoria del isolate es escasa. El streaming resuelve el segundo problema; para superar el primero —objetos por encima de 5 GiB— no hay atajo: hay que partir.
+
+## Multipart: partir para conquistar
+
+La subida multipart descompone un objeto en partes numeradas que se suben de forma independiente y se ensamblan al final. Son tres actos. Primero abres la subida con `createMultipartUpload`, que te devuelve un `R2MultipartUpload` con un `uploadId`. Luego subes cada parte con `uploadPart`, que te devuelve por cada trozo un `R2UploadedPart` —su número y su `etag`—. Por último llamas a `complete` con la lista de partes, y solo entonces el objeto aparece, completo y visible globalmente, bajo su clave.
+
+```ts
+const subida = await env.BUCKET.createMultipartUpload("video.mp4");
+try {
+  const partes: R2UploadedPart[] = [];
+  // Cada parte, salvo la ultima, debe pesar al menos 5 MiB.
+  partes.push(await subida.uploadPart(1, trozo1));
+  partes.push(await subida.uploadPart(2, trozo2));
+  partes.push(await subida.uploadPart(3, trozoFinal));
+  const objeto = await subida.complete(partes);   // se ensambla y aparece
+  console.log(objeto.key, objeto.size);
+} catch (err) {
+  await subida.abort();   // limpia las partes subidas si algo falla
+  throw err;
+}
+```
+
+Las reglas de tamaño no son caprichos, son el contrato del ensamblaje. Cada parte, excepto la última, debe pesar al menos 5 MiB, y todas las partes no finales han de tener el mismo tamaño; la última puede ser más pequeña. Un objeto se compone de hasta 10 000 partes, lo que con partes de tamaño generoso te lleva sin problema hasta el techo de los teras. Y una subida a medias no es eterna: R2 aborta automáticamente las subidas multipart incompletas a los siete días, para que las partes huérfanas de un proceso que murió no se te queden ocupando espacio en silencio.
+
+<Cards>
+  <Card icon="🆕" title="createMultipartUpload">
+    Abre la subida y devuelve un `uploadId`. Ese identificador es el estado externo que hace la subida coordinable y reanudable.
+  </Card>
+  <Card icon="🧱" title="uploadPart">
+    Sube una parte numerada y devuelve su `etag`. Cada parte es independiente: viaja sola, se reintenta sola, va en paralelo.
+  </Card>
+  <Card icon="✅" title="complete">
+    Ensambla las partes en el orden que le pasas y publica el objeto. Recién entonces la clave existe y es visible globalmente.
+  </Card>
+  <Card icon="🧹" title="abort">
+    Cancela la subida y libera las partes ya subidas. Sin él, quedarían ocupando espacio hasta la caducidad de siete días.
+  </Card>
+</Cards>
+
+## Streaming de subida y reanudabilidad
+
+La virtud que justifica toda la ceremonia del multipart es que cada parte es una unidad independiente de fallo y de progreso. Si el trozo siete falla por un corte de red, reintentas el trozo siete —no los seis anteriores, que ya están a salvo en R2—. Si tienes ancho de banda, subes varias partes a la vez en lugar de en fila. Y como el `uploadId` identifica la subida en curso, un proceso distinto —otra invocación del Worker, otro cliente— puede retomarla con `resumeMultipartUpload` sin haber sido quien la empezó.
+
+```ts
+// Retomar una subida ya iniciada, con la clave y el uploadId guardados.
+const subida = env.BUCKET.resumeMultipartUpload("video.mp4", uploadId);
+const parte = await subida.uploadPart(4, siguienteTrozo);
+```
+
+Esto convierte la subida en algo reanudable y coordinable. Guardas el `uploadId` y qué partes llevas confirmadas —en KV o D1—, y el proceso sobrevive a que el Worker que lo arrancó se recicle. El `complete` final es idempotente en su resultado: le entregas la lista exacta de partes con sus `etag`, y si falta alguna o un `etag` no cuadra, falla en vez de ensamblar a medias un objeto corrupto.
+
+El trabajo fino está en trocear la fuente en partes de tamaño uniforme. Si recibes un flujo, lo lees acumulando bytes hasta llenar un trozo del tamaño elegido, subes esa parte, y repites; solo el último trozo puede quedar por debajo del mínimo. Elegir el tamaño de parte es un equilibrio: partes pequeñas dan más granularidad de reintento pero más operaciones que pagar y más redondeos; partes grandes, lo contrario.
+
+```ts
+const TAM = 8 * 1024 * 1024;   // 8 MiB por parte, por encima del minimo de 5
+const partes: R2UploadedPart[] = [];
+let numero = 1;
+for (const trozo of trocear(fuente, TAM)) {
+  partes.push(await subida.uploadPart(numero++, trozo));
+}
+await subida.complete(partes);
+```
+
+<Callout type="warn" title="Tamaño uniforme y una escritura por segundo">
+Dos reglas te morderán si las ignoras. Todas las partes no finales deben tener exactamente el mismo tamaño, o `complete` rechaza el ensamblaje; no mezcles trozos de 8 y de 6 MiB. Y R2 admite como mucho una escritura por segundo sobre una misma clave: si martilleas la misma clave con `put` concurrentes, recibirás respuestas `429`. El multipart no viola esa regla —sus partes son una sola subida coordinada—, pero tu diseño alrededor sí puede.
+</Callout>
+
+<Callout type="note" title="Casi nunca implementas el multipart a mano">
+La mayoría de los SDK y herramientas compatibles con S3 —`rclone`, `aws-sdk`— eligen multipart automáticamente cuando un fichero supera cierto umbral configurable. Rara vez tendrás que orquestar `uploadPart` tú mismo: lo harás cuando el troceo ocurra dentro de tu Worker, por ejemplo al recibir una subida por partes desde un cliente y reenviarla a R2. Conviene conocer la mecánica aunque muchas veces la ejecute la herramienta por ti.
+</Callout>
+
+<Mermaid code={`flowchart TB
+  Init[createMultipartUpload devuelve uploadId] --> P1[uploadPart 1]
+  Init --> P2[uploadPart 2]
+  Init --> P3[uploadPart 3]
+  P1 --> C[complete con la lista de partes]
+  P2 --> C
+  P3 --> C
+  C --> Obj[objeto unico visible]
+  class Obj t-green`} />
+
+<Callout type="dios" title="El multipart aplica a los bytes la misma idea que la ejecución durable aplica al cómputo">
+Detén la mirada en la forma del problema, porque ya la has visto antes. Una subida monolítica es todo o nada: un solo canal largo por el que han de pasar sin tropiezo miles de millones de bytes, y si el canal se corta al 90 por ciento, no tienes el 90 por ciento —tienes nada, y vuelves a empezar—. Es exactamente la fragilidad de la ejecución efímera que motivó los Workflows, transportada del cómputo al almacenamiento. Y la solución tiene la misma silueta: no persigas una transferencia que no falle nunca, construye una transferencia cuyo progreso sobreviva al fallo. El multipart trocea el problema en unidades pequeñas cada una de las cuales, una vez confirmada, es un punto de control durable que ya no se repite. El corte de red deja de ser una catástrofe global y se reduce a reintentar un trozo. Aparecen de regalo dos propiedades que la subida única jamás podría dar: el paralelismo, porque las partes son independientes y viajan a la vez, y la reanudabilidad, porque el `uploadId` externaliza el estado de la subida y cualquiera puede retomarla. Si miras con esta lente reconocerás el mismo patrón por todas partes —el reintento por lotes de un cron, los pasos con checkpoint de un Workflow, los segmentos de una descarga con rango, incluso el write-ahead log de una base de datos—: fragmentar un todo frágil en piezas idempotentes con progreso persistido es una de las ideas verdaderamente universales de los sistemas distribuidos. La lección de nivel dios no es memorizar los tres métodos del multipart, es reconocer que "parte grande y arriesgada en trozos pequeños y confirmables" es la misma respuesta que la ingeniería da una y otra vez a la fragilidad, ya sea de cómputo o de datos. El día que interiorizas esa forma, dejas de aprender APIs sueltas y empiezas a ver la única idea que todas comparten.
+</Callout>
+
+<Challenge title="Sube un objeto que no cabe en un put">
+1. Escribe un Worker que suba `request.body` con un solo `put` en streaming y verifica que la memoria del isolate no crece con el tamaño del fichero.
+2. Explica con precisión la diferencia entre el límite de 5 GiB del `put` único, el de 5 TiB por objeto y el tope del cuerpo de petición del propio Worker.
+3. Implementa una subida multipart de tres partes con `createMultipartUpload`, `uploadPart` y `complete`, respetando el mínimo de 5 MiB salvo en la última parte.
+4. Añade manejo de error que llame a `abort` si una parte falla, y razona qué pasaría con las partes huérfanas si no lo hicieras y por qué R2 las caduca a los siete días.
+5. Diseña, sin implementarlo, cómo harías reanudable la subida guardando el `uploadId` y las partes confirmadas, y por qué eso la hace sobrevivir al reciclado del Worker.
+</Challenge>

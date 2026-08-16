@@ -1,0 +1,162 @@
+---
+title: "Qué comprueba la validación y qué sigue siendo tu problema"
+description: "Por qué WebGPU valida en la creación y no en cada draw, las familias de comprobaciones con sus mensajes reales, el canal aparte de los errores de shader, y la frontera exacta de lo que nadie va a verificar por ti."
+subject: webgpu
+level: 44
+order: 4
+position: "44.4"
+duration: "21 min"
+---
+
+<Lead>
+La queja más repetida sobre WebGPU es que sus descriptores son interminables: para dibujar un triángulo hay que declarar el layout de vértices, el formato de cada attachment, el estado de profundidad, el de mezcla y el de primitiva. Esa verbosidad no es burocracia, es el precio de una decisión de diseño concreta: WebGPU comprueba todo lo que puede en el momento de crear los objetos para no tener que comprobar casi nada en el momento de dibujar. Entender qué familias de comprobaciones existen te permite leer un mensaje de error y saber en qué descriptor buscar; entender dónde termina la validación te ahorra las horas que se pierden esperando que el navegador te avise de un fallo que nunca va a detectar.
+</Lead>
+
+<Goals>
+
+- Explicar por qué la validación previa hace que el camino de dibujado sea más rápido que en WebGL.
+- Clasificar un mensaje de validación en su familia y saber qué descriptor revisar.
+- Extraer los errores de compilación de un módulo WGSL con `getCompilationInfo` y situarlos en el fuente.
+- Delimitar qué clases de fallo la validación no puede detectar por construcción.
+
+</Goals>
+
+## Validar una vez, no en cada draw
+
+En WebGL, cada llamada de dibujado es una apuesta sobre una máquina de estados global. El driver tiene que verificar en ese instante si el programa está enlazado, si los atributos activos tienen buffer asignado, si el framebuffer está completo, si el formato de cada textura enlazada es compatible con el modo de filtrado del sampler, si los uniformes tienen tipo correcto. Y tiene que hacerlo **en cada draw**, porque entre dos llamadas consecutivas cualquier `bindTexture` o `useProgram` ha podido cambiar cualquier cosa. Ese coste por llamada es una parte grande de por qué el camino de dibujado de WebGL es caro en CPU.
+
+WebGPU eliminó el problema congelando el estado dentro de objetos inmutables. Un `GPURenderPipeline` contiene ya el módulo de shader, el layout de vértices, los formatos de los attachments, el estado de profundidad y estarcido, el de mezcla y el de primitiva; nada de eso se puede cambiar después. Un `GPUBindGroup` contiene una lista fija de recursos que se verificó contra su layout al crearse. Cuando llegas al `draw`, la mayoría de las preguntas ya tienen respuesta: solo queda comprobar cosas baratas, como que el bind group enlazado en el grupo cero sea compatible con el layout que el pipeline declaró, o que haya un vertex buffer en cada ranura que el layout exige.
+
+De ahí sale la verbosidad. Si la validación ocurre en la creación, la creación tiene que recibir toda la información, y no hay valores «por defecto» que el driver pueda deducir sobre la marcha. Es un intercambio explícito: escribes cincuenta líneas de descriptor una vez en el arranque para no pagar nada en las cien mil llamadas de dibujado que vienen después.
+
+Hay un segundo efecto, menos comentado y más útil: como la validación ocurre lejos del bucle de fotogramas, **puede permitirse ser cara y exhaustiva**. Un driver que valida por draw tiene que ser rápido y acaba comprobando lo mínimo; un sistema que valida al crear puede recorrer el shader entero, cruzarlo con el layout y redactar un párrafo explicando la incompatibilidad. Por eso los mensajes de WebGPU son de los mejores del ecosistema web: no es que alguien se esmerara más, es que el modelo lo permite.
+
+## Las familias de comprobaciones
+
+Casi todo lo que verás cae en una de seis familias. Reconocer la familia por la forma del mensaje es lo que te lleva directo al descriptor culpable.
+
+| Familia | Qué compara | Dónde se emite |
+|---|---|---|
+| Compatibilidad de layouts | Bind group contra bind group layout, pipeline layout contra el shader | Creación del bind group o del pipeline |
+| Usos de buffer y textura | El flag de `usage` que la operación exige | La operación que lo usa |
+| Formatos y attachments | Formato de la vista contra el declarado en el pipeline | Comienzo del render pass o `finish` |
+| Tamaños y alineaciones | Múltiplos exigidos por el hardware | La copia o la escritura |
+| Rangos y límites | El valor contra el límite del dispositivo | Creación del recurso |
+| Estado del encoder | El orden de las llamadas | `finish` del encoder |
+
+**Compatibilidad de layouts.** Es la más frecuente en cuanto tu proyecto crece. Cubre dos cruces distintos: el bind group contra el bind group layout con el que se crea, y el pipeline layout contra lo que el módulo de shader declara con sus atributos de grupo y binding. Un shader que declara un `var` de storage de solo lectura no encaja en un layout que anuncia storage de lectura y escritura, aunque el tipo del contenido coincida.
+
+```bash
+Bind group layout entry 0 is not compatible with the shader module:
+the shader declares buffer type read-only-storage but the layout
+declares storage.
+```
+
+**Usos de buffer y textura.** El error número uno de todo el que empieza, sin discusión. Cada operación exige un flag concreto en `usage` y la lista es larga: copiar hacia un buffer necesita `COPY_DST`, copiar desde él `COPY_SRC`, mapearlo para leer `MAP_READ`, enlazarlo como uniforme `UNIFORM`, dibujar índices desde él `INDEX`. Lo mismo con texturas: `RENDER_ATTACHMENT` para pintar en ella, `TEXTURE_BINDING` para muestrearla, `STORAGE_BINDING` para escribir desde un shader. Y el flag hay que pedirlo en la creación, no cuando lo necesitas.
+
+```bash
+[Buffer "particulas/posiciones"] usage (BufferUsage::Storage|CopySrc)
+doesn't include BufferUsage::CopyDst.
+ - While calling [Queue].WriteBuffer([Buffer "particulas/posiciones"], 0, ...).
+```
+
+La tentación es pedir todos los flags siempre. No lo hagas: el `usage` es información que la implementación usa para elegir dónde y cómo colocar la memoria, y un buffer que declara `MAP_READ` acaba en memoria visible por la CPU, que es más lenta para la GPU. Pide lo que necesitas y nada más.
+
+**Formatos y attachments.** El formato de la vista de textura que enlazas como attachment tiene que coincidir exactamente con el que declaraste en `targets` del pipeline, y el número de muestras del pass con el `multisample.count` del pipeline. No hay conversión implícita.
+
+```bash
+Attachment [TextureView "gbuffer/normales"] format (RGBA16Float) does not
+match the expected format (RGBA8Unorm) of the pipeline
+[RenderPipeline "gbuffer/opacos"].
+```
+
+**Tamaños y alineaciones.** El hardware impone múltiplos y WebGPU los hace explícitos. Los dos que más vas a encontrar: en cualquier copia entre textura y buffer, `bytesPerRow` debe ser **múltiplo de 256**, lo que obliga a rellenar cada fila y a desrellenarla al leer; y los desplazamientos y tamaños de `writeBuffer` y de `copyBufferToBuffer` deben ser **múltiplos de 4**. A eso se suman las alineaciones de enlace: el offset de un binding de uniform o de storage tiene que ser múltiplo de la alineación mínima del dispositivo, que por defecto son 256 bytes.
+
+```bash
+bytesPerRow (3200) is not a multiple of 256.
+ - While encoding [CommandEncoder "volcado"].CopyTextureToBuffer(...).
+```
+
+**Rangos y límites.** Todo valor numérico se compara con el límite correspondiente del dispositivo, y esos límites son los que pediste en `requestDevice` o los garantizados por defecto si no pediste nada. Pedir una textura de 16384 de lado en un dispositivo con el valor por defecto de 8192 es un error de validación, no un problema de memoria.
+
+**Estado del encoder.** El encoder es una máquina de estados con reglas de orden: no puedes grabar comandos después de `finish()`, no puedes usar el command encoder mientras hay un pass abierto, y todo pass tiene que cerrarse con `end()`. Como todo lo del encoder, el veredicto llega en `finish()`.
+
+## Los shaders van por otro canal
+
+Los errores de compilación de WGSL no viajan por el mismo camino que el resto, y esto sorprende siempre. `device.createShaderModule()` **no lanza ni devuelve nada especial** aunque el código esté lleno de errores de sintaxis: devuelve un `GPUShaderModule` inválido, y el error de validación no aparece hasta que intentas crear un pipeline con él. Si solo miras los error scopes, tu diagnóstico será «pipeline inválido» sin una sola pista sobre qué línea del shader tiene la culpa.
+
+El diagnóstico de verdad se pide aparte, con `getCompilationInfo()`. Devuelve una promesa a un `GPUCompilationInfo` con una propiedad `messages`, y cada `GPUCompilationMessage` trae seis campos:
+
+| Campo | Contenido |
+|---|---|
+| `message` | El texto del diagnóstico |
+| `type` | `"error"`, `"warning"` o `"info"` |
+| `lineNum` | Línea del fuente, empezando en uno. Vale cero si el mensaje no apunta a un punto concreto |
+| `linePos` | Posición dentro de la línea, empezando en uno. Cero si no aplica |
+| `offset` | Desplazamiento desde el principio del fuente, en unidades de código UTF-16 |
+| `length` | Longitud del fragmento señalado, en unidades de código UTF-16 |
+
+Con eso se construye un informe que señala la línea exacta, que es lo que cualquier compilador serio te da y lo que el navegador no te va a dar solo:
+
+```ts
+async function compilarWGSL(device: GPUDevice, label: string, fuente: string) {
+  const modulo = device.createShaderModule({ label, code: fuente });
+  const info = await modulo.getCompilationInfo();
+
+  const lineas = fuente.split("\n");
+  let hayError = false;
+
+  for (const m of info.messages) {
+    if (m.type === "error") hayError = true;
+
+    const cabecera = `[${m.type}] ${label}:${m.lineNum}:${m.linePos} — ${m.message}`;
+    if (m.lineNum === 0) {
+      console.warn(cabecera);
+      continue;
+    }
+
+    const linea = lineas[m.lineNum - 1] ?? "";
+    const sangria = " ".repeat(Math.max(0, m.linePos - 1));
+    const subrayado = "^".repeat(Math.max(1, m.length));
+    console.warn(`${cabecera}\n  ${linea}\n  ${sangria}${subrayado}`);
+  }
+
+  if (hayError) throw new Error(`el módulo "${label}" no compila`);
+  return modulo;
+}
+```
+
+Merece la pena llamarlo siempre, no solo cuando algo falla: los mensajes de tipo `"warning"` e `"info"` aparecen aunque la compilación funcione, y ahí es donde las implementaciones avisan de cosas como una variable declarada sin usar o un patrón que el backend va a traducir de forma subóptima. Es información gratis que casi nadie lee.
+
+La creación del pipeline tiene además una variante asíncrona que se comporta de forma distinta al resto del API. `createRenderPipelineAsync` y `createComputePipelineAsync` devuelven promesas que **sí rechazan** cuando la creación falla, y lo hacen con un `GPUPipelineError` que trae, además del `message`, una propiedad `reason` con dos valores posibles: `"validation"` si el descriptor o el shader están mal, e `"internal"` si el backend no pudo compilar algo que era legal.
+
+```ts
+try {
+  pipeline = await device.createRenderPipelineAsync(descriptor);
+} catch (e) {
+  if (e instanceof GPUPipelineError) {
+    console.error(`pipeline "${descriptor.label}" rechazado (${e.reason}): ${e.message}`);
+  }
+  throw e;
+}
+```
+
+Que la versión asíncrona sea la correcta no es una cuestión de estilo. Crear un pipeline implica que el backend traduzca tu WGSL al lenguaje nativo y lo compile de verdad, y eso puede tardar decenas o cientos de milisegundos por pipeline. La versión síncrona retorna inmediatamente, pero el trabajo no desaparece: se acumula y aparece como un tirón cuando ese pipeline se usa por primera vez, normalmente en mitad de una animación. La versión asíncrona te devuelve el control mientras el trabajo ocurre de fondo y te deja mostrar una barra de progreso honesta. Como norma: en el arranque y en cualquier carga diferida, siempre asíncrona.
+
+## Lo que la validación no comprueba
+
+Aquí está la frontera, y conviene tenerla clara porque es donde termina la ayuda y empieza tu trabajo.
+
+**El significado de los bytes.** La validación comprueba que tu buffer tenga el tamaño y el uso correctos; no tiene ni idea de qué representan sus contenidos. Una matriz escrita en el orden equivocado, un `vec3f` que en realidad ocupa cuatro flotantes por las reglas de alineación de WGSL, un color en espacio lineal donde el shader espera sRGB: todo eso es perfectamente válido y perfectamente incorrecto. El síntoma será geometría deformada o colores raros, nunca un mensaje.
+
+**La matemática.** Una matriz de proyección mal construida, un cuaternión sin normalizar, un plano de recorte invertido. La validación no evalúa nada; para ella son dieciséis flotantes en un buffer del tamaño correcto.
+
+**Los índices fuera de rango.** Este merece un párrafo propio porque es contraintuitivo. Si tu index buffer apunta a un vértice que no existe, WebGPU **no genera un error de validación**. Lo que hace es garantizar que el acceso no lea memoria ajena: el resultado es un vértice de ceros o un valor recortado, según la implementación. Es decir, el modelo te protege de leer memoria de otro proceso, pero no de leer basura tuya. Verás triángulos degenerados apuntando al origen, no un mensaje.
+
+**Cualquier error lógico dentro del shader.** Un bucle que itera una vez de más, una división que produce infinito, un `NaN` que se propaga y convierte un fragmento entero en negro, una normal sin normalizar tras una interpolación. El compilador de WGSL comprueba tipos y comprueba las reglas de uniformidad, y ahí se acaba. Todo lo demás es un programa que hace exactamente lo que escribiste.
+
+La consecuencia práctica ordena el resto del nivel: **cuando la consola está limpia y la pantalla está mal, la validación ya ha dicho todo lo que tenía que decir**. A partir de ese punto, ninguna herramienta te va a señalar el fallo, y lo único que funciona es acotar con [error scopes](/guia/webgpu/n44-error-scopes/), leer con etiquetas y volcar valores para verlos con tus ojos.
+
+<Callout type="dios" title="La validación de WebGPU no existe para ayudarte a ti">
+Este es el cambio de perspectiva que explica todas las decisiones raras del API. La validación de WebGPU es, ante todo, **una frontera de seguridad**. Estás pidiendo a un navegador que deje a código arbitrario de una página web cualquiera hablar con un driver de GPU, que es históricamente una de las superficies de ataque más blandas de un sistema operativo: un montón de código nativo, escrito bajo presión de rendimiento, que hasta hace poco solo recibía datos de aplicaciones instaladas y de confianza. Cada regla del modelo existe para que ninguna secuencia de llamadas de JavaScript pueda leer la memoria de otra pestaña, colgar el compositor o corromper el estado del driver. Que además los mensajes sean legibles es un efecto colateral afortunado, no el objetivo. De ahí salen dos consecuencias que conviene interiorizar. La primera: **no esperes que la validación crezca hacia la comodidad**. Nadie va a añadir una comprobación de que tu matriz de proyección tiene sentido, porque una matriz absurda no es un riesgo de seguridad y validarla costaría tiempo en el camino caliente. La frontera está donde está y no se va a mover. La segunda, más útil: **«válido» y «correcto» son propiedades ortogonales**, y confundirlas es lo que hace que la gente se quede mirando una consola limpia esperando una pista que no va a llegar. Un programa que no genera ni un error de validación puede pintar cualquier disparate; lo único que el modelo te garantiza es que ese disparate se queda dentro de tu pestaña. El caso de los índices fuera de rango lo resume perfecto: la especificación se toma la molestia de definir exactamente qué pasa —lees ceros o un valor recortado, nunca memoria ajena— y a la vez se niega explícitamente a considerarlo un error. Esa frase, «comportamiento definido pero probablemente no el que querías», es la descripción exacta del territorio donde vive el 90% de tus bugs de gráficos.
+</Callout>

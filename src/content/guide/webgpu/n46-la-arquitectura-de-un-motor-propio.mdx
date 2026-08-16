@@ -1,0 +1,189 @@
+---
+title: "La arquitectura de un motor de render propio, de principio a fin"
+description: "Las capas de un renderizador WebGPU real, el ciclo completo de un fotograma, el reparto de los cuatro bind groups, y por qué cada decisión está donde está."
+subject: webgpu
+level: 46
+order: 1
+position: "46.1"
+duration: "25 min"
+---
+
+<Lead>
+Todo lo de los cuarenta y cinco niveles anteriores se junta en un fichero de arranque y en un bucle. La diferencia entre una demo y un motor no está en los shaders ni en las técnicas: está en que el motor tiene un sitio definido para cada responsabilidad, un orden justificado para cada pasada, y una forma de apagarse que no deja nada encendido. Esta lección es el andamiaje completo, escrito como se escribe cuando ya se han cometido los errores.
+</Lead>
+
+<Goals>
+
+- Separar un motor WebGPU en capas cuyas responsabilidades no se solapen.
+- Justificar el orden de las pasadas de un fotograma en vez de heredarlo de un tutorial.
+- Repartir los cuatro bind groups por frecuencia de cambio y defender el reparto.
+- Diseñar la propiedad de los recursos para que la destrucción sea una sola llamada.
+
+</Goals>
+
+## Las capas y sus fronteras
+
+Un motor de tamaño real tiene cinco responsabilidades, y el noventa por ciento del dolor futuro viene de mezclar dos de ellas en la misma función.
+
+**El dispositivo** es la capa de más abajo: negocia el adaptador, las features y los límites, posee el `GPUDevice` y la cola, y sabe rehacerse cuando el dispositivo se pierde. No sabe nada de escenas, de materiales ni de cámaras. Es la única capa que habla con `navigator.gpu`, y esa exclusividad es lo que hace que la pérdida de dispositivo sea manejable: solo hay un sitio que reinicializar.
+
+**Los recursos** son los buffers, las texturas, los samplers, los módulos de shader, los layouts y los pipelines. Su trabajo es crearlos, cachearlos por descriptor y liberarlos. La regla que la define: **nada fuera de esta capa llama a `createBuffer` ni a `createRenderPipeline`**, porque el día que quieras cachear pipelines por clave, o recrearlos todos tras perder el dispositivo, necesitas un único punto por el que pasen.
+
+**La escena** es el contenido: transformaciones, mallas, materiales, luces, cámaras. Es datos, no comandos. No conoce WebGPU en absoluto, y esa ignorancia es lo que permite serializarla, probarla sin GPU y compartirla entre la ruta principal y una eventual ruta de reserva.
+
+**El grafo de fotograma** decide qué pasadas hay, en qué orden, qué texturas produce cada una y quién las consume. Es la capa que casi nadie separa y la que más ordena el proyecto: cuando el orden de las pasadas está expresado como datos en vez de como una secuencia de llamadas, añadir una pasada de niebla o quitar el desenfoque de movimiento deja de ser cirugía.
+
+**Las pasadas** son el código concreto de cada una: sombras, prepass de profundidad, geometría, iluminación, transparentes, post-proceso, interfaz. Cada pasada sabe lo que necesita y lo que produce, y nada más.
+
+La frontera que más se rompe es la de escena y pasadas. En cuanto un material guarda un `GPUBindGroup`, la escena ha dejado de ser datos y ya no se puede recrear tras perder el dispositivo sin reconstruir la escena entera. La solución es una indirección barata: el material guarda un identificador, y la capa de recursos mantiene la tabla de identificador a bind group. Cuesta una búsqueda en un mapa y compra la capacidad de tirar y rehacer todos los recursos de la GPU sin tocar la lógica.
+
+```ts
+/** La escena es datos puros: ni un solo objeto de WebGPU aquí dentro. */
+export interface Malla {
+  geometria: IdGeometria;
+  material: IdMaterial;
+  transformacion: Float32Array;   // 16 flotantes
+  esfera: { centro: [number, number, number]; radio: number };
+  visible: boolean;
+}
+
+export interface Escena {
+  mallas: Malla[];
+  luces: Luz[];
+  camara: Camara;
+}
+```
+
+## El ciclo de un fotograma
+
+El orden de las pasadas no es una convención: cada posición se justifica por lo que consume la siguiente. Este es el orden completo de un motor de propósito general y la razón de cada paso.
+
+**Cero: preparar en la CPU.** Actualizar transformaciones, cámara y luces, y escribir los uniforms del fotograma con `writeBuffer`. Aquí no hay ningún comando de GPU todavía.
+
+**Uno: culling.** Frustum y, si lo hay, oclusión. Va lo primero porque todo lo demás depende de cuántos objetos quedan. Si el culling se hace en compute, este es el primer pass del encoder.
+
+**Dos: mapas de sombra.** Van antes que la geometría porque la pasada de iluminación los lee. Son render passes a texturas de profundidad, típicamente con varias cascadas.
+
+**Tres: prepass de profundidad.** Dibuja solo profundidad, sin color. Su función es doble: elimina el overdraw de sombreado en la pasada siguiente, y produce el buffer de profundidad que necesitan la jerarquía de oclusión, el clustered lighting y varios efectos de post-proceso. En una escena con mucho solapamiento se paga solo; en una escena plana es coste puro, así que debe poder desactivarse.
+
+**Cuatro: asignación de luces.** Si el motor es clustered, aquí se construye la rejilla y se asignan las luces en un compute pass. Necesita la profundidad del paso anterior para acotar los clusters ocupados.
+
+**Cinco: geometría opaca.** Con `depthCompare: "equal"` y `depthWriteEnabled: false` si hubo prepass. Es donde se ejecuta el sombreado de verdad.
+
+**Seis: transparentes.** Después de los opacos, ordenados de atrás hacia delante, escribiendo profundidad solo si el material lo pide. Van aquí porque necesitan leer la escena opaca ya resuelta.
+
+**Siete: post-proceso.** Exposición, mapeo de tonos, antialiasing temporal, floraciones, y lo que haya. Cada efecto es un render pass de pantalla completa que lee la salida del anterior, lo que hace que el par de texturas de ping-pong sea el recurso más reutilizado del motor.
+
+**Ocho: interfaz.** Al final, en espacio de pantalla, normalmente sin profundidad.
+
+**Nueve: enviar.** Un solo `queue.submit` con un solo command buffer, salvo que tengas una razón concreta para partirlo.
+
+```ts
+export function dibujarFotograma(m: Motor, escena: Escena, dt: number) {
+  m.actualizarUniformes(escena, dt);            // 0
+
+  const enc = m.device.createCommandEncoder({ label: 'fotograma' });
+
+  m.pases.culling.ejecutar(enc, escena);        // 1
+  m.pases.sombras.ejecutar(enc, escena);        // 2
+  m.pases.prepass.ejecutar(enc, escena);        // 3
+  m.pases.clusters.ejecutar(enc, escena);       // 4
+  m.pases.opacos.ejecutar(enc, escena);         // 5
+  m.pases.transparentes.ejecutar(enc, escena);  // 6
+  m.pases.postproceso.ejecutar(enc, m.contexto.getCurrentTexture()); // 7
+  m.pases.interfaz.ejecutar(enc);               // 8
+
+  m.perfilador?.resolver(enc);
+  m.device.queue.submit([enc.finish()]);        // 9
+  m.perfilador?.leerSinBloquear();
+}
+```
+
+Dos detalles del código anterior que no son estéticos. El primero: `context.getCurrentTexture()` se llama **lo más tarde posible**, justo cuando se va a usar, porque pedirla temprano alarga el tiempo que el motor retiene una textura del sistema de composición. El segundo: la lectura de los tiempos del perfilador ocurre **después** del envío y sin ningún `await`, porque cualquier espera ahí sincroniza la CPU con la GPU y destruye exactamente lo que estabas midiendo.
+
+## Los cuatro bind groups
+
+`maxBindGroups` vale 4 y es un límite duro que no va a subir. Ese número es, en la práctica, la arquitectura de recursos entera de tu motor, y conviene decidirlo el primer día porque cambiarlo después toca todos los shaders. El reparto que funciona es por **frecuencia de cambio**, del que menos cambia al que más:
+
+| Grupo | Frecuencia | Contenido típico |
+|---|---|---|
+| 0 | Una vez por fotograma | Matrices de vista y proyección, tiempo, resolución, parámetros de exposición, luces |
+| 1 | Una vez por pasada | Los objetivos y las texturas de entrada de esa pasada, el buffer de clusters, el mapa de sombras |
+| 2 | Una vez por material | Texturas del material, sus parámetros, el sampler |
+| 3 | Una vez por objeto | Transformación e índice de instancia, casi siempre como offset dinámico |
+
+La razón de ordenarlos así es directa: cambiar un bind group invalida, en la mayoría de las implementaciones, los grupos de índice superior. Si el que cambia por objeto fuera el 0, cada objeto obligaría a reasignar los cuatro. Con este orden, dibujar mil objetos del mismo material cuesta mil `setBindGroup` del grupo 3 y ninguno de los otros.
+
+Y el grupo 3 casi nunca debería ser un bind group nuevo por objeto: es **el mismo bind group con un offset dinámico distinto**, apuntando a una zona diferente de un único buffer de uniforms de objetos. Recuerda que `minUniformBufferOffsetAlignment` vale 256, así que la estructura por objeto se rellena hasta un múltiplo de 256 bytes aunque solo lleve una matriz de 64.
+
+```ts
+const uniformesObjeto = device.createBuffer({
+  label: 'uniformes-por-objeto',
+  size: alineado(numObjetos * 256, 256),
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+});
+
+// Un solo bind group para todos los objetos.
+const grupoObjeto = device.createBindGroup({
+  label: 'grupo-objeto',
+  layout: layoutObjeto,
+  entries: [{
+    binding: 0,
+    resource: { buffer: uniformesObjeto, offset: 0, size: 256 },
+  }],
+});
+
+// En el bucle de dibujado no se crea nada: solo se mueve el offset.
+for (let i = 0; i < numObjetos; i++) {
+  pass.setBindGroup(3, grupoObjeto, [i * 256]);
+  pass.drawIndexed(indices[i].cuenta, 1, indices[i].primero, 0);
+}
+```
+
+El corolario que ordena el bucle de dibujado entero: **ordena por lo que es caro cambiar**. Primero por pipeline, luego por material, y dentro de cada material por objeto. Un cambio de pipeline es lo más caro; un offset dinámico es lo más barato.
+
+## Lo que hace que sobreviva a un año
+
+Tres propiedades separan un motor que se puede mantener de uno que se abandona, y ninguna de las tres tiene que ver con gráficos.
+
+**La propiedad de los recursos es explícita y la destrucción es una sola llamada.** Un registro que apunta cada cosa creada y la libera en orden inverso convierte la limpieza en un problema resuelto. Sin él, cada recurso nuevo es una fuga potencial y nadie se atreve a tocar el ciclo de vida.
+
+```ts
+export function crearRegistro() {
+  const acciones: Array<() => void> = [];
+  return {
+    /** Apunta un recurso con su liberación y lo devuelve. */
+    anotar<T>(recurso: T, liberar: () => void): T {
+      acciones.push(liberar);
+      return recurso;
+    },
+    /** Atajo para cualquier objeto con destroy(). */
+    conDestroy<T extends { destroy(): void }>(recurso: T): T {
+      acciones.push(() => recurso.destroy());
+      return recurso;
+    },
+    liberarTodo() {
+      for (let i = acciones.length - 1; i >= 0; i--) acciones[i]();
+      acciones.length = 0;
+    },
+  };
+}
+```
+
+**Toda creación pasa por una caché con clave.** Los pipelines, los layouts y los samplers son objetos caros de crear y baratos de reutilizar, y si se crean en el sitio donde se usan acabarás creando el mismo pipeline en cada fotograma sin enterarte. Una caché por descriptor serializado resuelve el problema y, de propina, te da la lista completa de pipelines para recrearlos tras perder el dispositivo.
+
+**Cada objeto lleva `label` desde el momento en que nace.** No es cosmética: es la diferencia entre un mensaje de validación que dice "un buffer" y uno que dice cuál. Cuesta cero y se paga la primera tarde que algo falla.
+
+Y una cuarta, que es de proceso y no de código: **el motor tiene que poder arrancar con los límites por defecto explícitos**. Una bandera que crea el dispositivo pidiendo exactamente el contrato mínimo de la especificación convierte cualquier suposición sobre tu hardware en un error de validación en tu propia máquina, hoy, en vez de en un informe de error dentro de seis meses.
+
+<Callout type="dios" title="El orden de las pasadas es un grafo de dependencias, y en cuanto lo escribes como tal el motor deja de pelearse contigo">
+La secuencia de nueve pasos de esta lección se lee como una lista, pero no lo es: es un grafo de dependencias aplanado, y el aplanado lo has hecho tú a mano. Las sombras van antes que la iluminación porque la iluminación consume el mapa de sombras; el prepass va antes que los clusters porque los clusters consumen la profundidad; el post-proceso va después de todo porque consume el color resuelto. Mientras el motor tiene ocho pasadas, mantener ese orden en la cabeza es viable. Con veinte deja de serlo, y aparece el síntoma inconfundible: alguien añade un efecto, lo pone en el sitio equivocado, y el resultado se ve *casi* bien porque está leyendo la textura del fotograma anterior. Ese bug puede vivir meses en un proyecto. La salida es escribir cada pasada declarando **qué lee y qué escribe**, y dejar que un ordenamiento topológico decida la secuencia; a partir de ese momento el orden es correcto por construcción y, de regalo, obtienes tres cosas que se pagan solas: sabes qué texturas pueden compartir memoria porque sus vidas no se solapan, sabes qué pasadas no dependen entre sí, y sabes exactamente qué hay que reejecutar cuando cambia el tamaño de la ventana. Eso es lo que en la industria se llama un *frame graph* o *render graph*, y la razón por la que todos los motores serios acabaron implementando uno no fue la elegancia: fue que el bug del fotograma anterior es indetectable en una captura de pantalla y evidente en un grafo.
+</Callout>
+
+<Challenge title="Monta el esqueleto">
+1. Dibuja el grafo de dependencias de tu motor actual: para cada pasada, qué texturas lee y cuáles escribe. Comprueba si el orden que tienes es el único posible o solo uno de varios.
+2. Audita si algún objeto de tu escena guarda un objeto de WebGPU. Si lo guarda, mete la indirección por identificador.
+3. Reparte tus recursos en los cuatro bind groups por frecuencia de cambio y mide cuántos `setBindGroup` haces por fotograma antes y después.
+4. Sustituye los bind groups por objeto por un único bind group con offset dinámico y comprueba el ahorro.
+5. Añade la bandera que crea el dispositivo con los límites por defecto explícitos y ejecuta tu escena más pesada con ella.
+</Challenge>

@@ -1,0 +1,137 @@
+---
+title: "read y write por el cache: búsqueda y readahead"
+description: "Cómo una lectura busca primero en el page cache y solo baja al disco si falla, cómo el readahead adivina el acceso secuencial y llena folios por adelantado, y por qué una escritura bufferizada regresa antes de que el dato llegue al disco."
+subject: kernel
+level: 24
+order: 3
+position: "24.3"
+duration: "16 min"
+---
+
+<Lead>
+Ya sabes qué es el page cache y dónde vive; ahora recorramos las dos syscalls que lo usan a todas horas. Una `read()` es, en el fondo, una búsqueda en la XArray del archivo seguida de una copia a espacio de usuario; el disco solo aparece cuando la búsqueda falla. Una `write()` bufferizada es aún más sorprendente: copia tu dato a un folio, lo marca sucio y **regresa** — sin haber tocado el disco todavía. Entre medias, el readahead trabaja para que casi nunca falles.
+</Lead>
+
+<Goals>
+
+- Seguir `read()` desde el VFS hasta `filemap_read` y la búsqueda en la XArray.
+- Entender el readahead síncrono y asíncrono y su ventana adaptativa.
+- Recorrer la escritura bufferizada con `write_begin` y `write_end`.
+- Comprender por qué `write()` regresa antes de que el dato sea durable.
+
+</Goals>
+
+## La lectura busca primero en el cache
+
+Una `read()` sobre un archivo entra al VFS, que la despacha a `file->f_op->read_iter`. Para casi todos los sistemas de archivos eso es `filemap_read`, la función genérica del page cache. Su lógica es un bucle: pide un lote de folios que cubran el rango, y por cada uno copia los bytes al búfer del usuario.
+
+```c
+/* mm/filemap.c (esquema) */
+ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter, ssize_t already)
+{
+	struct folio_batch fbatch;
+	do {
+		/* localiza (o trae) los folios del rango pedido */
+		filemap_get_pages(iocb, iter->count, &fbatch, ...);
+
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			struct folio *folio = fbatch.folios[i];
+			/* copia del folio al espacio de usuario, sin bloqueo */
+			copied = copy_folio_to_iter(folio, offset, bytes, iter);
+		}
+	} while (iov_iter_count(iter) && !error);
+}
+```
+
+El trabajo interesante está en `filemap_get_pages`. Para cada índice consulta `i_pages`: si el folio existe y está `uptodate`, es un **acierto** y se sirve desde RAM. Si falta, es un **fallo**, y entonces se dispara el readahead, que asigna folios nuevos y encola la E/S. Un folio recién traído no se copia hasta que su lectura termina y se marca `uptodate`; hasta entonces, el lector espera sobre el bit `PG_locked` del folio.
+
+<Mermaid code={`flowchart TD
+  R[filemap_read] --> G[filemap_get_pages]
+  G --> Q{El folio esta en la XArray y uptodate}
+  Q -->|hit| U[copy_folio_to_iter hacia el usuario]
+  Q -->|miss| RA[page_cache_sync_readahead]
+  RA --> RF[read_folio o readahead del a_ops]
+  RF --> BIO[bio al disco]
+  BIO --> UP[marca el folio uptodate y desbloquea]
+  UP --> U`} />
+
+## Readahead: leer antes de que lo pidan
+
+Si el kernel solo trajese la página exacta que pides, una lectura secuencial de un archivo grande sería un goteo de fallos, uno por página, cada uno pagando la latencia del disco. El **readahead** rompe ese goteo adivinando que seguirás leyendo hacia delante y trayendo un bloque grande por anticipado. Hay dos disparadores:
+
+```c
+/* fallo duro: el lector necesita ya estas paginas */
+void page_cache_sync_readahead(struct address_space *, struct file_ra_state *,
+                               struct file *, pgoff_t index, unsigned long count);
+
+/* el lector rozo una pagina marcada: relanza la ventana sin bloquear */
+void page_cache_async_readahead(struct address_space *, struct file_ra_state *,
+                                struct file *, struct folio *, unsigned long count);
+```
+
+La clave es el marcador `PG_readahead`: cuando el readahead trae una ventana de folios, marca uno cerca del final. Cuando el lector *alcanza* ese folio marcado, se lanza `page_cache_async_readahead` para traer la siguiente ventana **mientras** el lector aún consume la actual. Así el disco va siempre un paso por delante y la latencia desaparece. El estado por archivo abierto vive en `file_ra_state`:
+
+```c
+/* include/linux/fs.h */
+struct file_ra_state {
+	pgoff_t      start;       /* inicio de la ventana actual */
+	unsigned int size;        /* tamaño de la ventana, en paginas */
+	unsigned int async_size;  /* cola asincrona: cuando quede esto, relanzar */
+	unsigned int ra_pages;    /* ventana maxima permitida */
+	unsigned int mmap_miss;   /* fallos de mmap, para detectar acceso aleatorio */
+	loff_t       prev_pos;    /* posicion de la lectura anterior */
+};
+```
+
+La ventana es **adaptativa**: crece ante acceso secuencial (hasta `ra_pages`) y se colapsa ante acceso aleatorio, donde adelantar sería tirar E/S a la basura. El programa puede guiar esa heurística con `posix_fadvise`, y el administrador fijar el techo por dispositivo:
+
+```bash
+# techo de readahead del dispositivo (en KiB)
+$ cat /sys/class/bdi/$(mountpoint -d /)/read_ahead_kb
+128
+# una base de datos con acceso aleatorio pide no adelantar
+$ # en codigo: posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+```
+
+<Callout type="tip" title="Secuencial premia, aleatorio castiga">
+El readahead es una apuesta: si aciertas el patrón, conviertes N fallos de disco en una sola E/S grande y amortizada; si fallas, mueves páginas que nadie leerá y desperdicias ancho de banda y RAM. Por eso, ante una base de datos que salta por todo el archivo, `POSIX_FADV_RANDOM` (que pone la ventana a cero) suele mejorar el rendimiento: le dices al kernel que deje de adivinar.
+</Callout>
+
+## La escritura bufferizada llena el cache
+
+La `write()` bufferizada es el espejo de la lectura. `filemap` la despacha a `generic_perform_write`, que por cada trozo pide al sistema de archivos que prepare un folio (`write_begin`), copia los datos del usuario dentro, y lo cierra (`write_end`), que es donde el folio se marca **sucio**:
+
+```c
+/* mm/filemap.c (esquema) */
+ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
+{
+	do {
+		/* el fs reserva bloques y devuelve un folio bloqueado */
+		a_ops->write_begin(file, mapping, pos, bytes, &folio, &fsdata);
+
+		/* copia del usuario al folio; puede fallar por fallo de pagina */
+		copied = copy_folio_from_iter_atomic(folio, offset, bytes, i);
+		flush_dcache_folio(folio);
+
+		/* el fs marca el folio sucio y lo desbloquea */
+		a_ops->write_end(file, mapping, pos, bytes, copied, folio, fsdata);
+
+		/* frena al escritor si hay demasiado sucio pendiente */
+		balance_dirty_pages_ratelimited(mapping);
+	} while (iov_iter_count(i));
+}
+```
+
+Lo decisivo es la última verdad tácita: cuando `write_end` marca el folio sucio, el dato está en RAM pero **no en el disco**, y la syscall regresa. El kernel ha aceptado tu dato y ha emitido una promesa de bajarlo más tarde. Esa asincronía es lo que hace rápidas las escrituras — no esperas al disco — pero también lo que crea las páginas sucias cuya gestión, freno y durabilidad son todo el nivel 24.4. La llamada a `balance_dirty_pages_ratelimited` es el primer indicio: si te pasas de sucio, el kernel te frenará aquí mismo.
+
+<Callout type="dios" title="La syscall esconde que leer y escribir es rellenar y vaciar un cache">
+El salto conceptual de este nivel es ver que `read` y `write` no son operaciones de disco: son operaciones de **cache** que a veces provocan E/S de disco como efecto secundario. `read` es intentar servir desde los folios y, solo al fallar, rellenar; `write` es ensuciar folios y prometer vaciarlos. El disco no está en el camino crítico de ninguna de las dos en el caso común — está detrás de una capa de indirección que la interfaz de syscalls oculta por completo. Esta ocultación es un arma de doble filo magnífica. Por un lado, regala rendimiento gratis: la localidad temporal y espacial de tus programas se aprovecha sin que muevas un dedo, y una `write()` de un megabyte cuesta lo que una copia de memoria. Por otro, planta una ilusión peligrosa: tu programa cree que ha escrito en disco cuando solo ha escrito en RAM. Millones de líneas de código y toda la teoría de bases de datos existen para lidiar con esa brecha entre *visible* y *durable*. Quien entiende que `write()` no es una operación de disco sino una promesa de operación de disco tiene ya medio camino andado hacia entender por qué existe `fsync`, por qué las bases de datos llevan su propio *write-ahead log*, y por qué un corte de luz en el momento justo puede tragarse datos que tu programa juraba haber guardado.
+</Callout>
+
+<Challenge title="Mide el cache en acción">
+1. Con `strace -e read cat archivo`, observa que la primera pasada genera E/S y la segunda apenas toca el disco (compáralo con `iostat 1`).
+2. Lee un archivo grande secuencialmente y vigila la ventana con `POSIX_FADV_SEQUENTIAL` frente a `POSIX_FADV_RANDOM`; mide la diferencia.
+3. Baja `read_ahead_kb` a `4` para tu dispositivo y observa cómo se hunde el ancho de banda secuencial.
+4. Escribe un megabyte a un archivo y muestra que la `write()` regresa en microsegundos; luego comprueba con `iostat` que la E/S de disco ocurre después.
+5. Explica el papel del marcador `PG_readahead` y por qué el readahead asíncrono no bloquea al lector.
+</Challenge>

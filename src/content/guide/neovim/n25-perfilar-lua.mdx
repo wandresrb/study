@@ -1,0 +1,161 @@
+---
+title: "Perfilar Lua: encontrar la funcion que se come los milisegundos"
+description: "Instrumentacion manual con vim.uv.hrtime, muestreo estadistico con el perfilador de LuaJIT, el perfilador de Vimscript y por que no ve el interior de Lua, envoltura de require y de autocomandos para atribuir coste, y la disciplina de microbenchmark que evita optimizar el sitio equivocado."
+subject: neovim
+level: 25
+order: 3
+position: "25.3"
+duration: "22 min"
+---
+
+<Lead>
+El informe de arranque te dice qué fichero costó doce milisegundos; no te dice qué función dentro de él. Para bajar de la granularidad del fichero a la de la línea hacen falta instrumentos distintos, y hay exactamente tres familias disponibles dentro del editor: la instrumentación manual, que mide justo lo que rodeas y nada más; el muestreo estadístico, que interrumpe la ejecución muchas veces por segundo y construye una distribución de dónde estaba el programa; y el perfilador heredado de Vimscript, que es preciso en su dominio y ciego fuera de él. Elegir mal el instrumento produce números que parecen sólidos y describen otra cosa.
+</Lead>
+
+<Goals>
+
+- Medir intervalos con `vim.uv.hrtime` sin cometer los errores clásicos de resolución y de calentamiento.
+- Obtener un perfil por muestreo con el perfilador de `LuaJIT` y leer sus porcentajes.
+- Saber qué ve y qué no ve el perfilador de Vimscript invocado con `profile`.
+- Atribuir coste envolviendo `require` y autocomandos, y decidir con criterio dónde optimizar.
+
+</Goals>
+
+## Instrumentación manual
+
+El reloj monótono de la biblioteca de eventos devuelve nanosegundos y no retrocede nunca, ni siquiera si el sistema ajusta la hora. Es la base de cualquier medida seria dentro del editor, y usar en su lugar el reloj de pared o el contador de tiempo de procesador introduce artefactos que no vas a saber interpretar.
+
+```lua
+local function medir(etiqueta, fn, repeticiones)
+  repeticiones = repeticiones or 1
+  fn()                                   -- descartada: calienta cache y compilador
+  local muestras = {}
+  for i = 1, repeticiones do
+    local t0 = vim.uv.hrtime()
+    fn()
+    muestras[i] = (vim.uv.hrtime() - t0) / 1e6
+  end
+  table.sort(muestras)
+  local mediana = muestras[math.ceil(#muestras / 2)]
+  print(("%-24s mediana %8.3f ms   min %8.3f   max %8.3f")
+    :format(etiqueta, mediana, muestras[1], muestras[#muestras]))
+  return mediana
+end
+```
+
+Tres detalles de esa función concentran casi todo lo que se hace mal al medir. El primero es la ejecución descartada: la primera pasada paga la compilación de trazas del compilador justo a tiempo y el llenado de cachés, y mezclarla con el resto contamina la muestra. El segundo es la mediana en lugar de la media, por la misma razón que en el capítulo anterior. El tercero es medir un bloque suficientemente grande: si lo que rodeas dura menos que la resolución efectiva del reloj, estarás midiendo el propio instrumento, y la solución es repetir la operación mil veces dentro del bloque y dividir después.
+
+<Callout type="warn" title="El efecto del observador es real">
+Instrumentar tiene coste. Rodear una función que se llama cien mil veces con dos lecturas de reloj y una inserción en tabla puede duplicar su tiempo, y entonces el perfil miente en la dirección de lo que estás midiendo. Instrumenta granularidad gruesa, y para lo fino usa muestreo.
+</Callout>
+
+<Cards>
+  <Card icon="⏱️" title="Instrumentación">
+    Exacta y dirigida. Sabes qué mides. No descubre nada: solo confirma o refuta una hipótesis que ya tenías.
+  </Card>
+  <Card icon="🎲" title="Muestreo">
+    Estadística sobre interrupciones periódicas. Descubre el punto caliente sin que lo sospeches. Coste casi nulo, resolución limitada por la frecuencia.
+  </Card>
+  <Card icon="📜" title="Perfilador de Vimscript">
+    Contabilidad exacta por función y por línea, pero solo del lenguaje heredado. Imprescindible en configuraciones antiguas, inútil dentro de un módulo Lua.
+  </Card>
+</Cards>
+
+## Muestreo con el perfilador de LuaJIT
+
+El intérprete que ejecuta el editor incorpora un perfilador por muestreo que no requiere instalar nada. Interrumpe la ejecución cada pocos milisegundos, anota la pila en ese instante y, al terminar, presenta la proporción de muestras en que cada función estaba activa. Como la interrupción es barata y el resultado es estadístico, el coste añadido es despreciable y el perfil no está sesgado hacia lo que se te ocurrió instrumentar.
+
+```lua
+local p = require("jit.p")
+
+-- f = agrupar por funcion, l = por linea, v = mostrar estados de la maquina virtual
+-- i5 = muestrear cada 5 ms, m1 = ocultar lo que no llegue al 1 por ciento
+p.start("fli5m1", "/tmp/perfil.txt")
+
+for _ = 1, 200 do
+  vim.treesitter.get_parser(0):parse()
+end
+
+p.stop()
+vim.cmd.edit("/tmp/perfil.txt")
+```
+
+La cadena de opciones es donde está la potencia y también la confusión. Agrupar por función responde a la pregunta de quién consume; agrupar por línea localiza el bucle concreto. Un número en la cadena fija la profundidad de pila mostrada, y con profundidad dos o tres se ve la relación entre quien consume y quien llama, que suele ser la información realmente accionable, porque la función cara casi nunca es la que hay que cambiar: lo que hay que cambiar es la frecuencia con que alguien la llama. Existe además un modo de salida en crudo pensado para alimentar generadores de gráficos de llama, y es la forma más rápida de comunicar un perfil a otra persona.
+
+```text
+52%  parse
+ -- 41%  parse <- ejecutar_query
+ -- 11%  parse <- refrescar_plegado
+23%  get_node_text
+ -- 23%  get_node_text <- ejecutar_query
+ 9%  GC
+```
+
+Esa última línea merece atención porque es la que más se ignora. El recolector de basura aparece en el perfil como cualquier otra actividad, y un porcentaje alto no significa que el recolector sea lento, sino que tu código **asigna demasiado**. La cura no es tocar los parámetros del recolector, es dejar de crear tablas y cadenas dentro de bucles calientes, reutilizando búferes y evitando la concatenación repetida.
+
+<Mermaid code={`flowchart TB
+  a[Sintoma de lentitud] --> b[Delimitar la region con hrtime]
+  b --> c[Muestreo con el perfilador]
+  c --> d[Funcion y linea sospechosas]
+  d --> e[Microbenchmark aislado con repeticiones]
+  e --> f[Cambio y nueva medicion]
+  f --> g[Confirmado o descartado]
+  style c fill:#cba6f7,color:#11111b
+  style g fill:#a6e3a1,color:#11111b`} />
+
+## El perfilador heredado y sus límites
+
+El editor arrastra un perfilador propio, anterior a la incorporación de Lua, que se activa por comando y contabiliza con exactitud cada función y cada línea de Vimscript ejecutada, con número de llamadas, tiempo total y tiempo propio.
+
+```vim
+:profile start /tmp/vimscript.log
+:profile func *
+:profile file *
+" ... reproduce aqui la operacion lenta ...
+:profile stop
+```
+
+Su valor en una configuración moderna es concreto y limitado. Ve perfectamente los ficheros de detección de tipo, los ficheros de sintaxis, los `ftplugin` del tiempo de ejecución y los plugins antiguos que aún viven en tu instalación, que en muchas configuraciones son responsables de una fracción del arranque que nadie audita porque todo el mundo mira solo su propio código. Lo que no ve es el interior de una función Lua: un bloque Lua ejecutado desde Vimscript aparece como una única entrada con su tiempo agregado, sin desglose. Por eso los dos perfiladores no compiten, se reparten el territorio, y una investigación completa suele necesitar los dos: uno para saber qué capa cuesta, otro para saber qué línea dentro de esa capa.
+
+## De la muestra a la decisión
+
+Localizar el punto caliente es la mitad del trabajo; la otra mitad es no engañarse al actuar. Dos envolturas resuelven la mayoría de las atribuciones que hacen falta en una configuración real, y ambas se apoyan en el mismo truco: sustituir una función global por otra que mide y delega.
+
+```lua
+-- Atribuir el coste de carga a cada modulo, sin tocar ningun plugin
+local original = require
+local costes = {}
+_G.require = function(nombre)
+  if package.loaded[nombre] then return original(nombre) end
+  local t0 = vim.uv.hrtime()
+  local ok, mod = pcall(original, nombre)
+  costes[nombre] = (vim.uv.hrtime() - t0) / 1e6
+  if not ok then error(mod, 2) end
+  return mod
+end
+
+vim.api.nvim_create_user_command("Costes", function()
+  local lista = {}
+  for k, v in pairs(costes) do lista[#lista + 1] = { k, v } end
+  table.sort(lista, function(a, b) return a[2] > b[2] end)
+  for i = 1, math.min(#lista, 20) do
+    print(("%7.3f ms  %s"):format(lista[i][2], lista[i][1]))
+  end
+end, {})
+```
+
+Ese registro tiene una propiedad valiosa que el informe de arranque no ofrece: distingue carga en frío de reutilización, porque descuenta explícitamente los módulos ya presentes. Y el mismo patrón, aplicado a la creación de autocomandos, permite atribuir el coste por evento y descubrir el manejador que se ejecuta con cada movimiento del cursor sin que nadie lo hubiera notado.
+
+Al decidir, gobierna una regla que ninguna herramienta puede aplicar por ti: optimiza donde el producto de coste por frecuencia sea máximo, no donde el coste sea máximo. Una función de treinta milisegundos que se ejecuta una vez al abrir un proyecto es irrelevante; una de doscientos microsegundos enganchada al movimiento del cursor se ejecuta miles de veces por sesión y define si el editor se siente vivo. El perfilador te da el coste; la frecuencia la tienes que contar tú, y contarla es a menudo el descubrimiento entero.
+
+<Callout type="dios" title="Un perfil no es una lista de tareas: es un mapa de tus suposiciones equivocadas">
+Conviene enunciar con precisión lo que un perfil hace por ti, porque casi todo el mundo lo usa a medias. Su valor no está en que te diga dónde está el tiempo, que al fin y al cabo es un dato; está en que casi siempre te dice que el tiempo está donde tú no lo buscabas. Esa es una afirmación empírica, no retórica, y se sostiene en la estructura misma del software extensible: el coste real se acumula en los puntos de unión entre capas, y las capas las escribieron personas distintas que no se conocen. Tu código pide el nodo bajo el cursor; alguien decidió que esa consulta reparse el árbol si hay cambios pendientes; alguien más enganchó ese cálculo a un evento que se dispara con cada tecla; y el resultado es que una función tuya de tres líneas figura como responsable de un tercio del perfil sin que ninguna de esas tres líneas haga nada caro. Ningún razonamiento a priori te habría llevado hasta ahí, porque el razonamiento a priori solo puede examinar el código que conoces. De esa observación se sigue una disciplina que vale para el editor y para cualquier otro sistema que mantengas: nunca escribas una optimización antes de tener una medida que la justifique, y nunca aceptes una optimización sin una medida posterior que confirme que sirvió. La primera regla te ahorra el trabajo inútil, que es abundante; la segunda te ahorra algo peor, que es la complejidad permanente introducida a cambio de nada, código más difícil de leer y de mantener defendido para siempre por una intuición que resultó falsa y que ya nadie se atreve a cuestionar. Medir antes y después no es burocracia: es lo único que impide que tu configuración acumule cicatrices de batallas que nunca se ganaron.
+</Callout>
+
+<Challenge title="Cazar el milisegundo">
+1. Escribe la función de medida con calentamiento y mediana, y úsala para comparar dos formas de construir la misma cadena: concatenación en bucle frente a acumulación en tabla y unión final.
+2. Perfila por muestreo una operación que notes lenta en tu flujo real, primero agrupando por función y después por línea con profundidad de pila dos.
+3. Localiza en tu perfil el porcentaje dedicado al recolector de basura y reduce las asignaciones del bucle más caliente hasta que baje.
+4. Instala la envoltura de `require`, arranca, y compara su ranking con la tercera columna del informe de arranque. Explica las diferencias.
+5. Activa el perfilador de Vimscript durante un arranque completo y averigua cuánto de tu tiempo se va todavía en ficheros heredados que no has escrito tú.
+</Challenge>

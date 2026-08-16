@@ -1,0 +1,148 @@
+---
+title: "Depurar lo difícil: crashes raros y sanitizers"
+description: "El fallo que solo ocurre en producción, la carrera de datos que no se reproduce y la corrupción de memoria que estalla lejos de su causa. Método para cercar lo intermitente, qué detecta realmente el Thread Sanitizer y cómo combinar el resto de sanitizers y guardas de ejecución."
+subject: ios
+level: 25
+order: 5
+position: "25.5"
+duration: "22 min"
+---
+
+<Lead>
+Hay una clase de fallos que resiste al método habitual porque rompe su supuesto básico: que puedes volver a provocarlos. Un crash que aparece una vez cada trescientos arranques, una carrera de datos que solo se manifiesta en un dispositivo con seis núcleos bajo carga térmica, una corrupción de memoria que estalla veinte minutos y tres subsistemas después de haberse cometido. Con estos bugs, sentarse a poner puntos de interrupción es perder el tiempo. La técnica que funciona consiste en dejar de perseguir el síntoma y **cambiar el programa** para que el fallo se vuelva ruidoso, determinista y local: eso es exactamente lo que hacen los sanitizers y las guardas de ejecución, y por eso son la herramienta central de esta lección y no un apéndice.
+</Lead>
+
+<Goals>
+
+- Cercar un fallo intermitente distinguiendo entre reproducirlo y aumentar su probabilidad.
+- Explicar el algoritmo de vectores de reloj del `Thread Sanitizer` y sus límites reales.
+- Elegir entre `ASan`, `UBSan`, `TSan` y las guardas de asignación según el síntoma observado.
+- Leer un informe de fallo con hilos y direcciones y decidir el siguiente experimento.
+
+</Goals>
+
+## Cercar lo que no se reproduce
+
+Lo primero es aceptar que un fallo intermitente no es un fallo sin causa, sino un fallo cuya causa depende de variables que no estás controlando: el número de núcleos activos, la latencia de la red, el orden en que despiertan dos colas, si el sistema ya expulsó una página. El trabajo consiste en identificar esas variables y empujarlas, no en repetir la misma prueba con más paciencia.
+
+El informe de fallo es el punto de partida y contiene más de lo que parece. La **firma de excepción** ya clasifica: un `EXC_BAD_ACCESS` con dirección baja suele ser una referencia nula, con dirección alta y arbitraria apunta a un puntero colgante o a corrupción; un `EXC_BREAKPOINT` suele venir de una comprobación del lenguaje, como desenvolver un opcional vacío o un desbordamiento aritmético; una terminación por `watchdog` no es un crash de código sino un bloqueo del hilo principal. Además, el informe trae **todos** los hilos, no solo el que falló, y en los bugs de concurrencia la pila del hilo que no falló es casi siempre la que explica el fallo.
+
+Sobre esa base, tres tácticas aumentan la probabilidad del suceso hasta hacerlo observable.
+
+- **Estresar la programación**: ejecutar en el dispositivo más rápido y en el más lento, provocar contención con trabajo artificial, y repetir la operación sospechosa en bucle desde un test.
+- **Amplificar la ventana**: introducir esperas deliberadas dentro de la región sospechosa. Si un `sleep` de diez milisegundos entre dos accesos convierte un fallo raro en un fallo constante, acabas de demostrar que hay una ventana de carrera.
+- **Registrar antes de fallar**: un `os_signpost` en cada frontera de estado deja una traza que sobrevive al crash y que reconstruye el orden real de los eventos.
+
+<Callout type="warn" title="El bug de Heisenberg">
+Compilar con optimizaciones distintas, añadir un registro o activar un sanitizer cambia los tiempos y puede hacer desaparecer el síntoma. Que el fallo se esconda al observarlo no significa que se haya corregido: es evidencia adicional de que depende del orden de ejecución, es decir, de que es una carrera.
+</Callout>
+
+## Thread Sanitizer: qué detecta y qué no
+
+`TSan` no adivina ni prueba mil ordenaciones. Instrumenta cada acceso a memoria y mantiene, por hilo, un **vector de relojes** que registra qué eventos de otros hilos ha visto ya. Cuando dos hilos acceden a la misma dirección, al menos uno escribe, y entre ambos accesos no existe una relación de *ocurre antes* establecida por una primitiva de sincronización reconocida, declara una carrera de datos.
+
+Lo decisivo de ese algoritmo es que **no necesita que el fallo se manifieste**. Detecta la carrera aunque en esa ejecución concreta el orden haya sido benigno y el resultado correcto, que es precisamente el caso en el noventa y nueve por ciento de las ejecuciones de un bug intermitente. Ahí está su enorme valor: convierte un fenómeno probabilístico en un diagnóstico determinista.
+
+Sus límites son igual de precisos y hay que conocerlos.
+
+- Solo ve el código que se ejecuta. Un camino que tu prueba no recorre no se analiza, así que `TSan` pide cobertura, no solo activación.
+- Solo ve accesos instrumentados. Bibliotecas de terceros compiladas sin él quedan como puntos ciegos.
+- Multiplica el tiempo de ejecución por entre cinco y quince y el uso de memoria por varias veces, lo que lo hace inviable en producción y lo confina a pruebas y sesiones dirigidas.
+- Es incompatible con otros sanitizers en el mismo esquema, así que hay que decidir qué se busca antes de ejecutar.
+
+```swift
+// Carrera clasica: TSan la senala aunque el resultado parezca correcto
+final class Contador {
+    private var valor = 0
+    func incrementar() { valor += 1 }      // lectura y escritura sin proteccion
+    var actual: Int { valor }
+}
+
+// Una de las correcciones idiomaticas: aislar el estado en un actor
+actor ContadorSeguro {
+    private var valor = 0
+    func incrementar() { valor += 1 }
+    var actual: Int { valor }
+}
+```
+
+<Mermaid code={`flowchart TD
+  A[Sintoma observado] --> B{Que clase de fallo}
+  B -- Cuelgue o dato corrupto entre hilos --> C[Thread Sanitizer]
+  B -- Acceso invalido o direccion rara --> D[Address Sanitizer]
+  B -- Aritmetica o conversion sospechosa --> E[Undefined Behavior Sanitizer]
+  B -- Objeto liberado que responde --> F[Zombie Objects]
+  B -- Interfaz tocada fuera del hilo principal --> G[Main Thread Checker]
+  C --> H[Corregir la sincronizacion y volver a ejecutar]
+  D --> H
+  E --> H
+  F --> H
+  G --> H`} />
+
+## El resto del arsenal
+
+`TSan` cubre una sola familia. Las demás tienen su propia herramienta, y elegir la correcta ahorra días.
+
+El **Address Sanitizer** detecta accesos fuera de límites, uso después de liberar y desbordamientos de pila, colocando zonas envenenadas alrededor de cada asignación y retrasando la reutilización de la memoria liberada. Su virtud es que dispara en el instante del acceso ilegal y no veinte minutos después, que es cuando normalmente estallaría; su coste ronda el doble de tiempo y bastante más memoria.
+
+El **Undefined Behavior Sanitizer** inserta comprobaciones para desbordamientos de enteros, desplazamientos inválidos, punteros mal alineados y conversiones que pierden información. Es el más barato de todos y el que más veces encuentra bugs latentes en código de interoperación con `C`.
+
+Las **guardas de asignación** vienen de las variables de entorno del esquema y siguen siendo insustituibles. Los objetos zombis impiden que una instancia liberada devuelva su memoria y hacen que cualquier mensaje posterior falle con el nombre exacto de la clase, lo que convierte un crash indescifrable en una frase. `MallocScribble` rellena la memoria liberada con un patrón reconocible, y `MallocGuardEdges` coloca páginas protegidas en los bordes de las asignaciones grandes.
+
+Y el **Main Thread Checker** merece estar siempre activo en depuración: casi ningún equipo llega a la fase de sanitizers sin haber pasado antes por un bug causado por tocar la interfaz desde una cola de fondo.
+
+<Cards>
+  <Card icon="🔬" title="Uno cada vez">
+    Los sanitizers compiten por la misma instrumentación. Activar dos a la vez no duplica la cobertura: normalmente impide compilar o degrada el diagnóstico.
+  </Card>
+  <Card icon="🤖" title="En integración continua">
+    Un esquema nocturno con `TSan` sobre la suite de pruebas encuentra carreras que ninguna sesión manual va a provocar. Es el uso con mejor relación entre coste y hallazgos.
+  </Card>
+  <Card icon="🧱" title="Concurrencia estricta">
+    El comprobador del compilador en modo estricto elimina en tiempo de compilación buena parte de lo que `TSan` buscaría después. Lo barato es no escribir la carrera.
+  </Card>
+</Cards>
+
+## Un protocolo para el fallo que no se deja atrapar
+
+Cuando ninguna herramienta dispara, queda el método, y el método tiene un orden que evita perder semanas.
+
+**Uno.** Escribir la hipótesis en una frase falsable. No *hay un problema de concurrencia*, sino *dos tareas escriben el mismo diccionario del caché sin sincronización*. Solo una frase así indica qué experimento la refutaría.
+
+**Dos.** Reducir el programa hasta el mínimo que aún falla. Quitar pantallas, desactivar módulos, sustituir la red por respuestas fijas. Cada eliminación que conserva el síntoma acorta el espacio de búsqueda a la mitad, y cada una que lo elimina señala al sospechoso.
+
+**Tres.** Encerrar el sospechoso en una prueba que se ejecute mil veces. Un bucle de repetición con concurrencia real convierte un suceso de una vez cada trescientos arranques en un fallo de cada ejecución.
+
+```swift
+@Test func elCacheAguantaAccesoConcurrente() async {
+    let cache = Cache()
+    await withTaskGroup(of: Void.self) { grupo in
+        for i in 0..<1_000 {
+            grupo.addTask { await cache.guardar(valor: i, en: "clave\(i % 8)") }
+        }
+    }
+    #expect(await cache.recuento == 8)
+}
+```
+
+**Cuatro.** Ejecutar esa prueba bajo el sanitizer que corresponda a la hipótesis, no bajo todos por turnos. La elección del instrumento **es** la prueba de la hipótesis; probar al azar produce ruido y consume la paciencia del equipo.
+
+**Cinco.** Comprobar que la corrección elimina la causa y no el síntoma. La señal de alarma es haber arreglado el fallo cambiando algo que, por su naturaleza, no podía influir en la propiedad violada: mover una línea, añadir un registro, reordenar dos asignaciones independientes. Si la explicación de por qué funciona ahora no cabe en una frase, lo más probable es que el bug siga ahí esperando a otro compilador.
+
+**Seis.** Cuando se corrija, dejar la prueba en la suite. Un fallo intermitente que vuelve seis meses después sin test es un fallo nuevo con todo el coste de investigación otra vez, y además llega ya con la confianza del equipo gastada.
+
+<Callout type="note" title="Lo que revela un bloqueo del hilo principal">
+Si el proceso muere por `watchdog`, la pila del hilo cero muestra dónde esperaba, pero la causa está en el hilo que tenía el recurso. Buscar en el informe qué otro hilo está dentro de la misma región crítica resuelve la mayoría de estos casos sin ejecutar nada.
+</Callout>
+
+<Callout type="dios" title="Por qué una carrera de datos no es un bug de tiempos sino de semántica">
+La intuición más extendida sobre la concurrencia —que una carrera es *mala suerte en el orden* y que se arregla con un poco más de sincronización— es falsa, y creerla lleva a correcciones que no corrigen nada. El modelo de memoria de los lenguajes modernos define la corrección mediante una relación de orden parcial llamada **ocurre antes**, construida a partir del orden dentro de cada hilo y de los emparejamientos entre operaciones de sincronización: soltar un bloqueo ocurre antes de adquirirlo, una escritura atómica con semántica de liberación ocurre antes de la lectura con adquisición que la observa. Cuando dos accesos a la misma dirección, con al menos una escritura, no están ordenados por esa relación, el programa no tiene un resultado impredecible: tiene **comportamiento indefinido**, que es una categoría distinta y mucho peor. Un resultado impredecible sigue perteneciendo al conjunto de ejecuciones posibles del programa; el comportamiento indefinido libera al compilador de toda obligación, porque el optimizador razona asumiendo que las carreras no existen y a partir de esa premisa puede reordenar accesos, hundir una carga fuera de un bucle, mantener un valor en un registro para siempre o eliminar una comprobación entera por considerarla redundante. De ahí se explica el fenómeno que más desconcierta: añadir una sentencia inocua hace desaparecer el fallo, y el equipo declara victoria cuando en realidad solo ha cambiado la decisión del optimizador. De ahí se explica también por qué `TSan` es tan valioso pese a su lentitud: no muestrea ordenaciones ni busca síntomas, sino que verifica la propiedad formal directamente, y por eso encuentra la carrera en ejecuciones donde el resultado fue perfectamente correcto. Y de ahí se explica, por último, la dirección hacia la que se ha movido el ecosistema entero. El aislamiento de actores, la comprobación de `Sendable` y la concurrencia estricta no son azúcar sintáctico sobre los bloqueos: son un intento de trasladar esa relación de orden parcial al **sistema de tipos**, de modo que la ausencia de carreras deje de ser una propiedad que se busca a posteriori con instrumentación cara y pase a ser una propiedad que el compilador se niega a violar. Aceptar ese cambio de marco tiene una consecuencia práctica inmediata: cuando `TSan` señale una línea, la pregunta correcta nunca es qué `lock` añadir ahí, sino qué pieza del estado carece de un dueño único y bien definido.
+</Callout>
+
+<Challenge title="Hacer ruidoso lo silencioso">
+1. Escribe una prueba que ejerza una estructura compartida desde varias tareas y ejecútala con `TSan` activado.
+2. Corrige la carrera con aislamiento de actor en lugar de con un bloqueo y vuelve a ejecutar para confirmar el silencio.
+3. Introduce un acceso fuera de límites en código de interoperación con `C` y compara el crash con y sin `ASan`.
+4. Activa objetos zombis, provoca un mensaje a una instancia liberada y compara el mensaje con el fallo original.
+5. Toma un crash real, clasifica su firma de excepción y escribe cuál sería el siguiente experimento y por qué.
+</Challenge>

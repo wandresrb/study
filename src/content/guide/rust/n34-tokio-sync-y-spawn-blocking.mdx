@@ -1,0 +1,162 @@
+---
+title: "tokio::sync, spawn_blocking y el Mutex que no cruza un await"
+description: "Las tareas necesitan coordinarse: tokio::sync trae los primitivos async equivalentes a los de std, el Mutex que puedes sostener a través de un await, y los canales mpsc, oneshot y broadcast. spawn_blocking aísla el trabajo CPU-bound o bloqueante en un pool aparte para no secuestrar a los trabajadores. Y la trampa que corona el nivel: por qué sostener un Mutex de std a través de un await rompe tu programa."
+subject: rust
+level: 34
+order: 5
+position: "34.5"
+duration: "20 min"
+---
+
+<Lead>
+Las tareas concurrentes necesitan hablarse y coordinarse, y hacerlo con los primitivos del nivel 31 —los de `std::sync`— falla dentro de async, porque aquellos **bloquean el hilo** y async existe justo para no bloquearlo. Tokio responde con `tokio::sync`: los espejos asíncronos de los candados y canales que ya conoces, pero que **ceden** en vez de bloquear. Su `Mutex` puede sostenerse a través de un `.await`; sus canales `mpsc`, `oneshot` y `broadcast` cubren los patrones de mensajería que verás una y otra vez. A su lado, `spawn_blocking` resuelve el problema inverso —meter trabajo CPU-bound o una API bloqueante en un runtime async sin estrangularlo—. Y todo el nivel culmina en una trampa que hay que entender de raíz: por qué un `Mutex` de `std` sostenido a través de un `await` rompe tu programa de dos maneras distintas.
+</Lead>
+
+<Goals>
+
+- Usar `tokio::sync::Mutex` y saber cuándo, y solo cuándo, sustituye al de `std`.
+- Elegir entre los canales `mpsc`, `oneshot` y `broadcast` según el patrón de mensajería.
+- Aislar trabajo CPU-bound o bloqueante con `spawn_blocking` para no secuestrar a los trabajadores.
+- Explicar por qué sostener un `MutexGuard` de `std` a través de un `await` rompe la compilación o produce deadlock.
+
+</Goals>
+
+## tokio::sync: candados y canales que ceden
+
+`tokio::sync` reimplementa los primitivos de coordinación para que, al no poder progresar, **suspendan la tarea** en lugar de bloquear el hilo. El `Mutex` async es el ejemplo canónico: su `lock` es un `.await`, y su guarda —a diferencia de la de `std`— está diseñada para viajar a través de puntos de suspensión.
+
+```rust
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[tokio::main]
+async fn main() {
+    let contador = Arc::new(Mutex::new(0u64));
+    let mut handles = Vec::new();
+
+    for _ in 0..8 {
+        let c = Arc::clone(&contador);
+        handles.push(tokio::spawn(async move {
+            let mut guard = c.lock().await;   // cede si el candado esta ocupado
+            *guard += 1;
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    println!("total: {}", *contador.lock().await);
+}
+```
+
+El patrón `Arc<Mutex<T>>` es el mismo del nivel 31, pero el `Mutex` es el de Tokio y `lock()` lleva `.await`. Cuando el candado está tomado, la tarea que espera **cede** el hilo a otras en vez de bloquearlo. Ese es el único superpoder de este `Mutex`, y —como verás al final— también la única razón para usarlo.
+
+## mpsc, oneshot y broadcast
+
+El paso de mensajes suele ser preferible a los candados compartidos, y `tokio::sync` ofrece tres canales para tres formas distintas de conversación:
+
+- **`mpsc`** (*multiple producer, single consumer*): muchos emisores, un receptor. La versión async y **acotada** del canal del nivel 31; `send` es un `.await` que cede cuando el buffer está lleno, dando *contrapresión* natural.
+- **`oneshot`**: un solo valor, una sola vez. El puente ideal para devolver el resultado de una tarea lanzada, el patrón petición-respuesta.
+- **`broadcast`**: muchos emisores, muchos receptores, y **cada** receptor ve **cada** mensaje. Difusión en abanico para eventos.
+
+```rust
+use tokio::sync::{mpsc, oneshot};
+
+#[tokio::main]
+async fn main() {
+    // mpsc: un canal de trabajo con capacidad 32
+    let (tx, mut rx) = mpsc::channel::<u32>(32);
+
+    // oneshot: para que la tarea devuelva su total una sola vez
+    let (fin_tx, fin_rx) = oneshot::channel::<u32>();
+
+    tokio::spawn(async move {
+        let mut suma = 0;
+        while let Some(n) = rx.recv().await {   // None cuando se sueltan todos los tx
+            suma += n;
+        }
+        let _ = fin_tx.send(suma);              // responde una vez
+    });
+
+    for i in 1..=5 {
+        tx.send(i).await.unwrap();
+    }
+    drop(tx);                                    // cierra el canal: rx.recv dara None
+
+    let total = fin_rx.await.unwrap();
+    println!("la tarea sumo {total}");
+}
+```
+
+Elegir el canal es elegir la topología de la conversación. `mpsc` para una cola de trabajo con contrapresión; `oneshot` para una respuesta única —típicamente enviada *dentro* de un mensaje `mpsc` para responder a quien lo mandó—; `broadcast` para notificar un evento a todos los interesados, asumiendo que un receptor lento puede perder mensajes (`RecvError::Lagged`). Hay un cuarto, `watch`, para "el último valor gana", que verás cuando lo necesites.
+
+## spawn_blocking: el trabajo que no cede
+
+El nivel 34.3 dejó una regla inflexible: no bloquees un hilo trabajador. Pero el mundo real tiene trabajo que **no** cede —comprimir un fichero, calcular un hash, llamar a una librería síncrona como `diesel` o a `std::fs`—. Meterlo tal cual en una tarea secuestra un trabajador. La salida es `spawn_blocking`, que traslada ese trabajo a un **pool de hilos aparte**, dedicado a lo bloqueante, dejando intactos a los trabajadores del scheduler:
+
+```rust
+use tokio::task;
+
+async fn hash_costoso(datos: Vec<u8>) -> u64 {
+    // Trabajo CPU-bound: se va a un hilo del pool de bloqueo,
+    // no a un trabajador del scheduler async.
+    task::spawn_blocking(move || {
+        let mut h = 0u64;
+        for b in datos {
+            h = h.wrapping_mul(31).wrapping_add(b as u64);
+        }
+        h
+    })
+    .await
+    .unwrap()   // JoinHandle, como el de spawn: Result por si hubo panico
+}
+```
+
+`spawn_blocking` devuelve un `JoinHandle` sobre el que haces `.await`, así que desde fuera parece una operación async más, pero por dentro corre en un hilo que *puede* bloquearse sin dañar al runtime. El pool de bloqueo crece bajo demanda hasta un límite alto (512 hilos por defecto) porque sus hilos, al estar destinados a bloquearse, no rentabilizan ser pocos. Úsalo para lo que bloquea o computa largo; jamás para E/S de red, que tiene su variante async.
+
+<Callout type="tip" title="spawn_blocking para APIs síncronas, no para paralelismo masivo">
+`spawn_blocking` es el puente hacia código que **no** sabe ceder: E/S de fichero de `std`, drivers síncronos, criptografía pesada. No es un motor de cómputo paralelo de propósito general —para dividir un cálculo entre núcleos usarías `rayon`—. Y como cada llamada puede consumir un hilo real, lanzar cientos de miles de `spawn_blocking` a la vez sí agota recursos, al contrario que las tareas async. Es una válvula para aislar lo bloqueante, no una licencia para volver al modelo de hilos.
+</Callout>
+
+## Por qué un Mutex de std no cruza un await
+
+Llegamos a la trampa que corona el nivel. La tentación es natural: ya sabes usar `std::sync::Mutex` del nivel 31, es más rápido que el de Tokio, ¿por qué no usarlo en async? Puedes —pero **nunca** sosteniendo su guarda a través de un `.await`—. Este código no compila al lanzarlo con `spawn`:
+
+```rust
+use std::sync::Mutex;
+use std::sync::Arc;
+
+async fn roto(estado: Arc<Mutex<u64>>) {
+    let mut guard = estado.lock().unwrap();  // MutexGuard de std: es !Send
+    *guard += 1;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await; // sostiene la guarda
+    *guard += 1;
+} // el future que contiene un MutexGuard !Send tampoco es Send -> spawn lo rechaza
+```
+
+Hay dos fallos, y conviene ver los dos. **El de compilación**: la guarda `MutexGuard` de `std` es `!Send`, y un future que la mantiene *viva* en un punto `.await` guarda esa guarda dentro de su máquina de estados, volviéndose él mismo `!Send`; como `tokio::spawn` exige `Send + 'static`, el compilador lo rechaza con "el future no es `Send`". **El de ejecución**, más insidioso, aparece incluso en un runtime `current_thread` donde `Send` no se exige: la tarea que sostiene la guarda cede en el `.await`, el trabajador pasa a otra tarea que intenta tomar el **mismo** candado, y como el `Mutex` de `std` bloquea el hilo entero al esperar, ese hilo queda congelado sosteniendo un candado que solo la primera tarea —ahora imposible de reanudar— podría soltar. Deadlock.
+
+<Mermaid code={`flowchart TD
+  A[La tarea toma el MutexGuard de std] --> B[Llega a un await y cede el hilo]
+  B --> C[El future retiene la guarda que es not Send]
+  C --> D[spawn exige Send y no compila]
+  B --> E[Otra tarea del mismo hilo pide el candado]
+  E --> F[El Mutex de std bloquea el hilo entero]
+  F --> G[La primera tarea nunca se reanuda: deadlock]
+  class A t-blue
+  class D t-red
+  class F t-peach
+  class G t-red`} />
+
+La regla operativa es precisa y contraintuitiva: **prefiere `std::sync::Mutex`** para secciones críticas cortas que no contienen ningún `.await` —es más rápido y perfectamente válido en código async, siempre que tomes y sueltes la guarda entre dos `await`, nunca a través de uno—. Usa `tokio::sync::Mutex` **solo** cuando de verdad necesites mantener el candado tomado a lo largo de un `.await`. El candado async no es "el candado para async"; es el candado para el caso raro en que la sección crítica cruza una suspensión.
+
+<Callout type="dios" title="El tipo del guard codifica la ley del scheduler cooperativo">
+La trampa del `Mutex` de `std` a través de un `await` es, en apariencia, un detalle de implementación fastidioso; en realidad es una de las lecciones más profundas de todo el modelo async de Rust, porque en ella el sistema de tipos y el modelo de ejecución se tocan y se explican mutuamente. Empieza por preguntarte por qué la guarda de `std` es `!Send`, un hecho que en el nivel 31 parecía una tecnicalidad: es `!Send` porque un `Mutex` del sistema operativo, en muchas plataformas, exige que quien lo bloqueó sea quien lo desbloquee, atando la guarda al hilo que la creó. Ese marcador `!Send`, decidido por razones de bajo nivel, resulta ser exactamente la información que el compilador necesita para atrapar un error de altísimo nivel. Porque cuando el compilador transforma tu `async fn` en una máquina de estados (nivel 32.4), todo lo que esté vivo en un punto `.await` pasa a formar parte del estado que la tarea guarda mientras duerme; y si eso incluye una guarda `!Send`, la máquina de estados entera hereda el `!Send`, y `spawn` —que promete mover tareas entre hilos— la rechaza. El sistema de tipos, sin saber nada de deadlocks ni de schedulers, te está impidiendo escribir un programa donde una tarea podría despertar en un hilo distinto de aquel en que tomó el candado. Pero la enseñanza más honda está en el segundo fallo, el deadlock del `current_thread`, porque ahí no hay `Send` que te salve y el error es puramente semántico. Un candado de `std` es *bloqueante por diseño*: cuando lo pides y está ocupado, tu hilo se detiene por completo hasta que se libera. Esa semántica es correcta y deseable entre hilos de verdad, donde el que sostiene el candado sigue corriendo en su propio hilo y acabará soltándolo. Pero es catastrófica bajo un scheduler cooperativo de un solo hilo, donde ceder no significa "otro hilo sigue con lo mío" sino "este mismo hilo se dedica a otra tarea": si sostienes un candado bloqueante a través de un `await`, cedes el hilo *sin soltar el candado*, y la próxima tarea que lo pida bloqueará el único hilo que existe, condenando a muerte a la tarea que aún debía soltarlo. El candado de `std` presupone que esperar es bloquear un hilo; el mundo async presupone que esperar es ceder un hilo; esas dos presuposiciones son incompatibles, y sostener la guarda a través de un `await` es el punto exacto donde chocan. El `Mutex` de Tokio existe para reconciliarlas: su guarda es `Send` y su espera cede en vez de bloquear, de modo que puede sobrevivir a una suspensión. Pero la moraleja definitiva es la que invierte la intuición del principiante: no uses el `Mutex` de Tokio por defecto en async. Úsalo solo cuando debas cruzar un `await` con el candado tomado, y para todo lo demás quédate con el de `std`, más rápido, tomando y soltando la guarda dentro del mismo tramo sin suspensiones. Saber cuál usar no es memorizar una regla, es entender que el tipo de la guarda —`Send` o `!Send`, que cede o que bloquea— es la ley del scheduler cooperativo escrita en el sistema de tipos.
+</Callout>
+
+<Challenge title="Coordina tareas y desactiva la trampa">
+1. Cuenta con ocho tareas sobre un `Arc<tokio::sync::Mutex<u64>>` y confirma el total; luego reescríbelo con paso de mensajes por un canal `mpsc` y un acumulador, y compara los dos estilos.
+2. Monta el patrón petición-respuesta: envía trabajos por `mpsc` incluyendo en cada mensaje un `oneshot::Sender` por el que la tarea devuelve el resultado a quien lo pidió.
+3. Usa `broadcast` para difundir un evento a tres receptores y provoca un `Lagged` saturando a uno lento; explica qué garantía se pierde.
+4. Envuelve un cálculo CPU-bound en `spawn_blocking` y demuestra, con un runtime de un trabajador, que sin él las demás tareas se congelan y con él no.
+5. Escribe la función `roto` de la sección final, lee el error "el future no es `Send`", y arréglala de las dos formas posibles: soltando la guarda de `std` antes del `await`, o cambiando a `tokio::sync::Mutex`. Explica cuál preferirías y por qué.
+</Challenge>

@@ -1,0 +1,121 @@
+---
+title: "GEMM ingenuo y la intensidad aritmética"
+description: "La multiplicación de matrices escrita de la forma directa, el conteo exacto de lecturas de memoria global, y el modelo de tejado que explica por qué rinde el uno por ciento."
+subject: webgpu
+level: 37
+order: 1
+position: "37.1"
+duration: "20 min"
+---
+
+<Lead>
+La multiplicación de matrices es el núcleo de casi todo el aprendizaje automático y el ejemplo canónico de un problema que parece limitado por cálculo y está limitado por memoria. Escrita de la forma evidente, una GEMM en GPU alcanza alrededor del uno por ciento del rendimiento aritmético de la máquina, y la razón se puede calcular exactamente antes de medir nada: basta contar cuántos bytes hay que leer por cada operación aritmética. Ese cociente tiene nombre, intensidad aritmética, y es la herramienta de diagnóstico más útil de todo el cómputo en GPU.
+</Lead>
+
+<Goals>
+
+- Escribir el kernel de multiplicación de matrices directo y verificar su corrección.
+- Contar las lecturas de memoria global exactas de la versión ingenua.
+- Calcular la intensidad aritmética y situarla en el modelo de tejado.
+- Predecir el rendimiento alcanzable antes de escribir una sola línea de optimización.
+
+</Goals>
+
+## El kernel directo
+
+Multiplicar `A` de `M` por `K` por `B` de `K` por `N` da `C` de `M` por `N`, donde cada elemento es un producto escalar de una fila de `A` y una columna de `B`. La versión paralela obvia asigna una invocación a cada elemento de `C`.
+
+```wgsl
+struct Dims { M: u32, N: u32, K: u32, _r: u32 };
+@group(0) @binding(0) var<uniform> d: Dims;
+@group(0) @binding(1) var<storage, read>       A: array<f32>;   // M x K
+@group(0) @binding(2) var<storage, read>       B: array<f32>;   // K x N
+@group(0) @binding(3) var<storage, read_write> C: array<f32>;   // M x N
+
+@compute @workgroup_size(16, 16)
+fn gemm(@builtin(global_invocation_id) gid: vec3u) {
+  let fila = gid.y;
+  let col  = gid.x;
+  if (fila >= d.M || col >= d.N) { return; }
+
+  var acc = 0.0;
+  for (var k: u32 = 0u; k < d.K; k = k + 1u) {
+    acc = acc + A[fila * d.K + k] * B[k * d.N + col];
+  }
+  C[fila * d.N + col] = acc;
+}
+```
+
+```js
+pass.dispatchWorkgroups(Math.ceil(N / 16), Math.ceil(M / 16));
+```
+
+Es correcto, cabe en veinte líneas, y para matrices pequeñas es perfectamente razonable. Merece la pena fijarse en el patrón de acceso antes de seguir, porque explica la mitad del problema.
+
+`B[k * d.N + col]`: dentro de un workgroup de 16 por 16, las 16 invocaciones con la misma `y` y `x` consecutiva leen 16 flotantes contiguos. Eso es coalescente y está bien.
+
+`A[fila * d.K + k]`: las 16 invocaciones de una misma fila leen **el mismo** elemento. Eso también está bien, porque el hardware difunde una lectura repetida. Pero las 16 filas distintas del workgroup leen 16 posiciones separadas por `K` flotantes, o sea 16 transacciones distintas.
+
+Ninguno de los dos accesos es catastrófico. El problema no es la forma de los accesos, es la **cantidad**.
+
+## Contar las lecturas
+
+Cada elemento de `C` requiere `K` lecturas de `A` y `K` de `B`, o sea `2K` lecturas de memoria global. Con `M·N` elementos, el total es:
+
+```text
+lecturas globales = 2 · M · N · K
+operaciones       = 2 · M · N · K       (K multiplicaciones y K sumas)
+```
+
+Es decir, **una lectura de 4 bytes por cada operación en coma flotante**. Para matrices cuadradas de lado `N`:
+
+| `N` | operaciones | lecturas | bytes leídos |
+|---|---|---|---|
+| 256 | 33,5 millones | 33,5 millones | 134 MB |
+| 512 | 268 millones | 268 millones | 1,07 GB |
+| 1024 | 2.147 millones | 2.147 millones | 8,6 GB |
+| 2048 | 17.180 millones | 17.180 millones | 68,7 GB |
+
+Ocho gigabytes y medio de tráfico para multiplicar dos matrices de mil por mil, que ocupan cuatro megabytes cada una. Se lee cada elemento de `A` mil veces y cada elemento de `B` mil veces.
+
+## Intensidad aritmética y el modelo de tejado
+
+La **intensidad aritmética** es el cociente entre operaciones en coma flotante y bytes movidos desde memoria. Para la GEMM ingenua:
+
+```text
+I = 2·M·N·K operaciones / (2·M·N·K · 4 bytes) = 0,25 FLOP por byte
+```
+
+El modelo de tejado dice que el rendimiento alcanzable es el mínimo entre el pico aritmético de la máquina y el producto de la intensidad por el ancho de banda:
+
+```text
+rendimiento = min(pico_FLOPS, I · ancho_de_banda)
+```
+
+Con una GPU de escritorio de gama media típica —del orden de 10 TFLOP/s en `f32` y 450 GB/s de ancho de banda— el punto de inflexión, donde las dos curvas se cruzan, está en:
+
+```text
+I_critica = 10.000 GFLOP/s / 450 GB/s = 22,2 FLOP por byte
+```
+
+Cualquier kernel con intensidad por debajo de 22 está limitado por memoria; por encima, por cálculo. La GEMM ingenua tiene 0,25, que es **89 veces menor**. Su rendimiento previsto es:
+
+```text
+0,25 FLOP/byte · 450 GB/s = 112 GFLOP/s
+```
+
+Frente a un pico de 10.000. Un 1,1 por ciento. Y eso es una predicción, no una medición: si mides el kernel de arriba en una máquina con esas características, obtendrás un valor de ese orden.
+
+La caché mejora algo el resultado real —la fila de `A` que se relee 16 veces dentro del workgroup se sirve de L1, y las columnas de `B` que comparten varias invocaciones también— y por eso la medición suele quedar entre dos y cinco veces por encima de la predicción cruda. Pero el orden de magnitud es ese, y depende de un comportamiento de caché que no controlas ni puedes garantizar entre dispositivos.
+
+## Qué hay que cambiar
+
+De la fórmula sale directamente qué hay que atacar. El numerador, las operaciones, es fijo: hay que hacer `2MNK` multiplicaciones y sumas, no hay algoritmo razonable que las reduzca. Así que la única palanca es el denominador: **leer menos bytes de memoria global**.
+
+Y leer menos significa una cosa concreta: **reutilizar**. Si un valor de `A` que se va a usar 16 veces se lee una sola vez y se guarda en un sitio rápido, el tráfico se divide por 16 y la intensidad se multiplica por 16. Ese sitio rápido es la memoria compartida del workgroup, y esa idea es todo el [tiling](/guia/webgpu/n37-tiling-en-memoria-compartida/).
+
+La cuenta que hay que hacerse antes de optimizar cualquier kernel es siempre la misma: cuántas operaciones y cuántos bytes. Si la intensidad está muy por debajo del punto crítico de la máquina, optimizar la aritmética no sirve absolutamente de nada, por muy ingenioso que sea el truco; hay que reducir el tráfico. Y si está muy por encima, al revés.
+
+<Callout type="dios" title="La intensidad aritmetica se puede calcular en una servilleta y predice mejor que cualquier perfilador">
+Es tentador saltar directamente al perfilador cuando un kernel va lento, y el perfilador te dirá dónde se va el tiempo pero no qué es alcanzable. La cuenta de la servilleta sí. El procedimiento son tres números: operaciones aritméticas del algoritmo, bytes que hay que traer de memoria global en el peor caso, y las dos características de la máquina objetivo. Con eso sabes, antes de escribir código, si el problema está limitado por memoria o por cálculo, y cuál es el techo. Y sabes algo más valioso: cuánto puede mejorar una optimización concreta. Si el tiling reduce el tráfico por un factor de 16, la intensidad pasa de 0,25 a 4, y el rendimiento previsto de 112 a 1800 GFLOP/s: dieciséis veces mejor, pero todavía a un 18 por ciento del pico porque 4 sigue estando por debajo de 22. Eso te dice de antemano que después del tiling **hará falta otra optimización**, y cuál tiene que ser su magnitud. Es lo que separa optimizar con método de optimizar a base de probar. La misma cuenta explica cosas que de otro modo parecen misteriosas: por qué una convolución separable gana tanto, por qué la cuantización a 8 bits acelera un modelo aunque las operaciones sean las mismas —divide los bytes por cuatro—, por qué las unidades tensoriales de las GPU modernas serían inútiles sin memorias intermedias enormes. Y funciona en la otra dirección: si tu kernel tiene intensidad 100 y va lento, no toques la memoria, el problema está en la divergencia, en la ocupación o en que estás usando una función transcendental en el bucle interno.
+</Callout>

@@ -1,0 +1,145 @@
+---
+title: "Recuperación: de la pregunta a los fragmentos"
+description: "Con el corpus indexado llega la mitad que ocurre en tiempo real y que decide si la respuesta será posible. La pregunta del usuario se convierte en un vector con el mismo modelo que usó la ingesta, Vectorize devuelve los vecinos más cercanos con su puntuación, y esos identificadores se rehidratan en D1 para volver a ser texto. En el camino hay decisiones que separan un buscador serio de una demo: cuántos vecinos pedir, cómo leer un score de coseno, por qué el filtro por tenant va en la consulta y nunca después, y qué hacer cuando el usuario busca un código exacto que la semántica no ve."
+subject: cloudflare
+level: 31
+order: 3
+position: "31.3"
+duration: "20 min"
+---
+
+<Lead>
+Aquí es donde se gana o se pierde el sistema. La generación puede ser brillante, pero si el fragmento que contiene la respuesta no entra en el contexto, ningún modelo lo adivinará: la recuperación pone el techo y todo lo demás solo decide cuánto de ese techo aprovechas. El mecanismo parece trivial —convertir la pregunta en vector, pedir los vecinos, traer el texto— y en esa aparente trivialidad se esconden los cuatro o cinco detalles que distinguen un buscador que funciona de uno que devuelve cosas parecidas. Vamos a construirlo entero y a mirar de cerca cada uno.
+</Lead>
+
+<Goals>
+
+- Convertir la pregunta en `embedding` con el mismo modelo y las mismas convenciones que la ingesta.
+- Consultar Vectorize con `topK`, leer la puntuación de similitud y filtrar por metadata en la propia consulta.
+- Rehidratar el texto original de los `chunks` desde D1 y devolverlo ordenado por relevancia.
+- Reconocer los límites de la búsqueda semántica y complementarla con búsqueda léxica cuando toca.
+
+</Goals>
+
+## La pregunta también es un vector
+
+Buscar por similitud exige que la pregunta y los documentos vivan en el mismo espacio, y eso solo ocurre si los produjo el mismo modelo. Es la regla que más sistemas rotos explica: si la ingesta usó `bge-base` y la consulta usa otro modelo, la búsqueda no falla ni avisa, simplemente devuelve vecinos aleatorios con una puntuación de aspecto respetable.
+
+```ts
+const { data } = await env.AI.run("@cf/baai/bge-base-en-v1.5", { text: [pregunta] });
+const vector = data[0];
+```
+
+Hay una asimetría que conviene conocer: una pregunta y un pasaje no son el mismo tipo de texto. La pregunta es corta, interrogativa y a menudo elíptica; el pasaje es largo y afirmativo. Varias familias de modelos piden por eso un prefijo distinto para cada lado —algo como `query:` y `passage:`— y respetarlo mejora sensiblemente los resultados. Sea cual sea la convención que adoptes, la clave es que sea idéntica en la ingesta y en la consulta, hoy y dentro de un año.
+
+Otro descuido caro es el idioma. Muchos modelos de `embedding` populares están entrenados solo en inglés, y con un corpus en español producen vectores mediocres que degradan la búsqueda sin dar ninguna señal de error. Si tu contenido o tus usuarios no son angloparlantes, necesitas un modelo multilingüe, y la comprobación es trivial: incrusta dos frases que digan lo mismo en dos idiomas y mira si sus vectores se parecen.
+
+Y antes de incrustar nada, recuerda que la pregunta que llega no siempre es la pregunta buscable. En una conversación, "y eso cuánto cuesta" no tiene sentido aislado: hay que reescribirla con el historial hasta convertirla en una consulta autónoma antes de calcular su vector. Es un paso barato, se hace con el propio LLM, y arregla la mayoría de los fallos de RAG conversacional.
+
+## Consultar el índice
+
+Con el vector en la mano, Vectorize responde a la única pregunta que sabe responder: qué vectores del índice están más cerca de este.
+
+```ts
+const res = await env.INDICE.query(vector, {
+  topK: 8,
+  returnMetadata: "indexed",
+  filter: { tenant: tenantId },        // el filtro va aquí, no después
+});
+// res.matches: [{ id, score, metadata }, ...] ordenados de mayor a menor score
+```
+
+El `topK` es un compromiso directo. Pedir pocos vecinos arriesga dejar fuera el fragmento bueno; pedir muchos mete ruido en el contexto, encarece la generación y diluye la atención del modelo. Entre cinco y diez es el rango sensato para entregar directamente al `prompt`; si vas a re-rankear después —la lección de calidad lo desarrolla— tiene sentido pedir treinta o cincuenta y filtrar luego.
+
+La puntuación merece una advertencia. Con métrica de coseno es un número entre menos uno y uno que mide alineación de dirección, no una probabilidad ni una certeza. No existe un umbral universal: el valor a partir del cual un resultado es útil depende de tu corpus y de tu modelo, y se calibra mirando ejemplos reales. Lo que sí conviene es tener **algún** umbral, porque el índice siempre devuelve los vecinos más cercanos aunque el más cercano sea malísimo. Sin umbral, una pregunta ajena a tu dominio recupera basura con toda naturalidad y el generador la usará como si fuera relevante.
+
+Hay además un detalle que sorprende a quien viene de bases de datos: la búsqueda vectorial a escala es **aproximada**. Comparar la pregunta con todos los vectores del índice sería exacto y lentísimo, así que los motores construyen estructuras que exploran solo una fracción prometedora del espacio y aceptan perder de vez en cuando un vecino legítimo. El compromiso está en la naturaleza del problema, no en la implementación: velocidad a cambio de una cobertura ligeramente imperfecta. En la práctica el efecto es pequeño, pero explica por qué dos consultas casi idénticas pueden devolver listas que no coinciden del todo, y por qué el número que de verdad debes medir no es la latencia del índice sino cuántas veces el fragmento correcto acaba fuera.
+
+El filtro por metadata es la pieza de seguridad de todo el sistema. Va dentro de la consulta, no en un `if` posterior, y por dos razones. Una es de corrección: si filtras después, los resultados que descartas ya te robaron plazas del `topK` y puedes quedarte con dos fragmentos cuando pediste ocho. La otra es de superficie de fallo: un filtro en la consulta es una garantía del motor, mientras que un filtro posterior es una línea de código que alguien puede refactorizar mal un martes. Recuerda además que en Vectorize los campos de metadata deben declararse como indexados para poder filtrarse, y eso se decide al crear el índice.
+
+<Cards>
+  <Card icon="🎯" title="Mismo modelo">
+    Ingesta y consulta comparten modelo, versión y convención de prefijos. Distinto modelo, espacio distinto, resultados sin sentido.
+  </Card>
+  <Card icon="📏" title="Umbral propio">
+    El `score` no es una probabilidad. Calibra un mínimo con tu corpus o acabarás respondiendo con los mejores de entre los malos.
+  </Card>
+  <Card icon="🔐" title="Filtro en la consulta">
+    El filtro por tenant o permiso viaja en la `query`. Filtrar después arruina el `topK` y deja la seguridad en manos del código.
+  </Card>
+  <Card icon="🧩" title="Vecinos contiguos">
+    Traer el `chunk` anterior y el siguiente reconstruye el hilo que el troceo cortó, a un coste de contexto muy bajo.
+  </Card>
+</Cards>
+
+## Rehidratar el texto
+
+Vectorize devuelve identificadores y puntuaciones, no prosa. El texto vive en D1, indexado por esa misma clave, y una sola consulta lo recupera entero.
+
+Alguien preguntará por qué no guardar el texto directamente en la metadata del vector y ahorrarse el viaje. Se puede, para fragmentos cortos, y a veces compensa. Pero la metadata de un índice vectorial tiene límites de tamaño, encarece cada búsqueda al viajar en todas las respuestas y no se puede consultar por otros criterios: no podrás listar los fragmentos de un documento, ni corregir un texto sin recalcular su vector, ni cruzarlos con tus tablas. D1 hace de fuente de verdad textual y el índice se queda con lo suyo, que es la geometría.
+
+```ts
+const ids = res.matches.map((m) => m.id);
+const marcas = ids.map(() => "?").join(",");
+const { results } = await env.DB.prepare(
+  `SELECT id, doc_id, pos, texto FROM chunks WHERE id IN (${marcas})`,
+).bind(...ids).all();
+
+// SQL no conserva el orden de relevancia: hay que restaurarlo
+const porId = new Map(results.map((r) => [r.id, r]));
+const chunks = res.matches.map((m) => ({ ...porId.get(m.id), score: m.score }));
+```
+
+<Mermaid code={`flowchart LR
+  Q[pregunta reescrita] --> E[embedding con el mismo modelo]
+  E --> VZ[Vectorize query con topK y filtro]
+  VZ --> ID[ids con score]
+  ID --> D1[D1 select where id in]
+  D1 --> OR[reordenar por score y deduplicar]
+  OR --> CTX[contexto listo para el prompt]
+  class VZ t-blue
+  class OR t-yellow`} />
+
+Merece la pena detenerse en las dos últimas líneas, porque encierran un fallo silencioso muy común. SQL no garantiza ningún orden en un `IN`, así que el resultado llega ordenado por lo que la base decida, casi nunca por relevancia. Si montas el `prompt` con ese orden, estás colocando en primer lugar el fragmento que casualmente insertaste antes, y perdiendo la señal más valiosa que produjo el recuperador. Reindexa siempre por la lista de coincidencias, no por la de la base.
+
+Dos retoques baratos mejoran mucho el contexto resultante. El primero es **deduplicar por documento**: si seis de los ocho vecinos son trozos consecutivos del mismo manual, estás gastando el presupuesto entero en una sola fuente y perdiendo diversidad; limitar a dos o tres trozos por documento suele subir la calidad de la respuesta. El segundo es la **ventana de vecinos**: como guardaste la posición de cada trozo, puedes traer también el anterior y el posterior del mejor resultado y reconstruir el hilo que el troceo cortó.
+
+<Callout type="info" title="Lo que la semántica no ve">
+La búsqueda vectorial encuentra parecidos de significado y es ciega a los símbolos exactos. Un código de error, un identificador de pedido, un SKU o un apellido raro casi no aportan señal semántica, y el índice devolverá textos que hablan de temas parecidos sin contener el término. El remedio es la búsqueda híbrida: mantén también un índice léxico —FTS5 en D1 encaja perfectamente— y fusiona ambas listas de resultados por su posición en cada ranking. Semántica para las preguntas, léxico para los identificadores.
+</Callout>
+
+## Desconfiar de la pregunta
+
+Las mejoras más rentables del recuperador no tocan el índice: tocan la consulta antes de incrustarla. Tres técnicas cubren la mayoría de los casos, y las tres se apoyan en el mismo LLM que ya tienes a mano.
+
+La primera es la **reescritura con historial**, obligatoria en cualquier interfaz conversacional. Una pregunta como "y en el plan anual" no significa nada fuera de su hilo, y su vector apunta a ninguna parte útil.
+
+```ts
+const autonoma = await env.AI.run("@cf/meta/llama-3.3-70b-instruct", {
+  messages: [
+    { role: "system", content: "Reescribe la ultima pregunta como consulta autonoma. Devuelve solo la consulta." },
+    { role: "user", content: `HISTORIAL:\n${historial}\n\nPREGUNTA: ${pregunta}` },
+  ],
+});
+const vector = (await env.AI.run("@cf/baai/bge-base-en-v1.5", { text: [autonoma.response] })).data[0];
+```
+
+La segunda es la **consulta múltiple**: generar tres o cuatro formulaciones distintas de la misma duda, buscar con todas y fusionar los rankings. Como cada variante ilumina una zona algo distinta del espacio, la unión cubre huecos que una sola consulta deja abiertos. Para fusionar, la fórmula clásica suma para cada documento el inverso de su posición en cada lista, de modo que aparecer decente en varias listas vale más que aparecer primero en una sola.
+
+La tercera es la más contraintuitiva y a menudo la más eficaz: pedir al modelo una **respuesta hipotética** a la pregunta e incrustar esa respuesta en lugar de la pregunta. Suena a truco y tiene una lógica firme: en tu índice hay pasajes afirmativos, y un texto afirmativo inventado se parece geométricamente mucho más a ellos que una interrogación breve. Da igual que la respuesta hipotética contenga errores, porque nunca se le enseña al usuario; solo se usa como sonda para buscar.
+
+Las tres tienen el mismo coste, una llamada extra de inferencia antes de buscar, y el mismo criterio de adopción: mídelas con tu conjunto de preguntas antes de dejarlas puestas.
+
+Ese coste extra se amortiza con una caché. Las preguntas de los usuarios se repiten mucho más de lo que parece, y el `embedding` de una cadena idéntica siempre da el mismo vector, así que guardarlo en KV bajo una clave derivada del texto ahorra una inferencia entera en cada repetición. Con la misma lógica puedes cachear la lista de identificadores recuperados, siempre que caduque lo bastante rápido como para no servir resultados de un índice que ya cambió.
+
+<Callout type="dios" title="Toda recuperación es una hipótesis sobre lo que el usuario quiso decir">
+Conviene mirar de frente lo que hace realmente un recuperador vectorial, porque su elegancia esconde una apuesta muy fuerte. Toma una pregunta, la comprime en unos cientos de números, y decreta que los textos cuyo vector apunte en una dirección parecida son los que la responden. Es una hipótesis, no un hecho: la proximidad en el espacio de `embeddings` correlaciona con la relevancia, pero no es la relevancia. Hay pasajes que responden una pregunta sin parecerse a ella —la respuesta a por qué falló el despliegue puede ser una línea de log que no comparte ni una palabra con la pregunta—, y hay pasajes que se le parecen muchísimo sin responderla, empezando por otra formulación de la misma duda escrita por otro usuario. A esa brecha la disciplina de recuperación de información la lleva estudiando desde los años sesenta, cuando aún no había vectores densos, y le puso nombres que siguen valiendo: la disociación entre similitud y pertinencia, la diferencia entre lo que el usuario escribió y lo que necesitaba, la imposibilidad de maximizar a la vez cobertura y precisión. Los `embeddings` no resolvieron ese problema, lo trasladaron a un espacio continuo donde ahora es más fácil calcularlo y más difícil verlo. De ahí se siguen dos consecuencias prácticas que reordenan cómo diseñas esta capa. La primera es que casi todas las mejoras serias del recuperador consisten en desconfiar de la pregunta tal como llega: reescribirla con el historial de la conversación, generar varias variantes y unir sus resultados, redactar una respuesta hipotética e incrustarla en lugar de la pregunta porque una respuesta se parece más a otra respuesta que a su pregunta. La segunda es que la recuperación nunca debería ser un único disparo con una única representación: la búsqueda densa y la léxica fallan en sitios distintos, y fusionarlas cubre huecos que ninguna cubre sola. Quien entiende esto deja de tratar el `topK` como una constante afortunada y empieza a tratar la recuperación como lo que es: un modelo de lo que el usuario probablemente quiso decir, que se puede medir, discutir y mejorar por separado del LLM que viene después.
+</Callout>
+
+<Challenge title="Afina el recuperador">
+1. Consulta tu índice con `topK` de 3, 8 y 30 sobre las mismas diez preguntas y anota en cuántas aparece el fragmento correcto en cada caso.
+2. Lanza una pregunta completamente ajena a tu corpus y observa las puntuaciones que devuelve. Fija con ellas un umbral mínimo razonable.
+3. Comprueba en la práctica la diferencia entre filtrar por tenant dentro de la `query` y filtrar después: cuenta cuántos resultados útiles te quedan en cada caso.
+4. Añade deduplicación por documento y la ventana de vecinos contiguos, y compara los contextos resultantes sobre la misma pregunta.
+5. Busca un identificador exacto de tu dominio y verifica que la búsqueda semántica lo pierde. Añade un índice FTS5 en D1 y fusiona ambos rankings.
+</Challenge>

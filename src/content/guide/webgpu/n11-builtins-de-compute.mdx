@@ -1,0 +1,175 @@
+---
+title: "Los builtins de compute y la aritmética que los relaciona"
+description: "Los cinco identificadores de una invocación de cómputo, la fórmula exacta que los liga, los límites de @workgroup_size, y por qué el guardia de rango no siempre puede ir al principio."
+subject: webgpu
+level: 11
+order: 5
+position: "11.5"
+duration: "18 min"
+---
+
+<Lead>
+Un compute shader no recibe geometría ni fragmentos: recibe una posición dentro de una rejilla de tres dimensiones y tiene que deducir de ahí qué dato le toca. Los cinco builtins que dan esa posición son toda la información de contexto que tiene una invocación, y la aritmética que los relaciona hay que saberla de memoria porque de ella dependen tanto la corrección como el ancho de banda.
+</Lead>
+
+<Goals>
+
+- Enumerar los cinco builtins de cómputo con su tipo y su significado.
+- Derivar cualquiera de ellos a partir de los otros con la fórmula exacta.
+- Declarar `@workgroup_size` respetando los límites garantizados del dispositivo.
+- Escribir el guardia de rango de forma que no rompa el control de flujo uniforme.
+
+</Goals>
+
+## Los cinco identificadores
+
+| Builtin | Tipo | Qué es |
+|---|---|---|
+| `local_invocation_id` | `vec3u` | posición dentro del grupo de trabajo |
+| `local_invocation_index` | `u32` | la misma posición, linealizada |
+| `workgroup_id` | `vec3u` | posición del grupo dentro del dispatch |
+| `num_workgroups` | `vec3u` | dimensiones del dispatch |
+| `global_invocation_id` | `vec3u` | posición absoluta dentro del dispatch |
+
+Los cinco son de entrada, no hay ninguno de salida, y todos son enteros sin signo. Las tres dimensiones existen siempre aunque tu problema sea de una: en un dispatch de `(n, 1, 1)` los componentes `y` y `z` valen cero en todo.
+
+```wgsl
+@compute @workgroup_size(8, 8)
+fn cs(
+  @builtin(global_invocation_id) gid : vec3u,
+  @builtin(local_invocation_id)  lid : vec3u,
+  @builtin(local_invocation_index) li : u32,
+  @builtin(workgroup_id)         wid : vec3u,
+  @builtin(num_workgroups)       ngr : vec3u,
+) {
+  // ...
+}
+```
+
+Con la feature `subgroups` y su `enable` correspondiente aparecen dos más, `subgroup_invocation_id` y `subgroup_size`, que exponen la agrupación real del hardware por debajo del grupo de trabajo.
+
+## La aritmética
+
+Las tres relaciones que ligan los cinco valores:
+
+```
+global_invocation_id   = workgroup_id * workgroup_size + local_invocation_id
+
+local_invocation_index = local_invocation_id.x
+                       + local_invocation_id.y * workgroup_size.x
+                       + local_invocation_id.z * workgroup_size.x * workgroup_size.y
+
+total de invocaciones  = num_workgroups * workgroup_size    (componente a componente)
+```
+
+La segunda es la que hay que tener grabada: **la linealización es en orden X primero**. El componente `x` es el que varía más rápido, y por eso dos invocaciones con índices lineales consecutivos son vecinas en la dimensión `x` y no en la `y`.
+
+`num_workgroups` es lo que pasaste a `dispatchWorkgroups`, no el total de invocaciones. Es fácil confundirse: con `dispatchWorkgroups(64)` y `@workgroup_size(256)`, `num_workgroups.x` vale 64 y hay 16384 invocaciones.
+
+Su utilidad real es escribir shaders que se adaptan al tamaño del dispatch sin uniforms adicionales. El patrón de bucle en rejilla, que procesa un array de cualquier longitud con un número fijo de grupos, se apoya exactamente en eso:
+
+```wgsl
+@compute @workgroup_size(256)
+fn procesar(@builtin(global_invocation_id) gid : vec3u,
+            @builtin(num_workgroups) ngr : vec3u) {
+  let paso = ngr.x * 256u;                 // invocaciones totales
+  let n = arrayLength(&datos);
+  var i = gid.x;
+  while (i < n) {
+    datos[i] = datos[i] * 2.0;
+    i = i + paso;
+  }
+}
+```
+
+Ese bucle permite lanzar un número de grupos proporcional al hardware —no al problema— y procesar arrays de cualquier tamaño, incluidos los que superan `maxComputeWorkgroupsPerDimension`.
+
+## @workgroup_size y sus límites
+
+El atributo acepta hasta tres argumentos, y los que faltan valen 1. Sus valores tienen que ser expresiones de tiempo de compilación o expresiones `override`, y están acotados por cuatro límites del dispositivo cuyos mínimos garantizados son estos:
+
+| Límite | Mínimo garantizado |
+|---|---|
+| `maxComputeInvocationsPerWorkgroup` | 256 |
+| `maxComputeWorkgroupSizeX` | 256 |
+| `maxComputeWorkgroupSizeY` | 256 |
+| `maxComputeWorkgroupSizeZ` | 64 |
+| `maxComputeWorkgroupsPerDimension` | 65535 |
+
+El producto de las tres dimensiones no puede superar el primero, así que `@workgroup_size(16, 16)` son 256 y cabe justo, y `@workgroup_size(16, 16, 2)` son 512 y no cabe en un dispositivo que solo garantice el mínimo.
+
+Con `override` en el tamaño, el mismo módulo sirve para varias configuraciones sin duplicar texto:
+
+```wgsl
+override TAM_X : u32 = 8u;
+override TAM_Y : u32 = 8u;
+
+var<workgroup> tesela : array<f32, 64>;   // ojo: este si necesita un tamaño fijo o un override
+
+@compute @workgroup_size(TAM_X, TAM_Y)
+fn cs(@builtin(local_invocation_index) li : u32) { /* ... */ }
+```
+
+## El guardia y el control de flujo
+
+Como el número de invocaciones lanzadas es múltiplo del tamaño de grupo, casi siempre sobran invocaciones al final. Con 1000 elementos y grupos de 256 hacen falta 4 grupos, o sea 1024 invocaciones, y las 24 últimas no tienen dato que procesar.
+
+El guardia obvio es salir pronto:
+
+```wgsl
+@compute @workgroup_size(256)
+fn cs(@builtin(global_invocation_id) gid : vec3u) {
+  if (gid.x >= arrayLength(&datos)) { return; }   // correcto SOLO si no hay barreras
+  datos[gid.x] = sqrt(datos[gid.x]);
+}
+```
+
+Eso es perfectamente válido **mientras el shader no tenga barreras**. En cuanto aparece una `workgroupBarrier()`, el `return` temprano la rompe: la barrera exige que **todas** las invocaciones del grupo la alcancen, y las que se fueron no van a alcanzarla. El compilador lo detecta como control de flujo no uniforme y rechaza el módulo, o peor, en versiones antiguas lo aceptaba y el resultado colgaba.
+
+El patrón correcto con barreras es no salir nunca: guardar solo los accesos a memoria y dejar las barreras fuera de cualquier condicional.
+
+```wgsl
+var<workgroup> parciales : array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn reducir(@builtin(global_invocation_id) gid : vec3u,
+           @builtin(local_invocation_index) li : u32) {
+  let n = arrayLength(&datos);
+
+  // Carga con guardia: el elemento neutro para las invocaciones sobrantes.
+  var v = 0.0;
+  if (gid.x < n) { v = datos[gid.x]; }
+  parciales[li] = v;
+
+  workgroupBarrier();      // la alcanzan las 256, siempre
+
+  var salto = 128u;
+  while (salto > 0u) {
+    if (li < salto) { parciales[li] = parciales[li] + parciales[li + salto]; }
+    workgroupBarrier();    // fuera del if, tambien la alcanzan las 256
+    salto = salto / 2u;
+  }
+
+  if (li == 0u) { salidas[gid.x / 256u] = parciales[0]; }
+}
+```
+
+Fíjate en los dos detalles: el valor neutro para las invocaciones que se salen del rango, y las dos barreras colocadas donde el flujo es uniforme aunque el trabajo no lo sea.
+
+<Callout type="dios" title="El orden de linealización decide el ancho de banda, y es donde se pierde un factor de diez">
+`local_invocation_index` va con la `x` primero, y esa convención no es un detalle de presentación: describe cómo agrupa el hardware las invocaciones en unidades de ejecución. Las invocaciones con índices lineales consecutivos van juntas en el mismo grupo SIMD, ejecutan la misma instrucción a la vez, y **sus accesos a memoria se fusionan si son contiguos**.
+
+De ahí sale la regla que decide el rendimiento de casi cualquier shader que recorra una imagen o una matriz: **el componente `x` del identificador tiene que indexar la dimensión contigua en memoria**. Para una imagen almacenada por filas, eso significa que `x` es la columna.
+
+Con un grupo de `(8, 8)` procesando una tesela de una imagen, la versión correcta es la evidente:
+
+`let texel = textureLoad(entrada, vec2i(gid.xy), 0);`
+
+Y la versión que parece equivalente pero no lo es:
+
+`let texel = textureLoad(entrada, vec2i(gid.yx), 0);`
+
+En la primera, las ocho invocaciones consecutivas leen ocho texels contiguos, la GPU emite una transacción de memoria y sirve a las ocho. En la segunda, esas ocho invocaciones leen ocho texels separados por el ancho entero de la imagen, lo que son ocho transacciones distintas, ocho líneas de caché traídas para usar unos pocos bytes de cada una. Con un ancho de imagen grande, la diferencia medida entre las dos versiones ronda un orden de magnitud, y **las dos son correctas**: producen exactamente la misma imagen.
+
+Ese es el motivo de que estos errores sobrevivan. No hay validación que los detecte, no hay artefacto visual, no hay warning. Solo un shader que tarda diez veces más de lo que debería, y una explicación que no está en el código sino en cómo el índice se corresponde con la memoria. Cuando un compute shader vaya inexplicablemente lento, mira el mapeo del índice a la dirección **antes** de mirar la aritmética.
+</Callout>

@@ -1,0 +1,261 @@
+---
+title: "La región sucia: redibujar solo lo que ha cambiado"
+description: "La optimización de mayor retorno del canvas, con el patrón completo: cálculo del rectángulo, expansión por trazo y sombra, alineado a píxel y redibujado por recorte."
+subject: canvas
+level: 14
+order: 4
+position: "14.4"
+duration: "22 min"
+---
+
+<Lead>
+Cuando el usuario arrastra un nodo de doscientos por sesenta píxeles en un editor a pantalla completa, el código habitual borra dos millones de píxeles y redibuja doscientos objetos para actualizar doce mil. Redibujar solo el rectángulo afectado es la optimización con mejor relación entre esfuerzo y resultado de todo el canvas, y también la que casi nadie implementa, porque exige llevar una contabilidad que la API no lleva por ti y porque tiene dos detalles que, si se pasan por alto, dejan restos en pantalla y hacen abandonar la técnica.
+</Lead>
+
+<Goals>
+
+- Calcular el rectángulo sucio a partir de la posición anterior y la nueva.
+- Expandirlo correctamente por trazo, sombra y antialiasing, y alinearlo a píxel físico.
+- Redibujar la región con recorte, incluyendo los objetos que la solapan.
+- Combinar varias regiones y decidir cuándo volver al redibujado completo.
+
+</Goals>
+
+## La idea y su contabilidad
+
+El canvas no sabe qué ha cambiado, así que lo llevas tú. En cada fotograma, para cada objeto que se ha movido o alterado, hay **dos** rectángulos que ensuciar: el que ocupaba antes —para borrar el rastro— y el que ocupa ahora. La unión de todos ellos es la región sucia.
+
+```js
+class RegionSucia {
+  constructor() { this.reiniciar(); }
+
+  reiniciar() {
+    this.x0 = Infinity; this.y0 = Infinity;
+    this.x1 = -Infinity; this.y1 = -Infinity;
+  }
+
+  get vacia() { return this.x1 < this.x0; }
+
+  anadir(x, y, ancho, alto) {
+    if (ancho <= 0 || alto <= 0) return;
+    if (x < this.x0) this.x0 = x;
+    if (y < this.y0) this.y0 = y;
+    if (x + ancho > this.x1) this.x1 = x + ancho;
+    if (y + alto > this.y1) this.y1 = y + alto;
+  }
+
+  anadirCaja(c) { this.anadir(c.x, c.y, c.ancho, c.alto); }
+
+  expandir(m) {
+    if (this.vacia) return;
+    this.x0 -= m; this.y0 -= m; this.x1 += m; this.y1 += m;
+  }
+
+  // Recorta al canvas y alinea a pixel FISICO, hacia fuera
+  cerrar(anchoCanvas, altoCanvas, dpr) {
+    if (this.vacia) return null;
+    const x0 = Math.max(0, Math.floor(this.x0 * dpr) / dpr);
+    const y0 = Math.max(0, Math.floor(this.y0 * dpr) / dpr);
+    const x1 = Math.min(anchoCanvas, Math.ceil(this.x1 * dpr) / dpr);
+    const y1 = Math.min(altoCanvas, Math.ceil(this.y1 * dpr) / dpr);
+    if (x1 <= x0 || y1 <= y0) return null;
+    return { x: x0, y: y0, ancho: x1 - x0, alto: y1 - y0 };
+  }
+}
+```
+
+Dos decisiones de esa clase merecen explicación.
+
+**Se acumula en un solo rectángulo envolvente**, no en una lista. Es lo más simple, funciona bien en la mayoría de los casos y evita toda la complejidad de gestionar regiones solapadas. Cuándo conviene separar en varias es el asunto de la última sección.
+
+**El alineado va hacia fuera y en píxeles físicos.** `Math.floor` para el origen y `Math.ceil` para el extremo, multiplicando por la densidad antes y dividiendo después. Si no lo haces, el recorte cae en medio de un píxel físico y el navegador lo suaviza, con lo que queda media línea del contenido antiguo justo en el borde de la región. Es un fallo de medio píxel y es la razón número uno por la que la gente prueba esta técnica, ve costuras, y la abandona.
+
+## Expandir: el margen que todo el mundo olvida
+
+La caja de un objeto no es lo que ocupa en pantalla. Lo que ocupa es mayor, y por cinco motivos acumulables:
+
+| Causa | Cuánto añade |
+|---|---|
+| Antialiasing del borde | 1 píxel por lado |
+| Trazo | La mitad de `lineWidth` por lado |
+| Unión en pico | Hasta `lineWidth` multiplicado por `miterLimit` en las esquinas |
+| Sombra | El desenfoque más el valor absoluto del desplazamiento |
+| Filtro del contexto | Depende del filtro; un desenfoque, unas tres veces su radio |
+
+La forma segura es calcular el margen por objeto y quedarse con el mayor de la región:
+
+```js
+function margenDe(o) {
+  let m = 1;                                    // antialiasing
+  if (o.grosor) m += o.grosor / 2 * (o.union === 'miter' ? (o.miterLimit ?? 10) : 1);
+  if (o.sombraDesenfoque) {
+    m += o.sombraDesenfoque + Math.max(Math.abs(o.sombraX ?? 0), Math.abs(o.sombraY ?? 0));
+  }
+  return Math.ceil(m);
+}
+```
+
+El factor del pico sorprende: con `lineJoin` en `miter` y un ángulo agudo, la punta puede sobresalir mucho más que la mitad del grosor, hasta el límite que fije `miterLimit`. Con `round` o `bevel` no ocurre, y por eso muchos motores de dibujo evitan `miter` precisamente para poder acotar las regiones sucias.
+
+Y hay un margen que no depende del objeto sino de la escena: **si el canvas tiene una transformación de cámara con zoom, el margen en unidades de mundo hay que dividirlo por la escala** para que siga valiendo lo mismo en píxeles.
+
+## Redibujar la región
+
+Con el rectángulo cerrado, el redibujado tiene cuatro pasos y el tercero es el que se olvida.
+
+```js
+function dibujarRegion(ctx, escena, r) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(r.x, r.y, r.ancho, r.alto);
+  ctx.clip();                                   // 1. limitar todo lo que sigue
+
+  ctx.clearRect(r.x, r.y, r.ancho, r.alto);     // 2. borrar solo ahi
+  dibujarFondo(ctx, r);                         // 3. el fondo de esa zona
+
+  for (const id of escena.orden) {              // 4. TODO lo que toca la region
+    const o = escena.porId.get(id);
+    if (!intersecta(cajaConMargen(o), r)) continue;
+    dibujarObjeto(ctx, o);
+  }
+  ctx.restore();
+}
+
+function intersecta(a, r) {
+  return a.x < r.x + r.ancho && a.x + a.ancho > r.x &&
+         a.y < r.y + r.alto  && a.y + a.alto  > r.y;
+}
+```
+
+El paso cuatro es donde se equivoca todo el mundo: **no se redibuja el objeto que se movió, se redibujan todos los objetos que tocan la región**, y en el orden de profundidad original. Si redibujas solo el que se movió, cualquier objeto que estuviera debajo o encima aparece cortado, porque acabas de borrar el trozo que compartían. Y el orden importa: dibujar el objeto movido al final lo pone encima de todo aunque en la escena estuviera detrás.
+
+El recorte hace el trabajo pesado. Con él puedes llamar a la función de dibujo normal de cada objeto sin preocuparte de que se salga: lo que caiga fuera del rectángulo simplemente no se pinta. También es lo que permite dibujar el fondo con una sola llamada aunque sea un gradiente de pantalla completa.
+
+Todo junto en el bucle, con la contabilidad de las cajas anteriores:
+
+```js
+const region = new RegionSucia();
+const dpr = window.devicePixelRatio || 1;
+let redibujarTodo = true;
+
+function marcar(o) {                            // llamar al cambiar cualquier objeto
+  o.sucio = true;
+}
+
+function marco() {
+  region.reiniciar();
+  let margenMax = 0;
+
+  for (const id of escena.orden) {
+    const o = escena.porId.get(id);
+    if (!o.sucio) continue;
+    if (o.cajaPrevia) region.anadirCaja(o.cajaPrevia);   // donde estaba
+    const caja = cajaDe(o);
+    region.anadirCaja(caja);                             // donde esta
+    margenMax = Math.max(margenMax, margenDe(o));
+    o.cajaPrevia = caja;
+    o.sucio = false;
+  }
+
+  if (redibujarTodo) {
+    dibujarTodo(ctx, escena);
+    redibujarTodo = false;
+  } else if (!region.vacia) {
+    region.expandir(margenMax);
+    const r = region.cerrar(ancho, alto, dpr);
+    if (r) {
+      const proporcion = (r.ancho * r.alto) / (ancho * alto);
+      if (proporcion > 0.6) dibujarTodo(ctx, escena);    // ya no compensa
+      else dibujarRegion(ctx, escena, r);
+      ultimaRegion = r;                                  // para la depuracion
+    }
+  }
+  requestAnimationFrame(marco);
+}
+```
+
+El umbral del sesenta por ciento no es un capricho: por encima de esa proporción, el coste del recorte y de la comprobación de intersecciones supera al de borrar y redibujar entero, y además la ganancia restante es pequeña. Entre el cuarenta y el setenta por ciento es un rango razonable; conviene medirlo en tu escena.
+
+<Callout type="dios" title="Los dos fallos que hacen abandonar la técnica, y el tercero que solo aparece en producción">
+La región sucia tiene fama de frágil y la fama es merecida, pero los fallos son tres y son concretos, no una maldición difusa. **El primero: restos de un píxel en el borde.** Aparecen como una línea fina de contenido antiguo justo en el límite de la región, y son visibles sobre todo al mover algo rápido. La causa es siempre una de dos: no haber expandido por el antialiasing y el trazo, o no haber alineado el rectángulo a píxel físico hacia fuera. Ambas se arreglan con las funciones de arriba y ninguna se arregla "por si acaso" añadiendo diez píxeles de margen, que es lo que suele hacer la gente y lo que convierte una optimización en una excusa. **El segundo: objetos que aparecen cortados o mal apilados.** Ocurre cuando redibujas solo el objeto que cambió en vez de todos los que tocan la región. El síntoma es que un elemento que se solapaba con el que se movió queda con un mordisco rectangular, y a veces el mordisco se rellena solo al pasar por encima con el ratón, lo que despista muchísimo. La comprobación de intersección contra toda la lista es obligatoria. **El tercero solo aparece cuando el proyecto crece, y es el que de verdad mata la técnica: la invalidación olvidada.** El sistema entero se apoya en que cada cambio de estado marque su objeto como sucio, y basta con que **una** ruta de código modifique algo sin marcarlo para que aparezca un fallo intermitente e irreproducible: el elemento no se actualiza hasta que algo cerca de él ensucia la zona. Esos informes de error son de los peores que existen, porque el usuario describe un síntoma que no depende de lo que él hizo sino de lo que había alrededor. Hay una defensa que funciona y que conviene montar desde el principio: **encapsular el estado que afecta al dibujo detrás de asignaciones que marquen automáticamente**, con `set` de clase o un `Proxy` en desarrollo, de modo que sea imposible cambiar una posición sin ensuciar. Y una segunda defensa, más barata, que ahorra horas: **una tecla de depuración que fuerce el redibujado completo**. Si al pulsarla la pantalla se arregla, el fallo es de invalidación y sabes exactamente qué buscar; si no cambia nada, el fallo está en el dibujo y es otro asunto. Con esas dos piezas, la técnica es perfectamente mantenible; sin ellas, cualquier equipo la acaba desactivando "porque daba problemas".
+</Callout>
+
+## Varias regiones y la depuración
+
+El rectángulo envolvente único degenera en un caso muy concreto: **dos objetos que cambian en esquinas opuestas**. La unión es entonces casi toda la pantalla aunque el área real sucia sea diminuta.
+
+La solución es mantener una lista corta de regiones con una heurística de fusión:
+
+```js
+class Regiones {
+  constructor(maximo = 4) { this.lista = []; this.maximo = maximo; }
+
+  reiniciar() { this.lista.length = 0; }
+
+  anadir(x, y, ancho, alto) {
+    const nueva = { x, y, ancho, alto };
+    for (const r of this.lista) {
+      const u = union(r, nueva);
+      // Fusionar solo si no desperdicia demasiado
+      if (area(u) <= area(r) + area(nueva) * 1.4) {
+        Object.assign(r, u);
+        return;
+      }
+    }
+    this.lista.push(nueva);
+    if (this.lista.length > this.maximo) {
+      // Fusionar las dos que menos area desperdicien
+      let mejor = [0, 1], coste = Infinity;
+      for (let i = 0; i < this.lista.length; i++) {
+        for (let j = i + 1; j < this.lista.length; j++) {
+          const c = area(union(this.lista[i], this.lista[j]));
+          if (c < coste) { coste = c; mejor = [i, j]; }
+        }
+      }
+      const [i, j] = mejor;
+      this.lista[i] = union(this.lista[i], this.lista[j]);
+      this.lista.splice(j, 1);
+    }
+  }
+}
+
+const area = r => r.ancho * r.alto;
+const union = (a, b) => {
+  const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+  return {
+    x, y,
+    ancho: Math.max(a.x + a.ancho, b.x + b.ancho) - x,
+    alto: Math.max(a.y + a.alto, b.y + b.alto) - y,
+  };
+};
+```
+
+Cada región se dibuja con su propio recorte y su propio borrado. El techo de cuatro no es arbitrario: cada región supone un recorte, un borrado y un recorrido completo de la lista de objetos, así que más allá de unas pocas el coste de gestionarlas supera al de redibujar entero.
+
+Y para que todo esto sea depurable, una superposición que pinta las regiones. Sin ella se trabaja a ciegas:
+
+```js
+function dibujarDepuracion(ctx, regiones, ancho, alto) {
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = '#f38ba8';
+  ctx.fillStyle = 'rgba(243, 139, 168, 0.12)';
+  let sucia = 0;
+  for (const r of regiones) {
+    ctx.fillRect(r.x, r.y, r.ancho, r.alto);
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.ancho - 1, r.alto - 1);
+    sucia += r.ancho * r.alto;
+  }
+  ctx.fillStyle = '#f38ba8';
+  ctx.font = '12px monospace';
+  ctx.fillText(`${regiones.length} regiones, ${(sucia / (ancho * alto) * 100).toFixed(1)}%`, 8, 16);
+  ctx.restore();
+}
+```
+
+Ese porcentaje es la métrica que gobierna toda la técnica. En un editor con un nodo arrastrándose debería estar por debajo del cinco por ciento; si está en cuarenta, algo está ensuciando de más y merece la pena averiguar qué antes de seguir optimizando cualquier otra cosa.
+
+<Challenge>
+Implementa la superposición de depuración en una escena con veinte objetos y arrastra uno. Comprueba que el porcentaje se mantiene bajo. Después añade una sombra de veinte píxeles al objeto arrastrado sin tocar la función de margen: verás aparecer el rastro cortado, y al arreglar el margen desaparece. Es la demostración más rápida de por qué la expansión no es opcional.
+</Challenge>

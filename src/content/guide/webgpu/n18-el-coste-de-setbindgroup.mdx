@@ -1,0 +1,131 @@
+---
+title: "El coste real de setBindGroup y cómo medirlo"
+description: "Qué hace un setBindGroup por dentro en cada backend, por qué el coste vive en la CPU y no en la GPU, y cómo montar una medición honesta con timestamps y con el reloj de pared."
+subject: webgpu
+level: 18
+order: 4
+position: "18.4"
+duration: "20 min"
+---
+
+<Lead>
+Todo el mundo repite que `setBindGroup` es barato, y es cierto comparado con lo que sustituye. Pero barato no es gratis, y en un renderer con miles de objetos la suma decide si el frame cabe en el presupuesto. Lo interesante es que el coste no está donde la intuición lo pone: no lo paga la GPU, lo paga el hilo de JavaScript, y eso cambia por completo cómo se mide y cómo se reduce.
+</Lead>
+
+<Goals>
+
+- Describir qué trabajo hace `setBindGroup` en la CPU y qué comando genera para la GPU.
+- Distinguir el coste de grabar comandos del coste de ejecutarlos y saber cuál domina.
+- Montar una medición de CPU con `performance.now()` que aísle la grabación del pass.
+- Interpretar una timestamp query para descartar que el cuello esté en la GPU.
+
+</Goals>
+
+## Qué pasa cuando llamas
+
+`setBindGroup` en un `GPURenderPassEncoder` hace tres cosas. Primero, valida: comprueba que el índice está dentro de `maxBindGroups`, que el número de dynamic offsets coincide con el número de entradas que los declaran, y que cada offset respeta su alineación mínima. Segundo, guarda el estado en el encoder: el grupo pasa a ser el atado en ese índice para todos los comandos siguientes. Tercero, cuando se emite un `draw`, el estado acumulado se resuelve y se graba en el command buffer.
+
+Lo que llega finalmente a la GPU depende del backend. En Vulkan es un `vkCmdBindDescriptorSets` con el descriptor set ya construido. En D3D12 es un `SetGraphicsRootDescriptorTable` que escribe un puntero. En Metal, si la implementación usa argument buffers, es un `setFragmentBuffer` con el buffer de argumentos. En los tres casos la GPU hace un trabajo mínimo: cambiar una dirección base desde la que leerá descriptores.
+
+El coste dominante, por tanto, es el de la **grabación**: el paso por el binding de WebIDL desde JavaScript, la validación, la actualización del estado del encoder y la escritura en el buffer de comandos interno de la implementación. Todo eso ocurre en el hilo principal, compitiendo con tu lógica de juego, con el layout del DOM y con el recolector de basura.
+
+<Callout type="info" title="El coste del binding de JavaScript es real y medible">
+Cada llamada a la API de WebGPU cruza la frontera entre el motor de JS y el código nativo del navegador. Ese cruce cuesta del orden de decenas a cientos de nanosegundos según el navegador y la forma de los argumentos. Con 2000 objetos y cuatro llamadas por objeto son 8000 cruces por frame: entre medio milisegundo y dos milisegundos solo en peaje, sin haber dibujado nada. Es la razón por la que reducir llamadas importa aunque la GPU esté ociosa.
+</Callout>
+
+## Un detalle que sí cuesta: los dynamic offsets
+
+No todas las llamadas cuestan lo mismo. `setBindGroup(i, grupo)` con dos argumentos es la forma barata. `setBindGroup(i, grupo, [offset])` con un array de JavaScript obliga a la implementación a recorrer el array, convertir cada número y validarlo, y ese array además es un objeto que el recolector tendrá que limpiar.
+
+La API ofrece una sobrecarga pensada para evitarlo: pasar un `Uint32Array` preasignado junto con un índice de inicio y una longitud.
+
+```js
+// Reserva única, fuera del bucle.
+const offsets = new Uint32Array(objetos.length);
+for (let i = 0; i < objetos.length; i++) offsets[i] = i * paso;
+
+// En el bucle: sin asignar arrays, sin conversiones.
+for (let i = 0; i < objetos.length; i++) {
+  pass.setBindGroup(2, grupoObjeto, offsets, i, 1);
+  pass.drawIndexed(objetos[i].cuenta);
+}
+```
+
+Los tres argumentos extra son `dynamicOffsetsData`, `dynamicOffsetsStart` en elementos del array y `dynamicOffsetsLength`. La diferencia frente a `[offset]` no es enorme por llamada, pero elimina 2000 asignaciones de array por frame, y eso sí se nota en el perfil de recolección de basura de una aplicación que corre durante horas.
+
+## Medir el coste de CPU
+
+La medición correcta aísla la fase de grabación. Como `queue.submit` es asíncrono respecto a la GPU pero la grabación es síncrona, un `performance.now()` alrededor del bucle mide exactamente lo que quieres:
+
+```js
+function medirGrabacion(escena, repeticiones = 60) {
+  const muestras = [];
+  for (let r = 0; r < repeticiones; r++) {
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginRenderPass(descriptorPass);
+
+    const t0 = performance.now();
+    dibujarEscena(pass, escena);       // solo grabación: setBindGroup + draw
+    const t1 = performance.now();
+
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    muestras.push(t1 - t0);
+  }
+  muestras.sort((a, b) => a - b);
+  return {
+    mediana: muestras[Math.floor(muestras.length / 2)],
+    p95:     muestras[Math.floor(muestras.length * 0.95)],
+  };
+}
+```
+
+Usa la mediana y el percentil 95, no la media: la primera iteración incluye compilaciones perezosas y la distribución tiene cola larga por culpa del recolector. Y ejecuta las repeticiones dentro del mismo frame o en frames consecutivos, no separadas por interacción del usuario, para que el reloj esté en el mismo estado térmico.
+
+Con esa función puedes responder la única pregunta que importa: si quitas la llamada a `setBindGroup(2, ...)` del bucle interno —dibujando mal a propósito, todos los objetos con la misma matriz—, ¿cuánto baja la mediana? Esa diferencia es el coste real de esa llamada en tu aplicación, en tu navegador y en tu máquina. Cualquier número que venga de otra fuente es folclore.
+
+## Descartar que el cuello esté en la GPU
+
+Antes de optimizar llamadas conviene comprobar que el problema no está al otro lado. Si el dispositivo tiene la feature `timestamp-query`, un render pass puede escribir marcas de tiempo al empezar y al terminar:
+
+```js
+const soporta = adapter.features.has('timestamp-query');
+const device = await adapter.requestDevice({
+  requiredFeatures: soporta ? ['timestamp-query'] : [],
+});
+
+const querySet = device.createQuerySet({ type: 'timestamp', count: 2 });
+const resolucion = device.createBuffer({
+  size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+});
+const lectura = device.createBuffer({
+  size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+});
+
+const pass = encoder.beginRenderPass({
+  colorAttachments: [...],
+  timestampWrites: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
+});
+// ... dibujar ...
+pass.end();
+encoder.resolveQuerySet(querySet, 0, 2, resolucion, 0);
+encoder.copyBufferToBuffer(resolucion, 0, lectura, 0, 16);
+device.queue.submit([encoder.finish()]);
+
+await lectura.mapAsync(GPUMapMode.READ);
+const t = new BigInt64Array(lectura.getMappedRange());
+console.log('pass en ms:', Number(t[1] - t[0]) / 1e6);   // los timestamps son ns
+lectura.unmap();
+```
+
+Los valores son nanosegundos en `BigInt64Array`, y el navegador puede cuantizarlos deliberadamente para no ofrecer un reloj de alta precisión explotable. Sirven perfectamente para comparar dos versiones del mismo pass; no sirven para medir microsegundos absolutos.
+
+La comparación decisiva es esta: si el tiempo de grabación en CPU es 4 ms y el pass en GPU es 1,2 ms, estás limitado por CPU y reducir llamadas es exactamente lo que hay que hacer. Si es al revés, reducir `setBindGroup` no cambiará nada y el trabajo está en el shader o en el ancho de banda.
+
+<Callout type="dios" title="La medición que casi nadie hace es la del navegador equivocado">
+El coste de `setBindGroup` no es una propiedad de WebGPU sino de la implementación concreta, y varía más entre navegadores que entre GPUs. La validación de WebGPU vive en el proceso de contenido en algunos navegadores y en el proceso de GPU en otros, con serialización de por medio; la sobrecarga por llamada puede diferir en un factor de tres. Si tu renderer va sobrado en Chrome en un portátil de desarrollo y se arrastra en Safari en un móvil, la primera hipótesis no debería ser la GPU: debería ser el número de llamadas por frame, que es la magnitud que peor escala al cambiar de implementación. Mide el mismo frame en los tres motores antes de tocar un shader.
+</Callout>
+
+<Challenge>
+Coge tu bucle de dibujado y escribe tres variantes: una con un bind group por objeto, otra con un bind group compartido y dynamic offset en array literal, y otra con la sobrecarga de `Uint32Array` preasignado. Mide las tres con la función de arriba sobre la misma escena y anota mediana y p95. Después repite en un dispositivo distinto. El orden relativo se mantendrá; la magnitud, casi seguro que no.
+</Challenge>

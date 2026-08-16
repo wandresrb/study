@@ -1,0 +1,140 @@
+---
+title: "Implementar .mmap en un driver: remap_pfn_range y .fault"
+description: "Exponer memoria de dispositivo o un buffer del kernel directamente en el espacio de usuario elimina copias. Dos técnicas: remap_pfn_range para cablear de golpe una región físicamente contigua, o un manejador .fault en vm_operations_struct para poblar páginas perezosamente. Cómo escribir file_operations.mmap y fijar los vm_flags correctos."
+subject: kernel
+level: 23
+order: 4
+position: "23.4"
+duration: "17 min"
+---
+
+<Lead>
+Un driver puede hacer algo casi mágico: mapear su memoria de dispositivo, o un buffer del kernel, directamente en el espacio de direcciones de un proceso. A partir de ahí el usuario lee y escribe registros de hardware o comparte un buffer sin un solo `read` ni `write`, sin copias, a velocidad de puntero. La herramienta es el método `.mmap` de `file_operations`, y hay dos formas de implementarlo según cómo sea la memoria que expones.
+</Lead>
+
+<Goals>
+
+- Implementar `file_operations.mmap` en un driver de carácter.
+- Usar `remap_pfn_range` para mapear memoria de dispositivo contigua.
+- Escribir un `.fault` en `vm_operations_struct` para buffers no contiguos.
+- Fijar los `vm_flags` correctos con las macros modernas de escritura protegida.
+
+</Goals>
+
+## El enganche: file_operations.mmap
+
+Cuando un proceso hace `mmap` sobre el fichero de dispositivo de tu driver, el camino del nivel 23.2 (`do_mmap` a `call_mmap`) acaba invocando tu método. Recibes la VMA ya creada y tu trabajo es rellenar la tabla de páginas del rango `[vma->vm_start, vma->vm_end)` con las páginas físicas de tu dispositivo, o bien instalar un `vm_ops` que las provea bajo demanda.
+
+```c
+static int mydev_mmap(struct file *filp, struct vm_area_struct *vma);
+
+static const struct file_operations mydev_fops = {
+	.owner = THIS_MODULE,
+	.open  = mydev_open,
+	.mmap  = mydev_mmap,       /* <- lo llama el kernel en mmap(2) */
+};
+```
+
+## remap_pfn_range: cablear una región contigua
+
+Si tu memoria es **físicamente contigua** —registros MMIO de un dispositivo, o un buffer DMA reservado— la vía directa es `remap_pfn_range`, que instala de una vez las traducciones para todo el rango. Trabaja en *page frame numbers* (PFN): el número de marco físico, que es la dirección física desplazada `PAGE_SHIFT` bits.
+
+```c
+static int mydev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct mydev *dev = filp->private_data;
+	unsigned long size = vma->vm_end - vma->vm_start;
+	unsigned long pfn  = dev->phys_base >> PAGE_SHIFT;   /* marco fisico base */
+
+	if (size > dev->len)
+		return -EINVAL;
+
+	/* Memoria de dispositivo: no cacheable, sin struct page, no volcar a core */
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+	return remap_pfn_range(vma, vma->vm_start,
+	                       pfn + vma->vm_pgoff,  /* respeta el offset de mmap */
+	                       size, vma->vm_page_prot);
+}
+```
+
+Los flags cuentan una historia. `VM_IO` marca la región como espacio de E/S. `VM_PFNMAP` declara que detrás de estas PFN **no hay** un `struct page` gestionado por el kernel: son marcos crudos, y el subsistema de memoria no debe intentar contarlos ni reclamarlos. `VM_DONTEXPAND` impide que un `mremap` la agrande, y `VM_DONTDUMP` la excluye de los volcados de core. Para MMIO real conviene `io_remap_pfn_range`, que en algunas arquitecturas ajusta los atributos del bus.
+
+<Callout type="warn" title="vm_flags ya no se asigna directamente">
+Desde Linux 6.3 el campo `vm_flags` es de **solo lectura** para el código que no sea del core de memoria: no puedes hacer `vma->vm_flags |= VM_IO`. Debes usar los ayudantes `vm_flags_set(vma, ...)`, `vm_flags_clear(vma, ...)` y `vm_flags_mod(vma, ...)`. El cambio existe para que toda modificación de flags pase por un punto controlado, necesario para la seguridad de los locks por-VMA del nivel 23.3. Código antiguo que asigne `vm_flags` a pelo no compilará en Linux 7.x.
+</Callout>
+
+## .fault: poblar página a página
+
+`remap_pfn_range` exige contigüidad física. Pero un buffer de `vmalloc` es contiguo en el espacio **virtual** del kernel y disperso en el físico: sus marcos no son consecutivos, así que no puedes mapearlo de un tirón. La solución es la paginación bajo demanda del nivel 23.3 puesta al servicio del driver: instalas un `vm_operations_struct` con un `.fault`, y el kernel te llama una vez por cada página que el usuario toque.
+
+```c
+static vm_fault_t mydev_fault(struct vm_fault *vmf)
+{
+	struct mydev *dev = vmf->vma->vm_private_data;
+	unsigned long offset = vmf->pgoff << PAGE_SHIFT;   /* byte dentro del buffer */
+	struct page *page;
+
+	if (offset >= dev->len)
+		return VM_FAULT_SIGBUS;            /* fuera de rango: senal al proceso */
+
+	page = vmalloc_to_page(dev->buf + offset); /* marco real de esta pagina */
+	get_page(page);                            /* referencia que sostiene el mapeo */
+	vmf->page = page;                          /* el kernel instala la PTE */
+	return 0;
+}
+
+static const struct vm_operations_struct mydev_vm_ops = {
+	.fault = mydev_fault,
+};
+
+static int mydev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	vma->vm_ops = &mydev_vm_ops;
+	vma->vm_private_data = filp->private_data;
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+	return 0;                              /* no se mapea nada aun: sera perezoso */
+}
+```
+
+Fíjate en la simetría con el nivel 23.3: aquí tu `.fault` juega el papel que `filemap_fault` juega para los ficheros. Devuelves la página en `vmf->page` con una referencia tomada (`get_page`), y el core instala la PTE. Como estas páginas **sí** tienen `struct page` (a diferencia del caso `VM_PFNMAP`), no marcas `VM_IO`: el kernel las gestiona con normalidad.
+
+Existe una tercera vía, más quirúrgica, para memoria sin `struct page` poblada perezosamente: los ayudantes `vmf_insert_pfn` y `vmf_insert_page`, que instalan una sola PTE y devuelven directamente un `vm_fault_t`. Son ideales cuando quieres control fino página a página sobre memoria de dispositivo.
+
+<Cards>
+  <Card icon="🧱" title="remap_pfn_range">
+    Ansioso y de un tirón. Para memoria físicamente contigua: MMIO, DMA. Marca `VM_PFNMAP | VM_IO`. Sin `struct page` detrás.
+  </Card>
+  <Card icon="🎯" title="vm_ops .fault">
+    Perezoso, página a página. Para buffers no contiguos (`vmalloc`) o mapeos enormes y dispersos. Devuelve `vmf->page` con `get_page`.
+  </Card>
+  <Card icon="💉" title="vmf_insert_pfn">
+    Control fino. Instala una PTE por llamada y devuelve `vm_fault_t`. Para PFN de dispositivo pobladas bajo demanda.
+  </Card>
+</Cards>
+
+## Cerrar el ciclo desde userspace
+
+El usuario no ve nada de esto: mapea y desreferencia.
+
+```c
+int fd = open("/dev/mydev", O_RDWR);
+uint32_t *regs = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                      MAP_SHARED, fd, 0);
+regs[0] = 0xdeadbeef;    /* escribe directo en el hardware o buffer del driver */
+```
+
+Con `MAP_SHARED`, esa escritura llega al buffer del driver o al registro del dispositivo sin intermediarios. Has convertido una porción de tu hardware en memoria direccionable por un programa de usuario.
+
+<Callout type="dios" title="El driver se vuelve un servidor de fallos de página">
+Da un paso atrás y mira lo que has construido. Con `remap_pfn_range` cableas de golpe; con `.fault` respondes bajo demanda. En el segundo caso, tu driver deja de ser un objeto pasivo que atiende `read` y `write` y se convierte en algo más profundo: un **servidor de fallos de página**. Cada vez que el proceso de usuario toca una dirección de tu región, la MMU dispara una excepción, el core de memoria la enruta y termina llamando a tu callback para que digas qué página física debe aparecer ahí. Estás, literalmente, programando la unidad de gestión de memoria del procesador desde tu módulo. Y con eso se cierra el gran arco de Unix. "Todo es un fichero" te dio `read`, `write`, `ioctl`: un dispositivo que se comporta como un flujo de bytes. `mmap` va un paso más allá y te deja decir "todo es memoria": un dispositivo que se comporta como una región direccionable, indistinguible para el programa de un array en el heap. La misma abstracción que el kernel usa para mentirle a los procesos sobre la RAM —VMAs que prometen, fallos que entregan— queda ahora en tus manos, y puedes hacer que detrás de una dirección virtual viva un registro de hardware, un buffer compartido o lo que tu imaginación de diseñador de sistemas decida. El fallo de página, que empezó siendo el mecanismo interno de la pereza del kernel, se convierte en tu interfaz de programación.
+</Callout>
+
+<Challenge title="Expón un buffer del kernel al usuario">
+1. Escribe un driver de carácter que reserve un buffer con `vmalloc` e implemente `.mmap` con un `vm_ops.fault` que lo exponga página a página.
+2. Desde userspace, mapéalo con `MAP_SHARED`, escribe un patrón y verifica desde el módulo (o un segundo `mmap`) que el dato llegó.
+3. Reescribe el driver con `remap_pfn_range` usando memoria contigua (`kmalloc` de una página o marcos reservados) y contrasta cuándo es aplicable cada técnica.
+4. Explica por qué necesitas `vm_flags_set` en vez de asignar `vm_flags`, y qué significan `VM_IO`, `VM_PFNMAP` y `VM_DONTEXPAND`.
+5. Razona el papel de `get_page` en el `.fault` y qué pasaría con la vida de la página si lo omitieras.
+</Challenge>

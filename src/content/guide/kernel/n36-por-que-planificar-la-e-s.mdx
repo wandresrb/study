@@ -1,0 +1,137 @@
+---
+title: "Por qué planificar la E/S de bloques"
+description: "El bio como unidad de transferencia, cómo la capa de bloques lo fusiona con peticiones vecinas y lo reordena para amortizar el coste brutal de un seek en un disco rotacional, y la tensión irreducible entre las tres metas de todo planificador de E/S: latencia baja, throughput alto y reparto justo entre procesos."
+subject: kernel
+level: 36
+order: 1
+position: "36.1"
+duration: "16 min"
+---
+
+<Lead>
+Un disco no es RAM. En un plato rotacional la cabeza tiene que desplazarse físicamente hasta la pista correcta y esperar a que el sector pase por debajo: un `seek` cuesta milisegundos, una eternidad frente al nanosegundo de un acceso a memoria. Dos peticiones a sectores contiguos son casi gratis juntas y ruinosas separadas. Entre el sistema de archivos y el driver vive una capa que hace tres cosas con ese torrente de peticiones: las **fusiona**, las **reordena** y **arbitra** entre procesos que compiten. Eso es planificar la E/S de bloques: convertir un flujo caótico de `bio` en un orden que respete la física del medio y la justicia del sistema.
+</Lead>
+
+<Goals>
+
+- Entender qué es un `bio` y cómo la capa de bloques lo agrega en una `struct request`.
+- Ver por qué fusionar y reordenar peticiones amortiza el coste de un `seek` en un HDD.
+- Distinguir las tres metas en tensión: latencia, throughput y fairness.
+- Situar dónde se decide todo esto: el ascensor dentro de blk-mq.
+
+</Goals>
+
+## El bio: la unidad de transferencia
+
+Cuando un sistema de archivos quiere leer o escribir, no habla con el driver: construye un `bio`, la descripción de una transferencia contigua de sectores hacia o desde un conjunto de páginas, y lo entrega a la capa de bloques con `submit_bio`. El `bio` es deliberadamente pequeño y desechable; su vida es un viaje de ida.
+
+```c
+/* include/linux/blk_types.h — el bio describe una transferencia contigua */
+struct bio {
+	struct bio		*bi_next;	/* encadenado dentro de una request */
+	struct block_device	*bi_bdev;	/* a que dispositivo va */
+	blk_opf_t		bi_opf;		/* REQ_OP_READ o REQ_OP_WRITE, mas flags */
+	struct bvec_iter	bi_iter;	/* sector de inicio y bytes restantes */
+	bio_end_io_t		*bi_end_io;	/* callback al completar */
+	void			*bi_private;
+	struct bio_vec		*bi_io_vec;	/* vector de pagina, offset y longitud */
+	unsigned short		bi_vcnt;
+	/* ... */
+};
+
+struct bvec_iter {
+	sector_t	bi_sector;	/* sector de 512 B donde empieza */
+	unsigned int	bi_size;	/* bytes que faltan por transferir */
+	unsigned int	bi_idx;		/* segmento actual en bi_io_vec */
+};
+```
+
+El `bio` viaja por `submit_bio` a `blk_mq_submit_bio`, y ahí la capa de bloques intenta lo primero que puede ahorrarle trabajo al disco: no crear una petición nueva, sino **agregar** este `bio` a una `struct request` que ya espera. Una `request` es un `bio` que creció: uno o varios `bio` contiguos fusionados, con un `tag` de hardware asignado, listos para despacharse como una sola operación al dispositivo.
+
+## Fusionar y reordenar: amortizar el seek
+
+Aquí está el motivo histórico de toda esta maquinaria. En un HDD el tiempo de servicio de una petición está dominado por dos costes mecánicos: el `seek` —mover la cabeza— y la latencia rotacional —esperar a que el sector gire hasta la cabeza—. Ambos se pagan **una vez** por operación, sin importar cuántos sectores transfiera. De ahí la aritmética que lo cambia todo: fusionar dos peticiones vecinas en una convierte dos seeks en uno, y ordenar las peticiones pendientes por sector convierte un vaivén frenético de la cabeza en un barrido suave, como un ascensor que atiende los pisos en orden en vez de subir y bajar por capricho. Por eso al planificador clásico se le llamó el `elevator`.
+
+La fusión ocurre sobre todo mientras la cola está "taponada": el kernel acumula peticiones de una misma tarea antes de volcarlas, precisamente para darles la oportunidad de encontrarse.
+
+```c
+/* el kernel tapona la cola para acumular y fusionar antes de despachar */
+struct blk_plug plug;
+
+blk_start_plug(&plug);
+submit_bio(bio_a);       /* sectores 100..107 */
+submit_bio(bio_b);       /* sectores 108..115: back-merge con el anterior */
+submit_bio(bio_c);       /* sectores  92..99:  front-merge por delante   */
+blk_finish_plug(&plug);  /* se vuelca ya fusionado en una sola request */
+```
+
+Un `back-merge` engancha el `bio` nuevo al final de una petición cuyo último sector es justo el anterior al suyo; un `front-merge` lo engancha por delante. El efecto es medible: los contadores por dispositivo revelan cuánto se fusionó.
+
+```bash
+# rrqm/s y wrqm/s: peticiones fusionadas por segundo antes de encolar
+$ iostat -x 1
+Device   rrqm/s  wrqm/s   r/s   w/s  rkB/s   await  aqu-sz  %util
+sda        48.0    12.0   120    30   4800    8.40    1.10    92.0
+```
+
+Cada petición que aparece en `rrqm/s` es un `seek` que el disco no tuvo que pagar.
+
+<Callout type="tip" title="blktrace: ver cada fusión con lupa">
+Cuando `iostat` no basta y quieres presenciar el reordenamiento en vivo, `blktrace` instrumenta la capa de bloques y registra cada evento por sector: `Q` cuando un `bio` entra a la cola, `M` cuando se fusiona con una petición existente, `I` cuando se inserta, `D` cuando se despacha al driver y `C` cuando se completa. Correr `blktrace -d /dev/sda -o - | blkparse -i -` mientras lanzas una carga te muestra, línea a línea, cómo un torrente de `bio` desordenados se colapsa en pocas peticiones ordenadas. Es la radiografía del planificador y la mejor herramienta para entender por qué un patrón de acceso rinde como rinde.
+</Callout>
+
+## Las tres metas en tensión
+
+Si el único objetivo fuera minimizar seeks, el problema estaría resuelto: ordena siempre por sector y despacha. Pero un planificador de E/S sirve a tres amos que tiran en direcciones opuestas, y no existe un orden que optimice los tres a la vez.
+
+- **Throughput**: mover el máximo de bytes por segundo. Favorece el orden estricto por sector y las fusiones agresivas, aunque una petición concreta espere mucho.
+- **Latencia**: que ninguna petición tarde demasiado. Un ascensor puro puede **matar de hambre** a un sector aislado en un extremo mientras la cabeza barre el otro; hay que romper el orden y atenderlo por plazo.
+- **Fairness**: que un proceso que satura el disco no ahogue a los demás. Requiere contabilidad por proceso o por `cgroup`, y sacrificar throughput global para dar su turno a cada uno.
+
+El reparto justo no es teórico: es una palanca que el administrador acciona, y que solo algunos planificadores respetan.
+
+```bash
+# prioridad de E/S por proceso (la respeta BFQ)
+$ ionice -c 2 -n 0 dd if=/dev/sda of=/dev/null   # best-effort, prioridad alta
+
+# reparto proporcional por cgroup v2: pesos relativos de disco
+$ echo "259:0 500" > /sys/fs/cgroup/basedatos/io.bfq.weight
+$ echo "259:0 100" > /sys/fs/cgroup/backups/io.bfq.weight
+```
+
+Ese triángulo —throughput, latencia, fairness— es el espacio de diseño entero. Cada planificador del nivel siguiente es un punto distinto dentro de él.
+
+## Dónde se decide: el ascensor de blk-mq
+
+Todo esto vive en la **capa de bloques**, entre el sistema de archivos y el driver, y desde hace años su única implementación es blk-mq (multi-queue). El planificador es un módulo intercambiable enchufado a esa capa; lo eliges por dispositivo escribiendo en `sysfs`.
+
+```bash
+# los planificadores disponibles; el activo va entre corchetes
+$ cat /sys/block/sda/queue/scheduler
+none [mq-deadline] kyber bfq
+```
+
+<Mermaid code={`flowchart TD
+  FS[Sistema de archivos] -->|submit_bio| BL[Capa de bloques blk-mq]
+  subgraph Planificador enchufable
+    BL --> MERGE[Fusionar bios vecinos]
+    MERGE --> SORT[Reordenar por sector y por plazo]
+  end
+  SORT -->|request con tag| DRV[Driver: queue_rq]
+  DRV --> HW[Dispositivo fisico]`} />
+
+<Callout type="info" title="El bio no sabe nada del planificador">
+Fíjate en la separación: el `bio` que construye el sistema de archivos ignora por completo qué planificador hay debajo, cuántas colas tiene el dispositivo o si es un HDD o un NVMe. Solo expresa "estos sectores, estas páginas, esta dirección". Toda la política de fusión y reorden vive en una capa aparte, sustituible en caliente. Esa frontera es la que permite que el mismo sistema de archivos rinda bien sobre un disco de 1990 y sobre un SSD de 2026.
+</Callout>
+
+<Callout type="dios" title="El planificador es física del medio codificada en software">
+Detente en lo que realmente hiciste al ordenar peticiones por sector, porque encierra una lección que trasciende el disco. El `elevator` no es un algoritmo de listas: es un **modelo del mundo físico** incrustado en el kernel. Su premisa entera —que reordenar y fusionar merece la pena— se sostiene sobre un único hecho del hardware: que el acceso secuencial es órdenes de magnitud más barato que el aleatorio, porque hay una cabeza con masa que debe recorrer una distancia real. Cada línea de código del planificador clásico es una consecuencia deducida de esa asimetría mecánica. Y aquí está lo que debes interiorizar: cuando el software modela una restricción física, hereda su fecha de caducidad. El día en que el medio deje de tener cabeza que mover —el día del SSD, del NVMe, de la memoria persistente— la premisa se evapora, y con ella la justificación de reordenar. No es que el planificador se vuelva subóptimo: es que la magnitud que optimizaba, el número de seeks, deja de existir. Por eso el planificador correcto para un NVMe rápido se llama `none`, y por eso este nivel entero es la historia de cómo una idea brillante y necesaria durante cuarenta años se convirtió, para el hardware más veloz, en puro coste. Aprende el ascensor no como una técnica atemporal, sino como el ejemplo más limpio de una verdad incómoda: el mejor código de sistemas está casado con el hardware de su época, y ninguna abstracción sobrevive a la desaparición del problema que la hizo necesaria.
+</Callout>
+
+<Challenge title="Mide el ahorro de fusionar">
+1. Ejecuta `cat /sys/block/<disco>/queue/scheduler` en tu máquina y anota cuál está activo y qué medio es ese disco (rotacional o no, según `queue/rotational`).
+2. Lanza una carga de E/S secuencial con `dd` y observa `iostat -x 1`: relaciona `rrqm/s` con `aqu-sz` y explica qué te dicen juntos sobre las fusiones.
+3. Explica, con la aritmética del seek, por qué fusionar dos peticiones de 4 KiB contiguas casi duplica el throughput en un HDD pero apenas cambia nada en un SSD.
+4. Describe un patrón de acceso concreto en el que optimizar throughput mate de hambre a una petición, y qué meta habría que sacrificar para evitarlo.
+5. Argumenta por qué el `bio` no debe conocer al planificador y qué se rompería si lo conociera.
+</Challenge>

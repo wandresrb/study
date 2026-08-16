@@ -8,7 +8,7 @@ import { compile } from '@mdx-js/mdx';
 import rehypeKatex from 'rehype-katex';
 import remarkMath from 'remark-math';
 
-const GUIDE = 'src/content/guia';
+const GUIDE = 'src/content/guide';
 const only = process.argv[2];
 
 const dirs = (await readdir(GUIDE, { withFileTypes: true }))

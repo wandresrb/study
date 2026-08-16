@@ -1,0 +1,146 @@
+---
+title: "Consumir el Device Tree desde el driver: propiedades, MMIO, IRQ, GPIO y clocks"
+description: "Cómo un platform driver saca del device tree todo lo que necesita: of_property_read_u32 y string para las propiedades, devm_platform_ioremap_resource y platform_get_irq para registros e interrupción, devm_gpiod_get para las líneas GPIO y devm_clk_get_enabled para los relojes, todo con la limpieza automática de devm."
+subject: kernel
+level: 29
+order: 5
+position: "29.5"
+duration: "17 min"
+---
+
+<Lead>
+Todo el nivel converge aquí. El hardware era mudo, el device tree lo describió, el emparejamiento por `compatible` llevó el nodo hasta el driver, y ahora `probe` tiene delante ese nodo lleno de datos. Consumirlo es traducir cada propiedad del árbol en un recurso vivo del kernel: la propiedad `reg` en registros mapeados, `interrupts` en una IRQ enganchada, `clocks` en un reloj encendido, `reset-gpios` en una línea que puedes conmutar. El driver es genérico; el device tree lo parametriza. En este último paso ves por qué eso es tan potente.
+</Lead>
+
+<Goals>
+
+- Leer propiedades escalares y de texto con `of_property_read_u32` y `of_property_read_string`.
+- Mapear los registros con `devm_platform_ioremap_resource` y obtener la IRQ con `platform_get_irq`.
+- Reclamar líneas GPIO descritas en el nodo con `devm_gpiod_get`.
+- Obtener y habilitar relojes del device tree con `devm_clk_get_enabled`.
+
+</Goals>
+
+## Leer propiedades: escalares, textos y arreglos
+
+Las propiedades que no son recursos estándar —parámetros de configuración propios del binding— se leen del `of_node` del dispositivo. `of_property_read_u32` extrae un entero; devuelve cero si existe y un errno si falta, patrón ideal para aplicar un valor por defecto. `of_property_read_string` hace lo mismo con cadenas, y `of_property_read_u32_array` con vectores. Supón este nodo:
+
+```c
+uart0: serial@50000000 {
+	compatible = "acme,uart-9100";
+	reg = <0x50000000 0x1000>;
+	interrupts = <0 42 4>;
+	clocks = <&clk_uart>;
+	reset-gpios = <&gpio1 5 GPIO_ACTIVE_LOW>;
+	acme,fifo-depth = <64>;
+	acme,mode = "rs485";
+};
+```
+
+Sus dos propiedades propias, `acme,fifo-depth` y `acme,mode`, se consumen así:
+
+```c
+struct device *dev = &pdev->dev;
+u32 fifo_depth;
+const char *mode;
+
+if (of_property_read_u32(dev->of_node, "acme,fifo-depth", &fifo_depth))
+	fifo_depth = 16;   /* la propiedad falta: valor por defecto sensato */
+
+if (of_property_read_string(dev->of_node, "acme,mode", &mode))
+	mode = "rs232";
+
+/* variante generica fwnode: identica logica, sirve para device tree y ACPI */
+device_property_read_u32(dev, "acme,fifo-depth", &fifo_depth);
+```
+
+La forma `device_property_read_u32` es la moderna: opera sobre la abstracción `fwnode` y funciona igual si el hardware se describió con device tree o con ACPI. Para código nuevo que quiera portabilidad, es la preferida.
+
+## Registros e interrupción: MMIO e IRQ desde reg e interrupts
+
+Las propiedades `reg` e `interrupts` no se leen a mano: el kernel ya las convirtió en `struct resource` al crear el `platform_device`, y las recoges con los helpers del nivel 29.2. `devm_platform_ioremap_resource` toma la propiedad `reg`, la mapea y te devuelve el puntero `__iomem`; `platform_get_irq` traduce `interrupts` a un número de IRQ Linux.
+
+```c
+void __iomem *base;
+int irq, ret;
+
+base = devm_platform_ioremap_resource(pdev, 0);   /* toma reg[0], mapea y reclama */
+if (IS_ERR(base))
+	return PTR_ERR(base);
+
+irq = platform_get_irq(pdev, 0);                  /* traduce interrupts[0] a virq */
+if (irq < 0)
+	return irq;
+
+ret = devm_request_irq(dev, irq, acme_isr, 0, dev_name(dev), priv);
+if (ret)
+	return dev_err_probe(dev, ret, "no pude solicitar la IRQ\n");
+```
+
+<Mermaid code={`flowchart LR
+  DT[Nodo del device tree] -->|reg| MMIO[devm_platform_ioremap_resource]
+  DT -->|interrupts| IRQ[platform_get_irq]
+  DT -->|clocks| CLK[devm_clk_get_enabled]
+  DT -->|reset-gpios| GPIO[devm_gpiod_get]
+  DT -->|propiedades propias| PROP[of_property_read_u32 y string]
+  MMIO --> DRV[Driver operativo]
+  IRQ --> DRV
+  CLK --> DRV
+  GPIO --> DRV
+  PROP --> DRV`} />
+
+## GPIOs: la interfaz de descriptores
+
+La propiedad `reset-gpios` describe una línea GPIO: qué controlador la provee (`&gpio1`), qué número dentro de él (`5`) y su polaridad (`GPIO_ACTIVE_LOW`). El driver la reclama con `devm_gpiod_get`, que devuelve un `struct gpio_desc` **opaco**. La gran ventaja de la interfaz de descriptores es que la polaridad queda encapsulada: pides "activar" el reset y el kernel pone el nivel eléctrico correcto según lo que dijo el device tree, sin que tu código sepa si la línea es activa a nivel alto o bajo.
+
+```c
+#include <linux/gpio/consumer.h>
+
+struct gpio_desc *reset;
+
+/* el sufijo "reset" busca la propiedad reset-gpios; arranca en estado activo */
+reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+if (IS_ERR(reset))
+	return dev_err_probe(dev, PTR_ERR(reset), "sin gpio de reset\n");
+
+fsleep(10);                              /* mantener el reset un instante */
+gpiod_set_value_cansleep(reset, 0);      /* soltar el reset: el kernel ajusta la polaridad */
+```
+
+## Clocks: obtener y habilitar en un paso
+
+La propiedad `clocks` referencia con un phandle el reloj que alimenta el periférico. El idioma moderno es `devm_clk_get_enabled`: obtiene el reloj **y lo habilita** en una sola llamada, y registra su apagado y liberación en `devm`, de modo que al desligar el dispositivo el reloj se detiene solo. Antes hacían falta tres pasos y una ruta de error para cada uno.
+
+```c
+#include <linux/clk.h>
+
+struct clk *clk;
+unsigned long rate;
+
+clk = devm_clk_get_enabled(dev, NULL);   /* NULL: el primer/unico reloj del nodo */
+if (IS_ERR(clk))
+	return dev_err_probe(dev, PTR_ERR(clk), "no hay reloj\n");
+
+rate = clk_get_rate(clk);                /* la frecuencia real, para calcular divisores */
+dev_info(dev, "reloj a %lu Hz\n", rate);
+```
+
+<Callout type="warn" title="El orden importa: reloj antes que registros">
+Si tocas los registros de un periférico cuyo reloj aún no está habilitado, el acceso puede colgar el bus o leer basura, porque muchos SoC congelan por completo un bloque sin reloj. Por eso el orden dentro de `probe` no es libre: habilita primero el reloj con `devm_clk_get_enabled`, suelta después el reset por GPIO, y solo entonces mapea y programa los registros. `devm` deshará todo en el orden inverso correcto al desligar.
+</Callout>
+
+<Callout type="info" title="of_property_read_u32 devuelve errno, no el valor">
+Un tropiezo clásico: `of_property_read_u32` no devuelve el entero leído sino un código de error, y escribe el valor por referencia en el puntero que le pasas. Un `if` sobre su retorno comprueba si la propiedad **existe**, no cuánto vale. Ese diseño es lo que permite el patrón de valor por defecto: si la lectura falla, dejas la variable con su valor sensato y sigues, en vez de abortar `probe` por una propiedad opcional ausente.
+</Callout>
+
+<Callout type="dios" title="El driver es una función; el device tree es el argumento; probe es la aplicación">
+Recoge ahora todo el nivel en una sola imagen, porque acabas de cerrar el círculo que abrió el hardware mudo. Un platform driver bien escrito no contiene ni una sola dirección, ni un número de interrupción, ni una frecuencia de reloj: contiene únicamente el **mecanismo**, el saber cómo se maneja una familia de dispositivos en abstracto. Todos los datos concretos —dónde vive el periférico, qué interrupción dispara, qué reloj lo alimenta, en qué GPIO cuelga su reset, cuán profundo es su FIFO— entran por una sola puerta, el device tree, y se materializan en `probe` a través de un puñado de funciones que traducen propiedades en recursos vivos. Visto así, `probe` es la **aplicación de una función a sus argumentos**: el driver es la función, pura y reutilizable; el nodo del device tree es la tupla de argumentos, específica de esta placa; y `probe` es el momento en que ambos se encuentran y nace una instancia funcionando. Esta es la razón última de que un solo binario del kernel maneje un catálogo entero de placas: el mecanismo se escribió una vez y los argumentos viajan aparte, en datos. Y fíjate en cómo `devm` refuerza la misma simetría por el otro extremo: cada recurso que `probe` reclama —memoria, registros, IRQ, GPIO, reloj— se ata a la vida del dispositivo, de modo que cuando la instancia muere, todos sus argumentos materializados se liberan solos y en orden inverso, sin que el driver tenga que recordar nada. Cuando internalizas que un driver es una función parametrizada por el firmware, que `probe` es su aplicación y que `devm` es la desasignación automática de esa aplicación al terminar, dejas de ver estas APIs como una lista que memorizar y las ves como lo que son: los operadores con los que el kernel evalúa, sobre cada placa del mundo, la misma función escrita una única vez. Ese es el sentido profundo de describir el hardware en datos en lugar de en código, y con él dominas el nivel entero.
+</Callout>
+
+<Challenge title="Alimenta un driver enteramente desde el device tree">
+1. Escribe un `probe` que lea `acme,fifo-depth` con `of_property_read_u32` y aplique 16 por defecto si la propiedad falta; explica por qué el `if` va sobre el retorno y no sobre el valor.
+2. Ordena correctamente dentro de `probe` la habilitación del reloj, la liberación del reset por GPIO y el mapeo de registros, y justifica por qué ese orden no es arbitrario.
+3. Cambia `reset-gpios` de `GPIO_ACTIVE_LOW` a `GPIO_ACTIVE_HIGH` en el nodo y razona por qué tu código C con `gpiod_set_value` no necesita cambiar ni una línea.
+4. Sustituye `of_property_read_u32` por `device_property_read_u32` y describe qué ganarías si mañana la misma placa se describiera con ACPI en lugar de device tree.
+5. Enumera todos los recursos que `devm` liberará al hacer `rmmod` de este driver, y en qué orden respecto a como los reclamó `probe`.
+</Challenge>

@@ -1,0 +1,144 @@
+---
+title: "Desplazamiento por textura"
+description: "Leer un mapa de alturas desde el vertex shader: la configuración exacta de la textura, el error de espacio de color que arruina la escala, y el bandeado de ocho bits."
+subject: three
+level: 34
+order: 2
+position: "34.2"
+duration: "18 min"
+---
+
+<Lead>
+Una función procedural produce la deformación que la matemática dicta; un mapa de alturas produce la que un artista dibujó o la que un satélite midió. La técnica es idéntica salvo por la fuente del valor, y sin embargo casi todos los problemas de esta lección son de configuración: el espacio de color, el filtrado, el número de bits y la correspondencia entre la resolución del mapa y la de la malla.
+</Lead>
+
+<Goals>
+
+- Muestrear una textura desde el vertex shader con la configuración correcta.
+- Explicar por qué un mapa de alturas debe quedarse en `NoColorSpace`.
+- Reconocer y corregir el terraceado de un mapa de ocho bits.
+- Ajustar la resolución de la malla a la información real del mapa.
+
+</Goals>
+
+## El muestreo en el vertex shader
+
+La lectura de texturas desde la etapa de vértices está garantizada en WebGL 2: la especificación exige al menos dieciséis unidades de textura accesibles desde el vertex shader, frente a las cero que WebGL 1 podía ofrecer. No hay que comprobar nada.
+
+```glsl
+uniform sampler2D uAlturas;
+uniform float uAmplitud;
+
+varying vec2 vUv;
+varying float vAltura;
+
+void main() {
+  vUv = uv;
+
+  float h = texture2D( uAlturas, uv ).r;
+  vAltura = h;
+
+  vec3 p = position;
+  p.z += h * uAmplitud;
+
+  gl_Position = projectionMatrix * modelViewMatrix * vec4( p, 1.0 );
+}
+```
+
+Lo que hay que saber es que en el vertex shader **no hay derivadas**, porque no existen fragmentos vecinos. Eso significa que el nivel de mipmap no se puede deducir y la lectura usa el nivel base. Si la textura tiene mipmaps generados, ocupan memoria que nunca se usa; y si la textura no está completa —por ejemplo con un `minFilter` que exige mipmaps que no se generaron— la lectura devuelve negro.
+
+## La configuración de la textura
+
+Cinco líneas, y todas importan.
+
+```js
+const alturas = await new THREE.TextureLoader().loadAsync( '/texturas/alturas.png' );
+
+alturas.colorSpace = THREE.NoColorSpace;          // es un valor, no un color
+alturas.generateMipmaps = false;                  // nunca se van a usar
+alturas.minFilter = THREE.LinearFilter;           // sin mipmaps, minFilter no puede pedirlos
+alturas.magFilter = THREE.LinearFilter;
+alturas.wrapS = THREE.ClampToEdgeWrapping;        // sin repeticion: el borde no debe envolver
+alturas.wrapT = THREE.ClampToEdgeWrapping;
+```
+
+`ClampToEdgeWrapping` merece un comentario. Con `RepeatWrapping`, un vértice en `uv` exactamente 1.0 muestrea el borde opuesto por el redondeo, y el terreno se cierra sobre sí mismo con un escalón. Con `ClampToEdgeWrapping` el borde se extiende y el escalón desaparece.
+
+### El error del espacio de color
+
+Éste es el error que más tiempo cuesta descubrir porque no produce ningún síntoma que apunte a su causa: simplemente el terreno sale más plano de lo que debería y uno se pasa media hora subiendo `uAmplitud`.
+
+Desde que la gestión de color está activa por defecto, una textura marcada como `SRGBColorSpace` se sube a la GPU con un formato interno sRGB, y **el hardware aplica la función de transferencia inversa al muestrear**. Un téxel con valor 128 sobre 255 no llega al shader como 0.502: llega como 0.216.
+
+```text
+codificado 0.25  ->  lineal 0.0508
+codificado 0.50  ->  lineal 0.2140
+codificado 0.75  ->  lineal 0.5225
+codificado 1.00  ->  lineal 1.0000
+```
+
+Es decir, se aplasta la mitad baja del rango. Un mapa de alturas decodificado así produce un terreno con los valles hundidos y las cimas más o menos correctas, y la relación entre unos y otras es errónea de una forma que no se puede compensar con un factor de escala.
+
+La regla: **cualquier textura cuyos valores signifiquen un número y no un color va en `NoColorSpace`**. Alturas, rugosidad, metalicidad, oclusión, máscaras, mapas de normales, ruido precalculado, datos de simulación. Solo el mapa de color base y el emisivo son `SRGBColorSpace`.
+
+En el caso concreto de un `ShaderMaterial`, `TextureLoader` deja `colorSpace` en `NoColorSpace` por defecto, así que si no lo tocas estás bien. El problema aparece al copiar código de un `MeshStandardMaterial`, donde alguien puso `SRGBColorSpace` porque ahí sí hacía falta para el mapa de color.
+
+### Ocho bits no bastan
+
+Un PNG de ocho bits por canal tiene 256 niveles. Con una amplitud de veinte unidades, cada nivel son casi ocho centímetros, y esos escalones se ven: el terreno queda terraceado como un campo de arroz.
+
+Hay cuatro salidas y conviene conocer las cuatro.
+
+**Suavizar en el muestreo.** El filtrado lineal ya interpola entre téxeles, así que los escalones solo aparecen cuando la malla tiene más resolución que el mapa. Si el mapa es más grande que la malla, no hay problema.
+
+**Usar un formato de más rango.** Y aquí hay una trampa: un PNG de dieciséis bits por canal cargado con `TextureLoader` **no conserva los dieciséis bits**, porque el camino pasa por un `HTMLImageElement` y el navegador entrega la imagen ya decodificada a ocho bits por canal. Para obtener precisión real hay que usar un formato que Three.js parsee por su cuenta hasta un array tipado: `EXRLoader` de los addons, que devuelve `HalfFloatType` o `FloatType`, o un `.hdr` con `HDRLoader`, que es el nombre vigente desde r180 —`RGBELoader` sobrevive solo como envoltorio obsoleto que avisa por consola—. Con EXR de media precisión tienes once bits de mantisa, más que suficiente para cualquier terreno.
+
+**Repartir la altura en dos canales.** Un truco clásico: el canal rojo lleva la parte gruesa y el verde la fina, y se recomponen con precisión efectiva de dieciséis bits sobre un PNG normal de ocho.
+
+```glsl
+// R es la parte alta, G la baja
+float leerAltura16( sampler2D mapa, vec2 uv ) {
+  vec2 c = texture2D( mapa, uv ).rg;
+  return c.r + c.g / 255.0;
+}
+```
+
+**Generar el mapa en coma flotante.** Si el mapa lo produces tú, una `DataTexture` de tipo `FloatType` o `HalfFloatType` no tiene ninguna cuantización.
+
+```js
+function crearMapaDeAlturas( lado, funcion ) {
+  const datos = new Float32Array( lado * lado );
+  for ( let y = 0; y < lado; y ++ ) {
+    for ( let x = 0; x < lado; x ++ ) {
+      datos[ y * lado + x ] = funcion( x / lado, y / lado );
+    }
+  }
+  const textura = new THREE.DataTexture(
+    datos, lado, lado, THREE.RedFormat, THREE.FloatType
+  );
+  textura.minFilter = THREE.LinearFilter;
+  textura.magFilter = THREE.LinearFilter;
+  textura.needsUpdate = true;
+  return textura;
+}
+```
+
+`RedFormat` con `FloatType` ocupa cuatro bytes por téxel en lugar de dieciséis, que para un mapa de un solo canal es la elección correcta.
+
+## Resolución de malla y resolución de mapa
+
+Un mapa de 1024 por 1024 contiene un millón de valores. Una malla de 128 por 128 tiene dieciséis mil vértices, así que **descarta el 98 % de la información**. Y al revés: una malla de 2048 por 2048 sobre un mapa de 256 por 256 interpola linealmente entre téxeles, con lo que produce facetas planas unidas por aristas, que es peor que una malla más gruesa.
+
+La correspondencia ideal es un vértice por téxel, es decir una malla de `n` segmentos para un mapa de `n + 1` téxeles de lado. Cuando no se puede —porque un millón de vértices es demasiado— la respuesta correcta no es interpolar más, sino **reducir el mapa antes**, para que el filtrado ocurra sobre datos y no sobre una malla.
+
+Y hay una consecuencia sobre las UV que se olvida siempre: en un `PlaneGeometry` de `n` segmentos, las UV van de cero a uno con los vértices en los extremos, mientras que los téxeles se muestrean en sus centros. La correspondencia exacta requiere un desplazamiento de medio téxel:
+
+```glsl
+vec2 uvCorregida = ( uv * float( uTamanoMapa - 1 ) + 0.5 ) / float( uTamanoMapa );
+```
+
+Para un mapa suave la diferencia es invisible; para uno con detalle fino, medio téxel es un desplazamiento real del terreno.
+
+<Callout type="dios" title="El mapa de alturas y el mapa de normales del mismo terreno tienen que venir del mismo sitio">
+Un error de coherencia que produce terrenos que se ven mal sin que nadie sepa por qué: usar un mapa de alturas para desplazar y un mapa de normales generado aparte para iluminar. Los dos describen la misma superficie, pero uno se aplica en el vertex shader sobre una malla de resolución finita y el otro en el fragment shader a resolución de píxel, y **no coinciden**. El mapa de normales se generó a partir de la altura a resolución completa, así que contiene detalle que la malla desplazada no tiene; la iluminación insinúa relieve donde la silueta dice que no lo hay, y el ojo lo detecta como una superficie que parece pintada. El caso extremo es cuando el mapa de normales viene de un modelo de alta resolución y la malla desplazada de un mapa de alturas suavizado: entonces las dos superficies son literalmente distintas y en los bordes se ve la discrepancia. Hay dos formas correctas de resolverlo y ninguna es intermedia. La primera: **calcular las normales a partir de la misma altura que desplazas**, que es exactamente el tema de las dos últimas lecciones de este nivel, y usar el mapa de normales solo para el detalle por debajo del tamaño de un triángulo. La segunda: no desplazar en absoluto y confiar todo el relieve al mapa de normales, aceptando que la silueta será plana. Lo que no funciona es aplicar los dos al mismo rango de frecuencias, porque entonces el relieve se cuenta dos veces en el sombreado y una sola en la geometría.
+</Callout>

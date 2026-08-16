@@ -1,0 +1,130 @@
+---
+title: "Localidad de caché y NUMA: medir y diseñar para escalar"
+description: "Por qué la localidad decide el rendimiento en servidores grandes y HPC. Cómo medir el desequilibrio NUMA con numastat y numa_maps, cómo cazar false sharing con perf c2c y la PMU, y cómo diseñar estructuras conscientes de la línea de caché y del nodo con ____cacheline_aligned y asignación por nodo. El cierre del arco: compartir es el enemigo a dos escalas."
+subject: kernel
+level: 26
+order: 5
+position: "26.5"
+duration: "17 min"
+---
+
+<Lead>
+Las cuatro lecciones anteriores fueron herramientas; esta es el juicio para usarlas. En una máquina grande, dos programas idénticos pueden diferir 5x en rendimiento solo por dónde vive su memoria y cómo comparten sus líneas de caché. Y lo que no se mide no se arregla. Aquí aprendes a **ver** el desequilibrio NUMA y el false sharing con las herramientas del kernel, y a **diseñar** datos que respeten la topología. Es el cierre del nivel: la localidad no es un detalle de afinado, es la variable maestra del rendimiento a escala.
+</Lead>
+
+<Goals>
+
+- Medir el desequilibrio NUMA con `numastat` y `/proc/PID/numa_maps`.
+- Cazar false sharing con `perf c2c` y contadores de la PMU.
+- Eliminar el rebote de líneas con `____cacheline_aligned_in_smp`.
+- Diseñar estructuras conscientes del nodo y de la caché para HPC y servidores.
+</Goals>
+
+## Medir el desequilibrio NUMA
+
+La primera pregunta es si tu carga asigna local o remoto. `numastat` lee los contadores por nodo que el kernel mantiene en `mm/vmstat.c`:
+
+```bash
+# Contadores globales por nodo: aciertos locales vs accesos remotos
+numastat
+
+# Por proceso: cuanta memoria de cada nodo usa
+numastat -p $(pgrep mi_servidor)
+
+# El desglose crudo de un nodo
+cat /sys/devices/system/node/node0/numastat
+```
+
+Los contadores que importan: `numa_hit` (asignaciones que consiguieron el nodo deseado), `numa_miss` (querían un nodo pero cayeron en otro), `numa_foreign` (destinadas aquí pero servidas en otro sitio), `local_node` y `other_node` (asignadas en el nodo del núcleo que las pidió, o no). Un `numa_miss` alto o mucho `other_node` es el síntoma inequívoco de páginas mal colocadas. Para ver **qué** rango vive **dónde**, `numa_maps` desglosa cada VMA del proceso por nodo:
+
+```bash
+cat /proc/$(pgrep mi_servidor)/numa_maps
+# ...heap anon=262144 dirty=262144 N0=131072 N1=131072  <- repartido 50/50
+# ...       anon=524288 dirty=524288 N0=524288           <- TODO en el nodo 0
+```
+
+Esa segunda línea —todo el buffer en un solo nodo— es el fallo de first-touch (26.2) hecho visible.
+
+## Cazar el false sharing
+
+El **false sharing** es el asesino silencioso de la escalabilidad, y es un problema de la escala más fina: la **línea de caché** (64 bytes en x86-64). Dos variables lógicamente independientes que caen en la misma línea comparten destino físico: si el núcleo A escribe una y el núcleo B escribe la otra, el protocolo de coherencia hace **rebotar** la línea entre sus cachés en cada escritura, aunque nunca toquen el mismo byte. La herramienta que lo caza es `perf c2c` (cache-to-cache):
+
+```bash
+# Graba las transferencias de cache con modificacion (HITM)
+perf c2c record -a -- sleep 10
+perf c2c report --stdio
+
+# Y directo de la PMU: fallos que se resuelven en otra cache
+perf stat -e node-loads,node-load-misses,LLC-load-misses ./bench
+```
+
+El informe de `perf c2c` señala las líneas de caché con más **HITM** (Hit Modified: una carga que encontró el dato modificado en la caché de *otro* núcleo, la firma exacta del rebote) y, mejor aún, el **offset dentro de la línea** de cada acceso en conflicto, apuntando con el dedo a los campos culpables de tu estructura.
+
+<Callout type="warn" title="False sharing frente a acceso remoto: dos males, dos herramientas">
+No los confundas, porque el arreglo es distinto. El **acceso remoto NUMA** es un problema de **nodo**: el dato está en la RAM equivocada; lo diagnostica `numastat` y lo cura colocar bien (política, first-touch, `kmalloc_node`). El **false sharing** es un problema de **línea de caché** dentro de un mismo nodo: los datos están bien colocados pero mal empaquetados; lo diagnostica `perf c2c` y lo cura separar los campos. Un servidor puede sufrir los dos a la vez, y perseguir uno con la herramienta del otro es no encontrar nada.
+</Callout>
+
+## Diseñar para la localidad
+
+La cura del false sharing es empujar los campos calientes a líneas de caché distintas con `____cacheline_aligned_in_smp` (`include/linux/cache.h`):
+
+```c
+#include <linux/cache.h>
+
+/* MAL: dos contadores martilleados por nucleos distintos, misma linea */
+struct stats_malo {
+	atomic_t rx;   /* lo golpea el nucleo A */
+	atomic_t tx;   /* lo golpea el nucleo B -> la linea rebota */
+};
+
+/* BIEN: cada campo caliente en su propia linea de cache */
+struct stats_bueno {
+	atomic_t rx ____cacheline_aligned_in_smp;
+	atomic_t tx ____cacheline_aligned_in_smp;
+};
+```
+
+El sufijo `_in_smp` es fino: en un kernel uniprocesador el relleno desaparece y no malgastas memoria. El tamaño de línea es `SMP_CACHE_BYTES` (derivado de `L1_CACHE_BYTES`, 64 en x86-64), y `cache_line_size()` lo da en runtime. La cara opuesta de la misma moneda es agrupar a propósito los campos que **siempre se usan juntos** en la misma línea para maximizar la localidad espacial: separar lo que compite, juntar lo que coopera.
+
+Y a la escala mayor, el diseño consciente del nodo: réplicas de la estructura por nodo, cada núcleo tocando la suya (variables per-CPU, 26.3), memoria asignada con `kmalloc_node`/`alloc_pages_node` en el nodo del hilo o del dispositivo (26.2), y en el espacio de usuario, hilos anclados con `sched_setaffinity` o `numactl --cpunodebind` para que cómputo y datos no se separen jamás.
+
+<Mermaid code={`flowchart TD
+  A[Dos variables calientes en la misma linea de cache] --> B[El nucleo 0 escribe la variable X]
+  A --> C[El nucleo 1 escribe la variable Y]
+  B --> D[La linea rebota entre las caches sin necesidad real]
+  C --> D
+  D --> E[perf c2c ve el HITM y senala el campo culpable]
+  E --> F[Separar con cacheline aligned elimina el rebote]
+  class D t-red
+  class F t-green`} />
+
+<Callout type="info" title="Por qué esto es la vida o la muerte en HPC">
+En cómputo de alto rendimiento la memoria, no la CPU, suele ser el techo. Un benchmark de ancho de banda como STREAM cae en picado si los datos viven en un nodo remoto, y un solver que comparte una línea de caché entre ranks de MPI pierde toda la ventaja de sus núcleos. Por eso el instrumental de HPC —`lstopo`/hwloc para ver la topología, `libnuma` para colocar, la vinculación de ranks por nodo NUMA— existe: en esa liga, ignorar la localidad es tirar la mitad de la máquina. Y con la memoria por niveles CXL de 2026, con nodos de latencias muy distintas, colocar bien pasa de optimización a requisito.
+</Callout>
+
+<Cards>
+  <Card icon="📊" title="numastat">
+    Aciertos locales frente a accesos remotos por nodo. Si `numa_miss` u `other_node` crecen, tienes páginas mal colocadas.
+  </Card>
+  <Card icon="🗺️" title="numa_maps">
+    En `/proc/PID/numa_maps`, qué rango vive en qué nodo. Delata el first-touch: un buffer entero en un solo nodo salta a la vista.
+  </Card>
+  <Card icon="🔥" title="perf c2c">
+    Caza el false sharing por HITM y señala el offset dentro de la línea, apuntando con el dedo al campo culpable de tu estructura.
+  </Card>
+  <Card icon="📐" title="cacheline aligned">
+    `____cacheline_aligned_in_smp` empuja cada campo caliente a su propia línea y borra el rebote de coherencia. El bisturí del diseño.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Compartir es el enemigo, a dos escalas que son la misma">
+Recorre el nivel entero y verás que ha contado una sola historia dos veces, a dos aumentos distintos. A la escala del **nodo NUMA**, compartir memoria entre sockets cuesta latencia y satura el interconnect; la cura es la localidad: cada dato en el nodo que lo usa. A la escala de la **línea de caché**, compartir una línea entre núcleos cuesta rebotes de coherencia; la cura es, de nuevo, la localidad: cada campo caliente en su propia línea, cada núcleo con su copia. Son el mismo principio a dos zooms: **el rendimiento a escala lo decide qué tan poco comparten los núcleos, y a qué distancia está lo que tocan**. Por eso las variables per-CPU (26.3) y la asignación consciente del nodo (26.2) no son dos técnicas, sino la misma idea —particionar y acercar— aplicada a la caché y a la RAM. Y por eso el ingeniero que de verdad hace escalar un sistema no piensa primero en algoritmos ni en locks: piensa en el **movimiento de datos**. ¿Qué línea de caché rebota? ¿Qué página vive lejos de quien la lee? ¿Qué núcleo espera memoria de otro socket? Optimizar a gran escala es, casi siempre, un ejercicio de geografía: poner cada byte cerca de quien lo usa y lograr que nadie tenga que preguntarle a otro por lo que ya tiene en casa. Cuando ese mapa de datos se te vuelve visible —cuando lees una estructura y ya *ves* sus líneas de caché y sus nodos— has aprendido a pensar como piensa el kernel a la escala de las máquinas más grandes del mundo. Ahí termina este arco, y ahí empieza tu criterio de arquitecto de sistemas.
+</Callout>
+
+<Challenge title="Ve el movimiento de datos">
+1. Corre `numastat -p` sobre un proceso con carga y clasifica sus contadores: ¿tiene `numa_miss` o mucho `other_node`?
+2. Lee `/proc/PID/numa_maps` y localiza un VMA concentrado en un solo nodo; explica si es first-touch o política deliberada.
+3. Escribe una estructura con dos contadores en la misma línea, martilléalos desde dos `kthread` y cázalos con `perf c2c`.
+4. Arréglalos con `____cacheline_aligned_in_smp` y vuelve a medir el HITM.
+5. Formula, en una frase, por qué la localidad de nodo y la de línea de caché son el mismo principio a dos escalas.
+</Challenge>

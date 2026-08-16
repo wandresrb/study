@@ -1,0 +1,147 @@
+---
+title: "Cloudflare Access: autenticar antes de que exista la petición"
+description: "Access convierte una aplicación en un objeto de política y coloca la decisión en el proxy inverso, de modo que la petición que no cumple nunca llega a ser una invocación de tu Worker. Vemos cómo se define una aplicación autoalojada, el álgebra exacta de include, exclude y require dentro de una regla, el orden de evaluación de las acciones Bypass, Service Auth, Allow y Block, el viaje completo de una petición sin cookie hasta el proveedor de identidad, y las señales de dispositivo y contexto que convierten una política estática en una decisión dinámica."
+subject: cloudflare
+level: 35
+order: 2
+position: "35.2"
+duration: "20 min"
+---
+
+<Lead>
+La lección anterior terminó con una exigencia y ninguna herramienta: el punto de aplicación tiene que ser inevitable. `Access` es esa herramienta en Cloudflare, y su rasgo definitorio no es que autentique, porque autenticar sabe hacerlo cualquier biblioteca, sino dónde lo hace. Vive en el mismo proxy que ya termina tu conexión y decide antes de que haya un isolate, un enrutador o una línea de tu código. Eso cambia dos cosas de golpe. La primera es de coste: la petición rechazada no consume nada tuyo. La segunda es de diseño, y es la que de verdad importa: tu aplicación deja de contener la lógica de quién entra y pasa a recibirla ya resuelta, firmada y verificable. Esta lección trata de cómo se escribe esa lógica fuera y con qué precisión.
+</Lead>
+
+<Goals>
+
+- Definir una aplicación autoalojada en `Access` y entender qué la delimita exactamente.
+- Dominar el álgebra de `include`, `exclude` y `require` dentro de una regla.
+- Ordenar acciones y políticas sabiendo cuál gana y por qué el orden no es cosmético.
+- Elegir señales de identidad, dispositivo y contexto que hagan la decisión dinámica.
+
+</Goals>
+
+## La aplicación como objeto de política
+
+Antes de nada, un apunte de dónde vive esta configuración, porque sorprende a quien llega desde el resto de la plataforma: `Access` no se declara en el manifiesto de Wrangler ni se despliega con tu código. Vive en el panel de Zero Trust de la cuenta, o en su `API`, o en el proveedor de Terraform. Esa separación tiene sentido, porque una política gobierna un nombre de anfitrión y no un artefacto, y ese nombre puede pasar de un Worker a otro sin que la política cambie. También tiene un coste, y es que la protección y el código dejan de desplegarse juntos, con todo lo que eso implica para revisar cambios.
+
+Lo primero que hace `Access` es raro y conviene mirarlo despacio: te obliga a declarar qué es una aplicación. No en términos de repositorio ni de despliegue, sino en términos de superficie expuesta. Una aplicación autoalojada se define por un nombre de anfitrión y, opcionalmente, una ruta. El dominio `panel.ejemplo.com` es una aplicación; `ejemplo.com/admin` es otra distinta, aunque las sirva el mismo Worker; y un comodín de subdominio puede cubrir a un conjunto entero.
+
+Conviene pensar esa delimitación con la misma disciplina con la que se piensa una frontera de servicio, porque comete los mismos errores. Una aplicación demasiado ancha, del estilo de proteger el dominio entero con una sola política, obliga a que la parte pública y la administrativa compartan reglas y duración de sesión, y el resultado es siempre un compromiso a la baja. Una aplicación demasiado estrecha, con una entrada por cada camino, multiplica las políticas hasta que nadie sabe cuál gobierna qué. El criterio que funciona es agrupar por sensibilidad y no por tecnología: todo lo que merezca la misma exigencia y la misma caducidad va junto.
+
+Esa delimitación es la unidad sobre la que se decide y también sobre la que se emite el testimonio. Cada aplicación recibe una etiqueta de audiencia propia, el `AUD tag`, que es un identificador único e inmutable de esa aplicación concreta. Aparecerá en el `JWT` que verás en la lección siguiente, y es lo que impide que una prueba emitida para el panel interno sirva para entrar en la interfaz de facturación. Dos aplicaciones, dos audiencias, dos testimonios que no se pueden intercambiar.
+
+La consecuencia operativa es que el mapa de aplicaciones debe cubrir toda la superficie sin huecos ni solapes descuidados. Un Worker desplegado en un dominio propio y también en su subdominio `workers.dev` es una aplicación protegida y una puerta abierta con el mismo código detrás. Antes de escribir la primera política conviene desactivar la ruta de `workers.dev` en el manifiesto, porque `Access` no puede aplicar nada sobre un tráfico que no pasa por la zona.
+
+```toml
+workers_dev = false
+routes = [
+  { pattern = "panel.ejemplo.com", custom_domain = true }
+]
+```
+
+Existen otros tipos de aplicación que conviene conocer aunque no los uses hoy, porque delimitan el alcance del producto. La aplicación de tipo `SaaS` coloca a `Access` como proveedor de identidad intermedio delante de un servicio de terceros que habla `SAML` u `OIDC`, con lo que las mismas políticas gobiernan también lo que no alojas tú. La de red privada expone recursos accesibles por dirección y puerto a través del cliente, sin publicarlos en internet. Y la de infraestructura cubre accesos administrativos como `SSH`. Las cuatro comparten motor de políticas, que es justamente lo que evita tener cuatro modelos mentales.
+
+Hay además una pieza pequeña con un efecto desproporcionado: el lanzador de aplicaciones. Es una página donde cada persona ve exactamente las aplicaciones a las que sus políticas le conceden acceso, y ninguna otra. Suena a comodidad y es una propiedad de seguridad interesante, porque convierte el inventario de recursos en una función de la identidad de quien mira: quien no tiene acceso a algo tampoco descubre que existe.
+
+## El álgebra de una regla
+
+Una política de `Access` es un predicado, no un procedimiento. No se ejecuta paso a paso: se evalúa sobre la identidad y el contexto de la petición, y produce verdadero o falso. Ese predicado se compone de tres bloques con semánticas de conjunto distintas, y confundirlas es el error más común de todo el producto.
+
+| Bloque | Semántica | Se cumple cuando |
+| --- | --- | --- |
+| `include` | Unión | Coincide al menos uno de los selectores |
+| `exclude` | Complemento | No coincide ninguno de los selectores |
+| `require` | Intersección | Coinciden todos los selectores |
+
+Leído formalmente, la política casa si se cumple algún `include`, ningún `exclude` y todos los `require`. Esa asimetría es deliberada y muy expresiva. El `include` describe a la población candidata, que suele ser una lista de grupos o dominios de correo; el `exclude` recorta excepciones nominales; y el `require` impone condiciones transversales que deben darse pase quien pase, como llevar el segundo factor o venir de un dispositivo con el disco cifrado.
+
+Una aplicación puede tener varias políticas, y ahí aparece un segundo nivel de composición que también es de conjuntos: basta con que una política de `Allow` case para que el acceso se conceda. Es decir, dentro de una política los bloques se combinan con la asimetría que describe la tabla, y entre políticas manda la unión. Por eso la pregunta que hay que saber responder de una aplicación con seis políticas nunca es qué dice la política que estás mirando, sino cuántas de las seis concederían acceso a una persona concreta.
+
+El error clásico consiste en meter una condición transversal en el `include`. Si añades como `include` el grupo de administración y también la exigencia de dispositivo gestionado, acabas de escribir una disyunción: entra quien esté en el grupo, sin dispositivo gestionado, o quien tenga dispositivo gestionado, sin estar en el grupo. La condición que creías obligatoria se ha convertido en una vía alternativa de entrada. Toda condición que deba cumplirse siempre va en `require`, sin excepción.
+
+Los selectores disponibles son la materia prima del predicado, y su variedad es lo que hace dinámica a la política. Están los de identidad pura, como correo, dominio de correo, grupo del proveedor o atributo `SAML`; los de contexto de red, como país o rango de direcciones; los de método, como el tipo de autenticación empleada o el proveedor concreto por el que se entró; los de dispositivo, que exigen el cliente `WARP` y aportan versión de sistema, cifrado de disco, número de serie o veredicto de un `EDR` de terceros; y los de máquina, como `service token` o nombre común de un certificado de cliente, que veremos en la última lección.
+
+Un selector merece mención aparte por su potencia y su peligro: el dominio de correo. Incluir un dominio entero es cómodo el primer día y se convierte en un agujero el día que ese dominio admite invitados, alias o buzones compartidos. La regla sana es incluir grupos del directorio, que alguien mantiene deliberadamente, y reservar el dominio para aplicaciones donde el acceso de cualquier empleado sea de verdad la política deseada y no la que salió por comodidad.
+
+Estas políticas se pueden escribir a mano en el panel, pero conviene tratarlas como lo que son, código de infraestructura, y mantenerlas en un repositorio con revisión. La `API` de `Access` y el proveedor de Terraform describen exactamente la misma estructura de tres bloques, y verla en texto ayuda a razonar sobre el predicado sin la mediación de la interfaz.
+
+```json
+{
+  "name": "panel interno",
+  "decision": "allow",
+  "include": [{ "group": { "id": "grupo-plataforma" } }],
+  "require": [{ "auth_method": { "auth_method": "mfa" } }],
+  "exclude": [{ "email": { "email": "becario@ejemplo.com" } }],
+  "session_duration": "1h"
+}
+```
+
+## Acciones y orden de evaluación
+
+Cada política lleva una acción, y las acciones no son simétricas ni se evalúan en el orden en que las escribiste. `Access` resuelve primero las que deciden sin identidad y solo después las que la exigen, porque de lo contrario no habría forma de dejar pasar tráfico automático sin someterlo a una redirección de inicio de sesión que ninguna máquina sabe seguir.
+
+<Cards>
+  <Card icon="🎫" title="Service Auth">
+    Autentica sin identidad humana mediante `service token` o certificado de cliente. No redirige nunca: responde con un error si falta la credencial.
+  </Card>
+  <Card icon="✅" title="Allow">
+    Concede el paso a quien cumpla el predicado, tras pasar por el proveedor de identidad y establecer sesión.
+  </Card>
+  <Card icon="⛔" title="Block">
+    Deniega explícitamente a un subconjunto, incluso si otra política más permisiva lo incluía.
+  </Card>
+  <Card icon="🕳️" title="Bypass">
+    Desactiva `Access` para el tráfico que coincida. Es la única acción capaz de abrir un agujero por diseño, y se usa con cuentagotas.
+  </Card>
+</Cards>
+
+La existencia de `Service Auth` como acción separada, y no como un selector más dentro de `Allow`, es un detalle de diseño que se entiende mejor desde el fallo que evita. Una máquina no puede seguir la redirección al proveedor de identidad, así que si su política se evaluara después de una de `Allow` que la incluyese por descuido, recibiría una página de inicio de sesión con código de respuesta correcto y la interpretaría como el cuerpo de tu `API`. Los errores más difíciles de depurar de este producto son exactamente de esa forma: nada falla, todo responde, y el contenido es `HTML` donde esperabas `JSON`.
+
+`Bypass` merece un aviso propio porque su nombre suena inofensivo y su efecto es total: el tráfico que coincide no recibe testimonio alguno, de modo que tu Worker no verá ningún `JWT` que validar. Cuando aparece un `bypass` por rango de direcciones para el cortafuegos de la oficina, acabas de reintroducir la hipótesis de perímetro que la lección anterior desmontó, y encima en el único punto donde no se registra identidad.
+
+<Mermaid code={`flowchart TD
+  R[peticion a panel punto ejemplo com] --> C[hay cookie CF_Authorization]
+  C --> N[no hay cookie]
+  N --> T[redireccion al dominio del equipo]
+  T --> I[proveedor de identidad]
+  I --> V[evaluacion del predicado]
+  V --> K[emite JWT firmado y fija la cookie]
+  K --> W[la peticion sigue al Worker]
+  C --> S[hay cookie valida]
+  S --> W
+  V --> B[pagina de bloqueo]`} />
+
+Hay una simetría útil entre `Block` y `exclude` que ayuda a decidir cuál usar. El `exclude` recorta dentro de una política concreta y solo afecta a esa; el `Block` es una política propia y por tanto se aplica frente a todas las demás, incluidas las que alguien añada mañana sin conocer el contexto. Cuando la denegación es una excepción local, va en `exclude`; cuando expresa una prohibición institucional, va en una política de `Block` y se documenta.
+
+El viaje que dibuja el diagrama tiene un detalle que conviene retener. Tras la vuelta del proveedor de identidad, `Access` fija una cookie llamada `CF_Authorization` cuyo contenido es un `JWT` firmado, y además inyecta ese mismo testimonio en una cabecera hacia el origen. Existen dos testimonios distintos, uno de aplicación y otro de organización, y solo el primero lleva tu `AUD tag`. La duración de la sesión se configura por aplicación y puede afinarse por política, de modo que la consola de producción caduque en una hora mientras el panel de lectura aguanta una jornada. Esa cifra no es una preferencia de comodidad: es el intervalo de la lección anterior, el que separa revocar de que deje de funcionar.
+
+## Señales que convierten la política en decisión
+
+Antes de exigir postura de dispositivo conviene conocer su precio real, que no es de licencia sino de cobertura. La postura requiere el cliente instalado y matriculado, de modo que cualquier persona sin él queda fuera por construcción. Eso es exactamente lo que quieres para la plantilla con equipo corporativo, y exactamente lo que no quieres para un auditor externo que entra dos días al año. La solución no es rebajar la exigencia global, sino separar aplicaciones: la que toca datos sensibles exige dispositivo gestionado y la que solo muestra informes agregados no.
+
+Una política que solo mira el correo electrónico es un inicio de sesión con otro nombre. Lo que la convierte en control de acceso es la acumulación de señales independientes que el borde puede correlacionar sin pedirle nada al usuario legítimo. La postura del dispositivo, que exige tener desplegado el cliente `WARP`, aporta versión del sistema operativo, cifrado de disco, cortafuegos activo, pertenencia a una lista de números de serie, presencia de un certificado de cliente o el veredicto de un agente de detección de terceros. El método de autenticación permite exigir que el segundo factor se haya usado de verdad en esta sesión, no que exista en el perfil del usuario.
+
+<Callout type="info" title="Los grupos vienen del directorio, no de tu base de datos">
+Cuando el proveedor de identidad expone grupos, `Access` puede evaluarlos directamente y, con la sincronización de directorio activada, mantenerlos al día sin intervención. Modelar los permisos gruesos como grupos del directorio en lugar de como filas propias hace que dar de baja a alguien en un único sitio se propague a todas las aplicaciones a la vez.
+</Callout>
+
+Merece la pena entender por qué la sincronización de directorio cambia la calidad de la decisión y no solo la comodidad. Sin ella, la pertenencia a un grupo se conoce en el momento del inicio de sesión y se congela hasta que la sesión caduca; con ella, el cambio en el directorio se propaga y la siguiente evaluación ya lo refleja. Vuelve a aparecer aquí el intervalo de la primera lección, el que separa dejar de merecer un acceso de perderlo, y ahora se ve con nitidez de qué dos números es la suma: la latencia de sincronización más la duración de sesión que tú elegiste.
+
+`Access` admite además varios proveedores de identidad simultáneos, y esa capacidad resuelve un caso muy real sin inventar nada: la plantilla entra por el directorio corporativo, los contratistas por otro proveedor y los invitados esporádicos por código de un solo uso enviado al correo. Como el proveedor concreto por el que se entró es a su vez un selector, puedes exigir que a la consola de producción solo se llegue por el directorio corporativo aunque las tres puertas estén abiertas para el resto de aplicaciones.
+
+Quedan dos controles menos conocidos y muy útiles en entornos regulados. La justificación de propósito obliga a escribir un motivo antes de entrar, y ese motivo queda registrado junto al evento; sirve para accesos legítimos pero infrecuentes, donde el valor no está en impedir sino en dejar rastro. La autenticación temporal exige que un aprobador designado conceda el paso en el momento, con una ventana de vigencia corta, y convierte un permiso permanente en un permiso bajo demanda. Ninguno de los dos es una barrera criptográfica; los dos cambian por completo el incentivo de quien accede.
+
+Y para lo que ninguna combinación de selectores alcanza existe una válvula de escape: la evaluación externa, que delega la decisión en un extremo tuyo, perfectamente un Worker, al que `Access` consulta durante la evaluación y que devuelve un veredicto firmado. Es la puerta por la que entran las políticas que dependen de tu propio estado de negocio, del estilo de conceder acceso solo mientras un ticket esté abierto o solo a quien esté hoy de guardia. Úsala con moderación, porque cada evaluación externa añade una dependencia tuya al camino crítico de la autenticación, y una dependencia caída ahí no degrada el servicio: lo cierra.
+
+<Callout type="dios" title="Sacar la autenticación de la aplicación no la mueve de sitio: cambia el coste marginal de proteger la siguiente, y con él lo que te atreves a construir">
+Aquí está el efecto de segundo orden que casi nadie ve la primera vez, y que explica por qué las organizaciones que adoptan este modelo terminan con una arquitectura distinta y no solo con una seguridad mejor. Cuando la autenticación vive dentro de cada aplicación, el coste de proteger una aplicación nueva es aproximadamente constante y nunca pequeño: hay que elegir biblioteca, gestionar sesiones, guardar contraseñas o delegar en un proveedor, escribir el flujo de vuelta, probar el caso del token caducado y mantener todo eso mientras la aplicación viva. Ese coste constante actúa como un impuesto sobre la existencia de aplicaciones internas, y el resultado observable en cualquier empresa que no lo haya resuelto es siempre el mismo: pocas aplicaciones muy grandes, con menús interminables, porque añadir una pestaña a un monolito que ya autentica es gratis y crear un servicio nuevo cuesta un sprint. La arquitectura acaba dictada por dónde estaba la sesión, que es una razón pésima para decidir fronteras de servicio. Cuando el punto de aplicación es el proxy que ya está delante de todo, ese coste marginal se desploma hasta ser una entrada en un panel, y entonces ocurre algo que parece organizativo y es profundamente técnico: empieza a compensar que existan aplicaciones pequeñas. El cuadro de mando de un equipo, la herramienta de tres botones que solo usa administración, el panel de depuración que solo debería ver quien está de guardia. Cada una con su propia audiencia, su propio predicado y su propia duración de sesión, que es exactamente el mínimo privilegio que la teoría pedía y que la economía anterior hacía inviable. Fíjate en la inversión que se ha producido: no has hecho más seguro lo que ya tenías, has hecho barato lo que la seguridad siempre recomendó y nadie podía permitirse. Y de ahí sale también el nuevo modo de fallar, porque ninguna ganancia es gratis: con el coste marginal en el suelo, la proliferación de políticas se convierte en el problema real, y la pregunta que hay que saber responder en el segundo año deja de ser si la aplicación está protegida y pasa a ser cuántas políticas concederían acceso a una persona concreta, y si alguien sabría enumerarlas.
+</Callout>
+
+<Challenge title="Escribe una política que no se pueda esquivar">
+1. Declara tu Worker como aplicación autoalojada en un dominio propio y desactiva la ruta de `workers.dev` en el manifiesto. Comprueba que la ruta antigua ya no responde.
+2. Escribe una política de `Allow` con el grupo del directorio en `include` y el segundo factor en `require`. Verifica con una cuenta sin segundo factor que la exclusión funciona.
+3. Repite la prueba moviendo la exigencia del segundo factor al `include` y observa cómo se convierte en vía alternativa de entrada. Documenta lo que acabas de ver.
+4. Añade una segunda aplicación sobre una ruta concreta, con duración de sesión más corta, y comprueba que su `AUD tag` es distinto del de la primera.
+5. Activa la justificación de propósito en la ruta sensible y localiza el motivo escrito en el registro de eventos de acceso.
+</Challenge>

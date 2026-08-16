@@ -1,0 +1,149 @@
+---
+title: "Optimizar la latencia: menos viajes y mejor colocados"
+description: "En el edge la latencia casi nunca la produce tu código: la produce el número de viajes de ida y vuelta que tu código encadena y el lugar desde el que los inicia. Cuatro palancas, en orden de rentabilidad decreciente: eliminar subrequests que no hacían falta, paralelizar las que sí, cachear con agresividad para que la mayoría de peticiones no viaje nunca, y mover la ejecución cerca de los datos con Smart Placement cuando el patrón conversacional lo justifica. Con el detalle de por qué la latencia no aparece en la factura y aun así importa más que ella."
+subject: cloudflare
+level: 40
+order: 2
+position: "40.2"
+duration: "17 min"
+---
+
+<Lead>
+Hay una asimetría incómoda en el edge que conviene mirar de frente: la latencia no se factura y sin embargo es lo único que el usuario percibe. Ninguna de las mejoras de esta lección aparecerá en la factura del mes, porque esperar no cuesta dinero; todas aparecerán en el percentil 95 de tu tiempo de respuesta, que es donde se decide si un producto se siente instantáneo o pesado. Y el hallazgo que ordena el resto es siempre el mismo: en un Worker bien escrito, el tiempo de respuesta no lo produce tu código, lo produce la cantidad de viajes de ida y vuelta que tu código encadena y el lugar desde donde los inicia.
+</Lead>
+
+<Goals>
+
+- Contar la latencia en viajes de ida y vuelta en lugar de en milisegundos de código propio.
+- Eliminar `subrequests` innecesarios y paralelizar los que sí lo son con `Promise.all`.
+- Usar la caché como palanca de latencia, no solo como palanca de coste.
+- Decidir con criterio cuándo `Smart Placement` ayuda y cuándo no cambia nada.
+
+</Goals>
+
+## La latencia es una cuenta de viajes
+
+Descompón cualquier respuesta lenta y encontrarás casi siempre la misma estructura: unos pocos milisegundos de trabajo propio y varios centenares de espera repartidos en viajes sucesivos. Cada `subrequest` que sale de tu Worker paga un tiempo de ida y vuelta que depende de la distancia física al destino y que ninguna optimización de código reduce. Si el origen está a ciento veinte milisegundos y haces cuatro llamadas encadenadas, has comprometido casi medio segundo antes de escribir una sola línea de lógica.
+
+De ahí se sigue la regla que gobierna toda esta lección: **la unidad de optimización no es el milisegundo, es el viaje**. Reescribir un bucle para que sea el doble de rápido ahorra fracciones de milisegundo; eliminar una llamada de red ahorra ciento veinte. Antes de perfilar código conviene dibujar la cascada de llamadas y contar cuántas hay, cuáles dependen de cuáles y cuál es la más lejana, porque esa cuenta explica el noventa por ciento del tiempo de respuesta.
+
+Ese dibujo revela además algo que ninguna métrica agregada muestra: la **profundidad** de la cascada, es decir, la longitud del camino más largo de llamadas encadenadas. Dos rutas que hacen seis llamadas cada una pueden comportarse de forma radicalmente distinta si una las lanza todas a la vez y la otra las encadena de tres en tres. La latencia mínima alcanzable de una ruta es la suma de su camino más largo, y ningún ajuste posterior baja de ahí, de modo que esa cifra es el techo real de cualquier optimización que no cambie la estructura.
+
+Conviene además elegir bien qué número se vigila. La latencia media es una métrica consoladora y casi inútil, porque una distribución con cola larga puede tener una media excelente mientras una de cada veinte peticiones tarda tres segundos; y esa de cada veinte es, precisamente, la que un usuario encuentra varias veces en una sesión. El percentil 95 y el 99 describen la experiencia real mucho mejor, y tienen la virtud de reaccionar a las causas que de verdad importan en el edge: un origen que se degrada, una caché que falla más de lo que debería, una llamada que a veces se reintenta.
+
+Las llamadas se clasifican en dos familias con destinos muy distintos. Las **dependientes** forman una cadena real: necesitas el identificador que devuelve la primera para poder pedir la segunda, y esa serialización es intrínseca al problema. Las **independientes** están encadenadas solo porque quien escribió el código puso un `await` detrás de otro por costumbre narrativa, y ese encadenamiento es puro accidente. La primera familia se ataca eliminando eslabones; la segunda, ejecutando todo a la vez.
+
+<Mermaid code={`flowchart TB
+  subgraph secuencial
+    A1[usuario] --> B1[llamada 1] --> C1[llamada 2] --> D1[llamada 3] --> E1[total 360 ms]
+  end
+  subgraph paralelo
+    A2[usuario] --> B2[llamada 1]
+    A2 --> C2[llamada 2]
+    A2 --> D2[llamada 3]
+    B2 --> E2[total 120 ms]
+    C2 --> E2
+    D2 --> E2
+  end
+  class E1 t-red
+  class E2 t-green`} />
+
+## Eliminar y paralelizar
+
+El primer trabajo, y el más rentable, es eliminar. Suena obvio y casi nunca se hace, porque eliminar exige entender por qué existe cada llamada y esa arqueología es incómoda; optimizar, en cambio, permite sentirse productivo sin cuestionar nada. Muchas cascadas contienen llamadas que no aportan información nueva: una consulta de configuración que devuelve siempre lo mismo, una validación remota de un token que podría verificarse con criptografía local, un servicio intermedio que se limita a reenviar la petición a otro. Cada uno de esos eslabones se justificó una vez por razones organizativas y sobrevive por inercia, pero paga un viaje completo en cada petición del planeta.
+
+Lo que no se puede eliminar se lanza a la vez. El patrón es trivial de escribir y sorprendentemente raro de encontrar en código real, porque el estilo secuencial se lee mejor y nadie mide lo que cuesta esa comodidad.
+
+```ts
+// Secuencial por accidente: tres viajes uno detras de otro.
+const perfil = await fetch(URL_PERFIL).then((r) => r.json());
+const pedidos = await fetch(URL_PEDIDOS).then((r) => r.json());
+const avisos = await fetch(URL_AVISOS).then((r) => r.json());
+
+// Paralelo: el coste total es el del mas lento, no la suma.
+const [perfil2, pedidos2, avisos2] = await Promise.all([
+  fetch(URL_PERFIL).then((r) => r.json()),
+  fetch(URL_PEDIDOS).then((r) => r.json()),
+  fetch(URL_AVISOS).then((r) => r.json()),
+]);
+```
+
+Conviene fijarse en un detalle que se escapa a menudo: la promesa empieza a ejecutarse cuando se crea, no cuando se espera. Basta con construir las tres antes del primer `await` para que viajen simultáneamente, y el `Promise.all` solo sirve para recogerlas. Cuando una de las tres es opcional o puede fallar sin arruinar la respuesta, `Promise.allSettled` permite degradar con elegancia en vez de tumbar la página entera por un servicio secundario.
+
+Hay un caso intermedio que merece nombre propio porque se resuelve con un truco muy rentable: la cadena falsa. Ocurre cuando la segunda llamada depende de la primera solo por un dato menor —un identificador que podrías haber deducido de la URL, una región que ya venía en la petición, un nombre que estaba en el token—, de modo que la dependencia existe en el código pero no en el problema. Romperla suele consistir en propagar ese dato antes, no en optimizar nada, y convierte de golpe una cadena de tres viajes en un abanico de tres.
+
+Hay una tercera técnica, menos conocida y muy potente: **responder antes de terminar**. Si parte del trabajo no condiciona lo que el usuario ve —registrar una métrica, invalidar una caché, notificar a un sistema interno—, ese trabajo va dentro de `ctx.waitUntil` y desaparece de la ruta crítica. La respuesta sale de inmediato y el resto ocurre después, sin que nadie lo note. La única disciplina que exige es distinguir con honestidad lo que el usuario necesita ver de lo que el sistema necesita registrar, una frontera que en muchos endpoints está borrosa solo porque nadie la ha trazado nunca.
+
+<Callout type="tip" title="El streaming convierte el tiempo total en tiempo hasta el primer byte">
+Si tu respuesta se construye a trozos, no esperes a tenerla entera para enviarla. Devolver el cuerpo de un `fetch` sin deserializarlo, o escribir en un `TransformStream` conforme llegan los datos, hace que el navegador empiece a pintar mientras el resto sigue viajando. La latencia total no cambia, pero la percibida se desploma, y es la percibida la que define la experiencia.
+</Callout>
+
+## Cachear para no viajar
+
+La optimización definitiva de un viaje es no hacerlo. Una respuesta cacheada en el punto de presencia se sirve a milisegundos del usuario sin cruzar la red, y eso mejora a la vez las tres magnitudes que te importan: la latencia, el número de peticiones que llegan a tu origen y el trabajo de CPU que se repite.
+
+Cachear con agresividad significa aceptar deliberadamente que ciertos datos sean unos segundos viejos a cambio de que la inmensa mayoría de peticiones no viaje nunca. La pregunta correcta no es si el dato puede quedar obsoleto, sino cuántos segundos de obsolescencia tolera el negocio, y la respuesta honesta casi siempre es mayor que cero. Formulada así, la conversación cambia de tono: deja de ser una discusión de principios sobre si cachear es peligroso y pasa a ser una estimación concreta que alguien de producto puede contestar en una frase. Un catálogo con treinta segundos de desfase, una portada con sesenta, una lista de precios con cinco minutos: cada uno de esos números convierte miles de viajes en cero.
+
+```ts
+const cache = caches.default;
+const clave = new Request(new URL(req.url).toString(), req);
+let res = await cache.match(clave);
+if (!res) {
+  res = await fetch(URL_ORIGEN);
+  res = new Response(res.body, res);
+  res.headers.set("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
+  ctx.waitUntil(cache.put(clave, res.clone()));
+}
+return res;
+```
+
+Hay una segunda caché, más pequeña y más rápida, que casi nadie usa a propósito: la del propio isolate. Guardar en el ámbito del módulo un resultado inmutable y compartible evita incluso el acceso a la caché del punto de presencia durante la vida de ese isolate, que suele atender muchas peticiones seguidas. Es una capa complementaria, no sustitutiva, y su única regla es la de siempre: ahí solo va lo que es idéntico para todos los usuarios.
+
+La directiva `stale-while-revalidate` merece una mención aparte porque resuelve el dilema clásico entre frescura y velocidad sin sacrificar ninguna de las dos: el usuario recibe al instante la copia caducada mientras la plataforma refresca por detrás, de modo que nadie paga jamás la espera de la revalidación. Es, con diferencia, la línea de configuración con mejor relación entre esfuerzo y latencia ganada de todo el edge.
+
+<Callout type="warn" title="Una clave de cache demasiado especifica es una cache que no existe">
+Si la clave incluye la cadena de consulta entera, la cookie de sesión o cabeceras que varían por usuario, cada visitante genera su propia entrada y la tasa de acierto se hunde. Normaliza la clave antes de usarla: quédate solo con los parámetros que cambian de verdad la respuesta y descarta los de seguimiento, que son ruido publicitario disfrazado de identidad.
+</Callout>
+
+Conviene recordar, además, que cachear reduce la carga de todo lo que hay detrás: menos peticiones al origen significan menos conexiones, menos consultas y menos posibilidades de que ese origen se degrade bajo un pico. Buena parte de las mejoras de percentil 99 que se atribuyen a la caché no vienen del acierto en sí, sino de que el sistema de atrás trabaja mucho más descansado.
+
+## Cuando el problema es dónde se ejecuta
+
+Queda un caso que ninguna de las palancas anteriores arregla: el Worker que necesita varios viajes dependientes contra un origen que vive en un único punto del planeta. Aunque elimines lo eliminable y paralelices lo paralelizable, si quedan tres llamadas encadenadas a una base de datos que está en Fráncfort y tu usuario está en Santiago, el edge te perjudica: ejecutar cerca del usuario significa cruzar el Atlántico tres veces.
+
+`Smart Placement` invierte esa decisión y deja que la plataforma ejecute tu Worker cerca de los datos en lugar de cerca del usuario. El usuario paga entonces un solo viaje largo hasta el punto donde corre el código, y las tres llamadas dependientes se vuelven locales. La cuenta es puramente aritmética: conviene cuando el número de viajes internos multiplicado por su distancia supera el viaje único del usuario.
+
+| Situación | Colocación adecuada |
+| --- | --- |
+| Muchas llamadas dependientes a un origen centralizado | Cerca de los datos |
+| Una sola llamada, o ninguna | Cerca del usuario |
+| Respuestas mayormente cacheadas | Cerca del usuario |
+| Estado repartido por regiones o servicios globales | Cerca del usuario |
+
+Dos advertencias cierran el asunto. La primera es que `Smart Placement` no es una optimización que se activa y se olvida: cambia la geografía de tu ejecución, de modo que hay que verificar el efecto con datos reales del percentil 95 por región y no dar por hecha la mejora. La segunda es que compite directamente con la caché, y la caché gana casi siempre: si la mayoría de las respuestas se sirven desde el punto de presencia, mover la ejecución lejos del usuario penaliza justamente al caso frecuente para beneficiar al raro. El orden correcto de las palancas es el de esta lección, y colocar es la última precisamente porque solo tiene sentido cuando las tres anteriores ya se agotaron.
+
+Conviene terminar recordando por qué merece la pena todo este trabajo si nada de ello aparece en la factura. La latencia es la única propiedad técnica que el usuario percibe directamente y sin intermediarios: no ve tu arquitectura, no ve tu cobertura de pruebas y no ve tu factura, pero siente cada uno de los cuatrocientos milisegundos que separan su clic de la respuesta. En un mercado donde el producto equivalente está a un clic de distancia, esa percepción es una ventaja competitiva medible, y por eso el orden de prioridades de esta lección —eliminar, paralelizar, cachear, colocar— vale tanto como el de la lección sobre coste, aunque su resultado nunca se lea en un recibo.
+
+<Cards>
+  <Card icon="🔗" title="Cuenta viajes, no lineas">
+    Un viaje de ida y vuelta cuesta más que todo tu código junto. Empieza siempre por dibujar la cascada.
+  </Card>
+  <Card icon="⚡" title="Crear la promesa ya la lanza">
+    Construir los `fetch` antes del primer `await` los pone a viajar a la vez. El `Promise.all` solo recoge.
+  </Card>
+  <Card icon="📦" title="La caché gana dos veces">
+    Una respuesta cacheada no viaja y no se recomputa: mejora latencia y coste con la misma línea.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="La latencia es una propiedad de la topologia, no del codigo">
+Optimizar latencia en el edge exige un cambio de encuadre que cuesta más de lo que parece, porque contradice el instinto formado en años de perfilar funciones. El instinto dice que un programa lento tiene dentro una parte lenta, y que basta con encontrarla y arreglarla; ese razonamiento es correcto cuando todo el cómputo ocurre en una máquina, y es sencillamente falso cuando la mayor parte del tiempo se gasta en trayectos entre máquinas separadas por miles de kilómetros. En un Worker típico, la suma de todo el trabajo propio cabe holgadamente en unos pocos milisegundos, mientras que un único salto transatlántico ronda los ciento cincuenta, de modo que el perfilador puede estar impecable y la página seguir sintiéndose lenta. Lo que hay que perfilar no es la función, es el grafo de dependencias entre llamadas remotas, y ese grafo se optimiza con tres operaciones y ninguna más: quitar nodos, convertir cadenas en abanicos y mover la raíz. Quitar nodos es eliminar llamadas que nadie necesitaba; convertir cadenas en abanicos es reconocer que la dependencia entre dos llamadas era narrativa y no lógica, un artefacto de haber escrito el código como se cuenta una historia, de arriba abajo; mover la raíz es admitir que el punto de ejecución también es una variable de diseño y no una constante de la plataforma. La caché merece un lugar propio en esta jerarquía porque no optimiza el grafo, lo **suprime**: una respuesta servida desde el punto de presencia no tiene grafo, tiene un acierto local, y por eso ninguna otra técnica compite con ella en rentabilidad. Cuando esta forma de pensar se asienta, cambia incluso la conversación de diseño: se deja de preguntar cuánto tarda este endpoint, que es una medida agregada y ciega, y se empieza a preguntar cuántos viajes hace, cuáles de ellos son evitables, cuáles son simultáneos y desde dónde salen. Esas cuatro respuestas predicen el tiempo de respuesta con una precisión que ningún perfilador de código puede igualar, y además son accionables una por una.
+</Callout>
+
+<Challenge title="Reduce la cascada de una ruta real">
+1. Dibuja la cascada completa de una ruta tuya y anota cuántos viajes hace y cuál es el más lejano.
+2. Clasifica cada llamada en dependiente o independiente, y justifica la clasificación con el dato concreto que obliga a esperar.
+3. Convierte todas las independientes en un único abanico y mide la diferencia en el percentil 95.
+4. Elige un endpoint y ponle `stale-while-revalidate`. Calcula qué porcentaje de peticiones deja de viajar.
+5. Decide con la tabla si esa ruta se beneficiaría de `Smart Placement` y argumenta la aritmética que respalda tu decisión.
+</Challenge>

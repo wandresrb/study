@@ -1,0 +1,144 @@
+---
+title: "Monomorfización y codegen: del MIR al código máquina"
+description: "El MIR es genérico y portable; la máquina no entiende ni genéricos ni portabilidad. Entre ambos media el codegen: el colector de monomorfización recorre el MIR y emite una copia concreta por cada instanciación, esas copias se reparten en unidades de codegen, se traducen a LLVM IR, y LLVM las optimiza hasta convertirlas en código máquina. En ese trayecto se explica también la pregunta eterna: por qué Rust compila tan despacio, y qué backends como Cranelift intentan hacer al respecto."
+subject: rust
+level: 51
+order: 3
+position: "51.3"
+duration: "20 min"
+---
+
+<Lead>
+El `MIR` de la lección anterior tiene dos rasgos que la máquina no tolera: es **genérico** —lleno de `T` sin resolver— y es **portable** —no sabe nada de tu procesador—. El codegen es el tramo final que borra ambos: primero especializa cada genérico en copias concretas, luego traduce esas copias a `LLVM IR`, y deja que `LLVM` las muela hasta obtener instrucciones reales de tu CPU. Ya conociste la monomorfización como *abstracción de coste cero*; ahora la verás desde dentro del compilador, como el mecanismo que gobierna cuánto código se genera, cuánto tarda la compilación, y por qué Rust tiene fama de lento en compilar pese a ser velocísimo en ejecutar.
+</Lead>
+
+<Goals>
+
+- Entender qué hace el colector de monomorfización al recorrer el `MIR`.
+- Seguir el descenso de `MIR` a `LLVM IR` y de ahí a código máquina y el enlazado.
+- Situar a `LLVM`, `Cranelift` y el backend de `GCC` como alternativas de generación de código.
+- Explicar, con causas concretas, por qué compilar Rust es lento y qué lo mitiga.
+
+
+</Goals>
+
+## Del MIR genérico a los items monomórficos
+
+El `MIR` de una función genérica es una plantilla: `fn imprime<T: Display>(x: T)` existe una sola vez, con su `T` sin resolver. Pero la máquina necesita una función concreta por cada tipo real. El puente es el **colector de monomorfización** (`rustc_monomorphize`).
+
+El colector arranca desde un conjunto de *raíces* —`main`, las funciones exportadas, todo lo que el mundo exterior puede invocar— y recorre su `MIR` buscando cada llamada, cada uso de un tipo, cada instanciación. Cada vez que encuentra `imprime` aplicado a `i32`, registra un **mono item**: la pareja de la función y sus argumentos de tipo concretos. Desde cada item sigue tirando del hilo, recolectando recursivamente todo lo que ese item usa, hasta cerrar el grafo completo de lo que el programa realmente necesita. Lo que ningún camino alcanza —un genérico que nunca instancias— sencillamente no se genera.
+
+```rust
+use std::fmt::Display;
+
+fn imprime<T: Display>(x: T) { println!("{x}"); }
+
+fn main() {
+    imprime(5_i32);   // registra el mono item imprime::<i32>
+    imprime("hola");  // registra el mono item imprime::<&str>
+}
+```
+
+De este `MIR` con un solo `imprime` genérico, el colector deriva **dos** items monomórficos: `imprime::<i32>` e `imprime::<&str>`. Si el mismo tipo aparece en veinte sitios, el item es uno solo: el compilador comparte copias por tipo, no por punto de llamada. El resultado es la lista exacta y finita de todas las funciones concretas que habrá en el binario, cada una tan específica como si la hubieras escrito a mano.
+
+Esta explosión es fácil de subestimar. Una crate intensiva en genéricos —`serde`, el ecosistema de iteradores, cualquier API construida sobre traits parametrizados— puede generar, al monomorfizarse contra decenas de tipos de tu programa, miles de items concretos. Cada uno es una función real que el backend deberá optimizar por separado. Aquí nace, en germen, la lentitud de compilación que diseccionaremos al final: no es el `MIR` genérico lo que cuesta, sino la muchedumbre de copias que el colector extrae de él. Y el colector no adivina: solo genera lo que algún camino desde una raíz alcanza de verdad, de modo que el trabajo es proporcional a lo que tu programa *usa*, no a lo que tus dependencias *ofrecen*.
+
+<Callout type="info" title="Monomorfización frente a borrado de tipos">
+Aquí Rust toma el camino opuesto a Java o a Go con su borrado de tipos, donde el genérico sobrevive en ejecución con una única representación compartida y alguna forma de indirección. Rust prefiere gastar en compilación para no gastar en ejecución: genera código específico y suprime toda indirección genérica. Es la misma decisión que estudiaste como coste cero, vista ahora desde el lado del compilador: quien paga el precio es el `codegen`, no el programa en marcha.
+</Callout>
+
+## De MIR a LLVM IR: el descenso al backend
+
+Con la lista de mono items cerrada, `rustc` los reparte en **unidades de codegen** (*codegen units*, `CGU`). Este reparto es puro pragmatismo: cada unidad se puede compilar en un hilo distinto y cachear por separado, así que trocear el trabajo habilita el paralelismo y la incrementalidad. Por defecto una compilación de *release* usa dieciséis unidades; las de *debug*, muchas más, priorizando la velocidad de compilación sobre la calidad del resultado.
+
+Ese número es una palanca en tus manos, y encarna un compromiso directo. Menos unidades le dan al optimizador una vista más global —puede *inlinear* a través de fronteras que, troceadas, se lo impedirían— a cambio de menos paralelismo y compilaciones más lentas:
+
+```toml
+# En Cargo.toml: una sola unidad exprime la optimizacion al maximo
+[profile.release]
+codegen-units = 1   # mejor codigo generado, peor paralelismo del backend
+lto = true          # optimizacion a traves de todas las fronteras
+```
+
+Cada unidad se desciende de `MIR` a **`LLVM IR`** (`rustc_codegen_llvm` sobre `rustc_codegen_ssa`): un lenguaje intermedio de bajo nivel, en forma `SSA`, que es la lengua franca del compilador `LLVM`. Aquí tu función concreta se convierte en una secuencia de operaciones primitivas —cargas, almacenamientos, saltos, aritmética— anotadas con tipos de máquina. Es el punto donde Rust deja de hablar en sus propios términos y empieza a hablar en los de la infraestructura que comparte con `Clang`, con `Swift` y con tantos otros.
+
+Puedes ver ese `LLVM IR` con tus propios ojos y comprobar cuánto genera Rust por una función aparentemente simple:
+
+```bash
+# Emitir el LLVM IR de un crate para inspeccionarlo
+cargo +nightly rustc --release -- --emit=llvm-ir
+```
+
+Suele sorprender la cantidad: una función de tres líneas con un par de genéricos puede producir un `LLVM IR` extenso, porque cada instanciación se emite entera antes de que el optimizador la funda. Ese volumen es, literalmente, lo que `LLVM` tiene que digerir, y por eso el tamaño del `LLVM IR` generado es un buen predictor de cuánto tardará la compilación.
+
+A partir de ahí, `LLVM` toma el mando: aplica sus *pasadas de optimización* —*inlining*, vectorización, propagación, eliminación de código muerto—, emite el código máquina de tu arquitectura respetando la `ABI`, y produce ficheros objeto. Finalmente, el **enlazador** (`ld`, `lld`, `mold`) cose todos los objetos y las bibliotecas en un ejecutable. Solo entonces existe un binario.
+
+<Mermaid code={`flowchart TB
+  mir[MIR genericos sin resolver] --> col[Colector recorre desde main]
+  col --> items[Lista de mono items concretos]
+  items --> cgu[Reparto en unidades de codegen]
+  cgu --> llvm[Descenso a LLVM IR]
+  llvm --> opt[LLVM optimiza inlining vectorizacion]
+  opt --> obj[Codigo maquina en ficheros objeto]
+  obj --> link[Enlazador produce el ejecutable]
+  class mir t-blue
+  class items t-mauve
+  class opt t-peach
+  class link t-green`} />
+
+## Otros backends: Cranelift y GCC
+
+`LLVM` domina, pero no es la única salida. `rustc` separa el *frontend* —todo lo que viste hasta el `MIR`— del *backend* de generación de código, y esa costura permite enchufar motores alternativos con objetivos distintos.
+
+**`Cranelift`** (`rustc_codegen_cranelift`) es un backend pensado para *velocidad de compilación*, no de ejecución: optimiza poco pero genera código deprisa, lo que lo hace ideal para el ciclo de *debug* donde recompilas cien veces por hora y no te importa que el binario sea algo más lento. **El backend de `GCC`** (`rustc_codegen_gcc`, sobre `libgccjit`) persigue otra cosa: acceder al enorme catálogo de arquitecturas que `GCC` soporta y `LLVM` no. Son dos palancas del mismo eje: cambiar el motor que convierte `MIR` en máquina sin tocar una línea del frontend.
+
+Esa separación limpia entre frontend y backend es más que una comodidad de ingeniería: es lo que evita que Rust quede casado para siempre con `LLVM`. Si mañana aparece un motor mejor, el `MIR` seguirá siendo el mismo punto de entrega, y el frontend —todo el trabajo de tipos, préstamos y desazucarado— se reaprovecha intacto. El compilador está diseñado para sobrevivir a las modas de su propia infraestructura.
+
+<Cards>
+  <Card icon="🏭" title="LLVM · el backend por defecto">
+    Optimización agresiva y código máquina de máxima calidad. El precio es tiempo: la mayor parte de una compilación de release se va en sus pasadas.
+  </Card>
+  <Card icon="⚡" title="Cranelift · velocidad de compilación">
+    Optimiza poco, genera rápido. Pensado para el ciclo de `debug`, donde iterar deprisa importa más que el rendimiento del binario.
+  </Card>
+</Cards>
+
+## Por qué Rust compila lento
+
+Ahora tienes las piezas para responder a la queja más repetida sobre Rust con precisión, no con tópicos. La lentitud no es un defecto accidental: es la factura de decisiones deliberadas, pagada casi toda en el backend.
+
+- **La monomorfización multiplica el trabajo.** Un genérico usado con veinte tipos produce veinte cuerpos, y `LLVM` debe optimizar los veinte. El *code bloat* que estudiaste como coste en tamaño es también un coste en *tiempo*: más código que generar y optimizar.
+- **`LLVM` es caro.** El grueso de una compilación de *release* no se va en el chequeo de tipos ni en el borrow checker, sino en las pasadas de `LLVM`. Rust le entrega mucho `LLVM IR` —fruto de la monomorfización— y `LLVM` lo optimiza a fondo.
+- **El frontend también pesa.** Traits complejos, macros procedurales que ejecutan código en compilación, *build scripts*: todo suma antes incluso de llegar al backend.
+
+No tienes que creer en estas causas: puedes medirlas. Cargo y `rustc` exponen desgloses que reparten el tiempo entre el frontend y el backend, y casi siempre confirman el veredicto —el grueso se va en `LLVM`—:
+
+```bash
+# Informe HTML del tiempo por crate y fase de compilacion
+cargo build --timings
+
+# Desglose de las fases internas del propio rustc
+RUSTFLAGS="-Ztime-passes" cargo +nightly build
+```
+
+Frente a esto, el proyecto despliega mitigaciones que ya conoces del nivel de herramientas: la **compilación incremental** rehace solo las unidades tocadas; el **frontend paralelo** reparte el trabajo entre hilos; **`Cranelift`** acelera los *builds* de desarrollo; y afinar `codegen-units`, `opt-level` o recurrir a menos genéricos son palancas en tu mano. La lentitud es real, pero es negociable.
+
+<Callout type="tip" title="Menos genéricos donde no aportan">
+Una táctica concreta que a veces sorprende: si una función genérica no necesita el rendimiento del despacho estático, convertirla a `dyn` recorta drásticamente el código generado. Donde la monomorfización emitiría una copia por tipo, `dyn` deja una sola función compartida a costa de una indirección por llamada. Cambiar unos pocos genéricos muy instanciados por objetos de trait puede reducir a la vez el tamaño del binario y el tiempo de compilación, sin que se note en ejecución. Es la palanca inversa a la que eliges por defecto, y a veces la más juiciosa.
+</Callout>
+
+<Callout type="dios" title="Compilar Rust es mover el coste en el tiempo: pagas una vez tú para que tus usuarios no paguen nunca">
+Aquí se cierra el círculo que abriste con la monomorfización, y se ve entero. Rust hace una apuesta temporal audaz: acepta ser lento *donde el coste lo pagas tú, una vez, en tu máquina* —la compilación— a cambio de ser máximamente rápido *donde el coste lo pagarían tus usuarios, un número ilimitado de veces, para siempre* —la ejecución—. La monomorfización es la encarnación perfecta de esa apuesta: genera montañas de código especializado, tortura a `LLVM` optimizándolas, y a cambio produce un binario sin una sola indirección genérica, tan veloz como C. Cada segundo que esperas ante `cargo build --release` es un regalo a cada persona que ejecutará tu programa. Y esto reencuadra por completo la eterna queja de la lentitud: no es un fracaso de ingeniería que el proyecto no haya sabido arreglar, es una *elección* sobre dónde colocar el gasto, coherente con la vocación entera del lenguaje. Un lenguaje de sistemas que fuese rápido de compilar pero produjese binarios mediocres traicionaría su razón de ser; Rust prefiere lo contrario y trabaja sin descanso —`Cranelift`, frontend paralelo, incrementalidad— por recortar la factura sin renunciar al trato. Entender el codegen es entender que la velocidad de ejecución de Rust no es magia ni suerte: es tiempo de compilación transmutado en tiempo de ejecución ahorrado. Quien comprende esto deja de maldecir la espera y empieza a leerla como lo que es: el precio, justo y consciente, de la abstracción que se evapora.
+</Callout>
+
+<Callout type="note" title="Lo esencial del codegen">
+El colector de monomorfización recorre el `MIR` desde `main` y emite un *mono item* concreto por cada instanciación genérica usada. Esos items se reparten en unidades de codegen —para paralelismo e incrementalidad—, se descienden a `LLVM IR` y `LLVM` los optimiza hasta código máquina, que el enlazador cose en un ejecutable. `Cranelift` y el backend de `GCC` son alternativas con otros fines. Y Rust compila lento por causas concretas —monomorfización que multiplica código, `LLVM` que optimiza a fondo— que son la contrapartida deliberada de su velocidad en ejecución.
+</Callout>
+
+<Challenge title="Sigue el código hasta la máquina">
+1. Para `fn dobla<T: std::ops::Add<Output = T> + Copy>(x: T) -> T { x + x }` usado con `i32`, `f64` y `u8`, enumera los *mono items* que registra el colector.
+2. Explica por qué un genérico que defines pero nunca instancias no aporta ni un byte al binario, apoyándote en cómo trabaja el colector.
+3. Ordena en el tiempo `MIR`, `LLVM IR`, ficheros objeto y ejecutable, y di qué componente produce cada transición.
+4. Argumenta, con las tres causas de la lección, por qué el grueso de un `cargo build --release` suele irse en `LLVM` y no en el borrow checker.
+5. Decide: para un ciclo de desarrollo con recompilaciones constantes, ¿qué backend elegirías y qué sacrificas al hacerlo?
+</Challenge>

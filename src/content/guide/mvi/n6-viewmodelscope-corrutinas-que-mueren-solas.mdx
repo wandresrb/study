@@ -1,0 +1,150 @@
+---
+title: "viewModelScope: corrutinas que mueren solas"
+description: "Un ViewModel que sobrevive a la rotación sin un scope que muera con él sería una fábrica de fugas. Esta lección disecciona viewModelScope pieza a pieza: dónde se guarda realmente, por qué su contexto combina un SupervisorJob con Dispatchers.Main.immediate, y qué consecuencias tiene cada una de esas dos decisiones sobre el comportamiento de tu pantalla. Explica después que la cancelación en Kotlin es cooperativa —y por qué un bucle de cálculo o una llamada bloqueante ignoran la orden de cancelar—, cómo se limpia correctamente con NonCancellable, y cuáles son las fugas clásicas: el scope creado a mano que nadie cancela, el GlobalScope, el singleton que retiene una referencia al ViewModel y el trabajo que debería sobrevivir a la pantalla y por tanto no pertenece a este scope."
+subject: mvi
+level: 6
+order: 2
+position: "6.2"
+duration: "17 min"
+---
+
+<Lead>
+Un objeto que sobrevive a la rotación es una bendición y una amenaza a partes iguales. Bendición porque conserva el estado; amenaza porque todo lo que ese objeto arranque y no sepa detener seguirá vivo mientras él viva, y él vive mucho. La lección anterior te dejó con un `ViewModel` que atraviesa impasible la destrucción de sus pantallas; esta lección te da la contrapartida imprescindible: el scope de corrutinas que nace con él, que muere con él y que arrastra en su caída a toda la descendencia que hayas lanzado dentro. `viewModelScope` es una propiedad de doce líneas, pero esas doce líneas codifican tres decisiones de diseño —dónde se guarda, qué `Job` usa y sobre qué despachador corre— que explican buena parte del comportamiento de tus pantallas.
+</Lead>
+
+<Goals>
+
+- Desmontar la anatomía de `viewModelScope`: dónde se almacena y cuándo se cancela.
+- Entender por qué su contexto usa un `SupervisorJob` y qué aísla exactamente.
+- Comprender la elección de `Dispatchers.Main.immediate` y su efecto sobre el parpadeo visual.
+- Reconocer las fugas clásicas y saber qué trabajo no pertenece nunca a este scope.
+
+</Goals>
+
+## Anatomía de viewModelScope
+
+`viewModelScope` es una propiedad de extensión sobre `ViewModel`, no un campo declarado en la clase. Su implementación es sencilla y merece leerse despacio: la primera vez que la usas, crea un `CoroutineScope` y lo guarda en una bolsa interna de objetos etiquetados que todo `ViewModel` mantiene; en los accesos siguientes devuelve el que ya está guardado. Ese scope implementa `Closeable`, y cuando el framework limpia el `ViewModelStore`, cierra uno por uno los objetos de esa bolsa —cancelando el scope— y solo después invoca `onCleared`.
+
+```kotlin
+// Reconstrucción conceptual de lo que hace la librería
+public val ViewModel.viewModelScope: CoroutineScope
+    get() = getCloseable(SCOPE_KEY)
+        ?: CloseableCoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+            .also { addCloseable(SCOPE_KEY, it) }
+```
+
+De esa única línea de contexto se derivan las dos decisiones interesantes. La primera es el `SupervisorJob`. Con un `Job` corriente, el fallo de una corrutina hija cancela a su padre, y el padre cancela al resto de hermanas: una llamada de red que revienta se llevaría por delante la suscripción a la base de datos y cualquier otra tarea en vuelo, dejando el `ViewModel` vivo pero con el scope muerto y sordo a futuras peticiones. El `SupervisorJob` invierte esa propagación hacia arriba: una hija que falla no arrastra a nadie. Cada `launch` es un compartimento estanco, que es justo lo que quieres cuando cada corrutina atiende una acción independiente del usuario.
+
+<Callout type="warn" title="SupervisorJob no significa a prueba de fallos">
+Aísla, pero no captura. Una excepción no atrapada dentro de un `launch` sigue llegando al manejador de excepciones no capturadas del hilo y puede tumbar la aplicación: lo único que evita el `SupervisorJob` es que además cancele a sus hermanas. Si tu corrutina puede fallar, la responsabilidad de tratarlo sigue siendo tuya, con un `try`/`catch` alrededor de la operación arriesgada, un `runCatching` o un `CoroutineExceptionHandler` sumado al contexto. En Orbit el lugar natural de ese tratamiento es el cuerpo del `intent`, traduciendo el fallo a un `reduce` que ponga el estado de error.
+</Callout>
+
+Hay un matiz que conviene fijar porque produce confusión: el `SupervisorJob` aísla a los *hijos directos* del scope, es decir, a cada `launch` que hagas sobre `viewModelScope`. Dentro de uno de esos `launch`, la jerarquía vuelve a ser la normal: si abres un `coroutineScope` y lanzas dos operaciones en paralelo, el fallo de una sí cancela a su hermana y sube al padre. Y así debe ser, porque esas dos operaciones colaboran en la misma tarea y la mitad de un resultado no vale para nada. La supervisión pertenece a la frontera entre acciones independientes del usuario, no al interior de una sola acción.
+
+La segunda decisión es `Dispatchers.Main.immediate`, y es más sutil de lo que parece. El `Dispatchers.Main` a secas siempre encola el trabajo en el bucle de mensajes del hilo principal, aunque ya estés en él; la variante `immediate` comprueba primero si el hilo actual ya es el principal y, si lo es, ejecuta el bloque sin reenviarlo. La diferencia se nota justo donde importa: cuando actualizas el estado desde un gesto del usuario, la actualización se aplica en el mismo ciclo en lugar de en el siguiente. Sin `immediate` habría un fotograma en el que la pantalla ya reaccionó al toque pero el estado todavía no había cambiado; con `immediate` ese hueco desaparece, y con él el parpadeo característico de un indicador de carga que aparece un instante tarde.
+
+Que el despachador por defecto sea el principal no significa que el trabajo pesado deba correr ahí. Significa lo contrario de lo que muchos concluyen: como el punto de partida es el hilo de la interfaz, *cada* operación costosa tiene que declarar explícitamente su cambio de contexto. Y la responsabilidad de declararlo pertenece a quien conoce el coste —el repositorio, la fuente de datos, el caso de uso— y no a quien la invoca. Una función `suspend` bien diseñada es segura de llamar desde el hilo principal porque ella misma se aparta con `withContext` cuando lo necesita; si tienes que recordar en cada llamada desde qué hilo invocarla, la abstracción está mal puesta.
+
+```kotlin
+// El coste lo declara quien lo conoce, no quien llama
+class PerfilRepo(private val dao: PerfilDao) {
+    suspend fun cargar(id: String): Perfil = withContext(Dispatchers.IO) {
+        dao.buscar(id)   // seguro de invocar desde el hilo principal
+    }
+}
+```
+
+## La cancelación es cooperativa
+
+Cancelar en Kotlin no es matar. Cuando el scope se cancela, lo único que ocurre es que el `Job` de cada corrutina pasa a estado cancelado y las funciones `suspend` de la biblioteca —`delay`, `withContext`, `await`, la recolección de un `Flow`— lanzan una `CancellationException` la próxima vez que se les da el control. Si tu código nunca devuelve el control, nadie lo interrumpe: un bucle de cálculo puro o una llamada bloqueante de entrada y salida seguirán trabajando aunque el `ViewModel` esté muerto, sosteniendo lo que hayan capturado.
+
+```kotlin
+// Cooperar con la cancelación en trabajo pesado
+fun procesar(datos: List<Registro>) = viewModelScope.launch(Dispatchers.Default) {
+    val salida = buildList {
+        datos.forEach { registro ->
+            ensureActive()          // punto de cancelación explícito
+            add(transformar(registro))
+        }
+    }
+    withContext(NonCancellable) {   // limpieza que debe completarse igual
+        cache.volcar(salida)
+    }
+}
+```
+
+`ensureActive` es la forma más barata de sembrar puntos de cancelación en un bucle largo; `yield` hace lo mismo y además cede el turno. En el otro extremo está `NonCancellable`: un bloque que necesita terminar sí o sí —cerrar un fichero, confirmar una transacción, soltar un bloqueo— debe envolverse así, porque de lo contrario la primera suspensión dentro de la limpieza abortará también la limpieza. Son dos herramientas complementarias: una para dejarse cancelar bien, otra para negarse a ser cancelado en el tramo exacto donde negarse es correcto.
+
+<Callout type="info" title="La CancellationException no es un error">
+Cuando una corrutina se cancela, la excepción que la atraviesa es una `CancellationException`, y el sistema la trata como parte del protocolo normal, no como un fallo. Por eso un `catch (e: Exception)` demasiado ancho alrededor de una operación suspendida es peligroso: atrapa también la cancelación, se la traga y deja la corrutina viva o el estado en un limbo. Si necesitas capturar de forma amplia, relanza explícitamente lo que sea cancelación antes de tratar el resto, o usa las utilidades que ya distinguen ambos casos.
+</Callout>
+
+<Mermaid code={`flowchart TD
+  VM[ViewModel] --> SJ[SupervisorJob del scope]
+  SJ --> C1[Corrutina de carga inicial]
+  SJ --> C2[Corrutina que colecciona la base de datos]
+  SJ --> C3[Corrutina de una accion del usuario]
+  C1 -.si falla no arrastra a sus hermanas.-> X[Fallo aislado]
+  CL[El owner se destruye] --> CLR[Se limpia el ViewModelStore]
+  CLR --> CAN[Se cancela el scope en cascada]
+  CAN --> SJ
+  class SJ t-green
+  class CAN t-red
+  class VM t-blue`} />
+
+## Fugas: lo que se escapa del scope
+
+Toda fuga de corrutinas en un `ViewModel` responde a la misma causa: trabajo que corre fuera de la jerarquía que se cancela. La primera variante es el scope artesanal, un `CoroutineScope(Dispatchers.IO)` creado como campo de la clase porque hacía falta otro despachador. Nadie lo cancela nunca, así que sus corrutinas sobreviven al `onCleared` reteniendo el `ViewModel` entero. La corrección es trivial y siempre la misma: no cambies de scope para cambiar de hilo, cambia de contexto con `withContext(Dispatchers.IO)` dentro del scope que ya se cancela solo.
+
+La segunda es `GlobalScope`, que es literalmente el scope de toda la aplicación: nada de lo que lances ahí se cancelará jamás por causa de tu pantalla. La tercera es más difícil de ver porque la referencia va al revés: un componente de larga vida —un repositorio singleton, un gestor de sesión, un oyente registrado en un servicio— guarda una lambda que captura el `ViewModel`. Aunque el scope se cancele con puntualidad, el objeto no puede recolectarse porque alguien más lo sujeta desde fuera, y con él queda retenido todo el estado que custodiaba.
+
+<Cards>
+  <Card icon="🕳️" title="Scope artesanal">
+    Un `CoroutineScope` creado como campo y nunca cancelado. Sus corrutinas sobreviven a `onCleared` y retienen el `ViewModel` entero con todo su estado.
+  </Card>
+  <Card icon="🌍" title="GlobalScope">
+    El ámbito de la aplicación completa. Nada de lo que lances ahí se cancelará por causa de tu pantalla, y nada te avisará de ello.
+  </Card>
+  <Card icon="🪢" title="Referencia entrante">
+    Un singleton que guarda una lambda capturando el `ViewModel`. El scope se cancela bien, pero el objeto sigue sujeto desde fuera y no se recolecta.
+  </Card>
+</Cards>
+
+<Callout type="tip" title="Regla practica de tres preguntas">
+Ante cualquier trabajo asíncrono, haz tres preguntas antes de escribir la primera línea. ¿Quién lo cancela? Si la respuesta no es un scope atado a un ciclo de vida, ya tienes una fuga. ¿Qué captura? Si captura la vista o un contexto de `Activity`, cámbialo por datos planos. ¿Debe morir con la pantalla? Si la respuesta es no, entonces este no es su sitio.
+</Callout>
+
+Detectar estas fugas a ojo es poco fiable, así que conviene automatizarlo. Una herramienta de detección de fugas instrumenta la destrucción de los objetos con ciclo de vida y avisa cuando un `ViewModel` sigue accesible después de haberse limpiado, mostrándote la cadena exacta de referencias que lo sujeta. Leer esa cadena es la parte instructiva: siempre termina en algo que vive más que la pantalla y que un día decidiste guardar por comodidad.
+
+Esa tercera pregunta señala el error inverso, menos comentado pero igual de real: meter en `viewModelScope` trabajo que *no debe* morir con la pantalla. Subir una foto, sincronizar un borrador o registrar una compra son operaciones cuyo destino no puede depender de que el usuario decida volver atrás. Si viven en el scope del `ViewModel`, se cancelarán a mitad de camino en cuanto la pantalla se destruya, y el usuario perderá el trabajo sin entender por qué. Esas tareas pertenecen a un componente de ámbito de aplicación o, si deben resistir incluso a la muerte del proceso, a un planificador de trabajo persistente. El scope correcto no es el más cómodo: es aquel cuya duración coincide con la duración legítima de la tarea.
+
+## Orbit corre sobre este mismo scope
+
+Nada de lo anterior es teoría separada del patrón que estás estudiando: la fábrica `container` de `orbit-viewmodel` construye el contenedor precisamente sobre `viewModelScope`. Cada `intent` que escribes es una corrutina hija de ese scope, así que hereda las tres propiedades de golpe: se aísla de sus hermanos por el `SupervisorJob`, aplica sus `reduce` sin salto de fotograma por `Dispatchers.Main.immediate` y se cancela en cascada cuando el `ViewModel` muere.
+
+```kotlin
+// Un intent que colecciona para siempre: nunca tendrás que cancelarlo
+fun observarMensajes() = intent {
+    repo.mensajesFlow(state.chatId).collect { lista ->
+        reduce { state.copy(mensajes = lista) }
+    }
+}
+```
+
+Ese `intent` no termina jamás por sí mismo, y sin embargo no es una fuga. Termina cuando el usuario abandona la pantalla de forma definitiva, porque en ese instante se limpia el `ViewModelStore`, se cierra el scope y la recolección recibe su `CancellationException` en la siguiente suspensión. Escribir código que no termina y que aun así no fuga solo es posible cuando la vida de la corrutina está atada estructuralmente a la vida de algo con significado para el usuario.
+
+<Callout type="note" title="Una suscripcion se arranca una vez, no en cada pintado">
+El único cuidado que exige un `intent` de este tipo es no lanzarlo repetidamente. Si lo invocas en cada recomposición o en cada entrada a la pantalla, acumularás recolectores duplicados observando lo mismo, todos vivos dentro del mismo scope y todos aplicando `reduce`. El sitio correcto es el bloque de creación del `container`, que se ejecuta una sola vez, o una envoltura atada al conteo de suscriptores para que la recolección se pause cuando nadie mira.
+</Callout>
+
+<Callout type="dios" title="Elegir un scope es declarar cuanto merece vivir una tarea">
+La lección profunda de `viewModelScope` no es que te ahorre líneas de cancelación, aunque las ahorre. Es que convierte una pregunta de gestión de memoria en una pregunta de diseño. Antes de la concurrencia estructurada, la vida de una tarea asíncrona era un asunto de contabilidad: alguien tenía que acordarse de guardar un identificador, un `Disposable` o una referencia, y de soltarlo en el sitio correcto; olvidarlo no daba error de compilación, no fallaba en las pruebas y solo se manifestaba semanas después como una fuga en producción. La concurrencia estructurada elimina esa contabilidad por construcción: si una corrutina cuelga de un padre y el padre muere, la hija muere. Pero el regalo verdadero está un nivel por encima. Al obligarte a lanzar dentro de *algún* scope, Kotlin te obliga a responder, cada vez, a una pregunta que antes podías esquivar indefinidamente: ¿cuánto debe durar esto? Y esa pregunta es arquitectura pura. Una llamada para pintar una pantalla dura lo que dure la intención del usuario, y por eso `viewModelScope` es su hogar. Una subida que el usuario ya dio por hecha dura hasta completarse, y por eso pertenece al ámbito de la aplicación o a un planificador persistente. Un latido de telemetría dura lo que dure el proceso. Cuando eliges un scope no estás decidiendo un detalle técnico de limpieza: estás firmando un contrato sobre la importancia relativa de esa tarea frente a lo que el usuario haga a continuación. Por eso la peor respuesta a un problema de cancelación es crear un scope nuevo para esquivarlo: no soluciona nada y, además, borra la única pregunta que valía la pena hacerse.
+</Callout>
+
+<Challenge title="Audita la vida de tus corrutinas">
+1. Explica qué cambiaría en el comportamiento de tu pantalla si `viewModelScope` usara un `Job` normal en lugar de un `SupervisorJob`, con un ejemplo concreto de dos corrutinas hermanas.
+2. Construye un caso donde `Dispatchers.Main.immediate` evite un parpadeo visible y razona en qué fotograma exacto se manifestaría el problema con `Dispatchers.Main` a secas.
+3. Escribe un bucle de cálculo que ignore la cancelación y arréglalo con puntos de cancelación explícitos, midiendo dónde estaba la fuga.
+4. Localiza en un proyecto real un scope creado a mano y reescríbelo para que el cambio de hilo ocurra dentro del scope que ya se cancela solo.
+5. Clasifica cinco tareas asíncronas de tu app según cuánto merecen vivir, y asigna a cada una el scope correcto justificando la decisión desde el usuario, no desde la comodidad.
+</Challenge>

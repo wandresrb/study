@@ -1,0 +1,153 @@
+---
+title: "JSON-RPC sobre stdio: cabeceras, peticiones y notificaciones"
+description: "La capa de transporte real del protocolo: por qué hace falta una cabecera Content-Length sobre una tubería sin fronteras, en qué se diferencia una petición de una notificación, qué papel juegan los identificadores en la correlación de respuestas, y cómo se representan errores y cancelaciones."
+subject: neovim
+level: 19
+order: 2
+position: "19.2"
+duration: "20 min"
+---
+
+<Lead>
+Debajo de toda la sofisticación semántica de un servidor de lenguaje hay una tubería de bytes. El cliente lanza un proceso hijo, escribe en su entrada estándar y lee de su salida estándar; no hay sockets, ni HTTP, ni descubrimiento de servicios, ni autenticación. Esa elección —la más humilde posible— es la que hace que un servidor de lenguaje sea trivialmente portable y trivialmente depurable: cualquier programa capaz de leer de `stdin` y escribir en `stdout` puede ser un servidor. Pero una tubería es un flujo sin estructura, y un flujo sin estructura no tiene fronteras de mensaje. Todo lo que sigue —la cabecera de longitud, la disciplina de identificadores, la distinción entre lo que espera respuesta y lo que no— es la consecuencia inevitable de haber elegido el transporte más simple del mundo y tener que reconstruir sobre él la noción de mensaje.
+</Lead>
+
+<Goals>
+
+- Explicar por qué un flujo de bytes exige enmarcado explícito y cómo lo resuelve la cabecera `Content-Length`.
+- Distinguir petición de notificación por la presencia o ausencia del campo de identificador.
+- Describir cómo el cliente correlaciona respuestas con peticiones y qué implica que el orden no esté garantizado.
+- Interpretar la forma de un error y el mecanismo de cancelación de una petición en vuelo.
+
+</Goals>
+
+## El enmarcado sobre un flujo sin fronteras
+
+Una tubería entrega bytes, no mensajes. Si un servidor escribe dos documentos serializados uno detrás de otro, el cliente recibirá una única secuencia continua y no tendrá forma de saber dónde acaba el primero. Se podría delimitar por línea en blanco, pero el contenido puede incluir saltos de línea; se podría delimitar por un carácter reservado, pero entonces habría que escaparlo en toda la carga útil. La solución que adoptó LSP es la más barata y la más antigua: anteponer una cabecera que declare cuántos bytes ocupa el cuerpo, con el mismo formato de cabeceras que usa HTTP, terminadas por una línea vacía.
+
+```text
+Content-Length: 126\r\n
+\r\n
+{"jsonrpc":"2.0","id":7,"method":"textDocument/definition","params":{...}}
+```
+
+Tres detalles de esta capa causan la mayoría de los fallos en implementaciones caseras. El primero es que los separadores son retorno de carro seguido de nueva línea, no solo nueva línea: en sistemas donde la biblioteca estándar traduce automáticamente los finales de línea, escribir la cabecera en modo texto corrompe el enmarcado. El segundo es que `Content-Length` cuenta **bytes**, no caracteres, así que un cuerpo con acentos o emoji tiene más bytes que caracteres y medir mal la longitud desincroniza el flujo de forma permanente. El tercero es que la cabecera `Content-Type` existe pero es opcional y prácticamente nadie la usa; asumir su presencia rompe la interoperabilidad.
+
+La consecuencia más importante de este diseño es que un desincronizado no es recuperable. Si el lector consume un byte de más, todo lo que siga se interpretará desplazado y la sesión quedará inutilizable sin que aparezca ningún mensaje de error claro. Por eso los clientes serios tratan el analizador de cabeceras como código crítico y cierran la conexión al primer indicio de inconsistencia, en lugar de intentar resincronizar.
+
+<Mermaid code={`sequenceDiagram
+  participant C as cliente
+  participant P as tuberia
+  participant S as servidor
+  C->>P: cabecera con longitud
+  C->>P: cuerpo serializado
+  P->>S: bytes en stdin
+  S->>P: cabecera con longitud
+  S->>P: cuerpo serializado
+  P->>C: bytes en stdout`} />
+
+## Peticiones frente a notificaciones
+
+Sobre ese enmarcado viaja `JSON-RPC` en su versión 2.0. El protocolo define exactamente tres clases de mensaje, y la diferencia entre ellas se decide por qué campos están presentes. Una **petición** lleva método, parámetros y un identificador; obliga al receptor a responder. Una **notificación** lleva método y parámetros pero **no** lleva identificador; el receptor no debe responder nunca, ni siquiera para confirmar. Una **respuesta** lleva el identificador de la petición que contesta y, de forma mutuamente excluyente, un resultado o un error.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 12,
+  "method": "textDocument/hover",
+  "params": {
+    "textDocument": { "uri": "file:///p/src/lib.rs" },
+    "position": { "line": 30, "character": 14 }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didChange",
+  "params": {
+    "textDocument": { "uri": "file:///p/src/lib.rs", "version": 43 },
+    "contentChanges": [ { "text": "fn main() {}\n" } ]
+  }
+}
+```
+
+La elección entre una y otra no es estilística: codifica una decisión sobre acoplamiento temporal. Todo lo que describe un cambio de estado del mundo —el documento se abrió, el documento cambió, la configuración se modificó— viaja como notificación, porque el emisor no tiene nada que esperar y bloquearse sería absurdo. Todo lo que pregunta algo —dónde está la definición, qué documentación tiene este símbolo— viaja como petición, porque sin respuesta el cliente no puede hacer nada útil. La regla práctica que se deriva es que las notificaciones son el canal por el que se mantiene sincronizado el modelo compartido, y las peticiones son el canal por el que se consulta ese modelo.
+
+<Cards>
+  <Card icon="📨" title="Petición">
+    Lleva identificador. Exige respuesta con ese mismo identificador. Puede fallar, tardar o ser cancelada.
+  </Card>
+  <Card icon="📢" title="Notificación">
+    Sin identificador. Sin respuesta posible. Si el receptor no la entiende, la ignora en silencio.
+  </Card>
+  <Card icon="↩️" title="Respuesta">
+    Contiene resultado o error, nunca ambos. Se aparea por identificador, no por orden de llegada.
+  </Card>
+</Cards>
+
+## Identificadores, orden y errores
+
+El identificador es el mecanismo completo de correlación y su existencia implica algo que se suele pasar por alto: **el orden de las respuestas no está garantizado**. Un servidor puede estar procesando cinco peticiones en paralelo y contestar la quinta antes que la primera, porque la quinta era barata. El cliente, por tanto, no puede llevar una cola: tiene que mantener una tabla que asocie cada identificador emitido con el manejador que debe ejecutarse cuando llegue su respuesta. Neovim expone esa tabla implícitamente a través de la interfaz de petición asíncrona.
+
+```lua
+local params = vim.lsp.util.make_position_params(0, "utf-8")
+local cliente = vim.lsp.get_clients({ bufnr = 0 })[1]
+
+-- Asincrona: devuelve el id emitido y una funcion para cancelarla.
+local ok, id_peticion = cliente:request("textDocument/definition", params,
+  function(err, resultado, ctx)
+    if err then
+      vim.notify("fallo " .. err.code .. ": " .. err.message, vim.log.levels.WARN)
+      return
+    end
+    vim.print(resultado)
+  end, 0)
+
+-- Sincrona: util solo para depurar, porque bloquea el hilo de la interfaz.
+local respuesta = cliente:request_sync("textDocument/hover", params, 1000, 0)
+```
+
+Los identificadores tienen dos reglas que conviene respetar aunque el cliente las gestione por ti. Deben ser únicos dentro de la conexión mientras la petición esté viva, y cada extremo lleva su **propia** numeración, porque el servidor también puede enviar peticiones al cliente —para pedirle que aplique una edición al espacio de trabajo, por ejemplo—. Esa bidireccionalidad es la razón de que hablemos de dos participantes simétricos y no de cliente y servidor en el sentido clásico.
+
+Cuando algo va mal, la respuesta contiene un objeto de error en lugar de un resultado, con un código entero, un mensaje legible y un campo de datos opcional. Los códigos negativos por debajo de treinta mil provienen de `JSON-RPC` —método inexistente, parámetros inválidos, error interno— y los que LSP añade describen situaciones propias: el servidor todavía no está inicializado, el contenido del documento que el cliente cree tener no coincide con el del servidor, la petición fue cancelada.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 12,
+  "error": { "code": -32601, "message": "Method not found" }
+}
+```
+
+La cancelación merece atención porque es la única forma de que el sistema siga siendo usable bajo carga. Si el usuario escribe deprisa, el cliente emite peticiones de completado que quedan obsoletas antes de contestarse; dejarlas correr desperdicia el servidor y produce resultados que llegan tarde y descolocan la interfaz. El protocolo resuelve esto con una notificación de cancelación que lleva el identificador de la petición a abortar. Es una notificación, no una petición, y eso es coherente: cancelar es informar de una intención, y el servidor puede legítimamente ignorarla si ya terminó.
+
+## Comprobar el transporte con las manos
+
+Toda esta capa es lo bastante simple como para ejercitarla sin editor, y hacerlo una vez vale más que leer la especificación entera. Basta con lanzar el servidor y escribirle por su entrada estándar un mensaje bien enmarcado; si contesta, el transporte funciona y cualquier fallo posterior está por encima. La única precaución es calcular la longitud en bytes del cuerpo exacto que se va a enviar, sin saltos de línea de más.
+
+```sh
+# Enmarcar y enviar un initialize minimo a mano.
+cuerpo='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}'
+n=$(printf '%s' "$cuerpo" | wc -c)
+printf 'Content-Length: %d\r\n\r\n%s' "$n" "$cuerpo" | lua-language-server
+```
+
+<Callout type="warn" title="La salida estándar pertenece al protocolo, y a nada más">
+Cualquier byte que un servidor escriba en `stdout` fuera del enmarcado rompe la sesión de forma irrecuperable. Las trazas, los avisos y los mensajes de progreso deben ir a la salida de error o a un fichero propio.
+</Callout>
+
+Un servidor sano responderá con su propia cabecera y su cuerpo. Si no responde nada, el problema es el ejecutable o sus argumentos; si responde con basura sin cabecera, está escribiendo mensajes de aviso en la salida estándar y corromperá cualquier sesión real, porque esa salida está reservada para el protocolo y solo para él. Ese error concreto —un servidor que imprime trazas donde no debe— es de los pocos que dejan la conexión irrecuperable desde el primer byte, y desde dentro del editor resulta casi indistinguible de un servidor que simplemente no arranca.
+
+<Callout type="dios" title="Un protocolo es una máquina de estados distribuida, y todo lo que no está en el mensaje está en tu cabeza">
+Vale la pena detenerse en la elegancia de que la distinción entre petición y notificación se codifique en la **presencia de un campo** y no en un tipo de mensaje declarado. Podría haberse hecho con un campo `kind` explícito, y sería más legible para un humano; sin embargo la ausencia del identificador es autoevidente para la máquina y hace imposible el estado incoherente de una notificación que espera respuesta. Ese es un patrón que reaparece en todo diseño de protocolos maduro: hacer que los estados inválidos sean irrepresentables en lugar de detectarlos con validación. Ahora observa la segunda capa de esta lección, que es más profunda. Un protocolo con peticiones asíncronas correlacionadas por identificador es, literalmente, una máquina de estados distribuida entre dos procesos, y ninguno de los dos ve el estado completo. El cliente sabe qué pidió y no sabe en qué punto de su procesamiento está el servidor; el servidor sabe qué está calculando y no sabe si al cliente todavía le interesa. Toda la complejidad operativa de LSP —respuestas que llegan cuando el buffer ya cambió, diagnósticos de una versión anterior del fichero, completados que se refieren a un texto que el usuario ya sobrescribió— nace de ese desconocimiento mutuo, y no de ningún fallo de implementación. Por eso el protocolo lleva números de versión en cada notificación de cambio: el número de versión es la única manera de que el receptor sepa si lo que le están contando es más nuevo o más viejo que lo que ya sabía. Cuando entiendas que cada mensaje es una fotografía de un estado que ya no existe en el momento en que se lee, dejarás de sorprenderte con los fallos raros y empezarás a predecirlos. Y hay una consecuencia práctica inmediata: cualquier funcionalidad que construyas sobre LSP tiene que ser correcta cuando la respuesta llega tarde, cuando llega dos veces, cuando no llega nunca y cuando llega para un buffer que el usuario ya cerró. Un cliente que no gestiona esos cuatro casos no está roto por descuido: está roto porque su autor pensó en el protocolo como en una llamada a función, y no lo es.
+</Callout>
+
+<Challenge title="Diseccionar el transporte">
+1. Escribe a mano un mensaje con su cabecera y cuenta los bytes del cuerpo con y sin caracteres acentuados; explica la diferencia.
+2. Emite una petición asíncrona y otra síncrona sobre el mismo buffer y contrasta el efecto sobre la interfaz mientras el servidor tarda.
+3. Provoca un error de método inexistente enviando un nombre inventado y captura el código devuelto en el manejador.
+4. Lanza tres peticiones seguidas y registra el orden de llegada de las respuestas; razona por qué no coincide con el de emisión.
+5. Cancela una petición en vuelo con el identificador que devuelve el cliente y comprueba qué recibe el manejador registrado.
+</Challenge>

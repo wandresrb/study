@@ -1,0 +1,204 @@
+---
+title: "Cómputo o memoria: los tres experimentos que lo deciden"
+description: "Cómo averiguar en veinte minutos si un shader está limitado por la ALU o por los accesos a memoria, la tabla de decisión con las cuatro combinaciones, y por qué en un shader limitado por memoria la aritmética es gratis."
+subject: webgpu
+level: 42
+order: 5
+position: "42.5"
+duration: "24 min"
+---
+
+<Lead>
+Ya sabes cuánto tarda cada pass. La siguiente pregunta es la que decide todo lo que hagas después: ese pass tarda porque la unidad aritmética no da abasto, o porque los datos no llegan a tiempo. Son dos enfermedades distintas con dos tratamientos opuestos, y aplicar el equivocado no es que rinda poco, es que rinde exactamente cero. Lo bueno es que averiguarlo no requiere herramientas de fabricante ni contadores de hardware: tres experimentos, veinte minutos y una tabla de cuatro filas.
+</Lead>
+
+<Goals>
+
+- Diseñar los tres experimentos que separan un shader limitado por cómputo de uno limitado por memoria.
+- Evitar que el compilador elimine las lecturas al desactivar la aritmética.
+- Calcular la intensidad aritmética de un shader y compararla con el balance de la máquina.
+- Parametrizar los experimentos con `override` de WGSL en lugar de editar el shader a mano.
+
+</Goals>
+
+## La pregunta antes de cualquier optimización
+
+Una GPU tiene dos recursos que se agotan por separado. Uno es la capacidad de hacer operaciones: sumar, multiplicar, hacer raíces. El otro es la capacidad de mover bytes entre la memoria y los núcleos. Un shader concreto satura uno de los dos, y mientras satura uno el otro está parcialmente ocioso.
+
+Los números de una máquina real dejan clara la tensión. Una GPU de escritorio de gama media de 2026 anda por los 20 TFLOP/s en coma flotante de 32 bits y unos 500 GB/s de ancho de banda. Divide: **unas 40 operaciones por cada byte que puede leer**. Ese cociente se llama balance de la máquina, y es la frontera. Si tu shader hace menos de 40 operaciones por byte leído, la memoria se agota antes que la ALU y estás limitado por memoria. Si hace más, al revés.
+
+La frontera está entre 20 y 60 operaciones por byte en prácticamente todo el hardware actual, de escritorio y de móvil. Y la mayoría de los shaders reales no llegan ni a 10. Esa es la razón profunda de que la intuición mayoritaria —"si va lento es que hace demasiadas cuentas"— sea equivocada la mayor parte de las veces.
+
+Lo que sí cambia radicalmente entre plataformas es el presupuesto absoluto. A 500 GB/s y 16,7 ms por fotograma tienes **8,3 GB de tráfico por fotograma**. En un móvil con 50 GB/s de memoria unificada, compartidos además con la CPU y con el controlador de pantalla, tienes 835 MB. Ahora pon números a una pasada a pantalla completa a 2560 por 1440: son 3,69 millones de píxeles, y en `rgba16float` cada uno ocupa 8 bytes, o sea 29,5 MB por textura. Un pass que lee tres texturas y escribe una mueve 118 MB. En el escritorio eso es el 1,4 por ciento del presupuesto del fotograma. En el móvil es el **14 por ciento, en una sola pasada**. Por eso un móvil está casi siempre limitado por memoria y un escritorio con GPU dedicada suele estarlo por cómputo, y por eso la misma optimización puede ser brillante en una máquina e irrelevante en la otra.
+
+Hasta que no sepas de qué lado estás, cualquier cambio es una apuesta. Los tres experimentos son la forma de dejar de apostar.
+
+## Los tres experimentos
+
+**Experimento 1: baja la resolución a la mitad.** Es el más barato y el que hay que hacer primero, porque no toca ni una línea de shader.
+
+```ts
+const escala = 0.5;                 // la mitad de lado = un cuarto de pixeles
+lienzo.width  = Math.floor(anchoBase * devicePixelRatio * escala);
+lienzo.height = Math.floor(altoBase  * devicePixelRatio * escala);
+// Recrea los render targets intermedios con el mismo factor.
+```
+
+Media resolución de lado es **un cuarto de píxeles**, así que la lectura es directa:
+
+- El tiempo baja a cerca del 25-35 por ciento: estás limitado por el fragment shader o por el ancho de banda del render target. Los dos escalan con el número de píxeles.
+- El tiempo baja a un 60-80 por ciento: lo anterior domina en parte, pero hay un componente fijo importante.
+- El tiempo apenas se mueve, por encima del 90 por ciento: el cuello **no está en los píxeles**. Está en el procesado de vértices, en la CPU, o en un pass de resolución fija que no se ha enterado del cambio: mapas de sombra, un compute sobre una rejilla constante, la construcción de una estructura de aceleración.
+
+Ese último caso es el más rentable de descubrir, porque redirige la investigación entera. Dos avisos: no bajes de un cuarto de escala, porque por debajo empiezan a dominar los costes fijos de arrancar passes y de grabar draws y el experimento deja de medir lo que crees. Y mide por pass, no solo el fotograma completo, o mezclarás passes que escalan con píxeles y passes que no.
+
+**Experimento 2: quita el trabajo aritmético dejando los mismos accesos.** Aquí está la trampa que invalida el 90 por ciento de los intentos, así que va primero. Si sustituyes el cálculo por una constante sin más, el compilador ve que el resultado ya no depende de las texturas, **elimina también las lecturas**, y acabas midiendo un shader sin aritmética y sin memoria. El tiempo se desploma, concluyes "limitado por cómputo" y te has engañado a ti mismo.
+
+La regla es: el resultado tiene que seguir dependiendo de todo lo que has leído, de la forma más barata posible.
+
+```wgsl
+override CALCULO: bool = true;
+
+@fragment
+fn fs(entrada: Interpolado) -> @location(0) vec4f {
+  // Las lecturas se hacen SIEMPRE, fuera de la rama.
+  let albedo    = textureSample(texAlbedo,    muestreador, entrada.uv);
+  let normalTex = textureSample(texNormal,    muestreador, entrada.uv);
+  let orm       = textureSample(texRugosidad, muestreador, entrada.uv);
+
+  if (CALCULO) {
+    let n = normalizar_tangente(normalTex.xyz, entrada.tbn);
+    let color = pbr(albedo.rgb, n, entrada.vista, orm.g, orm.b);
+    return vec4f(color, albedo.a);
+  }
+
+  // Barato, pero depende de las tres lecturas: no se puede eliminar nada.
+  return vec4f(albedo.rgb + normalTex.rgb + orm.rgb, albedo.a);
+}
+```
+
+Tres sumas de vectores frente a un modelo de iluminación completo: has quitado el 99 por ciento de la aritmética y no has quitado un solo byte de tráfico.
+
+- **El tiempo no baja, o baja menos de un 10 por ciento: estás limitado por memoria.** La ALU estaba esperando de brazos cruzados y le has quitado trabajo que no estaba haciendo.
+- El tiempo baja un 40 por ciento o más: estás limitado por cómputo, y el modelo de iluminación es el objetivo.
+
+**Experimento 3: reduce el tamaño de los datos manteniendo la aritmética.** El espejo del anterior. Ahora el shader hace exactamente las mismas cuentas, pero sobre menos bytes.
+
+Hay dos formas de conseguirlo y conviene probar las dos, porque miden cosas distintas:
+
+```ts
+// (a) menos texeles: la misma textura a la mitad de lado
+const texMitad = device.createTexture({
+  size: [ancho / 2, alto / 2],
+  format: "rgba8unorm",
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+});
+
+// (b) menos bytes por texel: el mismo tamaño con la mitad de precision
+const objetivoLigero = device.createTexture({
+  size: [ancho, alto],
+  format: "rgba16float",          // en lugar de rgba32float: 8 bytes en vez de 16
+  usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+});
+```
+
+Si el tiempo baja, estás limitado por memoria. La variante (a) mide sobre todo el ancho de banda y la localidad de caché juntos; la variante (b) aísla los bytes por texel dejando el patrón de acceso intacto, así que es la más limpia de las dos como diagnóstico.
+
+Una advertencia específica de WebGPU sobre la variante (b): `rgba32float` **no es filtrable por defecto**. Necesita la feature opcional `float32-filterable`, y sin ella tu sampler está haciendo `nearest` aunque le hayas pedido `linear`. Al pasar a `rgba16float`, que sí es filtrable, no solo cambias los bytes: puedes estar activando el filtrado bilineal, que tiene su propio coste. Si vas a comparar, compara con el mismo modo de filtrado en los dos casos o el experimento medirá dos cosas a la vez.
+
+## La tabla de decisión y la intensidad aritmética
+
+Los experimentos 2 y 3 son ortogonales, así que cruzarlos da cuatro casos y los cuatro son informativos:
+
+| Menos ALU (exp. 2) | Menos bytes (exp. 3) | Diagnóstico | Qué hacer |
+|---|---|---|---|
+| baja mucho | apenas baja | Limitado por **cómputo** | Simplificar el modelo, pasar a `f16`, precalcular en una LUT, mover trabajo a menor frecuencia (por vértice, por objeto, por fotograma) |
+| apenas baja | baja mucho | Limitado por **memoria** | Formatos más pequeños, texturas comprimidas, mipmaps correctos, fusionar passes, empaquetar el G-buffer |
+| baja | baja | En la esquina del roofline | Los dos limitan. Empieza por el más barato de tocar; cualquier mejora se nota, pero a medias |
+| apenas baja | apenas baja | **Ninguno de los dos** | No estabas limitado ahí: overhead fijo del pass, ocupación baja, cadenas de dependencias, la CPU, o el vsync |
+
+La cuarta fila es la que más gente descoloca y la más frecuente en escenas ligeras. Si quitas la aritmética y quitas los bytes y el tiempo no se mueve, el pass no está haciendo nada de lo que creías: probablemente lo domina el coste de arrancarlo, o no hay suficiente paralelismo para tapar la latencia, o directamente no estás limitado por la GPU. En ese último caso, la respuesta está en [el reloj de CPU y el de GPU](/guia/webgpu/n42-el-reloj-de-cpu-y-el-de-gpu/), no aquí.
+
+Antes de correr un solo experimento se puede tener una hipótesis gratis: **cuenta operaciones y cuenta bytes**. La intensidad aritmética es el cociente, y comparada con el balance de la máquina —esas 20 a 60 operaciones por byte— predice el resultado sorprendentemente bien.
+
+| Shader | Bytes por píxel | Operaciones | Intensidad |
+|---|---|---|---|
+| Copia o blit | 4 leídos + 4 escritos | ~2 | 0,25 |
+| Desenfoque de 13 muestras en `rgba16float` | 104 + 8 | ~40 | 0,36 |
+| Sombreado PBR, 4 texturas `rgba8`, 4 luces | 16 + 8 | ~250 | 10 |
+| Raymarching de un SDF, 96 pasos | ~64 | ~15 000 | 234 |
+
+Los tres primeros están muy por debajo del balance de cualquier máquina: **limitados por memoria, sin excepción y en todo el hardware**. El cuarto está muy por encima: limitado por cómputo en todas partes. Ese desenfoque de 0,36 operaciones por byte es el caso didáctico perfecto, porque es donde la gente pierde días optimizando las cuentas del kernel gaussiano en un pass cuya ALU está ociosa el 99 por ciento del tiempo.
+
+El cálculo tiene un sesgo que conviene conocer: cuenta los bytes que *pides*, no los que la memoria *mueve*. La DRAM se lee por líneas de caché de 32, 64 o 128 bytes, así que un acceso disperso que solo aprovecha 4 de esos bytes multiplica el tráfico real por dieciséis o por treinta y dos sin que aparezca en tu cuenta. La intensidad calculada a mano es por tanto un límite superior: la real suele ser peor, lo que solo refuerza la conclusión de que casi todo está limitado por memoria.
+
+<Callout type="dios" title="En un shader limitado por memoria, la aritmética es gratis. Y eso invierte la optimización">
+La consecuencia que casi nadie extrae, y que separa a quien ha entendido esto de quien solo lo ha leído, es que la conclusión "limitado por memoria" no significa "optimiza la memoria". Significa algo mucho más fuerte: **la ALU está ociosa y puedes gastarla sin pagar nada**. La optimización correcta deja de ser reducir trabajo y pasa a ser **cambiar memoria por cuentas**, que es exactamente lo contrario de lo que dicta el instinto. Los ejemplos son concretos y todos están en producción. En un G-buffer, guardar la normal en dos canales octaédricos y reconstruir la tercera componente con una raíz cuadrada y unos cuantos signos: ahorras 4 bytes por píxel y pagas quince operaciones que no cuestan nada. Guardar la posición del mundo es un error clásico de doce bytes por píxel cuando se reconstruye desde la profundidad con una multiplicación de matriz y una división. Empaquetar dos valores de 16 bits en un `u32` y desempaquetarlos en el shader. Calcular el ruido proceduralmente en lugar de leerlo de una textura. Sustituir una tabla de consulta por el polinomio que aproxima. Todas esas transformaciones **aumentan** el número de operaciones y **reducen** el tiempo, y a alguien que no ha hecho el diagnóstico le parecen absurdas. Hay un corolario todavía más incómodo y es el que hay que tener presente al leer código ajeno: la tabla de consulta, que fue una optimización canónica durante cuarenta años, es hoy una pesimización en la mayoría de los shaders. Cambiar una raíz cuadrada por una lectura de textura era ganar cuando la raíz costaba veinte ciclos y la memoria era rápida en comparación; ahora la raíz cuesta uno y la lectura, si falla la caché, cuesta cientos. **El balance de la máquina se ha movido dos órdenes de magnitud y las recetas heredadas no se han enterado.**
+</Callout>
+
+## Hacerlo con overrides, y por qué la respuesta no es universal
+
+Editar el WGSL a mano entre experimento y experimento es lento y produce errores. Las **override constants** de WGSL existen exactamente para esto: son constantes que el shader declara con un valor por defecto y que se fijan al crear el pipeline, no al compilar el módulo.
+
+```wgsl
+override CALCULO: bool = true;
+override PASOS: u32 = 96u;
+override MIP_FORZADO: f32 = 0.0;
+override TAM_GRUPO: u32 = 64u;
+
+@compute @workgroup_size(TAM_GRUPO)
+fn principal(@builtin(global_invocation_id) gid: vec3u) {
+  // ...
+}
+```
+
+Y en JavaScript, el valor va en el descriptor de la etapa, junto al módulo y al punto de entrada:
+
+```ts
+function crearVariante(calculo: boolean, mip: number): GPURenderPipeline {
+  return device.createRenderPipeline({
+    layout: layoutSombreado,
+    vertex: { module: modulo, entryPoint: "vs" },
+    fragment: {
+      module: modulo,                       // el mismo modulo, sin recompilar el WGSL
+      entryPoint: "fs",
+      constants: { CALCULO: calculo ? 1 : 0, MIP_FORZADO: mip },
+      targets: [{ format: formatoLienzo }],
+    },
+    depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+  });
+}
+
+const variantes = {
+  normal:     crearVariante(true,  0),
+  sinCalculo: crearVariante(false, 0),   // experimento 2
+  menosDatos: crearVariante(true,  2),   // experimento 3: fuerza mip 2, un 16avo de texeles
+};
+```
+
+Tres detalles que hacen que esto funcione bien. Primero, los valores booleanos se pasan como números: cero es falso y cualquier otra cosa es verdadero. Segundo, la especialización ocurre al **crear el pipeline**, así que la rama muerta del `if (CALCULO)` desaparece de verdad del código máquina; no es un salto en tiempo de ejecución, es código que no existe. Y tercero, precisamente por eso crear una variante cuesta una compilación: hazlo todo al arrancar y luego alterna con `setPipeline`, que es gratis. Un panel con un desplegable de tres variantes y el desglose por pass al lado convierte los tres experimentos en tres clics.
+
+Para el mip forzado, el shader usa `textureSampleLevel` en lugar de `textureSample` cuando la constante lo pide:
+
+```wgsl
+fn leer(t: texture_2d<f32>, s: sampler, uv: vec2f) -> vec4f {
+  if (MIP_FORZADO > 0.0) {
+    return textureSampleLevel(t, s, uv, MIP_FORZADO);
+  }
+  return textureSample(t, s, uv);
+}
+```
+
+Queda la advertencia final, y no es un adorno: **la respuesta puede ser distinta en dos GPU**. El mismo shader, la misma escena, la misma resolución, y en una máquina el experimento 2 lo tumba y en otra no lo mueve. No es un fallo de la metodología: es que las dos máquinas tienen balances distintos, jerarquías de caché distintas y anchos de banda que difieren en un factor de diez.
+
+La regla operativa que sale de ahí es sencilla. **Haz el diagnóstico en el dispositivo más lento que te importe**, porque es el que define tus decisiones. Un escritorio con GPU dedicada tiene tanto ancho de banda que casi cualquier cosa acaba limitada por la ALU, y te llevará a optimizar cuentas. Un móvil, con memoria unificada compartida con la CPU y con la pantalla, está limitado por memoria y por ancho de banda casi siempre, y allí la misma optimización de cuentas no cambia un solo milisegundo mientras que empaquetar el G-buffer los cambia todos. Si solo puedes optimizar para una plataforma, y tu público es mixto, optimiza el tráfico: reducir bytes nunca perjudica al escritorio, y reducir cuentas puede no hacer nada por el móvil.
+
+Y mide siempre después de cambiar, con el desglose por pass de [el perfil por pass](/guia/webgpu/n42-el-perfil-por-pass/). Un diagnóstico es una hipótesis; la optimización solo cuenta si el número baja.
+
+<Challenge title="Diagnostica tu pass más caro">
+1. Identifica el pass que más milisegundos consume y estima su intensidad aritmética a mano antes de medir.
+2. Corre el experimento de media resolución y anota el porcentaje exacto de tiempo restante.
+3. Añade un `override` booleano y monta la variante sin aritmética, comprobando que las lecturas siguen vivas.
+4. Cambia un render target de `rgba32float` a `rgba16float` con el mismo filtrado y mide.
+5. Sitúa tu pass en la tabla de cuatro filas y repite los tres experimentos en un móvil para ver si cambia de casilla.
+</Challenge>

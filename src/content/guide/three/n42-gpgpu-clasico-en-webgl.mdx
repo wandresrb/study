@@ -1,0 +1,254 @@
+---
+title: "GPGPU clásico: render targets y GPUComputationRenderer"
+description: "Cómo se hacía cómputo en GPU antes de los compute shaders, cómo usar el addon GPUComputationRenderer paso a paso, y qué limitaciones tiene esta técnica frente a TSL sobre WebGPU."
+subject: three
+level: 42
+order: 5
+position: "42.5"
+duration: "20 min"
+---
+
+<Lead>
+WebGL2 no tiene compute shaders y nunca los tendrá. Durante quince años la única forma de hacer cálculo general en la GPU desde el navegador fue un truco: si el fragment shader puede escribir en una textura y leer de otra, entonces una textura es un array, un texel son cuatro floats, y dibujar un cuadrilátero a pantalla completa es un bucle paralelo. Esa técnica sigue siendo la única disponible en la mitad del parque de dispositivos, y Three.js la empaqueta en un addon que merece la pena conocer aunque tu objetivo sea WebGPU.
+</Lead>
+
+<Goals>
+
+- Explicar cómo una textura de coma flotante hace de array de datos.
+- Montar una simulación con `GPUComputationRenderer`, sus variables y sus dependencias.
+- Consumir la textura resultante desde un material de render.
+- Enumerar las limitaciones reales frente al cómputo con storage buffers.
+
+</Goals>
+
+## Una textura es un array, un fragmento es un hilo
+
+El truco tiene tres piezas. La primera: crear una textura con formato `RGBAFormat` y tipo `FloatType`, que almacena cuatro números de 32 bits por texel en lugar de cuatro bytes. La segunda: dibujar un cuadrilátero que cubra exactamente esa textura como render target, de modo que se ejecute un fragmento por texel. La tercera: dentro del fragment shader, usar `gl_FragCoord.xy` para saber qué elemento del array te ha tocado, leer los valores de la textura de entrada y escribir el resultado en `gl_FragColor`.
+
+El equivalente de `instanceIndex` es la coordenada del fragmento. El equivalente del storage buffer es la textura. Y el equivalente del despacho es un draw call de dos triángulos.
+
+Las limitaciones caen solas de esa estructura. Un fragmento **solo puede escribir en su propio texel**: no hay escritura arbitraria, no hay `posiciones[otroIndice] = x`. El ping-pong es obligatorio siempre, porque leer y escribir la misma textura en el mismo pase es comportamiento indefinido. Y el estado por elemento está limitado a cuatro floats por textura, así que un sistema con posición, velocidad y color necesita tres texturas.
+
+## GPUComputationRenderer paso a paso
+
+El addon abstrae toda esa mecánica en un modelo de **variables**. Cada variable es una textura con su propio fragment shader y su propio par de render targets para el ping-pong, y puede declarar dependencias de otras variables, que llegan al shader como uniforms de tipo sampler.
+
+```js
+import * as THREE from 'three';
+import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
+
+const LADO = 512;                       // 512*512 = 262144 particulas
+const renderer = new THREE.WebGLRenderer( { antialias: true } );
+
+const gpu = new GPUComputationRenderer( LADO, LADO, renderer );
+
+// 1. Texturas iniciales.
+const texPos = gpu.createTexture();
+const texVel = gpu.createTexture();
+
+rellenarPosiciones( texPos );
+rellenarVelocidades( texVel );
+
+function rellenarPosiciones( textura ) {
+
+	const datos = textura.image.data;
+
+	for ( let i = 0; i < datos.length; i += 4 ) {
+
+		datos[ i + 0 ] = ( Math.random() - 0.5 ) * 40;
+		datos[ i + 1 ] = Math.random() * 20;
+		datos[ i + 2 ] = ( Math.random() - 0.5 ) * 40;
+		datos[ i + 3 ] = 1;                       // vida
+
+	}
+
+}
+
+function rellenarVelocidades( textura ) {
+
+	textura.image.data.fill( 0 );
+
+}
+```
+
+`gpu.createTexture()` devuelve un `DataTexture` de `LADO` por `LADO` texels con un `Float32Array` detrás. El cuarto canal está libre y es donde se guarda ese dato extra que siempre acaba haciendo falta: vida, tamaño, semilla, índice de grupo.
+
+Los shaders de cómputo son fragment shaders sin cabecera: el addon inyecta un `#define resolution` con el tamaño y declara los samplers de las dependencias.
+
+```js
+const shaderVelocidad = /* glsl */`
+	uniform float delta;
+	uniform vec3 atractor;
+
+	void main() {
+
+		vec2 uv = gl_FragCoord.xy / resolution.xy;
+
+		vec3 pos = texture2D( texturePosicion, uv ).xyz;
+		vec3 vel = texture2D( textureVelocidad, uv ).xyz;
+
+		vec3 haciaCentro = atractor - pos;
+		float d = max( length( haciaCentro ), 0.5 );
+
+		vel += normalize( haciaCentro ) * ( 2.0 / ( d * d ) ) * delta;
+		vel *= 0.985;
+
+		gl_FragColor = vec4( vel, 1.0 );
+
+	}
+`;
+
+const shaderPosicion = /* glsl */`
+	uniform float delta;
+
+	void main() {
+
+		vec2 uv = gl_FragCoord.xy / resolution.xy;
+
+		vec4 pos = texture2D( texturePosicion, uv );
+		vec3 vel = texture2D( textureVelocidad, uv ).xyz;
+
+		gl_FragColor = vec4( pos.xyz + vel * delta, pos.w );
+
+	}
+`;
+```
+
+Fíjate en que `texturePosicion` y `textureVelocidad` no se declaran: el addon las añade al principio del shader al procesar las dependencias. Por eso el nombre de la variable **es** el nombre del uniform, y por eso la convención de prefijar con `texture` no es cosmética sino la única forma de que el código sea legible.
+
+El montaje conecta las piezas:
+
+```js
+const varVel = gpu.addVariable( 'textureVelocidad', shaderVelocidad, texVel );
+const varPos = gpu.addVariable( 'texturePosicion', shaderPosicion, texPos );
+
+// Cada variable declara de que texturas lee. Casi siempre se incluye a si misma.
+gpu.setVariableDependencies( varVel, [ varVel, varPos ] );
+gpu.setVariableDependencies( varPos, [ varVel, varPos ] );
+
+// Uniforms propios de cada shader.
+varVel.material.uniforms.delta = { value: 0 };
+varVel.material.uniforms.atractor = { value: new THREE.Vector3() };
+varPos.material.uniforms.delta = { value: 0 };
+
+// Bordes y filtrado: NearestFilter y ClampToEdge son lo correcto para datos.
+varPos.wrapS = THREE.ClampToEdgeWrapping;
+varPos.wrapT = THREE.ClampToEdgeWrapping;
+
+const error = gpu.init();
+if ( error !== null ) console.error( error );
+```
+
+`gpu.init()` devuelve `null` si todo va bien y una cadena con el mensaje si algo falla. El fallo más común es que el dispositivo no soporte texturas de vértice, y el addon lo comprueba explícitamente porque el consumo típico de esta técnica es leer la textura de posiciones **desde el vertex shader**.
+
+El bucle es una llamada:
+
+```js
+const reloj = new THREE.Timer();
+reloj.connect( document );
+
+function animate( tiempo ) {
+
+	reloj.update( tiempo );
+	const delta = Math.min( reloj.getDelta(), 1 / 30 );
+
+	varVel.material.uniforms.delta.value = delta;
+	varPos.material.uniforms.delta.value = delta;
+
+	gpu.compute();
+
+	material.uniforms.texturePosicion.value = gpu.getCurrentRenderTarget( varPos ).texture;
+
+	renderer.render( scene, camera );
+
+}
+```
+
+`gpu.compute()` hace todo el ping-pong internamente: enlaza las texturas actuales como uniforms de dependencia, renderiza cada variable a su render target alterno, e intercambia el índice al terminar. `getCurrentRenderTarget( variable )` devuelve el target que acaba de escribirse, que es el que hay que pasar al material de render.
+
+## Consumir el resultado al dibujar
+
+El sistema de partículas se construye con una geometría cuyos vértices no llevan posición útil, sino la **coordenada UV que identifica su texel**. El vertex shader lee la posición real de la textura.
+
+```js
+const geometria = new THREE.BufferGeometry();
+const totales = LADO * LADO;
+const posicionesDummy = new Float32Array( totales * 3 );
+const referencias = new Float32Array( totales * 2 );
+
+for ( let i = 0; i < totales; i ++ ) {
+
+	referencias[ i * 2 + 0 ] = ( i % LADO ) / LADO;
+	referencias[ i * 2 + 1 ] = Math.floor( i / LADO ) / LADO;
+
+}
+
+geometria.setAttribute( 'position', new THREE.BufferAttribute( posicionesDummy, 3 ) );
+geometria.setAttribute( 'referencia', new THREE.BufferAttribute( referencias, 2 ) );
+
+const material = new THREE.ShaderMaterial( {
+	uniforms: {
+		texturePosicion: { value: null },
+		tamano: { value: 2 }
+	},
+	vertexShader: /* glsl */`
+		uniform sampler2D texturePosicion;
+		uniform float tamano;
+		attribute vec2 referencia;
+
+		void main() {
+
+			vec3 pos = texture2D( texturePosicion, referencia ).xyz;
+			vec4 mv = modelViewMatrix * vec4( pos, 1.0 );
+
+			gl_PointSize = tamano * ( 300.0 / - mv.z );
+			gl_Position = projectionMatrix * mv;
+
+		}
+	`,
+	fragmentShader: /* glsl */`
+		void main() {
+
+			vec2 c = gl_PointCoord - 0.5;
+			if ( dot( c, c ) > 0.25 ) discard;
+			gl_FragColor = vec4( 0.6, 0.8, 1.0, 1.0 );
+
+		}
+	`
+} );
+
+const puntos = new THREE.Points( geometria, material );
+puntos.frustumCulled = false;
+scene.add( puntos );
+```
+
+El atributo `posicionesDummy` está lleno de ceros y no se usa, pero tiene que existir: Three.js necesita un atributo `position` para calcular la bounding sphere y para no romper el pipeline. Y `frustumCulled = false` es igual de necesario que en la versión con storage buffers, y por la misma razón: la CPU no sabe dónde están realmente las partículas.
+
+## Lo que se pierde y lo que se gana
+
+Comparado con el cómputo en WebGPU, la técnica clásica tiene cuatro limitaciones que no se pueden esquivar.
+
+| Aspecto | Render targets | Compute con TSL |
+|---|---|---|
+| Escritura | Solo al propio texel | Arbitraria en todo el buffer |
+| Ping-pong | Obligatorio siempre | Solo si hay lectura de vecinos |
+| Datos por elemento | 4 floats por textura | Cualquier struct |
+| Memoria compartida | No existe | Workgroup y barreras |
+| Atómicas | No existen | Disponibles |
+| Coste por paso | Un draw call con rasterización | Un dispatch sin rasterización |
+
+Lo que se gana es cobertura. `GPUComputationRenderer` funciona sobre WebGL2, que a agosto de 2026 sigue siendo la base más segura por dispositivos antiguos, y funciona hoy en móviles de gama baja donde WebGPU todavía no llega. Para una simulación de partículas independientes, que es el 80 % de los casos reales, el rendimiento es perfectamente competitivo: el trabajo pesado lo hace igual la GPU y la rasterización de un cuadrilátero de 512 por 512 es despreciable.
+
+El enfoque correcto es el de siempre: mejora progresiva. Detecta el backend, ejecuta la versión con storage buffers cuando haya WebGPU y la clásica cuando no, y ajusta el número de partículas al presupuesto de cada camino.
+
+<Callout type="dios" title="El límite que decide la técnica no es el rendimiento, es la dispersión">
+Todo el mundo compara estas dos técnicas por velocidad y esa es la comparación equivocada. Para una simulación de partículas independientes van prácticamente igual de rápido, y quien te diga que el compute shader es "diez veces más rápido" está midiendo otra cosa. La diferencia que decide de verdad es la **escritura dispersa**, y se ve en un ejemplo concreto: contar cuántas partículas caen en cada celda de una rejilla espacial. Con storage buffers es trivial —cada hilo calcula su celda y hace un `atomicAdd` sobre el contador correspondiente— y es la base de toda búsqueda de vecinos, de toda colisión entre partículas, de todo fluido SPH. Con render targets es **imposible** en el sentido literal: un fragmento no puede escribir en un texel que no sea el suyo, así que no hay forma de que la partícula 7 incremente el contador de la celda 431. La técnica clásica te obliga a darle la vuelta al problema: en lugar de que cada partícula escriba en su celda, cada celda tiene que **buscar** qué partículas le corresponden, lo que significa recorrer todas las partículas desde cada celda, o construir el índice ordenando en la CPU y volviendo a subirlo cada frame. El primero es cuadrático; el segundo destruye el paralelismo. Por eso los ejemplos de GPGPU en WebGL que ves por ahí son siempre partículas sin interacción, telas con vecinos fijos, o campos de altura: problemas donde el destino de cada escritura se conoce de antemano. En cuanto necesitas que un elemento afecte a otro que no está en una posición predeterminada, la técnica clásica se acabó, y esa frontera —no la velocidad— es la que debe decidir si tu proyecto puede permitirse exigir WebGPU.
+</Callout>
+
+<Challenge title="Porta una simulación en los dos sentidos">
+1. Monta el atractor del ejemplo con `GPUComputationRenderer` y 262 144 partículas.
+2. Añade una tercera variable de color que dependa de la velocidad y consúmela en el fragment shader.
+3. Reescribe la misma simulación con `instancedArray` y TSL y compara líneas de código.
+4. Mide ambas versiones en el mismo equipo con el mismo número de partículas.
+5. Intenta añadir un contador de partículas por celda en la versión de render targets y documenta exactamente dónde te bloqueas.
+</Challenge>

@@ -1,0 +1,119 @@
+---
+title: "De clip space al viewport: lo que hace el hardware después de ti"
+description: "El volumen de recorte de WebGPU, la división de perspectiva, la transformación de viewport con sus fórmulas exactas, y por qué nunca hay que dividir por w a mano."
+subject: webgpu
+level: 14
+order: 5
+position: "14.5"
+duration: "18 min"
+---
+
+<Lead>
+El vertex shader termina devolviendo un `vec4f` y a partir de ahí el trabajo lo hace hardware fijo: recorta, divide por la cuarta componente y mapea al rectángulo de la pantalla. Son tres operaciones, están todas especificadas al detalle, y saber exactamente qué hacen es lo que explica por qué una matriz de proyección copiada de un tutorial de OpenGL recorta media escena y por qué dividir por `w` tú mismo estropea la interpolación.
+</Lead>
+
+<Goals>
+
+- Enunciar el volumen de recorte de WebGPU y en qué se diferencia del de OpenGL.
+- Aplicar las fórmulas exactas de la división de perspectiva y del mapeo al viewport.
+- Configurar `setViewport` y `setScissorRect` sabiendo qué cambia cada uno.
+- Explicar por qué la interpolación necesita la `w` y qué se rompe al dividir a mano.
+
+</Goals>
+
+## Lo que devuelve el vertex shader
+
+`@builtin(position)` es una posición en **espacio de clip**: el resultado de multiplicar la posición del modelo por la cadena de matrices, **sin dividir**. Sus cuatro componentes son homogéneos y el cuarto no es un relleno: es el que contiene la profundidad de perspectiva.
+
+Un punto está dentro del volumen visible si cumple estas tres condiciones a la vez:
+
+```
+-w <= x <= w
+-w <= y <= w
+ 0 <= z <= w
+```
+
+Las dos primeras son las de siempre. **La tercera es la que cambia respecto a OpenGL**, donde el rango era de `-w` a `w`. WebGPU usa la convención de Direct3D, Metal y Vulkan: el plano cercano está en `z = 0`, no en `z = -w`.
+
+De ahí sale el error más frecuente al portar código: una matriz de proyección construida para OpenGL mapea el plano cercano a `-w`, y todo lo que quede entre el plano cercano y la mitad del volumen se recorta. El síntoma es que la escena aparece pero le falta la mitad delantera, o que los objetos desaparecen al acercarse mucho antes de lo que deberían. Las librerías de matemáticas actuales tienen las dos variantes; en `gl-matrix` las funciones correctas son `perspectiveZO` y `orthoZO`.
+
+## Las tres operaciones del hardware
+
+**Recorte.** La primitiva se corta contra el volumen anterior, generando vértices nuevos donde haga falta. Es importante que ocurra **antes** de dividir: dividir un punto con `w` negativo, que es lo que tienen los puntos detrás de la cámara, produce coordenadas que parecen válidas y están del revés. El recorte previo elimina ese caso.
+
+Con la feature `depth-clip-control` se puede desactivar el recorte en profundidad poniendo `primitive.unclippedDepth: true`, lo cual es útil para técnicas como el sujetado de sombras contra el plano cercano.
+
+**División de perspectiva.** Los tres primeros componentes se dividen por el cuarto, y el resultado son las coordenadas normalizadas de dispositivo:
+
+```
+ndc.x = clip.x / clip.w      // de -1 a 1, positivo a la derecha
+ndc.y = clip.y / clip.w      // de -1 a 1, positivo hacia ARRIBA
+ndc.z = clip.z / clip.w      // de 0 a 1
+```
+
+**Transformación de viewport.** Las coordenadas normalizadas se mapean al rectángulo de píxeles:
+
+```
+fx = (ndc.x + 1) * 0.5 * vp.ancho + vp.x
+fy = (1 - ndc.y) * 0.5 * vp.alto  + vp.y
+fz = ndc.z * (vp.profMax - vp.profMin) + vp.profMin
+```
+
+Fíjate en el `1 - ndc.y` de la segunda línea: **el eje vertical se invierte**. En coordenadas normalizadas la `Y` crece hacia arriba, y en coordenadas de framebuffer crece hacia abajo. Es la misma inversión que hay que hacer a mano cuando se reconstruyen coordenadas desde `@builtin(position)` en un fragment shader.
+
+Ese resultado `(fx, fy, fz)` es exactamente lo que llega al fragment shader como `@builtin(position)`, con el cuarto componente valiendo `1 / clip.w`.
+
+## Viewport y tijera
+
+Por defecto, el viewport ocupa el attachment entero y el rango de profundidad va de 0 a 1. Los dos se pueden cambiar dentro del render pass:
+
+```js
+// x, y, ancho, alto, profundidad minima, profundidad maxima
+pase.setViewport(0, 0, 512, 512, 0, 1);
+
+// x, y, ancho, alto: recorta escrituras, no transforma nada
+pase.setScissorRect(64, 64, 256, 256);
+```
+
+La diferencia entre los dos es que **el viewport transforma y la tijera solo recorta**. Cambiar el viewport encoge la imagen dentro del rectángulo; cambiar la tijera deja la imagen igual y descarta los fragmentos de fuera. Para renderizar cuatro vistas en un mismo target se usa el viewport; para limitar el borrado o el dibujado a una región, la tijera.
+
+El rango de profundidad del viewport es la palanca para técnicas de capas: dibujar el arma en primera persona con el rango comprimido a la parte cercana evita que atraviese las paredes sin necesidad de un segundo pase de profundidad.
+
+## Corrección de perspectiva
+
+Aquí está la razón profunda de que el hardware necesite la `w` y de que tú no debas tocarla.
+
+Interpolar un atributo linealmente **en pantalla** es incorrecto en cuanto hay perspectiva: los puntos equiespaciados en el espacio del mundo no son equiespaciados en la pantalla. La interpolación correcta se hace dividiendo cada atributo por `w`, interpolando linealmente `atributo/w` y `1/w`, y dividiendo al final:
+
+```
+valor = interp(atributo / w) / interp(1 / w)
+```
+
+Eso es lo que hace el rasterizador con cada `@location` que no lleve `@interpolate(linear)` ni `@interpolate(flat)`, y es también la razón de que el fragment shader reciba `1 / clip.w` en el cuarto componente de `position`: es un valor que el interpolador ya tenía calculado.
+
+De ahí sale la regla operativa: **nunca dividas por `w` en el vertex shader**. Este código parece razonable y rompe dos cosas:
+
+```wgsl
+// MAL. No hagas esto.
+@vertex
+fn vs(@location(0) p : vec3f) -> @builtin(position) vec4f {
+  let clip = camara.viewProj * vec4f(p, 1.0);
+  return vec4f(clip.xyz / clip.w, 1.0);     // ya dividido: w = 1
+}
+```
+
+Rompe el **recorte**, porque los vértices detrás de la cámara ya han pasado por una división por un número negativo y están colocados en cualquier sitio. Y rompe la **corrección de perspectiva**, porque con `w` igual a 1 el interpolador cree que no hay perspectiva y las texturas aparecen deformadas siguiendo las diagonales de los triángulos.
+
+<Callout type="dios" title="El artefacto de la textura que se dobla por la diagonal es la firma de una w perdida, y aparece de tres formas distintas">
+Merece la pena saber reconocerlo porque el diagnóstico es instantáneo una vez que lo has visto: **una textura sobre un plano grande visto en escorzo aparece doblada, con una arruga visible justo en la diagonal donde se juntan los dos triángulos del quad**. Las líneas rectas de la textura se quiebran en la diagonal. En movimiento, la deformación cambia de forma nauseabunda.
+
+Ese artefacto es el aspecto exacto que tiene una interpolación afín en lugar de perspectiva, y es el mismo que tenían las consolas de los noventa que no la implementaban. En WebGPU aparece por tres caminos y conviene tenerlos separados.
+
+**Uno: has dividido por `w` en el vertex shader**, la versión de arriba. El interpolador no puede corregir lo que ya no tiene.
+
+**Dos: has marcado el atributo con `@interpolate(linear)`.** Ese modo hace exactamente eso, interpolar linealmente en pantalla sin corregir, y existe para valores que ya están en espacio de pantalla. Aplicárselo a una coordenada de textura da este artefacto directamente.
+
+**Tres, y el más sutil: estás interpolando algo que no es lineal en el espacio del mundo.** La corrección de perspectiva garantiza que se interpola correctamente una función que era lineal sobre la superficie. Si interpolas una función que no lo es —una profundidad ya no lineal, un color al que has aplicado una curva gamma, un valor al que has aplicado una potencia en el vertex shader—, el resultado será suave pero no será el correcto, y el error se concentra en el centro de los triángulos.
+
+De esa tercera se saca la regla general y la parte que se aplica todos los días: **interpola las magnitudes en su forma lineal y aplica las curvas después, en el fragment shader**. Interpola color lineal y conviértelo a espacio de visualización en el fragmento, no al revés. Interpola la posición del mundo y calcula la niebla exponencial en el fragmento, no la niebla en el vértice. Interpola la profundidad de vista si la necesitas, no su recíproco. Cuesta unas instrucciones por fragmento y elimina una familia entera de artefactos que se manifiestan como bandas o costuras en el centro de los polígonos grandes.
+</Callout>

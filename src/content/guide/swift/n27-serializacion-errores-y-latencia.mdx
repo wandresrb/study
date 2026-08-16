@@ -1,0 +1,154 @@
+---
+title: "Serialización, errores de transporte y la latencia como material de diseño"
+description: "Qué tipos pueden cruzar el cable y por qué una referencia a otro actor distribuido sí puede hacerlo; qué errores aparecen sin que los hayas declarado; y por qué un tiempo de espera agotado es la ambigüedad más peligrosa de un sistema distribuido."
+subject: swift
+level: 27
+order: 3
+position: "27.3"
+duration: "19 min"
+---
+
+<Lead>
+Una llamada local pasa punteros; una llamada remota pasa bytes. Ese cambio de material tiene tres consecuencias que ninguna abstracción puede disolver y que conviene mirar de frente. La primera es que el conjunto de cosas expresables se encoge: solo cruza lo que sabe convertirse en una secuencia de bytes y reconstruirse al otro lado con el mismo significado. La segunda es que aparecen modos de fallo que no están en tu lógica y que sin embargo tu lógica tiene que atender. La tercera, la más silenciosa y la que más diseños arruina, es que el coste de una llamada deja de ser despreciable y pasa a ser el factor dominante de la arquitectura. Esta lección trata las tres como lo que son: restricciones de diseño, no incomodidades de implementación.
+</Lead>
+
+<Goals>
+
+- Determinar qué tipos cumplen el requisito de serialización y por qué un `distributed actor` es uno de ellos.
+- Distinguir errores de dominio, errores de codificación y errores de transporte, y decidir dónde se atienden.
+- Razonar sobre la ambigüedad de un plazo agotado y elegir entre idempotencia, deduplicación o reconciliación.
+- Diseñar interfaces de grano grueso y justificar cada viaje de ida y vuelta que el diseño conserva.
+
+</Goals>
+
+## Qué cabe en un mensaje
+
+La regla base es sencilla: todo parámetro y todo valor de retorno de un miembro `distributed` debe cumplir el `SerializationRequirement` del sistema, que en la práctica es `Codable`, y además ser `Sendable`, porque sigue cruzando una frontera de aislamiento. Eso descarta de golpe una familia entera de valores que en local pasabas sin pensar: clausuras, referencias a clases con identidad local, punteros, manejadores de fichero, cualquier cosa cuyo significado dependa de este espacio de direcciones.
+
+```swift
+struct Pedido: Codable, Sendable {
+    let id: UUID
+    let lineas: [Linea]
+    let creado: Date
+}
+
+distributed actor Almacen {
+    typealias ActorSystem = ClusterSystem
+
+    distributed func registrar(_ pedido: Pedido) throws -> Recibo { ... }
+
+    // No compila: una clausura no sabe convertirse en bytes
+    // distributed func alRecibir(_ accion: @Sendable () -> Void) { }
+}
+```
+
+La excepción interesante rompe la intuición y es el mecanismo que da poder al modelo: **una referencia a otro actor distribuido sí puede viajar**. Cuando el sistema aporta la conformidad correspondiente, un `distributed actor` es codificable, y lo que se codifica no es su estado sino su `ID`. Al otro lado, la decodificación llama a `resolve` y produce una referencia utilizable, que será local o proxy según dónde se abra el sobre.
+
+```swift
+distributed func delegarEn(_ operario: Operario, el pedido: Pedido) async throws {
+    // `operario` llego como identidad y aqui ya es una referencia viva
+    try await operario.atender(pedido)
+}
+```
+
+La diferencia semántica es enorme y conviene decirla con todas las letras: los datos se copian, los actores se **direccionan**. Pasar un `Pedido` entrega una fotografía independiente; pasar un `Operario` entrega la capacidad de hablar con el original, esté donde esté. Un sistema distribuido bien diseñado suele consistir en pocos tipos de datos gordos y muchas referencias finas.
+
+<Callout type="warn" title="Las estructuras compartidas dejan de estar compartidas">
+En local, dos actores que reciben el mismo array observan el mismo contenido tras una mutación coordinada. En remoto reciben dos copias que divergen desde el instante del envío. Si tu diseño dependía de que ambos vieran lo mismo, ahora necesita un propietario único y una consulta, no una copia.
+</Callout>
+
+## Los errores que no escribiste
+
+Un método distribuido convive con tres categorías de fallo que se propagan por el mismo canal y que exigen decisiones distintas.
+
+Los **errores de dominio** son los tuyos: `sinStock`, `pedidoDuplicado`. Para que crucen intactos deben ser serializables; si no lo son, la mayoría de sistemas los degradan a un error genérico que conserva la descripción y pierde el caso concreto, con lo que el `catch` tipado del otro lado deja de discriminar. Declarar los errores del contrato como enumeraciones `Codable` no es un detalle de estilo, es lo que mantiene útil el manejo de errores a través del cable.
+
+Los **errores de codificación** aparecen antes de que nada viaje: un tipo que no sabe codificarse, una versión del formato incompatible, un campo obligatorio que el emisor no envió porque su versión del tipo aún no lo tenía. Son fallos de contrato, no de red, y su lugar natural de detección son las pruebas de compatibilidad entre versiones.
+
+Los **errores de transporte** son los que existen únicamente porque hay dos procesos: nodo inalcanzable, conexión cerrada, actor no encontrado en el destino, plazo agotado. No tienen relación con lo que pedías y pueden ocurrir en cualquier llamada.
+
+```swift
+enum ErrorDePedido: String, Codable, Error {
+    case sinStock, duplicado, cerrado
+}
+
+distributed func registrar(_ p: Pedido) throws -> Recibo {
+    guard abierto else { throw ErrorDePedido.cerrado }
+    ...
+}
+```
+
+Declarar el error como `enum` con datos codificables tiene un efecto que se nota en el llamante: el `catch` puede seguir discriminando casos al otro lado del cable. Si el error no es serializable, lo que llega es un envoltorio genérico con una cadena, y toda la lógica de recuperación se degrada a comparar textos.
+
+```swift
+do {
+    let recibo = try await almacen.registrar(pedido)
+    confirmar(recibo)
+} catch let e as ErrorDePedido {
+    mostrar(e)                       // dominio: el sistema remoto decidio
+} catch {
+    reintentarOEscalar(error)         // transporte: nadie decidio nada, o quiza si
+}
+```
+
+## Cuando el silencio es ambiguo
+
+El plazo agotado merece sección propia porque es la única situación en la que tu programa no sabe qué ha pasado y no puede averiguarlo. Si envías `registrar` y no llega respuesta en dos segundos, cabe que el mensaje no llegara, que llegara y el nodo cayera antes de aplicarlo, o que se aplicara perfectamente y se perdiera la respuesta. Los tres casos son indistinguibles desde tu lado.
+
+<Mermaid code={`sequenceDiagram
+  participant C as Cliente
+  participant N as Nodo remoto
+  C->>N: registrar pedido
+  Note over C: arranca el plazo
+  N-->>N: aplica el efecto
+  N--xC: la respuesta se pierde
+  Note over C: plazo agotado
+  C->>C: reintentar puede duplicar el pedido
+  C->>C: no reintentar puede perderlo`} />
+
+Las tres salidas practicables son conocidas y ninguna es gratis. La primera es **hacer la operación idempotente**: el cliente genera un identificador único por intento lógico y el servidor guarda cuáles ya aplicó, de modo que repetir es inofensivo. La segunda es **consultar antes de reintentar**, lo que exige una operación de lectura del estado y traslada el problema a la consistencia de esa lectura. La tercera es **aceptar la ambigüedad y reconciliar después**, que es lo que hacen los sistemas de pagos con sus procesos de conciliación. Elegir es parte del diseño del contrato, no del código de red.
+
+<Callout type="tip" title="El identificador del intento va en la firma">
+Si una operación distribuida muta estado, su firma debería llevar un identificador de intento provisto por el llamante. Es una línea más en el tipo y convierte el reintento de arriesgado en trivial.
+</Callout>
+
+La latencia impone la otra mitad del diseño. Encadenar llamadas finas multiplica viajes, y cada viaje suma latencia completa además de exponerse a fallo parcial. El remedio no es técnico sino de granularidad de la interfaz.
+
+```swift
+// Tres viajes de ida y vuelta, tres oportunidades de fallar
+let nombre = try await cliente.nombre
+let saldo  = try await cliente.saldo
+let plan   = try await cliente.plan
+
+// Un viaje, una unidad de consistencia, un solo fallo posible
+struct Ficha: Codable, Sendable { let nombre: String; let saldo: Decimal; let plan: Plan }
+distributed func ficha() -> Ficha
+```
+
+<Cards>
+  <Card icon="📦" title="Datos gordos, viajes pocos">
+    Una llamada que devuelve la vista completa vence a cinco que devuelven campos sueltos, incluso si transporta más bytes.
+  </Card>
+  <Card icon="🎟️" title="Idempotencia por diseño">
+    Un identificador de intento en la firma convierte el reintento en seguro sin coordinación adicional.
+  </Card>
+  <Card icon="🧾" title="Errores serializables">
+    Un `enum` de errores `Codable` mantiene discriminable el `catch` del otro lado del cable.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="La frontera de serialización es la frontera de tu modelo de consistencia">
+Es tentador ver `Codable` como un detalle de fontanería, y esa lectura oculta el hecho más consecuente del nivel: el punto donde un valor se convierte en bytes es exactamente el punto donde deja de existir una única verdad sobre él. Mientras un dato vive en un proceso, la identidad y el valor van juntos y el lenguaje puede garantizar, con aislamiento de actores y con `Sendable`, que nadie lo observa a medio cambiar. En el instante en que lo serializas, fabricas una **copia con fecha**: una afirmación sobre cómo estaban las cosas en el emisor en un instante que ya pasó, y que el receptor interpretará en un instante distinto, quizá después de que el original haya cambiado tres veces. De ahí se sigue todo lo demás. Se sigue que la elección entre enviar un valor y enviar una referencia a un actor no es una preferencia estilística sino la elección entre entregar una foto y entregar un canal hacia la verdad viva, es decir, entre asumir obsolescencia y asumir latencia; casi todos los diseños malos de sistemas distribuidos son un reparto equivocado entre esas dos monedas. Se sigue también que la evolución del esquema es un problema de consistencia y no de formato: dos nodos con versiones distintas del mismo `struct` no discrepan sobre bytes, discrepan sobre el mundo, y por eso las reglas prácticas —campos nuevos siempre opcionales, nunca reutilizar un nombre con otro significado, nunca hacer obligatorio lo que era opcional sin una migración en dos fases— no son buenas prácticas de codificación sino condiciones de compatibilidad entre observadores. Y se sigue, por último, la razón profunda de que Swift ponga `throws` en toda llamada distribuida: el fallo parcial es el fenómeno que impide que exista una vista global, porque significa que dos participantes pueden discrepar para siempre sobre si algo ocurrió; a eso apuntan los resultados de imposibilidad clásicos, desde los dos generales hasta FLP, y ninguna cantidad de reintentos los deroga. La enseñanza transferible cabe en una frase incómoda: al distribuir no estás moviendo funciones de sitio, estás sustituyendo tu modelo de memoria por un modelo de mensajes, y el tipo que declaras `Codable` es la firma con la que aceptas ese cambio.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+Cruzan los valores serializables y las referencias a otros actores distribuidos, que viajan como identidad. Los errores de transporte existen en toda llamada aunque el método no lance. Un plazo agotado no dice si el efecto ocurrió: la respuesta se diseña con idempotencia, consulta o reconciliación. La granularidad de la interfaz es una decisión de latencia.
+</Callout>
+
+<Challenge title="Rompe el cable y observa">
+1. Define un tipo con una propiedad no `Codable` y transcribe el error del compilador al usarlo como parámetro distribuido.
+2. Pasa una referencia a otro `distributed actor` como argumento y demuestra, con trazas, que al otro lado se resolvió en lugar de copiarse.
+3. Lanza un error de dominio no serializable desde el nodo remoto y comprueba qué recibe exactamente el `catch` del llamante.
+4. Simula un plazo agotado con la respuesta perdida y el efecto aplicado. Añade después un identificador de intento y verifica que el reintento no duplica.
+5. Mide una interfaz de cinco propiedades frente a una que devuelve una ficha completa, con una latencia inyectada de cincuenta milisegundos por viaje.
+</Challenge>

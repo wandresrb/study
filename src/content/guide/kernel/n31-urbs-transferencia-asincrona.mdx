@@ -1,0 +1,134 @@
+---
+title: "URBs: la unidad de transferencia asíncrona"
+description: "El URB (USB Request Block) como descriptor asíncrono de una transferencia, análogo al bio del block layer. Reservarlo con usb_alloc_urb, rellenarlo con usb_fill_bulk_urb, enviarlo con usb_submit_urb y procesar el resultado en el callback de completado que corre en contexto de interrupción. Buffers coherentes, cancelación con usb_kill_urb y anchors."
+subject: kernel
+level: 31
+order: 4
+position: "31.4"
+duration: "16 min"
+---
+
+<Lead>
+Nunca escribes bytes directamente en un cable USB. Rellenas un URB —un USB Request Block— que describe una transferencia, se lo entregas a `usbcore` con `usb_submit_urb` y te marchas. Cuando el host controller termina, te llama de vuelta a tu callback de completado. El URB es a USB lo que el `bio` es al block layer: el descriptor asíncrono de una operación de E/S, la pieza donde el DMA, las interrupciones y el contrato del driver se dan la mano.
+</Lead>
+
+<Goals>
+
+- Entender el URB como descriptor asíncrono de una transferencia y su ciclo de vida.
+- Reservar y rellenar un URB con `usb_alloc_urb` y `usb_fill_bulk_urb`.
+- Enviarlo con `usb_submit_urb` y procesar el resultado en el callback de completado.
+- Gestionar buffers coherentes con DMA y la cancelación con `usb_kill_urb` y anchors.
+
+</Goals>
+
+## El URB: anatomía y ciclo de vida
+
+Un URB es una estructura que reúne todo lo que define una transferencia: a qué dispositivo y por qué tubería, dónde está el buffer y cuánto mide, y a quién avisar al terminar. Es un objeto **con conteo de referencias** (`kref`) y **asíncrono** por naturaleza: enviarlo no bloquea. Su ciclo de vida es un rombo: reservar, rellenar, enviar, y en algún momento futuro el HCD invoca tu callback, tras lo cual liberas el URB o lo reenvías.
+
+```c
+/* include/linux/usb.h — los campos publicos que maneja un driver */
+struct urb {
+	struct usb_device *dev;             /* (in)  dispositivo destino */
+	unsigned int pipe;                  /* (in)  endpoint mas direccion mas tipo */
+	int status;                         /* (out) resultado, 0 = exito */
+	unsigned int transfer_flags;        /* (in)  URB_NO_TRANSFER_DMA_MAP... */
+	void *transfer_buffer;              /* (in)  buffer de datos */
+	dma_addr_t transfer_dma;            /* (in)  su direccion de bus */
+	u32 transfer_buffer_length;         /* (in)  bytes a transferir */
+	u32 actual_length;                  /* (out) bytes realmente movidos */
+	usb_complete_t complete;            /* (in)  callback de completado */
+	void *context;                      /* (in)  dato privado para el callback */
+	/* ... campos de iso y de uso interno del core ... */
+};
+```
+
+El campo `pipe` es un entero compacto que codifica el endpoint, su dirección y su tipo; se construye con macros como `usb_rcvbulkpipe`. Los campos marcados `(out)` los rellena el núcleo al completar: `status` con el veredicto y `actual_length` con cuántos bytes se movieron de verdad, que puede ser menos que lo pedido (una *lectura corta*).
+
+## Reservar y rellenar
+
+Se reserva con `usb_alloc_urb`, cuyo primer argumento es el número de paquetes isócronos (cero para el resto de tipos). El buffer conviene pedirlo con `usb_alloc_coherent`, que devuelve memoria ya lista para DMA y su dirección de bus en `transfer_dma`, ahorrándote el mapeo de la DMA API (nivel 27). Luego un helper `usb_fill_*` rellena los campos según el tipo de transferencia:
+
+```c
+urb = usb_alloc_urb(0, GFP_KERNEL);          /* 0 = sin paquetes iso */
+if (!urb)
+	return -ENOMEM;
+
+buf = usb_alloc_coherent(udev, len, GFP_KERNEL, &urb->transfer_dma);
+if (!buf) {
+	usb_free_urb(urb);
+	return -ENOMEM;
+}
+
+usb_fill_bulk_urb(urb, udev,
+		  usb_rcvbulkpipe(udev, dev->bulk_in_addr),
+		  buf, len, skel_read_complete, dev);
+urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;  /* el buffer ya es coherente */
+```
+
+La bandera `URB_NO_TRANSFER_DMA_MAP` le dice al núcleo que no vuelva a mapear el buffer, porque `usb_alloc_coherent` ya te dio una dirección de bus válida. Es la conexión directa entre este nivel y la DMA API: el URB lleva tanto el puntero del kernel (`transfer_buffer`) como la dirección que ve el hardware (`transfer_dma`).
+
+## Enviar y el callback de completado
+
+`usb_submit_urb` encola la transferencia y **retorna de inmediato**; el argumento GFP describe si puede dormir para reservar recursos. A partir de ese momento el URB pertenece al núcleo y no debes tocarlo hasta que te lo devuelvan.
+
+```c
+ret = usb_submit_urb(urb, GFP_KERNEL);
+if (ret) {
+	dev_err(&intf->dev, "submit fallo: %d\n", ret);
+	usb_free_coherent(udev, len, buf, urb->transfer_dma);
+	usb_free_urb(urb);
+}
+```
+
+El callback corre en **contexto de interrupción** (softirq del HCD), y esa única frase gobierna todo lo que puedes hacer dentro: no dormir, no reservar con `GFP_KERNEL`, no tomar un mutex. Lo primero es examinar `urb->status`, distinguiendo el éxito de los códigos que significan cancelación o desconexión:
+
+```c
+static void skel_read_complete(struct urb *urb)
+{
+	struct usb_skel *dev = urb->context;
+
+	switch (urb->status) {
+	case 0:
+		break;                    /* exito: urb->actual_length bytes validos */
+	case -ECONNRESET:             /* URB cancelado con usb_unlink_urb */
+	case -ENOENT:                 /* URB cancelado con usb_kill_urb */
+	case -ESHUTDOWN:              /* el dispositivo se desconecto */
+		return;                   /* no reenviar: nos vamos */
+	default:
+		dev_warn(&dev->intf->dev, "estado %d\n", urb->status);
+	}
+
+	/* procesar dev->buf[0 .. urb->actual_length] */
+	/* para una lectura continua, reenviar aqui el mismo urb */
+	usb_submit_urb(urb, GFP_ATOMIC);   /* atomico: estamos en interrupcion */
+}
+```
+
+Fíjate en el segundo `usb_submit_urb`: para una entrada continua —un teclado, un sensor— el patrón canónico es **reenviar el URB desde su propio callback**, creando un bucle perpetuo de sondeo. Y como el callback es contexto atómico, el reenvío usa `GFP_ATOMIC`, no `GFP_KERNEL`.
+
+## Cancelar y sincronizar: kill y anchors
+
+Cuando llega la desconexión (nivel 31.3) hay que abortar los URBs en vuelo. `usb_kill_urb` cancela un URB y **bloquea hasta que su callback termina**, por lo que solo puede llamarse en contexto que pueda dormir; su primo `usb_unlink_urb` es asíncrono. Para no llevar la cuenta de cada URB a mano, `usbcore` ofrece los **anchors**: un ancla agrupa un conjunto de URBs en vuelo y permite matarlos todos de golpe.
+
+```c
+usb_anchor_urb(urb, &dev->submitted);   /* registrar antes de enviar */
+ret = usb_submit_urb(urb, GFP_KERNEL);
+if (ret)
+	usb_unanchor_urb(urb);
+
+/* en disconnect o suspend, cancelar todo lo pendiente de una vez */
+usb_kill_anchored_urbs(&dev->submitted);
+```
+
+Para transferencias simples de una sola vez que sí pueden dormir, existen los envoltorios síncronos `usb_bulk_msg` y `usb_control_msg`: internamente arman un URB, lo envían y esperan con una `completion` (nivel 16). Úsalos cuando quieras la sencillez de una llamada bloqueante; usa URBs crudos cuando necesites asincronía, alto rendimiento o sondeo continuo.
+
+<Callout type="dios" title="Submit-and-forget es el mismo reactor que gobierna todo el kernel de alto rendimiento">
+El URB no es una peculiaridad de USB: es una encarnación más del patrón que vertebra toda la E/S rápida del kernel. Enviar un descriptor, seguir con tu vida, y ser llamado de vuelta cuando el hardware termina es exactamente lo que hace el `bio` en el block layer, lo que hace NAPI en la pila de red y lo que hace la E/S asíncrona en el VFS. La razón de que este patrón aparezca una y otra vez es física: el hardware es órdenes de magnitud más lento que la CPU, así que bloquear un hilo esperándolo es desperdiciar un recurso carísimo. En su lugar, describes el trabajo, lo entregas y liberas la CPU; el completado te encuentra por interrupción. Pero esa elegancia tiene un precio que debes interiorizar: el callback corre en **contexto de interrupción**, y de ahí desciende toda la disciplina de sincronización que aprendiste en los niveles 14 a 16. No puedes dormir, no puedes usar `GFP_KERNEL`, no puedes tomar un mutex; solo spinlocks y `GFP_ATOMIC`. El URB es, por tanto, el punto exacto donde convergen tres niveles enteros de esta guía: el DMA del nivel 27 (que da al buffer una dirección de bus), las interrupciones (que traen el completado) y la concurrencia (que dicta qué puedes hacer al recibirlo). Cuando ves el URB como lo que es —un descriptor de E/S asíncrona en un reactor dirigido por interrupciones— dejas de aprender USB y empiezas a reconocer la arquitectura universal de todo dispositivo rápido bajo Linux.
+</Callout>
+
+<Challenge title="Un bucle de lectura continua">
+1. Reserva un URB con `usb_alloc_urb` y un buffer con `usb_alloc_coherent`, y rellénalo con `usb_fill_bulk_urb` sobre un pipe `usb_rcvbulkpipe`.
+2. Implementa el callback con el `switch (urb->status)` que distingue éxito de los códigos de cancelación, y reenvía el URB con `GFP_ATOMIC` para una lectura perpetua.
+3. Registra cada URB en un anchor antes de enviarlo y cancélalos todos con `usb_kill_anchored_urbs` en `.disconnect`.
+4. Reescribe la misma lectura de una sola vez con `usb_bulk_msg` y explica en qué contexto puede usarse cada versión y por qué el callback asíncrono no puede dormir.
+</Challenge>

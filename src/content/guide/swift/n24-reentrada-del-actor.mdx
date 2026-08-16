@@ -1,0 +1,157 @@
+---
+title: "Reentrada: el actor atiende a otro mientras tú esperas"
+description: "Un actor garantiza exclusión mutua, no atomicidad de método. En cada `await` el turno se libera y otra tarea puede entrar y mutar el estado. De ahí sale el bug más sutil de la concurrencia moderna y la disciplina para evitarlo."
+subject: swift
+level: 24
+order: 2
+position: "24.2"
+duration: "19 min"
+---
+
+<Lead>
+Hay una frase que casi todo el mundo se dice a sí mismo al aprender actores y que es falsa: «mientras mi método se ejecuta, nadie más toca el estado». Lo cierto es más incómodo y mucho más interesante. Un actor de Swift es *reentrante*: cada vez que su código suspende en un `await`, devuelve el turno al ejecutor, que puede admitir otro mensaje pendiente sobre la misma instancia. Cuando tu método reanuda, el mundo ha cambiado bajo sus pies: las variables locales siguen intactas, el estado del actor no tiene por qué. Esta lección explica por qué se diseñó así, qué error concreto produce y qué disciplina lo neutraliza.
+</Lead>
+
+<Goals>
+
+- Describir con precisión qué se libera y qué se conserva en un punto de suspensión dentro de un actor.
+- Reconocer el patrón comprobar-y-actuar roto por la reentrada en cachés, contadores y máquinas de estado.
+- Aplicar las tres estrategias de defensa: revalidar tras el `await`, mover el trabajo fuera del turno o reificar la operación en curso.
+- Argumentar por qué un actor no reentrante evitaría el bug al precio de reintroducir el interbloqueo.
+
+</Goals>
+
+## Qué se libera en un `await`
+
+El aislamiento del actor es una propiedad sobre *ejecución simultánea*, no sobre *ejecución ininterrumpida*. Entre dos puntos de suspensión, el código aislado es efectivamente atómico: nadie más puede estar corriendo en ese actor. En el punto de suspensión, esa atomicidad termina.
+
+```swift
+actor Perfil {
+    private var nombre = "sin nombre"
+    private var visitas = 0
+
+    func actualizar(desde url: URL) async throws {
+        let anterior = nombre            // copia local: sobrevive a todo
+        visitas += 1                     // atomico hasta aqui
+        let nuevo = try await descargarNombre(url)   // FIN DEL TURNO
+        // Al reanudar: `anterior` vale lo mismo, `visitas` puede haber cambiado,
+        // `nombre` puede haber sido reescrito por otra tarea.
+        nombre = nuevo
+        registrar(cambio: anterior, a: nuevo)
+    }
+}
+```
+
+La regla operativa cabe en una línea: **toda conclusión que hayas sacado del estado del actor antes de un `await` deja de ser válida después**. Las variables locales son tuyas y nadie las toca; las propiedades del actor son un recurso compartido cuya foto caduca en cada suspensión. Por eso el `await` no es ruido sintáctico que el compilador podría inferir: es una marca visual que delimita las fronteras de atomicidad de tu programa, y borrarla te dejaría sin ninguna forma de ver dónde se rompe la invariante.
+
+<Mermaid code={`sequenceDiagram
+  participant A as Tarea A
+  participant Act as Actor
+  participant B as Tarea B
+  A->>Act: pide turno y entra
+  Act-->>A: ejecuta hasta el await
+  A->>Act: suspende y libera el turno
+  Act-->>B: admite el mensaje de B
+  B->>Act: lee y muta el estado
+  Act-->>A: reanuda a A con estado distinto`} />
+
+## El bug: la caché que descarga dos veces
+
+El caso canónico es una caché perezosa. El código parece obviamente correcto y contiene dos fallos distintos.
+
+```swift
+actor CacheImagenes {
+    private var cache: [URL: Imagen] = [:]
+
+    func imagen(para url: URL) async throws -> Imagen {
+        if let ya = cache[url] { return ya }
+        let descargada = try await red.descargar(url)   // suspension
+        cache[url] = descargada
+        return descargada
+    }
+}
+```
+
+El primero es de eficiencia: si diez tareas piden la misma imagen antes de que la primera descarga termine, las diez encuentran la caché vacía, las diez suspenden y se lanzan diez descargas idénticas. La exclusión mutua se ha respetado escrupulosamente y aun así el trabajo se ha multiplicado por diez.
+
+El segundo es de corrección, y es el que arruina una tarde de depuración. Supón que entre la suspensión y la reanudación alguien llamó a `invalidar(url)` y luego insertó una versión nueva. La línea `cache[url] = descargada` sobrescribe el dato fresco con el viejo, sin ninguna carrera de datos y sin ningún aviso. El actor cumplió su contrato; lo que se rompió fue una invariante que nadie había declarado.
+
+<Callout type="warn" title="Firma del problema">
+Busca en tu código toda secuencia con la forma comprobar-o-decidir, `await`, escribir. Si la escritura posterior depende de la comprobación anterior, el actor no te está protegiendo: solo te está garantizando que ninguna de las dos mitades se corrompa por dentro.
+</Callout>
+
+## Tres defensas
+
+<Cards>
+  <Card icon="🔁" title="Revalidar al reanudar">
+    Tras el `await`, vuelve a leer el estado y decide otra vez. Sirve cuando repetir el trabajo es aceptable y lo único inaceptable es publicar un resultado obsoleto.
+  </Card>
+  <Card icon="🎫" title="Reificar la operación">
+    Guarda en el estado la `Task` en curso, no solo el resultado. La segunda llamada encuentra el ticket, se suscribe a él y nadie duplica trabajo.
+  </Card>
+</Cards>
+
+La segunda estrategia es la que resuelve la caché de una vez, porque convierte «no hay valor todavía» en un estado explícito en lugar de en un hueco:
+
+```swift
+actor CacheImagenes {
+    private enum Entrada {
+        case enCurso(Task<Imagen, Error>)
+        case lista(Imagen)
+    }
+    private var entradas: [URL: Entrada] = [:]
+
+    func imagen(para url: URL) async throws -> Imagen {
+        switch entradas[url] {
+        case .lista(let img):
+            return img
+        case .enCurso(let tarea):
+            return try await tarea.value          // nos sumamos al trabajo ajeno
+        case nil:
+            let tarea = Task { try await red.descargar(url) }
+            entradas[url] = .enCurso(tarea)       // publicado ANTES de suspender
+            do {
+                let img = try await tarea.value
+                if case .enCurso = entradas[url] { entradas[url] = .lista(img) }
+                return img
+            } catch {
+                if case .enCurso = entradas[url] { entradas[url] = nil }
+                throw error
+            }
+        }
+    }
+}
+```
+
+La tercera estrategia merece código propio porque cambia la forma del método en lugar de parchearlo: si el actor no suspende, no hay reentrada posible. Basta con que el trabajo lento ocurra antes de entrar en el turno.
+
+```swift
+// El llamante descarga fuera; el actor solo hace una escritura atomica
+actor CacheSimple {
+    private var cache: [URL: Imagen] = [:]
+    func guardar(_ img: Imagen, para url: URL) { cache[url] = img }
+    func leer(_ url: URL) -> Imagen? { cache[url] }
+}
+```
+
+Es la versión más aburrida y a menudo la mejor: el actor recupera la propiedad de ser un método sin `await` dentro, y con ello la atomicidad completa de cada operación. El precio es que la coordinación —quién descarga y quién espera— sube un nivel, hacia el llamante, donde suele estar el contexto necesario para decidirla bien.
+
+Volviendo al patrón del ticket, dos detalles hacen todo el trabajo. El ticket se inserta en el diccionario **antes** de la primera suspensión, de modo que cualquier tarea que llegue después ya lo encuentra. Y la escritura final se condiciona a que la entrada siga siendo la misma que dejamos, con lo que una invalidación intermedia gana la partida en vez de perderla. Ninguno de los dos detalles es un truco: los dos consisten en hacer explícito, dentro del estado del actor, algo que antes solo existía implícitamente en el tiempo que duraba una llamada.
+
+## Por qué Swift eligió la reentrada
+
+<Callout type="dios" title="Reentrada o interbloqueo: elige uno">
+La reentrada no es un descuido de diseño, es la mitad visible de un dilema formal. Imagina el actor no reentrante que muchos desean: al suspender, mantiene el turno tomado hasta terminar el método. Ahora escribe dos actores que se llaman mutuamente —un catálogo que consulta al almacén y un almacén que consulta al catálogo— y tendrás un ciclo de espera cerrado, exactamente el interbloqueo que el modelo prometía erradicar. Peor aún: bastaría que un actor se llamase a sí mismo indirectamente, a través de una devolución de llamada o de una capa intermedia que ni siquiera sabes que existe, para congelar el subsistema entero. Un modelo no reentrante solo es seguro si puedes garantizar que el grafo de llamadas entre actores es acíclico, y ese grafo no es local ni estable: cambia cuando alguien inserta una dependencia tres capas más abajo. Swift tomó la decisión clásica en teoría de sistemas: prefiere el *progreso* a la *atomicidad extendida*. Un actor reentrante nunca se bloquea a la espera de sí mismo, así que el sistema siempre avanza; a cambio, la atomicidad deja de ser la unidad del método y pasa a ser la unidad del fragmento entre suspensiones. Lo notable es que esa elección no oculta nada: cada punto donde la atomicidad se rompe está marcado con cinco letras que hay que teclear a mano. Comparado con los monitores clásicos —donde la espera con condición también libera el candado y provocaba exactamente el mismo problema, solo que sin ninguna marca en el código— el actor de Swift no ha inventado el peligro, ha inventado su señalización. Y esa es la diferencia entre un bug que se encuentra leyendo y un bug que se encuentra en producción.
+</Callout>
+
+<Callout type="note" title="Regla de bolsillo">
+Dentro de un actor, trata cada `await` como si fuese el final del método y el principio de otro. Si una invariante debe sostenerse a ambos lados, hazla explícita: un estado `enCurso`, un número de versión, una comprobación al reanudar.
+</Callout>
+
+<Challenge title="Provocar y curar la reentrada">
+1. Instrumenta la caché ingenua con un contador de descargas y lanza veinte peticiones simultáneas de la misma URL. Mide cuántas descargas ocurren y explica el número.
+2. Introduce un método `invalidar` y construye una secuencia de llamadas que haga que la caché termine sirviendo el valor antiguo. Escribe la traza de turnos que lo provoca.
+3. Reescribe la caché con el patrón del ticket y verifica que veinte peticiones producen una sola descarga.
+4. Añade cancelación: si la tarea que creó el ticket se cancela, ¿qué debería ocurrirle a las que se sumaron? Justifica tu decisión y añade `Task.isCancelled` donde corresponda.
+5. Diseña sobre papel un actor no reentrante y encuentra un ciclo de llamadas de tu propio código que se bloquearía con él. Es la prueba práctica del argumento de la sección final.
+</Challenge>

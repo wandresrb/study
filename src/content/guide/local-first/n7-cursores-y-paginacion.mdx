@@ -1,0 +1,154 @@
+---
+title: "Cursores: recorrer sin cargar en memoria"
+description: "El iterador que mantiene viva la transacción mientras lo alimentas: direcciones y variantes únicas, cursores de solo clave, y por qué la paginación real se hace con el método del asiento y no con saltos."
+subject: local-first
+level: 7
+order: 5
+position: "7.5"
+duration: "18 min"
+---
+
+<Lead>
+Leer con `getAll` es cómodo hasta el día en que el almacén tiene doscientos mil registros y la pestaña se queda sin memoria intentando materializarlos todos a la vez. El cursor es la respuesta de IndexedDB a ese problema: un iterador con posición que te entrega un registro cada vez y solo avanza cuando tú se lo pides. Pero además de resolver la memoria, el cursor resuelve algo que ya viste en la lección de transacciones —cada avance es una petición nueva que mantiene viva la transacción—, y sobre esa mecánica se construye la única paginación que no se degrada al llegar a la página doscientos.
+</Lead>
+
+<Goals>
+
+- Entender el cursor como un iterador que se alimenta a sí mismo dentro de la transacción.
+- Elegir dirección y variante única según la pregunta que quieres responder.
+- Distinguir el cursor de índice del de solo clave y medir lo que ahorra cada uno.
+- Implementar paginación por asiento en lugar de por desplazamiento.
+
+</Goals>
+
+## El iterador que se alimenta
+
+Un cursor no es una lista perezosa ni un iterador de JavaScript: es una petición que se vuelve a disparar. Llamas a `openCursor` una sola vez y recibes un objeto de petición; cada vez que llamas a `continue` sobre el cursor, esa **misma** petición vuelve a resolverse y su manejador de éxito se ejecuta de nuevo, ahora con el cursor apuntando al siguiente registro. Cuando no queda ninguno, el resultado es `null` y el bucle termina.
+
+```js
+const tx = db.transaction("notas", "readonly");
+const peticion = tx.objectStore("notas").openCursor();
+
+peticion.onsuccess = () => {
+  const cursor = peticion.result;
+  if (!cursor) return; // fin del recorrido
+  procesar(cursor.value);
+  cursor.continue();   // reencola la misma peticion
+};
+```
+
+Esa reencolación es exactamente el mecanismo que mantiene viva la transacción: mientras haya un `continue` pendiente, hay trabajo pendiente, y el motor no comprometerá nada. Un cursor abandonado a mitad de recorrido, en cambio, deja la transacción sin peticiones y provoca su cierre inmediato.
+
+<Callout type="tip" title="No uses cursor para conjuntos pequeños">
+Cada avance del cursor es un viaje de ida y vuelta hasta el motor. Si sabes que el resultado cabe holgadamente en memoria, `getAll(rango, limite)` resuelve todo en un solo viaje y suele ser varias veces más rápido. El cursor gana cuando el conjunto es grande, cuando quieres cortar antes de tiempo o cuando vas a modificar lo que recorres.
+</Callout>
+
+## Direcciones y variantes únicas
+
+El segundo argumento de `openCursor` decide el sentido y el tratamiento de los duplicados. Son cuatro valores y cada uno responde a un tipo de pregunta distinto.
+
+<Cards>
+  <Card icon="⬇️" title="next">
+    Orden ascendente de clave, con todos los duplicados. Es el recorrido por defecto y el que usarás casi siempre.
+  </Card>
+  <Card icon="⬆️" title="prev">
+    Orden descendente. Combinado con un límite, es la forma correcta de pedir los últimos elementos sin recorrer el almacén entero.
+  </Card>
+  <Card icon="🎯" title="nextunique">
+    Solo el primer registro de cada clave de índice. Es la manera nativa de obtener los valores distintos de una propiedad.
+  </Card>
+  <Card icon="🔁" title="prevunique">
+    Igual que la anterior pero descendente. Sutileza: devuelve el primero de cada clave, no el último, aunque el recorrido vaya hacia atrás.
+  </Card>
+</Cards>
+
+Además de `continue`, el cursor admite dos movimientos más. `advance(n)` salta `n` posiciones y `continue(clave)` reposiciona el cursor en la primera entrada mayor o igual que esa clave, lo que permite hacer saltos dirigidos sin abrir un cursor nuevo.
+
+<Mermaid code={`flowchart TD
+  A[openCursor sobre un rango] --> B[Evento success con el cursor posicionado]
+  B --> C{El cursor es nulo}
+  C -->|Si| D[Fin del recorrido y autocommit]
+  C -->|No| E[Se procesa el registro actual]
+  E --> F{Que movimiento se pide}
+  F -->|continue| G[Siguiente entrada del rango]
+  F -->|continue con clave| H[Salto dirigido a esa clave]
+  F -->|advance con n| I[Salto de n posiciones]
+  G --> B
+  H --> B
+  I --> B`} />
+
+## Cursores de índice y de solo clave
+
+Cuando el cursor nace de un índice y no de un almacén, expone tres datos distintos que conviene no confundir: `cursor.key` es la clave del índice, `cursor.primaryKey` es la clave del registro en el almacén y `cursor.value` es el registro completo. El motor hace la segunda búsqueda por ti, pero la hace.
+
+De ahí sale la optimización más rentable del capítulo. `openKeyCursor` abre un cursor que **no** deserializa el valor: solo te entrega la clave del índice y la clave primaria. Si estás contando, filtrando o recogiendo identificadores para una segunda ronda, evitas por completo el coste de clonar cada registro, que en objetos grandes domina el tiempo total.
+
+```js
+const indice = tx.objectStore("notas").index("por_libreta_fecha");
+
+// Solo claves: ni un solo valor se deserializa
+const soloClaves = indice.openKeyCursor(rango);
+const ids = [];
+soloClaves.onsuccess = () => {
+  const cursor = soloClaves.result;
+  if (!cursor) return;
+  ids.push(cursor.primaryKey);
+  cursor.continue();
+};
+```
+
+Dentro de una transacción de escritura, el cursor también modifica lo que recorre: `cursor.update(valor)` reescribe el registro actual y `cursor.delete()` lo borra, ambos sin interrumpir el recorrido. Es la forma canónica de aplicar una migración de datos registro a registro.
+
+<Callout type="warn" title="Actualizar la clave del índice bajo tus pies">
+Si dentro del recorrido modificas la propiedad que el índice proyecta, el registro puede reposicionarse y volver a aparecer más adelante. Cuando la migración toca la clave del índice, recorre por el almacén y no por el índice.
+</Callout>
+
+## Paginación por asiento
+
+El anti-patrón es evidente en cuanto se nombra: abrir un cursor y llamar a `advance(2000)` para llegar a la página cien. El coste es lineal en el desplazamiento, así que cada página siguiente es más cara que la anterior y la aplicación se degrada exactamente donde más datos hay.
+
+La solución es el **método del asiento**: no guardas cuántos elementos saltaste, guardas dónde te quedaste. La página siguiente es un rango que empieza justo después de la última clave vista, y su coste es constante sea cual sea la página.
+
+```js
+// Pagina siguiente a partir de la ultima posicion vista
+function pagina(indice, limite, ultimaClave, ultimaPrimaria) {
+  const rango = ultimaClave === undefined
+    ? null
+    : IDBKeyRange.lowerBound(ultimaClave);
+  const peticion = indice.openCursor(rango, "next");
+  const filas = [];
+  let primerAvance = ultimaClave !== undefined;
+
+  peticion.onsuccess = () => {
+    const cursor = peticion.result;
+    if (!cursor) return entregar(filas);
+    if (primerAvance) {
+      primerAvance = false;
+      // Indice no unico: retomar por la pareja clave mas clave primaria
+      return cursor.continuePrimaryKey(ultimaClave, ultimaPrimaria);
+    }
+    filas.push(cursor.value);
+    if (filas.length === limite) return entregar(filas, cursor);
+    cursor.continue();
+  };
+}
+```
+
+La pieza que casi nadie conoce es `continuePrimaryKey`. Sobre un índice no único, la última clave de índice vista no basta para retomar sin repetir ni saltar elementos, porque puede haber varios registros compartiéndola. El par formado por la clave del índice y la clave primaria sí es un asiento único, y ese método es el que permite posicionarse exactamente en él.
+
+El asiento tiene además una propiedad que el desplazamiento no tiene y que importa mucho en local-first: es **estable frente a escrituras concurrentes**. Si mientras el usuario pagina llega una tanda de registros nuevos por sincronización, un desplazamiento numérico desplaza todas las páginas siguientes y produce filas repetidas o perdidas; un asiento sigue apuntando al mismo punto del orden, y lo nuevo aparece donde le corresponde.
+
+<Callout type="note" title="Cede el hilo cada cierto número de registros">
+Un recorrido de cien mil registros dentro de una sola transacción bloquea el hilo lo suficiente para que se note. Procesa en tandas, cierra la transacción, cede el control con una tarea corta y retoma desde el asiento: la transacción vuelve a abrirse barata y la interfaz sigue respondiendo.
+</Callout>
+
+<Callout type="dios" title="El cursor convierte una base de datos embebida en un flujo, y el asiento convierte la paginación en una operación de coste constante">
+Hay dos ideas encadenadas en esta lección y ambas trascienden a IndexedDB. La primera es que un cursor no es una comodidad de lectura sino un cambio de régimen de memoria: sin él, el tamaño máximo de una consulta está acotado por la memoria de la pestaña, con lo cual el techo de tu aplicación local-first lo fija el dispositivo más modesto de tus usuarios; con él, ese techo desaparece y puedes procesar un almacén de un gigabyte con un consumo constante de unos pocos kilobytes, porque en ningún instante existen más de un registro y su clave. Es la misma diferencia que hay entre leer un fichero entero y leerlo por líneas, y tiene la misma consecuencia arquitectónica: el flujo permite cortar antes de tiempo, permite ceder el hilo cada mil registros para que la interfaz respire y permite transformar mientras se recorre en lugar de acumular y transformar después. La segunda idea es que la paginación por desplazamiento es una deuda que se paga al final. Contar dos mil elementos para llegar al dos mil uno es trabajo que crece con la profundidad, de modo que la página cien cuesta cien veces lo que la primera; y en una base local ese coste no se disimula tras la latencia de red, se nota como un salto perceptible en el hilo principal. El método del asiento sustituye la pregunta cuántos salto por la pregunta dónde me quedé, y como el índice está ordenado, retomar desde un punto es una búsqueda directa en el árbol, no un recorrido. La sutileza que separa una implementación correcta de una que duplica o pierde filas es reconocer que en un índice no único el asiento no es la clave del índice sino la pareja de clave de índice y clave primaria: la primera identifica el grupo, la segunda identifica la silla exacta dentro del grupo. Quien interioriza esas dos ideas —flujo en lugar de materialización, asiento en lugar de desplazamiento— ya tiene el modelo mental de IndexedDB completo, y lo que queda del capítulo siguiente es entender por qué, aun haciéndolo todo bien, sigue siendo más lento de lo que esperabas.
+</Callout>
+
+<Challenge title="Recorre de verdad">
+1. Carga cien mil registros y compara `getAll` con un cursor midiendo memoria pico y tiempo total.
+2. Repite el recorrido con `openKeyCursor` sobre el mismo índice y anota cuánto tiempo se iba solo en deserializar valores.
+3. Implementa la misma paginación dos veces, con `advance` y con el método del asiento, y grafica el coste de la página uno frente a la página doscientos.
+4. Sobre un índice con claves repetidas, pagina usando solo la clave del índice y comprueba que pierdes o duplicas filas; después arréglalo con `continuePrimaryKey`.
+</Challenge>

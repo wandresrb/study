@@ -1,0 +1,184 @@
+---
+title: "El scan de Blelloch: óptimo en trabajo"
+description: "Barrido ascendente y descendente sobre un árbol implícito, con la mitad de invocaciones que elementos y trabajo lineal."
+subject: webgpu
+level: 33
+order: 4
+position: "33.4"
+duration: "22 min"
+---
+
+<Lead>
+Hillis-Steele gasta `n·log2(n)` operaciones para producir lo que un bucle secuencial produce con `n`. Guy Blelloch demostró en 1990 que se puede hacer un scan paralelo con `2n` operaciones, es decir, óptimo en trabajo salvo un factor constante, a cambio de duplicar la profundidad. La construcción es elegante: el mismo árbol de la reducción, recorrido dos veces, una hacia arriba acumulando y otra hacia abajo repartiendo. Y tiene una propiedad práctica que a menudo pesa más que la teoría: cada invocación se ocupa de dos elementos, así que un workgroup de 256 escanea bloques de 512.
+</Lead>
+
+<Goals>
+
+- Ejecutar a mano el barrido ascendente y el descendente sobre ocho elementos.
+- Implementar el scan de Blelloch en memoria compartida con los índices correctos.
+- Comparar trabajo, profundidad y número de barreras con Hillis-Steele.
+- Reconocer y mitigar los conflictos de banco que introducen sus accesos con paso variable.
+
+</Goals>
+
+## Las dos fases
+
+El algoritmo trabaja sobre un array de `N` elementos con `N/2` invocaciones y usa el mismo árbol binario implícito que la reducción, pero guarda los resultados intermedios **en el propio array**, en las posiciones de índice impar del nivel correspondiente.
+
+**Barrido ascendente.** Es exactamente una reducción, pero sin descartar los parciales: en cada nivel, la posición derecha de cada par recibe la combinación del par. Al terminar, la última posición contiene el total del bloque y las posiciones intermedias contienen las sumas de los subárboles.
+
+```text
+inicial       [3   1   7   0   4   1   6   3]
+paso offset=1 [3   4   7   7   4   5   6   9]
+paso offset=2 [3   4   7  11   4   5   6  14]
+paso offset=4 [3   4   7  11   4   5   6  25]
+```
+
+Las posiciones 1, 3, 7 contienen la suma de los rangos `[0,1]`, `[0,3]` y `[0,7]`. La 5 contiene la de `[4,5]`.
+
+**Barrido descendente.** Se pone el neutro en la última posición y se recorre el árbol al revés. En cada paso, un nodo entrega su valor al hijo izquierdo y el hijo izquierdo entrega su valor antiguo al derecho, que lo combina con lo que ya tenía.
+
+```text
+tras poner 0  [3   4   7  11   4   5   6   0]
+paso offset=4 [3   4   7   0   4   5   6  11]
+paso offset=2 [3   0   7   4   4  11   6  15]
+paso offset=1 [0   3   4  11  11  15  16  22]
+```
+
+El resultado es el scan **exclusivo**, directamente, sin desplazamientos. Es una propiedad del algoritmo, no un añadido: el barrido descendente reparte precisamente "lo que hay a la izquierda".
+
+## La implementación
+
+Los índices son la parte delicada. En el nivel con desplazamiento `offset`, la invocación `li` toca dos posiciones:
+
+```text
+ai = offset * (2·li + 1) - 1     hijo izquierdo
+bi = offset * (2·li + 2) - 1     hijo derecho
+```
+
+Con `offset = 1` son los pares `(0,1)`, `(2,3)`, `(4,5)`, `(6,7)`; con `offset = 2` son `(1,3)` y `(5,7)`; con `offset = 4` es `(3,7)`. Ese es el árbol.
+
+```wgsl
+const TAM: u32 = 256u;          // invocaciones por workgroup
+const N:   u32 = 2u * TAM;      // 512 elementos por bloque
+const NEUTRO: f32 = 0.0;
+fn comb(a: f32, b: f32) -> f32 { return a + b; }
+
+struct Params { conteo: u32 };
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read>       entrada: array<f32>;
+@group(0) @binding(2) var<storage, read_write> salida:  array<f32>;
+@group(0) @binding(3) var<storage, read_write> sumas:   array<f32>;   // total por bloque
+
+var<workgroup> buf: array<f32, N>;
+
+@compute @workgroup_size(TAM)
+fn scanBloque(@builtin(local_invocation_index) li: u32,
+              @builtin(workgroup_id)          wid: vec3u) {
+
+  let base = wid.x * N;
+  let i0 = base + li;
+  let i1 = base + li + TAM;
+
+  // Carga de dos elementos por invocacion, con relleno neutro.
+  var v0 = NEUTRO;
+  var v1 = NEUTRO;
+  if (i0 < params.conteo) { v0 = entrada[i0]; }
+  if (i1 < params.conteo) { v1 = entrada[i1]; }
+  buf[li]       = v0;
+  buf[li + TAM] = v1;
+
+  // --- Barrido ascendente ---
+  var offset: u32 = 1u;
+  for (var d: u32 = N >> 1u; d > 0u; d >>= 1u) {
+    workgroupBarrier();
+    if (li < d) {
+      let ai = offset * (2u * li + 1u) - 1u;
+      let bi = offset * (2u * li + 2u) - 1u;
+      buf[bi] = comb(buf[ai], buf[bi]);
+    }
+    offset <<= 1u;
+  }
+
+  // El total del bloque esta en la ultima posicion. Se guarda y se
+  // sustituye por el neutro para arrancar el barrido descendente.
+  workgroupBarrier();
+  if (li == 0u) {
+    sumas[wid.x] = buf[N - 1u];
+    buf[N - 1u] = NEUTRO;
+  }
+
+  // --- Barrido descendente ---
+  for (var d: u32 = 1u; d < N; d <<= 1u) {
+    offset >>= 1u;
+    workgroupBarrier();
+    if (li < d) {
+      let ai = offset * (2u * li + 1u) - 1u;
+      let bi = offset * (2u * li + 2u) - 1u;
+      let t = buf[ai];
+      buf[ai] = buf[bi];
+      buf[bi] = comb(t, buf[bi]);
+    }
+  }
+  workgroupBarrier();
+
+  if (i0 < params.conteo) { salida[i0] = buf[li]; }
+  if (i1 < params.conteo) { salida[i1] = buf[li + TAM]; }
+}
+```
+
+Cuatro detalles que hay que respetar.
+
+La barrera va **al principio** del cuerpo del bucle, antes del `if`, no al final. Es lo que garantiza que la escritura del nivel anterior sea visible antes de que este nivel lea. Y como está fuera del `if`, todas las invocaciones la ejecutan aunque solo `li < d` haga trabajo: el control de flujo de la barrera es uniforme.
+
+`offset` acaba valiendo `N` tras el barrido ascendente, y el descendente empieza dividiéndolo, con lo que arranca en `N/2`. Esa asimetría no es un descuido, es lo que hace que los dos barridos recorran el mismo árbol en sentidos opuestos.
+
+En `comb(t, buf[bi])` el orden de los argumentos es el que corresponde al scan: lo que viene de la izquierda va primero. Con la suma es indiferente, con un operador no conmutativo es la diferencia entre correcto e incorrecto.
+
+Y el relleno neutro de la carga es, otra vez, lo que hace el kernel correcto cuando `conteo` no llega a llenar el último bloque. El árbol siempre opera sobre `N` posiciones porque `N` es constante y potencia de dos.
+
+## El balance frente a Hillis-Steele
+
+| | Hillis-Steele | Blelloch |
+|---|---|---|
+| trabajo | `n·log2(n) - n + 1` | `2(n - 1)` |
+| profundidad | `log2(n)` | `2·log2(n)` |
+| barreras | `log2(n)` | `2·log2(n) + 2` |
+| elementos por invocación | 1 | 2 |
+| memoria compartida | `2n` valores | `n` valores |
+| complejidad del código | trivial | moderada |
+
+Con `n = 512`: Hillis-Steele haría 4097 operaciones en 9 pasos, y Blelloch hace 1022 en 18. Blelloch gasta cuatro veces menos trabajo y tarda el doble de pasos.
+
+Cuál gana en la práctica depende del régimen. Si el kernel está limitado por el ancho de banda de la memoria compartida —que es lo habitual en un scan de `f32`, donde la operación es una suma y todo el tiempo se va en leer y escribir— Blelloch gana porque hace la cuarta parte de accesos. Si está limitado por la latencia de las barreras, que es el caso en bloques muy pequeños, gana Hillis-Steele.
+
+Y hay un factor que a menudo decide sin que nadie lo mida: **Blelloch procesa el doble de elementos por workgroup**. Con el límite de 256 invocaciones por workgroup, Hillis-Steele escanea bloques de 256 y Blelloch de 512. Eso reduce a la mitad el número de bloques del [scan de varios bloques](/guia/webgpu/n33-scan-de-varios-bloques/), y con él el tamaño del array intermedio y el coste de las pasadas de consolidación. En un scan de un millón de elementos ese factor pesa más que la diferencia de trabajo.
+
+## Los conflictos de banco, y por qué aquí duelen
+
+Los accesos de Blelloch tienen paso variable: en el nivel `offset`, las invocaciones activas tocan posiciones separadas por `2·offset`. Cuando `offset` llega a 16 o 32, todas las posiciones caen en el mismo banco de memoria compartida y el acceso se serializa por completo.
+
+El remedio clásico, que viene del artículo de Harris, Sengupta y Owens en GPU Gems 3, es añadir un desplazamiento proporcional al índice para desalinearlo respecto al número de bancos:
+
+```wgsl
+const BANCOS: u32 = 32u;                       // suposicion razonable
+fn pad(i: u32) -> u32 { return i + i / BANCOS; }
+
+// El array necesita hueco para el relleno.
+var<workgroup> buf: array<f32, N + N / BANCOS>;
+
+// Y todos los accesos pasan por pad():
+if (li < d) {
+  let ai = pad(offset * (2u * li + 1u) - 1u);
+  let bi = pad(offset * (2u * li + 2u) - 1u);
+  buf[bi] = comb(buf[ai], buf[bi]);
+}
+```
+
+WGSL no expone el número de bancos y no hay forma de consultarlo, así que 32 es una suposición. Funciona bien en la práctica porque todas las arquitecturas conocidas usan un número de bancos que es potencia de dos y menor o igual que 32, y el desplazamiento las desalinea todas. Cuesta `N/32` valores extra de memoria compartida, que para bloques de 512 son 16 flotantes.
+
+Si el kernel no está limitado por la memoria compartida, este relleno no aporta nada y complica el código. Es una optimización que se aplica **después** de medir, no antes.
+
+<Callout type="dios" title="Blelloch guarda la suma del bloque gratis, y eso es lo que hace posible el scan de varios bloques">
+Hay un detalle del barrido ascendente que parece un subproducto y es la pieza clave de todo lo que viene después: al terminar la fase de subida, la última posición del array contiene **la suma total del bloque**, y hay que sacarla de ahí de todas formas para poner el neutro. O sea que Blelloch te da el total del bloque sin gastar ni una operación adicional. Eso importa porque el scan de un array que no cabe en un workgroup necesita exactamente dos cosas: el scan local de cada bloque y el total de cada bloque, para poder escanear los totales y sumar el desplazamiento correspondiente. Con Hillis-Steele el total del bloque está en la última posición del scan inclusivo, así que también sale gratis, pero hay que tener cuidado de leerlo **antes** de convertir a exclusivo, y esa conversión pierde el dato si se hace en sitio. Con Blelloch la extracción está integrada en el algoritmo y es imposible olvidarla. Es un ejemplo de algo que se ve poco en la literatura: la elección entre dos algoritmos con la misma salida a veces se decide por qué información intermedia dejan accesible, no por su coste asintótico. En el diseño de kernels de GPU, donde cada dato que hay que recalcular es un dispatch extra o un viaje a memoria global, esa clase de subproductos vale más que un factor constante en el conteo de operaciones.
+</Callout>

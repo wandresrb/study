@@ -1,6 +1,7 @@
-// Wires the buttons of a <Run> figure to an editor and a runtime. The runtime is
-// pulled on the first click: a lesson the reader never runs pays nothing for it.
+// Wires the buttons of a code <Exercise> to an editor and a runtime. The runtime
+// is pulled on the first click: a lesson the reader never runs pays nothing.
 import { lazyMount } from '../editor/mount';
+import { complete, get, lessonIdOf } from '../learner';
 import type { Editor, EditorOptions } from '../editor/core';
 import type { RunEvent, Runtime, Test, TestResult } from './types';
 
@@ -10,6 +11,35 @@ let js: Promise<JsModule> | null = null;
 const loadJs = () => (js ??= import('./js'));
 
 const runtimes = new WeakMap<HTMLElement, Runtime>();
+/** Runs in this visit: solving it on the first try is what earns the star. */
+const attempts = new WeakMap<HTMLElement, number>();
+
+function paintState(root: HTMLElement, mastery: number | undefined) {
+  const el = root.querySelector<HTMLElement>('[data-state]');
+  if (!el) return;
+  el.textContent = mastery === 2 ? '★' : mastery !== undefined ? '✓' : '○';
+  el.className =
+    'font-mono text-sm normal-case ' +
+    (mastery === 2 ? 'text-yellow' : mastery !== undefined ? 'text-green' : 'text-overlay0');
+}
+
+/** Files a passing run in the learner store and repaints the mark. */
+async function record(root: HTMLElement, attempt: number, solution: string, tests: Test[]) {
+  const id = root.dataset.id;
+  if (!id) return;
+  const lesson = lessonIdOf(location.href);
+  const itemId = `${lesson}#${id}`;
+  await complete(itemId, {
+    kind: 'exercise',
+    lesson,
+    label: root.dataset.label,
+    // enough to replay it away from its lesson
+    data: { solution, tests },
+    noHint: true,
+    withinBudget: attempt === 1,
+  });
+  paintState(root, (await get(itemId))?.mastery);
+}
 const originals = new WeakMap<HTMLElement, string>();
 
 const jsonIn = <T,>(root: ParentNode, sel: string): T | null => {
@@ -61,11 +91,18 @@ async function run(root: HTMLElement) {
     out.scrollTop = out.scrollHeight;
   };
 
+  const attempt = (attempts.get(root) ?? 0) + 1;
+  attempts.set(root, attempt);
+
   for await (const e of rt.run(editor.doc, tests) as AsyncIterable<RunEvent>) {
     if (e.k === 'out') write(e.text);
     else if (e.k === 'err') write(e.text, 'text-red');
-    else if (e.k === 'tests') paintTests(root, e.results);
-    else if (e.k === 'done') {
+    else if (e.k === 'tests') {
+      paintTests(root, e.results);
+      if (e.results.length && e.results.every((r) => r.pass)) {
+        void record(root, attempt, editor.doc, tests);
+      }
+    } else if (e.k === 'done') {
       if (out && !out.textContent) write('(sin salida)', 'text-overlay0');
       write(`— ${e.ms} ms`, 'text-overlay0');
     }
@@ -96,6 +133,10 @@ async function setupEditor(host: HTMLElement): Promise<Editor | void> {
   const { create } = await import('../editor/core');
   const editor = await create(slot, JSON.parse(raw) as EditorOptions);
   originals.set(host, editor.doc);
+  const root = host.closest<HTMLElement>('[data-run]');
+  if (root?.dataset.id) {
+    void get(`${lessonIdOf(location.href)}#${root.dataset.id}`).then((r) => paintState(root, r?.mastery));
+  }
   return editor;
 }
 

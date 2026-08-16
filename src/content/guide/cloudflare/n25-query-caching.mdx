@@ -1,0 +1,149 @@
+---
+title: "Query caching: lecturas populares servidas sin tocar la base"
+description: "La segunda palanca de Hyperdrive cachea las respuestas de las consultas de lectura y las sirve sin llegar al origen. Viene activada por defecto con max_age de 60 segundos y stale_while_revalidate de 15, ampliable hasta una hora. Aquí se ve cómo distingue lectura de escritura, qué consultas quedan fuera por contener funciones volátiles o estables como NOW o RANDOM, y la advertencia que más caro sale: escribir en la base no invalida la caché. De ahí el patrón de dos configuraciones —una cacheada y otra sin caché— para separar lo que tolera desfase de lo que exige frescura, como sesiones, permisos o cualquier lectura inmediatamente posterior a una escritura."
+subject: cloudflare
+level: 25
+order: 3
+position: "25.3"
+duration: "16 min"
+---
+
+<Lead>
+El pool resuelve el coste de hablar con la base; la caché de consultas resuelve algo más ambicioso: no hablar con ella en absoluto. Hyperdrive analiza cada sentencia, decide si lee o escribe, y guarda la respuesta de las lecturas para servirlas desde el edge sin molestar al origen. Está encendida por defecto, lo que significa que ya la estás usando aunque no lo hayas decidido, y esa es exactamente la razón por la que hay que entender sus reglas antes de que te sorprendan. Porque la caché tiene una propiedad que sorprende a todo el mundo la primera vez: escribir en tu base no la invalida.
+</Lead>
+
+<Goals>
+
+- Entender cómo Hyperdrive distingue lecturas de escrituras y qué guarda exactamente.
+- Manejar los dos parámetros de tiempo, `max_age` y `stale_while_revalidate`, y sus valores por defecto.
+- Reconocer qué consultas quedan fuera de la caché por contener funciones volátiles o estables.
+- Decidir cuándo NO cachear y aplicar el patrón de dos configuraciones para lecturas frescas.
+
+</Goals>
+
+## Qué se cachea y durante cuánto
+
+Cuando una consulta pasa por Hyperdrive, lo primero que ocurre es un análisis sintáctico: la sentencia se clasifica como mutante o no mutante. Un `INSERT`, un `UPDATE`, un `DELETE` viajan siempre al origen. Un `SELECT` es candidato a cachearse, y si ya existe una respuesta guardada que coincide, se devuelve desde el edge sin que la base llegue a enterarse de que alguien preguntó.
+
+Nótese lo poco habitual de ese gesto. La mayoría de las cachés que has usado son opacas: guardan un valor bajo una clave que tú eliges y no tienen ni idea de qué significa. Esta lee el SQL, lo interpreta y decide sola. Esa comprensión es lo que le permite acertar sin configuración —distinguir lectura de escritura, detectar lo que no debe guardarse—, y también lo que fija sus límites, porque un analizador solo puede razonar sobre lo que el texto de la consulta le dice, nunca sobre lo que tu aplicación pretende hacer con el resultado.
+
+Merece la pena subrayar la magnitud de lo que eso supone en la arquitectura. Con el pool, una lectura sigue cruzando el planeta: has abaratado el saludo, no el viaje. Con un acierto de caché, la lectura no sale del edge. Son dos órdenes de mejora distintos —uno reduce un coste fijo, el otro elimina el trayecto entero— y por eso una carga con buena tasa de aciertos puede rendir de forma casi indistinguible de una base nativa del borde, aunque su origen esté a diez mil kilómetros. El beneficio no es solo para quien lee: cada acierto es una consulta que tu base no ejecuta, así que la caché es también un mecanismo de protección del origen.
+
+La caché se gobierna con dos números que conviene tener grabados, porque son los que están activos ahora mismo en cualquier configuración que no hayas tocado:
+
+- `max_age` es 60 segundos por defecto: la vida máxima que una respuesta puede servirse desde la caché. Admite hasta una hora como valor máximo.
+- `stale_while_revalidate` es 15 segundos por defecto: la ventana adicional durante la cual se sigue sirviendo la respuesta caducada mientras se revalida en segundo plano.
+
+Esa segunda cifra es la que evita la estampida clásica. Al vencer el `max_age`, la primera petición no se queda esperando a que el origen responda: recibe la copia vieja al instante mientras Hyperdrive refresca por detrás, y las siguientes ya reciben la nueva. El usuario nunca paga el precio del refresco.
+
+El nombre técnico de lo que se evita ahí es el efecto rebaño: sin ventana de revalidación, el instante exacto de la caducidad convierte a todas las peticiones simultáneas en fallos de caché a la vez, y todas salen corriendo hacia el origen al mismo tiempo. Es decir, la caché produciría picos de carga justo en el momento en que más tráfico hay, que es exactamente lo contrario de lo que se le pide. Servir lo caducado mientras se refresca desactiva ese pico convirtiendo un acantilado en una pendiente, y lo hace a cambio de unos segundos adicionales de desfase que casi siempre son gratis en términos de dominio.
+
+```bash
+# crear una configuracion con una ventana de cache mas corta
+npx wrangler hyperdrive create catalogo \
+  --connection-string="postgres://usuario:clave@host:5432/midb" \
+  --max-age=30
+
+# o desactivar la cache por completo en esta configuracion
+npx wrangler hyperdrive create sesiones \
+  --connection-string="postgres://usuario:clave@host:5432/midb" \
+  --caching-disabled
+```
+
+Conviene entender también que una respuesta puede desaparecer de la caché antes de agotar su `max_age`: si una entrada se usa poco, es candidata a ser desalojada. El `max_age` es un techo de vida, no una garantía de permanencia.
+
+De ahí se sigue una consecuencia económica que rara vez se enuncia y que decide si la caché te sirve para algo. Una entrada solo rinde si recibe varios aciertos antes de caducar o de ser desalojada, así que el beneficio real no depende del `max_age` en abstracto sino de la relación entre esa ventana y la frecuencia con que se repite exactamente esa misma consulta. Una consulta que se lanza cien veces por segundo amortiza su entrada de sobra con sesenta segundos de vida; una que se lanza cada cinco minutos no llegará nunca a un acierto por mucho que amplíes la ventana, y toda su ganancia aparente será ruido. Antes de tocar los parámetros, mide la frecuencia de repetición: es la variable que gobierna todo lo demás.
+
+<Callout type="info" title="Cuatro estados que puedes medir">
+Cada consulta que atraviesa Hyperdrive registra un `cacheStatus` que la analítica expone y que es la herramienta de diagnóstico más directa que tienes. Los cuatro valores cuentan cuatro historias distintas: `hit` significa que se sirvió desde la caché; `miss`, que era cacheable pero no había copia y hubo que ir al origen; `disabled`, que esa configuración tiene la caché apagada; y `uncacheable`, que la consulta quedó excluida por su contenido. Confundir un `miss` masivo con un `uncacheable` masivo lleva a diagnósticos opuestos: el primero pide más tráfico o más `max_age`, el segundo pide reescribir el SQL.
+</Callout>
+
+## Lo que nunca se cachea
+
+Hay consultas que Hyperdrive se niega a cachear, y la razón es de corrección, no de rendimiento. Postgres clasifica sus funciones por volatilidad, y desde 2026 Hyperdrive trata como no cacheables tanto las funciones `VOLATILE` —como `RANDOM` o `LASTVAL`— como las `STABLE` —como `NOW`, `CURRENT_TIMESTAMP` o `CURRENT_DATE`—. El motivo es sutil y correcto: una función estable puede devolver valores distintos en sentencias distintas dentro de la misma transacción, así que cachear su resultado equivale a servir datos falsos.
+
+La detección se hace por coincidencia de patrones sobre el texto de la consulta, y ahí aparece la trampa: basta con que el nombre de una de esas funciones aparezca en el SQL —incluso dentro de un comentario— para que la consulta entera quede marcada como no cacheable. Un comentario inocente puede tumbar tu tasa de aciertos sin que nada falle visiblemente.
+
+Que la detección sea textual y no semántica tiene una lectura que conviene aceptar sin resistencia: el sistema prefiere equivocarse por exceso de prudencia. Marcar como no cacheable algo que quizá sí lo era solo cuesta rendimiento; cachear algo que no debía cachearse cuesta corrección, y un dato incorrecto servido rápido es peor que un dato correcto servido despacio. Cuando descubras que una consulta tuya cae en `uncacheable` por un nombre de función escondido en un comentario, la respuesta adecuada no es indignarse con el analizador sino limpiar el texto.
+
+La solución es siempre la misma y es buena práctica por sí sola: sacar el cálculo volátil del SQL y llevarlo al Worker, pasando el resultado como parámetro. Además de devolver la consulta a la zona cacheable, la vuelve determinista y comprobable, que es justo lo que uno quiere de una sentencia que va a ejecutarse millones de veces.
+
+```ts
+// NO se cachea: el nombre de la funcion volatil aparece en el texto
+const recientes = await sql`
+  SELECT id, titulo FROM articulos WHERE creado_en > NOW() - INTERVAL '1 day'
+`;
+
+// SI se cachea: el instante se calcula en el Worker y viaja como parametro
+const desde = new Date(Date.now() - 86400000).toISOString();
+const cacheables = await sql`
+  SELECT id, titulo FROM articulos WHERE creado_en > ${desde}
+`;
+```
+
+<Callout type="warn" title="Los comentarios no son una API de invalidación">
+Existe la tentación de creer que cambiar un comentario del SQL genera una entrada de caché distinta, y no es así: dos consultas idénticas con comentarios diferentes comparten el mismo valor cacheado. Si una se ejecuta antes, la otra recibirá su resultado. Hyperdrive no documenta los comentarios como mecanismo de control de caché y el comportamiento del analizador difiere entre motores, así que apoyarse en ese detalle es construir sobre arena. Cuando necesites una lectura garantizadamente fresca, la respuesta es una configuración sin caché, nunca un truco en el texto de la consulta.
+</Callout>
+
+## Cuándo NO cachear
+
+Aquí está la propiedad que hay que interiorizar antes que ninguna otra: **Hyperdrive no invalida la caché cuando tu aplicación escribe en la base**. No hay ningún mecanismo que conecte un `UPDATE` con las entradas cacheadas que ese `UPDATE` deja obsoletas. Un `SELECT` posterior que coincida seguirá devolviendo el valor viejo hasta que expire su `max_age`, e incluso durante la ventana de revalidación. Las escrituras llegan siempre a la base; lo que queda desincronizado es la lectura.
+
+La secuencia que hay que visualizar es sencilla y devastadora si te pilla desprevenido. Un usuario actualiza su dirección, tu Worker ejecuta el `UPDATE`, la base la guarda correctamente y devuelve éxito. Acto seguido la interfaz recarga la ficha con un `SELECT` que ya estaba cacheado hace veinte segundos, y el usuario ve su dirección antigua. Nada ha fallado: ni la escritura, ni la lectura, ni la caché, que hizo exactamente lo que se le pidió. Lo que falló fue la suposición de que escribir y leer comparten una noción común del presente, y esa suposición no la garantiza nadie salvo tú al elegir por dónde enrutas cada lectura.
+
+Eso convierte la elección de cachear en una pregunta de dominio, no de infraestructura: ¿cuánto desfase tolera este dato concreto? Dos familias de datos responden que ninguno.
+
+<Cards>
+  <Card icon="⏱️" title="Datos volátiles">
+    Saldos, inventario al límite, estado de un pedido, permisos, ajustes de administración, cualquier lectura inmediatamente posterior a una escritura. Ver un valor de hace un minuto no es un detalle estético: es un error funcional.
+  </Card>
+  <Card icon="👤" title="Datos por usuario">
+    Sesiones, autenticación, perfiles y carritos. Además del riesgo de servir estado ajeno al momento, la eficacia se desploma: cada usuario genera su propia entrada, así que la tasa de aciertos tiende a cero y solo pagas el coste sin cobrar el beneficio.
+  </Card>
+</Cards>
+
+Entre las dos hay un matiz que las diferencia y que conviene tener claro: en los datos volátiles el problema es la corrección, y en los datos por usuario es además la inutilidad. Un saldo cacheado es peligroso aunque la caché funcione a la perfección; un carrito cacheado es peligroso y, encima, no acierta nunca. Reconocer cuál de las dos objeciones aplica ayuda a decidir si el remedio es acortar la ventana o sacar esa lectura de la caché por completo.
+
+El patrón recomendado no es apagar la caché en todo el proyecto, sino **separar los caminos**: dos configuraciones de Hyperdrive apuntando a la misma base, una con caché y otra con `--caching-disabled`, declaradas como dos bindings distintos. Las lecturas tolerantes viajan por la primera; las que exigen frescura, por la segunda. La configuración sin caché conserva íntegro el pool de conexiones y el establecimiento cercano, así que no renuncias a nada más.
+
+Esa última frase es la que hace viable el patrón, y conviene no pasarla por alto: desactivar la caché no es renunciar a Hyperdrive. Las dos palancas son independientes, y la del pool —que es la que evita que tu base caiga— sigue intacta. Una configuración sin caché es, exactamente, un camino corto y siempre fresco hasta tu origen.
+
+```jsonc
+{
+  "hyperdrive": [
+    { "binding": "HD_CACHE", "id": "id-de-la-config-con-cache" },
+    { "binding": "HD_FRESCO", "id": "id-de-la-config-sin-cache" }
+  ]
+}
+```
+
+<Mermaid code={`flowchart TD
+  Q[lectura desde el Worker] --> D{tolera desfase de un minuto}
+  D -->|si| C[binding con cache]
+  D -->|no| F[binding sin cache]
+  C --> H[respuesta desde el edge]
+  C -.miss.-> DB[Postgres origen]
+  F --> DB
+  class C t-green
+  class F t-peach
+  class DB t-blue`} />
+
+Si tu ORM o tu biblioteca de autenticación es quien construye el SQL y no te deja elegir consulta por consulta, la traducción del patrón es directa: crea dos clientes de base de datos, uno sobre cada binding, y entrega el cliente sin caché al código que necesita leer fresco. Solo cuando la mayoría de tus lecturas exigen frescura tiene sentido desactivar la caché globalmente.
+
+Existe además una vía intermedia que se pasa por alto y que suele ser la más razonable en aplicaciones reales: en lugar de la disyuntiva entre cachear un minuto o no cachear nada, bajar el `max_age` y el `stale_while_revalidate` a unos pocos segundos. Muchos datos que se declaran intolerantes al desfase en realidad toleran tres segundos sin ninguna consecuencia visible, y tres segundos bastan para absorber la mayor parte de una avalancha de lecturas repetidas. Reservar el binding sin caché para lo que de verdad exige lectura inmediata después de escritura, y afinar la ventana para todo lo demás, produce sistemas mucho más rápidos que la elección binaria.
+
+<Callout type="note" title="Los parámetros forman parte de la identidad de la consulta">
+Una entrada de caché no corresponde a una tabla ni a un endpoint, sino a una consulta concreta con sus valores ligados concretos. Dos `SELECT` idénticos con parámetros distintos son dos entradas distintas, y eso explica por qué las consultas paramétricas por usuario fragmentan la caché hasta volverla inútil, mientras que una consulta de catálogo sin parámetros o con pocos valores posibles concentra todos los aciertos en un puñado de entradas calientes. Diseñar para la caché consiste, en buena medida, en reducir la cardinalidad de los parámetros que participan en tus lecturas más frecuentes.
+</Callout>
+
+<Callout type="dios" title="Toda caché es una apuesta sobre el tiempo, y quien la hace no es la infraestructura">
+La caché de consultas de Hyperdrive es una lección condensada sobre la naturaleza de cachear cualquier cosa, y la lección empieza por desmontar un malentendido muy extendido: creer que una caché es un componente de rendimiento. No lo es. Una caché es una afirmación sobre el tiempo —esta respuesta seguirá siendo verdad durante N segundos— y esa afirmación no la puede hacer ninguna infraestructura, porque depende de qué significa el dato para el negocio, no de cómo se almacena. Un catálogo de productos con un minuto de retraso sigue siendo un catálogo correcto; un saldo con un minuto de retraso es una mentira con consecuencias legales. La misma tabla, la misma consulta, la misma latencia, y sin embargo una tolera la caché y la otra no, porque lo que cambia no está en ningún sitio del sistema técnico sino en el contrato con el usuario. Que Hyperdrive no invalide al escribir es lo que hace explícita esa verdad y, lejos de ser una carencia, es una decisión honesta: invalidar de verdad exigiría entender las dependencias entre cada escritura y cada consulta cacheada, un problema que en el caso general no tiene solución barata ni fiable, y fingir que sí la tiene produciría una falsa sensación de seguridad mucho peor que la advertencia. Al no prometerlo, la plataforma te devuelve la decisión a ti, que eres el único que puede tomarla, y te da la herramienta adecuada para expresarla: dos caminos hacia la misma base, uno rápido y ligeramente atrasado, otro fresco y algo más caro, elegidos consulta a consulta. Esa forma de pensar —clasificar cada lectura por la frescura que exige antes de decidir por dónde la enrutas— es transferible a cualquier sistema con caché que construyas en tu vida, con Cloudflare o sin él. Y su corolario práctico es incómodo pero liberador: si no sabes decir cuántos segundos de desfase tolera un dato, todavía no lo entiendes lo suficiente como para cachearlo.
+</Callout>
+
+<Challenge title="Clasifica tus lecturas por frescura">
+1. Enuncia de memoria los valores por defecto de `max_age` y `stale_while_revalidate`, y explica qué problema evita el segundo.
+2. Toma cinco consultas reales de un proyecto y asigna a cada una los segundos de desfase que tolera; enruta cada una al binding que le corresponda.
+3. Encuentra una consulta que quede fuera de la caché por contener una función volátil o estable y reescríbela para que sea cacheable.
+4. Explica con un ejemplo concreto por qué escribir en la base no refresca la caché, y qué error de producto produciría eso en un flujo de compra.
+5. Justifica por qué cachear datos por usuario suele ser inútil además de arriesgado, razonando sobre la tasa de aciertos.
+</Challenge>

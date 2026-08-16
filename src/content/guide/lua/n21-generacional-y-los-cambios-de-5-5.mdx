@@ -1,0 +1,149 @@
+---
+title: "Generacional y el gran cambio de Lua 5.5: las mayores también son incrementales"
+description: "La hipótesis generacional dice que la inmensa mayoría de los objetos muere joven, y de ahí sale un recolector que revisa a los recién nacidos a menudo y a los veteranos casi nunca. Lua 5.4 implementó esa idea con un talón de Aquiles: cuando tocaba una recolección mayor, se paraba el mundo entero. Lua 5.5, publicada en diciembre de 2025, elimina ese talón haciendo las recolecciones mayores de forma incremental, con lo que el modo generacional deja de tener un peor caso catastrófico y pasa a ser la opción razonable para programas de larga duración."
+subject: lua
+level: 21
+order: 3
+position: "21.3"
+duration: "23 min"
+---
+
+<Lead>
+Durante quince años el recolector de Lua ofreció una elección incómoda. El modo incremental daba pausas cortas y estables a cambio de recorrer el grafo entero una y otra vez, incluidas las estructuras grandes y evidentemente vivas que llevaban horas sin cambiar. El modo generacional que llegó con 5.4 resolvió justamente eso —dejar de mirar lo que no ha muerto— pero introdujo un peor caso feroz: cuando el heurístico decidía que tocaba una recolección mayor, se paraba el mundo y se recorría todo de una sentada, así que el programa más plácido podía sufrir de repente el mismo tirón que un recolector de los años setenta. Lua 5.5 cierra ese hueco de la única forma que tiene sentido: las recolecciones mayores del modo generacional pasan a hacerse **de forma incremental**. Esta lección es sobre esa idea, sobre cómo está construida y sobre qué mejora exactamente.
+</Lead>
+
+<Goals>
+
+- Enunciar la hipótesis generacional y explicar por qué se cumple con tanta fuerza en programas Lua.
+- Describir el sistema de edades del modo generacional y el invariante que sostiene la barrera de escritura.
+- Explicar en qué consiste el cambio de Lua 5.5 y qué desaparece exactamente del perfil de pausas.
+- Decidir con criterio qué modo activar según el perfil de asignación y las exigencias de latencia.
+
+</Goals>
+
+## La hipótesis: casi todo muere joven
+
+La observación empírica que sostiene todo esto lleva décadas verificándose en lenguajes muy distintos entre sí: **la inmensa mayoría de los objetos muere muy poco después de nacer**, y los que sobreviven un rato tienden a sobrevivir mucho más. La distribución de vidas no es plana ni normal: es una caída brutal seguida de una cola larguísima.
+
+En Lua esa distribución es todavía más extrema que en la media, y por razones estructurales del lenguaje. Una tabla creada como argumento con nombre muere al volver de la llamada. Una concatenación en un bucle produce cadenas intermedias que mueren en la iteración siguiente. Una closure creada para pasarla a una función de orden superior muere al terminar la llamada. Un iterador muere al agotar el bucle. Frente a eso, la tabla de configuración, el registro de módulos, el estado del mundo y las metatablas de tus clases viven desde el arranque hasta el apagado.
+
+Hay además un factor cultural que refuerza la asimetría en este lenguaje concreto. Como en Lua la tabla es la única estructura de datos, absolutamente todo se expresa creando tablas: un registro, una tupla de retorno, un conjunto de opciones, un par de coordenadas. La consecuencia es que la tasa de creación de objetos efímeros en un programa Lua idiomático es mucho más alta que en lenguajes con registros en la pila o tipos por valor, y por tanto el premio de tratar bien a los recién nacidos es proporcionalmente mayor.
+
+Un recolector incremental clásico trata a ambos grupos exactamente igual: en cada ciclo recorre las mil tablas efímeras y también las cincuenta mil permanentes, y del segundo recorrido no obtiene absolutamente nada, porque nada de eso va a morir. La idea generacional consiste en aprovechar la asimetría: separar los objetos por edad, revisar a los jóvenes con mucha frecuencia y a los viejos casi nunca.
+
+<Callout type="info" title="Vieja no significa grande ni importante">
+La edad de un objeto en el recolector se mide en ciclos sobrevividos, no en tiempo ni en bytes. Una tabla de un millón de elementos creada hace un instante es *nueva*; una tabla vacía creada al arrancar el programa es *vieja*. Lo único que importa es cuántas recolecciones ha esquivado.
+</Callout>
+
+## Edades, colecciones menores y el invariante que hay que sostener
+
+El modo generacional de Lua clasifica cada objeto por edad. Simplificando la escala real, hay tres estados que importan: **nuevo** —creado desde la última recolección—, **superviviente** —ha esquivado una— y **viejo** —ha esquivado suficientes como para considerarlo estable—.
+
+Una **recolección menor** recorre únicamente los objetos nuevos y supervivientes. Es baratísima, porque en un programa típico esa población es una fracción diminuta del total, y libera casi toda la basura, porque casi toda la basura es joven. Los que sobrevivan a la menor envejecen un escalón. Una **recolección mayor** es el ciclo completo de siempre: recorre absolutamente todo y es la única que puede liberar objetos viejos que murieron.
+
+<Mermaid code={`flowchart TD
+  N[Nuevo: creado desde la ultima recoleccion] --> S[Superviviente: esquivo una menor]
+  S --> V[Viejo: estable, no se revisa en las menores]
+  V --> T[Tocado: un viejo al que se le escribio una referencia]
+  T --> V
+  T --> L[Lista de viejos tocados, revisada en cada menor]`} />
+
+Aquí aparece el problema de fondo, y es el mismo que en la lección anterior con otro disfraz. Si una recolección menor solo mira a los jóvenes, ¿cómo descubre a un objeto joven cuya única referencia está guardada dentro de un objeto viejo, que por definición no se va a recorrer? Sin una respuesta, ese joven se declararía basura estando vivo.
+
+La respuesta es el mismo invariante de siempre, reformulado: **ningún objeto viejo debe apuntar a un objeto joven sin que el recolector lo sepa**. Y el mecanismo que lo sostiene es la barrera de escritura que ya conoces, reutilizada: cuando el programa escribe una referencia dentro de un objeto viejo, la barrera lo marca como *tocado* y lo mete en una lista aparte. Las recolecciones menores recorren los jóvenes **más** esa lista de viejos tocados, y con eso el invariante se mantiene sin recorrer el resto del grafo veterano.
+
+```lua
+local mundo = { entidades = {} }         -- tras un rato, mundo ya es viejo
+collectgarbage("generational")
+
+for i = 1, 1000 do
+  -- Cada insercion en una tabla vieja activa la barrera:
+  -- mundo.entidades pasa a la lista de tocados y sera revisada
+  -- en la proxima recoleccion menor.
+  mundo.entidades[i] = { vida = 100, pos = { x = 0, y = 0 } }
+end
+```
+
+De ahí sale una guía de rendimiento concreta y contraintuitiva: en modo generacional, **escribir referencias nuevas dentro de estructuras viejas es la operación cara**, no crear objetos. Un programa que mete objetos frescos en un contenedor permanente en cada imagen mantiene ese contenedor en la lista de tocados permanentemente, y las menores dejan de ser baratas.
+
+La escala real de edades tiene algún escalón más que los tres que hemos descrito, y la razón es sutil: un objeto que acaba de sobrevivir a su primera recolección todavía no merece confianza, porque pudo salvarse por accidente —estaba vivo justo en ese instante y murió medio milisegundo después—. Exigir dos supervivencias antes de conceder la vejez filtra ese ruido y evita que la población de viejos se contamine con objetos que en realidad eran efímeros. Del mismo modo, un objeto viejo que ha sido tocado no vuelve directamente al estado estable: pasa por un escalón intermedio que garantiza que se revise durante otra recolección más antes de dejar de mirarlo.
+
+<Callout type="tip" title="Las estructuras que se llenan una vez y se leen mil son las ideales">
+El modo generacional premia exactamente el patrón que un buen diseño ya recomienda: construir una estructura, dejarla estable y consultarla. Penaliza el patrón contrario, el contenedor permanente que se muta en cada iteración. Si el generacional no te da nada, mira primero qué estás escribiendo dentro de tus estructuras de larga vida.
+</Callout>
+
+## Lo que cambia en Lua 5.5
+
+El modo generacional de Lua 5.4 tenía un defecto que limitaba mucho su adopción real: las recolecciones mayores eran **de una sola pieza**. Mientras el programa se mantenía en el régimen de menores, las pausas eran minúsculas y el modo brillaba; pero cuando el heurístico detectaba que la memoria vieja había crecido demasiado y convocaba una mayor, esa mayor se ejecutaba entera, sin trocear, parando el mundo. El perfil resultante era el peor posible para un interactivo: latencia excelente durante minutos y de golpe un tirón enorme, precisamente el patrón que más se nota y más difícil es de diagnosticar.
+
+Lua 5.5, publicada en diciembre de 2025, corrige exactamente eso. **Las recolecciones mayores del modo generacional se realizan ahora de forma incremental**: cuando el recolector decide que hace falta un recorrido completo, no lo ejecuta de golpe sino que pasa a trabajar por pasos, con la misma maquinaria de troceado y barreras del modo incremental, y al terminar vuelve al régimen de menores. El modo generacional deja de ser *menores baratas más una bomba de relojería* y pasa a ser *menores baratas más mayores troceadas*.
+
+<Mermaid code={`flowchart LR
+  A[Lua 5.4 generacional] --> B[Menores muy baratas]
+  A --> C[Mayor de una pieza: parada larga del mundo]
+  D[Lua 5.5 generacional] --> E[Menores muy baratas]
+  D --> F[Mayor troceada en pasos: sin parada larga]`} />
+
+Lo que mejora, dicho con precisión: no baja el trabajo total, que sigue siendo el mismo recorrido completo del grafo, y no baja la frecuencia con que se convoca una mayor. Lo que desaparece es el **peor caso de latencia**. La pausa máxima del modo generacional deja de ser proporcional al tamaño del grafo vivo y pasa a ser proporcional al tamaño de un paso, igual que en el modo incremental. Para un servidor que lleva semanas en pie, un juego con sesiones largas o un editor con un proyecto grande cargado —los casos donde la memoria vieja crece de forma sostenida y las mayores son inevitables— eso convierte un modo experimental en un modo utilizable.
+
+El precio, honesto, es el de siempre: una mayor incremental cuesta algo más en total que una mayor de una pieza, por las barreras y el reprocesado que ya conoces, y arrastra basura flotante. El cambio no es una optimización, es un movimiento deliberado en el eje pausa contra rendimiento, en la misma dirección que el resto del diseño de Lua.
+
+Hay además una consecuencia de segundo orden que conviene anticipar. Como la mayor deja de ser instantánea, existe ahora una ventana de tiempo en la que el recolector está recorriendo el grafo completo mientras el programa sigue creando objetos jóvenes. Durante esa ventana el sistema de edades no puede aplicar sus atajos, así que el coste por objeto sube temporalmente y la memoria pico es algo mayor que la que se observaba con una mayor de una pieza. Es exactamente el mismo tributo de basura flotante que paga el modo incremental clásico, trasladado al régimen generacional, y en un programa de larga duración es un intercambio que sale a cuenta con holgura: unos megabytes más de pico a cambio de que ninguna imagen se pierda.
+
+<Callout type="warn" title="Ni el generacional ni el incremental arreglan un grafo mal diseñado">
+Ningún modo de recolección puede compensar un programa que mete objetos frescos en estructuras permanentes sin parar ni uno que mantiene vivo lo que ya no usa. Los modos redistribuyen el coste; la cantidad de trabajo la fija tu código. Si el perfil no mejora al cambiar de modo, la respuesta casi nunca está en el recolector.
+</Callout>
+
+<Cards>
+  <Card icon="👶" title="La asimetría es real">
+    En programas Lua típicos, la proporción de objetos que mueren antes de la primera recolección supera con holgura el noventa por ciento. Revisar a los veteranos en cada ciclo es trabajo puro sin retorno.
+  </Card>
+  <Card icon="🔗" title="La lista de tocados es la clave">
+    Un viejo al que se le escribe una referencia entra en una lista que las menores sí recorren. Ese es el puente que permite mirar solo a los jóvenes sin perder a ninguno vivo.
+  </Card>
+  <Card icon="🧨" title="El fallo de 5.4">
+    Las mayores de una pieza producían un perfil de latencia con picos aislados y enormes, el patrón más difícil de detectar en pruebas y el más molesto en producción.
+  </Card>
+  <Card icon="🩹" title="Lo que arregla 5.5">
+    Al trocear las mayores, la pausa máxima del modo generacional pasa a depender del tamaño de paso y no del grafo vivo. El coste total sube un poco; el pico desaparece.
+  </Card>
+</Cards>
+
+## Qué modo elegir
+
+Cambiar de modo es una llamada, y se puede hacer en caliente. En 5.5 el modo generacional se pide con la opción correspondiente y el ajuste fino se hace con los parámetros que controlan cada cuánto se convoca una menor, cuándo se decide escalar a una mayor y cuándo se vuelve al régimen de menores.
+
+```lua
+collectgarbage("generational")   -- activa el modo generacional
+collectgarbage("incremental")    -- vuelve al modo incremental clasico
+```
+
+Los tres parámetros del modo generacional responden, uno a uno, a las tres decisiones que el recolector tiene que tomar. El **multiplicador de menores** fija cuánto tiene que crecer la memoria respecto al final de la última recolección mayor para que se convoque una menor; su valor por defecto es pequeño, del orden de un veinte por ciento, precisamente porque una menor es barata y conviene hacerla a menudo. El **umbral de escalada** decide en qué punto la memoria vieja ha crecido lo bastante como para que una menor deje de servir y haya que hacer una mayor. Y el **umbral de retorno** decide, al terminar una mayor, si el programa ha vuelto a un régimen en el que las menores compensan o si conviene seguir en incremental un rato más.
+
+Ese tercer parámetro solo tiene sentido en 5.5 y es la firma del cambio: en un recolector donde la mayor es un evento atómico no hay nada que decidir después, porque al terminar ya estás donde estabas. En uno donde la mayor es un régimen troceado, entrar y salir de ese régimen es una decisión con la que se puede afinar, y por eso aparece una perilla nueva. Como siempre, los valores por defecto están ajustados contra programas reales y la probabilidad de mejorarlos a ojo es baja.
+
+<Callout type="tip" title="Cambiar de modo en caliente es legítimo y muy útil">
+Nada impide activar el modo generacional durante la fase de juego y volver al incremental durante una carga de nivel, donde se asigna muchísimo y se descarta casi todo de golpe. El modo es estado del intérprete, no una decisión de compilación, y ajustarlo por fases del programa suele rendir más que buscar una configuración única que sirva para todo.
+</Callout>
+
+La regla operativa es sencilla. El modo generacional gana cuando tienes **mucha memoria vieja y estable y mucha basura joven**: motores de juego con el estado del mundo cargado, servidores con sesiones, editores con un documento grande residente. El modo incremental sigue siendo preferible cuando el grafo vivo es pequeño o cuando la memoria muere en bloques grandes y poco frecuentes, porque ahí la separación por edades no compra nada y las barreras extra solo cuestan.
+
+Y como siempre en esta materia, la única forma de decidir es medir. El modo generacional puede ser espectacular o indiferente según el perfil de asignación, y ese perfil lo determina cómo escribe tu programa, no el manual.
+
+Al medir, la métrica que hay que mirar no es el tiempo total sino la **distribución completa de las latencias**. Un promedio idéntico puede esconder dos perfiles radicalmente distintos, y el que importa en un sistema interactivo es el de la cola: cuántas iteraciones superan tu presupuesto y por cuánto. Registrar la duración de cada iteración en un histograma y comparar los percentiles altos entre modos cuesta veinte líneas de código y es la única evidencia que debería hacerte cambiar de configuración en producción.
+
+<Callout type="dios" title="El cambio de 5.5 no añade una técnica: elimina una elección falsa">
+Lo interesante de la evolución del recolector de Lua es que las dos ideas grandes —trocear y separar por edad— atacan problemas ortogonales, y sin embargo durante toda la vida de 5.4 el usuario tuvo que elegir entre ellas como si fueran alternativas. El modo incremental compraba latencia estable pagando trabajo repetido sobre estructuras que nunca iban a morir; el modo generacional dejaba de repetir ese trabajo pero renunciaba al troceado justo en el momento en que más falta hacía, porque su recolección mayor era exactamente el recolector que para el mundo del que se llevaba huyendo desde 5.1. La consecuencia es que el modo generacional era una apuesta: si tu programa se mantenía en régimen de menores, ganabas mucho; si tu memoria vieja crecía, cambiabas una pequeña ganancia constante por un pico ocasional catastrófico, y en sistemas interactivos ese intercambio casi nunca sale a cuenta, porque un pico raro es peor que un coste conocido. Que Lua 5.5 haga las mayores de forma incremental no es, por tanto, un ajuste de rendimiento: es la unificación de dos líneas de trabajo que llevaban veinte años avanzando en paralelo, y su efecto sobre el usuario no se mide en porcentajes sino en el hecho de que **desaparece una pregunta que antes había que contestar mal por fuerza**. El recolector puede ahora prometer a la vez las dos cosas que un sistema de larga duración necesita: que el caso común sea barato porque no vuelve a mirar lo que evidentemente sigue vivo, y que el caso raro no rompa nada porque llega repartido. Hay una moraleja de arquitectura ahí, y es la razón por la que este cambio merece una lección entera: cuando un sistema te obliga a elegir entre dos propiedades deseables, muy a menudo la elección no es una ley de la naturaleza sino una limitación de la implementación que nadie ha ido a arreglar todavía, y el trabajo de ingeniería más valioso no es optimizar cualquiera de las dos ramas, sino descubrir que la bifurcación entera era innecesaria.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+La hipótesis generacional —casi todo muere joven, lo que sobrevive dura mucho— justifica separar los objetos por edad y revisar solo a los jóvenes en las recolecciones menores. El puente que hace correcto ese atajo es la barrera de escritura, que marca como *tocado* a todo objeto viejo al que se le escribe una referencia y lo mete en una lista que las menores sí recorren. En Lua 5.4 las recolecciones mayores eran de una sola pieza y devolvían al programa la parada del mundo que el modo incremental había eliminado. Lua 5.5, de diciembre de 2025, hace esas mayores **de forma incremental**: el trabajo total no baja, pero la pausa máxima deja de depender del grafo vivo y pasa a depender del paso, que es justo lo que necesitan los programas de larga duración.
+</Callout>
+
+<Challenge title="Compara los dos modos con tus propios datos">
+1. Construye un estado permanente de doscientas mil tablas y, sobre él, un bucle que cree y descarte diez mil objetos efímeros por iteración. Mide el tiempo total en modo incremental y en modo generacional.
+2. Instrumenta el mismo bucle registrando la duración de cada iteración y representa el histograma. Compara las colas de los dos modos, no las medias.
+3. Haz que el estado permanente crezca de forma sostenida para forzar recolecciones mayores. Si dispones de 5.4 y 5.5, contrasta el pico de latencia en modo generacional entre ambas versiones.
+4. Modifica el bucle para que los objetos nuevos se guarden dentro del estado viejo en lugar de descartarse, y explica por qué las menores dejan de ser baratas.
+5. Determina experimentalmente, para tu programa, el punto en que el modo generacional deja de compensar. Escribe en una frase cuál es la propiedad de tu perfil de asignación que marca ese umbral.
+</Challenge>

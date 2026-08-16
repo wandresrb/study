@@ -1,0 +1,143 @@
+---
+title: "El control de flujo uniforme y el análisis que rechaza tu shader"
+description: "Qué significa que un punto del programa sea uniforme, qué operaciones lo exigen y por qué, qué valores considera uniformes el análisis, y las tres formas de arreglar el error."
+subject: webgpu
+level: 12
+order: 5
+position: "12.5"
+duration: "23 min"
+---
+
+<Lead>
+Escribes un `textureSample` dentro de un `if` y el compilador rechaza el módulo con un mensaje sobre uniformidad de derivadas. El código es correcto en cualquier lectura razonable, la textura existe, los tipos casan, y aun así no compila. Este es el error que más desconcierta de WGSL, y detrás hay una restricción real del hardware que WebGL tenía igual pero no comprobaba.
+</Lead>
+
+<Goals>
+
+- Definir uniformidad respecto del grupo de invocaciones que corresponde a cada operación.
+- Enumerar las operaciones que exigen control de flujo uniforme y la razón física de cada una.
+- Clasificar los valores de un shader en uniformes y no uniformes.
+- Aplicar las tres reparaciones posibles y elegir la correcta en cada caso.
+
+</Goals>
+
+## Qué significa uniforme
+
+Un valor es **uniforme** respecto de un conjunto de invocaciones si vale lo mismo en todas ellas. Un punto del programa tiene **control de flujo uniforme** si, para ese conjunto, o lo alcanzan todas las invocaciones o no lo alcanza ninguna.
+
+Lo importante es que el conjunto no es siempre el mismo. Para una barrera de grupo, el conjunto es **el grupo de trabajo entero**. Para una derivada en un fragment shader, el conjunto es el **cuadrado de 2x2 invocaciones vecinas** que el rasterizador procesa a la vez. Son escalas distintas y por eso la misma expresión puede ser uniforme para una operación y no para otra.
+
+WGSL comprueba esto con un **análisis estático** en tiempo de compilación. No ejecuta nada, no sabe qué datos vas a pasar: sigue las dependencias desde las fuentes conocidas de no uniformidad y decide si puede **demostrar** que un punto es uniforme. Como todo análisis conservador, rechaza programas que en ejecución habrían sido correctos, y esa es la fuente de la mayoría de la frustración.
+
+## Las operaciones que lo exigen
+
+| Operación | Escala | Por qué |
+|---|---|---|
+| `dpdx`, `dpdy`, `fwidth` y sus variantes | cuadrado de 2x2 | se calculan restando el valor de invocaciones vecinas |
+| `textureSample` | cuadrado de 2x2 | elige el nivel de mip con derivadas implícitas de la coordenada |
+| `textureSampleBias` | cuadrado de 2x2 | igual, con un sesgo aplicado al nivel |
+| `textureSampleCompare` | cuadrado de 2x2 | igual, con comparación de profundidad |
+| `workgroupBarrier` | grupo de trabajo | tienen que llegar todas o hay bloqueo |
+| `storageBarrier` | grupo de trabajo | igual |
+| `workgroupUniformLoad` | grupo de trabajo | lee un valor que tiene que ser el mismo para todas |
+
+Las dos razones físicas son distintas y conviene entenderlas por separado.
+
+**Las derivadas se calculan por diferencias finitas dentro del cuadrado.** El rasterizador no sombrea píxeles sueltos: sombrea grupos de dos por dos, siempre, incluso en el borde de un triángulo donde solo uno de los cuatro está cubierto. Los tres restantes se ejecutan igualmente como **invocaciones auxiliares**, cuyo único propósito es que existan valores con los que restar. `dpdx(v)` es literalmente la diferencia entre el `v` de la invocación de la derecha y el de la izquierda del cuadrado.
+
+Si una invocación del cuadrado no ejecutó la línea donde se calcula `v` —porque tomó la otra rama de un `if`—, la resta se hace contra un valor que nunca se calculó. El resultado no es un error: es un número sin sentido, que en el caso de `textureSample` se traduce en un nivel de mip aleatorio y en una franja de textura borrosa o pixelada en el borde de la rama.
+
+**Las barreras necesitan que lleguen todas.** Una barrera de grupo detiene a cada invocación hasta que llegan las demás. Si unas entran en una rama con barrera y otras no, las primeras esperan para siempre a las segundas. En hardware real eso es un cuelgue del dispatch, y en algunos sistemas un reinicio del driver.
+
+## Qué considera uniforme el análisis
+
+**Uniformes**, siempre:
+
+- Los literales, las `const` y las `override`.
+- Los valores leídos de una variable `var<uniform>`. Son iguales para todas las invocaciones por definición del espacio.
+- `workgroup_id` y `num_workgroups`, a escala de grupo de trabajo.
+- Cualquier expresión que solo dependa de lo anterior.
+
+**No uniformes**:
+
+- `global_invocation_id`, `local_invocation_id` y `local_invocation_index`.
+- `vertex_index` e `instance_index`.
+- En fragmento, `position`, `front_facing`, `sample_index` y cualquier `@location` interpolada.
+- Los valores leídos de `var<storage>` y de `var<workgroup>`, porque son memoria escribible y el análisis no puede saber qué hay.
+- El resultado de cualquier lectura de textura.
+- Todo lo que se derive de los anteriores, incluidas comparaciones y condiciones de bucle.
+
+Ese penúltimo punto es el que sorprende: **leer de un storage buffer produce un valor no uniforme aunque todas las invocaciones lean la misma posición**. El análisis no razona sobre direcciones, y una escritura desde otra invocación podría haber cambiado el contenido. Si de verdad necesitas ramificar sobre un valor de storage y luego muestrear texturas, ese dato tiene que estar en un uniform buffer.
+
+## El error canónico y sus tres salidas
+
+Este fragmento no compila:
+
+```wgsl
+@fragment
+fn fs(entrada : Entrada) -> @location(0) vec4f {
+  if entrada.uv.x > 0.5 {
+    return textureSample(albedo, muestreo, entrada.uv);   // uniformidad de derivadas
+  }
+  return vec4f(0.0, 0.0, 0.0, 1.0);
+}
+```
+
+`entrada.uv` es una variable interpolada, luego no es uniforme, luego la condición no es uniforme, luego el interior del `if` no es un punto de control de flujo uniforme, luego `textureSample` no puede estar ahí.
+
+**Salida 1: sacar la operación de la rama.** Es la correcta en la mayoría de los casos y suele ser gratis, porque la GPU habría ejecutado las dos ramas de todos modos.
+
+```wgsl
+@fragment
+fn fs(entrada : Entrada) -> @location(0) vec4f {
+  let muestra = textureSample(albedo, muestreo, entrada.uv);   // flujo uniforme
+  if entrada.uv.x > 0.5 {
+    return muestra;
+  }
+  return vec4f(0.0, 0.0, 0.0, 1.0);
+}
+```
+
+**Salida 2: usar una variante sin derivadas implícitas.** `textureSampleLevel` toma el nivel de mip explícito y `textureSampleGrad` toma las derivadas como argumentos, así que ninguna de las dos necesita control de flujo uniforme. Si te hacía falta el mip automático, se puede calcular fuera de la rama y pasarlo dentro:
+
+```wgsl
+@fragment
+fn fs(entrada : Entrada) -> @location(0) vec4f {
+  // Las derivadas se calculan donde el flujo SI es uniforme.
+  let ddx = dpdx(entrada.uv);
+  let ddy = dpdy(entrada.uv);
+
+  if entrada.uv.x > 0.5 {
+    return textureSampleGrad(albedo, muestreo, entrada.uv, ddx, ddy);
+  }
+  return vec4f(0.0, 0.0, 0.0, 1.0);
+}
+```
+
+Este patrón es el que se usa de verdad en shaders con bucles: en un bucle de parallax o de trazado por texturas, el mip se calcula una vez fuera y se muestrea con `textureSampleGrad` dentro.
+
+**Salida 3: bajar la severidad del diagnóstico.** Es la única de las tres que no arregla nada:
+
+```wgsl
+@fragment
+@diagnostic(warning, derivative_uniformity)
+fn fs(entrada : Entrada) -> @location(0) vec4f { /* ... */ }
+```
+
+El compilador deja de rechazar el módulo, y el resultado en las invocaciones auxiliares sigue siendo indeterminado. Solo tiene sentido cuando **sabes** que la condición es uniforme por construcción y el análisis no puede demostrarlo, y aun así merece un comentario explicando por qué.
+
+Para las barreras no hay diagnóstico que valga: el error es duro y la única salida es reestructurar el código para que la barrera quede fuera de todo condicional, con el patrón de cargar un valor neutro en vez de salir pronto.
+
+<Callout type="warn" title="El error señala la línea de la operación, no la de la causa">
+El mensaje apunta al `textureSample`, pero el problema está en la condición del `if`, que puede estar veinte líneas más arriba o dentro de una función que llamó a otra. El análisis se propaga a través de los parámetros: una función auxiliar que muestrea una textura hereda el requisito de uniformidad de **cada uno de sus puntos de llamada**, así que la misma función puede compilar cuando la llamas desde un sitio y fallar desde otro. Cuando el mensaje no cuadre, busca hacia atrás la condición no uniforme más cercana.
+</Callout>
+
+<Callout type="dios" title="La uniformidad es la factura del mipmapping, y explica por qué el alpha test y las derivadas se llevan tan mal">
+Todo esto existe por una sola razón: **el filtrado de texturas necesita saber a qué velocidad cambian las coordenadas en pantalla**, para elegir el nivel de mip. Y la única forma barata que se le ocurrió a nadie de saberlo es comparar con el vecino. De esa decisión, tomada en los años noventa, salen el cuadrado de 2x2, las invocaciones auxiliares, el sombreado con granularidad de cuatro píxeles y esta restricción entera.
+
+La consecuencia menos conocida y más cara es la del **coste de los triángulos pequeños**. Como el cuadrado es la unidad indivisible, un triángulo que cubre un solo píxel ejecuta cuatro invocaciones y descarta tres. Un modelo con triángulos del tamaño de un píxel —el follaje denso, un personaje lejano con toda su malla, cualquier geometría sin niveles de detalle— sombrea hasta cuatro veces los píxeles que ocupa. No es un problema de tu shader: es la geometría de las derivadas.
+
+Y de ahí sale la interacción con `discard` que hay que tener clara. Un fragmento descartado en una hoja de árbol con alpha test sigue formando parte del cuadrado, y sus vecinos necesitan sus valores para derivar. Por eso WGSL define `discard` de forma que la invocación deja de escribir pero el resto del cuadrado conserva derivadas bien definidas, en lugar de matarla inmediatamente como hacían algunas implementaciones antiguas de GLSL. Si el descarte terminara la invocación de golpe, el borde de cada hoja tendría un mip aleatorio, que es exactamente el artefacto de bordes brillantes o borrosos que se veía en motores antiguos.
+
+La regla operativa que sacas de aquí, y que resuelve casi todos los casos antes de que aparezcan: **calcula las coordenadas de textura y muestrea siempre en el nivel más externo del shader, y ramifica después sobre el resultado**. No es solo lo que el compilador te obliga a hacer: es lo que la GPU iba a hacer de todos modos, porque las dos ramas se ejecutan cuando el cuadrado diverge. Escribir el shader así desde el principio hace que el análisis de uniformidad nunca te moleste, y no porque lo estés esquivando, sino porque estabas escribiendo lo que el hardware sabe ejecutar.
+</Callout>

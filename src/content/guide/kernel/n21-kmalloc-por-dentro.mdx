@@ -1,0 +1,147 @@
+---
+title: "kmalloc por dentro: caches de tamaños y alineación"
+description: "kmalloc no es magia: traduce tu tamaño a la caché kmalloc-N más ajustada, kzalloc le añade cero y kfree encuentra la slab desde el puntero. Las familias normal, dma, cgroup y las aleatorias de hardening, ksize frente a kmalloc_size_roundup, y las garantías de alineación."
+subject: kernel
+level: 21
+order: 2
+position: "21.2"
+duration: "15 min"
+---
+
+<Lead>
+`kmalloc` es la puerta por la que pasa casi toda la memoria dinámica del kernel, y por dentro es un enrutador de tamaños: coge tu petición, la redondea a la clase de tamaño más cercana y te sirve de una batería de cachés prefabricadas llamadas kmalloc-8, kmalloc-16, kmalloc-64... Entender ese enrutamiento, sus familias y sus garantías de alineación es dejar de usar `kmalloc` como una caja negra.
+</Lead>
+
+<Goals>
+
+- Ver cómo `kmalloc` traduce un tamaño a una caché kmalloc-N concreta.
+- Conocer las familias de caches: normal, dma, cgroup y las aleatorias de hardening.
+- Usar `ksize` y `kmalloc_size_roundup` correctamente y sin caer en la trampa de KASAN.
+- Entender las garantías de alineación que ofrece `kmalloc`.
+
+</Goals>
+
+## De un tamaño a una caché: kmalloc-64, kmalloc-128...
+
+El kernel arranca creando una batería de cachés de propósito general cuyos tamaños siguen una progresión casi geométrica. Míralas en cualquier máquina viva:
+
+```bash
+sudo grep -E '^kmalloc-[0-9]' /proc/slabinfo | awk '{print $1, $4}'
+# kmalloc-8     8
+# kmalloc-16    16
+# kmalloc-32    32
+# kmalloc-64    64
+# kmalloc-96    96
+# kmalloc-128   128
+# kmalloc-192   192
+# kmalloc-256   256
+# ... hasta kmalloc-8k (8192)
+```
+
+Las clases 96 y 192 no son potencias de dos: se intercalan a propósito para partir por la mitad el desperdicio entre 64 y 128, y entre 128 y 256. Cuando pides un tamaño, `kmalloc` elige la **caché más pequeña en la que quepas**. Para un tamaño constante conocido en compilación, esa elección la resuelve el compilador con `kmalloc_index`; para un tamaño variable, una función de búsqueda equivalente en tiempo de ejecución.
+
+```c
+/* include/linux/slab.h, esencia del camino comun */
+static __always_inline __alloc_size(1)
+void *kmalloc_noprof(size_t size, gfp_t flags)
+{
+	if (__builtin_constant_p(size) && size <= KMALLOC_MAX_CACHE_SIZE) {
+		unsigned int index = kmalloc_index(size);
+
+		return kmalloc_trace(
+			kmalloc_caches[kmalloc_type(flags, _RET_IP_)][index],
+			flags, size);
+	}
+	return __kmalloc_noprof(size, flags);   /* tamano variable o grande */
+}
+```
+
+Así, `kmalloc(65, ...)` aterriza en kmalloc-96 y `kmalloc(100, ...)` en kmalloc-128. Y hay un umbral que cambia el juego: `KMALLOC_MAX_CACHE_SIZE`, que en SLUB con páginas de 4 KiB vale 8192. Por encima de él ya no hay caché que valga; `kmalloc` deriva la petición al **buddy** directamente vía `alloc_pages`, sin capa de slab.
+
+Ese camino grande tiene a su vez un techo: `KMALLOC_MAX_SIZE`, del orden de varios megabytes, por encima del cual `kmalloc` falla porque el buddy no entrega bloques físicamente contiguos tan grandes de forma fiable —la memoria se fragmenta—. Cuando necesitas más, o cuando no exiges contigüidad física, la respuesta es `kvmalloc`, que prueba primero un `kmalloc` y, si no hay suerte, cae a `vmalloc` cosiendo páginas dispersas en un rango virtual contiguo. Su pareja de liberación es `kvfree`.
+
+<Mermaid code={`flowchart TD
+  K[kmalloc size flags] --> Q[size menor o igual a 8 KiB]
+  Q -->|si| IDX[kmalloc_index elige la clase kmalloc-N]
+  Q -->|no| PAGE[va directo al buddy con alloc_pages]
+  IDX --> FAM[familia segun flags normal dma cg o rnd]
+  class K t-blue
+  class FAM t-mauve
+  class PAGE t-yellow`} />
+
+<Callout type="info" title="El envoltorio alloc_hooks y el perfilado de asignaciones">
+Desde Linux 6.10, `kmalloc` es en realidad una macro: `alloc_hooks(kmalloc_noprof(...))`. Ese envoltorio implementa el *alloc tagging* de `CONFIG_MEM_ALLOC_PROFILING`, que asocia a cada sitio de llamada un contador y permite leer en `/proc/allocinfo` cuánta memoria pide cada línea de código. Es transparente para ti —sigues escribiendo `kmalloc`— pero explica por qué la función real lleva el sufijo `_noprof`.
+</Callout>
+
+## kzalloc, kfree y las familias de caches
+
+`kzalloc` no es una caché aparte: es `kmalloc` con una bandera. Y `kfree` hace el viaje inverso, deduciendo la caché a partir del puntero.
+
+```c
+/* kzalloc = kmalloc + memoria a cero */
+static inline __alloc_size(1) void *kzalloc_noprof(size_t size, gfp_t flags)
+{
+	return kmalloc_noprof(size, flags | __GFP_ZERO);
+}
+
+/* kfree encuentra la slab desde la direccion del objeto */
+void kfree(const void *objp)
+{
+	struct slab *slab = virt_to_slab(objp);   /* del puntero a su descriptor */
+	/* ... devuelve el objeto a slab->slab_cache ... */
+}
+```
+
+`kfree(NULL)` es legal y no hace nada, lo que simplifica los caminos de error. Pero `kmalloc-N` no es una sola familia: el kernel mantiene **varias copias paralelas** de la batería de tamaños, seleccionadas por las banderas de asignación. `kmalloc_type(flags)` decide en cuál caes:
+
+```bash
+sudo awk '/kmalloc/ {print $1}' /proc/slabinfo | sort -u
+# kmalloc-64          <- NORMAL:  el caso comun
+# kmalloc-cg-64       <- CGROUP:  con __GFP_ACCOUNT, contabilizado a memcg
+# dma-kmalloc-64      <- DMA:     con GFP_DMA, memoria apta para DMA legado
+# kmalloc-rnd-07-64   <- RANDOM:  copias barajadas para endurecer el heap
+```
+
+Las copias `kmalloc-rnd-NN` provienen de `CONFIG_RANDOM_KMALLOC_CACHES` (desde 6.6): el kernel crea varias baterías idénticas y reparte cada sitio de llamada entre ellas de forma pseudoaleatoria por arranque. Así, dos objetos del mismo tamaño pedidos desde código distinto acaban en slabs distintas, lo que **rompe las técnicas de heap spraying** que dependen de colocar la víctima y el atacante en posiciones predecibles.
+
+<Callout type="note" title="Asignar arrays sin desbordar el tamaño">
+Para reservar un array nunca calcules `n * size` a mano: un desbordamiento de enteros produciría una asignación diminuta seguida de escrituras masivas fuera de límites, un patrón clásico de vulnerabilidad. Usa `kmalloc_array(n, size, flags)`, que detecta el desbordamiento y devuelve `NULL` en vez de mentir, o `kcalloc(n, size, flags)` si además lo quieres a cero. Ambos desembocan en la misma maquinaria de cachés kmalloc-N.
+</Callout>
+
+## ksize, kmalloc_size_roundup y la alineación
+
+Como kmalloc-96 sirve peticiones de 65 a 96 bytes, el bloque que recibes suele ser **mayor** que lo que pediste. `ksize` te dice cuánto espacio usable hay de verdad:
+
+```c
+void *p = kmalloc(65, GFP_KERNEL);
+size_t real = ksize(p);       /* devuelve 96, no 65 */
+```
+
+Aquí acecha una trampa moderna. La tentación es pedir 65, consultar `ksize` y usar los 96 bytes "gratis". **No lo hagas.** Con KASAN activo, la región entre el tamaño pedido y el de la caché está envenenada como redzone: escribir ahí es un error reportado. La regla correcta es redondear *antes* de asignar, con `kmalloc_size_roundup` (desde 6.1), que te dice qué tamaño servirá `kmalloc` sin llegar a asignar nada:
+
+```c
+/* patron correcto para un buffer que puede crecer */
+size_t querido = kmalloc_size_roundup(nbytes);   /* p.ej. 65 -> 96 */
+void  *buf = kmalloc(querido, GFP_KERNEL);
+/* ahora los 'querido' bytes son legitimamente tuyos, KASAN contento */
+```
+
+Sobre la **alineación**, `kmalloc` ofrece dos garantías que conviene grabar. Primera: todo bloque está alineado al menos a `ARCH_KMALLOC_MINALIGN` (8 bytes en x86-64, más en arquitecturas con requisitos de DMA). Segunda, y muy útil: **una asignación de tamaño potencia de dos está alineada a su propio tamaño**. Un bloque de kmalloc-128 empieza en una dirección múltiplo de 128; uno de kmalloc-4k, en un múltiplo de 4096. Esto te permite exigir alineaciones fuertes sin `posix_memalign`.
+
+Ese mínimo no es un capricho: garantiza que cualquier bloque sirva para los tipos escalares del compilador y para el DMA coherente de la arquitectura. En plataformas donde la línea de caché no coherente con DMA medía 128 bytes, `ARCH_KMALLOC_MINALIGN` llegó a inflar cada asignación diminuta a ese tamaño; los kernels recientes lo desacoplaron creando cachés kmalloc de grano fino por debajo del histórico `ARCH_DMA_MINALIGN` y reservando el alineado grande solo para la memoria marcada para DMA. Para conocer la alineación segura de DMA en tiempo de ejecución, `dma_get_cache_alignment`.
+
+<Callout type="warn" title="Las clases 96 y 192 no heredan esa alineación">
+La garantía de alineación al tamaño solo aplica a potencias de dos. kmalloc-96 y kmalloc-192 dan únicamente `ARCH_KMALLOC_MINALIGN`. Si tu código necesita, por ejemplo, alineación a 64 para una línea de caché, no confíes en que un `kmalloc(96, ...)` te la dé: pide una potencia de dos, usa `SLAB_HWCACHE_ALIGN` en una caché propia (nivel 21.4), o `kmalloc_size_roundup` para saber qué clase te tocará.
+</Callout>
+
+<Callout type="dios" title="La clase de tamaño: fragmentación acotada a cambio de O(1)">
+`kmalloc` encarna un compromiso de ingeniería que se repite por todo el kernel: sacrificar un poco de espacio a cambio de un tiempo constante y predecible. Redondear cada petición a una clase de tamaño fija introduce fragmentación interna —hasta casi el doble en el peor caso de las potencias de dos puras, que las clases 96 y 192 se encargan de recortar—, pero a cambio la asignación y la liberación son O(1) sin búsqueda ni coalescencia, los metadatos se comparten entre todos los objetos de una clase, y los bloques del mismo tamaño se fusionan en las mismas slabs, lo que mejora la localidad y permite que SLUB unifique cachés equivalentes. Es la misma filosofía que verás en los asignadores de las mejores máquinas virtuales y bibliotecas de espacio de usuario: no busques el ajuste perfecto byte a byte, cuantiza a un conjunto pequeño de tamaños y gana en velocidad, simplicidad y escalabilidad lo que pierdes en unos bytes de holgura. El desperdicio está acotado y es predecible; la latencia, constante. En un núcleo que asigna miles de millones de veces, esa apuesta es siempre la correcta.
+</Callout>
+
+<Challenge title="Enruta tus propios tamaños">
+1. Predice a qué caché kmalloc-N van a parar peticiones de 8, 65, 129 y 5000 bytes, y qué pasa con una de 20 000.
+2. Explica por qué `kzalloc` no necesita una batería de cachés propia.
+3. Reescribe un fragmento que use `ksize` para ampliar un buffer de modo que sea correcto bajo KASAN con `kmalloc_size_roundup`.
+4. Enumera las cuatro familias de caches kmalloc y di qué bandera de asignación selecciona cada una.
+5. Argumenta por qué las copias `kmalloc-rnd-NN` dificultan un exploit de heap spraying.
+</Challenge>

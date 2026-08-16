@@ -1,0 +1,156 @@
+---
+title: "device.lost: sobrevivir a que la GPU desaparezca"
+description: "Por qué un dispositivo puede perderse a mitad de sesión, cómo se detecta, qué queda inválido y cómo se estructura una aplicación para poder rearrancar sin recargar la página."
+subject: webgpu
+level: 3
+order: 5
+position: "3.5"
+duration: "18 min"
+---
+
+<Lead>
+La pérdida de dispositivo es el modo de fallo que nadie implementa hasta que le pasa en producción. No es un caso exótico: ocurre cuando el sistema operativo reinicia el controlador gráfico, cuando un portátil cambia de GPU integrada a discreta, cuando el navegador decide liberar recursos de una pestaña de fondo, o cuando tu propio código deja colgada la GPU. En todos esos casos la aplicación no recibe una excepción: recibe una promesa que se resuelve y un montón de objetos que dejan de valer.
+</Lead>
+
+<Goals>
+
+- Enumerar las causas reales de pérdida de dispositivo y su frecuencia.
+- Instalar el manejador de `device.lost` y leer sus dos campos.
+- Distinguir la pérdida de un error de validación y de un error de memoria.
+- Estructurar una aplicación para poder recrear todo su estado de GPU.
+
+</Goals>
+
+## Por qué se pierde un dispositivo
+
+Seis causas, ordenadas de más a menos frecuente en la práctica.
+
+**Reinicio del controlador por vigilancia.** Los sistemas operativos vigilan que la GPU responda; en Windows el mecanismo se llama TDR y salta a los pocos segundos. Si un shader entra en un bucle demasiado largo, el sistema reinicia el controlador y todos los contextos gráficos de todos los procesos se pierden. Es la causa número uno durante el desarrollo, porque un `while` mal escrito en un compute shader la provoca de forma fiable.
+
+**Actualización del controlador.** Instalar controladores nuevos invalida los contextos activos sin cerrar el navegador.
+
+**Cambio de GPU.** En portátiles con gráficos conmutables, conectar o desconectar la corriente, o enchufar un monitor externo, puede mover el trabajo de una GPU a otra.
+
+**Presión de recursos.** El navegador puede destruir el dispositivo de una pestaña de fondo para liberar memoria de vídeo. Es política del navegador y no la controlas.
+
+**Fallo de memoria irrecuperable.** Si la reserva de memoria de vídeo falla de forma que la implementación no puede continuar, el dispositivo se pierde.
+
+**Destrucción explícita.** Tú llamaste a `device.destroy()`.
+
+Solo la última es voluntaria, y la especificación la distingue: `reason` vale `"destroyed"` en ese caso y `"unknown"` en todos los demás.
+
+<Callout type="danger" title="Un bucle infinito en un shader cuelga el sistema entero, no solo tu pestaña">
+Un shader no tiene forma de ser interrumpido cooperativamente. Si escribes un bucle cuya condición de salida depende de datos y esos datos no la cumplen nunca, la GPU se queda ocupada hasta que el vigilante del sistema operativo la reinicia, y durante esos segundos toda la interfaz gráfica de la máquina se congela. Por eso conviene acotar siempre los bucles de un shader con un contador máximo, aunque la lógica «no lo necesite»: `for (var i = 0u; i < 256u && !terminado; i++)` cuesta nada y evita colgar el equipo del usuario.
+</Callout>
+
+## Detectarlo
+
+`device.lost` es una **propiedad** de tipo `Promise<GPUDeviceLostInfo>`, no un método. Está pendiente durante toda la vida del dispositivo y se resuelve —nunca rechaza— cuando el dispositivo se pierde.
+
+```js
+device.lost.then((info) => {
+  console.warn('dispositivo perdido:', info.reason, info.message);
+  if (info.reason !== 'destroyed') {
+    programarRearranque();
+  }
+});
+```
+
+`info.reason` es `"destroyed"` o `"unknown"`. `info.message` es una cadena legible que la implementación rellena con lo que sepa.
+
+La comprobación de `reason` importa: si tú llamaste a `device.destroy()` porque el usuario cerró la vista, no quieres rearrancar. Cualquier otro motivo sí merece un intento de recuperación.
+
+Conviene distinguir esto de los otros dos canales de error, que son cosas distintas y no implican pérdida:
+
+**Errores de validación.** Un descriptor incorrecto o un uso inválido. Llegan por `uncapturederror` o por `popErrorScope()`. El dispositivo sigue perfectamente vivo; lo que queda inválido es el objeto concreto.
+
+**Errores de memoria.** Una reserva que no cabe. Llegan por el mismo canal con tipo `GPUOutOfMemoryError`. El dispositivo sigue vivo salvo que la implementación decida lo contrario.
+
+**Pérdida de dispositivo.** Llega por `device.lost`. Todo deja de valer.
+
+## Qué queda inválido
+
+Absolutamente todo lo que colgaba de ese dispositivo: búferes, texturas, samplers, módulos de shader, layouts, bind groups, pipelines, encoders y la cola. Ninguna de esas referencias sirve, y usarlas produce errores de validación silenciosos —recuerda que WebGPU no lanza excepciones para eso—.
+
+Lo que **sí** sobrevive es todo lo que no es de la GPU: el elemento `canvas`, tus datos en memoria de JavaScript, el estado de la aplicación, las texturas todavía en forma de `ImageBitmap`, la geometría en `Float32Array`. Y esa es exactamente la línea sobre la que hay que construir la arquitectura.
+
+Un detalle que se olvida: **el contexto del canvas hay que volver a configurarlo**. `context.configure()` recibe el dispositivo, así que la configuración anterior apunta a un dispositivo muerto y el contexto no produce texturas válidas hasta que lo reconfiguras con el nuevo.
+
+## La arquitectura que permite rearrancar
+
+La condición necesaria es una sola: **todo objeto de GPU tiene que poder reconstruirse desde datos que viven fuera de la GPU**. Si el único sitio donde existe un búfer de vértices es la memoria de vídeo, ese búfer se ha perdido para siempre.
+
+De ahí salen tres reglas concretas.
+
+**Uno: separa la fuente de verdad de la copia en GPU.** La geometría vive en `Float32Array`, las texturas en `ImageBitmap` o en una URL desde la que se pueden volver a cargar, los parámetros en objetos normales. Los recursos de GPU son una proyección de esos datos, no el original.
+
+**Dos: agrupa toda la creación de recursos en una función.** Si crear todo el estado de GPU son cuarenta líneas repartidas por diez archivos, la recuperación es inviable. Si es una función `crearRecursos(device)`, la recuperación es llamarla otra vez.
+
+**Tres: nadie guarda el dispositivo en una variable de módulo.** El dispositivo se pasa como parámetro o se lee de un objeto de contexto mutable. Si veinte archivos importaron el dispositivo directamente, tras un rearranque veinte archivos tienen el viejo.
+
+Con eso, el ciclo completo cabe en una función:
+
+```js
+export function crearApp(canvas) {
+  const estado = { device: null, ctx: null, recursos: null, corriendo: false };
+
+  async function arrancar() {
+    const adapter = await navigator.gpu?.requestAdapter();
+    if (!adapter) return false;
+
+    const device = await adapter.requestDevice({ label: 'principal' });
+    device.addEventListener('uncapturederror', (e) =>
+      console.error('[webgpu]', e.error.message));
+
+    device.lost.then((info) => {
+      estado.corriendo = false;
+      if (info.reason === 'destroyed') return;
+      console.warn('dispositivo perdido:', info.message, '- reintentando');
+      setTimeout(() => arrancar(), 1000);
+    });
+
+    const ctx = canvas.getContext('webgpu');
+    ctx.configure({
+      device,
+      format: navigator.gpu.getPreferredCanvasFormat(),
+      alphaMode: 'opaque',
+    });
+
+    estado.device = device;
+    estado.ctx = ctx;
+    estado.recursos = crearRecursos(device);   // todo desde datos de CPU
+    estado.corriendo = true;
+    requestAnimationFrame(frame);
+    return true;
+  }
+
+  function frame(t) {
+    if (!estado.corriendo) return;
+    dibujar(estado, t);
+    requestAnimationFrame(frame);
+  }
+
+  function parar() {
+    estado.corriendo = false;
+    estado.device?.destroy();
+  }
+
+  return { arrancar, parar };
+}
+```
+
+Fíjate en `estado.corriendo`. Sin ese interruptor, el bucle de `requestAnimationFrame` sigue vivo tras la pérdida y genera un error de validación por fotograma, sesenta veces por segundo, hasta que la consola se hace inútil. Pararlo en el manejador de `lost` es lo primero que hay que hacer.
+
+Y fíjate en el `setTimeout` antes de reintentar. Si el controlador acaba de reiniciarse, pedir un adaptador inmediatamente suele fallar. Un segundo de espera, idealmente con retroceso exponencial y un número máximo de intentos, convierte un fallo en una recuperación.
+
+<Callout type="dios" title="Provoca la pérdida a propósito, porque es el único camino de código que nunca se ejecuta solo">
+La recuperación ante pérdida de dispositivo tiene una propiedad desagradable: es código que solo se ejecuta cuando algo raro pasa, y por tanto es código que nunca se ejecuta durante el desarrollo. Escribirlo y no probarlo produce la peor combinación posible: la falsa seguridad de tener un plan que no funciona.
+
+Provocarlo es trivial y casi nadie lo hace. **`device.destroy()` desde la consola resuelve `device.lost` con motivo `"destroyed"`**, lo que sirve para verificar que el manejador se dispara, que el bucle se para y que no se generan errores en cascada. Para probar la ruta completa de recuperación, cambia temporalmente la comprobación de `reason` para que también rearranque en `"destroyed"`, o expón un botón de prueba que destruya y rearranque. En treinta segundos sabes si tu aplicación se recupera o si se queda en un canvas negro.
+
+Y hay una prueba más dura que merece la pena una vez en la vida del proyecto: **destruir el dispositivo en mitad de un fotograma**, justo entre `beginRenderPass` y `submit`. Eso reproduce el caso real, que no es limpio, y saca a la luz las suposiciones que tu código hace sobre que los objetos siguen siendo válidos entre dos líneas consecutivas. Los errores que aparecen ahí son exactamente los que verás en los informes que no puedes reproducir.
+
+El coste de todo esto es una tarde. El coste de no hacerlo es una clase de fallo que se manifiesta en el equipo del usuario, no deja rastro útil en la consola, y se describe siempre igual: «a veces se queda en negro».
+</Callout>
+
+Con el dispositivo asegurado, falta la superficie donde se dibuja: [el contexto del canvas](/guia/webgpu/n4-getcontext-webgpu/).

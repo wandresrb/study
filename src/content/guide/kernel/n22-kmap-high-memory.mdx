@@ -1,0 +1,110 @@
+---
+title: "Mapeos temporales: kmap_local_page y el fantasma de la high memory"
+description: "Por qué existen los mapeos temporales de páginas: el concepto histórico de high memory en 32-bit, cómo kmap y kmap_atomic lo resolvían, y kmap_local_page como la API moderna para mapear una página arbitraria al kernel sin bloquear ni deshabilitar la preempción, incluso en 64-bit."
+subject: kernel
+level: 22
+order: 5
+position: "22.5"
+duration: "15 min"
+---
+
+<Lead>
+No toda página tiene una dirección de kernel permanente. En 32-bit, la RAM por encima de cierto umbral —la *high memory*— quedaba sin mapear en el direct map, y para tocarla había que fabricar un mapeo temporal. En x86-64 ese problema desapareció, pero las APIs que lo resolvían siguen vivas y son la forma correcta de mapear una página arbitraria —de usuario, de otra zona— al espacio del kernel. Aprender `kmap_local_page` es aprender que una página y una dirección son cosas separables.
+</Lead>
+
+<Goals>
+
+- Entender el concepto histórico de high memory y por qué existió `ZONE_HIGHMEM`.
+- Conocer `kmap`/`kmap_atomic` y por qué quedaron obsoletos.
+- Dominar `kmap_local_page`/`kunmap_local` y sus reglas de uso.
+- Comprender por qué el patrón sigue siendo necesario y correcto en 64-bit.
+
+</Goals>
+
+## El fantasma: qué era la high memory
+
+En un kernel de 32-bit con el reparto clásico 3G/1G, el kernel disponía de apenas 1 GB de espacio virtual para mapear **toda** la RAM física. Si la máquina tenía más de unos 896 MB, era imposible tener toda esa RAM en el direct map a la vez: sencillamente no cabían las direcciones. La memoria por encima de ese límite era la *high memory* (`ZONE_HIGHMEM`), y su rasgo definitorio era no tener una dirección de kernel permanente. Existía físicamente, pero para leerla o escribirla había que pedir prestado un hueco virtual, usarlo y devolverlo.
+
+De ahí nace `page_address(page)`: devuelve la dirección permanente de una página si la tiene —las de la zona baja, en el direct map— o **`NULL`** si es una página high-memory sin mapear. Ese `NULL` es la semilla de toda la maquinaria de mapeos temporales.
+
+El reparto no era caprichoso: `ZONE_DMA`, `ZONE_NORMAL` y `ZONE_HIGHMEM` dividían la RAM física según qué se podía hacer con cada tramo. La zona normal, hasta los ~896 MB, era la *lowmem*, siempre mapeada; por encima empezaba la highmem, accesible solo por ventanas temporales. Estructuras internas del kernel —tablas de páginas, descriptores— tenían que salir de lowmem porque exigían dirección permanente, lo que convertía esos primeros 896 MB en un recurso disputado que la highmem no podía aliviar. Toda una generación de ajuste fino de kernels de 32-bit giró alrededor de esa frontera.
+
+## kmap y kmap_atomic: la solución histórica
+
+Dos herramientas resolvían el problema, cada una con su compromiso:
+
+- `kmap(page)` reservaba un hueco en el área *pkmap*, un rango virtual pequeño y compartido. Podía **dormir** esperando un hueco libre, así que solo servía en contexto de proceso. Su `kunmap` liberaba el hueco.
+- `kmap_atomic(page)` usaba ranuras por-CPU del *fixmap* y no dormía, pero a cambio **deshabilitaba la preempción** (y los page faults) mientras durara el mapeo. Servía en contexto atómico, pero convertía cualquier sección con una página mapeada en una sección no expropiable, dañina para la latencia.
+
+Ambas cargaban con un pecado: obligaban a elegir de antemano entre «puedo dormir» y «puedo estar en atómico», y `kmap_atomic` castigaba a todo el sistema deshabilitando la preempción aunque tú no la necesitaras. Por eso hoy están **obsoletas**.
+
+Había además una asimetría venenosa: `kmap` y `kmap_atomic` no eran intercambiables, así que una función invocable desde ambos contextos tenía que decidir a priori cuál usar o duplicar caminos. Peor aún, el número de ranuras atómicas por CPU era minúsculo y fijo, de modo que anidar demasiados `kmap_atomic` agotaba el fixmap y corrompía en silencio. Esa fragilidad —elegir contexto por adelantado y contar ranuras a mano— es justo lo que la API local vino a borrar.
+
+## kmap_local_page: la API moderna
+
+Desde la refundición de la memoria alta (Linux 5.11 en adelante), la forma correcta es `kmap_local_page`. Crea un mapeo temporal **local a la tarea**, válido solo en el contexto de quien lo pide, y lo hace sin los defectos de sus predecesoras:
+
+```c
+#include <linux/highmem.h>
+
+char *vaddr = kmap_local_page(page);   /* mapeo temporal local a esta tarea */
+memcpy(vaddr, datos, len);             /* usa la pagina como memoria normal */
+kunmap_local(vaddr);                   /* obligatorio, en orden LIFO */
+```
+
+Sus reglas son estrictas pero liberadoras. **No** deshabilita la preempción: la tarea puede ser expropiada e incluso reprogramada, porque los mapeos locales forman parte del estado de la tarea y se salvan y restauran en cada cambio de contexto. Sí **deshabilita la migración** entre CPUs mientras el mapeo vive, para que los índices por-CPU sigan siendo válidos. El mapeo es privado: no se lo puedes pasar a otra tarea ni a otro contexto. Y hay que desmapear en orden **LIFO** —como una pila— y en el mismo contexto que lo creó. Se pueden anidar, y hasta anidar con `kmap_atomic` heredado.
+
+En el mundo de folios (nivel 21) existe el hermano directo, que evita calcular la página a mano:
+
+```c
+void *p = kmap_local_folio(folio, offset);   /* mapea dentro del folio */
+/* ... */
+kunmap_local(p);
+```
+
+Bajo el capó, en 32-bit con highmem, `kmap_local_page` no busca un hueco global ni bloquea: cada CPU dispone de un pequeño juego de ranuras contiguas en el fixmap, y el mapeo toma la siguiente ranura libre como una pila, escribiendo una PTE e invalidando solo su TLB local. Al no tocar estructura compartida alguna, no hay contención entre CPUs. La pieza elegante es el cambio de contexto: los mapeos locales viven en el `task_struct`, así que al expulsar la tarea el kernel **desmapea** sus ranuras activas y las restaura al replanificarla. Por eso puedes ser expropiado sin que tu mapeo se corrompa, y por eso se prohíbe migrar de CPU mientras dure: la ranura es local a la CPU actual. Es la inversión exacta frente a `kmap_atomic`, que congelaba al planificador para proteger el mapeo; aquí se le enseña al planificador a llevárselo consigo.
+
+<Cards>
+  <Card icon="🪦" title="kmap — obsoleto">
+    Hueco en el área pkmap, compartido y escaso. Podía **dormir** esperando ranura: solo en contexto de proceso.
+  </Card>
+  <Card icon="🪦" title="kmap_atomic — obsoleto">
+    Ranura por-CPU del fixmap, no dormía, pero **deshabilitaba la preempción** entera mientras durase el mapeo.
+  </Card>
+  <Card icon="✅" title="kmap_local_page — actual">
+    Ranura por-CPU **local a la tarea**. No toca la preempción, solo la migración; se salva y restaura en cada cambio de contexto.
+  </Card>
+</Cards>
+
+<Callout type="info" title="En 64-bit es prácticamente un no-op">
+En x86-64 no hay high memory: **toda** la RAM está en el direct map (nivel 22.3). Ahí `kmap_local_page` simplemente devuelve `page_address(page)` —la dirección de direct map, que siempre existe— sin construir ninguna tabla de páginas ni tocar el fixmap. El coste es casi nulo. Entonces, ¿por qué molestarse? Porque el mismo código debe compilar y correr sobre 32-bit con highmem, y porque escribirlo como si la página pudiera no tener dirección permanente lo vuelve correcto en toda arquitectura. La disciplina cuesta cero en tu portátil y salva al código en el hardware donde sí importa.
+</Callout>
+
+## Por qué el patrón sobrevive a la high memory
+
+Aunque la high memory sea historia en 64-bit, mapear temporalmente una página arbitraria sigue haciendo falta. El caso canónico es una página que te llega como `struct page` —de un búfer de usuario fijado con `pin_user_pages`, de una página del page cache, de una lista de scatter-gather— y de la que solo tienes el descriptor, no un puntero utilizable. `kmap_local_page` es el puente estándar de `struct page` a `void *` con el que operar sobre su contenido.
+
+```c
+/* de struct page a datos utilizables, sin asumir direccion permanente */
+void *src = kmap_local_page(sg_page(sg));
+memcpy(dst, src + sg->offset, sg->length);
+kunmap_local(src);
+```
+
+De hecho, subsistemas enteros lo esconden tras iteradores: el `sg_miter` de scatter-gather, el recorrido de páginas de un `bio` en la capa de bloques o la copia de páginas del page cache llaman a `kmap_local_page` por dentro. Casi nunca escribirás highmem a mano, pero todo ese código descansa sobre la misma disciplina: una `struct page` es siempre válida; su dirección virtual es un préstamo que pides justo antes de usarla y devuelves justo después.
+
+<Callout type="warn" title="No guardes el puntero: es efímero y local">
+La dirección que devuelve `kmap_local_page` es válida **solo** en el hilo que la creó y **solo** hasta el `kunmap_local` correspondiente. No la almacenes en una estructura de larga vida, no la pases a otro hilo, no la uses tras un punto donde el flujo pudiera haber salido del contexto. En 64-bit «funcionará» por accidente, porque coincide con la dirección de direct map permanente; en 32-bit con highmem será una página distinta y corromperás memoria ajena. Trátala siempre como lo que es: un préstamo con vencimiento inmediato y LIFO.
+</Callout>
+
+<Callout type="dios" title="Una página y una dirección son cosas separables">
+La lección profunda trasciende con mucho a la high memory. `kmap_local_page` enseña que un marco físico de RAM y una dirección virtual desde la que tocarlo son **entidades independientes**: la primera puede existir sin la segunda, y `page_address` puede devolver `NULL` con toda legitimidad. Estamos tan acostumbrados a que «tener un dato» equivalga a «tener su dirección» que olvidamos que es un lujo del direct map, no una ley de la naturaleza. En el fondo, una `struct page` es la identidad **canónica** de un trozo de RAM —existe siempre, para cada marco— mientras que una dirección virtual es una relación **contingente** que puede tener, o no, en un instante dado. El kernel razona en términos de páginas precisamente porque son el sustrato permanente; las direcciones van y vienen. Y hay una moraleja de ingeniería que se sale del tema: una restricción de hardware ya extinta —el techo de 32-bit— talló una API cuya disciplina resultó valiosa mucho después de que la restricción desapareciera. El buen diseño no envejeció con su causa. Programar como si cada página pudiera carecer de dirección permanente no es arqueología: es la costumbre que mantiene tu código correcto en cada arquitectura que el kernel todavía sostiene.
+</Callout>
+
+<Challenge title="Mapea una página desde su descriptor">
+1. En un módulo, reserva una página con `alloc_page(GFP_KERNEL)`, mapéala con `kmap_local_page`, escribe un patrón y desmapea con `kunmap_local`.
+2. Imprime `page_address` de esa página y compárala con lo que devolvió `kmap_local_page`: explica por qué coinciden en x86-64.
+3. Anida dos `kmap_local_page` y comprueba que debes desmapearlos en orden LIFO; razona qué se rompería si no.
+4. Explica la diferencia esencial entre `kmap_atomic` (preempción deshabilitada) y `kmap_local_page` (solo migración deshabilitada).
+5. Argumenta por qué usar `kmap_local_page` es correcto aun en 64-bit, donde parece innecesario.
+</Challenge>

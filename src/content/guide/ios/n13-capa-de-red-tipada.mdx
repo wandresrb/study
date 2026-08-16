@@ -1,0 +1,159 @@
+---
+title: "Una capa de red decente: el cliente tipado"
+subject: ios
+level: 13
+order: 1
+position: "13.1"
+duration: "20 min"
+description: "Por qué llamar a la sesión de red desde cualquier vista envenena una app, cómo describir cada petición como un dato genérico en su respuesta, cómo construir un cliente con async/await que decodifica una sola vez, y por qué la frontera entre el objeto que viaja por el cable y el modelo que usa la app es la decisión de diseño que sostiene todo el nivel."
+---
+
+<Lead>
+Casi todas las apps que consumen una API empiezan igual: una llamada suelta a `URLSession` dentro de una vista, un `JSONDecoder` improvisado, un `try?` que traga el error. Funciona el primer día y se pudre el segundo, porque esa línea de código no es una llamada de red: es una decisión arquitectónica tomada por descuido. Consumir una API es cruzar una frontera entre dos mundos que no se deben nada —el formato que un servidor ajeno decidió publicar y el modelo que tu app necesita para razonar— y todo el trabajo serio consiste en poner esa frontera en un solo sitio, hacerla explícita y hacerla comprobable. Esta lección construye esa frontera desde cero.
+</Lead>
+
+<Goals>
+
+- Entender por qué acoplar las vistas a `URLSession` degrada la app entera.
+- Describir una petición como un dato genérico en el tipo de su respuesta.
+- Construir un cliente con async/await que valide, decodifique y falle una sola vez.
+- Separar el transporte del dominio y saber qué gana la app en esa frontera.
+
+</Goals>
+
+## El coste oculto de llamar a la sesión desde cualquier sitio
+
+`URLSession` es una API excelente y ese es justamente el problema: es tan cómoda que invita a usarse en el sitio equivocado. Cuando una vista construye su propia `URLRequest`, la envía y decodifica la respuesta, ha adquirido cuatro responsabilidades que no le tocan —conocer la URL base, conocer la política de cabeceras, conocer el formato de fechas del servidor y conocer el esquema JSON exacto— y cada una de ellas se replica en la siguiente vista que necesite datos. El resultado no es solo repetición: es que un cambio en el servidor, como añadir un prefijo de versión a las rutas o cambiar el formato de las fechas, se convierte en una migración que toca decenas de archivos.
+
+Hay además un coste menos visible y más caro. Una vista acoplada a `URLSession` es una vista que no se puede probar sin red, y una app cuyos tests dependen de un servidor real no tiene tests, tiene un ritual. La red es el subsistema más lento, más hostil y menos determinista de una app móvil: falla por túneles, por hoteles, por operadores que inyectan portales cautivos, por certificados caducados y por servidores que devuelven HTML donde prometieron JSON. Si ese caos entra sin filtro en la capa de presentación, el caos es la app.
+
+<Callout type="info" title="Tres responsabilidades que conviene no mezclar">
+El **transporte** sabe hablar HTTP: construir la petición, enviarla, comprobar el código de estado. La **serialización** sabe traducir bytes a valores y valores a bytes. El **dominio** sabe qué significan esos valores para tu app y no debería saber que existe una red. Mezclar las tres en una función es la causa raíz de casi todos los problemas de red que verás en una revisión de código.
+</Callout>
+
+## Describir la petición como un dato
+
+El primer movimiento es dejar de escribir peticiones y empezar a describirlas. Una petición es un valor: un método, una ruta, unos parámetros de consulta, unas cabeceras y quizá un cuerpo. Si además la parametrizamos por el tipo que esperamos de vuelta, el compilador empieza a trabajar para nosotros: `Endpoint<Usuario>` y `Endpoint<[Articulo]>` son tipos distintos, y ya no es posible pedir uno y decodificar el otro.
+
+```swift
+enum Metodo: String { case get = "GET", post = "POST", patch = "PATCH", delete = "DELETE" }
+
+struct Endpoint<Respuesta: Decodable> {
+    var metodo: Metodo = .get
+    var ruta: String
+    var query: [URLQueryItem] = []
+    var cabeceras: [String: String] = [:]
+    var cuerpo: Data? = nil
+
+    func peticion(base: URL) throws -> URLRequest {
+        var componentes = URLComponents(
+            url: base.appending(path: ruta),
+            resolvingAgainstBaseURL: false
+        )
+        componentes?.queryItems = query.isEmpty ? nil : query
+        guard let url = componentes?.url else { throw ErrorRed.urlInvalida(ruta) }
+
+        var peticion = URLRequest(url: url)
+        peticion.httpMethod = metodo.rawValue
+        peticion.httpBody = cuerpo
+        cabeceras.forEach { peticion.setValue($1, forHTTPHeaderField: $0) }
+        return peticion
+    }
+}
+```
+
+Cada recurso de la API se declara entonces como una constante o una función estática, y esa declaración es la única documentación viva del contrato con el servidor:
+
+```swift
+extension Endpoint where Respuesta == [ArticuloDTO] {
+    static func articulos(pagina: Int) -> Endpoint {
+        Endpoint(ruta: "v1/articulos", query: [URLQueryItem(name: "page", value: "\(pagina)")])
+    }
+}
+```
+
+## El cliente: un transporte genérico sobre async/await
+
+Con la petición convertida en dato, el cliente se reduce a una única función genérica. Fíjate en que no hay nada específico de ningún recurso: valida el código de estado, decodifica el tipo que el `Endpoint` promete y traduce cualquier fallo a un error del dominio de red. Se escribe una vez y sirve para toda la API.
+
+```swift
+protocol Transporte: Sendable {
+    func datos(para peticion: URLRequest) async throws -> (Data, HTTPURLResponse)
+}
+
+struct TransporteHTTP: Transporte {
+    let sesion: URLSession
+
+    func datos(para peticion: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (datos, respuesta) = try await sesion.data(for: peticion)
+        guard let http = respuesta as? HTTPURLResponse else { throw ErrorRed.respuestaNoHTTP }
+        return (datos, http)
+    }
+}
+
+actor ClienteAPI {
+    private let base: URL
+    private let transporte: Transporte
+    private let decodificador: JSONDecoder
+
+    init(base: URL, transporte: Transporte, decodificador: JSONDecoder = JSONDecoder()) {
+        self.base = base
+        self.transporte = transporte
+        self.decodificador = decodificador
+    }
+
+    func enviar<R>(_ endpoint: Endpoint<R>) async throws -> R {
+        let peticion = try endpoint.peticion(base: base)
+        let (datos, http) = try await transporte.datos(para: peticion)
+        guard (200..<300).contains(http.statusCode) else {
+            throw ErrorRed.servidor(codigo: http.statusCode, cuerpo: datos)
+        }
+        do { return try decodificador.decode(R.self, from: datos) }
+        catch { throw ErrorRed.decodificacion(error) }
+    }
+}
+```
+
+El detalle decisivo es el protocolo `Transporte`. Al inyectarlo, el cliente deja de depender de `URLSession` y pasa a depender de una capacidad: dame bytes y una respuesta HTTP. En producción se inyecta la implementación real; en los tests, una que devuelve un fichero JSON guardado en disco. Ahí es donde una app gana tests de red que corren en milisegundos y sin conexión.
+
+## La frontera entre transporte y dominio
+
+Queda la pieza que más se descuida y más rentabilidad da: el tipo que decodificas **no** debería ser el tipo que usa tu app. El objeto que viaja por el cable —el DTO— es propiedad del servidor: refleja sus nombres, sus opcionales, sus fechas en texto y sus decisiones históricas. El modelo de dominio es propiedad tuya: tiene los tipos que tu lógica necesita, sin opcionales innecesarios y con invariantes ya validadas. Entre ambos hay una función de mapeo, y esa función es exactamente el lugar donde absorbes los cambios del servidor sin que la app entera se entere.
+
+<Mermaid code={`flowchart LR
+  V[Vista SwiftUI] --> S[Servicio de dominio]
+  S --> C[ClienteAPI generico]
+  C --> T[Transporte]
+  T --> U[URLSession]
+  C -.decodifica.-> D[DTO del servidor]
+  S -.mapea.-> M[Modelo de dominio]
+  class M t-green
+  class D t-yellow`} />
+
+El servicio de dominio es una capa fina que pide un `Endpoint`, recibe un DTO y devuelve modelos. Nadie por encima de él sabe que existe HTTP:
+
+```swift
+struct ServicioArticulos {
+    let cliente: ClienteAPI
+
+    func articulos(pagina: Int) async throws -> [Articulo] {
+        try await cliente.enviar(.articulos(pagina: pagina)).compactMap(Articulo.init(dto:))
+    }
+}
+```
+
+<Callout type="dios" title="La capa de red no existe para hablar con el servidor, existe para protegerte de él">
+Es tentador leer todo lo anterior como ceremonia: tres tipos y un protocolo para hacer lo que una línea de `URLSession` ya hacía. Esa lectura confunde el propósito. Una capa de red no se construye para enviar peticiones —eso ya lo sabe hacer el sistema, y muy bien— sino para instalar una **frontera de soberanía** entre dos sistemas que evolucionan por separado y que jamás se pondrán de acuerdo. El servidor es un artefacto ajeno: cambiará de nombres de campo, añadirá versiones, devolverá errores que no documentó, romperá contratos en despliegues que nadie te anunció. Tu app, mientras tanto, tiene que seguir teniendo sentido. La única manera de que ambas cosas sean ciertas a la vez es que exista un punto único, pequeño y explícito donde el mundo exterior se traduce al vocabulario interior, y que ese punto sea lo bastante estrecho como para caber en la cabeza de quien lo mantiene. Por eso el `Endpoint` es un dato y no una función: los datos se inspeccionan, se comparan y se prueban. Por eso el transporte es un protocolo y no un tipo concreto: una dependencia que puedes sustituir es una dependencia que puedes interrogar. Y por eso el DTO no es el modelo: mientras existan dos tipos y una función entre ellos, cualquier temblor del servidor se detiene en esa función; el día que los fusionas por comodidad, el esquema JSON de un tercero se convierte en el modelo de tu dominio y has cedido el diseño de tu app a alguien que no la ha visto nunca. La medida de una buena capa de red no es lo poco que ocupa, sino lo poco que hay que cambiar cuando el servidor cambia.
+</Callout>
+
+<Callout type="note" title="Lo esencial del cliente tipado">
+Llamar a `URLSession` desde las vistas replica la URL base, las cabeceras y el esquema JSON por toda la app y hace imposible probarla sin red. La alternativa: describir cada petición como un `Endpoint` genérico en su respuesta, enviarla con un cliente único que valida el estado y decodifica una sola vez, e inyectar el transporte como protocolo para poder sustituirlo en los tests. Sobre eso, un servicio de dominio traduce el DTO del servidor al modelo propio: dos tipos y una función de mapeo que absorben los cambios ajenos.
+</Callout>
+
+<Challenge title="Construye la frontera">
+1. Define un `Endpoint` genérico con método, ruta, query y cabeceras, y un método que produzca la `URLRequest` a partir de una URL base.
+2. Declara dos recursos concretos con extensiones restringidas por el tipo de respuesta y comprueba que el compilador impide confundirlos.
+3. Escribe el cliente con la función genérica `enviar` y extrae el protocolo `Transporte` para inyectarlo.
+4. Implementa un transporte falso que lea un JSON de disco y escribe un test que no toque la red.
+5. Añade el DTO, el modelo de dominio y la función de mapeo; después cambia un nombre de campo en el JSON y verifica que solo tocas un archivo.
+</Challenge>

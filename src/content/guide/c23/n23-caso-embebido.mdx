@@ -1,0 +1,173 @@
+---
+title: "El caso embebido"
+description: "Bare metal de verdad: la tabla de vectores que arranca un Cortex-M, el script de enlazado que separa VMA de LMA, la inicialización manual de `.data` y `.bss`, y el bucle principal que nunca retorna."
+subject: c23
+level: 23
+order: 5
+position: "23.5"
+duration: "19 min"
+---
+
+<Lead>
+En un microcontrolador no hay kernel que prepare una pila, ni cargador que copie segmentos, ni nadie que ponga a cero tus variables globales. Hay una memoria de programa, una memoria de datos y un núcleo que, al soltarse la señal de reset, lee dos palabras de una dirección fija. Todo lo que ocurre después lo escribes tú, y esta lección es exactamente ese «todo».
+</Lead>
+
+<Goals>
+
+- Construir la tabla de vectores de un Cortex-M y entender qué lee el núcleo al arrancar.
+- Distinguir dirección de carga y dirección de ejecución en el script de enlazado.
+- Escribir el `Reset_Handler` que inicializa `.data` y `.bss` antes de tocar nada.
+- Estructurar el bucle principal y el acceso a periféricos con `volatile`.
+
+</Goals>
+
+## Quién arranca el arranque
+
+La secuencia de reset de un Cortex-M es peculiar y vale la pena memorizarla, porque explica la forma de todo el fichero de arranque. El núcleo **no** salta a una dirección fija: lee dos palabras de 32 bits del comienzo de la tabla de vectores y las carga en dos registros.
+
+<Cards>
+  <Card icon="📚" title="Palabra 0: el puntero de pila">
+    Se carga en el Main Stack Pointer. La pila ya existe **antes** de la primera instrucción, y crece hacia abajo desde el final de la RAM.
+  </Card>
+  <Card icon="🎯" title="Palabra 1: el Reset Handler">
+    Se carga en el contador de programa. Su bit menos significativo debe valer uno para indicar estado Thumb; el enlazador lo pone por ti al tomar la dirección de una función.
+  </Card>
+</Cards>
+
+Después vienen las excepciones del núcleo en un orden fijado por la arquitectura, y a continuación las interrupciones del periférico concreto. En C la tabla es simplemente un array constante de punteros a función, colocado a la fuerza en una sección propia:
+
+```c
+#include <stdint.h>
+
+extern uint32_t _estack;          /* simbolo definido por el enlazador */
+void Reset_Handler(void);
+void Default_Handler(void) { for (;;) { } }   /* atrapa lo no manejado */
+
+/* Alias debiles: cualquier definicion fuerte del proyecto los sustituye */
+void NMI_Handler(void)       __attribute__((weak, alias("Default_Handler")));
+void HardFault_Handler(void) __attribute__((weak, alias("Default_Handler")));
+void SysTick_Handler(void)   __attribute__((weak, alias("Default_Handler")));
+
+__attribute__((section(".isr_vector"), used))
+void (* const tabla_vectores[])(void) = {
+    (void (*)(void))&_estack,     /* 0: pila inicial */
+    Reset_Handler,                /* 1: reset */
+    NMI_Handler, HardFault_Handler,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* reservados, SVCall, PendSV */
+    SysTick_Handler,              /* 15 */
+};
+```
+
+El truco de los alias débiles es el estándar de facto de todos los ficheros de arranque de la industria: cualquier fichero del proyecto que defina `SysTick_Handler` con enlace fuerte gana automáticamente, sin registro ni indirección en tiempo de ejecución.
+
+## El script de enlazado: VMA frente a LMA
+
+Aquí aparece la distinción que hace que el resto tenga sentido. Una variable global inicializada vive en dos sitios: sus valores iniciales tienen que estar grabados en la **memoria flash**, porque la RAM está indeterminada al arrancar, pero el código debe **direccionarla en RAM**, porque es escribible. Esas dos direcciones son la dirección de carga y la dirección de ejecución, y el enlazador te deja fijarlas por separado.
+
+```c
+MEMORY {
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+  RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+SECTIONS {
+  .isr_vector : { KEEP(*(.isr_vector)) } > FLASH
+  .text       : { *(.text*) *(.rodata*) . = ALIGN(4); } > FLASH
+
+  _sidata = LOADADDR(.data);          /* donde estan grabados los valores */
+  .data : { _sdata = .; *(.data*) . = ALIGN(4); _edata = .; }
+          > RAM AT> FLASH             /* VMA en RAM, LMA en FLASH */
+
+  .bss  : { _sbss = .; *(.bss*) *(COMMON) . = ALIGN(4); _ebss = .; } > RAM
+
+  _estack = ORIGIN(RAM) + LENGTH(RAM);
+}
+```
+
+Dos detalles que cuestan horas cuando faltan. El `KEEP` alrededor de la tabla de vectores impide que `--gc-sections` la elimine por considerarla no referenciada: nadie la llama desde C, la lee el hardware. Y `.bss` no tiene dirección de carga porque **no se graba nada**: son ceros, y grabarlos sería desperdiciar flash. Alguien tiene que escribirlos en tiempo de arranque.
+
+<Mermaid code={`flowchart TD
+  R[Senal de reset liberada] --> V[El nucleo lee la palabra 0 y carga el puntero de pila]
+  V --> P[Lee la palabra 1 y carga el contador de programa]
+  P --> H[Reset Handler]
+  H --> D[Copia data desde flash hacia RAM]
+  D --> B[Pone a cero la region bss]
+  B --> C[Configura reloj y perifericos]
+  C --> M[Llama a main]
+  M --> L[Bucle principal que nunca retorna]
+  class H t-yellow
+  class L t-green`} />
+
+## El Reset Handler: `.data`, `.bss` y a `main`
+
+Con los símbolos que acaba de exportar el enlazador, la inicialización manual es de una brevedad casi decepcionante. Lo importante es el orden y lo que **no** se puede hacer antes de terminarla.
+
+```c
+extern uint32_t _sidata[], _sdata[], _edata[], _sbss[], _ebss[];
+int main(void);
+void SystemInit(void);
+
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+void Reset_Handler(void)
+{
+    const uint32_t *src = _sidata;                /* 1. flash hacia RAM */
+    for (uint32_t *dst = _sdata; dst != _edata; ) *dst++ = *src++;
+
+    for (uint32_t *b = _sbss; b != _ebss; ) *b++ = 0;   /* 2. cero en bss */
+
+    SystemInit();     /* 3. solo ahora es legal usar variables globales */
+    main();
+    for (;;) { }      /* main no debe retornar; si lo hace, atrapalo */
+}
+```
+
+Declarar los símbolos del enlazador como arrays y no como escalares no es capricho: lo que el enlazador define es una **dirección**, no un objeto con valor, y escribir `_sdata` como `uint32_t` para tomar luego su dirección invita a que el optimizador razone sobre un valor que no existe. Y el atributo sobre la función es la mitigación de la lección anterior aplicada al sitio más peligroso posible: esos dos bucles **son** un `memcpy` y un `memset`, el optimizador los reconocerá, y aquí las funciones de memoria podrían no estar todavía en un estado utilizable.
+
+<Callout type="warn" title="Antes del paso 3 no hay variables globales">
+Todo lo que ejecutes antes de completar la copia y el borrado lee memoria indeterminada. Nada de constructores, nada de contadores estáticos, nada de estructuras de configuración globales. Es la ventana más frágil de todo el firmware, y los fallos que se cuelan en ella son no deterministas porque dependen del contenido residual de la RAM.
+</Callout>
+
+## El bucle principal y el hardware por memoria
+
+En bare metal los periféricos son direcciones. Escribir en `0x40021000` enciende un reloj; leer de otra devuelve el estado de un pin. El compilador no lo sabe, y para él una lectura repetida de la misma dirección sin escrituras intermedias es redundante y eliminable. `volatile` es lo que se lo prohíbe.
+
+```c
+typedef struct { volatile uint32_t MODER, OTYPER, OSPEEDR, PUPDR, IDR, ODR; } GPIO_t;
+#define GPIOA ((GPIO_t *)0x48000000UL)
+
+static volatile uint32_t ticks;              /* la modifica una interrupcion */
+void SysTick_Handler(void) { ticks++; }
+
+int main(void)
+{
+    GPIOA->MODER |= (1U << 10);              /* pin 5 como salida */
+    for (;;) {
+        uint32_t ahora = ticks;              /* lectura obligatoria cada vuelta */
+        if (ahora % 500 == 0) GPIOA->ODR ^= (1U << 5);
+        __asm__ volatile ("wfi");            /* duerme hasta la proxima IRQ */
+    }
+}
+```
+
+`volatile` garantiza que cada acceso ocurra y en ese orden respecto a otros accesos volátiles, pero **no** es una primitiva de concurrencia: no da atomicidad ni ordena respecto a accesos normales. Para estado compartido con una rutina de interrupción, lo correcto en C23 es `_Atomic` con el orden de memoria explícito, o una sección crítica breve deshabilitando interrupciones; un contador de 64 bits incrementado por una ISR y leído por el bucle principal se corrompe con `volatile` a secas. Y el bucle no retorna nunca porque no hay adónde retornar: no existe proceso padre, ni código de salida, ni sistema que recoja el resultado. `wfi` detiene el núcleo hasta la siguiente interrupción, y es la diferencia entre un dispositivo que dura meses con una pila y uno que dura días.
+
+```bash
+arm-none-eabi-gcc -std=c23 -mcpu=cortex-m4 -mthumb -ffreestanding -nostdlib \
+    -O2 -ffunction-sections -fdata-sections -Wl,--gc-sections \
+    -T enlace.ld arranque.c main.c -o firmware.elf -lgcc
+arm-none-eabi-size firmware.elf          # text, data y bss por separado
+arm-none-eabi-objcopy -O binary firmware.elf firmware.bin
+```
+
+<Callout type="dios" title="Aquí termina la pila de abstracciones">
+Debajo de esto no hay nada. Has llegado al suelo: una señal eléctrica que se libera, dos palabras leídas de una dirección cableada en silicio, y a partir de ahí instrucciones tuyas hasta el final de los tiempos. No hay planificador que te quite la CPU, no hay MMU que te proteja de un puntero equivocado, no hay `printf` que te diga qué pasó, no hay proceso que muera limpiamente. Cada byte de RAM que exista tiene un nombre que tú le diste, y cada ciclo que se ejecute está en un camino que tú escribiste. Es un cambio de perspectiva del que no se vuelve: después de escribir tu propio arranque, la pregunta «¿de dónde salen mis variables globales inicializadas?» tiene una respuesta concreta —de un bucle de copia que alguien escribió— y esa respuesta es igual de cierta en tu portátil, donde el bucle lo ejecuta el cargador dinámico. Todo el edificio del software, los sistemas operativos, los lenguajes con recolector de basura, los contenedores, las máquinas virtuales, se apoya en última instancia en un puñado de líneas como estas corriendo sobre metal desnudo. Y ahora sabes escribirlas.
+</Callout>
+
+<Challenge title="Enciende un LED desde cero absoluto">
+1. Escribe el fichero de arranque completo y el script de enlazado para tu placa, sin usar los que genera el fabricante.
+2. Comprueba con `arm-none-eabi-objdump -h firmware.elf` que la sección `.data` tiene VMA en RAM y LMA en flash, y que difieren.
+3. Elimina el `KEEP` de la tabla de vectores, recompila con `--gc-sections` y observa cómo el binario deja de arrancar. Explica por qué.
+4. Comenta el bucle que pone a cero `.bss`, declara un contador global sin inicializar y observa el valor con el que arranca tras un reset en caliente frente a un corte de alimentación.
+5. Quita el atributo del `Reset_Handler`, compila con `-O2` y busca en el desensamblado las llamadas a `memcpy` y `memset` que aparecen solas.
+6. Sustituye el contador `volatile` compartido con la ISR por un `_Atomic` con `memory_order_relaxed` y razona qué garantía has ganado.
+</Challenge>

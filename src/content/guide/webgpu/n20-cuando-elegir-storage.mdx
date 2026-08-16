@@ -1,0 +1,87 @@
+---
+title: "Cuándo un storage buffer gana al uniform"
+description: "Los cinco casos donde el storage buffer es objetivamente la elección correcta, los dos donde no lo es, y el coste real de la indexación divergente medido en accesos a memoria."
+subject: webgpu
+level: 20
+order: 5
+position: "20.5"
+duration: "16 min"
+---
+
+<Lead>
+La decisión entre uniform y storage se toma docenas de veces en un renderer y casi siempre por costumbre. Merece la pena convertirla en un criterio explícito, porque las dos opciones no compiten en un eje sino en tres: el patrón de acceso, el tamaño y la escritura. Cuando los tres apuntan al mismo sitio la decisión es trivial; cuando se contradicen, hay un orden de prioridad que conviene conocer.
+</Lead>
+
+<Goals>
+
+- Aplicar un criterio de tres ejes para elegir entre uniform y storage.
+- Reconocer los cinco casos donde el storage buffer es inequívocamente mejor.
+- Explicar el coste de la indexación divergente en términos de accesos a memoria.
+- Estructurar los datos de un array grande para no romper la coalescencia.
+
+</Goals>
+
+## Los cinco casos claros
+
+**El tamaño depende de la escena.** Un array de luces, de instancias, de nodos de una BVH, de partículas. Aunque hoy quepan doce elementos en 64 KiB, un array de tamaño fijo con contador es una limitación arbitraria que alguien tendrá que quitar. El storage buffer con array de tamaño en tiempo de ejecución elimina la pregunta.
+
+**El shader escribe.** No hay alternativa: los uniform buffers son de solo lectura. Todo el cómputo, todos los acumuladores y todos los contadores viven en storage.
+
+**Cada invocación lee su propia entrada.** Datos por instancia indexados con `@builtin(instance_index)`, tiles indexados por posición de pantalla, celdas de una rejilla espacial. Con acceso divergente, el uniform buffer pierde su única ventaja y conserva sus limitaciones.
+
+**El dato supera los 64 KiB.** O los 16 KiB del modo de compatibilidad, si te importa esa cobertura. Una matriz de skinning con 300 huesos son 19 200 bytes, que en compat ya no caben.
+
+**El array tiene elementos pequeños.** Un `array<f32, N>` en espacio uniform tiene stride 16 y desperdicia el 75 % del ancho de banda; en storage tiene stride 4. Para tablas de números —pesos de un filtro, coeficientes de armónicos esféricos, una curva muestreada— el storage es cuatro veces más eficiente sin ninguna contrapartida.
+
+## Los dos casos donde no
+
+**Datos leídos idénticamente por todas las invocaciones.** Matrices de cámara, parámetros del frame, constantes del material. Aquí el uniform buffer permite al hardware usar su camino de difusión, y en shaders muy paralelos la diferencia es medible. Es el uso para el que existe.
+
+**Cuando el presupuesto de bindings aprieta.** `maxStorageBuffersPerShaderStage` vale 8 y `maxUniformBuffersPerShaderStage` vale 12, y en algunos dispositivos los límites por etapa de vértices son aún más estrictos. Si estás rozando el límite de storage y te sobra presupuesto de uniform, mover un dato pequeño y uniformemente leído al uniform es la solución correcta.
+
+Cuando los ejes se contradicen, el orden de prioridad es: **escritura por encima de todo**, después **tamaño**, y por último **patrón de acceso**. Si el shader escribe, es storage y no hay debate. Si no cabe, es storage. Solo cuando ambos permiten las dos opciones decide el patrón de acceso.
+
+<Callout type="tip" title="Un dato puede vivir en los dos sitios">
+No es raro tener el mismo array en un uniform con las primeras entradas y en un storage con todas. Un renderer que ilumina con las cuatro luces más cercanas en el camino rápido y con todas en el lento puede tener las cuatro en un uniform y el resto en storage. Duplicar 256 bytes para evitar el acceso divergente en el 90 % de los fragmentos es un intercambio razonable.
+</Callout>
+
+## Qué cuesta de verdad la indexación divergente
+
+Conviene entender el mecanismo, porque los números de intuición aquí son malos.
+
+Una GPU ejecuta las invocaciones en grupos de 32 o 64 en lock-step. Cuando ese grupo emite una lectura de memoria, el hardware intenta **coalescer**: si las 32 direcciones caen dentro de la misma línea de caché, se resuelve con una transacción. Si caen en 32 líneas distintas, se necesitan 32 transacciones, y el grupo entero espera a la última.
+
+Con un `array<Particula>` donde `Particula` mide 32 bytes y la línea de caché son 128 bytes, 32 invocaciones consecutivas leyendo su propio índice tocan 32 × 32 = 1024 bytes, o sea 8 líneas. Eficiente. Con `Particula` de 36 bytes —cuatro de más por un `vec3` mal emparejado— las mismas 32 invocaciones tocan 1152 bytes repartidos en 10 líneas, y además ninguna estructura empieza en un límite de línea, así que muchas se parten en dos. El resultado es más transacciones para leer los mismos datos.
+
+La regla que sale de ahí es simple y vale la pena seguirla siempre: **redondea el tamaño de los elementos de un array grande a una potencia de dos**, y a ser posible a un divisor o múltiplo de 128.
+
+```wgsl
+// 36 bytes: cruza líneas de caché de forma irregular.
+struct Mala { pos : vec3<f32>, vel : vec3<f32>, vida : f32 };
+// offsets: pos 0, vel 16, vida 28 -> SizeOf 32... afortunadamente cuadra.
+
+// 44 bytes, este sí es malo.
+struct PeorAun {
+  pos : vec3<f32>, vel : vec3<f32>, color : vec3<f32>,   // 0, 16, 32
+};                                                        // SizeOf 48
+
+// 32 bytes exactos, emparejando cada vec3 con un escalar.
+struct Buena {
+  pos  : vec3<f32>, vida  : f32,   // 0, 12
+  vel  : vec3<f32>, masa  : f32,   // 16, 28
+};                                  // SizeOf 32
+```
+
+Hay un segundo patrón que va más allá y que conviene conocer: en vez de un array de structs, **varios arrays paralelos**. Si un compute shader solo necesita las posiciones, un `array<vec4<f32>>` de posiciones puras se lee con coalescencia perfecta, mientras que un `array<Particula>` arrastra las velocidades y las vidas que no va a usar. Es la diferencia entre *array of structures* y *structure of arrays*, y en shaders limitados por ancho de banda la segunda gana con claridad. El coste es más bindings y más código de gestión.
+
+## La comprobación práctica
+
+Antes de reestructurar nada, conviene saber si el shader está limitado por memoria o por cómputo. La prueba más rápida no necesita herramientas: duplica el trabajo aritmético del shader sin tocar los accesos a memoria —repite el bucle interno dos veces sumando a una variable que acabas usando— y mide.
+
+Si el tiempo apenas sube, estás limitado por memoria y reestructurar los datos pagará. Si el tiempo casi se duplica, estás limitado por ALU y el layout de los buffers no es el problema.
+
+La medición se hace con las timestamp queries que vimos en el [nivel 18](/guia/webgpu/n18-el-coste-de-setbindgroup/), aplicadas a un compute pass en vez de a uno de render: el descriptor de `beginComputePass` acepta el mismo campo `timestampWrites` con `querySet`, `beginningOfPassWriteIndex` y `endOfPassWriteIndex`.
+
+<Callout type="dios" title="El uniform buffer sobrevive por una razón que casi nadie nombra">
+Con storage buffers de 128 MiB, arrays de tamaño variable y layout sin desperdicio, la pregunta honesta es por qué sigue existiendo el uniform buffer. La respuesta no es el rendimiento de lectura, que en hardware moderno es comparable. Es que el compilador **sabe** que un uniform no cambia durante la ejecución del pass, y eso desbloquea optimizaciones que con un storage `read_write` no puede hacer: puede cargar el valor una vez fuera de un bucle en lugar de en cada iteración, puede propagar constantes desde una override, puede reordenar accesos libremente. Con un storage `read_write`, cualquier escritura en cualquier parte del shader obliga al compilador a asumir que el valor pudo cambiar y a recargarlo. Por eso, cuando un dato es de solo lectura, declararlo como `read-only-storage` en vez de `storage` no es cosmética: le da al compilador la misma libertad que con un uniform. Es la optimización de una palabra que más rendimiento devuelve en WGSL, y consiste únicamente en no pedir permisos que no necesitas.
+</Callout>

@@ -1,0 +1,155 @@
+---
+title: "Streaming de respuestas: ReadableStream, TransformStream, SSE y el TTFB"
+description: "El cuerpo de una Response puede ser un flujo. En vez de fabricar la respuesta entera y luego enviarla, emites bytes según los produces y el cliente empieza a recibir antes de que termines. Así se sirven gigabytes con kilobytes de memoria, se emiten eventos en vivo con Server-Sent Events y se hunde el tiempo hasta el primer byte."
+subject: cloudflare
+level: 10
+order: 4
+position: "10.4"
+duration: "17 min"
+---
+
+<Lead>
+Una `Response` no obliga a tener su cuerpo entero en memoria antes de devolverla. Su cuerpo puede ser un `ReadableStream`: un flujo que va entregando trozos a medida que los produces, de modo que el cliente empieza a recibir la respuesta mucho antes de que tú la hayas terminado. Esta inversión —emitir por partes en lugar de fabricar y luego enviar— es lo que te permite atravesar gigabytes con una huella de memoria mínima, mantener abierto un canal de eventos en vivo con Server-Sent Events, y sobre todo desplomar el tiempo hasta el primer byte, la métrica que el usuario percibe como velocidad.
+</Lead>
+
+<Goals>
+
+- Devolver un `ReadableStream` como cuerpo de una `Response` para responder por partes.
+- Usar un `TransformStream` para escribir por un extremo mientras transmites por el otro sin bufferizar.
+- Emitir eventos en vivo con Server-Sent Events sobre `text/event-stream`.
+- Explicar por qué el streaming mejora el TTFB y aligera la memoria del isolate.
+
+</Goals>
+
+## El cuerpo de una respuesta puede ser un flujo
+
+El constructor `new Response(body, init)` acepta como cuerpo un `ReadableStream`, no solo una cadena o un búfer. Puedes fabricar ese flujo a mano con el constructor `ReadableStream`, cuyo método `start` recibe un `controller` con el que encolas trozos y cierras el flujo cuando terminas. Los trozos han de ser bytes, así que un `TextEncoder` convierte tus cadenas en `Uint8Array`.
+
+```ts
+const encoder = new TextEncoder();
+const stream = new ReadableStream({
+  start(controller) {
+    controller.enqueue(encoder.encode("primer trozo\n"));
+    controller.enqueue(encoder.encode("segundo trozo\n"));
+    controller.close();
+  },
+});
+
+return new Response(stream, {
+  headers: { "content-type": "text/plain; charset=utf-8" },
+});
+```
+
+El cliente recibe `primer trozo` en cuanto lo encolas, sin esperar al segundo. La respuesta ya viaja mientras tú sigues decidiendo qué emitir, y en ningún momento ha existido en memoria la cadena completa.
+
+Que los trozos deban ser bytes y no cadenas no es un capricho: la red transporta octetos, y obligarte a codificar con `TextEncoder` deja explícito el punto donde tu texto se convierte en lo que de verdad viaja. Un `ReadableStream` de bytes es también lo que te devuelven R2, la respuesta de un `fetch` o un `TransformStream`, así que todos encajan como piezas del mismo mecano.
+
+## TransformStream: escribir por un lado, transmitir por el otro
+
+Encolar todo dentro de `start` sirve cuando el contenido es breve, pero el patrón más potente separa la producción de la entrega. Un `TransformStream` te da dos puntas conectadas: un `readable` que devuelves de inmediato como cuerpo, y un `writable` en el que escribes de forma asíncrona. Lo devuelves antes de haber escrito nada, y el runtime mantiene viva la invocación mientras el flujo siga abierto.
+
+```ts
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    // arrancamos la produccion sin await: el cuerpo ya viaja
+    (async () => {
+      for (const fuente of fuentes) {
+        const datos = await fuente();   // trabajo lento por trozo
+        await writer.write(encoder.encode(datos));
+      }
+      await writer.close();
+    })();
+
+    return new Response(readable, {
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  },
+};
+```
+
+La clave está en no esperar a la función asíncrona: la disparas y devuelves el `readable` acto seguido. Entre una escritura y la siguiente puedes consultar una base de datos o lanzar otro `fetch`, y cada resultado sale hacia el cliente en cuanto está listo, sin que un trozo lento retenga a los que ya tenías.
+
+Cuando lo que quieres es enchufar un flujo existente a otro en vez de escribir a mano, usa `pipeThrough` para pasarlo por un transformador y `pipeTo` para volcarlo en un destino. Así encadenas etapas —descifrar, recodificar, filtrar— sin que ninguna materialice el contenido entero.
+
+<Callout type="warn" title="La contrapresión te protege de ti mismo">
+Si el cliente lee despacio, el `write` sobre el `writable` tarda a propósito en resolverse: es la contrapresión, la señal de que el consumidor va por detrás. No la sortees acumulando trozos en un array mientras esperas, porque entonces la memoria que el streaming te ahorraba vuelve a crecer sin control. Respeta el `await` de cada escritura y deja que el ritmo lo marque quien recibe.
+</Callout>
+
+## Server-Sent Events: un canal de eventos en vivo
+
+Server-Sent Events, o SSE, es streaming con un formato acordado: una respuesta de larga duración con `content-type` igual a `text/event-stream`, donde cada evento es una línea `data:` seguida de una línea en blanco. El navegador la consume con `EventSource` y recibe cada evento en cuanto llega, ideal para progreso de tareas, notificaciones o tokens de un modelo de lenguaje.
+
+```ts
+function sse(dato: unknown): string {
+  return `data: ${JSON.stringify(dato)}\n\n`;
+}
+
+// dentro del productor asincrono, sobre el writer del TransformStream:
+await writer.write(encoder.encode(sse({ progreso: 42 })));
+
+// y las cabeceras que lo declaran como flujo de eventos:
+const headers = {
+  "content-type": "text/event-stream",
+  "cache-control": "no-cache",
+};
+```
+
+Juntando las piezas, un handler SSE completo abre el `TransformStream`, emite eventos desde una función que no espera y devuelve el `readable` con esas cabeceras:
+
+```ts
+export default {
+  async fetch(): Promise<Response> {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    (async () => {
+      for (let paso = 0; paso <= 100; paso += 20) {
+        await writer.write(encoder.encode(sse({ progreso: paso })));
+      }
+      await writer.close();
+    })();
+
+    return new Response(readable, {
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      },
+    });
+  },
+};
+```
+
+<Callout type="info" title="SSE es un flujo, no una consulta">
+A diferencia de un JSON normal, una respuesta SSE no se cierra tras el primer dato: se mantiene abierta y el servidor empuja eventos cuando los hay. Recuerda que sigue contando como una invocación viva, con su consumo de CPU y su límite de duración, así que un canal SSE eterno no es gratis: pensado para ráfagas de eventos, no para conexiones ociosas de horas.
+</Callout>
+
+## Por qué el streaming mejora el TTFB
+
+El tiempo hasta el primer byte —TTFB— mide cuánto tarda el cliente en recibir el primer dato útil. Sin streaming, calculas la respuesta entera, la bufferizas y solo entonces la envías: el primer byte sale tarde, cuando ya está todo hecho. Con streaming, el primer byte parte en cuanto el primer trozo está listo, y el resto se produce mientras ese primero ya viaja por la red.
+
+<Mermaid code={`flowchart LR
+  P[Productor en el Worker] -->|primer trozo listo| FB[Primer byte enviado ya]
+  FB --> CL[Cliente empieza a pintar]
+  P -->|sigue trabajando| MAS[Trozos siguientes]
+  MAS --> CL`} />
+
+La ganancia es doble. De cara al usuario, un navegador que recibe HTML por partes empieza a renderizar y a pedir recursos antes de tener la página completa, y la percepción de velocidad se dispara. De cara al isolate, los bytes atraviesan tu Worker sin acumularse: transmitir un objeto de R2 de un gigabyte como flujo cabe holgado en los 128 MB, mientras que cargarlo entero con `arrayBuffer` lo reventaría.
+
+Este mismo mecanismo sostiene el renderizado en servidor por streaming y la salida token a token de un modelo de lenguaje: en ambos casos el primer fragmento útil parte antes de que exista el último, y el usuario percibe respuesta donde antes solo había una espera con la página en blanco.
+
+<Callout type="dios" title="La respuesta deja de ser una cosa y pasa a ser un suceso">
+Casi todo lo que aprendiste sobre respuestas asume que una respuesta es un objeto: lo construyes completo, lo tienes en la mano, lo entregas de un golpe. El streaming disuelve esa imagen y la sustituye por otra más honesta con lo que de verdad ocurre en la red. Una respuesta no es una cosa que se transfiere instantáneamente: es un proceso que se desenvuelve en el tiempo, y el cliente no la recibe, la presencia mientras sucede. Cuando aceptas eso, dejas de preguntarte "cuándo estará lista la respuesta" y empiezas a preguntarte "cuándo puede salir el primer byte", que es una pregunta moralmente distinta, porque el primer byte es lo único que el usuario percibe como el instante en que el sistema respondió. Todo lo demás —terminar de calcular, cerrar el flujo— sucede tras el telón, mientras la persona al otro lado ya ve algo moverse. Y la misma inversión que mejora la latencia resuelve la memoria, porque un flujo que atraviesa tu Worker sin residir en él te vuelve una válvula en vez de un depósito: los bytes pasan, tú los tocas al vuelo, y ninguno se queda a ocupar tu escaso presupuesto. Server-Sent Events lleva la idea a su extremo natural, un canal que no se cierra y por el que la verdad va llegando a plazos. Cuando interiorizas que responder es abrir un grifo y no entregar un paquete, todo el edge encaja: el cuerpo de la petición era un flujo que se consumía una vez, el de la respuesta es un flujo que emites por partes, y tu trabajo consiste en que los datos crucen sin detenerse.
+</Callout>
+
+<Challenge title="Emite por partes en lugar de fabricar y entregar">
+1. Devuelve un `ReadableStream` que encole tres trozos con `TextEncoder` y ciérralo; comprueba con `curl` que llegan escalonados.
+2. Monta un `TransformStream` y escribe en su `writable` desde una función asíncrona que no esperas, devolviendo el `readable` de inmediato.
+3. Sirve un endpoint SSE con `content-type` de `text/event-stream` que emita un evento de progreso cada poco y conéctalo desde el navegador con `EventSource`.
+4. Transmite el `body` de un objeto grande de R2 como flujo y razona por qué esto cabe en 128 MB mientras que `arrayBuffer` no.
+5. Explica con tus palabras por qué el streaming baja el TTFB aunque el trabajo total sea el mismo, y qué gana el navegador al recibir HTML por partes.
+</Challenge>

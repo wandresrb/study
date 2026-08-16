@@ -1,0 +1,151 @@
+---
+title: "Push con APNs: el token, el proveedor y el viaje del payload"
+description: "Una notificación remota atraviesa cuatro dominios de confianza distintos antes de aparecer en una pantalla, y cada frontera tiene su propio modo de fallo silencioso. Esta lección recorre el trayecto completo —registro del token, autenticación del proveedor, cabeceras del canal `HTTP/2`, estructura del `payload` y entrega— y explica por qué el token nunca debe tratarse como identidad de usuario."
+subject: ios
+level: 21
+order: 3
+position: "21.3"
+duration: "20 min"
+---
+
+<Lead>
+Cuando una notificación remota aparece en la pantalla bloqueada de un iPhone, ha cruzado cuatro dominios de confianza: tu servidor, la infraestructura de `APNs`, el demonio de notificaciones del dispositivo y finalmente el proceso de tu app. Cada frontera impone su propio formato, su propia autenticación y su propio catálogo de fallos, y la característica que define a este subsistema es que casi todos esos fallos son silenciosos. Un `payload` mal formado, un token caducado, una cabecera ausente o una prioridad mal elegida no producen una excepción visible: producen una notificación que simplemente no llega. Depurar `APNs` exige, por tanto, tener un mapa mental preciso del trayecto completo y saber qué evidencia deja cada tramo.
+</Lead>
+
+<Goals>
+
+- Describir el ciclo de vida del token de dispositivo y justificar por qué no es un identificador estable de usuario.
+- Configurar la autenticación del proveedor con clave de firma y construir las cabeceras obligatorias del canal `HTTP/2`.
+- Componer un `payload` correcto para alerta, entrega silenciosa y modificación por extensión, respetando el límite de tamaño.
+- Diagnosticar los fallos de cada tramo interpretando códigos de respuesta y comportamiento observable en el dispositivo.
+
+</Goals>
+
+## El token no es un identificador de usuario
+
+El registro empieza con `registerForRemoteNotifications`, que pide al sistema un token opaco y lo devuelve de forma asíncrona por delegado. Ese token identifica la combinación de una app concreta, una instalación concreta y un entorno concreto, y su vigencia no está garantizada más allá del momento en que se recibe. Cambia al restaurar el dispositivo desde una copia de seguridad, al reinstalar la app, en ciertas actualizaciones del sistema y por rotaciones que `APNs` puede decidir sin motivo observable.
+
+De ahí se sigue la regla que evita la mayoría de los incidentes en producción: el token es un **atributo volátil de una instalación**, no la identidad de una persona. El modelo de datos correcto asocia varios tokens a una cuenta, guarda para cada uno el entorno, la versión de la app, la configuración regional y la fecha de última confirmación, y aplica una política de caducidad. Guardar un único token por usuario garantiza que quien tiene un iPhone y un iPad recibirá los avisos en uno solo de los dos, con la particularidad de que será impredecible cuál.
+
+```swift
+func application(_ app: UIApplication,
+                 didRegisterForRemoteNotificationsWithDeviceToken data: Data) {
+    let token = data.map { String(format: "%02x", $0) }.joined()
+    Task { await ServicioTokens.registrar(token,
+                                          entorno: entornoActual,
+                                          idioma: Locale.current.identifier) }
+}
+
+func application(_ app: UIApplication,
+                 didFailToRegisterForRemoteNotificationsWithError error: Error) {
+    Registro.aviso("Sin token remoto: \(error.localizedDescription)")
+}
+```
+
+Dos consecuencias operativas se derivan de la volatilidad. La primera es que hay que llamar a `registerForRemoteNotifications` en **cada arranque**, no solo en el primero: es una operación barata que devuelve el token cacheado si no ha cambiado y el nuevo si lo ha hecho. La segunda es que el servidor debe consumir las señales de invalidación que `APNs` devuelve —una respuesta con estado `410` significa que ese token está muerto— y borrar la fila, porque seguir enviando a tokens muertos degrada la reputación del proveedor y desperdicia capacidad.
+
+<Callout type="warn" title="Sandbox y producción son universos separados">
+Un token obtenido con un perfil de desarrollo solo es válido contra el entorno de pruebas de `APNs`, y uno obtenido desde TestFlight o la App Store solo contra el de producción. Enviar al servidor equivocado produce `BadDeviceToken`, que es un mensaje engañoso porque el token es perfectamente válido: lo que está mal es el destino. Guarda siempre el entorno junto al token y trátalos como claves compuestas; el noventa por ciento de los ratos perdidos depurando push empiezan aquí.
+</Callout>
+
+## El proveedor y el canal
+
+El servidor se comunica con `APNs` sobre `HTTP/2` con conexiones persistentes y multiplexación de peticiones. La autenticación recomendada usa una clave de firma en formato `p8` descargada una única vez desde el portal de desarrollo, con la que se firma un `JWT` de vida corta que viaja en la cabecera de autorización. Frente al esquema antiguo de certificados por app, la clave de firma no caduca, sirve para todas las apps del equipo y cubre ambos entornos, lo que elimina toda una categoría de incidencias por expiración.
+
+Las cabeceras de la petición no son metadatos accesorios: gobiernan el comportamiento de entrega y omitirlas provoca rechazos o entregas degradadas.
+
+<Cards>
+  <Card icon="🏷️" title="apns-topic">
+    El identificador del paquete de la app, con sufijo cuando el destino es una extensión, una actividad en vivo o `VoIP`. Obligatoria cuando la clave sirve a varias apps.
+  </Card>
+  <Card icon="📮" title="apns-push-type">
+    Declara la naturaleza del envío: `alert`, `background`, `liveactivity`, `voip`. Debe concordar con el `payload` o el envío se rechaza.
+  </Card>
+  <Card icon="⏱️" title="apns-priority">
+    El valor 10 entrega de inmediato; el 5 permite al sistema agrupar y ahorrar energía; el 1 es la prioridad mínima. Los envíos silenciosos exigen 5 o menos.
+  </Card>
+  <Card icon="🔁" title="apns-collapse-id">
+    Identificador de colapso: los envíos que lo comparten se sustituyen entre sí en el dispositivo. Es la herramienta contra la avalancha de estados intermedios.
+  </Card>
+</Cards>
+
+El identificador de colapso merece un ejemplo porque su utilidad es mayor de lo que sugiere su descripción. Un repartidor que avanza por la ciudad genera decenas de actualizaciones de estado; enviarlas todas produce una pila de avisos obsoletos que la persona debe descartar uno a uno. Compartiendo `apns-collapse-id` entre todas ellas, el dispositivo conserva únicamente la última, y el resultado es una sola tarjeta que se actualiza sola. La regla general es que todo aviso que represente el **estado actual** de una entidad, y no un evento irrepetible, debe llevar identificador de colapso derivado de esa entidad.
+
+Dos cabeceras más completan el cuadro. `apns-expiration` fija el instante a partir del cual `APNs` deja de reintentar la entrega a un dispositivo apagado o sin red; sin ella, el valor por defecto puede hacer que un aviso caducado aparezca horas más tarde, con el efecto desconcertante de anunciar algo que ya pasó. Y `apns-id` permite que el proveedor imponga su propio identificador de correlación, indispensable para cruzar registros entre tu sistema y las respuestas del servicio.
+
+## Anatomía del payload
+
+El cuerpo es un objeto `JSON` cuyo tamaño total no puede superar los cuatro kilobytes. Dentro, la clave `aps` está reservada al sistema y todo lo demás es espacio libre para tu dominio, que llegará intacto a la app dentro del `userInfo`.
+
+```json
+{
+  "aps": {
+    "alert": {
+      "title": "Pedido en camino",
+      "subtitle": "Llega hoy entre 14:00 y 16:00",
+      "body": "El repartidor ha salido del almacen"
+    },
+    "sound": "default",
+    "badge": 3,
+    "thread-id": "pedido-8842",
+    "category": "PEDIDO",
+    "interruption-level": "time-sensitive",
+    "relevance-score": 0.9,
+    "mutable-content": 1
+  },
+  "pedido_id": "8842",
+  "imagen_url": "https://cdn.ejemplo.com/p/8842.jpg"
+}
+```
+
+Tres claves de control merecen atención porque cambian el modo de operación. `mutable-content` con valor uno habilita la intercepción por la extensión de servicio, tema de la lección siguiente. `content-available` con valor uno convierte el envío en una entrega silenciosa que despierta la app en segundo plano sin mostrar nada. Y `category` enlaza con las acciones registradas en el cliente, de modo que el servidor puede decidir qué botones ofrece cada aviso sin desplegar una versión nueva.
+
+La entrega silenciosa exige una advertencia proporcionada a la cantidad de arquitecturas que se han construido sobre ella olvidándola: **no está garantizada**. El sistema aplica un presupuesto por app que depende del nivel de batería, del modo de bajo consumo, del patrón de uso reciente y de la frecuencia con la que tu app ha aprovechado despertares anteriores. Una app poco usada puede recibir un puñado de despertares al día. Un diseño que dependa de la entrega silenciosa para mantener datos sincronizados fallará de forma intermitente e inexplicable; el patrón correcto es tratarla como una **optimización oportunista** y mantener la sincronización real en el retorno a primer plano.
+
+<Mermaid code={`sequenceDiagram
+  participant A as App
+  participant S as Sistema iOS
+  participant P as Proveedor propio
+  participant N as APNs
+  A->>S: registerForRemoteNotifications
+  S-->>A: deviceToken opaco
+  A->>P: guardar token con entorno e idioma
+  P->>N: POST con JWT firmado y cabeceras
+  N-->>P: 200 con apns-id o error 400 y 410
+  N->>S: entrega segun prioridad y expiracion
+  S->>A: userInfo completo al abrir o despertar`} />
+
+## El viaje completo y sus puntos de fallo
+
+Recorrer el trayecto entero con las causas de fallo asociadas convierte una depuración de horas en una de minutos. En el **registro**, el token no llega si el dispositivo no tiene red al arrancar o si falta la capacidad de notificaciones remotas en el perfil; conviene registrar el error del delegado en lugar de dejarlo vacío. En el **almacenamiento**, el fallo típico es la colisión de entornos y la ausencia de limpieza de tokens muertos. En el **envío**, los códigos de respuesta son concluyentes: `400` con razón textual señala `payload` o cabeceras mal formados, `403` indica firma inválida o clave equivocada, `410` significa token retirado y `429` que se está saturando el canal.
+
+Merece la pena conservar el `apns-id` que devuelve la respuesta junto al identificador interno de la campaña y del destinatario. Es el único hilo que permite responder a la pregunta que llega desde soporte —este usuario dice que no recibió el aviso del martes— sin recurrir a conjeturas, y su ausencia convierte cada incidencia individual en una investigación abierta.
+
+Superado el envío, los fallos dejan de tener código y hay que inferirlos. Si `APNs` acepta y nada aparece, las causas probables son que la app tenga el permiso revocado, que el nivel de interrupción no atraviese un modo de concentración activo, que la entrega esté diferida a un resumen programado o que un `apns-collapse-id` compartido haya sustituido el aviso por otro posterior. Y hay un caso que confunde a todo el mundo la primera vez: mientras la app está en primer plano no se muestra nada salvo que el delegado devuelva explícitamente las opciones de presentación deseadas.
+
+```swift
+func userNotificationCenter(
+    _ centro: UNUserNotificationCenter,
+    willPresent notificacion: UNNotification
+) async -> UNNotificationPresentationOptions {
+    let info = notificacion.request.content.userInfo
+    guard esRelevanteEnPantallaActual(info) else { return [] }
+    return [.banner, .list, .sound]
+}
+```
+
+<Callout type="dios" title="APNs es un sistema distribuido con entrega best effort disfrazado de llamada a función">
+La abstracción que ofrece el envío remoto es engañosamente simple: una petición `HTTP` que devuelve doscientos y, al otro lado del mundo, una pantalla que se enciende. Esa simetría aparente induce a razonar sobre el push como si fuera una llamada a procedimiento remoto con confirmación de entrega, y de ahí nacen casi todos los diseños frágiles del ecosistema. Lo que realmente hay es un sistema distribuido con las tres propiedades incómodas de la familia: entrega en el mejor esfuerzo sin garantía, ausencia de orden entre mensajes independientes y ausencia de confirmación de que el destinatario final lo vio. El doscientos que devuelve `APNs` significa acepto la custodia del mensaje, no el usuario lo ha recibido, y entre esas dos afirmaciones caben un dispositivo apagado durante el periodo de expiración, un modo de concentración que lo silenció, un presupuesto de despertares agotado y un resumen programado que lo pospuso hasta las nueve de la noche. La consecuencia arquitectónica es una y es innegociable: **la notificación es una señal, nunca el dato**. Todo lo que se anuncia debe ser reconstruible por la app cuando abra, y el estado autoritativo debe residir en el servidor, no en la secuencia de avisos entregados. Los sistemas que respetan esa separación degradan con elegancia cuando falla la entrega; los que la ignoran producen usuarios que descubren un pedido cancelado tres días tarde y no vuelven a confiar en el canal.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+El token identifica una instalación en un entorno, no a una persona: guarda varios por cuenta, con entorno y fecha, renuévalo en cada arranque y borra los que devuelvan `410`. Autentica con clave de firma y `JWT` corto, y declara siempre `apns-topic`, `apns-push-type`, `apns-priority` y `apns-expiration`. En el `payload`, reserva `aps` al sistema y usa `mutable-content` para interceptar, `content-available` para despertar y `category` para las acciones. Trata la entrega silenciosa como oportunista y la notificación entera como señal, no como dato.
+</Callout>
+
+<Challenge title="Instrumentar el trayecto de extremo a extremo">
+1. Modela la tabla de tokens con clave compuesta de token y entorno, añade fecha de última confirmación y una tarea que purgue los que devuelvan estado `410`.
+2. Envía el mismo aviso con prioridad 10 y con prioridad 5 a un dispositivo en modo de bajo consumo y mide la diferencia de latencia observada.
+3. Construye un envío con `apns-collapse-id` para una entidad que cambia de estado cinco veces seguidas y verifica que en el dispositivo solo queda uno.
+4. Provoca deliberadamente los errores `400`, `403` y `410`, captura la razón textual de cada respuesta y escribe el mensaje de registro que un compañero de guardia entendería a las tres de la mañana.
+5. Implementa el delegado de primer plano para que decida presentar o silenciar según la pantalla activa, y comprueba el comportamiento con la app abierta en la vista que el aviso menciona.
+</Challenge>

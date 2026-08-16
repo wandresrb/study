@@ -1,0 +1,134 @@
+---
+title: "Timers de baja resolución: struct timer_list"
+description: "Los timers clásicos de granularidad de jiffies: declarar un struct timer_list, armarlo con timer_setup, dispararlo tras un retardo con mod_timer, recuperar el objeto contenedor con timer_container_of, cancelarlo con seguridad usando timer_delete_sync, y por qué su callback corre en softirq y no puede dormir."
+subject: kernel
+level: 45
+order: 3
+position: "45.3"
+duration: "15 min"
+---
+
+<Lead>
+La necesidad más común es también la más humilde: "ejecuta esta función dentro de un rato". Un watchdog que salta si el hardware no respondió, un reintento diferido, una limpieza perezosa. Para eso el kernel ofrece el timer clásico, `struct timer_list`: le das una función y un instante en `jiffies`, y el subsistema de timers la llama cuando ese instante llega. Su granularidad es la del tick, su coste es ínfimo y su callback corre en un contexto atómico donde, como en toda interrupción diferida, dormir está prohibido.
+</Lead>
+
+<Goals>
+
+- Declarar un `struct timer_list` y armarlo con `timer_setup` y su callback moderno.
+- Programar y reprogramar el disparo con `mod_timer` y `add_timer`.
+- Recuperar el objeto contenedor desde el callback con `timer_container_of`.
+- Cancelar sin carreras con `timer_delete_sync` y entender por qué el callback no puede dormir.
+
+</Goals>
+
+## Armar un timer: timer_setup y el callback
+
+Un `struct timer_list` casi siempre se embebe en tus datos, no vive suelto. Se arma con `timer_setup`, que registra la función a llamar y unas banderas, dejando el instante de disparo para después:
+
+```c
+#include <linux/timer.h>
+
+struct mi_dispositivo {
+	struct timer_list	watchdog;
+	void __iomem		*regs;
+	unsigned int		fallos;
+};
+
+/* el callback moderno recibe el propio timer, no un unsigned long */
+static void watchdog_fn(struct timer_list *t)
+{
+	struct mi_dispositivo *dev = timer_container_of(dev, t, watchdog);
+
+	if (readl(dev->regs + REG_STATUS) & STATUS_COLGADO) {
+		dev->fallos++;
+		schedule_work(&dev->reset_work);   /* el trabajo pesado, diferido */
+	}
+	mod_timer(&dev->watchdog, jiffies + HZ);   /* rearmar para el proximo segundo */
+}
+
+static void dev_init_timer(struct mi_dispositivo *dev)
+{
+	timer_setup(&dev->watchdog, watchdog_fn, 0);
+}
+```
+
+Dos detalles marcan la época. Primero, el callback recibe `struct timer_list *`, no el viejo `unsigned long data`: para llegar a tus datos usas `timer_container_of`, el `container_of` especializado que da el salto del campo `timer_list` al struct que lo contiene. Este ayudante es el nombre actual —introducido al alinear la API con `container_of`— del clásico `from_timer`, que aún verás en código más viejo. Segundo, las banderas de `timer_setup`: `TIMER_DEFERRABLE` permite que el timer se retrase si la CPU está ociosa (clave para NO_HZ y ahorro de energía), y `TIMER_PINNED` lo clava a la CPU actual.
+
+## Disparar y reprogramar: mod_timer
+
+Un timer armado todavía no está en marcha. Se pone a contar dándole un instante de expiración absoluto en `jiffies`. La forma canónica es `mod_timer`, que sirve tanto para arrancarlo como para reprogramarlo:
+
+```c
+/* dispara dentro de 250 ms a partir de ahora */
+mod_timer(&dev->watchdog, jiffies + msecs_to_jiffies(250));
+```
+
+`mod_timer(t, expires)` es idempotente y libre de carreras respecto a sí mismo: si el timer ya estaba pendiente lo mueve al nuevo plazo, y si no lo estaba lo activa. Devuelve 1 si el timer ya estaba pendiente y 0 si no. Esa semántica lo hace el martillo universal; existe también `add_timer` para el caso de "arráncalo por primera vez" tras fijar `->expires` a mano, pero `mod_timer` cubre casi todo sin sorpresas.
+
+Un matiz esencial de granularidad: `expires` está en `jiffies`, así que la resolución es la del tick. Con `HZ` de 1000 pides milisegundos; con `HZ` de 250, cuartos de segundo. Y además el subsistema **agrupa** timers cercanos en "cubos" de la rueda de timers para amortizar su coste, de modo que un timer clásico puede dispararse algo más tarde de lo pedido, nunca antes. Si necesitas precisión de nanosegundos o disparos exactos, el timer clásico no es tu herramienta: son los hrtimers (nivel 45.4).
+
+## La rueda de timers y el contexto softirq
+
+¿Cómo encuentra el kernel, en cada tick, qué timers han vencido, sin recorrer una lista global gigantesca? Con la **timer wheel**: una jerarquía de cubos indexada por bits del instante de expiración. Los timers próximos caen en cubos de resolución fina; los lejanos, en cubos gruesos que se refinan a medida que se acercan. Insertar y borrar son O(1), y en cada tick solo se examina el puñado de cubos que pueden haber vencido. El precio de esa eficiencia es justamente la agrupación: un timer clásico es barato precisamente porque el kernel se reserva el derecho de redondear su disparo.
+
+Cuando un timer vence, su callback **no** corre en el manejador de interrupción del tick, sino en el softirq `TIMER_SOFTIRQ`, disparado poco después. Eso sigue siendo contexto atómico: no hay proceso al que dormir.
+
+```c
+static void watchdog_fn(struct timer_list *t)
+{
+	/* PROHIBIDO aqui, exactamente como en un manejador de IRQ:   */
+	/* mutex_lock(...);      -> los mutex duermen                  */
+	/* kmalloc(n, GFP_KERNEL); -> puede bloquear en reclaim        */
+	/* msleep(10);           -> duerme; scheduling while atomic    */
+
+	spin_lock(&dev->lock);        /* correcto: el spinlock no duerme */
+	dev->ticks++;
+	spin_unlock(&dev->lock);
+}
+```
+
+Si el callback necesita hacer algo que pueda dormir —tomar un mutex, asignar con `GFP_KERNEL`, hablar por un bus— difiere ese trabajo a una workqueue con `schedule_work`, igual que la mitad inferior de una interrupción.
+
+## Cancelar sin carreras: timer_delete_sync
+
+Destruir el objeto que contiene un timer mientras su callback podría estar a punto de correr en otra CPU es una receta para un use-after-free. La cancelación correcta es `timer_delete_sync` (el nombre moderno de `del_timer_sync`), que borra el timer y **espera** a que cualquier ejecución en curso del callback termine antes de volver:
+
+```c
+static void dev_teardown(struct mi_dispositivo *dev)
+{
+	/* desde este punto el timer no volvera a rearmarse... */
+	dev->apagando = true;
+	/* ...y esperamos a que ninguna instancia del callback siga viva */
+	timer_delete_sync(&dev->watchdog);
+	/* ahora es seguro liberar dev */
+}
+```
+
+Hay una trampa clásica: si el propio callback se rearma con `mod_timer` (como nuestro watchdog), `timer_delete_sync` puede quedar persiguiendo un timer que vuelve a nacer. La solución es la bandera `dev->apagando`: el callback comprueba esa condición y deja de rearmarse, de modo que la cancelación converge. Existe `timer_delete` (sin `_sync`) que borra sin esperar, pero solo es seguro cuando estás seguro de que el callback no está corriendo en ningún sitio; en SMP, la versión síncrona es la regla.
+
+<Mermaid code={`sequenceDiagram
+  participant C as Codigo
+  participant W as Timer wheel
+  participant S as TIMER_SOFTIRQ
+  participant F as Callback
+  C->>W: mod_timer expira en jiffies mas delta
+  Note over W: agrupado en un cubo por jiffies
+  W->>S: en el tick del vencimiento
+  S->>F: ejecuta el callback en contexto atomico
+  F->>W: mod_timer se rearma opcionalmente`} />
+
+<Callout type="warn" title="No liberes lo que un timer aún puede tocar">
+El error más frecuente con timers es de ciclo de vida, no de lógica. Si desregistras tu driver y liberas el struct mientras un callback pendiente todavía apunta a él, el softirq lo tocará después de muerto. La disciplina es doble: una bandera que impida rearmar y un `timer_delete_sync` que espere al callback en vuelo. Con `devm_` no hay atajo automático para timers como sí lo hay para IRQs: la cancelación ordenada es responsabilidad tuya, y va siempre antes de liberar la memoria que el timer referencia.
+</Callout>
+
+<Callout type="dios" title="El timer clásico es una promesa barata, no un reloj exacto">
+Detente en la economía de lo que acabas de construir, porque revela la filosofía entera del kernel sobre el tiempo grueso. Un `timer_list` no promete dispararse en el instante que pediste; promete dispararse *no antes* de él, y pronto después, a cambio de un coste casi nulo. Esa asimetría no es un defecto: es el trato. La rueda de timers agrupa, redondea y difiere precisamente para que armar un millón de timeouts de red no cueste un millón de operaciones caras, sino un puñado de accesos a cubos. Interioriza que la baja resolución no es "un timer peor", sino un timer que ha vendido precisión a cambio de escala, y que esa venta es la correcta para la inmensa mayoría de sus usos: un timeout de TCP no necesita nanosegundos, necesita ser gratis por millones. De ahí se sigue todo lo demás. El callback corre en softirq porque el tick ya está ahí y aprovecharlo es gratis, y por correr ahí hereda la prohibición de dormir que arrastra todo contexto atómico. El instante se mide en `jiffies` porque `jiffies` es la rejilla que el tick ya mantiene, y reusarla es gratis. La lección profunda es que el kernel construye sus abstracciones de tiempo por capas de coste: cuando la promesa barata basta, usa el timer clásico; solo cuando la precisión es innegociable —audio, red de baja latencia, tiempo real— paga el precio del hrtimer. Elegir la capa correcta es media ingeniería de sistemas.
+</Callout>
+
+<Challenge title="Un watchdog que se rearma y se apaga limpio">
+1. Escribe un módulo con un `struct timer_list` embebido en tu struct de datos, armado con `timer_setup`.
+2. En el callback incrementa un contador, imprímelo cada segundo y rearma con `mod_timer(&t, jiffies + HZ)`.
+3. Usa `timer_container_of` para recuperar tu struct desde el callback en vez de una variable global.
+4. En la descarga, pon una bandera `apagando`, haz que el callback deje de rearmarse si está activa y llama a `timer_delete_sync`; explica por qué ese orden evita un use-after-free.
+5. Cambia el callback para que intente `msleep(1)` y observa el `BUG scheduling while atomic`; luego difiere ese trabajo con `schedule_work` y razona la diferencia.
+</Challenge>

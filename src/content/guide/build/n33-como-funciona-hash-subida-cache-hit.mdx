@@ -1,0 +1,150 @@
+---
+title: "Cómo funciona: hash, subida y el cache hit remoto"
+description: "El remote caching en tres actos: resumir las entradas de una tarea en un hash, subir el artefacto y los logs bajo ese hash cuando hay que ejecutar, y en cualquier otra máquina volver a hashear y, si la clave existe, descargar y reproducir en lugar de compilar. La dirección es el contenido, y toda la corrección descansa en la honestidad del hash."
+subject: build
+level: 33
+order: 2
+position: "33.2"
+duration: "17 min"
+---
+
+<Lead>
+El remote caching se entiende como una función memoizada cuyo dominio es el hash de las entradas de una tarea. Tres actos lo componen. Primero, se **resumen las entradas** en un hash: los fuentes, las dependencias, la configuración, las variables de entorno. Segundo, si no hay resultado guardado, se ejecuta la tarea y se **sube el artefacto y los logs** a un almacén compartido, bajo ese hash como clave. Tercero, en cualquier otra máquina se **repite el hash** y, si la clave ya existe, se descarga y se reproduce la salida en lugar de recompilar. La dirección de un cómputo es su contenido, y por eso puede compartirse.
+</Lead>
+
+<Goals>
+
+- Enumerar qué entra en el hash de una tarea y por qué cada pieza debe estar.
+- Entender qué se sube: el artefacto de salida y también los logs capturados.
+- Seguir la decisión de una ejecución: hit local, hit remoto o miss con subida.
+- Interiorizar el contrato de corrección: el hash debe capturar toda entrada que afecte a la salida.
+</Goals>
+
+## El hash: la dirección es el contenido
+
+El corazón del sistema es el hash, y su propiedad esencial es que se deriva **solo del contenido de las entradas**, no de la máquina ni del momento. Turborepo construye ese hash a partir de un conjunto preciso de ingredientes: el contenido de los archivos fuente del paquete —filtrados por `inputs` si lo declaras—, las dependencias externas resueltas según el lockfile, la definición de la tarea en `turbo.json`, las variables de entorno que hayas declarado relevantes en `env` o `globalEnv`, las dependencias globales, y —crucial en un grafo— los hashes de las tareas de las que esta depende vía `dependsOn`. Un `^build` significa que el hash de tu tarea incorpora el hash de la build de tus dependencias internas, de modo que un cambio río arriba se propaga río abajo automáticamente.
+
+```json
+{
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["src/**", "tsconfig.json"],
+      "outputs": ["dist/**"],
+      "env": ["NODE_ENV", "API_URL"]
+    }
+  }
+}
+```
+
+Que el hash dependa solo del contenido es lo que lo hace **direccionable globalmente**. Dos máquinas que parten del mismo código, resuelven el mismo lockfile y declaran las mismas variables computan bit a bit el mismo hash. No hay noción de "mi hash" frente a "tu hash": el hash es una propiedad del contenido, así que sirve de dirección universal. Esa es, exactamente, la propiedad que faltaba en la caché local del nivel anterior: allí la memoria estaba atada a la máquina; aquí la clave está atada al contenido, y por tanto puede vivir en cualquier parte.
+
+<Callout type="tip" title="Inspecciona el hash antes de confiar en él">
+Puedes pedirle a Turborepo que te muestre el hash de cada tarea y qué entró en él sin ejecutar nada, con una corrida en seco. Es la herramienta diagnóstica número uno: si dos entornos que deberían coincidir producen hashes distintos, ahí tienes la fuga —una variable de entorno no declarada, un archivo colado en los `inputs`, una versión de dependencia divergente—. El hash no miente; solo hay que aprender a leerlo.
+</Callout>
+
+Hay una jerarquía en esas entradas que conviene tener presente. Unas son **locales** a la tarea —los fuentes del paquete, su configuración propia— y otras son **globales** al repositorio —el lockfile, un archivo de configuración raíz, una variable declarada en `globalEnv` o un patrón de `globalDependencies`—. Un cambio en una entrada global reescribe el hash de **todas** las tareas a la vez, que es justo lo que quieres: si subes la versión de una herramienta compartida, nada debería acertar en caché, porque nada se construye igual que antes. El arte de declarar entradas es trazar esa frontera con precisión: ni tan estrecha que se cuele una dependencia sin registrar, ni tan ancha que un cambio irrelevante invalide medio repositorio.
+
+Puesto en una tabla, el conjunto de ingredientes del hash queda a la vista:
+
+| Entrada | Ejemplo | Alcance |
+| --- | --- | --- |
+| Fuentes de la tarea | `src/**`, `tsconfig.json` | local al paquete |
+| Dependencias externas | el lockfile resuelto | global |
+| Config de la tarea | `dependsOn`, `outputs` | local al paquete |
+| Variables declaradas | `env`, `globalEnv` | segun se declare |
+| Tareas dependientes | el hash de `^build` | grafo arriba |
+
+## El artefacto: la salida y también los logs
+
+Cuando una tarea se ejecuta porque no había resultado guardado —un *miss*—, Turborepo empaqueta el resultado y lo guarda bajo su hash. El artefacto es un tarball comprimido, típicamente `.tar.zst`, que contiene dos cosas. La primera es obvia: los archivos que la tarea declaró en `outputs` —el `dist/`, los tipos, lo que produzca—. La segunda es menos obvia pero igual de importante: los **logs capturados**, la salida estándar y de error que la tarea imprimió mientras corría.
+
+Guardar los logs es lo que permite que un *cache hit* sea indistinguible de una ejecución real. Cuando otra máquina obtiene un acierto, Turborepo no solo restaura los archivos de `dist/`: también **reproduce** en la terminal la salida original, con un mensaje que lo delata.
+
+```bash
+ui:build: cache hit, replaying logs 3f8a1c2b
+ui:build: > tsup src/index.ts --format esm,cjs
+ui:build: CLI Building entry: src/index.ts
+```
+
+Ese "replaying logs" es la firma de que no se compiló nada: la salida que ves es una grabación, restaurada junto al artefacto, no el producto de una ejecución. La experiencia es idéntica a haber corrido la tarea, pero ocurrió en milisegundos y en otra máquina, quizá hace horas.
+
+Que la salida viaje comprimida no es un detalle menor a escala. El tarball se comprime con un algoritmo veloz —zstd— precisamente porque el cuello de botella de una caché remota es la red, no el disco: un artefacto más pequeño se sube y se baja más rápido, y a lo largo de miles de ejecuciones esa diferencia decide si la caché ahorra tiempo o lo consume. Guardar los logs junto a la salida responde a una segunda exigencia, esta de experiencia de uso: un acierto que no reprodujera la salida original se sentiría como una caja negra, un resultado sin rastro de qué ocurrió. Al reproducir los logs, el acierto conserva la legibilidad de una ejecución real sin pagar su coste.
+
+<Mermaid code={`flowchart TB
+  start[turbo run build] --> hash[calcula hash de entradas]
+  hash --> local{hit local}
+  local -->|si| restaura[restaura salida y reproduce logs]
+  local -->|no| remoto{hit remoto}
+  remoto -->|si| baja[descarga artefacto y reproduce logs]
+  remoto -->|no| corre[ejecuta la tarea]
+  corre --> sube[sube artefacto y logs al almacen]
+  baja --> fin[listo]
+  restaura --> fin
+  sube --> fin
+  class restaura t-green
+  class baja t-green
+  class corre t-red`} />
+
+La transferencia usa un protocolo HTTP sencillo: subir un artefacto es un `PUT` a un endpoint del tipo `/v8/artifacts/:hash`, descargarlo es un `GET`, todo acotado a un equipo. Que sea un protocolo abierto y documentado, y no una caja negra, es lo que hará posible el nivel de self-hosted: cualquiera puede implementar el servidor mientras hable ese protocolo. Y para que una máquina pueda confiar en un artefacto que descargó de un almacén compartido, el protocolo admite **firmar** cada artefacto con una clave secreta compartida (`TURBO_REMOTE_CACHE_SIGNATURE_KEY`): una firma HMAC que verifica integridad y procedencia antes de restaurar nada.
+
+<Cards>
+  <Card icon="🔢" title="Hashear">
+    Resumir las entradas —fuentes, dependencias, config, entorno— en una clave que solo depende del contenido, idéntica en toda máquina.
+  </Card>
+  <Card icon="⬆️" title="Subir">
+    En un miss, ejecutar y guardar bajo el hash un tarball con la salida declarada y los logs capturados, firmado si procede.
+  </Card>
+  <Card icon="⬇️" title="Reproducir">
+    En cualquier máquina, rehacer el hash y, si la clave existe, descargar y reproducir salida y logs en vez de compilar.
+  </Card>
+</Cards>
+
+## El contrato de corrección: inputs completos y salida determinista
+
+Todo el edificio descansa en una sola premisa, y conviene enunciarla con dureza: **el hash tiene que capturar toda entrada que pueda alterar la salida**. Si una tarea lee en tiempo de build una variable de entorno que no declaraste en `env`, esa variable no entra en el hash; entonces dos valores distintos de esa variable producen el mismo hash, y la caché servirá con toda tranquilidad un artefacto construido con el valor equivocado. El resultado es un acierto falso: el sistema cree que restaura lo correcto y en realidad reparte basura, de forma silenciosa y a todo el equipo a la vez. El viejo "en mi máquina funcionaba" regresa con un disfraz nuevo y peor, porque ahora la máquina equivocada eres tú restaurando el error de otro.
+
+El fallo se ilustra en tres líneas. Imagina una tarea que incrusta en el bundle una URL de API leída del entorno, pero que no la declara en `env`:
+
+```bash
+# turbo.json NO declara API_URL en env: queda fuera del hash
+API_URL=https://prod turbo run build     # siembra la cache con la URL de prod
+API_URL=https://staging turbo run build  # MISMO hash: acierto, restaura prod
+```
+
+El segundo comando debería reconstruir con la URL de staging, pero como `API_URL` no está en el hash, Turborepo ve la misma clave, canta un acierto y restaura el artefacto de producción. La caché no se equivocó; tú no le dijiste que esa variable importaba, así que la trató como irrelevante.
+
+<Callout type="warn" title="Un input no declarado es un acierto falso esperando a ocurrir">
+La caché es correcta si y solo si el hash es una función total de todo lo que afecta a la salida. Cada entrada que olvidas declarar —una variable de entorno, un archivo de configuración fuera de `inputs`, una herramienta del sistema— es un agujero por el que se cuela un artefacto obsoleto disfrazado de acierto. Y como el fallo es silencioso, no lo descubres al cachear: lo descubres en producción, cuando lo desplegado no se corresponde con lo que el código de hoy debería haber producido. Declarar entradas no es burocracia; es la condición de que la caché sea sana.
+</Callout>
+
+El reverso del contrato es la **determinismo**. Para que "mismo hash implica mismo resultado" sea cierto, la tarea debe ser una función pura de sus entradas declaradas: dadas las mismas entradas, la misma salida, siempre. Cualquier no-determinismo que se cuele en la salida —una marca de tiempo incrustada, un número aleatorio, un identificador que cambia cada corrida, un orden dependiente del sistema de archivos— rompe la equivalencia por el otro lado: ahora la misma entrada produce artefactos distintos, y aunque el hash coincida, el resultado guardado ya no representa fielmente lo que la tarea haría hoy. Un build no determinista no solo ensucia la caché: destruye la propiedad que la justifica.
+
+Las fuentes de no-determinismo son más comunes de lo que parece: una marca de tiempo de compilación incrustada en el bundle, un hash de contenido que depende del orden en que el sistema de archivos lista los ficheros, un identificador aleatorio generado en cada corrida, la ruta absoluta del proyecto colándose en un sourcemap. Cazarlas y neutralizarlas —fijando semillas, ordenando salidas, normalizando rutas— es una tarea ingrata pero necesaria, porque cada una de ellas es una tarea que jamás acertará en caché por mucho que sus entradas reales no cambien.
+
+## Local y remoto: dos niveles de la misma caché
+
+La caché remota no reemplaza a la local: se apila sobre ella. Ante cada tarea, Turborepo consulta primero el `.turbo/cache` de tu disco, que es instantáneo, y solo si ahí no está el hash pregunta a la caché remota por la red. El orden es una jerarquía de latencias: lo más rápido primero, lo más lento después, y compilar como último recurso. Un acierto local no gasta red; un acierto remoto sí, pero muchísimo menos que recompilar; un miss en ambos paga el coste completo y, de paso, siembra los dos niveles para la próxima vez.
+
+Esa estratificación explica un comportamiento que de otro modo confunde. La primera vez que tocas una tarea en tu máquina tras clonar el repo, obtienes un acierto **remoto**: la salida viaja por la red desde el trabajo de otro. La segunda vez, el mismo hash ya está en tu disco, y el acierto es **local**, sin red. La caché remota, en cierto sentido, precalienta tu caché local con el trabajo del equipo entero.
+
+Esta jerarquía de dos niveles es también la razón de que la caché sea robusta ante fallos: si la remota no responde, la local sigue funcionando, y si ninguna tiene el hash, siempre queda compilar. Ningún nivel es un punto único de fallo, porque el último recurso —hacer el trabajo— nunca desaparece. La caché acelera cuando puede y se aparta cuando no, sin llegar a bloquear jamás.
+
+Para probar específicamente el nivel remoto, puedes forzar a Turborepo a ignorar el disco y consultar solo la red. Es la forma de verificar que un artefacto de verdad viajó, y no que te engañó una caché local que ya tenías sembrada de una corrida anterior.
+
+```bash
+# Ignora la cache local: obliga a resolver todo contra la remota
+turbo run build --remote-only
+```
+
+<Callout type="dios" title="Cachear es memoizar una función pura cuyo dominio es el hash">
+Lo que parece un truco de infraestructura es, mirado de cerca, una idea profunda de las ciencias de la computación aplicada al build. Una compilación es conceptualmente una **función**: toma unas entradas —código, dependencias, configuración, entorno— y produce una salida determinada. Memoizar una función es guardar sus resultados indexados por sus argumentos para no recalcularlos; y el remote caching es exactamente eso, con dos refinamientos que lo hacen viable a escala. El primero es el **direccionamiento por contenido**: en lugar de indexar por los argumentos crudos, se indexa por su hash, un resumen de tamaño fijo que es idéntico en toda máquina que comparta el contenido, lo que convierte la memoria local en memoria global sin coordinación. El segundo es que se memoizan **también los efectos observables**, los logs, para que restaurar sea indistinguible de ejecutar. Pero toda memoización tiene un supuesto que, si se viola, la vuelve veneno: que la función sea **pura**, que no dependa de nada fuera de sus argumentos y no produzca nada fuera de su valor. Aquí ese supuesto se parte en dos deberes que recaen sobre ti, no sobre la herramienta. Debes declarar **todas** las entradas, para que el dominio del hash cubra de verdad todo lo que afecta a la salida; si olvidas una, la función que crees estar memoizando no es la que se ejecuta, y el acierto es falso. Y debes garantizar la **determinismo** de la salida, para que la misma entrada no produzca resultados distintos; si no, la equivalencia que la caché explota deja de existir. La lección última de este nivel es, por tanto, filosófica antes que técnica: el remote caching no acelera tus builds, los reencuadra como funciones, y te obliga a hacerlas puras. La velocidad es la recompensa; la pureza es el precio, y es un precio que mejora tu build lo pagues o no lo pagues.
+</Callout>
+
+<Challenge title="Sigue un artefacto de punta a punta">
+1. Ejecuta una corrida en seco de una tarea e identifica su hash y la lista de entradas que lo componen.
+2. Cambia una sola variable de entorno declarada en `env` y verifica que el hash cambia; quítala de `env` y verifica que ya no cambia. Acabas de reproducir un acierto falso en miniatura.
+3. Ejecuta la tarea, localiza el tarball en `.turbo/cache` y ábrelo: comprueba que dentro están tanto el `dist/` como los logs.
+4. Vuelve a ejecutarla y observa el mensaje `cache hit, replaying logs`; confirma que la salida es una reproducción, no una compilación.
+5. Busca en una de tus tareas una fuente de no-determinismo —una marca de tiempo, un orden inestable— y argumenta por qué envenena la equivalencia en la que se apoya la caché.
+</Challenge>

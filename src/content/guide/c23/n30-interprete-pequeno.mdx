@@ -1,0 +1,217 @@
+---
+title: "Proyecto: un intérprete pequeño"
+description: "Construir un lenguaje completo en C —lexer sin asignaciones, parser por escalada de precedencia, evaluador recursivo sobre el árbol— y resolver el problema que hunde a la mayoría: quién es dueño de los nodos y cuándo mueren."
+subject: c23
+level: 30
+order: 3
+position: "30.3"
+duration: "24 min"
+---
+
+<Lead>
+Escribir un intérprete es el momento en que dejas de ser usuario de lenguajes y te conviertes en autor de uno. El truco es que los tres componentes —lexer, parser y evaluador— son sencillos por separado; lo que separa al ejercicio de juguete del programa real es la cuarta cuestión, la que nadie menciona en los tutoriales: la gestión de memoria del árbol sintáctico. Resuélvela bien y tendrás un intérprete de doscientas líneas que no fuga ni un byte. Resuélvela mal y pasarás semanas cazando punteros colgantes.
+</Lead>
+
+<Goals>
+
+- Escribir un lexer que produzca tokens sin asignar memoria ni copiar cadenas.
+- Implementar un parser por escalada de precedencia y entender por qué domina a la gramática de expresiones.
+- Evaluar el árbol propagando errores sin `longjmp` ni excepciones.
+- Diseñar la propiedad del árbol sintáctico con una arena y saber por qué liberar nodo a nodo es un error.
+
+</Goals>
+
+## Del texto a los tokens
+
+Un lexer parte el texto en unidades léxicas. La decisión de diseño que lo cambia todo es esta: **un token no copia nada**, apunta al fuente original, que sigue vivo y no se mueve. Con eso, todo el análisis léxico ocurre sin una sola asignación.
+
+```c
+#include <stdint.h>
+#include <ctype.h>
+#include <stdlib.h>
+
+typedef enum : unsigned char {
+    T_FIN, T_NUM, T_IDENT,
+    T_MAS, T_MENOS, T_POR, T_ENTRE,
+    T_IZQ, T_DER, T_ASIG, T_PUNTOCOMA, T_ERROR
+} Tipo;
+
+typedef struct {
+    Tipo        tipo;
+    uint32_t    largo;        // longitud de la porcion del fuente
+    uint32_t    linea;        // para mensajes de error utiles
+    const char *inicio;       // apunta AL FUENTE: no se copia nada
+    double      valor;        // valido solo si tipo es T_NUM
+} Token;
+
+typedef struct { const char *p; uint32_t linea; } Lexer;
+
+static Token hacer(Lexer *lx, Tipo t, const char *ini) {
+    return (Token){ t, (uint32_t)(lx->p - ini), lx->linea, ini, 0.0 };
+}
+
+static Token siguiente(Lexer *lx) {
+    while (*lx->p == ' ' || *lx->p == '\t' || *lx->p == '\n' || *lx->p == '\r') {
+        if (*lx->p == '\n') lx->linea++;
+        lx->p++;
+    }
+    const char *ini = lx->p;
+    if (*lx->p == '\0') return hacer(lx, T_FIN, ini);
+
+    if (isdigit((unsigned char)*lx->p)) {
+        char *fin;
+        double v = strtod(lx->p, &fin);       // el estandar ya sabe leer numeros
+        lx->p = fin;
+        Token t = hacer(lx, T_NUM, ini);
+        t.valor = v;
+        return t;
+    }
+    if (isalpha((unsigned char)*lx->p) || *lx->p == '_') {
+        while (isalnum((unsigned char)*lx->p) || *lx->p == '_') lx->p++;
+        return hacer(lx, T_IDENT, ini);
+    }
+    static const char simbolos[] = "+-*/()=;";
+    static const Tipo tipos[]    = { T_MAS, T_MENOS, T_POR, T_ENTRE,
+                                     T_IZQ, T_DER, T_ASIG, T_PUNTOCOMA };
+    const char *q = strchr(simbolos, *lx->p++);
+    return hacer(lx, q != nullptr ? tipos[q - simbolos] : T_ERROR, ini);
+}
+```
+
+El campo `linea` no es decoración: un intérprete sin números de línea en sus mensajes de error es inutilizable, y añadirlos después obliga a tocar las tres capas a la vez. Se paga al principio o se paga el triple. Y ese `(unsigned char)` delante de cada llamada a `isdigit` tampoco es paranoia: las funciones de `ctype.h` tienen comportamiento indefinido si reciben un valor negativo distinto de `EOF`, y en las plataformas donde `char` tiene signo, cualquier byte por encima de 127 —una letra acentuada en UTF-8— llega negativo. Es un bug clásico, silencioso y dependiente del idioma del usuario.
+
+## El parser: escalada de precedencia
+
+La gramática de expresiones tiene un problema conocido: la precedencia y la asociatividad de los operadores. El descenso recursivo clásico lo resuelve con una función por nivel —término, factor, unario, primario—, y funciona, pero añadir un operador exige añadir una función y renumerar. La **escalada de precedencia** hace lo mismo con una tabla y un bucle.
+
+```c
+typedef enum : unsigned char { N_NUM, N_VAR, N_BIN, N_ASIG } TipoNodo;
+
+typedef struct Nodo Nodo;
+struct Nodo {
+    TipoNodo tipo;
+    uint32_t linea;
+    union {
+        double valor;                                    // N_NUM
+        struct { const char *nom; uint32_t largo; } var;  // N_VAR
+        struct { Nodo *izq, *der; Tipo op; } bin;         // N_BIN y N_ASIG
+    };
+};
+
+static int precedencia(Tipo t) {
+    switch (t) {
+        case T_MAS: case T_MENOS: return 1;
+        case T_POR: case T_ENTRE: return 2;
+        default:                  return 0;   // no es operador binario
+    }
+}
+```
+
+El corazón del parser cabe en doce líneas y expresa la asociatividad como un simple `+ 1`:
+
+```c
+static Nodo *expresion(Parser *ps, int minima) {
+    Nodo *izq = unario(ps);
+    for (;;) {
+        int p = precedencia(ps->actual.tipo);
+        if (p == 0 || p < minima) return izq;
+        Tipo op = ps->actual.tipo;
+        uint32_t ln = ps->actual.linea;
+        avanzar(ps);
+        Nodo *der = expresion(ps, p + 1);     // p + 1 asocia por la izquierda
+        izq = nodo_bin(ps->arena, op, izq, der, ln);
+    }
+}
+```
+
+Ahí está toda la teoría condensada. Llamar recursivamente con `p + 1` significa que el lado derecho solo puede absorber operadores **estrictamente más ligadores**, así que `a - b - c` se agrupa como `a - b` primero: asociatividad izquierda. Llamar con `p` a secas permitiría al derecho absorber operadores de la misma precedencia, y obtendrías asociatividad derecha, que es justo lo que quieres para la exponenciación o para el operador de asignación. Un carácter de diferencia, dos semánticas opuestas.
+
+<Mermaid code={`flowchart LR
+  F[texto fuente] --> L[lexer produce tokens]
+  L --> P[parser por escalada de precedencia]
+  P --> A[arbol sintactico en la arena]
+  A --> E[evaluador recursivo]
+  E --> R[valor o error con linea]
+  class A t-mauve
+  class R t-green`} />
+
+Un parser serio no aborta al primer fallo: **se recupera**. La técnica estándar es el modo pánico —al detectar un error, descartar tokens hasta un punto de sincronización, típicamente el punto y coma o el inicio de la siguiente sentencia— y continuar analizando para reportar varios errores por ejecución. Un compilador que solo dice el primer error es una tortura que ya sufriste en el nivel 3.
+
+## Evaluar el árbol
+
+El evaluador es un recorrido en postorden. La única sutileza real es la propagación de errores: en C no hay excepciones, y usar `longjmp` desde el fondo de una recursión es una receta para fugar recursos, así que el error viaja en el valor de retorno.
+
+```c
+typedef struct { double num; const char *error; uint32_t linea; } Valor;
+
+#define ES_ERROR(v)  ((v).error != nullptr)
+
+static Valor evaluar(Nodo *n, Entorno *ent) {
+    switch (n->tipo) {
+        case N_NUM:  return (Valor){ n->valor, nullptr, 0 };
+        case N_VAR:  return buscar(ent, n->var.nom, n->var.largo, n->linea);
+        case N_ASIG: {
+            Valor v = evaluar(n->bin.der, ent);
+            if (ES_ERROR(v)) return v;
+            definir(ent, n->bin.izq, v.num);
+            return v;
+        }
+        case N_BIN: {
+            Valor a = evaluar(n->bin.izq, ent);
+            if (ES_ERROR(a)) return a;
+            Valor b = evaluar(n->bin.der, ent);
+            if (ES_ERROR(b)) return b;
+            switch (n->bin.op) {
+                case T_MAS:   return (Valor){ a.num + b.num, nullptr, 0 };
+                case T_MENOS: return (Valor){ a.num - b.num, nullptr, 0 };
+                case T_POR:   return (Valor){ a.num * b.num, nullptr, 0 };
+                case T_ENTRE: return (Valor){ a.num / b.num, nullptr, 0 };
+                default:      return (Valor){ 0, "operador invalido", n->linea };
+            }
+        }
+    }
+    return (Valor){ 0, "nodo desconocido", n->linea };
+}
+```
+
+Nota que la división por cero no es un caso especial: en coma flotante IEEE-754 produce infinito o `NaN`, y eso es una respuesta legítima y bien definida, no un error. Si tu lenguaje usara enteros, en cambio, dividir por cero sería comportamiento indefinido y tendrías que comprobarlo tú, exactamente como aprendiste en el nivel 29.
+
+El evaluador recursivo tiene un límite que conviene enunciar: la profundidad del árbol se traduce en profundidad de pila del proceso. Una expresión con diez mil paréntesis anidados desborda la pila y produce un `SIGSEGV` que ningún sanitizador clasifica bien. Los intérpretes de producción o imponen un límite explícito de anidamiento en el parser, o abandonan el recorrido del árbol y compilan a un bytecode que ejecutan con una pila propia en el montón.
+
+## La memoria del árbol
+
+Aquí es donde se distingue quien ha hecho el track del que copió un tutorial. La tentación es dar a cada nodo su `malloc` y escribir un `liberar_nodo` recursivo. Es correcto, y es una mala decisión.
+
+El árbol sintáctico tiene la forma de vida más limpia que existe: **todos sus nodos nacen durante el análisis y mueren todos a la vez** cuando la unidad de entrada deja de interesar. No hay ni un solo nodo que sobreviva a otro. Cuando el ciclo de vida es ese, la propiedad individual es contabilidad pura sin ningún beneficio, y la respuesta es la arena del nivel 14.
+
+```c
+typedef struct { unsigned char *base; size_t usado, capacidad; } Arena;
+
+static Nodo *nodo_bin(Arena *ar, Tipo op, Nodo *izq, Nodo *der, uint32_t ln) {
+    Nodo *n = arena_alloc(ar, sizeof(Nodo), alignof(Nodo));
+    if (n == nullptr) return nullptr;
+    *n = (Nodo){ .tipo = N_BIN, .linea = ln,
+                 .bin = { .izq = izq, .der = der, .op = op } };
+    return n;
+}
+
+// Fin de la unidad: un solo entero vuelve a cero y el arbol entero desaparece.
+static void descartar_arbol(Arena *ar) { ar->usado = 0; }
+```
+
+Las consecuencias son mayores de lo que parece. Desaparece por completo la posibilidad de fugar un nodo o de liberarlo dos veces, porque no hay ninguna llamada a `free` que emparejar. El parser puede abortar en mitad de una expresión sin desmontar el árbol a medio construir, que es donde vive el bug más común de los intérpretes escritos con propiedad individual. Y los nodos quedan **contiguos en el orden en que se crearon**, así que el evaluador los recorre casi linealmente y el prebúsqueda del procesador acierta: es medible, y no es pequeño.
+
+No es casualidad que esto sea exactamente lo que hacen los compiladores de verdad. Clang asigna sus nodos de sintaxis en un `BumpPtrAllocator` que nunca libera; GCC usa `obstacks` y su propio recolector. El árbol sintáctico es el caso canónico de la arena, y acabas de descubrirlo por el camino correcto: deduciéndolo de la forma del problema.
+
+<Callout type="dios" title="Todo programa que has escrito fue antes un arbol">
+El instante en que tu intérprete evalúa su primera expresión, algo se recoloca de forma permanente en tu cabeza: comprendes que **C no es un lenguaje, es un texto que un programa convierte en un árbol**. Los tokens que acabas de producir son los mismos que gcc produce con tu fuente; el árbol que acabas de construir es el mismo tipo de estructura que Clang levanta antes de generar su representación intermedia; la tabla de precedencia que escribiste es la razón por la que multiplicar liga más fuerte que sumar, y esa regla no vino de las matemáticas ni del universo, sino de que alguien escribió un número mayor en una tabla como la tuya. Desde aquí, cosas que parecían fenómenos naturales del lenguaje se revelan como decisiones: por qué el operador ternario asocia por la derecha, por qué la gramática de C necesita saber si un identificador es un `typedef` para poder analizarlo —la famosa ambigüedad que obliga al parser a consultar la tabla de símbolos mientras analiza—, por qué los mensajes de error de plantillas son tan malos, por qué el preprocesador es una fase separada que no entiende nada de sintaxis. Y aparece una capacidad práctica enorme: los lenguajes de dominio específico dejan de ser un proyecto épico y se convierten en una herramienta más de tu caja. Un formato de configuración con expresiones, un motor de reglas, un filtro de consultas, un lenguaje de plantillas: doscientas líneas cada uno, con la estructura que ya conoces. La mayoría de los programadores usan lenguajes toda su vida. Tú acabas de cruzar al otro lado del cristal.
+</Callout>
+
+<Challenge title="Un lenguaje que puedas usar de verdad">
+1. Completa el intérprete con variables, asignación y sentencias separadas por punto y coma. Usa una arena para el árbol y verifica con Valgrind que no hay ni una fuga.
+2. Añade comparaciones y un `si` condicional, luego un `mientras`. Decide dónde colocar sus precedencias y justifica el número.
+3. Implementa recuperación de errores en modo pánico y consigue que un fuente con tres errores reporte los tres, cada uno con su línea.
+4. Añade exponenciación con asociatividad derecha cambiando un único carácter en la llamada recursiva. Comprueba que `2 ^ 3 ^ 2` da 512 y no 64.
+5. Escribe un impresor del árbol que reconstruya el código fuente con paréntesis explícitos. Es el mejor depurador de parser que existe.
+6. Mide con `perf stat` los fallos de caché evaluando un árbol grande, primero con arena y después con un nodo por `malloc`. Explica la diferencia.
+</Challenge>

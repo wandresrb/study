@@ -1,0 +1,170 @@
+---
+title: "GitHub Actions con runners de macOS: xcodebuild, caché y tiempos reales"
+description: "Montar el pipeline uno mismo significa asumir tres cosas que la opción integrada regala: elegir la versión de herramientas, decidir qué se cachea y pagar los minutos de macOS a una tarifa multiplicada. Esta lección construye un flujo honesto con xcodebuild, separa la caché que de verdad ahorra de la que solo da sensación de ahorrar, y pone números reales a cada etapa para que las decisiones dejen de ser folclore."
+subject: ios
+level: 30
+order: 3
+position: "30.3"
+duration: "22 min"
+---
+
+<Lead>
+El primer flujo de macOS que escribe casi todo el mundo funciona a la primera y es, sin saberlo, entre dos y cuatro veces más lento y más caro de lo necesario. No por errores gruesos, sino por tres decisiones tomadas por omisión: dejar que el agente elija la versión de Xcode que le apetezca, cachear el directorio equivocado, y volver a compilar desde cero en cada partición de la suite. Ninguna de las tres se manifiesta como un fallo, y por eso sobreviven años. Esta lección las ataca en orden, con la disciplina de medir antes y después, porque en un runner de macOS cada minuto se factura a una tarifa multiplicada respecto a Linux y eso convierte cualquier descuido en una línea de factura recurrente.
+</Lead>
+
+<Goals>
+
+- Fijar el entorno del agente para que la versión de herramientas sea una decisión y no un accidente.
+- Escribir un flujo de `xcodebuild` que separe compilación de ejecución y permita repartir la suite.
+- Distinguir la caché que ahorra tiempo real de la que cuesta más restaurar de lo que evita.
+- Poner números a cada etapa y usarlos para decidir entre agentes gestionados y propios.
+
+</Goals>
+
+## Fijar el agente: la decisión que nadie toma y todo el mundo sufre
+
+Una imagen de macOS gestionada trae varias versiones de Xcode instaladas y una seleccionada por omisión, que cambia sin aviso cuando la imagen se actualiza. Ese cambio mueve a la vez el compilador, el enlazador, los tiempos de ejecución del simulador y el suavizado del texto. El resultado es un día en el que las instantáneas fallan en masa, la suite tarda un veinte por ciento más y nadie ha tocado el código. Fijar la versión de forma explícita es la línea de configuración con mejor relación entre esfuerzo y dolor evitado de todo el fichero.
+
+```yaml
+jobs:
+  verificar:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.0.app/Contents/Developer
+      DESTINO: 'platform=iOS Simulator,name=iPhone 17,OS=26.0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Comprobar el entorno
+        run: |
+          xcodebuild -version
+          xcrun simctl list runtimes | grep iOS
+```
+
+La variable `DEVELOPER_DIR` es preferible a invocar `xcode-select` porque no requiere permisos elevados y afecta solo a este trabajo. El paso de comprobación parece decorativo y no lo es: cuando dentro de seis meses una ejecución falle de forma extraña, ese registro será lo primero que compares entre la ejecución buena y la mala.
+
+El segundo asunto del entorno es el simulador. Lanzar pruebas contra un dispositivo que aún está arrancando produce un fallo de tiempo agotado en el primer caso, que es exactamente el patrón que luego se describe como inestabilidad misteriosa. Arrancar y esperar de forma explícita cuesta unos segundos y elimina una clase entera de fallos.
+
+```bash
+xcrun simctl shutdown all || true
+xcrun simctl boot 'iPhone 17'
+xcrun simctl bootstatus 'iPhone 17' -b
+defaults write com.apple.iphonesimulator SlowMotionAnimations -bool NO
+```
+
+<Callout type="warn" title="El multiplicador de macOS es la restricción de diseño">
+Los minutos de un agente de macOS se facturan a una tarifa varias veces superior a la de Linux, y los de la variante con procesador Apple aún más. Eso cambia el diseño: todo lo que no necesite `xcodebuild` —análisis estático de ficheros de configuración, validación de traducciones, comprobaciones de documentación— debe correr en Linux, y el agente de macOS debe recibir únicamente el trabajo que solo él puede hacer. Es la optimización más rentable y la que menos gente aplica.
+</Callout>
+
+## Compilar una vez, ejecutar muchas
+
+La estructura que separa `build-for-testing` de `test-without-building` es la que hace posible todo lo demás. Compilar es la parte cara y no paralelizable de forma trivial; ejecutar es la parte que se reparte bien. Si cada partición de la suite recompila, se paga la parte cara tantas veces como particiones haya, que es el error más caro y más común de los flujos de iOS.
+
+<Mermaid code={`flowchart LR
+  a[Trabajo de compilacion] --> b[build for testing]
+  b --> c[Empaquetar productos y xctestrun]
+  c --> d[Subir como artefacto]
+  d --> e1[Particion 1 test without building]
+  d --> e2[Particion 2 test without building]
+  d --> e3[Particion 3 test without building]
+  e1 --> f[Unir resultados]
+  e2 --> f
+  e3 --> f
+  f --> g[Publicar informe en la propuesta de cambio]`} />
+
+```yaml
+  compilar:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilar para pruebas
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing \
+            -scheme MiApp \
+            -destination "$DESTINO" \
+            -derivedDataPath .derived \
+            -skipPackagePluginValidation \
+            -skipMacroValidation | xcbeautify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: productos
+          path: |
+            .derived/Build/Products
+            .derived/Build/Products/*.xctestrun
+
+  probar:
+    needs: compilar
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        particion: [1, 2, 3]
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: productos, path: .derived/Build/Products }
+      - name: Ejecutar particion
+        run: |
+          xcodebuild test-without-building \
+            -xctestrun .derived/Build/Products/MiApp_iphonesimulator26.0.xctestrun \
+            -destination "$DESTINO" \
+            -parallel-testing-enabled YES \
+            -resultBundlePath resultado-${{ matrix.particion }}.xcresult
+```
+
+Los dos indicadores que omiten validaciones de macros y de complementos de paquete merecen mención aparte: en un agente sin interacción, esas validaciones no aportan nada porque no hay nadie que pueda aprobar el diálogo de confianza, y sí pueden bloquear la ejecución. La alternativa a desactivarlas es fijar la confianza en el propio proyecto, que es lo correcto cuando el equipo controla las macros que usa.
+
+## Cachear lo que ahorra y no lo que parece que ahorra
+
+La caché es donde más folclore hay. La regla que ordena el asunto es sencilla: una caché solo compensa si el tiempo de restaurarla es claramente menor que el tiempo de regenerar lo que contiene, y esa comparación depende del ancho de banda del agente, no de la intuición.
+
+<Cards>
+  <Card icon="✅" title="Dependencias de SPM">
+    El directorio de checkouts y el estado resuelto. Se restaura en segundos y evita clonar repositorios remotos en cada ejecución. Casi siempre compensa. La clave debe incluir el hash de `Package.resolved`.
+  </Card>
+  <Card icon="⚠️" title="DerivedData completo">
+    Enorme, comprime mal y se invalida con cualquier cambio de versión de herramientas. Restaurar varios gigabytes suele costar más que recompilar de forma incremental. Rara vez compensa en agentes gestionados.
+  </Card>
+  <Card icon="✅" title="Herramientas instaladas">
+    Binarios de formateo, análisis estático o generación de código. Fijar la versión y cachear el binario evita una instalación por red en cada ejecución.
+  </Card>
+  <Card icon="🚫" title="Simuladores y tiempos de ejecución">
+    Varios gigabytes por tiempo de ejecución. Cachearlos no acelera nada frente a usar los que la imagen ya trae; la respuesta correcta es elegir una versión que venga preinstalada.
+  </Card>
+</Cards>
+
+```yaml
+      - name: Cachear dependencias de Swift Package Manager
+        uses: actions/cache@v4
+        with:
+          path: |
+            .derived/SourcePackages
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+```
+
+La caché de compilación merece un párrafo honesto. Existe la posibilidad de cachear el resultado de compilar módulos, pero en la práctica el compilador de Swift invalida con facilidad y la ganancia depende mucho de la forma del grafo de módulos: un proyecto modularizado con fronteras estables se beneficia bastante, y un objetivo monolítico casi nada. La secuencia correcta es medir primero cuánto tarda la compilación limpia, después cuánto tarda con caché caliente, y aceptar la complejidad solo si la diferencia es grande y estable a lo largo de varias semanas.
+
+## Los tiempos reales y el momento de irse a agentes propios
+
+Los órdenes de magnitud que conviene tener en la cabeza para una aplicación mediana, entendiendo que varían con el tamaño del proyecto pero no tanto en su proporción: la puesta a punto del agente y el clonado se van entre uno y dos minutos; resolver dependencias sin caché puede costar entre uno y tres minutos y con caché baja a segundos; la compilación limpia para pruebas de un proyecto de tamaño medio ronda los ocho o diez minutos, y con paquetes ya resueltos se queda en cinco o seis; arrancar el simulador cuesta cerca de un minuto; y la ejecución de la suite depende por completo del reparto. La conclusión que emerge de esos números es constante: **la compilación domina**, y por tanto cualquier esfuerzo que no la ataque produce mejoras marginales.
+
+De ahí salen las tres decisiones que de verdad mueven la aguja, en orden de rentabilidad. Primero, no recompilar por partición, que es el patrón de la sección anterior. Segundo, no ejecutar en macOS nada que pueda correr en Linux. Tercero, reducir el trabajo del compilador en el propio proyecto, con fronteras de módulo estables y sin ficheros que fuercen recompilaciones amplias.
+
+<Callout type="info" title="Cuándo dejan de compensar los agentes gestionados">
+El punto de cruce llega antes de lo que la gente cree. Un equipo que consume varios miles de minutos de macOS al mes con un pipeline ya optimizado suele encontrar que una máquina propia dedicada, bien mantenida, sale más barata y además elimina el tiempo de puesta a punto en cada ejecución. El coste oculto de esa decisión es el mantenimiento: alguien tiene que actualizar el sistema, gestionar el espacio en disco que los simuladores devoran y limpiar el estado entre ejecuciones, porque un agente persistente acumula suciedad que un agente efímero nunca tiene.
+</Callout>
+
+<Callout type="dios" title="Montarlo tú es aceptar la responsabilidad de las versiones">
+La diferencia esencial entre usar la opción integrada y montar el pipeline con agentes propios no es el precio ni la flexibilidad, sino quién asume la responsabilidad de que el entorno de compilación sea reproducible. En cuanto uno escribe su propio flujo, hereda un problema que antes era invisible: el resultado de compilar depende de un conjunto de versiones —Xcode, macOS, tiempos de ejecución de simulador, herramientas de línea de comandos, dependencias resueltas— que si no se fijan de forma explícita se moverán solas, y lo harán en el peor momento, porque las imágenes se actualizan cuando les toca y no cuando a ti te viene bien. La consecuencia práctica es que la calidad de un pipeline propio se mide por cuántas de esas versiones están escritas en algún sitio del repositorio, y que casi todos los fallos descritos como misteriosos son en realidad una versión que cambió sin que nadie lo pidiera. Por eso el orden de trabajo correcto empieza por fijar y registrar el entorno, sigue por separar compilación de ejecución para no pagar la parte cara varias veces, y solo entonces se ocupa de la caché, que es la optimización más visible y la que menos aporta. Invertir ese orden es el camino habitual: se empieza cacheando, se obtienen mejoras que la siguiente actualización de imagen se lleva por delante, y se concluye que la integración continua es caprichosa cuando lo único caprichoso era el entorno que nadie fijó.
+</Callout>
+
+<Challenge title="Construir el flujo y demostrar la mejora con números">
+1. Escribe un flujo que fije `DEVELOPER_DIR`, registre la versión de herramientas y ejecute la suite en un solo trabajo. Anota su duración total en tres ejecuciones.
+2. Sepáralo en un trabajo de compilación y tres particiones que consuman el artefacto. Vuelve a medir y calcula el ahorro.
+3. Añade caché de dependencias con clave basada en el hash de `Package.resolved` y mide el tiempo de restauración frente al de resolución limpia. Quítala si no gana.
+4. Mueve a un agente de Linux toda comprobación que no necesite `xcodebuild` y calcula el ahorro mensual en minutos facturados.
+5. Con el total de minutos de macOS de un mes ya optimizado, compara el coste con el de una máquina propia dedicada y decide de forma explícita.
+</Challenge>

@@ -31,7 +31,7 @@ export default function catalog(): AstroIntegration {
         const contentModule = join(ROOT, 'src/data/content.ts');
         let timer: ReturnType<typeof setTimeout> | undefined;
         const onChange = (file: string) => {
-          if (!file.includes('src/content/guia/') || !file.endsWith('.mdx')) return;
+          if (!file.includes('src/content/guide/') || !file.endsWith('.mdx')) return;
           clearTimeout(timer);
           timer = setTimeout(() => {
             try {

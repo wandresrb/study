@@ -1,0 +1,150 @@
+---
+title: "RPC sobre paso de mensajes: de un envío a una llamada"
+description: "Convertir un canal de mensajes en llamadas con promesas exige correlación explícita, un contrato de errores y una política ante la muerte del otro extremo; una librería automatiza el esqueleto pero no decide nada de eso por ti."
+subject: local-first
+level: 19
+order: 2
+position: "19.2"
+duration: "18 min"
+---
+
+<Lead>
+La primera frontera del plano es también la que más código propio te va a costar, y la que más silenciosamente se degrada. Un canal de mensajes no es un mecanismo de llamada: es un mecanismo de envío, sin retorno, sin correlación, sin errores y sin ninguna noción de que el otro extremo pueda haber dejado de existir. Todo lo que separa ese primitivo de la ergonomía de escribir una llamada con espera lo pones tú, y las decisiones que tomas al ponerlo determinan cómo se comportará tu aplicación el día que algo vaya mal. Esta lección construye esa capa entera, señala las cuatro piezas que casi nadie escribe el primer día y termina examinando qué compras exactamente cuando decides no escribirla.
+</Lead>
+
+<Goals>
+
+- Implementar la correlación de peticiones y respuestas, y entender por qué es el núcleo irreducible del problema.
+- Definir un contrato explícito de lo que cruza la frontera, incluidos los errores, que no cruzan bien por defecto.
+- Añadir las cuatro piezas que se olvidan: tiempos de espera, cancelación, contrapresión y muerte del otro extremo.
+- Evaluar con criterio qué aporta una librería de RPC y qué sigue siendo decisión tuya.
+
+</Goals>
+
+## La correlación: convertir un envío en una llamada
+
+El problema es exactamente uno y todo lo demás son consecuencias suyas: si envías tres peticiones seguidas y recibes tres respuestas, nada en el canal te dice cuál corresponde a cuál. Los mensajes llegan en orden en un mismo puerto, cierto, pero apoyarse en el orden es frágil en cuanto el otro lado procese algo de forma diferida o emita mensajes que no son respuestas. La solución canónica es un identificador por petición y un mapa de promesas pendientes indexado por ese identificador.
+
+```js
+// Cliente: el hilo principal
+const pendientes = new Map();
+let siguiente = 0;
+
+worker.addEventListener('message', ({ data }) => {
+  if (data.tipo !== 'respuesta') return;   // los avisos van por otro camino
+  const p = pendientes.get(data.id);
+  if (!p) return;                          // respuesta tardia o duplicada
+  pendientes.delete(data.id);
+  data.error ? p.reject(reconstruir(data.error)) : p.resolve(data.valor);
+});
+
+export function llamar(metodo, args) {
+  const id = ++siguiente;
+  return new Promise((resolve, reject) => {
+    pendientes.set(id, { resolve, reject });
+    worker.postMessage({ tipo: 'peticion', id, metodo, args });
+  });
+}
+```
+
+Fíjate en dos detalles que parecen defensivos y son estructurales. El primero es el filtro por tipo de mensaje: por el mismo canal van a viajar respuestas y avisos de cambio, y mezclarlos en un único manejador que asume que todo mensaje entrante resuelve algo es el origen de una clase entera de fallos difusos. El segundo es la salida silenciosa cuando el identificador ya no está en el mapa: significa que la petición fue cancelada, que expiró o que el otro lado ha respondido dos veces, y ninguna de esas tres situaciones debe reventar el manejador.
+
+El servidor es la imagen especular, y su propiedad más valiosa es la que no se ve: atiende un mensaje de principio a fin sin ceder el control.
+
+```js
+// Servidor: dentro del Worker
+const metodos = {
+  listarNotas: (args) => db.consultar('SELECT * FROM notas WHERE libro = ?', [args.libro]),
+  crearNota: (args) => db.ejecutar('INSERT INTO notas VALUES (?, ?)', [args.id, args.texto]),
+};
+
+self.addEventListener('message', ({ data }) => {
+  if (data.tipo !== 'peticion') return;
+  try {
+    const valor = metodos[data.metodo](data.args);   // sincrono, sin ceder el control
+    self.postMessage({ tipo: 'respuesta', id: data.id, valor });
+  } catch (e) {
+    self.postMessage({ tipo: 'respuesta', id: data.id, error: serializar(e) });
+  }
+});
+```
+
+Mientras el manejador no contenga ninguna espera, el Worker procesa las peticiones estrictamente en el orden en que llegaron y ninguna transacción puede entrelazarse con otra. Esa serialización es un regalo de la arquitectura y se pierde con una sola espera mal colocada: en el instante en que el manejador cede el control a mitad de una operación, has reintroducido concurrencia dentro de tu propio servicio y con ella carreras que creías haber dejado atrás en el nivel de las transacciones.
+
+## El contrato: qué cruza y qué se queda
+
+El canal no transporta objetos: transporta copias producidas por el algoritmo de clonado estructurado, y ese algoritmo tiene opiniones. Copia bien los tipos primitivos, los vectores, los objetos planos, las fechas, los mapas, los conjuntos, las expresiones regulares y los búferes binarios. No copia funciones ni nada que las contenga. Y, lo más traicionero, **no conserva los prototipos**: una instancia de tu clase llega al otro lado convertida en un objeto plano con los mismos campos y ninguna de sus capacidades.
+
+<Callout type="warn" title="Los errores propios no sobreviven al viaje">
+El clonado estructurado sabe copiar los errores estándar, pero una subclase tuya llega al otro lado como un error genérico que ya no supera la comprobación de tipo con la que pensabas distinguirla. Serializa los errores a mano —un código estable, un mensaje para humanos y los datos que necesites para reaccionar— y reconstrúyelos en el cliente antes de rechazar la promesa. Y separa desde el principio dos familias que se confunden todo el tiempo: los fallos de **dominio**, que son respuestas legítimas del servicio y que la interfaz debe saber tratar, y los fallos de **transporte**, que significan que el servicio no ha podido ni intentarlo. Se manejan de forma distinta y merecen tipos distintos.
+</Callout>
+
+Del lado del rendimiento, la regla es que el clonado se paga por byte y por forma. Un resultado grande devuelto como vector de objetos con doce claves copia esas doce claves por fila, genera basura en ambos lados y provoca pausas del recolector justo cuando la interfaz quiere pintar. Los búferes binarios admiten transferencia en lugar de copia: cambian de dueño sin duplicarse y su coste deja de depender del tamaño, a cambio de quedar inutilizables en el emisor. Para resultados masivos, un empaquetado columnar transferido gana por un margen que no admite discusión.
+
+Hay una decisión más que pertenece al contrato y que casi siempre se toma tarde: la **versión del protocolo**. Una pestaña abierta desde antes del último despliegue sigue viva, con el código antiguo, hablando con un Worker que se ha reiniciado con el código nuevo. Si el saludo inicial no acuerda una versión y no hay una política para la discrepancia, ese escenario produce fallos que no se reproducen jamás en desarrollo.
+
+## Lo que se olvida hasta que falla
+
+<Mermaid code={`flowchart TB
+  A[Peticion emitida] --> B[Entrada en el mapa de pendientes]
+  B --> C[Respuesta normal]
+  B --> D[Expira el tiempo de espera]
+  B --> E[Cancelacion del que llamo]
+  B --> F[El worker muere]
+  C --> G[Se resuelve la promesa]
+  D --> H[Se rechaza y se retira del mapa]
+  E --> H
+  F --> I[Se rechazan todas las pendientes de golpe]
+  class G t-green
+  class H t-yellow
+  class I t-red`} />
+
+**Tiempos de espera.** Una promesa sin plazo es una promesa que puede quedarse pendiente para siempre, y una interfaz esperando para siempre no muestra un error: muestra una rueda que gira. Todo elemento del mapa de pendientes necesita un plazo, y ese plazo debe ser generoso, porque el Worker puede estar legítimamente ocupado con una migración. El propósito no es cortar operaciones lentas, es garantizar que ninguna espera sea infinita.
+
+**Cancelación.** El usuario cambia de pantalla y las tres consultas que había pedido ya no le interesan a nadie. Cancelar del lado del cliente es trivial —retirar la entrada del mapa y rechazar— pero conviene entender que es puramente local: el mensaje ya salió y el Worker lo va a ejecutar de todas formas. Una cancelación que además libere trabajo al otro lado exige que el servidor consulte un registro de peticiones abortadas antes de empezar cada una, y solo compensa cuando las operaciones son caras.
+
+**Contrapresión.** El mapa de pendientes crece sin límite por diseño. Un buscador que emite una petición por pulsación puede acumular cientos, y como cada una retiene el argumento clonado y la promesa, eso es una fuga de memoria con forma de funcionalidad. Un tope explícito de peticiones en vuelo, con rechazo o encolado cuando se supera, es diez líneas y evita una clase entera de incidencias.
+
+**Muerte del otro extremo.** Es el caso más importante y el que casi nadie cubre. Un Worker puede terminar por presión de memoria, sobre todo en dispositivos móviles, y cuando eso ocurre no llega ninguna respuesta ni ningún error: simplemente no llega nada. Sin un manejador que rechace en bloque todas las promesas pendientes, la aplicación se queda esperando indefinidamente y el informe de fallo que recibirás dirá que la aplicación se queda colgada, sin más.
+
+```js
+function derribar(motivo) {
+  for (const [id, p] of pendientes) p.reject(new Error(motivo));
+  pendientes.clear();
+}
+
+worker.addEventListener('error', () => derribar('WORKER_CAIDO'));
+worker.addEventListener('messageerror', () => derribar('MENSAJE_NO_CLONABLE'));
+```
+
+## Qué te da una librería y qué te cobra
+
+Las librerías de RPC sobre workers automatizan el esqueleto anterior mediante intermediarios que interceptan el acceso a propiedades y lo traducen en mensajes, de forma que escribes lo que parece una llamada a un método de un objeto remoto y obtienes una promesa. Lo que compras es real: desaparecen el mapa de pendientes, la asignación de identificadores, el registro de métodos y buena parte del ruido, y con tipado estático obtienes además verificación del contrato en tiempo de compilación, que es probablemente el beneficio mayor.
+
+<Cards>
+  <Card icon="🎁" title="Lo que te ahorra">
+    Correlación, registro de métodos, serialización de argumentos y el pegamento repetitivo. También la ergonomía del tipado extremo a extremo, que atrapa desajustes del contrato antes de ejecutar nada.
+  </Card>
+  <Card icon="💸" title="Lo que sigue siendo tuyo">
+    Los plazos, la cancelación, el tope de peticiones en vuelo, la política ante la muerte del Worker, la versión del protocolo y la traducción de errores de dominio. Nada de eso lo decide una librería.
+  </Card>
+  <Card icon="🪤" title="El riesgo que introduce">
+    La transparencia invita a la charlatanería. Si acceder a una propiedad remota cuesta un mensaje, un bucle inocente genera cien cruces sin que nada en el código lo delate.
+  </Card>
+  <Card icon="🔍" title="El coste de diagnóstico">
+    Una pila de llamadas que atraviesa intermediarios es más difícil de leer, y la instrumentación que necesitarás en la lección 5 hay que insertarla en los puntos de extensión que la librería ofrezca.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="La transparencia es la mentira más cara de los sistemas distribuidos">
+Aquí conviene detenerse en algo que la industria ya aprendió, olvidó y volvió a aprender varias veces, porque estás a punto de repetirlo en miniatura. Desde los años ochenta, cada generación de tecnología distribuida ha intentado el mismo truco: hacer que una llamada remota se parezca a una llamada local para que el programador no tenga que pensar en la diferencia. Y cada generación ha descubierto que la diferencia no se puede esconder, porque no es sintáctica sino semántica. Una llamada local no puede fallar a medias, no tarda de forma impredecible, no requiere copiar sus argumentos, no puede perderse y no puede encontrarse con que el destinatario ha dejado de existir entre la invocación y el retorno. Una llamada remota puede hacer las cinco cosas, y ninguna capa de azúcar sintáctico cambia eso: solo consigue que el programador se lleve la sorpresa más tarde y en peor sitio. La formulación clásica de este argumento tiene ya tres décadas y sigue siendo exacta palabra por palabra, con la única diferencia de que tu red mide cuatro milímetros. Lo que se sigue de ahí, y es la conclusión práctica de esta lección, es que la frontera debe ser **visible en el diseño y cómoda en la escritura**, en ese orden. Cómoda significa que no reimplementes la correlación en cada archivo. Visible significa que tu API remota se diseñe como se diseña una API remota: pocas operaciones, gruesas, con nombres de dominio y no de tabla, pensadas cada una para satisfacer una pantalla completa, con la latencia y los modos de fallo presupuestados por adelantado. Cuando la comodidad se lleva por delante la visibilidad, lo que obtienes no es una abstracción sino una trampa: un código que se lee como si fuera local, se comporta como si fuera remoto y se rompe en producción por motivos que el propio código niega. El objetivo no es olvidar que hay una frontera. Es no tener que teclearla.
+</Callout>
+
+<Challenge title="Construye la capa entera">
+1. Implementa correlación, contrato de tipos de mensaje y saludo inicial con versión de protocolo acordada entre ambos lados.
+2. Serializa un error de dominio propio con código y datos, reconstrúyelo en el cliente y comprueba que la interfaz puede distinguirlo de un fallo de transporte.
+3. Añade plazos a todas las peticiones y un tope de peticiones en vuelo. Provoca la saturación a propósito y observa qué hace tu interfaz.
+4. Termina el Worker mientras hay peticiones en vuelo y verifica que todas las promesas se rechazan con un motivo legible en lugar de quedarse colgadas.
+5. Devuelve diez mil filas primero como vector de objetos y luego como búfer columnar transferido. Mide ambas y anota el factor.
+6. Simula un despliegue: arranca un Worker con versión de protocolo distinta de la del cliente y decide qué debe ocurrir exactamente.
+</Challenge>

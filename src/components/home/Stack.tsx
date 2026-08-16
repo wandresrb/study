@@ -8,11 +8,11 @@ const SLOT = 'flex items-center gap-4 min-h-[4.4rem] px-4 py-3.5 rounded-sm font
 
 export default function Stack() {
   const pop = () => {
-    if (phase() !== 'corriendo') return;
-    goTo('saliendo');
+    if (phase() !== 'running') return;
+    goTo('leaving');
     window.setTimeout(() => {
       popStack();
-      goTo('inicio');
+      goTo('start');
     }, EXIT_MS);
   };
 
@@ -31,7 +31,7 @@ export default function Stack() {
           {(layer, i) => (
             <li class={`${SLOT} border border-solid border-overlay1 bg-mantle`}>
               <span class="text-xs text-overlay2">{layer.addr}</span>
-              <span class="text-lg tracking-versalita text-text">{layer.name}</span>
+              <span class="text-lg tracking-smallcaps text-text">{layer.name}</span>
               {}
               <Show when={i() === stack().length - 1}>
                 <button

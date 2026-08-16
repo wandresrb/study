@@ -1,0 +1,147 @@
+---
+title: "AddressSanitizer por dentro"
+description: "La memoria de sombra a escala uno a ocho, las zonas rojas que rodean cada objeto y el veneno que marca lo intocable: cómo funciona ASan de verdad, qué detecta con exactitud y cuánto cuesta pagarlo."
+subject: c23
+level: 24
+order: 2
+position: "24.2"
+duration: "17 min"
+---
+
+<Lead>
+En la lección anterior usaste `ASan` como una caja negra que convierte cuelgues misteriosos en informes con dirección postal. Ahora la abrimos. Dentro hay una idea de una elegancia brutal: reservar **un byte de metadatos por cada ocho bytes** del programa y consultarlo en cada acceso a memoria. Entender esa maquinaria es lo que te permite leer sus informes con precisión quirúrgica, saber qué bugs jamás verá y decidir con criterio cuánto estás dispuesto a pagar por ella.
+</Lead>
+
+<Goals>
+
+- Entender la memoria de sombra y el mapeo a escala uno a ocho.
+- Saber qué son las zonas rojas y qué significa memoria envenenada.
+- Enumerar con exactitud qué detecta ASan y qué se le escapa.
+- Medir su coste real y enseñarle tus propios asignadores.
+
+</Goals>
+
+## La memoria de sombra: un byte por cada ocho
+
+ASan parte el espacio de direcciones en dos regiones: la memoria de la aplicación y la **memoria de sombra**. Cada grupo alineado de ocho bytes de la aplicación tiene exactamente un byte de sombra que describe su estado. La traducción no es una tabla ni una llamada: es aritmética que el compilador emite en línea.
+
+```c
+/* escala 3: ocho bytes de aplicacion -> un byte de sombra */
+unsigned char *sombra = (unsigned char *)((addr >> 3) + kShadowOffset);
+```
+
+El valor de ese byte codifica cuántos de los ocho bytes son direccionables:
+
+- `0` — los ocho bytes son accesibles.
+- `1` a `7` — solo los primeros `k` bytes lo son; el resto está envenenado. Así se cubren objetos cuyo tamaño no es múltiplo de ocho.
+- Valor negativo (bit alto a uno) — los ocho bytes están envenenados, y el código concreto dice **por qué**: `0xfa` zona roja izquierda del heap, `0xfb` derecha, `0xfd` memoria liberada, `0xf1` zona roja de pila, `0xf9` global envenenado.
+
+Con esa tabla, el chequeo que el compilador inserta antes de cada lectura o escritura cabe en unas pocas instrucciones:
+
+```c
+/* pseudocodigo de la instrumentacion, simplificado */
+unsigned char s = *sombra_de(addr);
+if (s != 0 && ((addr & 7) + tam_acceso) > s)
+    __asan_report_error(addr, tam_acceso, es_escritura);
+*(int *)addr = valor;            /* el acceso original, intacto */
+```
+
+El caso común —sombra igual a cero— es una carga y un salto no tomado. Esa es la razón de que ASan sea órdenes de magnitud más rápido que emular la CPU entera.
+
+<Mermaid code={`flowchart LR
+  A[Direccion de la aplicacion] --> B[Desplazar tres bits a la derecha]
+  B --> C[Sumar el offset de sombra]
+  C --> D[Leer el byte de sombra]
+  D --> E[Cero: acceso permitido]
+  D --> F[Uno a siete: parcialmente accesible]
+  D --> G[Negativo: envenenado, aborta e informa]
+  class E t-green
+  class F t-yellow
+  class G t-red`} />
+
+Esa misma codificación reaparece al final de cada informe, y saber leerla te sitúa de un vistazo:
+
+```bash
+==4711==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x60200000eff4
+WRITE of size 4 at 0x60200000eff4 thread T0
+Shadow bytes around the buggy address:
+  0x0c047fff9df0: fa fa 00 00 fa fa 00 04 fa fa[fa]fa fa fa fa fa
+Shadow byte legend:
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07
+  Heap left redzone:     fa
+  Freed heap region:     fd
+```
+
+Los corchetes señalan el byte de sombra del acceso culpable. Un `fa` significa que aterrizaste en la zona roja izquierda de un bloque; un `fd`, que tocaste memoria en cuarentena; un `04` a la derecha de un `00`, que el objeto ocupaba solo cuatro de esos ocho bytes y te saliste justo por el borde. El informe no te da una pista: te enseña el mapa literal de la memoria alrededor del disparo.
+
+## Zonas rojas y memoria envenenada
+
+Envenenar es marcar un rango como intocable en la sombra. Las **zonas rojas** son bloques envenenados que ASan coloca alrededor de tus objetos para que cualquier desbordamiento caiga en ellos en lugar de pisar al vecino.
+
+- **Heap.** El asignador de ASan sustituye a `malloc` y rodea cada bloque con una zona roja izquierda y otra derecha (configurables con `redzone` y `max_redzone`). En la izquierda guarda además la cabecera con la pila de reserva.
+- **Pila.** El compilador reordena las variables locales, intercala zonas rojas entre ellas y emite código que envenena el marco al entrar y lo limpia al salir. También deja una descripción del marco para que el informe pueda nombrar la variable culpable.
+- **Globales.** A cada global se le añade una zona roja al final y se registra su descriptor al arrancar mediante `__asan_register_globals`.
+- **Cuarentena.** Al liberar, la memoria no vuelve al asignador: se envenena con `0xfd` y entra en una cola FIFO de cuarentena (256 MB por defecto). Ese retraso deliberado en la reutilización es lo que hace que el use-after-free se detecte en lugar de sobrescribirse en silencio.
+
+<Callout type="info" title="La sombra de la sombra">
+La región de sombra tiene a su vez una zona sin mapear —el `shadow gap`— protegida con `PROT_NONE`. Si un puntero salvaje aterriza en el rango de sombra, el acceso a su sombra cae en el hueco y provoca un fallo de segmentación que ASan reconoce y reporta como `wild pointer`. Es la razón de que ASan necesite reservar un espacio de direcciones enorme al arrancar y de que conviva mal con límites estrictos de memoria virtual: si ves un fallo al inicio con `ulimit -v` activo, ese es el motivo.
+</Callout>
+
+## Qué detecta exactamente y qué se le escapa
+
+<Cards>
+  <Card icon="🧪" title="Lo que ve">
+    Desbordamientos de heap, pila y globales; use-after-free; use-after-return; use-after-scope; doble liberación; liberación inválida; y fugas de memoria a través de `LSan`.
+  </Card>
+  <Card icon="🕳️" title="Lo que no ve">
+    Lecturas de memoria no inicializada, carreras de datos, comportamiento indefinido aritmético, y desbordamientos **dentro** de un mismo objeto: entre dos campos de un `struct` no hay zona roja.
+  </Card>
+</Cards>
+
+Hay dos puntos ciegos más que conviene tener presentes. El primero: un índice suficientemente disparatado salta por encima de la zona roja y aterriza en otro objeto perfectamente válido, donde no hay nada que denunciar. ASan detecta el desbordamiento **contiguo**, que es la abrumadora mayoría, no el salto arbitrario. El segundo: la memoria que reparte tu propio asignador —una arena, un pool— es, para ASan, un bloque legítimo enorme. Se lo puedes enseñar con la API de envenenamiento manual:
+
+```c
+#include <sanitizer/asan_interface.h>
+
+void *arena_alloc(Arena *a, size_t n) {
+    void *p = a->base + a->usado;
+    a->usado += n;
+    ASAN_UNPOISON_MEMORY_REGION(p, n);   /* solo esto es tuyo */
+    return p;
+}
+
+void arena_reset(Arena *a) {
+    ASAN_POISON_MEMORY_REGION(a->base, a->usado);
+    a->usado = 0;                        /* todo vuelve a ser intocable */
+}
+```
+
+Con esas dos líneas, tu arena del nivel 14 recupera la detección de desbordamientos y de uso tras liberar que habías perdido al saltarte `malloc`.
+
+## El coste real
+
+Dos veces más lento y unas tres veces más memoria residente es la cifra honesta para un programa típico: la sombra añade un octavo, las zonas rojas y la cuarentena el resto. Compila con `-O1` o `-O2` —no con `-O0`, que multiplica el número de accesos instrumentados— y con `-fno-omit-frame-pointer` para obtener trazas legibles.
+
+```bash
+gcc -std=c23 -O1 -g -fno-omit-frame-pointer -fsanitize=address prog.c -o prog
+
+# el comportamiento se ajusta en tiempo de ejecucion, sin recompilar
+ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1:halt_on_error=1 ./prog
+```
+
+<Callout type="warn" title="ASan no es una mitigación de seguridad">
+Es tentador pensar en dejarlo activo en producción: al fin y al cabo, aborta ante cualquier corrupción. No lo hagas. El propio proyecto lo dice sin ambigüedad: ASan amplía la superficie de ataque —offset de sombra fijo y conocido, rutas de log influibles por el entorno— y no está endurecido contra un adversario. Para producción están las mitigaciones del nivel 26: `_FORTIFY_SOURCE`, `-fstack-protector-strong`, `-D_GLIBCXX_ASSERTIONS` y compañía. ASan es para desarrollo y para integración continua, donde su valor es incomparable.
+</Callout>
+
+<Callout type="dios" title="La sombra es la idea, no la herramienta">
+Detente un segundo en lo que acabas de entender, porque es una de las grandes ideas de la ingeniería de sistemas moderna. El problema era imposible de raíz: en C, la información de tamaño y validez de un objeto se pierde en cuanto lo conviertes en un puntero desnudo; el hardware ve direcciones, no objetos. La solución no fue cambiar el lenguaje ni el hardware, sino **construir un universo paralelo de metadatos** que vive junto a la memoria real, cuesta un octavo del espacio y se consulta con un desplazamiento y una suma. Esa idea —la memoria de sombra— es la misma que sostiene a `MSan`, a `TSan`, a `KASAN` dentro del kernel de Linux y, en hardware, a la extensión `MTE` de ARM, que hace lo mismo con etiquetas en los bits altos del puntero y coste casi nulo. Cuando comprendes la sombra dejas de usar ASan como un botón mágico y empiezas a razonar sobre él: sabes por qué un desbordamiento entre campos de un `struct` se le escapa, por qué la cuarentena consume memoria, por qué tu arena necesita instrucciones explícitas y por qué el futuro de esta técnica está en el silicio. Ese es el salto de usuario de herramientas a ingeniero que entiende sus herramientas.
+</Callout>
+
+<Challenge title="Interroga la sombra">
+1. Escribe un programa que reserve un bloque de 10 bytes y accede al índice 10, al 15 y al 100000. Explica por qué solo dos de los tres accesos producen informe.
+2. Provoca un use-after-free y observa cómo el informe nombra las tres pilas: reserva, liberación y acceso ilegal.
+3. Activa `detect_stack_use_after_return=1` y reproduce el error de devolver la dirección de una variable local.
+4. Toma tu arena del nivel 14, instrúmentala con `ASAN_POISON_MEMORY_REGION` y demuestra con un test que ahora detecta un desbordamiento entre dos reservas de la arena.
+5. Mide con `time` y con `/usr/bin/time -v` la penalización real de tu suite bajo ASan: tiempo y memoria máxima residente.
+</Challenge>

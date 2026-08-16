@@ -1,0 +1,154 @@
+---
+title: "El viaje del estado"
+description: "En el renderizado en servidor el estado nace dos veces: una en el proceso que produce el HTML y otra en el navegador que lo adopta. Entre esas dos ejecuciones no existe memoria compartida, ni punteros, ni objetos vivos; solo una cadena de bytes que atraviesa la red. Esta lección reconstruye ese trayecto pieza a pieza: por qué el servidor está obligado a `serialize` su grafo de objetos a una representación textual, cómo se inyecta esa representación en el documento sin abrir un agujero de seguridad, qué significan con exactitud `dehydrate` en el emisor y `hydrate` en el receptor, y cuál es el conjunto de valores que jamás sobrevive al viaje porque JSON no sabe expresarlos. Al terminar, la hidratación deja de parecer un truco del framework y se revela como lo que siempre fue: un problema clásico de serialización entre dos procesos que no comparten memoria, con todas las consecuencias de diseño que eso arrastra."
+subject: estado
+level: 20
+order: 1
+position: "20.1"
+duration: "18 min"
+---
+
+<Lead>
+Todo lo que has aprendido sobre estado hasta aquí asumía en silencio una comodidad enorme: que el estado vive en un único proceso, en una única memoria, y que quien lo escribe y quien lo lee comparten el mismo montón de objetos. El renderizado en servidor rompe esa premisa de raíz. Hay dos ejecuciones del mismo código, en dos máquinas distintas, separadas por decenas de milisegundos y por un protocolo que solo sabe transportar texto. El servidor consulta la base de datos, calcula el estado inicial, lo usa para producir un HTML completo y muere. El navegador recibe ese HTML ya pintado, arranca el mismo código y descubre que su estado está vacío: no heredó nada, porque los objetos del servidor no viajan, se destruyen con el proceso que los creó. Si nadie hace nada, el cliente vuelve a pedir a la red exactamente los datos que el servidor ya tenía en la mano, y el usuario ve la pantalla llenarse, vaciarse y volver a llenarse. La solución tiene un nombre técnico preciso y una mecánica que conviene entender antes que cualquier librería: el servidor deshidrata su estado a una forma transportable, lo escribe dentro del propio documento, y el cliente lo hidrata para arrancar ya poblado. Esta lección es el mapa de ese viaje.
+</Lead>
+
+<Goals>
+
+- Explicar por qué dos ejecuciones sin memoria compartida obligan a serializar el estado en lugar de compartirlo.
+- Describir el ciclo completo `dehydrate`, `serialize`, transporte, `parse` e `hydrate` y qué garantiza cada paso.
+- Inyectar el estado en el documento de forma segura, evitando la inyección de marcado por escapado insuficiente.
+- Identificar los valores que JSON no puede representar y elegir entre empobrecer el dato o usar un serializador enriquecido.
+
+</Goals>
+
+## Dos ejecuciones separadas por un abismo
+
+La intuición equivocada más común es imaginar el SSR como una continuación: el servidor empieza a renderizar y el cliente termina. No hay continuación. Hay dos ejecuciones independientes del mismo código fuente sobre dos entornos distintos, y lo único que las conecta es el documento que una escribe y la otra lee. El servidor no puede pasarle una referencia a un objeto al cliente, igual que un proceso de Unix no puede pasarle un puntero a otro: la dirección de memoria no significa nada al otro lado.
+
+Esto convierte el problema en uno perfectamente conocido en sistemas distribuidos. Cuando dos procesos que no comparten memoria necesitan intercambiar una estructura, el emisor la traduce a una secuencia de bytes autocontenida y el receptor la reconstruye. Eso es serialización, y arrastra sus tres impuestos clásicos: pérdida de identidad, pérdida de comportamiento y pérdida de tipos que el formato no contempla.
+
+Conviene además desmontar una segunda intuición engañosa, la de que el HTML ya contiene el estado y bastaría con leerlo del DOM. El HTML contiene una proyección visual del estado, no el estado: contiene el nombre impreso, no el registro del que salió; contiene la lista pintada, no el array con sus identificadores, sus banderas y los campos que la vista no muestra. Reconstruir el estado leyendo el marcado es un ejercicio de arqueología condenado a perder información, y por eso todas las soluciones serias del ecosistema transportan el estado aparte, en paralelo al marcado que produjo.
+
+Sin ese puente, el cliente arranca con el estado por defecto que declara el código, no con el que el servidor calculó. El HTML muestra los datos correctos, pero el estado que gobierna ese HTML está vacío. La discrepancia se resuelve del peor modo posible: el cliente pide de nuevo a la red lo que ya estaba en la página, y el usuario paga con un parpadeo y una petición redundante lo que ya se había hecho.
+
+<Mermaid code={`flowchart TD
+  S[servidor consulta datos y calcula estado] --> D[dehydrate a estructura plana]
+  D --> J[serialize a texto seguro]
+  J --> H[HTML con el estado incrustado]
+  H --> N[red]
+  N --> P[cliente parsea el texto]
+  P --> R[hydrate: el store arranca poblado]
+  R --> OK[sin peticion redundante y sin parpadeo]
+  class OK t-green`} />
+
+## Deshidratar, serializar, transportar, hidratar
+
+Conviene separar cuatro verbos que la conversación cotidiana mezcla, porque cada uno resuelve un problema distinto y falla de manera distinta.
+
+<Cards>
+  <Card icon="🖥️" title="dehydrate">
+    Toma la estructura viva del servidor —un store, una cache, un grafo de instancias— y produce una representación plana y sin comportamiento que describe su contenido. Decide qué se lleva y qué se descarta.
+  </Card>
+  <Card icon="🧵" title="serialize">
+    Convierte esa representación plana en texto. Aquí manda el formato: JSON por defecto, con sus límites, o un serializador enriquecido si necesitas tipos que JSON no conoce.
+  </Card>
+  <Card icon="📮" title="Transportar">
+    El texto viaja incrustado en el documento, normalmente dentro de una etiqueta `script` con tipo `application/json`, para que el navegador no intente ejecutarlo y el analizador lo trate como datos inertes.
+  </Card>
+  <Card icon="💧" title="hydrate">
+    El cliente lee ese texto, lo parsea y usa el resultado como estado inicial del store, en lugar del valor por defecto. A partir de ahí la aplicación continúa como si el estado siempre hubiera estado ahí.
+  </Card>
+</Cards>
+
+El lado del servidor es breve y su única sutileza es el escapado. Un dato de usuario que contenga la secuencia de cierre de la etiqueta `script` cerraría el bloque antes de tiempo y todo lo que siguiera se interpretaría como marcado. Escapar el carácter de apertura de etiqueta a su forma unicode elimina el problema sin alterar el valor.
+
+```ts
+// SERVIDOR: calcular, deshidratar, serializar e inyectar
+const estado = await cargarEstadoInicial(peticion)
+
+const json = JSON.stringify(estado)
+  .replace(/</g, '\\u003c')   // evita el cierre prematuro de script
+  .replace(/\u2028/g, '\\u2028') // separadores de linea invisibles
+  .replace(/\u2029/g, '\\u2029')
+
+const marca = `<script id="estado" type="application/json">${json}</script>`
+```
+
+Usar una etiqueta `script` con tipo `application/json` en lugar de asignar el valor a una propiedad global no es una preferencia estética. Un tipo desconocido impide que el navegador ejecute el contenido, de modo que un fallo de escapado degrada a error de análisis en vez de a ejecución de código ajeno; además el bloque queda inerte, sin coste de compilación, y su contenido puede leerse como texto plano cuando haga falta depurarlo.
+
+El lado del cliente es su reverso exacto, y merece una regla que se olvida a menudo: leer el nodo una sola vez, al arrancar, y nunca volver a consultarlo. Ese texto es una fotografía del instante en que el servidor respondió; releerlo más tarde significa resucitar datos ya caducados.
+
+```ts
+// CLIENTE: leer, parsear e hidratar una unica vez
+const nodo = document.getElementById('estado')
+const inicial = nodo ? JSON.parse(nodo.textContent ?? '{}') : {}
+
+const store = crearStore(inicial) // arranca poblado, no vacio
+```
+
+<Callout type="tip" title="El estado incrustado también cuesta bytes">
+Cada byte que deshidratas viaja en el documento, bloquea el primer pintado mientras se descarga y se analiza, y no se beneficia de la cache del navegador porque forma parte de una respuesta única por petición. Deshidratar el estado inicial de la vista es una inversión excelente; deshidratar el catálogo entero por si acaso duplica el peso del HTML para ahorrar una petición que quizá nadie iba a hacer. La pregunta correcta no es qué puedo incrustar, sino qué necesita la primera pantalla para no parpadear.
+</Callout>
+
+## Lo que no sobrevive al viaje
+
+JSON reconoce seis cosas: objetos, listas, cadenas, números, booleanos y el valor nulo. Todo lo demás se degrada en silencio, y el silencio es justamente lo peligroso, porque el error no aparece al serializar sino mucho después, cuando alguien llama a un método que ya no existe.
+
+Una fecha se convierte en cadena y pierde su interfaz. Un `Map` o un `Set` se convierten en objeto vacío o en algo irreconocible. Una instancia de clase pierde su prototipo y llega como objeto plano. Una función desaparece de la salida sin dejar rastro. Un valor indefinido se elimina de los objetos y se convierte en nulo dentro de las listas. Y las referencias compartidas se duplican: dos propiedades que apuntaban al mismo objeto llegan como dos objetos distintos, mientras que un ciclo directamente lanza una excepción.
+
+```ts
+const original = {
+  fecha: new Date(),
+  etiquetas: new Set(['a', 'b']),
+  saludar: () => 'hola',
+  vacio: undefined,
+}
+
+const copia = JSON.parse(JSON.stringify(original))
+// copia.fecha      -> cadena, ya no tiene metodos de fecha
+// copia.etiquetas  -> objeto vacio, el contenido se perdio
+// copia.saludar    -> no existe, la clave desaparecio
+// copia.vacio      -> no existe
+```
+
+<Callout type="info" title="Con respuesta en flujo, el estado llega a trozos">
+Cuando el servidor emite el HTML en flujo en lugar de esperar a tenerlo entero, el estado no puede incrustarse todo al principio: parte de él aún no se ha calculado cuando la cabecera ya salió por el cable. La solución habitual es emitir bloques adicionales a medida que las porciones se resuelven, cada uno con su fragmento de estado, y que el cliente los vaya fusionando. Cambia el modelo mental de una fotografía única a una secuencia de fotogramas, y con él la regla de leer una sola vez: hay que leer cada bloque cuando aparece, no asumir que el último ya está ahí al arrancar.
+</Callout>
+
+Hay dos respuestas legítimas y conviene elegir a conciencia. La primera es empobrecer el dato en origen: deshidratar solo tipos primitivos, guardar las fechas como cadenas normalizadas y las colecciones como listas, y reconstruir la riqueza en el cliente al hidratar. La segunda es usar un serializador enriquecido que codifique los tipos perdidos y sepa restaurarlos al otro lado, al precio de un poco más de peso y de una dependencia compartida por ambos entornos.
+
+La primera opción escala mejor de lo que parece y tiene una virtud que rara vez se menciona: obliga a definir un contrato explícito entre servidor y cliente. Si el estado deshidratado solo contiene primitivos, listas y objetos planos, entonces está descrito por completo por su forma, es validable con un esquema y es estable frente a cambios de librería. Los serializadores enriquecidos son cómodos, pero acoplan ambos extremos a una misma versión de una misma herramienta y esconden dentro de la carga útil una gramática privada que nadie más entiende.
+
+```ts
+// Empobrecer en origen y reconstruir al llegar: contrato explicito
+type PerfilPlano = { id: string; alta: string; etiquetas: string[] }
+
+const aPlano = (p: Perfil): PerfilPlano => ({
+  id: p.id,
+  alta: p.alta.toISOString(),
+  etiquetas: [...p.etiquetas],
+})
+
+const aRico = (p: PerfilPlano): Perfil => ({
+  id: p.id,
+  alta: new Date(p.alta),
+  etiquetas: new Set(p.etiquetas),
+})
+```
+
+<Callout type="warn" title="Nunca deshidrates lo que el usuario no debe ver">
+El estado incrustado está en el código fuente de la página, visible para cualquiera con la vista de fuente abierta. Si tu objeto de servidor arrastra un token de sesión, la clave de una API, el hash de una contraseña o el registro completo de un usuario del que la vista solo muestra el nombre, todo eso queda publicado. Deshidratar no es copiar el estado del servidor: es elegir deliberadamente el subconjunto que el cliente tiene derecho a conocer, y esa elección es una frontera de seguridad, no una optimización.
+</Callout>
+
+<Callout type="dios" title="La hidratacion es serializacion, y la serializacion siempre pierde algo">
+La palabra hidratación suena a magia reversible, como si el estado se secara para el viaje y recuperara su forma exacta al llegar. No es así, y entender por qué te ahorrará una clase entera de bugs que parecen inexplicables. Lo que cruza la red no es tu estado: es una descripción de tu estado, escrita en un lenguaje mucho más pobre que la memoria de la que salió. La memoria conoce identidad, prototipos, referencias compartidas, ciclos, funciones y tipos con comportamiento. El texto no conoce nada de eso. Por tanto, `dehydrate` no es una copia sino una proyección, y toda proyección tiene un núcleo que aplasta: lo que dos objetos compartían deja de compartirse, lo que sabía hacer algo deja de saberlo, lo que tenía identidad pasa a tener solo contenido. El cliente no reconstruye el estado del servidor, construye uno nuevo que resulta ser equivalente en los aspectos que el formato supo describir. Esa distinción es la que convierte el SSR en una disciplina en lugar de una configuración. Te obliga a decidir explícitamente qué aspectos del estado son esenciales —y por tanto deben sobrevivir al viaje— y cuáles eran accidentes de la representación en memoria que puedes recrear al llegar. Es exactamente la misma pregunta que separaba el estado esencial del accidental en el primer nivel de este recorrido, solo que ahora la frontera no es conceptual sino física: pasa por un cable, y cobra peaje en bytes. Quien deshidrata sin pensar acaba enviando su base de datos por el cable; quien piensa antes de deshidratar descubre que la primera pantalla casi siempre necesita mucho menos de lo que temía.
+</Callout>
+
+<Challenge title="Sigue el estado de punta a punta">
+1. En una página renderizada en servidor, calcula un objeto de estado inicial, serialízalo con escapado del carácter de apertura de etiqueta e incrústalo en un `script` de tipo `application/json`.
+2. En el cliente, léelo una sola vez al arrancar y úsalo como estado inicial del store. Confirma en la pestaña de red que no se dispara ninguna petición redundante.
+3. Desactiva temporalmente la inyección y observa el parpadeo: HTML correcto, store vacío, refetch inmediato. Cronometra la diferencia.
+4. Mete a propósito una fecha, un `Set` y una función en el objeto deshidratado, y comprueba en el cliente qué llega de cada uno.
+5. Repite el punto anterior con un serializador enriquecido y compara el peso del HTML resultante frente al de la versión con JSON puro.
+6. Audita tu objeto deshidratado buscando datos que el usuario no debería ver, y redúcelo al subconjunto mínimo que la primera pantalla necesita.
+</Challenge>

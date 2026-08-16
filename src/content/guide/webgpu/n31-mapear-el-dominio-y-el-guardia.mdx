@@ -1,0 +1,156 @@
+---
+title: "Mapear el dominio: el guardia, el techo y el dispatch indirecto"
+description: "Cómo convertir un número de elementos en un número de workgroups, qué hacer cuando pasas de 65535, y cómo dejar que la GPU decida el tamaño del dispatch."
+subject: webgpu
+level: 31
+order: 5
+position: "31.5"
+duration: "19 min"
+---
+
+<Lead>
+Entre "tengo tres millones de partículas" y `dispatchWorkgroups(n)` hay una división entera, un límite de la especificación que casi nadie recuerda hasta que lo choca, y una decisión sobre quién calcula ese número: la CPU, que tendría que saber cuántos elementos hay, o la propia GPU, que ya lo sabe porque acaba de contarlos. Esta lección cierra el modelo de ejecución resolviendo las tres cosas.
+</Lead>
+
+<Goals>
+
+- Calcular el número de workgroups con división por techo y colocar el guardia correcto.
+- Sortear el límite de 65535 workgroups por dimensión con un dispatch de dos dimensiones o con un bucle de zancada.
+- Lanzar un dispatch cuyos argumentos escribió otro compute shader en un buffer.
+- Decidir entre una invocación por elemento y varios elementos por invocación.
+
+</Goals>
+
+## El techo y el guardia son inseparables
+
+El número de workgroups es el techo de la división entre el número de elementos y el tamaño del workgroup. En JavaScript, `Math.ceil(n / TAM)`; si prefieres aritmética entera y evitar los flotantes, `(n + TAM - 1) / TAM` con división entera hace lo mismo y no tiene el problema de precisión de `Math.ceil` con arrays de más de dieciséis millones de elementos.
+
+```js
+const TAM = 64;
+const n = 3_000_000;
+const grupos = Math.ceil(n / TAM);   // 46875
+pass.dispatchWorkgroups(grupos);
+```
+
+Esos 46875 grupos son 3.000.000 de invocaciones exactas por pura casualidad, porque tres millones es múltiplo de 64. Cambia `n` a 3.000.001 y tendrás 46876 grupos, o sea 3.000.064 invocaciones, con 63 sobrantes. Esas 63 invocaciones ejecutan el mismo shader con un índice fuera del dominio, y si no las paras, escriben.
+
+El guardia va lo antes posible, y compara contra **el conteo lógico**, no contra la longitud del buffer:
+
+```wgsl
+struct Params { conteo: u32 };
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read_write> datos: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= params.conteo) { return; }
+  datos[gid.x] = datos[gid.x] * 0.99;
+}
+```
+
+Podrías usar `arrayLength(&datos)` y ahorrarte el uniform, y para un buffer que siempre se procesa entero es correcto y más simple. Deja de serlo en cuanto el buffer está sobredimensionado —un pool de partículas de capacidad 100.000 con 12.000 vivas— porque entonces `arrayLength` devuelve 100.000 y el guardia no guarda nada.
+
+Hay un matiz de rendimiento en el `return` temprano. Las invocaciones que salen pertenecen todas al último workgroup, así que la divergencia está confinada a uno o dos grupos SIMD de todo el dispatch. No es un coste que merezca ninguna optimización: cualquier intento de evitar el guardia acaba siendo más caro que el guardia.
+
+## Cuando 65535 no basta
+
+`maxComputeWorkgroupsPerDimension` vale 65535 por defecto. Con workgroups de 64 invocaciones, un dispatch de una sola dimensión cubre 65535 · 64 = 4.194.240 elementos. Suena mucho hasta que simulas un fluido con ocho millones de partículas o procesas un volumen de 512 al cubo, que son 134 millones de vóxeles.
+
+La salida canónica es repartir el dispatch en dos dimensiones y volver a aplanarlo dentro del shader. Se elige una anchura fija —una potencia de dos, para que el compilador convierta la multiplicación en un desplazamiento— y se calcula el alto:
+
+```js
+const TAM = 64;
+const ANCHO = 4096;                                   // grupos en X, fijo
+const total = Math.ceil(n / TAM);                     // grupos necesarios
+const alto  = Math.ceil(total / ANCHO);               // grupos en Y
+pass.dispatchWorkgroups(ANCHO, alto);
+```
+
+```wgsl
+const ANCHO: u32 = 4096u;      // debe coincidir con el valor de JS
+const TAM:   u32 = 64u;
+
+@compute @workgroup_size(TAM)
+fn main(
+  @builtin(workgroup_id)           wid: vec3u,
+  @builtin(local_invocation_index) li:  u32,
+) {
+  let grupo = wid.y * ANCHO + wid.x;
+  let i = grupo * TAM + li;
+  if (i >= params.conteo) { return; }
+  // ...
+}
+```
+
+Con esa disposición el techo pasa a ser 65535 · 65535 · 64, del orden de 2,7 · 10^11 elementos, que ya no es un límite práctico. Fíjate en que aquí **no** se puede usar `global_invocation_id`: su componente `x` solo cubre el eje X del dispatch, y la información de la fila está en `wid.y`. Reconstruir el índice a mano es obligatorio.
+
+La alternativa es el **bucle de zancada**: lanzas un número fijo y moderado de invocaciones y cada una procesa varios elementos, avanzando de una en una zancada igual al total de invocaciones.
+
+```wgsl
+@compute @workgroup_size(64)
+fn main(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups)       nwg: vec3u,
+) {
+  let zancada = nwg.x * 64u;
+  var i = gid.x;
+  loop {
+    if (i >= params.conteo) { break; }
+    datos[i] = datos[i] * 0.99;
+    i += zancada;
+  }
+}
+```
+
+La zancada es exactamente el número total de invocaciones, y eso es deliberado: garantiza que las invocaciones consecutivas de un warp acceden a direcciones consecutivas en cada iteración, o sea que los accesos siguen siendo coalescentes. Si en vez de eso repartieras bloques contiguos por invocación —la invocación 0 se lleva los elementos 0 a 99, la 1 los 100 a 199— cada carril del warp leería de una zona distinta y la memoria se serializaría.
+
+El bucle de zancada tiene otra ventaja que a menudo pesa más: permite fijar el número de workgroups en un valor que llene el chip y nada más, en vez de lanzar millones de grupos que el planificador tiene que gestionar. Es el patrón de las [reducciones sobre arrays grandes](/guia/webgpu/n33-reduccion-entre-workgroups/).
+
+## Dejar que la GPU decida el dispatch
+
+`dispatchWorkgroupsIndirect(buffer, offset)` lee los tres argumentos del dispatch de un buffer en memoria de GPU en vez de recibirlos desde JavaScript. Son tres `u32` consecutivos —X, Y, Z— y el buffer necesita el uso `INDIRECT`.
+
+Esto resuelve el problema de raíz cuando el número de elementos lo produce la propia GPU: partículas vivas tras el reciclado, objetos que sobrevivieron al culling, celdas ocupadas de una rejilla. Sin dispatch indirecto habría que leer ese conteo de vuelta a la CPU, lo cual cuesta un frame entero de latencia como mínimo.
+
+```js
+const argsDispatch = device.createBuffer({
+  size: 12,                                   // 3 x u32
+  usage: GPUBufferUsage.INDIRECT
+       | GPUBufferUsage.STORAGE
+       | GPUBufferUsage.COPY_DST,
+});
+// Y = Z = 1 se escriben una vez y no cambian.
+device.queue.writeBuffer(argsDispatch, 4, new Uint32Array([1, 1]));
+```
+
+```wgsl
+// Kernel A: cuenta y deja preparados los argumentos del dispatch siguiente.
+struct Args { x: u32, y: u32, z: u32 };
+@group(0) @binding(0) var<storage, read_write> args: Args;
+@group(0) @binding(1) var<storage, read>       contador: u32;
+
+@compute @workgroup_size(1)
+fn preparar() {
+  args.x = (contador + 63u) / 64u;   // division por techo, en la GPU
+}
+```
+
+```js
+// Kernel A rellena args; kernel B lo consume. Todo en el mismo submit.
+const pass = enc.beginComputePass();
+pass.setPipeline(preparar);
+pass.setBindGroup(0, bgPreparar);
+pass.dispatchWorkgroups(1);
+pass.setPipeline(procesar);
+pass.setBindGroup(0, bgProcesar);
+pass.dispatchWorkgroupsIndirect(argsDispatch, 0);
+pass.end();
+```
+
+Dos dispatches en el mismo pass, y el segundo ve lo que escribió el primero: WebGPU garantiza la visibilidad entre dispatches consecutivos dentro de un pass sin que tengas que insertar nada. Ese detalle es lo que hace viable toda la familia de técnicas dirigidas por GPU.
+
+Ojo con un límite que sigue vigente: los valores leídos del buffer indirecto también están sujetos a `maxComputeWorkgroupsPerDimension`. Si el kernel A calcula 200.000, el dispatch se rechaza. Conviene saturar en el propio shader con un `min`, y llevar la cuenta de que has saturado.
+
+<Callout type="dios" title="El guardia con return no sirve si despues hay una barrera">
+El `if (i >= conteo) { return; }` de la primera línea es correcto y obligatorio en cualquier kernel elemento a elemento. Y es un error grave en cuanto el kernel usa `workgroupBarrier()`. La razón es que una barrera exige que **todas** las invocaciones del workgroup lleguen a ella, y las que ya han hecho `return` no van a llegar nunca; el comportamiento pasa a estar indefinido, lo que en la práctica significa desde un resultado corrupto hasta un cuelgue del dispositivo que el navegador acaba matando. El patrón correcto en un kernel con barreras es no salir nunca antes de tiempo, sino **cargar el elemento neutro**: las invocaciones sobrantes participan en toda la coreografía de barreras, pero aportan cero a una suma, infinito a un mínimo, menos infinito a un máximo. Después, solo el resultado final se protege. Este es el motivo real por el que las reducciones bien escritas funcionan con tamaños que no son potencia de dos: no es que el árbol maneje tamaños arbitrarios, es que el árbol siempre opera sobre un workgroup completo, que sí es potencia de dos, y el relleno con el neutro hace que el sobrante no altere el resultado. Si alguna vez ves un kernel con barreras y un `return` condicionado a los datos, has encontrado un bug, aunque el resultado parezca correcto en tu máquina.
+</Callout>

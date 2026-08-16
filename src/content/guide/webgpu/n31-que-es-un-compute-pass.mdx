@@ -1,0 +1,164 @@
+---
+title: "El compute pass: del pipeline al dispatch"
+description: "Cómo se construye y se lanza un pipeline de cómputo en WebGPU, y qué es exactamente el grid de invocaciones que produce dispatchWorkgroups."
+subject: webgpu
+level: 31
+order: 1
+position: "31.1"
+duration: "20 min"
+---
+
+<Lead>
+Todo lo que has visto hasta aquí tenía una forma fija: vértices que entran, triángulos que se rasterizan, fragmentos que salen. El compute pipeline borra esa forma. No hay geometría, no hay rasterizador, no hay framebuffer. Solo un shader y un número que dice cuántas veces quieres ejecutarlo. Esa desnudez es lo que separa WebGPU de WebGL, y es también lo que obliga a entender por primera vez cómo se organiza el trabajo dentro de una GPU, porque ya no hay un pipeline gráfico que lo decida por ti.
+</Lead>
+
+<Goals>
+
+- Construir un `GPUComputePipeline` completo y lanzarlo desde un compute pass.
+- Distinguir los tres niveles del grid de ejecución: dispatch, workgroup e invocación.
+- Explicar qué garantiza WebGPU sobre el orden de ejecución y qué no garantiza en absoluto.
+- Leer el resultado de un cómputo de vuelta en la CPU con un buffer de staging.
+
+</Goals>
+
+## Un pipeline sin geometría
+
+Un `GPUComputePipeline` tiene un solo campo interesante: el módulo de shader y su punto de entrada. No hay descriptor de primitivas, ni de profundidad, ni de mezcla, ni formato de destino. La razón es que no hay destino: un compute shader escribe donde tú le digas, a través de sus bindings, y nada más.
+
+El punto de entrada se marca con dos atributos que van siempre juntos: `@compute` declara la etapa y `@workgroup_size(x, y, z)` declara cuántas invocaciones forman un workgroup. Ese segundo atributo es obligatorio; sin él el módulo no compila.
+
+```wgsl
+@group(0) @binding(0) var<storage, read>       entrada: array<f32>;
+@group(0) @binding(1) var<storage, read_write> salida:  array<f32>;
+
+@compute @workgroup_size(64)
+fn duplicar(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= arrayLength(&entrada)) { return; }
+  salida[i] = entrada[i] * 2.0;
+}
+```
+
+El lado de JavaScript es igual de escueto. `layout: 'auto'` deduce el bind group layout del propio shader, que es suficiente mientras no compartas layouts entre pipelines.
+
+```js
+const module = device.createShaderModule({ code: wgsl, label: 'duplicar' });
+
+const pipeline = device.createComputePipeline({
+  label: 'duplicar',
+  layout: 'auto',
+  compute: { module, entryPoint: 'duplicar' },
+});
+```
+
+Existe también `createComputePipelineAsync`, que devuelve una promesa y permite que el driver compile en otro hilo. En producción es la forma correcta: la compilación de un shader de cómputo complejo puede costar decenas de milisegundos y bloquear el hilo principal si la pides justo antes del primer dispatch.
+
+El ejemplo completo, con buffers, bind group y lectura de vuelta:
+
+```js
+const datos = new Float32Array([1, 2, 3, 4, 5, 6, 7]);   // 7 elementos: no es potencia de dos
+const bytes = datos.byteLength;
+
+const bufIn = device.createBuffer({
+  size: bytes,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+device.queue.writeBuffer(bufIn, 0, datos);
+
+const bufOut = device.createBuffer({
+  size: bytes,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+});
+
+// El buffer de staging es el unico que se puede mapear en CPU.
+const bufRead = device.createBuffer({
+  size: bytes,
+  usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+});
+
+const bindGroup = device.createBindGroup({
+  layout: pipeline.getBindGroupLayout(0),
+  entries: [
+    { binding: 0, resource: { buffer: bufIn } },
+    { binding: 1, resource: { buffer: bufOut } },
+  ],
+});
+
+const enc = device.createCommandEncoder();
+const pass = enc.beginComputePass({ label: 'duplicar' });
+pass.setPipeline(pipeline);
+pass.setBindGroup(0, bindGroup);
+pass.dispatchWorkgroups(Math.ceil(datos.length / 64));   // 1 workgroup
+pass.end();
+enc.copyBufferToBuffer(bufOut, 0, bufRead, 0, bytes);
+device.queue.submit([enc.finish()]);
+
+await bufRead.mapAsync(GPUMapMode.READ);
+const resultado = new Float32Array(bufRead.getMappedRange().slice(0));
+bufRead.unmap();
+// Float32Array [2, 4, 6, 8, 10, 12, 14]
+```
+
+Dos detalles que la gente se salta. El primero: un buffer con `MAP_READ` solo puede combinarse con `COPY_DST`, así que no puede ser el destino directo del shader; hace falta la copia intermedia. El segundo: `getMappedRange()` devuelve un `ArrayBuffer` que deja de ser válido en cuanto llamas a `unmap()`, de ahí el `.slice(0)` que copia los datos antes de soltarlo.
+
+## Los tres niveles del grid
+
+`dispatchWorkgroups(x, y, z)` no lanza `x·y·z` invocaciones. Lanza `x·y·z` **workgroups**, y cada workgroup contiene el número de invocaciones que declaró `@workgroup_size`. El total es el producto de los dos, y esa multiplicación es la primera fuente de confusión de todo el que llega desde WebGL.
+
+<Mermaid code={`flowchart TB
+  D[Dispatch la rejilla de workgroups] --> W1[Workgroup 0 0 0]
+  D --> W2[Workgroup 1 0 0]
+  D --> W3[Workgroup 2 0 0]
+  W2 --> I1[Invocacion local 0]
+  W2 --> I2[Invocacion local 1]
+  W2 --> I3[Invocacion local 63]
+  W2 --> SM[Memoria workgroup compartida]
+  I1 -.- SM
+  I2 -.- SM
+  I3 -.- SM
+  class D t-mauve
+  class W1 t-blue
+  class W2 t-blue
+  class W3 t-blue
+  class I1 t-peach
+  class I2 t-peach
+  class I3 t-peach
+  class SM t-teal`} />
+
+El nivel de arriba, el **dispatch**, es lo único que controlas desde JavaScript, y su tamaño puede cambiar cada frame. El nivel de en medio, el **workgroup**, se fija en el shader y es constante para todo el pipeline. El nivel de abajo, la **invocación**, es una ejecución individual del cuerpo de tu función.
+
+La diferencia entre los dos niveles inferiores no es cosmética. Un workgroup es la unidad de planificación del hardware: se asigna entero a una única unidad de cómputo, sus invocaciones se ejecutan a la vez, comparten una memoria rápida y pueden sincronizarse entre ellas. Dos workgroups distintos pueden estar en unidades distintas del chip, o pueden estar separados en el tiempo porque no cabían todos a la vez; no comparten nada y no pueden esperarse.
+
+## Lo que WebGPU garantiza y lo que no
+
+Garantiza que las invocaciones de un mismo workgroup pueden sincronizarse con una barrera y compartir memoria. Garantiza que todos los workgroups del dispatch se ejecutan antes de que termine el pass. Y garantiza que la escritura de un pass es visible para el pass siguiente del mismo command buffer: no hace falta insertar barreras a mano entre passes como en Vulkan, el navegador las coloca.
+
+No garantiza nada más. En concreto, no garantiza el **orden** en que se ejecutan los workgroups, ni que dos workgroups estén vivos a la vez, ni que la invocación 5 se ejecute antes que la 6 dentro del mismo workgroup. Cualquier algoritmo que dependa de un orden implícito produce resultados distintos en máquinas distintas, y a veces en la misma máquina en ejecuciones distintas.
+
+Esto se traduce en una regla práctica que conviene interiorizar ya: **si dos invocaciones escriben en la misma dirección de memoria sin una operación atómica de por medio, el resultado no está definido**. No es que sea "una de las dos"; el modelo de memoria de WGSL dice que el contenido de esa dirección puede ser cualquier cosa. Es la clase de fallo que pasa los tests en tu portátil y falla en el móvil del usuario.
+
+```js
+// Un pass de computo NO puede estar dentro de un render pass.
+// Son passes hermanos dentro del mismo encoder.
+const enc = device.createCommandEncoder();
+
+const compute = enc.beginComputePass();
+compute.setPipeline(simulacion);
+compute.setBindGroup(0, bgSimulacion);
+compute.dispatchWorkgroups(numGrupos);
+compute.end();                            // obligatorio antes de abrir otro pass
+
+const render = enc.beginRenderPass(descriptorDeRender);
+render.setPipeline(dibujo);
+render.setBindGroup(0, bgDibujo);         // puede leer lo que el compute escribio
+render.draw(6, numParticulas);
+render.end();
+
+device.queue.submit([enc.finish()]);
+```
+
+Ese patrón —cómputo y render en el mismo command buffer, leyendo el segundo lo que escribió el primero— es la base del [render directo desde el buffer de simulación](/guia/webgpu/n35-render-desde-el-mismo-buffer/) y evita por completo el viaje de datos a la CPU.
+
+<Callout type="dios" title="El dispatch no es gratis, y por eso los algoritmos se disenan por numero de dispatches">
+Un `dispatchWorkgroups` con un solo workgroup y un `dispatchWorkgroups` con cien mil cuestan casi lo mismo en CPU: son un puñado de bytes escritos en un command buffer. Pero cada dispatch tiene un coste fijo en GPU que no aparece en ninguna documentación y que se nota en cuanto encadenas muchos: hay que vaciar las unidades de cómputo del dispatch anterior, aplicar la barrera de memoria implícita entre pases o entre dispatches del mismo pase, y volver a llenar el chip. En hardware de escritorio ese coste ronda unos pocos microsegundos; en una GPU integrada o en un móvil puede irse a decenas. Parece nada hasta que descubres que un bitonic sort de un millón de elementos necesita 210 dispatches encadenados, y que 210 por 20 microsegundos son más de cuatro milisegundos de puro sobrecoste, sin haber comparado todavía dos números. Por eso los algoritmos paralelos serios en GPU no se diseñan minimizando operaciones, se diseñan **minimizando el número de dispatches**: se mete todo el trabajo que se pueda dentro de un mismo dispatch usando la memoria compartida y las barreras internas del workgroup, y solo se sale a un dispatch nuevo cuando de verdad hace falta sincronizar workgroups distintos. Esa es la métrica que separa una implementación de libro de una que se puede usar en un frame de dieciséis milisegundos.
+</Callout>

@@ -1,0 +1,122 @@
+---
+title: "La ejecución divergente: por qué un if no es un if"
+description: "Cómo el hardware SIMT ejecuta las dos ramas de una condicional y descarta una, qué cuesta eso realmente, y cuándo una condicional sí es gratis."
+subject: three
+level: 30
+order: 4
+position: "30.4"
+duration: "20 min"
+---
+
+<Lead>
+Escribes un `if` esperando ahorrarte el trabajo de la rama que no se toma. En una CPU eso es exactamente lo que ocurre. En una GPU, si las invocaciones del mismo grupo no están de acuerdo sobre la condición, **se ejecutan las dos ramas y se descarta el resultado de la que no correspondía a cada una**. El coste no es el de la rama tomada: es la suma de las dos. Éste es el concepto que más cambia la forma de escribir código de shader, y el que explica por qué toda la programación gráfica está llena de aritmética donde esperarías condicionales.
+</Lead>
+
+<Goals>
+
+- Describir el mecanismo de máscara de ejecución que implementa un `if` en hardware SIMT.
+- Distinguir una condicional coherente de una divergente y calcular el coste de cada una.
+- Reescribir una condicional divergente como aritmética con `step`, `mix` o `smoothstep`.
+- Reconocer los tres casos en los que un `if` sigue siendo la respuesta correcta.
+
+</Goals>
+
+## El mecanismo: un contador de programa para treinta y dos invocaciones
+
+Un grupo SIMT —warp, wavefront, o como lo llame tu fabricante— es un conjunto de 32 o 64 invocaciones que comparten **un único contador de programa**. Todas ejecutan la misma instrucción en el mismo ciclo, cada una sobre sus propios datos. No hay forma de que dos invocaciones del mismo grupo estén en instrucciones distintas.
+
+Cuando aparece una condicional, el hardware no puede saltar para unas sí y para otras no. Lo que hace es mantener una **máscara de ejecución**: un bit por invocación que dice si el resultado de la instrucción se escribe o se tira. El proceso es este:
+
+Se evalúa la condición en todas las invocaciones y se obtiene una máscara. Si la máscara no es ni todo ceros ni todo unos, el grupo ha **divergido**. Entonces el hardware ejecuta el cuerpo del `if` con la máscara puesta, de modo que las invocaciones que no cumplían la condición ejecutan las mismas instrucciones pero descartan los resultados. Después invierte la máscara y ejecuta el cuerpo del `else` de la misma forma. Al final restaura la máscara completa y sigue.
+
+El tiempo total es el del `if` **más** el del `else`. Siempre. Sin importar cuántas invocaciones fueran por cada lado: basta con que una sola discrepe para pagar las dos ramas.
+
+```glsl
+// Coste: siempre el de las dos ramas si el grupo diverge
+if ( vUv.x < 0.5 ) {
+  color = calculoBarato( vUv );        //  10 instrucciones
+} else {
+  color = calculoRuinoso( vUv );       // 400 instrucciones
+}
+// En el borde vertical del cuadrado, cada grupo paga 410.
+```
+
+## Coherente frente a divergente
+
+La distinción práctica es si todas las invocaciones del grupo evalúan la condición igual.
+
+Si la condición depende **solo de uniforms**, todas coinciden por construcción. La máscara sale todo ceros o todo unos, el hardware puede saltar de verdad, y la rama no tomada no cuesta nada. Ese es el caso de un interruptor de calidad, de un modo de depuración o de una variante de material:
+
+```glsl
+uniform bool uModoDepuracion;   // igual para todas las invocaciones del dibujado
+
+if ( uModoDepuracion ) {
+  gl_FragColor = vec4( vNormal * 0.5 + 0.5, 1.0 );
+} else {
+  gl_FragColor = calcularIluminacionCompleta();
+}
+```
+
+Esa condicional es esencialmente gratis. Sigue teniendo un coste pequeño —la evaluación y el salto— y sigue impidiendo que el compilador elimine el código muerto, que es la razón por la que un `#define` es todavía mejor. Pero no hay divergencia.
+
+Si la condición depende de la posición, de una varying o de una textura, la coherencia depende de la **distribución espacial** del predicado. Y aquí hay un matiz que importa: los fragmentos de un grupo son vecinos en pantalla, así que una condición sobre una función suave suele ser coherente en la mayoría de grupos y divergente solo en los que caen sobre la frontera. Un círculo en pantalla tiene un interior coherente, un exterior coherente y un anillo de un grupo de ancho que diverge. La penalización es proporcional al **perímetro**, no al área.
+
+En cambio, una condición sobre ruido de alta frecuencia diverge en todos los grupos, siempre. Y en el vertex shader la coherencia es peor todavía, porque los vértices consecutivos en el índice no tienen por qué estar cerca en el espacio.
+
+## La reescritura aritmética
+
+La alternativa es calcular las dos posibilidades siempre y seleccionar con aritmética. Cuesta lo mismo que la divergencia en el peor caso, menos en instrucciones de control, y encima produce un resultado **continuo**, que es lo que permite el antialiasing.
+
+```glsl
+// Version condicional: borde con dientes de sierra
+vec3 color;
+if ( length( vUv - 0.5 ) < 0.25 ) {
+  color = vec3( 0.96, 0.55, 0.66 );
+} else {
+  color = vec3( 0.07, 0.07, 0.11 );
+}
+```
+
+```glsl
+// Version aritmetica: sin divergencia y con el borde suave
+float d = length( vUv - 0.5 );
+float dentro = 1.0 - smoothstep( 0.245, 0.255, d );
+vec3 color = mix( vec3( 0.07, 0.07, 0.11 ), vec3( 0.96, 0.55, 0.66 ), dentro );
+```
+
+`smoothstep` devuelve 0 por debajo del primer umbral, 1 por encima del segundo y una transición suave en medio. `mix` interpola linealmente. Las dos son instrucciones nativas del hardware, no funciones de librería.
+
+Si necesitas el corte duro sin transición, `step` hace de condicional exacta:
+
+```glsl
+float dentro = 1.0 - step( 0.25, d );   // 0 o 1, sin nada en medio
+```
+
+Y la selección de un valor entre dos según un booleano se escribe con `mix` de tres argumentos, disponible en el dialecto que compila `ShaderMaterial`:
+
+```glsl
+vec3 color = mix( colorFuera, colorDentro, bvec3( d < 0.25 ) );
+```
+
+## Los tres casos en que el if gana
+
+**Cuando la condición es un uniform.** Ya visto: no hay divergencia y la rama no tomada no se ejecuta.
+
+**Cuando la rama descartada es enormemente más cara y el predicado es muy coherente.** El ejemplo canónico es un bucle de marcha por rayos precedido de una prueba contra una caja envolvente: si el rayo no toca la caja, te ahorras cien iteraciones. Los grupos que caen enteros fuera de la silueta del objeto se ahorran el trabajo completo, y los que caen en el borde pagan de más. Con un objeto grande en pantalla, la mayoría de grupos son coherentes y el balance sale muy a favor.
+
+**Cuando la alternativa aritmética produciría un valor inválido.** Calcular las dos ramas exige que las dos sean calculables. Si una de ellas divide por cero, saca la raíz de un negativo o llama a `pow` con base negativa, obtienes un NaN que se propaga a través del `mix` y contamina el resultado aunque su peso sea cero. En ese caso, o bien blindas el cálculo con `max` y `abs`, o bien usas el `if`.
+
+```glsl
+// El mix NO salva de esto: si k es negativo, sqrt(k) es NaN y NaN * 0.0 sigue siendo NaN
+float k = 1.0 - eta * eta * ( 1.0 - ci * ci );
+vec3 refractado = mix( vec3( 0.0 ), eta * I - ( eta * ci + sqrt( k ) ) * N, step( 0.0, k ) );
+
+// Correcto: blindar el argumento antes
+vec3 refractado = mix( vec3( 0.0 ),
+  eta * I - ( eta * ci + sqrt( max( k, 0.0 ) ) ) * N,
+  step( 0.0, k ) );
+```
+
+<Callout type="dios" title="Muestrear una textura dentro de una rama divergente es comportamiento indefinido, y en movil se ve">
+La consecuencia de la divergencia que se cobra más víctimas no es de rendimiento sino de corrección. `texture2D` sin nivel explícito elige el mipmap a partir de las derivadas de las coordenadas, y las derivadas se calculan restando valores entre los cuatro fragmentos del bloque de dos por dos. Si uno de esos cuatro fragmentos no entró en la rama, su valor de coordenada no existe, la resta se hace contra basura y **el nivel de mipmap resultante es indefinido por especificación**. En una GPU de escritorio esto suele "funcionar" porque las invocaciones inactivas ejecutan igualmente el código con la máscara puesta y sus registros contienen algo razonable. En una GPU móvil con arquitectura de teselado, no: obtienes bloques cuadrados de textura con el nivel equivocado, y solo en el borde de la condición, y solo en algunos dispositivos. Es el bug perfecto: no reproduce en desarrollo, no da error, y el informe que te llega dice "se ven cuadraditos raros en el móvil de mi tío". Hay tres arreglos y todos son de una línea. Sacar el muestreo fuera del `if` y meter dentro solo el uso del resultado, que es lo más simple y casi siempre lo correcto. Usar `textureLod( mapa, uv, 0.0 )`, que fija el nivel y no necesita derivadas. O calcular las derivadas antes de la rama y pasarlas explícitamente con `textureGrad`. La regla mental que evita el problema entero: **cualquier función que dependa de los vecinos —`texture2D` sin lod, `dFdx`, `dFdy`, `fwidth`— exige control de flujo uniforme**.
+</Callout>

@@ -1,0 +1,244 @@
+---
+title: "Oclusión con la jerarquía de profundidad"
+description: "Construir una pirámide Hi-Z con un compute pass por nivel, probar la caja proyectada contra el nivel correcto, y resolver el desfase del fotograma anterior con el esquema de dos fases."
+subject: webgpu
+level: 40
+order: 3
+position: "40.3"
+duration: "25 min"
+---
+
+<Lead>
+El culling por frustum resuelve el problema fácil: lo que está fuera de la cámara. En un interior denso, un almacén, una ciudad o cualquier escena con paredes, la inmensa mayoría de lo que queda dentro del frustum está tapado por otra cosa y se dibuja para nada. La jerarquía de profundidad es la estructura que permite preguntarle a la GPU si un objeto está tapado sin dibujarlo, y el esquema de dos fases es lo que hace que la respuesta sea correcta aunque la cámara se mueva rápido.
+</Lead>
+
+<Goals>
+
+- Cuantificar por qué el frustum culling deja pasar casi todo el trabajo inútil en una escena cerrada.
+- Construir una pirámide Hi-Z del buffer de profundidad con un compute pass por nivel.
+- Elegir el nivel de mip correcto para el rectángulo proyectado de una caja envolvente.
+- Implementar el esquema de dos fases que corrige los falsos negativos del fotograma anterior.
+
+</Goals>
+
+## El frustum no basta
+
+Pon una cámara dentro de un edificio de oficinas modelado con 40.000 objetos. El frustum descarta lo que queda a la espalda y a los lados: te quedan unos 12.000. De esos, la pared que tienes a tres metros tapa el pasillo entero, la mesa tapa lo que hay debajo, y la fachada tapa el resto del edificio. Lo que de verdad contribuye a algún píxel final son quizá 800 objetos. Estás procesando quince veces más geometría de la necesaria.
+
+La métrica que describe esto es la **complejidad de profundidad**: el número medio de fragmentos que se generan por píxel final. En un exterior abierto ronda 1,5 o 2. En un interior denso pasa fácilmente de 8. Cada unidad por encima de 1 es geometría transformada, rasterizada y sombreada que un fragmento posterior sobrescribe.
+
+El rechazo temprano de profundidad del hardware ya te salva del coste de sombreado si dibujas de delante hacia atrás, pero **no** te salva del coste de vértices, ni de la rasterización, ni de la llamada de dibujo. Un edificio entero detrás de una fachada procesa todos sus vértices y descubre después que ningún fragmento sobrevive. El culling de oclusión ataca eso: decidir antes de emitir la geometría.
+
+La estructura que lo permite es una pirámide de mipmaps del buffer de profundidad, la **Hi-Z**. El nivel cero es el buffer de profundidad tal cual. Cada nivel siguiente tiene la mitad de resolución en cada eje y cada uno de sus téxeles guarda **el más lejano** de los cuatro téxeles de debajo. La propiedad que se busca es la invariante: *si un objeto está por detrás del valor guardado en un téxel del nivel L, está por detrás de todo lo que ese téxel resume*. Guardar el máximo con la convención habitual de profundidad —cerca vale 0, lejos vale 1— es lo que garantiza que la respuesta sea conservadora.
+
+<Callout type="danger" title="Con reversed-Z la piramide guarda el minimo, no el maximo">
+Si usas profundidad invertida, que es lo correcto para la precisión y lo que hace cualquier motor serio, el plano cercano vale 1 y el lejano vale 0. El téxel más lejano pasa a ser el de **menor** valor, así que la reducción es `min` y la comparación del test se invierte. Equivocarse aquí produce un bug que parece hardware: con la cámara quieta se ve todo bien porque el test acepta de más, y en cuanto te mueves desaparecen objetos que están delante. Decide la convención una vez, escríbela en un comentario junto a la constante de limpieza del depth, y no la toques.
+</Callout>
+
+## Construir la pirámide
+
+Hay una restricción de WebGPU que condiciona el diseño: una textura de profundidad **no puede enlazarse como storage texture**. Los formatos permitidos para `texture_storage_2d` no incluyen `depth32float`. Así que el nivel cero de la pirámide no es el depth buffer, sino una copia suya en una textura `r32float`, y la produce un primer pase que lee la profundidad con `texture_depth_2d` y escribe con `textureStore`.
+
+```wgsl
+// Nivel 0: copiar el depth buffer a una textura r32float con mips.
+@group(0) @binding(0) var profundidad : texture_depth_2d;
+@group(0) @binding(1) var destino     : texture_storage_2d<r32float, write>;
+
+@compute @workgroup_size(8, 8)
+fn copiar(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let dim = textureDimensions(destino);
+  if (gid.x >= dim.x || gid.y >= dim.y) {
+    return;
+  }
+  let d = textureLoad(profundidad, vec2<i32>(gid.xy), 0);
+  textureStore(destino, gid.xy, vec4<f32>(d, 0.0, 0.0, 0.0));
+}
+```
+
+A partir de ahí, un pase por nivel. Cada uno lee el nivel anterior como `texture_2d<f32>` y escribe el siguiente como storage:
+
+```wgsl
+@group(0) @binding(0) var origen  : texture_2d<f32>;
+@group(0) @binding(1) var destino : texture_storage_2d<r32float, write>;
+
+@compute @workgroup_size(8, 8)
+fn reducir(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let dim = textureDimensions(destino);
+  if (gid.x >= dim.x || gid.y >= dim.y) {
+    return;
+  }
+
+  let base = vec2<i32>(gid.xy) * 2;
+  let d00 = textureLoad(origen, base + vec2<i32>(0, 0), 0).r;
+  let d10 = textureLoad(origen, base + vec2<i32>(1, 0), 0).r;
+  let d01 = textureLoad(origen, base + vec2<i32>(0, 1), 0).r;
+  let d11 = textureLoad(origen, base + vec2<i32>(1, 1), 0).r;
+
+  // Convencion cerca 0 y lejos 1: el resumen conservador es el mas lejano.
+  textureStore(destino, gid.xy, vec4<f32>(max(max(d00, d10), max(d01, d11)), 0.0, 0.0, 0.0));
+}
+```
+
+En el lado de JavaScript, un bind group y un dispatch por nivel. Cada pase enlaza el nivel anterior como vista de lectura y el siguiente como vista de escritura, con `baseMipLevel` y `mipLevelCount` igual a uno en las dos:
+
+```js
+const niveles = Math.floor(Math.log2(Math.max(pirWidth, pirHeight))) + 1;
+
+const pase = encoder.beginComputePass({ label: 'construir hi-z' });
+pase.setPipeline(pipelineReducir);
+for (let n = 1; n < niveles; n++) {
+  const w = Math.max(1, pirWidth  >> n);
+  const h = Math.max(1, pirHeight >> n);
+  pase.setBindGroup(0, gruposPorNivel[n]);   // creados una vez, no por fotograma
+  pase.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
+}
+pase.end();
+```
+
+Un pase por nivel y no uno solo porque cada nivel depende del anterior, y dentro de un mismo dispatch no hay forma de sincronizar entre workgroups. Los pases dentro de un mismo `beginComputePass` sí se ordenan entre sí, así que un único compute pass con varios `dispatchWorkgroups` consecutivos basta; no hace falta abrir y cerrar el pase cada vez.
+
+Dos avisos prácticos. El primero: si la resolución no es potencia de dos, la reducción dos por dos deja fuera la última fila o columna impar, y aparecen objetos que se descartan mal en el borde de la pantalla. La solución habitual es dimensionar la pirámide a la potencia de dos **inferior o igual** a la resolución del lienzo y escalar las coordenadas del test en consecuencia; como la pirámide es una estructura conservadora y aproximada, perder unos píxeles de resolución no cambia el resultado. El segundo: la pirámide entera cuesta un tercio más de memoria que el nivel cero, y en `r32float` a 1920 por 1080 eso son 8,3 MB más 2,8 MB de mips. Es memoria que hay que presupuestar.
+
+## El test contra la pirámide
+
+Proyectar la caja envolvente, sacar su rectángulo en pantalla y su profundidad más cercana, elegir el nivel, comparar.
+
+La elección del nivel es la parte con enjundia. En el nivel `L`, cada téxel resume una región de `2^L` por `2^L` píxeles del nivel cero. Si el rectángulo proyectado mide `w` por `h` píxeles y eliges
+
+```text
+L = ceil( log2( max(w, h) ) )
+```
+
+entonces cada téxel de ese nivel es al menos tan grande como el lado mayor del rectángulo, y el rectángulo cae dentro de una ventana de dos por dos téxeles como mucho. Cuatro `textureLoad` cubren el rectángulo entero garantizado. Un nivel menos y harían falta más muestras; un nivel más y el resumen sería tan grosero que casi nada se descartaría. Es el punto exacto donde el test es correcto con el menor número de muestras posible.
+
+```wgsl
+struct Vista {
+  viewProj : mat4x4<f32>,
+  tamHiz   : vec2<f32>,   // dimensiones en texeles del nivel 0 de la piramide
+  niveles  : u32,
+  relleno  : u32,
+};
+
+struct Caja {
+  centro  : vec3<f32>,
+  relleno0: f32,
+  extent  : vec3<f32>,
+  relleno1: f32,
+};
+
+@group(0) @binding(0) var<uniform>             vista   : Vista;
+@group(0) @binding(1) var<storage, read>       cajas   : array<Caja>;
+@group(0) @binding(2) var<storage, read_write> visible : array<u32>;
+@group(0) @binding(3) var hiz : texture_2d<f32>;
+
+@compute @workgroup_size(64)
+fn ocluir(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= arrayLength(&cajas)) {
+    return;
+  }
+  // Lo que ya descarto el frustum no se vuelve a mirar.
+  if (visible[i] == 0u) {
+    return;
+  }
+
+  let c = cajas[i].centro;
+  let e = cajas[i].extent;
+
+  var minimo = vec3<f32>( 1e30,  1e30,  1e30);
+  var maximo = vec3<f32>(-1e30, -1e30, -1e30);
+
+  for (var k = 0u; k < 8u; k = k + 1u) {
+    let s = vec3<f32>(
+      select(-1.0, 1.0, (k & 1u) != 0u),
+      select(-1.0, 1.0, (k & 2u) != 0u),
+      select(-1.0, 1.0, (k & 4u) != 0u),
+    );
+    let clip = vista.viewProj * vec4<f32>(c + s * e, 1.0);
+    // Si una esquina cruza el plano de la camara, la proyeccion no es valida:
+    // se conserva el objeto. Falso positivo barato, falso negativo evitado.
+    if (clip.w <= 0.0) {
+      return;
+    }
+    let ndc = clip.xyz / clip.w;
+    minimo = min(minimo, ndc);
+    maximo = max(maximo, ndc);
+  }
+
+  // De NDC a coordenadas de textura. La y se invierte.
+  let uvMin = vec2<f32>(minimo.x * 0.5 + 0.5, 0.5 - maximo.y * 0.5);
+  let uvMax = vec2<f32>(maximo.x * 0.5 + 0.5, 0.5 - minimo.y * 0.5);
+
+  let px    = (uvMax - uvMin) * vista.tamHiz;
+  let lado  = max(max(px.x, px.y), 1.0);          // el max con 1 evita log2 de cero
+  let nivel = min(u32(ceil(log2(lado))), vista.niveles - 1u);
+
+  let dim = vec2<f32>(textureDimensions(hiz, nivel));
+  let a = vec2<i32>(clamp(uvMin, vec2<f32>(0.0), vec2<f32>(1.0)) * dim);
+  let b = vec2<i32>(clamp(uvMax, vec2<f32>(0.0), vec2<f32>(1.0)) * dim);
+  let l = i32(nivel);
+
+  let z00 = textureLoad(hiz, vec2<i32>(a.x, a.y), l).r;
+  let z10 = textureLoad(hiz, vec2<i32>(b.x, a.y), l).r;
+  let z01 = textureLoad(hiz, vec2<i32>(a.x, b.y), l).r;
+  let z11 = textureLoad(hiz, vec2<i32>(b.x, b.y), l).r;
+  let zOclusor = max(max(z00, z10), max(z01, z11));
+
+  // minimo.z es la profundidad mas cercana de la caja. Si incluso su punto
+  // mas cercano esta por detras del oclusor mas lejano, la caja esta tapada.
+  if (minimo.z > zOclusor) {
+    visible[i] = 0u;
+  }
+}
+```
+
+La comparación final es la única línea que hay que entender de verdad. `minimo.z` es lo más cerca que llega la caja; `zOclusor` es lo más lejos que llega la geometría que ya está dibujada en esa región de pantalla. Si lo más cercano de la caja está más lejos que lo más lejano de lo dibujado, no hay ni un píxel en el que la caja pueda ganar el test de profundidad. Las dos elecciones de extremo van en la dirección conservadora: cualquier error empuja hacia conservar, nunca hacia descartar.
+
+## Las dos fases
+
+Queda el agujero grande: **la pirámide que tienes disponible al empezar el fotograma se construyó con la profundidad del fotograma anterior**. Con la cámara quieta eso es exacto. Con la cámara girando a la velocidad a la que gira un ratón, lo que era el borde de la pantalla hace 16 ms está ahora en el centro, y un objeto que estaba tapado por una columna ya no lo está. Como la pirámide todavía tiene la columna donde estaba, el test lo descarta. El resultado es un **falso negativo**: un objeto visible que no se dibuja, y que reaparece de golpe al fotograma siguiente. Es el parpadeo característico del culling de oclusión mal hecho, y es inaceptable.
+
+La solución que usan los motores modernos, y la única que resuelve el problema sin latencia de CPU, es partir el fotograma en dos fases.
+
+**Fase uno.** Dibuja únicamente los objetos que estaban marcados como visibles al final del fotograma anterior. Ese conjunto es una aproximación excelente de los oclusores reales del fotograma actual, porque la mayoría de lo que tapaba sigue tapando. No estás dibujando la escena completa: estás dibujando los candidatos a oclusor.
+
+**Reconstruye la Hi-Z** con la profundidad que acaba de producir esa fase. Ahora la pirámide describe el fotograma **actual**, no el anterior.
+
+**Fase dos.** Prueba contra esa pirámide fresca solo los objetos que la fase uno *no* dibujó, es decir, los que estaban marcados como no visibles. Los que pasan el test son exactamente los falsos negativos que habrías perdido, y se dibujan en una segunda pasada sobre el mismo depth buffer, sin limpiarlo.
+
+**Actualiza los flags** con la unión de lo dibujado en las dos fases. Ese es el conjunto que la fase uno del siguiente fotograma usará como semilla.
+
+```js
+const encoder = device.createCommandEncoder({ label: 'fotograma' });
+
+// Fase 1: dibujar los que estaban marcados visibles al cerrar el fotograma
+// anterior. Limpia la profundidad porque es la primera escritura del frame.
+dibujarIndirecto(encoder, argsFase1, 'clear');
+
+// La profundidad recien escrita describe el fotograma ACTUAL: reconstruye.
+construirHiZ(encoder);
+
+// Fase 2: probar contra la piramide fresca solo los que la fase 1 descarto,
+// y dibujar los que resulten visibles sobre el mismo depth buffer.
+cullOclusionFase2(encoder);
+dibujarIndirecto(encoder, argsFase2, 'load');
+
+// La piramide definitiva es la semilla de la fase 1 del proximo fotograma.
+construirHiZ(encoder);
+
+device.queue.submit([encoder.finish()]);
+```
+
+El coste añadido es real y hay que contarlo: dos construcciones de pirámide por fotograma en vez de una, un compute pass extra de culling, y dos llamadas de dibujo indirectas por lote en vez de una. En un portátil con gráfica integrada a 1080p, construir la pirámide ronda 0,2 ms, así que el esquema completo añade entre 0,5 y 0,8 ms de GPU. Si con eso te ahorras dibujar 10.000 objetos tapados, es un negocio excelente. Si tu escena es un exterior abierto donde nada tapa nada, acabas de gastar 0,8 ms para descartar el 3 % de los objetos.
+
+Esta lección deja la lista de flags actualizada. Convertirla en algo que se pueda dibujar es el trabajo de [la compactación](/guia/webgpu/n40-compactar-visibles-con-un-scan/), y el número que sale de ahí es el que alimenta [el buffer indirecto](/guia/webgpu/n40-generar-el-draw-indirect-desde-la-gpu/).
+
+<Callout type="dios" title="La oclusion es la tecnica mas sobrevendida del renderizado en tiempo real">
+Casi todo el material que vas a encontrar sobre Hi-Z lo presenta como el siguiente paso natural después del frustum culling, algo que añades cuando quieres ir en serio. En la práctica es la técnica con el peor ratio entre complejidad y beneficio de todo el pipeline, y merece un juicio frío antes de tocar una línea.
+
+Lo que cuesta: dos fases, dos construcciones de pirámide, una textura extra con toda su cadena de mips, un formato de profundidad que tienes que copiar porque no puedes enlazarlo como storage, una convención de reversed-Z que hay que propagar a tres sitios, y un bug de clase entera nuevo —el falso negativo temporal— que solo se manifiesta con la cámara en movimiento y que por tanto no vas a ver en tus capturas estáticas. Cada una de esas piezas es un sitio donde equivocarse, y los errores se manifiestan como objetos que desaparecen, que es la peor categoría de bug visual porque el usuario lo nota antes que tú.
+
+Lo que gana: es proporcional a la complejidad de profundidad de tu escena, y a nada más. En un interior denso con complejidad 8 puedes descartar el 80 % de la geometría que pasa el frustum y la ganancia es enorme. En un exterior abierto con complejidad 1,8 vas a descartar un puñado de objetos y habrás pagado 0,8 ms de GPU por el privilegio. La diferencia entre los dos casos es un factor de veinte, y depende exclusivamente del arte, no del código.
+
+La regla operativa que aplico: **mide primero la complejidad de profundidad**. Dibuja la escena con un shader que sume uno por fragmento en un buffer atómico o que acumule en un render target, divide entre el número de píxeles, y mira el número. Por debajo de 3, no montes esto. Por encima de 5, es probablemente la mayor ganancia disponible en tu pipeline. Entre 3 y 5, prueba primero lo aburrido: ordenar de delante hacia atrás para que el rechazo temprano de profundidad haga su trabajo, y agrupar los objetos pequeños en instancias para que el volumen envolvente de cada test sea significativo. Un test de oclusión sobre 40.000 objetos que son tornillos individuales descarta muchísimo y no ahorra nada, porque los tornillos eran baratos; lo que hay que descartar son los objetos caros, y para eso la granularidad del volumen envolvente importa más que el algoritmo.
+</Callout>

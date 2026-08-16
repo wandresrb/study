@@ -53,7 +53,7 @@ async function setup(root: HTMLElement): Promise<VimExercise> {
       }
       const chip = document.createElement('kbd');
       chip.className =
-        'rounded-xs border border-borde bg-mantle px-1 font-mono text-2xs text-subtext1';
+        'rounded-xs border border-line bg-mantle px-1 font-mono text-2xs text-subtext1';
       chip.textContent = key;
       hudEl.append(chip);
       while (hudEl.childElementCount > 14) hudEl.firstElementChild!.remove();

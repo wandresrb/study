@@ -1,0 +1,144 @@
+---
+title: "Ordenar el bucle de dibujado por estado"
+description: "Cómo construir una clave de ordenación que agrupa los draws por pipeline y por material, qué hacer cuando la transparencia exige el orden contrario, y cómo mantener la lista ordenada sin reordenar cada frame."
+subject: webgpu
+level: 18
+order: 5
+position: "18.5"
+duration: "18 min"
+---
+
+<Lead>
+Un reparto perfecto de bind groups no sirve de nada si el bucle recorre los objetos en orden arbitrario: con la lista desordenada, un grupo de material se ata tantas veces como objetos hay. La organización por frecuencia y la ordenación del bucle son la misma decisión vista desde dos lados, y la segunda es la que se implementa con código.
+</Lead>
+
+<Goals>
+
+- Construir una clave de ordenación numérica que codifique pipeline, material y malla.
+- Ordenar una lista de draws con esa clave sin asignar objetos en el bucle.
+- Resolver el conflicto entre ordenar por estado y ordenar por profundidad.
+- Evitar reordenar la lista completa en cada frame cuando la escena es estática.
+
+</Goals>
+
+## La clave de ordenación
+
+La técnica clásica es codificar el estado de cada draw en un solo número entero y ordenar por ese número. Cada campo ocupa un rango de bits, y los campos de menor frecuencia van en los bits más significativos para que la ordenación numérica los agrupe primero.
+
+Con enteros de 32 bits y `Uint32Array` para no tocar el recolector, un reparto razonable es este:
+
+```js
+// 4 bits de pass | 8 bits de pipeline | 12 bits de material | 8 bits de malla
+function clave(pass, pipeline, material, malla) {
+  return ((pass     & 0x0f) << 28)
+       | ((pipeline & 0xff) << 20)
+       | ((material & 0xfff) << 8)
+       | ( malla    & 0xff);
+}
+```
+
+Ese reparto admite 16 passes, 256 pipelines, 4096 materiales y 256 mallas. Si tu escena necesita más, mueve bits: lo único importante es que los campos estén en orden de frecuencia creciente de izquierda a derecha, porque la comparación numérica compara primero los bits altos.
+
+Los índices `pipeline`, `material` y `malla` no son punteros: son posiciones en arrays que mantienes tú. Esa indirección es lo que permite meterlo todo en un entero, y de paso te da un identificador estable para deduplicar.
+
+```js
+// Arrays paralelos: una clave y un índice al draw real.
+const claves  = new Uint32Array(draws.length);
+const indices = new Uint32Array(draws.length);
+
+for (let i = 0; i < draws.length; i++) {
+  const d = draws[i];
+  claves[i]  = clave(d.pass, d.pipeline, d.material, d.malla);
+  indices[i] = i;
+}
+```
+
+Ordenar dos arrays paralelos en JavaScript sin asignar es incómodo, así que en la práctica se usa una sola lista de objetos ligeros y `Array.prototype.sort` con un comparador numérico, o se empaquetan clave e índice en un `Float64Array` aprovechando que un `double` representa exactamente cualquier entero de 53 bits:
+
+```js
+// clave de 32 bits en la parte alta, índice de 20 bits en la baja: 52 bits, exacto.
+const paquete = new Float64Array(draws.length);
+for (let i = 0; i < draws.length; i++) {
+  paquete[i] = claves[i] * 0x100000 + i;
+}
+paquete.sort();   // ordenación numérica nativa sobre un TypedArray
+
+for (let k = 0; k < paquete.length; k++) {
+  const i = paquete[k] % 0x100000;
+  emitir(draws[i]);
+}
+```
+
+`TypedArray.prototype.sort` ordena numéricamente por defecto, a diferencia de `Array.prototype.sort`, que ordena lexicográficamente y es la fuente de un bug clásico.
+
+## El bucle que aprovecha el orden
+
+Con la lista ordenada, el bucle solo tiene que detectar cambios comparando con lo último atado:
+
+```js
+function emitirLista(pass, lista) {
+  let ultimoPipeline = -1;
+  let ultimoMaterial = -1;
+  let ultimaMalla    = -1;
+
+  for (const d of lista) {
+    if (d.pipeline !== ultimoPipeline) {
+      pass.setPipeline(pipelines[d.pipeline]);
+      ultimoPipeline = d.pipeline;
+      ultimoMaterial = -1;   // el cambio de pipeline puede invalidar el grupo
+      ultimaMalla    = -1;
+    }
+    if (d.material !== ultimoMaterial) {
+      pass.setBindGroup(2, materiales[d.material].grupo);
+      ultimoMaterial = d.material;
+    }
+    if (d.malla !== ultimaMalla) {
+      const m = mallas[d.malla];
+      pass.setVertexBuffer(0, m.vertices);
+      pass.setIndexBuffer(m.indices, 'uint32');
+      ultimaMalla = d.malla;
+    }
+    pass.setBindGroup(1, grupoObjeto, offsets, d.slot, 1);
+    pass.drawIndexed(mallas[d.malla].cuenta);
+  }
+}
+```
+
+El detalle importante es el reinicio de `ultimoMaterial` cuando cambia el pipeline. Si los pipeline layouts comparten prefijo hasta el índice del material, ese reinicio es innecesario y se puede eliminar; si no lo comparten, omitirlo produce un renderer que dibuja con el material equivocado en frames concretos, que es un bug espantoso de localizar. La regla es acompañar cada eliminación de un reinicio con una comprobación explícita de que los layouts son compatibles hasta ese índice, como se explica en la [lección de pipeline layout compartido](/guia/webgpu/n18-pipeline-layout-compartido/).
+
+<Callout type="tip" title="Detectar redundancia no es lo mismo que evitarla">
+La comparación con el último valor atado elimina llamadas redundantes en tiempo de ejecución, pero cuesta una comparación por draw. En un bucle bien ordenado casi todas las comparaciones fallan y la llamada no se emite, así que compensa con creces. En un bucle desordenado casi todas aciertan y solo añades trabajo. Es otra forma de decir que la ordenación es el prerrequisito, no un extra.
+</Callout>
+
+## Cuando la profundidad manda
+
+La transparencia rompe el esquema. Un objeto translúcido tiene que dibujarse después de todo lo que hay detrás, así que su orden lo fija la distancia a la cámara y no el material. Si intentas ordenar los transparentes por estado, el resultado es incorrecto visualmente, y ningún ahorro de llamadas justifica eso.
+
+La solución estándar es partir la lista en dos y ordenarlas con criterios distintos. Los opacos se ordenan por estado, con la profundidad como criterio de desempate de grano grueso —de delante hacia atrás, para que el depth test descarte fragmentos pronto—. Los transparentes se ordenan estrictamente de atrás hacia delante y se acepta el coste.
+
+Eso se codifica en la misma clave usando el campo de pass como bit de partición y reservando los bits bajos para la profundidad cuantizada:
+
+```js
+// Opacos:      [pass=0][pipeline][material][profundidad ascendente]
+// Transparentes:[pass=1][profundidad descendente][pipeline][material]
+function claveOpaco(pipeline, material, z) {
+  const zq = Math.min(0xff, Math.max(0, z * 255)) | 0;      // cerca -> 0
+  return (0 << 28) | (pipeline << 20) | (material << 8) | zq;
+}
+function claveTransparente(pipeline, material, z) {
+  const zq = 0xfff - (Math.min(0xfff, Math.max(0, z * 4095)) | 0); // lejos -> 0
+  return (1 << 28) | (zq << 16) | (pipeline << 8) | material;
+}
+```
+
+Las dos claves usan el mismo entero de 32 bits pero reparten los bits al revés. Los transparentes siguen agrupándose por pipeline **dentro de cada franja de profundidad**, que es el poco ahorro que la corrección permite.
+
+<Callout type="dios" title="La ordenación se amortiza, no se paga cada frame">
+El coste de ordenar dos mil elementos es de decenas de microsegundos y se paga entero cada frame si reconstruyes la lista desde cero. En la mayoría de las escenas eso es tirar el trabajo: los objetos no cambian de material ni de malla entre frames, solo de posición. La versión que escala mantiene la lista **ya ordenada** y solo la toca cuando algo cambia de verdad. Para los opacos, la clave no depende de la posición salvo en los bits de profundidad, así que puedes ordenar una vez al cargar la escena y no volver a hacerlo, aceptando que la profundidad de desempate se queda desactualizada; el coste de ese desajuste es unos fragmentos de overdraw, mucho menor que reordenar. Para los transparentes, que sí dependen de la profundidad, un `sort` sobre una lista **casi ordenada** es prácticamente lineal, porque los algoritmos híbridos que usan los motores de JS detectan las secuencias ya ordenadas. Reordenar una lista casi ordenada de dos mil elementos cuesta la décima parte que ordenarla desde cero. Conservar el array entre frames en vez de reconstruirlo es, literalmente, la optimización de una línea.
+</Callout>
+
+## El presupuesto que persigues
+
+Con la lista ordenada, el reparto por frecuencia bien hecho y el prefijo común entre pipeline layouts, el objetivo realista para una escena de dos mil objetos y cincuenta materiales es este por frame: un `setBindGroup(0)`, del orden de decenas de `setPipeline`, cincuenta `setBindGroup` de material, y dos mil `setBindGroup` de objeto que idealmente desaparecen cuando migres a instancing con `@builtin(instance_index)`.
+
+Cuando los números que mide el contador de la [lección anterior](/guia/webgpu/n18-el-coste-de-setbindgroup/) se parecen a esos, el bucle de dibujado ha dejado de ser el problema y el trabajo pasa al otro lado: a los shaders, al ancho de banda y a la geometría.

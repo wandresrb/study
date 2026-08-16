@@ -1,0 +1,143 @@
+---
+title: "kswapd frente a reclaim directo: quién paga la deuda"
+description: "Los tres watermarks min, low y high como sistema de control con histéresis. kswapd recupera en segundo plano cuando la memoria libre cruza el watermark low; el reclaim directo es el propio hilo que asigna, bloqueándose de forma síncrona cuando kswapd no da abasto. Medir ambos con vmstat y PSI."
+subject: kernel
+level: 25
+order: 3
+position: "25.3"
+duration: "16 min"
+---
+
+<Lead>
+El reclaim se ejecuta de dos maneras que no podrían ser más distintas. Una es proactiva y asíncrona: un demonio, `kswapd`, mantiene un colchón de memoria libre sin que nadie espere por él. La otra es reactiva y síncrona: cuando la asignación no encuentra memoria, **el propio hilo que pidió** se arremanga y recupera, bloqueado, antes de poder continuar. Entre ambos median tres líneas de agua —los watermarks— que forman un sistema de control con histéresis. Entender quién paga la deuda de memoria, y cuándo, es entender la latencia de tu sistema bajo presión.
+</Lead>
+
+<Goals>
+
+- Conocer los tres watermarks min, low y high y qué dispara cada cruce.
+- Entender `kswapd`: kthread por nodo, su sueño y `balance_pgdat`.
+- Entender el reclaim directo: el camino lento de asignación y su stall.
+- Diferenciar y medir ambos con `/proc/vmstat` y la PSI.
+
+</Goals>
+
+## Los tres watermarks
+
+Cada zona de memoria tiene tres marcas de agua que definen su política de reclaim. De más alta a más baja: `WMARK_HIGH`, `WMARK_LOW` y `WMARK_MIN`. La memoria libre de la zona se lee contra ellas como un termostato con dos umbrales:
+
+- Por **encima del high**: abundancia. Nadie recupera nada; `kswapd` duerme.
+- Al bajar del **low**: primer aviso. Se despierta a `kswapd` para que recupere en segundo plano, pero las asignaciones siguen sirviéndose sin bloquearse.
+- Al bajar del **min**: emergencia. Solo las reservas atómicas pueden tocar esa memoria; una asignación normal ya no encuentra sitio y debe hacer **reclaim directo** ella misma.
+
+La histéresis es deliberada: `kswapd` no para al recuperar la primera página, sino que sigue hasta rebasar el **high**, muy por encima del umbral que lo despertó. Así se evita el aleteo de encender y apagar el reclaim en cada asignación. La distancia entre `min` y `low` la fija `watermark_scale_factor`, ajustable en `/proc/sys/vm/`.
+
+<Mermaid code={`flowchart TD
+  H[Libre por encima del high] --> IDLE[kswapd duerme]
+  L[Libre baja del low] --> WK[Despierta kswapd en segundo plano]
+  M[Libre baja del min] --> DR[Reclaim directo el hilo se bloquea]
+  DR --> RETRY[Reintentar la asignacion]
+  RETRY --> OOM[Si nada progresa el OOM killer]`} />
+
+## kswapd: el jardinero en segundo plano
+
+`kswapd` es un kthread por nodo NUMA —`kswapd0`, `kswapd1`...— cuya vida entera es un bucle de dormir y podar. Se despierta cuando una asignación cruza el watermark low y recupera hasta dejar el nodo equilibrado, es decir, todas las zonas relevantes por encima del high.
+
+```c
+/* mm/vmscan.c — el bucle de vida de kswapd, simplificado */
+static int kswapd(void *p)
+{
+	pg_data_t *pgdat = (pg_data_t *)p;
+
+	for ( ; ; ) {
+		/* dormir hasta que alguien cruce el watermark low */
+		kswapd_try_to_sleep(pgdat, alloc_order, reclaim_order,
+				    highest_zoneidx);
+
+		/* recuperar hasta reequilibrar el nodo */
+		reclaim_order = balance_pgdat(pgdat, alloc_order,
+					      highest_zoneidx);
+	}
+	return 0;
+}
+```
+
+El trabajo de fondo lo hace `balance_pgdat`, que corre el bucle de prioridad del nivel 25.1 hasta que el nodo queda equilibrado o se agotan los intentos:
+
+```c
+/* mm/vmscan.c — recuperar hasta el watermark high */
+static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
+{
+	struct scan_control sc = {
+		.gfp_mask = GFP_KERNEL, .order = order,
+		.may_unmap = 1, .may_swap = 1,
+	};
+restart:
+	sc.priority = DEF_PRIORITY;
+	do {
+		if (pgdat_balanced(pgdat, sc.order, highest_zoneidx))
+			goto out;             /* trabajo hecho, a dormir */
+
+		kswapd_shrink_node(pgdat, &sc);
+	} while (--sc.priority >= 0);
+out:
+	return sc.order;
+}
+```
+
+Al terminar, `kswapd` despierta también a su compañero `kcompactd` para desfragmentar y volver a habilitar asignaciones de orden alto. La clave es que todo esto ocurre **fuera** del camino de cualquier proceso: si `kswapd` va sobrado, nadie nota la presión.
+
+## Reclaim directo: cuando el que pide, paga
+
+Si las asignaciones consumen memoria más deprisa de lo que `kswapd` la libera, la libre cae por debajo del `min` y el camino rápido de asignación falla. Entra entonces el camino lento, `__alloc_pages_slowpath`, que primero insiste en despertar a `kswapd` y, si aun así no hay memoria, hace que el propio hilo recupere:
+
+```c
+/* mm/page_alloc.c — __alloc_pages_slowpath */
+if (alloc_flags & ALLOC_KSWAPD)
+	wake_all_kswapds(order, gfp_mask, ac);   /* que el demonio ayude */
+
+/* ...reintentar el camino rápido; si sigue fallando: */
+
+/* el propio hilo recupera memoria de forma SÍNCRONA */
+page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags,
+				    ac, &did_some_progress);
+```
+
+Dentro, `__alloc_pages_direct_reclaim` llama a `try_to_free_pages`, que ejecuta el mismo `shrink_node` que `kswapd` pero **en el contexto del hilo que pidió la memoria**. Ese hilo se bloquea: su latencia de asignación, normalmente de nanosegundos, se dispara a milisegundos mientras escanea listas y espera writebacks. Es la deuda de memoria cobrada al instante, y al peor postor: quien tuvo la mala suerte de pedir cuando el colchón se agotó.
+
+No todas las asignaciones pueden pagar. Las que llevan `GFP_ATOMIC` o `GFP_NOWAIT` carecen del flag `__GFP_DIRECT_RECLAIM` y **no pueden bloquearse** —vienen de contexto atómico o de interrupción—, así que fallan de inmediato en vez de recuperar. Por eso el kernel guarda reservas por debajo del `min` para ellas. Si el reclaim directo tampoco progresa tras varios reintentos y compactaciones, el camino lento acaba invocando al OOM killer (nivel 25.5).
+
+## Medir quién recupera
+
+La diferencia entre uno y otro es visible y actuable. `/proc/vmstat` separa el trabajo por origen: `pgscan_kswapd` y `pgsteal_kswapd` frente a `pgscan_direct` y `pgsteal_direct`. Un contador de reclaim directo alto —o el veterano `allocstall`— es una alarma: significa que hilos reales están bloqueándose por memoria.
+
+```bash
+grep -E 'pgscan_kswapd|pgsteal_kswapd|pgscan_direct|pgsteal_direct' /proc/vmstat
+# pgscan_kswapd   482113904   <- reclaim de fondo: sano
+# pgscan_direct     9042288   <- reclaim directo: hilos bloqueados
+```
+
+La otra ventana, más moderna y más honesta, es la **PSI** (Pressure Stall Information). `/proc/pressure/memory` mide qué fracción del tiempo hubo tareas atascadas esperando memoria, promediada a 10, 60 y 300 segundos:
+
+```bash
+cat /proc/pressure/memory
+# some avg10=6.32 ...   <- algún proceso esperó memoria
+# full avg10=1.15 ...   <- TODOS esperaban a la vez: parálisis
+```
+
+La línea `full` es la que asusta: mide el tiempo en que **ningún** proceso pudo progresar porque todos aguardaban memoria. Es la señal que usan `systemd-oomd` y los gestores de presión en la nube para actuar **antes** de que el kernel llegue al OOM killer.
+
+<Callout type="warn" title="El reclaim directo es una fuente silenciosa de latencia de cola">
+Un servicio puede tener una latencia media impecable y aun así sufrir picos brutales en el percentil 99 porque, de cuando en cuando, una petición cae en reclaim directo y se bloquea milisegundos recuperando memoria para todos. No aparece en el uso de CPU ni en los logs de la aplicación: hay que buscarlo en `pgscan_direct` y en la PSI. Si tus colas de latencia se disparan bajo presión de memoria, sospecha del reclaim directo antes que del disco o la red.
+</Callout>
+
+<Callout type="dios" title="Watermarks son un lazo de control; kswapd es cómo se oculta la latencia">
+Lo que tienes delante no es paginación, es **teoría de control**. Los watermarks definen un lazo con histéresis idéntico en espíritu a un termostato: un umbral bajo que enciende la acción (`low`) y otro alto que la satisface (`high`), separados a propósito para no oscilar. `kswapd` es el actuador que persigue el punto de consigna, y el reclaim directo es lo que ocurre cuando el actuador **se satura**: la planta —las asignaciones— exige más de lo que el controlador puede entregar, y el error se propaga aguas arriba hasta detener al propio proceso que lo generó. Visto así, ajustar `watermark_scale_factor` no es magia negra: es ensanchar el margen entre despertar el reclaim y agotar la memoria, dándole a `kswapd` más pista para frenar antes de estrellarse. La distinción entre fondo y directo es la misma dualidad asíncrono/síncrono que atraviesa todos los sistemas: mientras el productor de trabajo diferido va por delante del consumidor, nadie espera; en cuanto se cruzan, el consumidor bloquea al productor y la latencia oculta se vuelve latencia visible. La salud de un sistema bajo presión de memoria se reduce a una pregunta: ¿va `kswapd` por delante, o le has hecho pagar la deuda a tus peticiones?
+</Callout>
+
+<Challenge title="Provoca y observa cada camino">
+1. Enumera los tres watermarks y di exactamente qué ocurre al cruzar cada uno hacia abajo.
+2. Explica por qué `kswapd` recupera hasta el `high` y no se detiene al superar el `low`.
+3. Razona por qué una asignación `GFP_ATOMIC` no puede hacer reclaim directo y qué la protege.
+4. Genera presión de memoria con `stress-ng --vm` y observa crecer `pgscan_direct` en `/proc/vmstat`.
+5. Vigila `/proc/pressure/memory` durante esa prueba y explica la diferencia entre las líneas `some` y `full`.
+</Challenge>

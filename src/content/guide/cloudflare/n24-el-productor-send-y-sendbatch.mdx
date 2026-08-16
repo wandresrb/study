@@ -1,0 +1,150 @@
+---
+title: "El productor: send, sendBatch y responder al instante"
+description: "El lado productor de una cola es engañosamente simple: un binding y dos métodos. Pero cada detalle importa. Cuándo usar send y cuándo sendBatch y por qué el segundo es atómico, qué significa realmente el await de esa promesa, cómo viaja el cuerpo del mensaje según su contentType, qué límites de tamaño te obligan a encolar referencias en vez de datos, cómo programar una entrega diferida con delaySeconds y qué hacer si el encolado falla justo cuando ya escribiste en la base. Terminamos con el patrón que da sentido a todo: aceptar, encolar y devolver un 202 sin hacer esperar a nadie."
+subject: cloudflare
+level: 24
+order: 2
+position: "24.2"
+duration: "16 min"
+---
+
+<Lead>
+El productor es la mitad visible de una cola y la que toca el camino de la petición, así que es donde se deciden la latencia y la corrección de todo el sistema. Su superficie es minúscula: un binding en `env` y dos métodos, `send` y `sendBatch`. Pero bajo esa simplicidad hay decisiones con consecuencias reales: qué metes en el cuerpo del mensaje, si esperas o no a que el encolado termine, qué haces cuando falla, y si mandas cien mensajes en cien viajes o en uno solo. Dominar el productor es aprender a escribir un manejador `fetch` que hace lo mínimo imprescindible y se aparta.
+</Lead>
+
+<Goals>
+
+- Usar el binding del productor y distinguir cuándo corresponde `send` y cuándo `sendBatch`.
+- Elegir el contenido del mensaje respetando el límite de tamaño y prefiriendo referencias a datos.
+- Programar entregas diferidas con `delaySeconds` y entender su relación con el reloj de la cola.
+- Tratar el fallo del encolado dentro de la petición sin dejar el sistema en un estado inconsistente.
+
+</Goals>
+
+## El binding y el mensaje
+
+Declarar la cola como productor en el manifiesto te deja un objeto en `env` con una API diminuta. No hay cliente que instanciar, ni credenciales, ni cadena de conexión: el binding ya está autenticado por la plataforma, igual que ocurría con KV, R2 o D1.
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const pedido = await registrarPedido(request, env);
+    await env.PEDIDOS.send({ tipo: "confirmar", pedidoId: pedido.id });
+    return Response.json({ id: pedido.id }, { status: 202 });
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+El primer argumento es el cuerpo del mensaje y puede ser cualquier valor estructurable: un objeto, una cadena, un `ArrayBuffer`. Por defecto se serializa como JSON, y con el segundo argumento puedes ajustarlo. Conviene conocer las opciones porque cada una resuelve un caso distinto.
+
+| Opción | Valores | Para qué sirve |
+| --- | --- | --- |
+| `contentType` | `"json"` \| `"text"` \| `"bytes"` \| `"v8"` | Cómo se serializa el cuerpo. `"json"` es el defecto e interopera con todo; `"v8"` conserva tipos de JavaScript como `Date` o `Map` |
+| `delaySeconds` | de `0` a `43200` | Retrasa la disponibilidad del mensaje para el consumidor, hasta doce horas |
+
+Sobre el cuerpo hay una regla de oro: un mensaje tiene un límite de 128 KB, pero el buen criterio te hará quedarte muy por debajo. Encola **referencias, no cargas**. Si el trabajo consiste en generar la miniatura de una imagen de cuatro megas, el mensaje no lleva la imagen: lleva la clave del objeto en R2. Si consiste en enviar un correo, no lleva la plantilla renderizada: lleva el identificador del usuario y el nombre de la plantilla.
+
+<Callout type="tip" title="El mensaje es un puntero al trabajo, no el trabajo">
+Encolar referencias en lugar de datos tiene tres virtudes que se notan enseguida. El mensaje es pequeño y barato de mover. El consumidor lee el dato en el momento de procesarlo, así que trabaja siempre con la versión actual y no con una foto congelada de hace diez minutos. Y si el formato del dato cambia, no tienes mensajes viejos en vuelo con estructuras obsoletas. La excepción legítima es cuando el consumidor debe procesar exactamente el estado del instante en que se encoló, y entonces la copia dentro del mensaje es una decisión consciente, no un descuido.
+</Callout>
+
+Sobre `contentType` hay un matiz que se paga caro cuando se ignora. El valor `"v8"` usa el algoritmo de clonado estructurado de V8, así que conserva tipos que JSON pierde —un `Date` sigue siendo un `Date`, un `Map` sigue siendo un `Map`— y es más compacto. A cambio, solo lo entiende otro Worker: si algún día quieres consumir esa cola desde fuera de la plataforma, con un consumidor HTTP de tipo pull, los mensajes serán ilegibles. `"json"` es más pobre y más lento, pero es el formato que todo el mundo sabe leer, y por eso sigue siendo el defecto sensato salvo que midas que te compensa lo contrario.
+
+Y una última decisión sobre la forma del cuerpo: incluye siempre un campo discriminador y una versión. El discriminador —llámalo `tipo`— permite que una sola cola transporte varias clases de trabajo y que el consumidor las reparta con una comprobación limpia. La versión te salva el día en que cambies la estructura: durante el despliegue habrá mensajes del formato antiguo aún en vuelo, y un consumidor que sepa leer ambos convierte una migración peligrosa en un trámite.
+
+```ts
+await env.PEDIDOS.send({
+  v: 2,
+  tipo: "pedido.confirmado",
+  pedidoId: pedido.id,
+  ocurridoEn: new Date().toISOString(),
+});
+```
+
+## sendBatch: uno o cien, un solo viaje
+
+Cuando una sola acción genera muchos mensajes —un cron que reparte trabajo por cuenta, una importación que crea mil filas, un abanico hacia varios destinatarios— llamar a `send` en un bucle es un error de principiante. Cada llamada es un viaje de red independiente, y mil viajes secuenciales consumen tiempo y presupuesto de subpeticiones sin ninguna necesidad.
+
+```ts
+const mensajes = usuarios.map((u) => ({
+  body: { tipo: "recordatorio", usuarioId: u.id },
+}));
+
+// hasta 100 mensajes por lote; trocea si tienes mas
+for (let i = 0; i < mensajes.length; i += 100) {
+  await env.PEDIDOS.sendBatch(mensajes.slice(i, i + 100));
+}
+```
+
+`sendBatch` recibe un iterable de objetos con la forma `{ body, contentType?, delaySeconds? }` y los escribe de una vez. Acepta hasta cien mensajes por llamada, con un techo agregado de tamaño, así que el troceado del ejemplo no es adorno: es la forma correcta de mandar volúmenes grandes.
+
+Y hay una propiedad que va más allá del rendimiento: el lote es **atómico**. O se encolan todos los mensajes del lote o no se encola ninguno. Eso elimina el estado a medias que produce un bucle de `send` interrumpido por un error en la iteración cuatrocientos, donde te quedas sin saber cuáles llegaron y cuáles no. Si algo va mal, reintentas el lote entero sin miedo a duplicar la mitad.
+
+<Cards>
+  <Card icon="📮" title="send">
+    Un mensaje que nace de una acción concreta del usuario. Simple, directo, un viaje. El caso más común dentro de un manejador `fetch`.
+  </Card>
+  <Card icon="📦" title="sendBatch">
+    Muchos mensajes que nacen de una misma operación. Un solo viaje, escritura atómica y hasta cien por llamada. El caso del abanico y de la importación.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart LR
+  A[Bucle de send] -->|N viajes de red| Q1[Cola]
+  B[sendBatch] -->|1 viaje atomico| Q2[Cola]
+  class A t-red
+  class B t-green`} />
+
+## Diferir en el origen con delaySeconds
+
+No todo el trabajo debe hacerse cuanto antes. Un recordatorio de carrito abandonado tiene sentido una hora después; un reintento manual de un cobro, a los diez minutos; un correo de seguimiento, al día siguiente. Para eso está `delaySeconds`, que retiene el mensaje en la cola y lo hace visible para el consumidor solo cuando el plazo vence.
+
+```ts
+await env.PEDIDOS.send(
+  { tipo: "carrito-abandonado", carritoId },
+  { delaySeconds: 3600 },
+);
+```
+
+Es una herramienta de precisión y conviene no confundirla con un planificador. El retraso máximo es de doce horas, así que "el mes que viene" no es su terreno: eso es un cron o un Workflow con su espera durable. Y como un mensaje diferido puede quedar obsoleto —el usuario terminó su compra a los cinco minutos—, el consumidor debe volver a comprobar la condición antes de actuar. El retraso programa la revisión, no la decisión.
+
+## Encolar y responder al instante
+
+Queda el detalle más sutil del productor: la promesa que devuelven `send` y `sendBatch`. Esperarla significa esperar a que Cloudflare confirme que el mensaje está persistido. Son unos pocos milisegundos, no un viaje al otro lado del mundo, y a cambio obtienes la certeza que da sentido a toda la arquitectura. Si no la esperas y el isolate termina antes de tiempo, puedes perder el mensaje en silencio, que es exactamente el fallo que la cola venía a evitar.
+
+Por eso la regla práctica es simple: si el trabajo es crítico, haz `await` del encolado dentro de la petición; si es accesorio, envuélvelo en `ctx.waitUntil` para que la respuesta salga aún antes, aceptando que en el caso rarísimo de un fallo no te enterarás.
+
+```ts
+async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  const pedido = await registrarPedido(request, env);
+  try {
+    await env.PEDIDOS.send({ tipo: "confirmar", pedidoId: pedido.id });
+  } catch (e) {
+    // el pedido ya existe: marcalo como pendiente de encolar y sigue
+    await env.DB.prepare("UPDATE pedidos SET encolado = 0 WHERE id = ?")
+      .bind(pedido.id)
+      .run();
+  }
+  return Response.json({ id: pedido.id }, { status: 202 });
+}
+```
+
+Conviene recordar además que productor no es sinónimo de manejador `fetch`. Cualquier código que tenga el binding puede encolar: un manejador `scheduled` que reparte trabajo cada noche, un consumidor de otra cola que encadena la siguiente etapa, un Durable Object que publica un hecho tras serializar una escritura, o un Worker al que llegas por un service binding. El binding es lo único que define a un productor, y esa uniformidad es lo que permite componer capas sin inventar protocolos nuevos entre ellas.
+
+<Callout type="note" title="En local, el mensaje también existe">
+Con `wrangler dev` la cola se simula en tu máquina: los mensajes que encolas se entregan al manejador `queue` del mismo proyecto, con sus lotes y sus reintentos. Eso te deja probar el ciclo completo sin desplegar, y sobre todo te deja provocar fallos a propósito para ver cómo se comporta tu consumidor. Un productor que solo has probado contra el caso feliz no está probado.
+</Callout>
+
+Ese bloque encierra la única pregunta difícil del productor. Ya escribiste el pedido en la base y el encolado falla: ¿devuelves un error y dejas al usuario creyendo que no compró nada, cuando su fila existe? ¿O confirmas y aceptas que el trabajo posterior no ocurrirá? La respuesta madura es ninguna de las dos: dejas una marca que un barrido posterior pueda recoger. Y el código de estado que devuelves cuenta la verdad de lo que pasó —un 202 dice "aceptado, todavía no terminado", que es literalmente el contrato de una cola.
+
+<Callout type="dios" title="El productor no envía trabajo: publica un hecho que ya ocurrió">
+Hay un cambio de mentalidad que separa a quien usa una cola de quien la diseña, y vive en cómo nombras lo que mandas. Es tentador escribir mensajes como órdenes —"envía este correo", "genera esta miniatura"— porque así es como piensas cuando vienes de llamar funciones. Pero una orden acopla al productor con el conocimiento de qué debe hacerse, y ese conocimiento es justo lo que la frontera de la cola debería ocultar. Si mañana el alta de un usuario debe además darle de alta en el CRM, tienes que volver al productor, añadir otro `send`, desplegarlo y esperar que nadie olvide una rama. El productor se convierte en un directorio de todo lo que ocurre en el sistema, y eso es exactamente la centralización que la cola prometía disolver. La alternativa es publicar hechos: no "envía el correo de bienvenida" sino "un usuario se registró". El productor afirma algo que sucedió en su dominio y del que es la única autoridad, y ahí termina su responsabilidad; qué consecuencias tenga ese hecho es asunto de quien escuche. Añadir el CRM deja de tocar el productor y pasa a ser un consumidor más suscrito al mismo hecho. Esta inversión, que parece un capricho de nomenclatura, es la que convierte una cola en una arquitectura: el productor deja de ser el orquestador que sabe todo y pasa a ser un notario que solo certifica lo que vio. De ahí se desprenden dos disciplinas prácticas. La primera es que el cuerpo del mensaje debe describir el hecho con los datos mínimos para identificarlo —quién, qué, cuándo— y no con los datos que necesita un consumidor concreto, porque en cuanto lo adaptas a uno lo estás acoplando a él. La segunda es que el productor no debe esperar resultado alguno: si necesitas saber qué respondió el trabajo, no querías una cola, querías una llamada, y confundir ambas cosas produce sistemas que tienen la latencia de lo síncrono y la complejidad de lo asíncrono a la vez. El productor bien escrito es aburrido: valida, persiste, publica el hecho y se calla.
+</Callout>
+
+<Challenge title="Escribe un productor honesto">
+1. Convierte un bucle de `send` en una sola llamada a `sendBatch` con troceado de cien en cien, y explica qué ganas además de velocidad.
+2. Toma un mensaje tuyo que lleve datos dentro y reescríbelo para que lleve solo una referencia. Nombra qué gana el consumidor con ese cambio.
+3. Renombra tres mensajes tuyos que hoy sean órdenes para que expresen hechos ya ocurridos, y describe qué consumidor podrías añadir después sin tocar el productor.
+4. Implementa un recordatorio con `delaySeconds` y añade en el consumidor la comprobación que evita actuar sobre una condición ya resuelta.
+5. Decide, para una operación crítica tuya, qué haces si el encolado falla después de haber escrito en la base, y justifica el código de estado que devuelves.
+</Challenge>

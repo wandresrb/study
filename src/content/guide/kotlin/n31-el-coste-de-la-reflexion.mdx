@@ -1,0 +1,152 @@
+---
+title: "El coste: peso, arranque, latencia y los objetivos donde no existe"
+description: "Contabilidad completa de lo que cuesta reflexionar en tiempo de ejecución: el tamaño que `kotlin-reflect` añade al artefacto y su efecto sobre la eliminación de código muerto y la ofuscación, la penalización de arranque que impone decodificar el metadato, la distancia real entre una llamada reflexiva y una llamada directa, y las razones estructurales por las que en Kotlin Native y en Wasm la reflexión completa no es una opción disponible."
+subject: kotlin
+level: 31
+order: 4
+position: "31.4"
+duration: "21 min"
+---
+
+<Lead>
+La reflexión se paga cuatro veces y casi siempre se contabiliza una sola. Se paga en bytes, porque la biblioteca que la implementa lleva dentro un analizador de metadatos completo y no es pequeña. Se paga en arranque, porque antes de responder la primera pregunta sobre una clase hay que decodificar la descripción binaria que el compilador dejó grabada. Se paga en cada invocación, porque una llamada que el compilador habría resuelto a una instrucción se convierte en una búsqueda, una comprobación de accesibilidad, un empaquetado de argumentos y una desreferencia indirecta. Y se paga, la cuarta vez, en libertad de despliegue: un programa que se consulta a sí mismo por nombre no puede ser podado por un optimizador que no sepa qué nombres se consultarán, no puede ser ofuscado sin reglas de conservación y no puede compilarse hacia objetivos donde el modelo dinámico de clases sencillamente no existe. Este nivel pone cifras y mecanismos a esas cuatro facturas, porque la decisión de usar reflexión solo es defendible cuando se conocen las cuatro.
+</Lead>
+
+<Goals>
+
+- Cuantificar el peso que la biblioteca de reflexión añade y su interacción con la poda y la ofuscación.
+- Explicar el coste de arranque a partir del formato de metadatos que hay que decodificar.
+- Comparar el coste de una llamada reflexiva con el de una llamada directa e identificar dónde se va el tiempo.
+- Justificar por qué en los objetivos nativo y de Wasm la reflexión completa no está disponible.
+
+</Goals>
+
+## El peso en el artefacto
+
+La biblioteca de reflexión de Kotlin ronda los tres megabytes en su forma sin comprimir y aporta varias decenas de miles de métodos. En un servicio de servidor eso es irrelevante; en una aplicación móvil es una de las dependencias más caras que se pueden añadir por accidente, y se añade por accidente con frecuencia, porque basta con que una biblioteca transitiva la declare para que entre en el gráfico.
+
+El problema mayor no es el tamaño bruto sino su interacción con el optimizador. Un reductor de código funciona demostrando que ciertas clases y ciertos miembros no son alcanzables desde ningún punto de entrada. La reflexión rompe esa demostración de raíz: si en algún lugar del programa hay una búsqueda por nombre, el optimizador no puede saber qué nombres se buscarán y debe elegir entre conservar de más o romper el programa. La salida práctica son las reglas de conservación, que hay que escribir a mano, que nadie actualiza cuando el modelo cambia y que en la práctica acaban conservando jerarquías enteras.
+
+Conviene ver el tamaño de la renuncia con un ejemplo concreto. Para que una clase siga siendo inspeccionable tras la reducción hay que conservar la clase, sus miembros y, en Kotlin, además la anotación de metadatos sin la cual la biblioteca no sabe interpretarla. La regla resultante no protege un método: protege un subárbol.
+
+```kotlin
+// Reglas de conservacion tipicas, expresadas como comentario para leerlas aqui:
+//   keep class com.ejemplo.modelo.**  con todos sus miembros
+//   keepattributes RuntimeVisibleAnnotations
+//   keep class kotlin.Metadata        con todos sus miembros
+```
+
+Cada línea de ese fichero es una porción del programa que el optimizador deja de tocar y que el ofuscador deja de renombrar. Multiplicado por las bibliotecas que también reflexionan, el efecto acumulado suele ser mayor que el peso de la propia biblioteca de reflexión, y es mucho más difícil de medir porque no aparece como una dependencia sino como una ausencia de reducción.
+
+<Cards>
+  <Card icon="📦" title="Bytes que no se podan">
+    Cada clase alcanzable solo por reflexión debe conservarse entera, con sus miembros y su metadato, aunque el programa use dos campos de ella.
+  </Card>
+  <Card icon="🕶️" title="Ofuscación en conflicto">
+    El ofuscador reescribe nombres; la reflexión los busca. Toda regla de conservación es una renuncia parcial a la ofuscación.
+  </Card>
+  <Card icon="🧩" title="Dependencia transitiva">
+    Comprueba el gráfico de dependencias antes de suponer que no reflexionas: muchas bibliotecas la arrastran sin anunciarlo.
+  </Card>
+  <Card icon="🔢" title="Versión acoplada">
+    La versión de la biblioteca debe coincidir con la del compilador, lo que la convierte en una restricción más de tu matriz de actualización.
+  </Card>
+</Cards>
+
+## El arranque: decodificar antes de responder
+
+El coste de arranque no viene de cargar clases sino de interpretar el metadato. El compilador de Kotlin graba en cada clase una anotación con una estructura binaria que describe lo que el formato de la plataforma no sabe representar: nulabilidad, propiedades frente a campos, valores por defecto, receptores de extensión, variancia, alias y clases selladas. La primera vez que se pregunta por una clase, la biblioteca localiza esa anotación, la decodifica, construye el modelo y lo cachea. Las preguntas siguientes sobre la misma clase son mucho más baratas; las primeras sobre cada clase nueva vuelven a pagar el precio.
+
+Ese patrón tiene una consecuencia práctica que decide arquitecturas enteras: la penalización es proporcional al número de tipos distintos inspeccionados, no al número de operaciones. Un servicio de larga vida que inspecciona doscientos tipos en el arranque amortiza el coste en el primer minuto y no vuelve a pensarlo. Una aplicación de cliente que arranca, hace su trabajo y muere paga la factura completa en el tramo de tiempo que el usuario percibe, y la paga cada vez.
+
+De ahí que la única mitigación realmente eficaz sea diferir: no inspeccionar en la construcción del componente sino en el primer uso, y cachear el resultado con una inicialización perezosa. La técnica no reduce el coste total, lo reparte, y evita pagar por los tipos que esa ejecución concreta no llegará a usar.
+
+```kotlin
+class Descriptor(private val k: KClass<*>) {
+    // No se decodifica nada hasta la primera lectura real
+    val campos: List<KProperty1<Any, *>> by lazy {
+        @Suppress("UNCHECKED_CAST")
+        k.memberProperties.toList() as List<KProperty1<Any, *>>
+    }
+}
+
+private val cache = ConcurrentHashMap<KClass<*>, Descriptor>()
+fun descriptorDe(k: KClass<*>): Descriptor = cache.getOrPut(k) { Descriptor(k) }
+```
+
+Nótese que la caché es imprescindible y que su clave es la propia referencia de clase, que pertenece al subconjunto ligero. Sin ella, cada consulta reconstruye el modelo y el coste deja de ser de arranque para convertirse en coste permanente.
+
+<Mermaid code={`flowchart TD
+  A[Primera consulta sobre un tipo] --> B[Localizar la anotacion de metadatos]
+  B --> C[Decodificar la estructura binaria]
+  C --> D[Construir el modelo y cachearlo]
+  D --> E[Responder]
+  F[Consultas siguientes sobre el mismo tipo] --> D
+  G[Proceso de vida corta] --> H[Paga la decodificacion completa en cada arranque]`} />
+
+## La llamada reflexiva frente a la directa
+
+Una invocación normal se resuelve en compilación: el destino es conocido, los argumentos van por el mecanismo de paso habitual y el optimizador puede incorporarla en línea, especializarla o eliminarla. Una invocación reflexiva no puede hacer nada de eso. Hay que localizar el miembro, comprobar la accesibilidad, empaquetar los argumentos en un arreglo, envolver los valores primitivos en objetos, desempaquetar el retorno y propagar los errores a través de una capa de excepciones envolventes. El resultado, medido con cuidado, sitúa la llamada reflexiva entre uno y dos órdenes de magnitud por encima de la directa, y la variante por mapa de parámetros bastante peor todavía, porque además construye estructuras intermedias en cada llamada.
+
+```kotlin
+class Punto(val x: Int, val y: Int) {
+    fun distanciaAlOrigen(): Double = kotlin.math.hypot(x.toDouble(), y.toDouble())
+}
+
+val p = Punto(3, 4)
+
+// Directa: el destino se conoce en compilacion
+val a = p.distanciaAlOrigen()
+
+// Reflexiva: busqueda, comprobacion, empaquetado, envoltura
+val m = Punto::class.memberFunctions.first { it.name == "distanciaAlOrigen" }
+val b = m.call(p)
+```
+
+Hay dos matices que evitan conclusiones simplistas. El primero es que buena parte del coste se puede amortizar: resolver el miembro una vez y guardar la referencia elimina la búsqueda, que suele ser la fracción dominante, y deja solo el sobrecoste de invocación. El segundo es que la comparación importa cuando la llamada está en un camino caliente; si la reflexión ocurre una vez por petición y la petición hace entrada y salida de red, la diferencia desaparece bajo el ruido. La conclusión correcta no es que la reflexión sea lenta, sino que su coste es fijo y no mejora, mientras que el de la alternativa generada tiende a cero.
+
+Merece la pena desglosar dónde se va exactamente el tiempo, porque cada partida se ataca de forma distinta. La búsqueda del miembro por nombre recorre una colección construida al decodificar el metadato y solo se paga una vez si se cachea. La comprobación de accesibilidad ocurre en cada invocación salvo que se desactive explícitamente. El empaquetado de argumentos asigna un arreglo por llamada y envuelve cada valor primitivo en un objeto, con lo que introduce presión sobre el recolector allí donde la versión directa no asignaba nada. Y la indirección impide al compilador de la máquina virtual incorporar la llamada en línea, que es la optimización de la que dependen casi todas las demás.
+
+```kotlin
+class Invocador(k: KClass<*>, nombre: String) {
+    // Resuelto una sola vez en la construccion
+    private val m = k.memberFunctions.first { it.name == nombre }
+        .also { it.isAccessible = true }
+
+    fun invocar(receptor: Any): Any? = m.call(receptor)
+}
+```
+
+Ese pequeño envoltorio suele reducir el sobrecoste en un factor considerable y no cambia nada del diseño. Es lo mínimo exigible a cualquier código de producción que reflexione, y su ausencia es un indicador bastante fiable de que la decisión de reflexionar no llegó a evaluarse.
+
+<Callout type="tip" title="Amortiza siempre la resolución">
+Si tras evaluarlo decides reflexionar, resuelve los miembros una sola vez en la construcción del componente y guarda las referencias. Reflexionar dentro del bucle es el error que convierte una decisión defendible en un problema de rendimiento medible.
+</Callout>
+
+## Los objetivos donde simplemente no existe
+
+En Kotlin Native y en el objetivo de Wasm la reflexión completa no está disponible, y es importante entender que no se trata de una laguna pendiente de rellenar. Ambos compiladores son de programa completo: analizan todo el código alcanzable y eliminan lo demás, y esa eliminación es precisamente lo que permite que un binario nativo o un módulo de Wasm tengan un tamaño razonable. Un mecanismo que resuelve nombres en ejecución es incompatible con esa estrategia, porque obligaría a conservar la totalidad del programa junto con una descripción de sí mismo. Además, ninguno de los dos objetivos tiene un cargador de clases dinámico ni un formato de clases inspeccionable en ejecución: no hay nada análogo a la anotación de metadatos que la biblioteca sabe leer.
+
+Lo que sí existe en esos objetivos es el subconjunto ligero: la referencia de clase como identidad, el nombre simple, la comprobación de pertenencia, las referencias a función y a propiedad con su nombre y su invocación directa. En el objetivo nativo hay además un mecanismo específico que permite asociar un objeto a una clave de anotación y recuperarlo en ejecución, pensado exactamente para cubrir el caso de las factorías registradas sin necesidad de búsqueda por nombre. Es una pista muy clara sobre la dirección que ha tomado el diseño: en lugar de reproducir la reflexión, se ofrece un mecanismo declarativo que resuelve el mismo problema en compilación.
+
+```kotlin
+// Disponible en todos los objetivos: identidad, nombre y pertenencia
+fun describir(v: Any): String = v::class.simpleName ?: "anonimo"
+
+// No disponible fuera de la maquina virtual de Java: enumerar el modelo
+// fun campos(v: Any) = v::class.memberProperties
+```
+
+La consecuencia de diseño es directa y afecta a cualquier módulo compartido entre plataformas. Si el código común reflexiona, deja de ser común: hay que duplicarlo con una implementación esperada y varias reales, y la real de los objetivos sin reflexión tendrá que resolver el problema de otra manera, casi siempre generando o registrando. Cuando eso ocurre, la pregunta obvia es por qué no usar desde el principio la solución que funciona en todas partes, y esa pregunta es la que abre el nivel siguiente.
+
+<Callout type="dios" title="La reflexión es tiempo prestado del futuro a un interés que ya no compensa">
+Merece la pena reconstruir por qué la reflexión llegó a parecer natural, porque solo entendiendo su época se entiende su declive. Nació en un mundo donde compilar era caro, desplegar era lento y la única frontera de extensión disponible era el nombre: cargar una clase escrita por un tercero, buscar en ella un método con la firma acordada e invocarlo era la forma más simple de conectar dos programas que jamás se habían visto. En ese contexto el intercambio era razonable: se pagaba latencia en ejecución a cambio de acoplamiento nulo en compilación, y la latencia importaba menos que la posibilidad misma de conectar. Casi todo lo que sostenía ese cálculo ha cambiado. Los compiladores admiten hoy extensiones propias que participan en la compilación con acceso completo al modelo del programa. Los procesadores de símbolos permiten a un tercero generar código en tu compilación sin haber visto tu código antes. Las compilaciones incrementales y las cachés hacen que generar sea barato. Y el abanico de objetivos se ha ampliado hacia plataformas donde el modelo dinámico de clases no existe y nunca existirá, lo que convierte a la reflexión de una técnica costosa en una técnica no portátil, que es una categoría distinta y mucho más grave. Queda un residuo legítimo, y conviene nombrarlo sin ambigüedad para no caer en el purismo: la carga de módulos verdaderamente desconocidos en el momento de compilar, la inspección de código que no controlas, la instrumentación y las herramientas de diagnóstico. En todos esos casos la información no está disponible antes y la reflexión no es una comodidad sino la única vía. Fuera de ellos, cada llamada reflexiva es una decisión de trasladar al usuario final, en forma de bytes y de milisegundos multiplicados por cada arranque de cada dispositivo, un trabajo que una máquina de compilación podría haber hecho una sola vez. Vista con esa aritmética, la elección deja de ser una cuestión de gusto técnico.
+</Callout>
+
+<Challenge title="Pon cifras a las cuatro facturas">
+1. Añade la biblioteca de reflexión a un proyecto pequeño y mide la diferencia de tamaño del artefacto antes y después.
+2. Escribe un microbanco que compare llamada directa, llamada reflexiva con el miembro resuelto cada vez y llamada reflexiva con el miembro cacheado.
+3. Mide el tiempo de la primera consulta sobre cien tipos distintos y compáralo con el de cien consultas sobre el mismo tipo.
+4. Activa un reductor de código sobre un ejemplo que use reflexión, observa el fallo y escribe la regla de conservación mínima que lo arregla.
+5. Compila hacia el objetivo nativo un fragmento que solo use el subconjunto ligero y otro que use la biblioteca completa, y contrasta ambos resultados.
+</Challenge>

@@ -1,0 +1,155 @@
+---
+title: "El coste en la UI: snapshot entero o rebanada"
+description: "Si la interpretación casi nunca es el cuello de botella, el borde con la interfaz casi siempre lo es. Esta lección construye un modelo de coste cuantitativo para la suscripción: cuántas veces corre cada selector, cuántos componentes despiertan por transición y por qué el comparador es el contrato que decide todo. Cubre la aritmética de suscriptores por snapshot, la asimetría entre ejecutar un selector y ejecutar un render, los selectores derivados que anulan el ahorro, la semántica de la suscripción externa frente al render concurrente y cómo medir renders con el perfilador en lugar de discutirlos."
+subject: maquinas
+level: 24
+order: 2
+position: "24.2"
+duration: "19 min"
+---
+
+<Lead>
+El actor es barato y la pantalla es cara, así que el rendimiento de una aplicación gobernada por máquinas se decide casi íntegramente en la frontera entre ambos. Esa frontera tiene una forma precisa: un actor emite un snapshot por transición y un conjunto de observadores decide, cada uno por su cuenta, si eso les concierne. Suscribirse al snapshot entero convierte cada transición en un render garantizado; suscribirse a una proyección convierte cada transición en una comparación y, solo a veces, en un render. La diferencia entre ambas políticas no es estilística ni de gusto: es una diferencia de complejidad multiplicativa entre el número de transiciones y el número de componentes montados, y en un árbol grande esa multiplicación es exactamente lo que separa una interfaz que responde de una que arrastra. Esta lección la trata como lo que es, un problema de contabilidad.
+</Lead>
+
+<Goals>
+
+- Construir el modelo de coste que relaciona transiciones, suscriptores, ejecuciones de selector y renders.
+- Distinguir el coste de ejecutar un selector del coste de repintar, y decidir cuál conviene pagar.
+- Escribir comparadores como contratos de igualdad explícitos y detectar los que anulan el ahorro.
+- Medir renders desperdiciados con el perfilador y con instrumentación propia en vez de estimarlos.
+
+</Goals>
+
+## La aritmética de una transición
+
+Cuando el actor completa un macrostep notifica a sus observadores en orden de suscripción. Ese momento es donde se gasta el presupuesto, y su coste tiene una fórmula que conviene tener en la cabeza: por cada transición se ejecutan tantos selectores como suscriptores haya, y se producen tantos renders como selectores hayan devuelto un valor que el comparador considere distinto. Las dos cifras son independientes y se optimizan con técnicas distintas.
+
+<Mermaid code={`flowchart TD
+  A[transicion completada] --> B[snapshot nuevo]
+  B --> C[recorrer suscriptores]
+  C --> D[ejecutar selector de cada uno]
+  D --> E{el comparador dice distinto}
+  E -->|si| F[programar render del componente]
+  E -->|no| G[no hacer nada]
+  F --> H[reconciliacion y pintura]`} />
+
+De ahí se sigue una asimetría que gobierna todas las decisiones posteriores. Ejecutar un selector cuesta lo que cuesten unos accesos a propiedades: nanosegundos. Ejecutar un render cuesta reconciliación, comparación de árboles y, si toca, layout y pintura: cientos de microsegundos como mínimo, y bastante más si el componente tiene descendencia. La proporción entre ambos es de tres a cuatro órdenes de magnitud, y esa proporción justifica una regla práctica contundente: paga selectores a manos llenas con tal de no pagar un render de más.
+
+```ts
+// Doscientos suscriptores con selector: 200 ejecuciones baratas por transicion,
+// y solo los pocos cuyo valor cambio programan render.
+const etiqueta = useSelector(actorRef, (s) => s.context.filas[id].etiqueta)
+
+// Doscientos suscriptores al snapshot entero: 200 renders por transicion,
+// independientemente de si el dato que pintan cambio o no.
+const [snapshot] = useMachine(maquina)
+```
+
+Conviene poner números a esa intuición porque el resultado no es intuitivo en absoluto. Una tabla con doscientas filas suscritas al snapshot entero, ante una transición que solo afecta a una de ellas, produce doscientos renders de los cuales ciento noventa y nueve son puro desperdicio; con selectores produce doscientas ejecuciones de una función que accede a dos propiedades y un solo render. El trabajo total pasa del orden de decenas de milisegundos al orden de microsegundos, y el fotograma se salva o se pierde exactamente ahí. Es la misma transición, la misma máquina y el mismo dato: lo único que cambió fue la política de suscripción.
+
+<Cards>
+  <Card icon="📡" title="Snapshot entero">
+    Coste por transición proporcional al número de suscriptores multiplicado por el coste de render. Honesto cuando el componente depende de casi todo. Ruinoso en árboles amplios con eventos frecuentes.
+  </Card>
+  <Card icon="🔬" title="Rebanada con comparador">
+    Coste por transición proporcional al número de suscriptores multiplicado por el coste del selector, más los pocos renders reales. Tres órdenes de magnitud por debajo del anterior.
+  </Card>
+  <Card icon="🧭" title="Actor compartido por referencia">
+    Un único actor en la raíz, referencia estable por el árbol y cada componente eligiendo su porción. Evita que el contexto de React se convierta en un difusor de renders.
+  </Card>
+</Cards>
+
+<Callout type="info" title="La suscripción total no es siempre incorrecta">
+Un componente que ya depende de casi todo el snapshot —una barra de estado que muestra el valor finito, el paso actual y tres campos del contexto— no ahorra nada con selectores, porque su probabilidad de tener que repintar ante una transición cualquiera es cercana a uno. En ese caso la suscripción total es la política honesta y el grano fino solo añade cuatro hooks y un comparador que mantener. El grano fino paga cuando la ratio entre transiciones totales y transiciones que afectan a ese componente es alta, y no paga cuando esa ratio es cercana a la unidad.
+</Callout>
+
+## El comparador es el contrato
+
+El comparador decide qué cuenta como cambio, así que es el lugar exacto donde una optimización se convierte en un espejismo. El fallo canónico es devolver una estructura derivada: el selector construye un array o un objeto nuevo en cada snapshot, la identidad referencial nunca coincide y el comparador por defecto declara cambio siempre. El componente se re-renderiza en cada transición igual que con la suscripción total, pero ahora además paga la derivación. Se ha empeorado la situación creyendo mejorarla.
+
+```ts
+// Espejismo: crea un array nuevo cada snapshot, la comparacion por identidad falla siempre.
+const visibles = useSelector(actorRef, (s) => s.context.filas.filter((f) => f.visible))
+
+// Correcto por contenido: comparador explicito sobre las identidades que importan.
+const mismasIds = (a: Fila[], b: Fila[]) =>
+  a.length === b.length && a.every((f, i) => f.id === b[i].id)
+const visibles2 = useSelector(actorRef, (s) => s.context.filas.filter((f) => f.visible), mismasIds)
+
+// Correcto por proyeccion: selecciona un escalar comparable y deriva fuera.
+const version = useSelector(actorRef, (s) => s.context.versionFilas)
+const visibles3 = useMemo(() => derivar(actorRef.getSnapshot()), [version])
+```
+
+Las tres variantes tienen perfiles de coste distintos y elegir entre ellas es una decisión de ingeniería. El comparador de contenido paga una comparación lineal en cada transición para ahorrar un render; sale a cuenta mientras el array sea pequeño y el subárbol grande, y deja de salir cuando la lista tiene diez mil elementos y el componente pinta una etiqueta. La proyección escalar traslada el trabajo al productor: alguien debe mantener un contador de versión en el contexto, lo cual es disciplina extra, pero convierte la comparación en una igualdad de números y el redisparo de la derivación en algo perfectamente controlado.
+
+| Estrategia | Coste por transición | Cuándo conviene |
+| --- | --- | --- |
+| Selector escalar sin comparador | acceso a propiedad | el caso por defecto, siempre que se pueda |
+| Comparador de contenido superficial | recorrido lineal de la rebanada | rebanadas pequeñas y subárboles caros |
+| Comparador profundo recursivo | recorrido de toda la estructura | prácticamente nunca en el camino caliente |
+| Versión escalar más derivación externa | igualdad de números | listas grandes con derivación costosa |
+
+Hay un caso intermedio que aparece constantemente y que merece nombre propio: el selector que devuelve el valor finito de la máquina. Cuando ese valor es un identificador simple, la comparación por identidad funciona y todo va bien; cuando el estado es jerárquico o paralelo, el valor es un objeto anidado que se reconstruye en cada transición y la comparación por identidad vuelve a fallar siempre. La solución no es un comparador profundo sino un selector más estrecho: casi ningún componente necesita el valor completo, sino saber si la máquina se encuentra dentro de una zona concreta, y esa pregunta se responde con un booleano perfectamente comparable.
+
+```ts
+// Falla: objeto anidado reconstruido en cada transicion.
+const valor = useSelector(actorRef, (s) => s.value)
+
+// Correcto: la pregunta real, reducida a un booleano.
+const estaEnviando = useSelector(actorRef, (s) => s.matches({ formulario: 'enviando' }))
+```
+
+<Callout type="warn" title="Un comparador caro es un render disfrazado">
+El comparador corre en cada snapshot y para cada suscriptor, es decir, en el punto más caliente de todo el sistema. Una comparación profunda recursiva sobre un objeto anidado puede costar más que el render que evita, y lo peor es que lo hace de forma invisible: el perfilador atribuye ese tiempo a la notificación del actor y no al componente, con lo que la optimización parece haber funcionado mientras el fotograma sigue perdiéndose. Antes de escribir un comparador no trivial, calcula su coste multiplicado por el número de suscriptores y compáralo con el coste del render que pretende ahorrar.
+</Callout>
+
+## La suscripción externa y el render concurrente
+
+El puente entre un actor y React se apoya en el mecanismo de suscripción a almacenes externos, y conocer su semántica evita dos clases de errores sutiles. El primero es la inestabilidad del selector: si la función selectora se recrea en cada render y además devuelve una referencia nueva, el mecanismo puede detectar cambio donde no lo hay y entrar en un ciclo de renders que se alimentan entre sí. La defensa es tener selectores estables, definidos fuera del componente o memoizados, y que devuelvan valores comparables.
+
+```ts
+// Selector estable definido fuera del componente: no se recrea en cada render.
+const seleccionarPaso = (s: SnapshotDe<typeof maquina>) => s.value
+const seleccionarErrores = (s: SnapshotDe<typeof maquina>) => s.context.errores.length
+
+// Dentro del componente solo quedan las lecturas, ya estables y comparables.
+const paso = useSelector(actorRef, seleccionarPaso)
+const numeroDeErrores = useSelector(actorRef, seleccionarErrores)
+```
+
+El segundo error es más conceptual y tiene que ver con la coherencia. Un actor es una fuente de verdad externa que puede cambiar mientras React está a mitad de una reconciliación interrumpible, y si distintos componentes leyeran el snapshot por su cuenta en momentos distintos podrían pintar versiones incoherentes del mismo estado. El mecanismo de suscripción externa existe precisamente para impedirlo: fuerza una lectura consistente y descarta el trabajo especulativo cuando la fuente cambia bajo sus pies. La consecuencia práctica es que leer con `getSnapshot` directamente dentro del cuerpo de un componente, fuera del hook, es una violación silenciosa de esa garantía: funciona en desarrollo y produce incoherencias intermitentes bajo carga.
+
+<Callout type="tip" title="Un actor en la raíz, muchos ojos independientes">
+La forma que escala es un único actor creado una sola vez y compartido por referencia a través del árbol, con cada componente eligiendo su rebanada. Lo que viaja por el contexto de React es la referencia al actor, que nunca cambia de identidad, de modo que el contexto no dispara renders en cascada como haría si transportase el snapshot. Es la diferencia entre un estado izado a un ancestro común, que despierta a todos sus descendientes cuando cambia, y un actor observado lateralmente, que no tiene descendientes a los que despertar.
+</Callout>
+
+## Medir renders, no sensaciones
+
+Toda esta contabilidad es inútil si no se contrasta. La medición mínima viable es un contador de renders por componente y un contador de notificaciones del actor: con esos dos números tienes la ratio de renders desperdiciados, que es la métrica que realmente importa y la única que justifica introducir complejidad.
+
+```ts
+const renders = useRef(0)
+renders.current++
+useEffect(() => {
+  performance.mark(`render:${nombre}:${renders.current}`)
+})
+```
+
+Ese contador es deliberadamente tosco y por eso resulta fiable: no depende de extensiones, funciona igual en desarrollo y en una compilación de producción instrumentada, y produce un número entero que se puede comparar entre ramas sin margen para la interpretación. Su lectura correcta exige una precaución: en modo estricto de desarrollo los componentes se renderizan dos veces a propósito, así que lo que importa no es el valor absoluto sino la diferencia entre el antes y el después del cambio, medida siempre en el mismo modo.
+
+Con esa instrumentación se ejecuta un guion reproducible —abrir la vista, escribir en el filtro, desplazar la lista, enviar el formulario— y se comparan las cifras antes y después del cambio. El perfilador del navegador aporta la otra mitad: permite ver si el tiempo se va en reconciliación, en layout o en pintura, y esa distinción decide la técnica correcta, porque un problema de layout no se arregla estrechando suscripciones sino evitando que el componente lea geometría en el camino crítico. Optimizar sin esa desagregación es adivinar con más pasos.
+
+<Callout type="dios" title="La suscripción es una decisión de diseño, no un detalle de implementación">
+Hay una tentación muy extendida de tratar la elección entre snapshot entero y rebanada como una cuestión de rendimiento que se resuelve al final, cuando algo va lento, envolviendo cosas en memoizaciones hasta que el perfil deje de quejarse. Esa forma de verlo confunde el síntoma con la estructura. Lo que un componente elige observar es una declaración sobre su papel en el sistema: dice de qué depende, ante qué debe reaccionar y qué le resulta indiferente. Un componente suscrito al snapshot entero está afirmando que todo cuanto ocurre en la máquina le concierne, y esa afirmación casi siempre es falsa; la falsedad se paga en renders, pero antes se paga en comprensión, porque nadie que lea ese componente puede saber qué lo despierta. Cuando en cambio el componente declara su rebanada, el código gana una propiedad que no es de velocidad sino de legibilidad: la dependencia queda escrita, revisable en un cambio de código y verificable en una prueba. El comparador completa esa declaración añadiendo lo que ninguna otra parte del sistema dice en voz alta: qué significa que ese dato haya cambiado. Dos arrays con los mismos elementos, ¿son el mismo dato? La respuesta no la da el lenguaje ni la biblioteca, la da el dominio, y escribirla en un comparador es hacer explícita una regla que de otro modo vive en la intuición de quien programó el filtro. Por eso el trabajo de rendimiento en el borde de la interfaz acaba siendo indistinguible del trabajo de modelado: estrechar una suscripción es afinar una dependencia, y elegir un comparador es definir una identidad. Quien entiende esto deja de memoizar a ciegas y empieza a preguntarse, ante cada componente, de qué depende realmente. Esa pregunta produce interfaces más rápidas como efecto secundario de haberlas producido más honestas.
+</Callout>
+
+<Challenge title="Contabiliza tus renders">
+1. Instrumenta cinco componentes con contador de renders y anota cuántos se disparan durante un guion de uso concreto y repetible.
+2. Calcula la ratio de renders desperdiciados: cuántos ocurrieron sin que cambiara ningún dato que ese componente pinta.
+3. Convierte el componente peor situado a suscripción por rebanada y vuelve a ejecutar el guion; expresa la mejora en número de renders evitados, no en sensación.
+4. Escribe un selector que devuelva un array derivado sin comparador y demuestra con el contador que el ahorro desaparece por completo.
+5. Arregla ese caso de dos formas —comparador de contenido y versión escalar más derivación externa— y mide cuál gana en tu tamaño de lista real.
+6. Sustituye un comparador superficial por uno profundo recursivo, mide el tiempo total de notificación y explica por qué el fotograma puede empeorar aunque los renders bajen.
+</Challenge>

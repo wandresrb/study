@@ -1,0 +1,149 @@
+---
+title: "Cuatro pestañas, cuatro clientes: el estado que se multiplica"
+description: "Abrir la aplicación en cuatro pestañas crea cuatro clientes completos que comparten el almacenamiento pero no la memoria, y esa asimetría explica casi todos los fallos de concurrencia que verás en el navegador."
+subject: local-first
+level: 17
+order: 1
+position: "17.1"
+duration: "15 min"
+---
+
+<Lead>
+Sacar la base de datos del hilo principal resolvió un problema de latencia y creó la ilusión de que ya tenías una arquitectura. La ilusión dura exactamente hasta que el usuario pulsa el atajo de duplicar pestaña. Lo que aparece entonces no es una copia de la interfaz: es una instancia completa y autónoma de tu cliente, con su propia memoria, su propio bucle de eventos, su propio worker y su propia conexión al servidor, compitiendo por unos recursos que sí son únicos. La palabra clave de todo este nivel cabe en una frase: **compartes el disco y no compartes la memoria**. Casi todos los errores que vas a diagnosticar durante los próximos cuatro niveles son consecuencias de esa asimetría, y ninguno de ellos aparecerá jamás en tu máquina de desarrollo, donde siempre tienes una sola pestaña abierta.
+</Lead>
+
+<Goals>
+
+- Distinguir con precisión qué recursos son de origen y cuáles son de documento, y por qué esa frontera no coincide con la intuición.
+- Enumerar las cuatro contenciones que aparecen al multiplicar clientes: red, base, memoria y cuota.
+- Reconocer el bloqueo de `versionchange` como la manifestación más común y más malinterpretada del problema.
+- Entender por qué estos fallos son difíciles de reproducir y qué familias de solución ofrece la plataforma.
+
+</Goals>
+
+## Un origen, muchos documentos
+
+La unidad de aislamiento del almacenamiento en la web es el **origen**: esquema, host y puerto. La unidad de ejecución, en cambio, es el **documento**. Cada pestaña, cada ventana, cada iframe y cada ventana de aplicación instalada es un documento distinto, con su propio entorno de ejecución de JavaScript, su propio grafo de módulos cargados, sus propias instancias de clase, sus propios temporizadores y su propia pila de estado de interfaz. Dos pestañas de la misma aplicación no comparten ni una sola variable.
+
+Y sin embargo comparten todo lo que persiste. La frontera entre ambas categorías no coincide con la intuición, así que conviene tenerla escrita:
+
+- **Del origen, compartido por todos:** las bases de IndexedDB, el árbol de OPFS, las entradas de Cache Storage, las cookies, el presupuesto de cuota, el espacio de nombres de los bloqueos, el de los canales de difusión y el registro del Service Worker.
+- **Del documento, exclusivo de cada uno:** el montón de memoria, las instancias de tus módulos, los temporizadores, los observadores, el estado de la interfaz, las conexiones abiertas y los workers dedicados que haya arrancado.
+
+Escribe una pestaña y la lectura de la otra ve el resultado; agota la cuota una y las otras tres se quedan sin margen. Y ojo con el censo de documentos, que suele quedarse corto: cuentan también los iframes del mismo origen, la ventana de la aplicación instalada si el usuario la abrió además de la pestaña, y las ventanas emergentes. Solo el modo privado y otro perfil del navegador tienen almacenamiento distinto.
+
+<Mermaid code={`flowchart TB
+  O[Origen unico] --> D1[Pestana 1 memoria propia]
+  O --> D2[Pestana 2 memoria propia]
+  O --> D3[Pestana 3 memoria propia]
+  D1 --> S[Almacenamiento compartido del origen]
+  D2 --> S
+  D3 --> S
+  S --> I[IndexedDB]
+  S --> P[OPFS]
+  S --> C[Cache Storage y cuota]
+  class O t-blue
+  class S t-yellow
+  class I t-green`} />
+
+Conviene además descartar de entrada la salida fácil que todo el mundo busca primero: compartir memoria directamente. No se puede. Por razones de aislamiento de sitio, dos pestañas pueden vivir en procesos distintos del navegador, y aunque vivieran en el mismo, pertenecen a grupos de agentes diferentes; la memoria compartida real, con `SharedArrayBuffer`, solo se comunica dentro de un mismo grupo, es decir, entre un documento y sus propios workers. Nunca de pestaña a pestaña. Lo único que puedes mover entre documentos son **mensajes copiados** y **referencias a recursos del origen**.
+
+## Las cuatro contenciones
+
+<Cards>
+  <Card icon="🌐" title="La red se multiplica">
+    Cuatro pestañas son cuatro conexiones persistentes, cuatro bucles de sincronización, cuatro sondeos periódicos y cuatro esperas crecientes que, tras una caída del servidor, se reintentan casi al unísono y le devuelven el golpe amplificado.
+  </Card>
+  <Card icon="🗄️" title="La base se disputa">
+    IndexedDB admite conexiones simultáneas, pero cualquier cambio de versión exige que las demás se cierren. OPFS con manejador síncrono es directamente exclusivo: la segunda pestaña no arranca.
+  </Card>
+  <Card icon="🧠" title="La memoria diverge">
+    Cada pestaña mantiene su propia caché en memoria de los mismos registros. IndexedDB no emite eventos de cambio, así que la copia de la pestaña que no escribió queda obsoleta y nadie se lo dice.
+  </Card>
+  <Card icon="📊" title="La cuota se reparte">
+    El presupuesto es del origen. Cuatro clientes escribiendo sus propios índices derivados, sus adjuntos y sus registros de operaciones consumen el mismo saco, y el desalojo, cuando llegue, se las lleva a todas.
+  </Card>
+</Cards>
+
+La primera de las cuatro es la que primero se nota fuera de tu aplicación, porque el coste lo paga alguien más. Un usuario con cuatro pestañas no es un usuario: para tu servidor es un cliente que cuadruplica las conexiones, las peticiones de sondeo y los mensajes de mantenimiento. Y el efecto más desagradable no es el volumen sostenido sino el pico: cuando una caída breve corta las cuatro conexiones a la vez, las cuatro esperas crecientes arrancan del mismo instante, se mantienen alineadas al duplicar y devuelven al servidor una salva coordinada justo cuando peor lo lleva. La mitigación mínima es añadir aleatoriedad al reintento, y la buena es no tener cuatro clientes.
+
+```js
+// Minimo indispensable mientras haya varias pestanas emitiendo
+function esperaConRuido(intento) {
+  const base = Math.min(30000, 500 * 2 ** intento);
+  return base / 2 + Math.random() * base;   // desincroniza las pestanas
+}
+```
+
+De las cuatro contenciones, la que más incidencias genera es la segunda, y casi siempre por el mismo motivo: nadie escribe el manejador que cede el paso. Cuando una pestaña abre la base con un número de versión superior, el navegador necesita que todas las conexiones abiertas se cierren antes de ejecutar la migración. Si alguna no lo hace, la apertura queda esperando indefinidamente.
+
+```js
+// La pestana que quiere migrar
+const req = indexedDB.open('app', 3);
+
+req.onblocked = () => {
+  // Otra conexion sigue abierta: esto NO es un error, es una espera
+  avisar('Cierra las demas pestanas de la aplicacion para continuar');
+};
+
+// En TODAS las pestanas, desde el primer dia y sin excepcion
+db.onversionchange = () => {
+  db.close();                 // ceder el paso: sin esto, la otra nunca migra
+  interfazEnSoloLectura('La aplicacion se ha actualizado. Recarga la pagina.');
+};
+```
+
+La tercera contención es más silenciosa y por eso resulta más peligrosa: no produce un error, produce un dato incorrecto. Como IndexedDB no notifica los cambios, la caché en memoria de cada pestaña envejece sin que nadie se entere, y en cuanto una operación lee, modifica y vuelve a escribir sobre esa copia envejecida, la escritura de la otra pestaña desaparece sin dejar rastro. Es la actualización perdida de toda la vida, y aquí no la impide la transacción, porque cada mitad ocurrió dentro de la suya y ambas fueron perfectamente válidas.
+
+```js
+// Pestana A y pestana B ejecutan esto a la vez sobre su propia copia en memoria
+const doc = cacheEnMemoria.get(id);     // ambas leyeron la version 7
+doc.etiquetas.push(nueva);              // A anade una, B anade otra
+await guardar(doc);                     // la ultima en escribir borra a la otra
+```
+
+La transacción no te salva porque no hay conflicto de escritura que detectar; lo que hay es una lectura obsoleta convertida en escritura completa. Las salidas conocidas son tres, y las tres reaparecerán a lo largo del track: escribir operaciones en lugar de documentos enteros, comprobar la versión leída en el momento de escribir y rechazar si cambió, o tener un único escritor. Este nivel construye la tercera.
+
+<Callout type="warn" title="Sin `onversionchange` tu esquema no se puede actualizar nunca">
+Es el fallo más caro de este nivel porque no se manifiesta durante el desarrollo, sino el día del despliegue. Una pestaña olvidada en un escritorio, con la versión antigua de tu aplicación y una conexión abierta, basta para que cualquier otra pestaña del mismo usuario se quede colgada en la migración para siempre. Y el síntoma que llega a soporte no es "no puedo migrar", sino "la aplicación no carga", porque el `onblocked` sin manejador no produce ningún error visible: produce silencio. Escribe ambos manejadores en el primer día del proyecto; después ya no habrá ocasión, porque el código antiguo seguirá corriendo en las pestañas de los usuarios.
+</Callout>
+
+## Por qué el fallo es tan difícil de reproducir
+
+Estos errores tienen una firma epidemiológica reconocible: aparecen en producción, no se reproducen en el equipo de desarrollo, y llegan descritos con frases inservibles como "a veces se queda cargando" o "me duplicó una nota". Hay tres razones acumuladas para ello, y ninguna es casual.
+
+La primera es que el desarrollador vive en un mundo de una sola pestaña, mientras que el usuario abre enlaces con el botón central, restaura sesiones enteras al reabrir el navegador y deja abiertas durante semanas pestañas que ya no mira. La segunda es que el resultado depende de quién gane la carrera, y quién gane depende del orden de arranque, de la latencia del disco y de qué pestaña estaba en primer plano; el mismo escenario produce dos desenlaces distintos en dos ejecuciones. La tercera es la más incómoda: la pestaña que causa el problema suele estar **congelada**. Una página en la caché de retroceso y avance, o una pestaña de fondo que el navegador ha suspendido para ahorrar batería, no ejecuta código, no responde mensajes y no procesa temporizadores, pero sigue viva, sigue conectada y sigue reteniendo lo que retuviera.
+
+Esa combinación produce una firma clínica que conviene aprender a leer en los informes de fallo, porque casi siempre viene disfrazada de otra cosa: una carga que no termina y que se arregla al cerrar las demás pestañas es un bloqueo de cambio de versión; un dato que reaparece después de borrarlo es una caché en memoria obsoleta que ha vuelto a escribirse; una operación duplicada es la misma acción emitida por dos clientes que creían ser el único; y un consumo de batería desproporcionado en un portátil es media docena de bucles de sincronización que nadie ha coordinado.
+
+<Callout type="tip" title="Convierte las cuatro pestañas en tu configuración de desarrollo">
+La medida más rentable de este nivel entero no es una técnica, es un hábito: deja de desarrollar con una sola pestaña. Ten siempre dos ventanas abiertas y colocadas una junto a otra, con una de ellas en segundo plano el tiempo suficiente para que el navegador la ralentice, y añade a tu batería de pruebas automáticas al menos un caso con dos contextos simultáneos. La razón es económica antes que técnica: estos fallos son baratísimos de detectar en el momento en que se introducen y carísimos de diagnosticar seis meses después a partir de un informe que dice "a veces no carga". Con dos pestañas a la vista, la mayoría de ellos se manifiestan el mismo día en que los escribes.
+</Callout>
+
+<Callout type="info" title="La pestaña de ayer ejecuta el código de ayer">
+Hay un corolario que casi nadie contempla y que conviene interiorizar ahora. Las pestañas de un mismo usuario no ejecutan necesariamente la misma versión de tu aplicación: la que abrió esta mañana tiene el despliegue de hoy, la que lleva abierta desde el martes tiene el de la semana pasada. Comparten la base de datos. Eso significa que la coordinación entre pestañas es, además, un problema de compatibilidad entre versiones de tu propio protocolo, y que cualquier mensaje que definas entre pestañas necesita un número de versión y una regla de qué hacer cuando llega uno desconocido. Ignorar campos que no entiendes y no romper nunca el formato de los que ya existen deja de ser buena práctica y pasa a ser condición de funcionamiento.
+</Callout>
+
+## Lo que hace falta y lo que la plataforma ofrece
+
+Enunciado con precisión, lo que necesitas es un **punto único de serialización**: un lugar del que solo pueda existir una instancia por origen, que sea dueño de la base y de la conexión de red, y al que las pestañas hablen en vez de actuar por su cuenta. La plataforma ofrece cuatro piezas, ninguna de las cuales resuelve el problema entero por sí sola, y el resto de este nivel consiste en entender exactamente qué aporta cada una.
+
+- **Worker compartido**. Una sola instancia por origen y nombre, con un puerto por pestaña. Es la respuesta conceptualmente correcta, y su soporte no es universal.
+- **Canal de difusión**. Un bus de mensajes entre documentos del mismo origen. Resuelve avisar; no resuelve arbitrar.
+- **Service Worker**. Un singleton por origen con soporte excelente, y un ciclo de vida que puede aniquilarlo entre dos mensajes.
+- **Bloqueos web y pestaña líder**. Un árbitro de verdad, con liberación garantizada cuando el titular muere, sobre el que se construye la solución de reserva.
+
+Y conviene fijar desde ahora el criterio con el que se combinan, porque el error habitual es elegir una y confiarle todo. Cada pieza aporta exactamente una propiedad: el worker compartido aporta **unicidad**, el canal de difusión aporta **alcance**, el Service Worker aporta **enrutado** y persistencia de ámbito, y los bloqueos aportan **arbitraje** con detección de muerte. La arquitectura que funciona no elige entre ellas: las compone, y lo hace detrás de una única interfaz para que el resto de la aplicación no sepa cuál está en uso.
+
+<Callout type="dios" title="Tu aplicación no existe: existen documentos que se le parecen">
+Aquí está la inversión mental que hace falta para el resto del track, y merece enunciarse sin rodeos porque casi todo el mundo la hace tarde. Programando para el navegador uno adquiere sin darse cuenta el hábito de razonar sobre "la aplicación" como si fuese una entidad: tiene un estado, tiene una conexión, tiene una copia de los datos, arranca y termina. Esa entidad no existe en ninguna parte. Lo que existe es un conjunto variable de documentos que cargaron el mismo código, que pueden estar ejecutando versiones distintas de él, que aparecen y desaparecen sin avisarse, que pueden quedar suspendidos a mitad de una operación y despertar minutos después convencidos de que no ha pasado nada, y que solo se rozan a través de un almacenamiento común que ninguno de ellos posee. Es decir: no estás escribiendo un programa con concurrencia interna, estás escribiendo un **sistema distribuido de nodos efímeros sobre un disco compartido**, y lo estás haciendo aunque no lo hayas decidido, aunque tu aplicación sea una lista de tareas y aunque nunca hayas visto un servidor. Todos los conceptos que este track desplegará más adelante para sincronizar dispositivos entre continentes —identidad de nodo, detección de fallos, elección de líder, entrega al menos una vez, idempotencia, orden causal, convergencia— ya son necesarios aquí, dentro de un solo navegador, en la misma máquina y con el mismo reloj. La diferencia es que aquí puedes observarlo todo, reproducirlo con dos ventanas y depurarlo con `console.log`. Quien entienda el problema de las pestañas entenderá el de la red; quien lo trate como un caso raro que ya arreglará, reescribirá su capa de datos dos veces.
+</Callout>
+
+<Challenge title="Multiplica tu aplicación y observa el desastre">
+1. Abre tu aplicación en cuatro pestañas y cuenta, en el panel de red, cuántas conexiones persistentes y cuántas peticiones por minuto genera el conjunto frente a una sola.
+2. Sube el número de versión de tu base de datos y despliega: comprueba si la migración se completa con cuatro pestañas abiertas o si se queda esperando en silencio.
+3. Implementa `onversionchange` y `onblocked` en toda la aplicación y repite el experimento anterior documentando la diferencia.
+4. Escribe un registro desde la pestaña uno y comprueba en la pestaña dos si su caché en memoria refleja el cambio. Mide cuánto tiempo permanece obsoleta.
+5. Manda una pestaña a la caché de retroceso navegando hacia atrás y verifica si sigue apareciendo como cliente activo del origen.
+6. Redacta el inventario de tu aplicación separando qué estado es de documento y qué estado es de origen. Ese inventario será el plano de trabajo de las cuatro lecciones siguientes.
+</Challenge>

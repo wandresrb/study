@@ -1,0 +1,153 @@
+---
+title: "Procesos de negocio como statecharts"
+description: "Todo backend que gestiona pedidos, suscripciones o reclamaciones ya contiene una máquina de estados; lo que casi nunca contiene es el modelo. El ciclo de vida vive disperso en una columna de texto, tres banderas booleanas y condicionales repartidos entre controladores, tareas programadas y consumidores de cola. Esta lección reconstruye ese ciclo de vida como statechart explícito, demuestra que un pedido, una suscripción y una reclamación comparten esqueleto, y explica qué obliga a decidir el modelo que la columna permitía dejar sin decidir durante años."
+subject: maquinas
+level: 17
+order: 1
+position: "17.1"
+duration: "20 min"
+---
+
+<Lead>
+En el frontend la máquina de estados se justifica por la interfaz: hay que decidir qué se pinta y qué botón se habilita. En el backend la justificación es más severa, porque lo que está en juego no es un botón mal habilitado sino un cobro duplicado, un envío a un pedido cancelado o una suscripción que factura después de haberse dado de baja. Y sin embargo el backend es donde el modelo suele faltar: el ciclo de vida de un pedido se codifica en una columna `status` de tipo texto, se protege con condicionales escritos por cinco personas distintas en cinco momentos distintos, y se documenta en un diagrama de Confluence que dejó de coincidir con el código el mismo trimestre en que se dibujó. La máquina existe —siempre existe—, pero existe como folclore. Este nivel entero consiste en sacarla del folclore y convertirla en artefacto: un valor que se puede leer, versionar, probar y consultar.
+</Lead>
+
+<Goals>
+
+- Reconocer el ciclo de vida implícito que ya vive disperso en columnas, banderas y condicionales.
+- Traducir un pedido, una suscripción y una reclamación a un mismo esqueleto de statechart.
+- Separar estado del proceso, datos del dominio y proyecciones derivadas para lectura.
+- Situar la máquina dentro de la arquitectura del servicio sin convertirla en un framework.
+
+</Goals>
+
+## El ciclo de vida que nadie escribió
+
+El punto de partida habitual no es un diseño sino un sedimento. Alguien creó la columna con dos valores, alguien añadió un tercero, alguien más metió una bandera porque el tercero no cubría un caso, y el conocimiento de qué transiciones son legales quedó repartido entre las funciones que las ejecutan.
+
+```ts
+async function marcarPagado(pedidoId: string) {
+  const pedido = await repo.find(pedidoId)
+  if (pedido.status === 'cancelado') throw new Error('no se puede pagar')
+  if (pedido.reembolsado) throw new Error('ya reembolsado')
+  await repo.update(pedidoId, { status: 'pagado', pagadoEn: new Date() })
+  await cola.enviar('preparar-envio', { pedidoId })
+}
+```
+
+Hay tres síntomas que delatan este sedimento y conviene aprender a verlos porque preceden siempre al incidente. El primero es el valor huérfano: un estado que ya nadie escribe pero que sigue apareciendo en filas antiguas y en algún condicional defensivo, porque nadie se atrevió a comprobar si quedaban casos vivos. El segundo es la bandera redundante: un booleano que codifica una fase del proceso en paralelo a la columna, con lo que existen combinaciones que el negocio nunca aprobó y que ninguna restricción impide. El tercero es el condicional asimétrico: dos funciones que escriben la misma columna comprueban cosas distintas antes de hacerlo, y el camino más laxo se convierte de facto en la regla del sistema, porque basta con recorrerlo una vez para dejar el proceso en un lugar del que ya no hay vuelta.
+
+Esa función es correcta y aun así el sistema no lo es, porque la corrección es local. Nada garantiza que `marcarPreparado` repita las mismas comprobaciones, que el consumidor de la cola de reembolsos conozca la bandera, ni que la tarea nocturna que caduca pedidos abandonados respete las mismas reglas. El invariante del dominio —un pedido cancelado jamás avanza— no está escrito en ningún sitio: está replicado con distintos grados de fidelidad en cada punto de escritura, y basta con que un punto nuevo olvide una línea para que el invariante deje de existir sin que ninguna prueba falle.
+
+<Callout type="warn" title="Una columna no es un modelo, es un resumen">
+La columna `status` guarda el resultado de las decisiones, no las reglas que las gobiernan. Por eso admite cualquier valor que el código sepa escribir, incluidos los que el negocio considera imposibles. Cuando la única defensa contra un estado ilegal es que ninguna rama del código lo escriba, la seguridad del sistema depende de que nadie escriba una rama nueva sin leer las demás. Es una apuesta que se pierde siempre, y se pierde en producción.
+</Callout>
+
+## Tres procesos, un mismo esqueleto
+
+La observación que hace rentable este nivel es que los procesos de negocio se parecen mucho más entre sí de lo que sus nombres sugieren. Un pedido, una suscripción y una reclamación comparten una estructura de cuatro fases: una apertura reversible, una zona comprometida donde el dinero o la obligación ya se movieron, un conjunto de desenlaces terminales y una región de excepción que puede activarse casi en cualquier punto.
+
+| Fase | Pedido | Suscripción | Reclamación |
+| --- | --- | --- | --- |
+| Apertura reversible | carrito confirmado, pendiente de pago | periodo de prueba | recibida y sin clasificar |
+| Zona comprometida | pagado, en preparación, enviado | activa con cargos recurrentes | en investigación con plazo legal |
+| Desenlaces terminales | entregado, cancelado, devuelto | cancelada, expirada, migrada | resuelta a favor, desestimada |
+| Excepción transversal | incidencia de reparto | impago y reintento de cobro | escalado a instancia superior |
+
+Ese esqueleto compartido tiene consecuencias prácticas. La primera es que el equipo puede razonar sobre procesos nuevos por analogía en vez de partir de cero. La segunda, más importante, es que las preguntas difíciles son las mismas en los tres casos: dónde está la frontera exacta a partir de la cual el proceso deja de ser reversible, qué pasa si el mundo exterior contradice al modelo, y qué desenlaces son de verdad terminales frente a los que solo lo parecían hasta que llegó el primer caso raro.
+
+<Mermaid code={`stateDiagram-v2
+  [*] --> pendiente
+  pendiente --> pagado: PAGO_CONFIRMADO
+  pendiente --> cancelado: CANCELAR
+  pendiente --> caducado: vence el plazo
+  pagado --> preparando: RESERVA_OK
+  pagado --> reembolsando: CANCELAR
+  preparando --> enviado: TRANSPORTISTA_RECOGE
+  enviado --> entregado: PRUEBA_DE_ENTREGA
+  enviado --> incidencia: FALLO_DE_REPARTO
+  incidencia --> enviado: REINTENTO
+  incidencia --> devuelto: DEVOLUCION_A_ORIGEN
+  reembolsando --> cancelado: ABONO_OK
+  entregado --> [*]
+  cancelado --> [*]`} />
+
+<Cards>
+  <Card icon="🚧" title="La frontera del compromiso">
+    Antes de ella todo se deshace borrando; después, deshacer significa compensar. Nombrar esa frontera en el grafo evita discusiones eternas sobre qué es cancelar.
+  </Card>
+  <Card icon="🧾" title="Terminal de verdad">
+    Un estado final debe ser aquel al que ningún evento del dominio puede sacar. Si existe uno solo, no era final: era una parada larga y merece su propia arista.
+  </Card>
+  <Card icon="🌩️" title="Excepción ortogonal">
+    Incidencias, impagos y escalados no encajan en la secuencia principal. Modelarlos como región paralela evita duplicar medio grafo para cada caso raro.
+  </Card>
+  <Card icon="🕰️" title="El plazo como evento">
+    Caducidades, ventanas de desistimiento y plazos legales son transiciones temporizadas del proceso, no tareas nocturnas que corrigen datos por detrás.
+  </Card>
+</Cards>
+
+## Lo que el modelo obliga a decidir
+
+Escribir la máquina no añade reglas: revela las que faltaban. Cada arista que no se sabe dónde poner corresponde a una pregunta de negocio que el sistema anterior respondía por omisión, y por tanto de forma distinta según qué camino recorriera el usuario.
+
+```ts
+import { setup, assign } from 'xstate'
+
+type Pedido = { id: string; total: number; motivo: string | null }
+
+export const pedido = setup({
+  types: {
+    context: {} as Pedido,
+    events: {} as
+      | { type: 'PAGO_CONFIRMADO'; referencia: string }
+      | { type: 'CANCELAR'; motivo: string; actor: 'cliente' | 'operador' }
+      | { type: 'PRUEBA_DE_ENTREGA' },
+  },
+  guards: {
+    cancelacionPermitida: ({ event }) => event.type === 'CANCELAR' && event.motivo.length > 0,
+  },
+}).createMachine({
+  id: 'pedido',
+  initial: 'pendiente',
+  context: ({ input }: { input: Pedido }) => input,
+  states: {
+    pendiente: {
+      on: {
+        PAGO_CONFIRMADO: 'pagado',
+        CANCELAR: { target: 'cancelado', guard: 'cancelacionPermitida' },
+      },
+      after: { PLAZO_DE_PAGO: 'caducado' },
+    },
+    pagado: { on: { CANCELAR: { target: 'reembolsando', guard: 'cancelacionPermitida' } } },
+    reembolsando: { on: { ABONO_OK: 'cancelado' } },
+    caducado: { type: 'final' },
+    cancelado: { type: 'final' },
+  },
+})
+```
+
+Obsérvese que el mismo evento `CANCELAR` conduce a destinos distintos según el estado de origen: en `pendiente` termina el proceso de inmediato, en `pagado` abre una compensación. Esa diferencia existía antes en el negocio, pero el código la expresaba como una condición dentro de una única función de cancelación, mezclada con la validación del motivo y con el registro de auditoría. Al llevarla al grafo se convierte en topología, que es la forma de conocimiento más barata de leer y la más difícil de contradecir por accidente.
+
+<Callout type="tip" title="La autorización cabe en las guardas, pero no toda">
+Modelar quién puede disparar qué como guarda sobre el actor del evento funciona bien mientras la regla sea del dominio, por ejemplo que solo un operador cancele un pedido ya enviado. La autenticación, las políticas de tenencia y los permisos genéricos pertenecen a la capa de entrada: si acaban dentro del statechart, el modelo del proceso empieza a depender del sistema de identidades y deja de poder probarse en aislamiento.
+</Callout>
+
+## Dónde encaja la máquina en el servicio
+
+Queda una decisión de encaje que suele resolverse mal: qué hacer cuando un evento es ilegal en la posición actual. La respuesta por defecto —lanzar una excepción— es aceptable en un endpoint sincrónico, donde el usuario merece un mensaje inmediato, y desastrosa en un consumidor de cola, donde una excepción reencola el mensaje y produce un bucle infinito de reintentos sobre algo que jamás será legal. La disciplina consiste en distinguir tres desenlaces distintos: el evento que no corresponde ahora pero podría corresponder más tarde, y por tanto conviene aplazar; el evento que ya se aplicó y llega repetido, que se descarta en silencio; y el evento que nunca fue legal en este proceso, que debe registrarse como anomalía y detenerse. Una máquina de estados hace triviales las tres respuestas porque sabe con precisión si el evento tiene transición, si la tenía en un estado anterior o si no aparece en el modelo.
+
+La máquina no sustituye a la capa de aplicación ni al repositorio: se coloca entre ambos como árbitro puro. El controlador traduce la petición HTTP en un evento del dominio, la máquina decide si ese evento es legal en la posición actual y qué efectos ordena, y la capa de infraestructura ejecuta esos efectos y persiste el resultado. La regla que mantiene sano el diseño es que la máquina no llame a nadie: describe qué debe ocurrir y devuelve esa descripción, mientras que quien la hospeda decide cómo y cuándo cumplirla. Con esa separación, el mismo modelo sirve al endpoint sincrónico, al consumidor de cola y a la tarea programada, sin que ninguno de los tres necesite conocer las reglas del otro.
+
+<Callout type="dios" title="El proceso es el producto, y su modelo es la única documentación que no miente">
+Hay una asimetría curiosa en el software de negocio: dedicamos un cuidado exquisito a las entidades —tipamos el pedido, validamos el importe, normalizamos la dirección— y dejamos el proceso, que es donde de verdad ocurre el valor y donde se producen las pérdidas, sin ningún tipo de tipado. Un pedido con un importe negativo lo detiene un esquema en milisegundos; un pedido que pasa de cancelado a enviado no lo detiene nadie, porque la secuencia legal de un procedimiento no tiene representación en el lenguaje. Escribir el statechart es exactamente dar tipo al tiempo: declarar qué sucesiones de acontecimientos pertenecen al dominio y cuáles son formas de corrupción que da la casualidad de que la base de datos acepta. Y esa declaración tiene un efecto secundario que suele superar al técnico: se convierte en el único documento que el negocio y la ingeniería pueden leer a la vez sin traducirse mutuamente. La persona de operaciones no lee tu servicio de cancelación, pero mira el grafo y detecta en diez segundos que falta la arista de devolución parcial, porque el diagrama habla su idioma. Cuando ese diagrama es además el código que se ejecuta, desaparece la brecha entre lo acordado y lo construido, que es la brecha por la que se cuela la mayor parte de los incidentes graves de un sistema transaccional. Lo que se gana, en el fondo, no es una librería ni un patrón: es la posibilidad de que la organización entera discuta sobre una misma cosa concreta en lugar de sobre tres versiones de un recuerdo.
+</Callout>
+
+<Challenge title="Desentierra el ciclo de vida que ya tienes">
+1. Elige un proceso real de tu backend y enumera todos los valores que la columna de estado ha llegado a contener, incluidos los que ya nadie escribe.
+2. Localiza cada punto de escritura de esa columna y anota qué comprobaciones hace antes; señala las discrepancias entre ellos.
+3. Dibuja el grafo con los estados reales y marca en rojo cada transición que hoy es posible en el código pero ilegal en el negocio.
+4. Identifica la frontera del compromiso y escribe una frase que explique qué significa cancelar a cada lado de ella.
+5. Separa en tres listas lo que es estado del proceso, dato del dominio y proyección derivada para informes.
+6. Traduce el grafo a una máquina con `setup` y comprueba que rechaza al menos tres secuencias que hoy tu servicio aceptaría.
+</Challenge>

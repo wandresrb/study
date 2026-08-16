@@ -1,0 +1,155 @@
+---
+title: "Completions y colas de espera: aguardar un evento"
+description: "wait_event y wake_up para bloquear hasta que una condición se cumple; struct completion, wait_for_completion y complete para esperar a que algo termine sin carreras. Y una tabla para elegir la primitiva correcta."
+subject: kernel
+level: 16
+order: 5
+position: "16.5"
+duration: "15 min"
+---
+
+<Lead>
+No todo es exclusión mutua. A menudo lo que quieres no es proteger un dato, sino esperar: a que un DMA termine, a que un hilo arranque, a que llegue un paquete. Hacerlo con un bucle que consulta sin parar quema CPU; hacerlo mal genera carreras que pierden el aviso. El kernel tiene dos primitivas afiladas para esto, y las dos son, por debajo, la misma idea elegante.
+</Lead>
+
+<Goals>
+
+- Bloquear hasta que una condición se cumpla con `wait_event` y despertar con `wake_up`.
+- Esperar un evento único con `struct completion`.
+- Entender por qué el contador de `complete` evita la carrera del aviso perdido.
+- Elegir la primitiva de sincronización correcta con una tabla de decisión.
+
+</Goals>
+
+## Colas de espera: bloquear hasta una condición
+
+Una cola de espera (`wait_queue_head_t`) es una lista de tareas dormidas aguardando a que algo cambie. El durmiente usa `wait_event`; el que provoca el cambio usa `wake_up`:
+
+```c
+static DECLARE_WAIT_QUEUE_HEAD(cola);
+static bool hay_datos;
+
+/* consumidor: duerme hasta que haya datos */
+static int consumir(void)
+{
+	if (wait_event_interruptible(cola, hay_datos))
+		return -ERESTARTSYS;		/* señal durante la espera */
+	...procesar los datos...
+	return 0;
+}
+
+/* productor: publica y despierta */
+static void producir(void)
+{
+	hay_datos = true;
+	wake_up_interruptible(&cola);
+}
+```
+
+La magia está en cómo `wait_event` evita la carrera del **aviso perdido**. La macro no comprueba la condición y luego se duerme —eso dejaría una ventana en la que el productor podría avisar justo entre medias, y el aviso se perdería—. En su lugar, se apunta a la cola y pone su estado a `TASK_INTERRUPTIBLE` **antes** de comprobar la condición, y la reevalúa en un bucle. Si el aviso llega en cualquier momento, o si el despertar es espurio, la condición se vuelve a mirar. Nunca se pierde ni se cuela.
+
+<Callout type="info" title="La condición se reevalúa siempre">
+`wait_event` reevalúa la condición tras cada despertar. Por eso resiste los despertares espurios y el efecto manada (thundering herd): aunque `wake_up` despierte a diez tareas y solo una pueda avanzar, las otras nueve vuelven a comprobar, ven que no y se duermen otra vez. Tú escribes la condición; la macro se encarga de la corrección.
+</Callout>
+
+## Completions: el evento único, sin carreras
+
+Cuando lo que esperas es un hito concreto que ocurre una vez —"el DMA ha terminado", "el hilo ya arrancó"—, hacerlo a mano con colas es propenso a errores. `struct completion` empaqueta el patrón correcto:
+
+```c
+struct completion {
+	unsigned int		done;	/* contador; 0 = aún no ha ocurrido */
+	struct swait_queue_head	wait;
+};
+```
+
+El campo `done` es lo que la hace inmune a carreras. Si `complete` se ejecuta **antes** de que llegues a `wait_for_completion`, `done` ya vale más de cero y la espera retorna al instante. No hay aviso que perder:
+
+```c
+#include <linux/completion.h>
+
+static DECLARE_COMPLETION(dma_listo);
+
+/* el hilo que lanza el trabajo y espera el resultado */
+static int hacer_transferencia(void)
+{
+	lanzar_dma(&transferencia);
+	/* espera acotada: 0 significa que expiró el plazo */
+	if (!wait_for_completion_timeout(&dma_listo, msecs_to_jiffies(500)))
+		return -ETIMEDOUT;
+	return 0;
+}
+
+/* la ISR, en contexto atómico, avisa cuando el hardware termina */
+static irqreturn_t dma_isr(int irq, void *dev)
+{
+	complete(&dma_listo);		/* complete es legal en contexto atómico */
+	return IRQ_HANDLED;
+}
+```
+
+Fíjate en cómo esto cierra el círculo del nivel 16.1: `wait_for_completion` **duerme**, así que solo vale en contexto de proceso; pero `complete` solo coge un spinlock y despierta, así que se puede llamar desde una ISR, en pleno contexto atómico. La completion es el puente limpio entre los dos mundos: un lado espera durmiendo, el otro avisa sin dormir. Para despertar de golpe a todos los que esperan, y dejar el evento marcado para siempre, existe `complete_all`.
+
+## Despertar a todos y completions en la pila
+
+`complete` despierta a un solo durmiente; `complete_all` los despierta a todos y deja el evento marcado para siempre, de modo que cualquier espera futura pasa sin bloquear. Es el patrón para "esto ya ocurrió y no volverá atrás", como el arranque de un subsistema del que dependen muchos.
+
+Un uso muy común es una completion efímera, viva solo durante una llamada, declarada en la pila con `DECLARE_COMPLETION_ONSTACK`:
+
+```c
+static int arrancar_worker(void)
+{
+	DECLARE_COMPLETION_ONSTACK(arrancado);
+
+	struct task_struct *t = kthread_run(worker_fn, &arrancado, "mi_worker");
+	if (IS_ERR(t))
+		return PTR_ERR(t);
+
+	/* no sigo hasta que el hilo confirme que ya está listo */
+	wait_for_completion(&arrancado);
+	return 0;
+}
+```
+
+El hilo hijo hace `complete(&arrancado)` en cuanto termina su inicialización. Como la completion vive en la pila del que espera, y el que espera no retorna hasta recibir el aviso, la memoria sigue siendo válida durante toda la vida del objeto: el contador `done` garantiza que no hay carrera ni uso tras liberar.
+
+## Elegir la primitiva correcta
+
+Ya tienes toda la familia. La pregunta del nivel 16.1 —¿puedo dormir?— más la naturaleza de lo que necesitas eligen la herramienta:
+
+| Primitiva | ¿Duerme? | Dónde se usa | Cuándo elegirla |
+| --- | --- | --- | --- |
+| `spinlock_t` | No, gira | Proceso o atómico | Secciones muy cortas; único lock válido en IRQ |
+| `mutex` | Sí | Solo proceso | Por defecto para secciones que duermen; un dueño |
+| `struct semaphore` | Sí | Proceso | Contar N recursos concurrentes; sin dueño |
+| `rw_semaphore` | Sí | Proceso | Lectura mayoritaria con secciones que duermen |
+| RCU | El lector no | Lectura atómica | Lectura extrema, lectores cortos que no duermen |
+| `completion` | Espera sí; aviso no | Espera en proceso, aviso en cualquiera | Aguardar a que un evento concreto ocurra |
+| `wait_event` / `wake_up` | Espera sí | Espera en proceso | Bloquear hasta que una condición se cumpla |
+
+<Mermaid code={`flowchart TD
+  A[Necesito sincronizar] --> B{Espero un evento o protejo datos}
+  B -->|Espero un evento| C{Es un hito unico y concreto}
+  C -->|Si| D[completion]
+  C -->|No, es una condicion| E[wait_event y wake_up]
+  B -->|Protejo datos| F{Puedo dormir en la seccion critica}
+  F -->|No, contexto atomico| G[spinlock, atomic_t o RCU]
+  F -->|Si| H{Lectura mayoritaria}
+  H -->|No| I[mutex]
+  H -->|Si, lectores que duermen| J[rw_semaphore]
+  H -->|Si, lectores cortos sin dormir| K[RCU]
+  class D t-green
+  class I t-yellow
+  class K t-blue`} />
+
+<Callout type="dios" title="Por debajo, casi todo es una cola de espera">
+Levanta la tapa del mutex, del semáforo, del rwsem, de la completion, y encontrarás la misma maquinaria: una lista de tareas dormidas, un estado de tarea, y una llamada a `schedule` que cede la CPU hasta que alguien las despierta. La cola de espera es el átomo del que están hechas todas las primitivas durmientes del kernel. Lo que las distingue no es el mecanismo, sino la intención que codifican: el mutex dice "un dueño", el semáforo dice "N permisos", el rwsem dice "muchos leen o uno escribe", la completion dice "espera este hito". Elegir bien no es memorizar APIs: es traducir tu problema a una de esas intenciones y dejar que el tipo correcto imponga la corrección por ti. Cuando llegues a diseñar concurrencia real —y lo harás—, no empieces preguntando "¿qué función llamo?", sino "¿qué estoy esperando, y puedo dormir mientras lo hago?". Esas dos preguntas, que abrieron el nivel 16 y ahora lo cierran, te llevan casi siempre a la primitiva exacta. Ese es el mapa mental que separa a quien copia patrones de quien de verdad entiende la sincronización del kernel.
+</Callout>
+
+<Challenge title="Espera eventos como un driver de verdad">
+1. Monta una cola de espera con `DECLARE_WAIT_QUEUE_HEAD` y un flag booleano; bloquea un lector con `wait_event_interruptible` y despiértalo desde otro hilo con `wake_up_interruptible`.
+2. Sustituye ese esquema por un `struct completion`: usa `wait_for_completion_interruptible` en un lado y `complete` en el otro.
+3. Provoca a propósito la carrera del aviso perdido: haz que el `complete` ocurra antes del `wait`, y comprueba que con la completion **no** se cuelga, gracias al contador `done`.
+4. Añade un plazo con `wait_for_completion_timeout` y gestiona la expiración devolviendo `-ETIMEDOUT`.
+5. Repasa la tabla de decisión y clasifica tres locks reales del kernel (búscalos en el fuente) según la primitiva que usan y por qué.
+</Challenge>

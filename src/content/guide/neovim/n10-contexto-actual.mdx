@@ -1,0 +1,208 @@
+---
+title: "El contexto actual: operar sin saltar de ventana"
+description: "Buffer, ventana y pestaña actuales como estado implícito del editor: leer el cursor con su indexación mixta documentada, la palabra bajo el cursor, el modo y las marcas; por qué cambiar de contexto arrastra efectos colaterales caros, y cómo ejecutar código en otra ventana con nvim_win_call y nvim_buf_call sin moverse ni disparar la cascada de eventos."
+subject: neovim
+level: 10
+order: 4
+position: "10.4"
+duration: "18 min"
+---
+
+<Lead>
+Media API de Neovim funciona sobre un estado implícito: hay una pestaña actual, dentro de ella una ventana actual, y esa ventana determina cuál es el buffer actual. Ese estado es cómodo hasta que necesitas tocar algo que no está delante de ti. La respuesta ingenua es saltar allí, hacer el trabajo y volver; funciona en las pruebas y falla en producción, porque cada salto arrastra una cola de eventos y de estado pisoteado. La respuesta correcta tiene dos partes: saber leer el contexto —cursor, palabra, modo, marcas— con sus convenciones exactas, y no saltar nunca.
+</Lead>
+
+<Goals>
+
+- Entender la jerarquía pestaña, ventana y buffer, y quién determina a quién.
+- Leer el contexto con precisión: `nvim_win_get_cursor` y su indexación mixta, `expand`, `mode` y `nvim_buf_get_mark`.
+- Enumerar los efectos colaterales reales de un cambio de contexto y por qué no se restauran solos.
+- Ejecutar código en otra ventana o buffer con `nvim_win_call` y `nvim_buf_call`, conociendo sus límites.
+- Preferir las APIs con destino explícito y reconocer los pocos casos donde no bastan.
+
+</Goals>
+
+## Tres punteros encadenados
+
+El contexto no son tres variables independientes: es una cadena. La pestaña actual determina el conjunto de ventanas disponibles; la ventana actual determina el buffer actual. No puedes fijar el buffer actual sin que alguna ventana lo muestre.
+
+```lua
+local api = vim.api
+
+local tab = api.nvim_get_current_tabpage()
+local win = api.nvim_get_current_win()
+local buf = api.nvim_get_current_buf()
+
+-- siempre cierto
+assert(buf == api.nvim_win_get_buf(win))
+```
+
+Los verbos para moverse tienen alcances distintos. `nvim_set_current_win` cambia la ventana actual y, si está en otra pestaña, cambia también la pestaña, implícitamente. `nvim_set_current_buf` no mueve la ventana: hace que la ventana actual muestre otro buffer, que es una operación más destructiva de lo que parece, porque el usuario pierde de vista lo que tenía delante.
+
+La pestaña añade un matiz que casi nadie considera: cada pestaña recuerda cuál era su ventana activa, consultable con `nvim_tabpage_get_win`. Al volver a ella, el foco regresa a esa ventana y no a la primera, lo que significa que hay estado de contexto guardado por pestaña además del global.
+
+En toda la API, el valor `0` es el alias del elemento actual. Es cómodo y es peligroso: un `0` escrito en una función que se ejecuta más tarde —dentro de un callback, de un autocomando o de un `vim.schedule`— se resolverá contra el contexto de **ese** momento, que puede no ser el que tenías en mente al escribirlo. En código diferido, captura el identificador explícito antes de diferir.
+
+<Predict question="Un autocomando tuyo hace local buf = 0 y llama a vim.schedule(function() usar(buf) end). ¿Sobre qué buffer opera el callback?" options={[
+  { t: "Sobre el que sea actual cuando el callback se ejecute, que puede ser otro", ok: true, x: "0 no es un identificador: es un alias que se resuelve en cada llamada a la API. Al diferir, el contexto puede haber cambiado. La versión correcta captura vim.api.nvim_get_current_buf() ANTES del schedule." },
+  { t: "Sobre el buffer que era actual al crear el callback: la closure lo congela", x: "La closure congela el valor de la variable, que es literalmente 0. Lo que no congela es su significado, porque 0 se traduce a «el actual» dentro de cada función de la API, en el momento de llamarla." },
+  { t: "Da error: 0 no es válido dentro de vim.schedule", x: "Es perfectamente válido, y eso es lo malo: funciona siempre, pero sobre el buffer equivocado a veces. Los errores intermitentes de este tipo son de los más difíciles de cazar." },
+]} />
+
+## Leer el contexto sin tocarlo
+
+Antes de operar sobre el contexto hay que saber leerlo, y aquí se concentran las convenciones que más errores producen del nivel.
+
+La primera es el cursor. `nvim_win_get_cursor(win)` devuelve la pareja `{fila, columna}` con **fila en base uno y columna en base cero, contada en bytes**: la indexación «de marca» que la lección 8.1 presentó como excepción documentada de la API. `nvim_win_set_cursor` usa la misma convención, y tiene una propiedad valiosa: funciona sobre cualquier ventana y desplaza su vista si hace falta para que el cursor quede visible, sin que la ventana sea la actual.
+
+```lua
+-- leer y mover el cursor de OTRA ventana, sin entrar en ella
+local pos = api.nvim_win_get_cursor(otra_win)   -- { fila_base1, col_base0 }
+api.nvim_win_set_cursor(otra_win, { pos[1] + 1, 0 })
+
+-- traducir a coordenadas de lineas de la API: restar 1 a la fila
+local linea = api.nvim_buf_get_lines(
+  api.nvim_win_get_buf(otra_win), pos[1] - 1, pos[1], true)[1]
+```
+
+La segunda es la familia `expand`, herencia de Vimscript sin equivalente directo en la API y perfectamente legítima por la puerta `vim.fn` que conociste en la lección 8.1. `expand("%")` da el nombre del buffer actual, con los modificadores de ruta de siempre —`%:p` absoluta, `%:t` solo el fichero—; `expand("<cword>")` da la palabra bajo el cursor y `expand("<cfile>")` la ruta bajo el cursor. Las dos últimas son la materia prima de cualquier «buscar esto», «abrir lo que señalo».
+
+La tercera es el modo: `vim.fn.mode()` devuelve la letra —`n`, `i`, `v`, `V`— y `nvim_get_mode()` devuelve además `blocking`, que indica si el editor está a mitad de algo, por ejemplo esperando el movimiento de un operador. Un plugin que redibuja no debería interrumpir ese estado.
+
+Y la cuarta son las marcas: `nvim_buf_get_mark(buf, nombre)` devuelve la posición de una marca con la misma indexación del cursor —fila uno, columna cero— y la pareja `{0, 0}` si no está puesta, en vez de un error. Con ella lees `'<` y `'>` para la última selección visual, o la marca de última edición, sin pasar por comandos.
+
+```lua
+print(vim.fn.expand("%:t"), vim.fn.expand("<cword>"))
+print(vim.fn.mode(), api.nvim_get_mode().blocking)
+print(vim.inspect(api.nvim_buf_get_mark(0, "<")))
+```
+
+## Saltar sale caro
+
+Supón que quieres saber qué líneas son visibles en otra ventana. La solución tentadora: guardo la ventana actual, salto, consulto, vuelvo. Veamos la factura.
+
+<Pipeline
+  title="la misma consulta, por los dos caminos"
+  result="misma información; solo un camino deja el editor como estaba"
+  groups={[
+    { title: 'saltando: lo que pagas', tone: 'red', sequence: true, steps: [
+      { t: 'nvim_set_current_win(otra)', d: 'Dispara WinLeave, BufLeave, WinEnter, BufEnter… dos veces, porque luego hay que volver.' },
+      { t: 'los plugins del usuario reaccionan', d: 'Resaltado de ventana activa, autoguardado, statusline: todos trabajan por tu consulta.' },
+      { t: 'estado pisoteado', d: 'La jumplist registra el salto, el fichero alternativo cambia, y un modo a medias se interrumpe.' },
+    ]},
+    { title: 'destino explícito: lo que pagas', tone: 'green', sequence: true, steps: [
+      { t: 'vim.fn.getwininfo(win)', d: 'topline y botline: el rango visible, sin moverte.' },
+      { t: 'nada más', d: 'Cero eventos, cero estado alterado, y de regalo es más rápido.' },
+    ]},
+  ]}
+/>
+
+Merece la pena detallar el «estado pisoteado», porque no se restaura solo aunque vuelvas a la ventana original:
+
+- La **jumplist** registra el salto, así que el `<C-o>` del usuario deja de llevarle donde esperaba.
+- El **fichero alternativo**, el que abre `<C-^>`, cambia de valor.
+- La **vista** de la ventana visitada puede alterarse: desplazamiento, pliegues que se abren bajo el cursor.
+- Si el usuario estaba en modo insertar o a mitad de un operador, el salto lo interrumpe.
+
+Restaurar todo eso a mano es posible, y es exactamente el tipo de código que nadie mantiene bien. La disciplina correcta es otra: no saltes.
+
+## nvim_win_call y nvim_buf_call
+
+Para el código que de verdad necesita ejecutarse «desde dentro» de otro contexto, Neovim ofrece dos funciones —solo disponibles desde Lua— que ejecutan un callback *como si* estuvieras en otra ventana o buffer, y restauran el contexto al terminar, incluso si tu código lanza un error.
+
+```lua
+-- ejecutar en el contexto de otra ventana
+local topline = api.nvim_win_call(otra_win, function()
+  return vim.fn.line("w0")
+end)
+
+-- ejecutar en el contexto de otro buffer
+api.nvim_buf_call(otro_buf, function()
+  vim.cmd("silent! %s/\\s\\+$//e")
+end)
+```
+
+Dos propiedades las hacen distintas de un salto manual. La primera es que el valor devuelto por la función interior se propaga hacia fuera, lo que las convierte en expresiones y no en efectos. La segunda, decisiva, es que el cambio de contexto es interno, como el de `win_execute` en Vimscript: no dispara la cascada de eventos de ventana y buffer, y la jumplist y el fichero alternativo quedan intactos.
+
+Sus límites, antes de tropezar con ellos. Dentro del callback no puedes cerrar la ventana en cuyo contexto estás ni destruir su buffer, porque el restaurador los necesita vivos. Tampoco puedes hacer operaciones prohibidas por `textlock` si te llamaron desde un contexto restringido. Y conviene saber cómo trabaja `nvim_buf_call`: si el buffer ya está visible en la pestaña actual usa una de esas ventanas; si no, usa una ventana temporal interna —la «autocmd window», herencia histórica—, con lo cual las consultas dependientes de ventana pueden devolver valores de esa ventana ficticia y no de una real.
+
+<Predict question="Dentro de nvim_win_call(w, fn) tu código ejecuta vim.api.nvim_win_close(w, true). ¿Qué pasa?" options={[
+  { t: "Falla: no se puede cerrar la ventana en cuyo contexto estás", ok: true, x: "El mecanismo debe restaurar el contexto al salir y necesita que la ventana exista. Cierra después de que win_call retorne: decide dentro, actúa fuera." },
+  { t: "Funciona, y al salir el contexto se restaura a la ventana anterior", x: "No llega a funcionar: la operación está prohibida dentro del callback precisamente porque dejaría al restaurador sin ventana a la que volver." },
+  { t: "Funciona pero dispara WinClosed dos veces", x: "El problema no son los eventos sino la existencia: el restaurador necesita la ventana viva. La llamada falla en vez de duplicar nada." },
+]} />
+
+## Casi nunca hace falta
+
+La regla que ordena el nivel entero: `nvim_win_call` es la salida de emergencia, no la herramienta principal. La API moderna acepta destino explícito en casi todo, y esas variantes son más rápidas, más legibles y sin efectos colaterales.
+
+```lua
+-- cursor de otra ventana, sin entrar en ella
+local fila = api.nvim_win_get_cursor(otra_win)[1]
+
+-- opciones con destino explicito
+local envuelve = api.nvim_get_option_value("wrap", { win = otra_win })
+local tipo     = api.nvim_get_option_value("filetype", { buf = otro_buf })
+
+-- texto de otro buffer, sin mostrarlo
+local lineas = api.nvim_buf_get_lines(otro_buf, 0, -1, false)
+
+-- lineas visibles y geometria de otra ventana, de una sola vez
+local info = vim.fn.getwininfo(otra_win)[1]
+print(info.topline, info.botline, info.textoff)
+
+-- alto en pantalla del texto de otra ventana, pliegues incluidos
+local alto = api.nvim_win_text_height(otra_win, {}).all
+```
+
+Fíjate en la última: `nvim_win_text_height` devuelve un diccionario —`all` es el total de líneas de pantalla, `fill` cuenta las virtuales y de relleno—, no un número suelto. Y muchas funciones de Vimscript aceptan hoy un identificador como argumento, con `getwininfo` a la cabeza.
+
+El criterio queda simple: si existe una variante con destino explícito, úsala. Reserva `nvim_win_call` para funciones heredadas que solo saben leer la ventana actual —`line("w0")`, posiciones de pliegues— y `nvim_buf_call` para comandos ex cuyo alcance es «el buffer actual» y no tienen equivalente en la API.
+
+Queda un caso legítimo más: cuando el cambio de contexto va a ser real y visible, pero no quieres que dispare reacciones. Para eso está `eventignore`, que suspende los autocomandos que enumeres, con la disciplina de restaurarlo pase lo que pase:
+
+```lua
+local guardado = vim.o.eventignore
+vim.o.eventignore = "BufEnter,BufLeave,WinEnter,WinLeave"
+local ok, err = pcall(function()
+  api.nvim_set_current_win(otra_win)
+  vim.cmd("normal! zz")
+end)
+vim.o.eventignore = guardado
+if not ok then error(err) end
+```
+
+<Callout type="danger" title="Un eventignore sin restaurar apaga el editor en silencio">
+El `pcall` de arriba no es decorativo. Si el cuerpo falla y `eventignore` queda activado, a partir de ese momento el editor deja de reaccionar a esos eventos para **todo el mundo**: el resaltado no se actualiza, los plugins callan, y nada apunta a tu código como culpable. Es de los fallos más difíciles de diagnosticar que puede provocar un plugin. Silenciar eventos también silencia a los plugins del usuario que dependían de ellos: úsalo poco, restáuralo siempre.
+</Callout>
+
+Y cuando de verdad necesites que el usuario acabe en otro sitio, hazlo explícito y no lo disfraces: mueve el foco con `nvim_set_current_win` como acción deliberada y final, no como paso intermedio de una consulta.
+
+<Callout type="dios" title="El contexto implícito es deuda técnica heredada">
+Que exista un buffer actual y una ventana actual no es un rasgo de diseño elegante: es la herencia de una época en la que el editor era estrictamente monotarea y el estado global era la única forma de comunicar cosas entre comandos ex. Vimscript entero está construido sobre ese supuesto —`line(".")`, `getline(".")`, `%s`—: cada función lee «lo actual» porque en 1991 no había otra cosa que leer. La API de Lua se construyó encima con la intención contraria, visible en cada firma: todos los destinos son parámetros y el `0` es solo un atajo de cortesía. Escribir código que salta de ventana es programar contra la capa de compatibilidad en lugar de contra la interfaz real, y el coste no es teórico: en cuanto tu plugin convive con otros veinte que escuchan `BufEnter`, cada salto tuyo multiplica el trabajo de todos ellos, y la latencia que el usuario percibe no la produce ninguno en solitario sino la suma. Es el mismo argumento que en la lección 8.1 separaba describir estado de imitar usuarios, elevado a norma de diseño: la medida de calidad de un plugin en este nivel es cuántas veces cambia el contexto por segundo, y el objetivo es cero. Cuando encuentres un caso que parece exigir el salto, casi siempre es que aún no encontraste la función con destino explícito.
+</Callout>
+
+<Exercise challenge="Lee la posición del cursor y fíjate en la mezcla de bases." keys=":lua= vim.api.nvim_win_get_cursor(0)">
+Con el cursor en la primera línea, primera columna, devuelve `{ 1, 0 }`: fila en base uno, columna en base cero y en bytes. Es la indexación «de marca» de `:help api-indexing`, la excepción documentada de la API.
+</Exercise>
+
+<Exercise challenge="Captura la palabra bajo el cursor desde Lua." keys=":lua= vim.fn.expand('<cword>')">
+No hay equivalente en `vim.api`: es una de las funciones por las que `vim.fn` sigue siendo imprescindible. Con `<cfile>` obtienes la ruta bajo el cursor, lista para abrir.
+</Exercise>
+
+<Exercise challenge="Averigua el rango de líneas visibles de una ventana, sin entrar en ella." keys=":lua= vim.fn.getwininfo(vim.api.nvim_get_current_win())[1].topline">
+`getwininfo` acepta cualquier `winid` y devuelve `topline`, `botline`, `textoff` y la geometría completa en una sola llamada. Es la alternativa moderna a saltar y preguntar `line("w0")`.
+</Exercise>
+
+<Exercise challenge="Con dos ventanas abiertas, ejecuta una función en el contexto de la otra y recoge su resultado." keys=":lua= vim.api.nvim_win_call(vim.fn.win_getid(2), function() return vim.fn.line('w0') end)">
+`win_getid(2)` traduce el número de orden 2 —el mismo que usas al saltar con `2<C-w>w`— a su `winid`. El valor de retorno del callback se propaga: `win_call` es una expresión, no solo un efecto. Y no disparó ni un `WinEnter`: compruébalo con un autocomando contador.
+</Exercise>
+
+<Challenge title="Una consulta sin efectos colaterales">
+1. Escribe una función que devuelva, para cada ventana de la pestaña, su `winid`, el nombre corto de su buffer y su línea visible superior, usando solo destino explícito: `nvim_win_get_buf`, `nvim_buf_get_name` y `getwininfo`.
+2. Reescríbela con `nvim_win_call` y `expand("%:t")`, y compara legibilidad y líneas.
+3. Añade un autocomando `BufEnter` que incremente un contador global, ejecuta ambas versiones y comprueba cuántas veces se disparó con cada una. Luego repite la consulta saltando con `nvim_set_current_win` y vuelve a mirar el contador.
+4. Comprueba la contaminación del salto: mira `:jumps`, salta a otra ventana por código, vuelve, y mira `:jumps` otra vez.
+5. Escribe una función que, en modo visual, devuelva el rango seleccionado leyendo las marcas `'<` y `'>` con `nvim_buf_get_mark`, y tradúcelo a un rango base cero listo para `nvim_buf_get_lines`.
+6. Investiga: mide con `vim.uv.hrtime()` mil consultas de cursor con destino explícito frente a mil con salto real, con `eventignore` limpio, y explica la diferencia.
+</Challenge>

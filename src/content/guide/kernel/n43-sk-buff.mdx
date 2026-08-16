@@ -1,0 +1,145 @@
+---
+title: "struct sk_buff: el paquete hecho estructura"
+description: "La estructura central de la red del kernel: cómo `sk_buff` separa metadatos y datos, qué son el headroom y el tailroom, cómo los punteros `mac_header`, `network_header` y `transport_header` marcan dónde empieza cada capa, y por qué `skb_clone` comparte el búfer en vez de copiarlo. La aritmética de punteros que sostiene toda la pila."
+subject: kernel
+level: 43
+order: 2
+position: "43.2"
+duration: "19 min"
+---
+
+<Lead>
+Si el nivel anterior fue el mapa, este es el vehículo. Cada paquete que cruza el kernel —de la NIC al socket, del socket al cable— viaja dentro de un `sk_buff`, cariñosamente el *skb*. No es un simple búfer: es una estructura de una ingeniería obsesiva, diseñada para que añadir una cabecera, quitarla, o repartir el mismo paquete a tres consumidores no cueste ni una sola copia de memoria. Entender el `sk_buff` es entender por qué Linux es rápido en red, porque casi todo lo que hace la pila es, por dentro, manipular sus punteros.
+</Lead>
+
+<Goals>
+
+- Distinguir los metadatos del `sk_buff` del búfer de datos que describe.
+- Dominar `head`, `data`, `tail`, `end`, y calcular headroom y tailroom.
+- Usar `skb_reserve`, `skb_put`, `skb_push` y `skb_pull` sin copiar nada.
+- Explicar por qué `skb_clone` comparte el búfer y cuándo hay que copiar de verdad.
+
+</Goals>
+
+## Dos memorias en una: la estructura y el búfer
+
+Un `sk_buff` son en realidad dos asignaciones. Por un lado, la estructura de metadatos —punteros, longitudes, protocolo, socket dueño—. Por otro, un búfer lineal de datos donde vive la trama, con un `skb_shared_info` pegado al final para la parte paginada. Cuatro punteros gobiernan ese búfer:
+
+```c
+/* Los campos que definen la geometria del bufer (include/linux/skbuff.h, simplificado) */
+struct sk_buff {
+	unsigned int		len;              /* longitud total: lineal + paginada */
+	unsigned int		data_len;         /* solo la parte paginada (frags) */
+	__u16			transport_header; /* offset desde head hasta L4 */
+	__u16			network_header;   /* offset desde head hasta L3 */
+	__u16			mac_header;       /* offset desde head hasta L2 */
+	sk_buff_data_t		tail;             /* fin de los datos validos */
+	sk_buff_data_t		end;             /* fin del bufer reservado */
+	unsigned char		*head, *data;     /* inicio del bufer / inicio de datos */
+	unsigned int		truesize;         /* memoria real consumida */
+	refcount_t		users;            /* cuantos poseen ESTE skb */
+};
+```
+
+Entre `head` y `data` está el **headroom**: espacio libre por delante, reservado para las cabeceras que aún se antepondrán. Entre `tail` y `end` está el **tailroom**: espacio libre por detrás, para datos que aún se añadirán. Los datos válidos viven entre `data` y `tail`. Las dos macros que lo miden son pura resta de punteros:
+
+```c
+static inline unsigned int skb_headroom(const struct sk_buff *skb)
+{
+	return skb->data - skb->head;      /* hueco por delante */
+}
+static inline int skb_tailroom(const struct sk_buff *skb)
+{
+	return skb_is_nonlinear(skb) ? 0 : skb->end - skb->tail;  /* hueco por detras */
+}
+```
+
+Por eso los asignadores de recepción reservan headroom de oficio: `napi_alloc_skb` y `netdev_alloc_skb` dejan `NET_SKB_PAD` bytes por delante para que L2 y L3 puedan escribir sus cabeceras sin reasignar. El campo `truesize` —memoria realmente consumida, no solo `len`— es lo que la contabilidad de memoria del socket vigila para no desbordarse.
+
+Hay además un rincón que conviene conocer: `skb->cb`, el *control buffer*, cuarenta y ocho bytes de memoria de garabato que cada capa usa a su antojo mientras el skb está en su dominio. TCP guarda ahí su bloque de control —números de secuencia, banderas— vía `TCP_SKB_CB(skb)`; el qdisc almacena su propio estado. Es *scratch space* privado que viaja con el paquete sin coste de asignación, reinterpretado por cada capa igual que `netdev_priv` reinterpreta su bloque (lección 3).
+
+## Los punteros de cabecera: dónde empieza cada capa
+
+`mac_header`, `network_header` y `transport_header` no son punteros crudos sino **offsets** de 16 bits desde `head`. Guardar offsets y no direcciones permite que el búfer se realoje sin invalidarlos. A medida que el paquete sube, cada capa fija su marca y las macros de acceso las traducen:
+
+```c
+/* Al recibir, cada capa marca donde empieza; el acceso es un cast sobre el offset */
+skb_reset_mac_header(skb);                 /* L2 empieza en data */
+skb_pull(skb, ETH_HLEN);                   /* consume la cabecera Ethernet */
+skb_reset_network_header(skb);             /* L3 empieza donde quedo data */
+
+struct ethhdr *eth = eth_hdr(skb);         /* head + mac_header */
+struct iphdr  *iph = ip_hdr(skb);          /* head + network_header */
+struct tcphdr *th  = tcp_hdr(skb);         /* head + transport_header */
+```
+
+Así, `ip_hdr(skb)` y `tcp_hdr(skb)` funcionan en cualquier punto de la pila sin recalcular nada: la posición de cada cabecera quedó grabada cuando esa capa procesó el paquete. Es la razón de que netfilter (lección 5) pueda inspeccionar la cabecera IP en cualquier hook sin volver a parsear la trama.
+
+## Empujar y tirar: construir y desnudar sin copiar
+
+Cuatro operaciones mueven `data` y `tail` sobre el búfer. Ninguna copia carga útil: solo desplazan punteros y ajustan `len`.
+
+```c
+struct sk_buff *skb = napi_alloc_skb(napi, MAX_LEN);
+skb_reserve(skb, NET_IP_ALIGN + hdr_len);  /* crea headroom: data y tail avanzan juntos */
+
+skb_put(skb, payload_len);                 /* extiende por la cola: tail y len suben */
+memcpy(skb->data, payload, payload_len);   /* rellena la region recien abierta */
+
+skb_push(skb, sizeof(struct iphdr));       /* antepone cabecera: data baja, len sube */
+skb_pull(skb, sizeof(struct iphdr));       /* consume cabecera: data sube, len baja */
+```
+
+`skb_put` abre sitio al final para datos nuevos y devuelve el puntero donde escribirlos; `skb_push` retrocede `data` para hacer hueco a una cabecera por delante; `skb_pull` avanza `data` para descartar una cabecera ya procesada. Transmitir es una secuencia de `skb_push` (vistiendo cabeceras); recibir, una secuencia de `skb_pull` (desnudándolas). El paquete nunca se mueve; los punteros sí.
+
+<Mermaid code={`flowchart LR
+  H[head] --- HR[headroom] --- D[data] --- DA[datos validos] --- T[tail] --- TR[tailroom] --- E[end] --- SI[skb_shared_info]`} />
+
+## Clonar en vez de copiar: un búfer, muchos lectores
+
+Aquí está la joya. Cuando un paquete debe ir a varios sitios —a la pila normal y a un `tcpdump` que escucha, o a la cola de retransmisión de TCP mientras el original sigue su curso— el kernel **no copia los datos**. Clona solo los metadatos con `skb_clone`: crea un segundo `sk_buff` que apunta al mismo búfer y marca ambos como clonados.
+
+```c
+struct sk_buff *c = skb_clone(skb, GFP_ATOMIC);
+/* c y skb son structs distintas que COMPARTEN el mismo bufer de datos */
+/* skb_shinfo(skb)->dataref pasa a 2: dos skb miran el mismo bufer */
+```
+
+Dos contadores hacen esto seguro. `skb->users` cuenta cuántos poseen *esa* estructura concreta (lo sube `skb_get`, lo baja `kfree_skb`, que libera al llegar a cero). Y `dataref`, dentro del `skb_shared_info`, cuenta cuántas estructuras comparten el *búfer*. Como el búfer es compartido, escribirlo en sitio está prohibido: quien necesite mutarlo primero llama a `skb_cow` o `pskb_expand_head`, que rompen la compartición con una copia perezosa —copy-on-write puro—.
+
+```c
+if (skb_cow(skb, headroom_extra) < 0)   /* si esta clonado, copia; si no, no hace nada */
+	goto drop;                       /* ahora es seguro escribir el bufer */
+/* modificar cabeceras aqui */
+consume_skb(otro);                       /* liberar en el camino de exito... */
+kfree_skb_reason(malo, SKB_DROP_REASON_IP_CSUM);  /* ...o registrar el descarte con motivo */
+```
+
+Fijarse en el final: `consume_skb` marca un consumo normal, mientras que `kfree_skb_reason` registra un **descarte** con su causa, que el subsistema de *drop monitoring* recoge para que `dropwatch` te diga exactamente por qué se perdió un paquete.
+
+Un `sk_buff` rara vez viaja solo: casi siempre está encolado. La cola de recepción de un socket, el búfer de retransmisión de TCP o la cola de un qdisc son listas doblemente enlazadas de skbs, gobernadas por un `sk_buff_head` con su propio lock:
+
+```c
+struct sk_buff_head cola;
+skb_queue_head_init(&cola);
+skb_queue_tail(&cola, skb);                    /* encola por el final, bajo el lock de la cola */
+struct sk_buff *primero = skb_dequeue(&cola);  /* desencola por el frente, o NULL si vacia */
+```
+
+Y cada skb encolado en un socket recuerda a su dueño en `skb->sk`, a cuya cuota de memoria se carga su `truesize`. Esa es la razón última de que `truesize` mida la memoria real consumida y no `len`: es la cifra con la que el kernel decide cuándo un socket que no drena su cola debe dejar de aceptar datos. El control de flujo de todo Linux nace de esta contabilidad por skb.
+
+<Callout type="info" title="La parte paginada: cuando len supera a la región lineal">
+Un `sk_buff` no siempre es lineal. Su carga puede vivir en páginas sueltas referenciadas por el `skb_shared_info` (los *frags*), y entonces `data_len` mide esa parte paginada y `len` es el total. Es lo que permite el *zero-copy* real: la NIC hace DMA a páginas que nunca se linealizan, y `sendfile` transmite páginas del page cache sin copiarlas a un búfer. Cuando una función necesita los bytes contiguos, `skb_linearize` los junta —pero eso sí copia, y por eso se evita salvo necesidad—.
+</Callout>
+
+<Callout type="dios" title="El refcount es la razón silenciosa de que la red no copie">
+Piensa en lo que acabas de ver, porque es una de esas ideas que, una vez comprendidas, aparecen por todo el kernel. El problema parecía irresoluble: un mismo paquete tiene que ir a la vez a la pila TCP, al `tcpdump` del administrador y a la cola de retransmisión, y cada uno cree ser su dueño y decidirá cuándo liberarlo. La solución ingenua —dar a cada uno su copia— multiplicaría por tres el ancho de banda de memoria, y la memoria es justo el cuello de botella que el nivel 28 te enseñó a temer. La solución real es negarse a copiar y, en su lugar, **contar**. Se separan dos preguntas que la intuición fundía en una: cuántos poseen esta estructura de metadatos (`users`) y cuántos comparten el búfer de datos subyacente (`dataref`). Con esos dos contadores, tres consumidores comparten un solo búfer sin que ninguno sepa de los otros; cada uno lo suelta cuando termina, y solo el último en marcharse paga la liberación. Y en cuanto alguien necesita *escribir*, el copy-on-write aparece: se copia únicamente si de verdad hay compartición, y solo entonces. Esta es la misma disciplina que gobierna las páginas de memoria tras un `fork` (nivel 23), los inodos, los *dentries*, cada `struct` de larga vida del kernel. El refcount no es un detalle de implementación: es la respuesta estructural del kernel a la pregunta de cómo compartir sin copiar y liberar sin condiciones de carrera. La red lo lleva al extremo porque en la red cada copia evitada es latencia y ancho de banda ganados, millones de veces por segundo. Cuando entiendes que la velocidad de la pila nace de *no hacer* el trabajo obvio —no copiar, solo contar—, has entendido el alma del diseño de sistemas.
+</Callout>
+
+<Challenge title="Manipula un skb con tus manos">
+1. Dibuja en papel un búfer con `head`, `data`, `tail`, `end` y aplica sobre él, uno a uno, `skb_reserve(64)`, `skb_put(100)`, `skb_push(20)` y `skb_pull(20)`, anotando headroom, tailroom y `len` tras cada paso.
+2. En un módulo, crea un `sk_buff` con `alloc_skb`, escribe una cabecera falsa con `skb_put`/`memcpy` y verifica `skb_headroom` y `skb_tailroom` con `pr_info`.
+3. Clona ese skb con `skb_clone` y comprueba, imprimiendo `skb_shinfo(skb)->dataref`, que el búfer se comparte y no se duplicó.
+4. Intenta modificar el búfer del clon tras un `skb_cow` y razona qué habría pasado sin él.
+5. Explica en qué se diferencian `consume_skb` y `kfree_skb_reason`, y qué herramienta de espacio de usuario aprovecha esa diferencia.
+</Challenge>

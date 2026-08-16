@@ -1,0 +1,150 @@
+---
+title: "Trabajo en segundo plano: sacar peso del camino crítico"
+description: "Una petición debería hacer lo mínimo imprescindible para poder responder con verdad, y ni una operación más. Todo lo demás (enviar correos, generar miniaturas, sincronizar con terceros, recalcular informes, cobrar suscripciones) pertenece a otro sitio. La plataforma ofrece cuatro sitios distintos con contratos muy diferentes: waitUntil para la cola corta, Queues para el volumen desacoplado, cron para lo periódico y Workflows para procesos largos con memoria. Vemos el criterio para repartir, el impuesto de idempotencia que todos cobran y cómo se observa lo que ya no ocurre delante del usuario."
+subject: cloudflare
+level: 39
+order: 4
+position: "39.4"
+duration: "23 min"
+---
+
+<Lead>
+Hay una pregunta que ordena por sí sola la arquitectura de cualquier aplicación seria y que casi nadie se hace de forma explícita: qué tiene que haber terminado antes de responder al usuario. La respuesta honesta suele ser mucho menos de lo que el código hace en realidad. Cuando alguien sube una factura, lo único que debe ser cierto antes del `200` es que la factura está guardada de forma durable; que se haya generado la miniatura, notificado al contable, recalculado el panel y avisado al webhook del cliente no forma parte de la promesa, aunque el código actual lo haga todo en fila antes de contestar. Este nivel trata de esa frontera: cómo se traza, con qué herramienta se cruza y qué precio se paga al cruzarla, porque sacar trabajo del camino crítico no es gratis y quien lo hace sin entender el precio termina con un sistema rápido que a veces cobra dos veces.
+</Lead>
+
+<Goals>
+
+- Distinguir con un criterio explícito qué debe completarse antes de responder y qué puede esperar.
+- Elegir entre `waitUntil`, `Queues`, cron y `Workflows` según garantía, duración y necesidad de memoria.
+- Diseñar consumidores idempotentes que sobrevivan al reintento sin duplicar efectos.
+- Observar el trabajo diferido: profundidad de cola, edad del mensaje, tasa de fallo y cola de fallidos.
+
+</Goals>
+
+## Dónde está la frontera
+
+El criterio es una sola pregunta, formulada desde el punto de vista del usuario: si esto no ocurre, ¿mi respuesta se convierte en mentira? Guardar la factura sí, porque si falla y he respondido que se guardó, he mentido. Enviar el correo de confirmación no, porque el correo puede tardar treinta segundos sin que nadie considere rota la promesa. Esa distinción entre lo que constituye la verdad de la respuesta y lo que es consecuencia de ella es más fiable que cualquier heurística sobre duración, y tiene la ventaja de que se puede discutir con producto en lugar de con el equipo de plataforma.
+
+Una vez trazada la frontera aparece la segunda pregunta, que es de qué tipo es el trabajo desplazado. Aquí sí importan la duración, la tolerancia a la pérdida y si el proceso necesita recordar por dónde iba. Las cuatro herramientas responden a combinaciones distintas de esas tres variables y no son intercambiables, aunque las cuatro produzcan el mismo alivio inmediato en el percentil de respuesta.
+
+| Mecanismo | Se dispara con | Garantía | Duración razonable | Recuerda su estado |
+| --- | --- | --- | --- | --- |
+| `ctx.waitUntil` | La propia petición | Ninguna: si el isolate muere, se pierde | Segundos | No |
+| `Queues` | Un `send` desde cualquier Worker | Al menos una vez, con reintentos y cola de fallidos | Segundos a minutos por mensaje | No, cada mensaje es autónomo |
+| Cron | El reloj de la plataforma | Se ejecuta, aunque puede solaparse o retrasarse | Minutos | No, salvo que lo guardes tú |
+| `Workflows` | Una llamada explícita o un evento | Cada paso se completa una vez y se memoriza | Minutos a meses | Sí, ese es su motivo de existir |
+
+La confusión más habitual es tratar `waitUntil` como si fuera una cola. No lo es: es una promesa de que el runtime no matará tu isolate mientras esa tarea siga viva, y nada más. No hay reintento, no hay persistencia, no hay visibilidad. Es perfecta para escribir una métrica o refrescar una entrada de cache, y es una elección negligente para cobrar una tarjeta.
+
+<Callout type="warn" title="La prueba del apagón">
+Antes de meter algo en `waitUntil`, pregúntate qué pasa si ese trabajo se pierde exactamente ahora, sin aviso ni registro. Si la respuesta incluye la palabra dinero, datos o cliente, no va ahí: va a una cola.
+</Callout>
+
+## Las cuatro herramientas en código
+
+El productor es siempre trivial y esa es justamente la señal de que la frontera está bien puesta: el handler de la petición hace lo imprescindible, encola un hecho y responde. Fíjate en que lo que se encola es un hecho ocurrido, no una orden pendiente; ese matiz de vocabulario evita la mitad de los acoplamientos futuros.
+
+```ts
+app.post("/api/facturas", async (c) => {
+  const datos = await c.req.json<NuevaFactura>();
+  const id = crypto.randomUUID();
+
+  await c.env.DB.prepare("INSERT INTO facturas (id, usuario, total) VALUES (?, ?, ?)")
+    .bind(id, c.get("usuario")!.id, datos.total)
+    .run();
+
+  await c.env.TAREAS.send(
+    { tipo: "factura.emitida", id, usuario: c.get("usuario")!.id },
+    { contentType: "json" },
+  );
+
+  return c.json({ id }, 201);
+});
+```
+
+El consumidor recibe lotes, no mensajes sueltos, y ese detalle cambia su forma. Confirmar o reintentar mensaje a mensaje permite que un fallo aislado no arrastre a sus compañeros de lote, que es exactamente lo que ocurre si dejas que la excepción se propague sin capturar.
+
+```ts
+export default {
+  async queue(lote: MessageBatch<Tarea>, env: Env): Promise<void> {
+    for (const mensaje of lote.messages) {
+      try {
+        await procesar(mensaje.body, env);
+        mensaje.ack();
+      } catch (error) {
+        if (mensaje.attempts >= 3) mensaje.ack();
+        else mensaje.retry({ delaySeconds: 2 ** mensaje.attempts * 10 });
+      }
+    }
+  },
+};
+```
+
+Cuando el trabajo deja de ser un mensaje y pasa a ser un proceso con varias etapas, esperas largas y necesidad de retomar donde se quedó, la herramienta cambia. Un `Workflow` no es una cola con esteroides: es una máquina que memoriza el resultado de cada paso, de modo que un reinicio no repite lo ya hecho y una espera de tres días no consume nada mientras tanto.
+
+```ts
+export class AltaDeCliente extends WorkflowEntrypoint<Env, Alta> {
+  async run(evento: WorkflowEvent<Alta>, step: WorkflowStep) {
+    const cuenta = await step.do("crear cuenta", async () => crearCuenta(evento.payload));
+
+    await step.do(
+      "provisionar recursos",
+      { retries: { limit: 5, delay: "10 seconds", backoff: "exponential" } },
+      async () => provisionar(cuenta.id, this.env),
+    );
+
+    await step.sleep("periodo de prueba", "14 days");
+    await step.do("primer cobro", async () => cobrar(cuenta.id, this.env));
+  }
+}
+```
+
+## El impuesto de la idempotencia
+
+Toda entrega con garantía de al menos una vez implica que algún día un mensaje se procesará dos veces, y no por un fallo exótico sino por el funcionamiento normal del sistema: un reintento tras un tiempo de espera agotado en el que la operación sí había terminado. Quien no diseña para eso no tiene un sistema asíncrono, tiene una bomba de relojería con muy buen rendimiento.
+
+<Cards>
+  <Card icon="🔑" title="Clave de idempotencia">
+    Un identificador estable del hecho, no del intento. Guárdalo con una restricción de unicidad y deja que la base de datos rechace el duplicado.
+  </Card>
+  <Card icon="📝" title="Escritura condicional">
+    Convierte el efecto en una operación que solo aplica si el estado es el esperado. Repetirla no cambia nada.
+  </Card>
+  <Card icon="🧾" title="Registro de efectos">
+    Antes de llamar a un tercero, anota la intención. Al reintentar, comprueba si esa intención ya tiene resultado.
+  </Card>
+  <Card icon="⚰️" title="Cola de fallidos">
+    Lo que falla siempre debe acabar en un sitio observable, no en un registro perdido. Sin ella, el fallo silencioso es cuestión de días.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart LR
+  P[peticion del usuario] --> W[worker]
+  W --> D[d1 escribe lo imprescindible]
+  W --> R[respuesta inmediata]
+  W --> Q[queue con el hecho ocurrido]
+  Q --> C[consumidor por lotes]
+  C --> M[miniatura en r2]
+  C --> N[notificacion al tercero]
+  C --> F[cola de fallidos]
+  F --> O[panel de revision manual]
+  class R t-green
+  class F t-red`} />
+
+## Observar lo que ya nadie ve
+
+El coste oculto de sacar trabajo del camino crítico es que desaparece del sitio donde mirabas. Una ruta lenta se nota porque alguien se queja; una cola que crece no la nota nadie hasta que la reserva de mensajes es de horas y un cliente pregunta por qué su informe de ayer sigue sin llegar. Por eso el trabajo diferido exige su propia instrumentación, con cuatro señales que son casi siempre suficientes.
+
+La primera es la profundidad de la cola, que dice si el consumidor sigue el ritmo del productor. La segunda es la edad del mensaje más antiguo sin procesar, que es la métrica que de verdad se corresponde con la experiencia del usuario. La tercera es la tasa de reintentos, que se dispara mucho antes de que nada se rompa del todo y funciona como aviso temprano. Y la cuarta es el tamaño de la cola de fallidos, que nunca debería ser distinto de cero sin que alguien lo sepa. Un sistema que publica esas cuatro cifras es un sistema que puedes desplazar trabajo con confianza; uno que no las publica está acumulando deuda invisible.
+
+<Callout type="dios" title="Mover trabajo fuera del camino crítico no lo hace más rápido: lo hace mentiroso a cambio de un plazo, y toda la ingeniería consiste en administrar esa mentira con honradez">
+Conviene mirar de frente lo que realmente se está haciendo al encolar, porque el vocabulario habitual lo disfraza. Cuando respondes `201` y dejas la notificación para después, no has acelerado nada: la suma de trabajo del sistema es idéntica y probablemente algo mayor, porque has añadido serialización, transporte, deserialización y lógica de reintento. Lo que has hecho es cambiar la naturaleza de tu promesa. Antes decías al usuario esto ya está hecho, y era caro pero literal. Ahora dices esto ocurrirá, y es barato pero condicional. Has emitido crédito. Y como todo crédito, funciona magníficamente mientras la contraparte no dude de él y se convierte en el problema central en el momento exacto en que alguien pregunta cuándo. Esta es la razón profunda de que la idempotencia, la cola de fallidos y las cuatro métricas no sean buenas prácticas opcionales sino las condiciones de solvencia del sistema: son lo que respalda la promesa que acabas de emitir. Un sistema asíncrono sin cola de fallidos es un banco sin auditoría, y uno sin métrica de edad del mensaje es un banco que no sabe cuánto debe. Hay además una consecuencia de diseño que se deriva directamente y que rara vez se enuncia: la frontera entre lo síncrono y lo asíncrono no es una decisión técnica, es una decisión de producto, porque define exactamente qué está prometiendo tu interfaz. Por eso la frase el usuario no necesita esperar a esto debería salir de una conversación con quien diseña el producto y no de una optimización de última hora en una revisión de código. La arquitectura asíncrona bien hecha es sencillamente la traducción fiel de un conjunto de promesas que alguien se ha tomado la molestia de escribir. Todo lo demás es velocidad prestada, y las deudas de esa clase se cobran siempre en el peor momento.
+</Callout>
+
+<Challenge title="Traza tu frontera y defiéndela">
+1. Toma tu ruta más lenta y clasifica cada operación con la pregunta de la mentira. Escribe la lista de lo que se queda y lo que sale.
+2. Mueve lo que sale a `Queues` con un hecho ocurrido como mensaje. Mide el cambio en el percentil noventa y cinco de esa ruta.
+3. Fuerza un procesamiento duplicado invocando el consumidor dos veces con el mismo mensaje. Si el efecto se duplica, añade clave de idempotencia y repite.
+4. Configura la cola de fallidos y provoca un fallo permanente. Comprueba que acaba ahí y que alguien se entera sin mirar los registros.
+5. Sustituye un proceso multietapa que hoy vive en un cron por un `Workflow` con pasos y espera larga. Compara qué ocurre si lo reinicias a mitad.
+</Challenge>

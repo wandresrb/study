@@ -1,0 +1,109 @@
+---
+title: "Los tres precios del deferred"
+description: "Transparencia, MSAA y ancho de banda: por qué el deferred clásico obliga a mantener dos rutas de material, empujó a la industria al antialiasing temporal, y es una mala idea en GPU por tiles."
+subject: webgpu
+level: 39
+order: 3
+position: "39.3"
+duration: "22 min"
+---
+
+<Lead>
+El deferred convierte un producto en una suma y eso es un cambio de complejidad real, no un truco. Pero la factura llega entera y en tres partidas: no puedes dibujar transparentes, no puedes hacer MSAA como lo hacías, y el tráfico de memoria se multiplica por diez. Ninguna de las tres tiene una solución limpia. Las tres tienen soluciones, y todas consisten en añadir otra pieza al motor. Saber cuáles son antes de comprometerse es la diferencia entre elegir una arquitectura y descubrirla a mitad de proyecto.
+</Lead>
+
+<Goals>
+
+- Explicar por qué un G-buffer no puede representar geometría translúcida y qué implica mantener una pasada forward aparte.
+- Justificar por qué resolver el multisampling antes de sombrear produce resultados incorrectos, atributo por atributo.
+- Calcular el tráfico de memoria del G-buffer y compararlo con el ancho de banda disponible en escritorio y en móvil.
+- Identificar el punto a partir del cual el coste fijo del deferred deja de compensar.
+
+</Goals>
+
+## Transparencia: el G-buffer solo tiene sitio para una superficie
+
+Un [G-buffer](/guia/webgpu/n39-el-g-buffer/) guarda, por píxel, los atributos de **la** superficie visible. Una sola. Es una consecuencia directa del test de profundidad: el fragmento que gana sobrescribe los canales y el resto desaparece. Y una superficie translúcida es, por definición, una que no oculta lo que hay detrás: para sombrear correctamente ese píxel necesitarías los atributos del cristal y también los de la pared que se ve a través. No caben.
+
+No hay ningún empaquetado que arregle esto, porque el problema no es de bits sino de estructura: el número de superficies solapadas en un píxel no está acotado. Existen esquemas que lo intentan —listas enlazadas por píxel en un storage buffer con un contador atómico, que es la base del order independent transparency de verdad—, pero eso ya no es un G-buffer, es otra arquitectura completa con su propio presupuesto de memoria y un patrón de acceso hostil.
+
+Lo que se hace en producción es más aburrido y funciona: **una pasada forward posterior**. La secuencia queda así: pasada de geometría que llena el G-buffer con lo opaco, pasada de sombreado a pantalla completa, y luego una tercera pasada que dibuja los transparentes ordenados de atrás a delante, con el mismo buffer de profundidad ya escrito (`depthWriteEnabled: false`, `depthCompare: 'less'`) y con `blend` configurado, iluminándolos con el bucle de luces clásico.
+
+```js
+const transparentes = device.createRenderPipeline({
+  layout: layoutForward,
+  vertex:   { module: modForward, entryPoint: 'vs' },
+  fragment: {
+    module: modForward,
+    entryPoint: 'fs_pbr_forward',
+    targets: [{
+      format: formatoHDR,
+      blend: {
+        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        alpha: { srcFactor: 'one',       dstFactor: 'one-minus-src-alpha', operation: 'add' },
+      },
+    }],
+  },
+  depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'less' },
+});
+```
+
+El coste no es esa pasada: es lo que implica. Ahora tienes **dos implementaciones del mismo modelo de sombreado**, una que lee del G-buffer y otra que lee de los atributos interpolados del vértice. Y esas dos implementaciones divergen. Cambias la función de Fresnel en una y se te olvida la otra; añades un término de dispersión y el cristal deja de parecerse al plástico de al lado; el diferido usa la normal decodificada de la octaédrica y el forward usa la normal cruda, y a igualdad de material salen distintas en las siluetas.
+
+La disciplina que lo mantiene bajo control es poner la función de sombreado —la que toma unos parámetros de superficie y una luz y devuelve radiancia— en un fichero WGSL único, y que los dos pipelines la incluyan. Lo único que difiere debe ser cómo se rellena la struct de parámetros: en el diferido con `textureLoad` de cuatro texturas, en el forward con lecturas de textura y varyings. Es una convención, no un mecanismo del lenguaje: WGSL no tiene `#include`, así que la concatenación la haces tú en el bundler o en tiempo de carga.
+
+Un caso intermedio que sí cabe en el G-buffer y conviene no confundir: la geometría con alfa **recortada** —follaje, rejillas, cabello con máscara— no es transparente. Un `discard` en el fragment shader del pase de geometría la resuelve perfectamente, porque cada píxel sigue teniendo una única superficie ganadora. Lo que no cabe es el alfa **mezclado**.
+
+## MSAA: promediar atributos no significa nada
+
+El multisampling funciona porque separa la cobertura del sombreado: el rasterizador determina qué muestras de un píxel cubre el triángulo, el fragment shader se ejecuta una vez, y el resultado se replica a las muestras cubiertas. Al final, el resolve promedia las muestras y produce un borde suave. En forward eso es casi gratis.
+
+En deferred se rompe por los dos extremos. Si multimuestreas el G-buffer, la memoria se multiplica por el número de muestras: los 20 bytes por muestra del diseño de la lección anterior, a 1080p con 4x, son 166 MB solo de G-buffer residente, y el pase de sombreado tendría que ejecutarse **por muestra**, 8 294 400 veces en lugar de 2 073 600, lo cual destruye la ventaja de haber desacoplado.
+
+La alternativa evidente es resolver el G-buffer antes de sombrear, y es incorrecta. No aproximadamente incorrecta: sin sentido. Mira qué significa promediar cada canal en un píxel de borde entre dos superficies:
+
+- **Normal.** La media de dos normales que apuntan en direcciones distintas es un vector que no es la normal de ninguna de las dos, y tras normalizarlo apunta a un sitio donde no hay superficie. El especular resultante es un destello que no existe.
+- **Profundidad.** La media entre 2 metros y 40 metros es 21 metros: un punto en el aire. Reconstruyes una posición que está flotando en mitad de la nada, y con ella calculas atenuaciones y sombras.
+- **Albedo y metalicidad.** La media entre un metal de rugosidad 0,1 y un yeso de rugosidad 0,9 es un material de rugosidad 0,5 medio metálico que no existe en tu escena y que no se comporta como ninguno de los dos.
+
+El error es conceptual: **el sombreado no es lineal en sus parámetros**, así que promediar las entradas no es lo mismo que promediar las salidas. MSAA promedia salidas y por eso funciona. Resolver el G-buffer promedia entradas.
+
+La técnica que sí funciona existe y es cara: multimuestrear el G-buffer, marcar los píxeles de borde, y sombrear por muestra solo esos. En WebGPU la detección se puede hacer con el estarcido, escribiendo una marca en el pase de geometría con un formato `depth24plus-stencil8` y luego lanzando dos pipelines de sombreado con distinta `stencilFront.compare`; o con un compute pass que clasifique y produzca listas de píxeles. Para leer un G-buffer multimuestreado el tipo en WGSL es `texture_multisampled_2d<f32>`, se lee con `textureLoad(tex, coord, indiceMuestra)` y **no admite sampler**: no hay filtrado sobre una textura multimuestreada, tienes que pedir las muestras una por una.
+
+```wgsl
+@group(0) @binding(0) var gNormal: texture_multisampled_2d<f32>;
+
+@fragment
+fn fs_sombreado(@builtin(position) pos: vec4f,
+                @builtin(sample_index) muestra: u32) -> @location(0) vec4f {
+  let coord = vec2u(pos.xy);
+  let n = decodificarOct(textureLoad(gNormal, coord, muestra).xy);
+  // ...
+}
+```
+
+Usar `@builtin(sample_index)` en el fragment shader fuerza la ejecución por muestra, que es exactamente lo que quieres en los píxeles de borde y exactamente lo que no quieres en el resto.
+
+Casi nadie hace esto. Lo que hizo la industria fue lo otro: renunciar al MSAA y pasarse al antialiasing en post-proceso. FXAA detecta bordes en la imagen final y los difumina, cuesta una fracción de milisegundo y no necesita saber nada de geometría; SMAA hace lo mismo con mucho mejor criterio de reconstrucción de bordes; y TAA acumula muestras de fotogramas anteriores desplazando la proyección con un jitter subpíxel. Que el deferred se generalizara entre 2008 y 2015 y que el antialiasing post-proceso se generalizara en ese mismo periodo no es una coincidencia: es causa y efecto.
+
+<Callout type="dios" title="Elegir deferred es elegir TAA, y TAA te trae invitados">
+El coste de renunciar al MSAA no se paga en la lección de antialiasing, se paga en toda la arquitectura, y esto es lo que nadie te cuenta cuando dibuja el diagrama del G-buffer. FXAA y SMAA son parches sobre la imagen: quitan escaleras en los bordes y no hacen nada contra el aliasing especular, ni contra el temblor de las texturas de detalle, ni contra el hormigueo del follaje con alfa recortado. Para eso solo sirve TAA, así que el deferred acaba arrastrando a TAA en cualquier proyecto que aspire a verse bien en movimiento. Y TAA no es un pase de post-proceso, es una condición sobre el motor entero. Necesitas un buffer de velocidad, que son cuatro bytes más por píxel en `rg16float` sobre los veinte que ya escribías. Necesitas jitter subpíxel en la matriz de proyección, distinto en cada fotograma, con una secuencia de baja discrepancia tipo Halton, lo que significa que todo lo que dependa de la matriz de proyección —incluidos tus [AABB de clusters](/guia/webgpu/n39-forward-plus-y-clustered/) si los usas— tiene que saber si mira la matriz con jitter o sin él. Necesitas guardar el color del fotograma anterior y reproyectarlo, lo que dobla la memoria de tu buffer HDR. Y necesitas resolver el desocultamiento: los píxeles que aparecen desde detrás de un objeto no tienen historia válida, y si te la crees salen estelas. El acotado por vecindario que arregla las estelas te introduce a cambio parpadeo en los detalles finos. Cada uno de esos problemas tiene tres soluciones publicadas y ninguna es definitiva; hay equipos enteros que han pasado meses ahí. La conclusión operativa es incómoda pero útil: cuando estés evaluando si te compensa el deferred, no compares el coste del G-buffer contra el coste del bucle de luces. Compara *el motor con deferred y TAA* contra *el motor forward con 4x MSAA*, porque esa es la elección real, y del segundo lado hay un renderer que se ve nítido, no tiene estelas y que puedes terminar este mes.
+</Callout>
+
+## Ancho de banda: el tráfico que existe antes de iluminar
+
+El tercer precio es el más fácil de cuantificar y el más fácil de ignorar. Un G-buffer de 20 bytes por muestra más 4 de profundidad se escribe entero y se lee entero una vez por fotograma: 99,5 MB por fotograma a 1080p, 398 MB a 4K. A 60 fotogramas por segundo son **5,97 GB/s y 23,9 GB/s** respectivamente, de tráfico puro, antes de haber evaluado una sola luz, antes de las texturas de material, antes del post-proceso.
+
+En una GPU de escritorio con 400 o 500 GB/s de ancho de banda, seis gigabytes por segundo es ruido. El cálculo cambia por completo en cuanto sales de ahí. Un portátil con gráficos integrados y un móvil comparten la memoria con la CPU y viven en el rango de 30 a 100 GB/s **para todo el sistema**. Ahí, seis gigabytes por segundo son entre el seis y el veinte por ciento del bus total consumidos por el ida y vuelta del G-buffer, compitiendo con la CPU, con el decodificador de vídeo y con el compositor del sistema operativo. Y en un dispositivo con batería el tráfico a memoria externa es, con diferencia, la operación que más energía consume por bit: mover un dato de DRAM cuesta del orden de cien veces más energía que una operación de coma flotante sobre un dato que ya está en registros. Un renderer con mucho tráfico no es solo lento en un móvil: es un renderer que calienta el teléfono y lo obliga a bajar frecuencias.
+
+Encima de eso, las GPU de móvil son por tiles, y ese diseño es justo el que el deferred clásico desperdicia. Una GPU por tiles divide el framebuffer en bloques y mantiene el color y la profundidad del bloque en memoria on-chip mientras lo dibuja; solo al terminar el tile escribe el resultado a memoria principal, una vez. Una pasada forward en ese hardware hace un único store de color por píxel y punto. Un deferred rompe ese esquema en dos: la pasada de geometría tiene que *almacenar* cuatro texturas completas en memoria principal, y la de sombreado tiene que *cargarlas* otra vez, porque son pases distintos y entre ellos el contenido del tile se pierde.
+
+Vulkan resuelve esto con subpasses e input attachments, y Metal con imageblocks y mezcla programable: mecanismos para decirle a la GPU "estos attachments no salen del tile, el sombreado ocurre aquí mismo con los datos en SRAM". Con eso, el deferred en móvil es viable y hasta elegante. **WebGPU no expone hoy ningún equivalente**: no hay input attachments, no hay framebuffer fetch, no hay forma de encadenar dos pases que compartan memoria de tile. Así que en WebGPU, sobre una GPU por tiles, el deferred clásico paga los round trips completos a DRAM sin excepción. Ese es el argumento decisivo, y no es de rendimiento relativo: es que la API no tiene la primitiva que haría barata la técnica.
+
+## El coste fijo: el deferred paga igual con tres luces
+
+La última pega es de forma, no de magnitud. Todo lo anterior —los 24 bytes por muestra, la pasada a pantalla completa, la ruta forward para transparentes, el TAA— **se paga entero aunque tu escena tenga tres luces**. El deferred no tiene un modo barato. Su curva de coste es una recta casi horizontal con una ordenada en el origen muy alta.
+
+La del forward es lo contrario: ordenada en el origen casi cero y pendiente brutal. Las dos rectas se cruzan en algún punto, y el punto depende de tu escena, de tu resolución y de tu hardware, pero se puede razonar sobre él. Con un fragment shader PBR típico y una GPU de escritorio a 1080p, el cruce cae en algún lugar entre veinte y cincuenta luces por píxel efectivas. Por debajo de eso, el forward gana y encima te regala MSAA y transparencia. Muy por encima, el deferred gana con claridad.
+
+Lo que hace que esa comparación esté hoy obsoleta es que ninguna de las dos rectas es la mejor disponible. El culling de luces por región del espacio hunde la pendiente del forward sin subirle la ordenada, y eso convierte el punto de cruce en un sitio muchísimo más lejano y más difícil de alcanzar. Esa es la [síntesis por tiles y por clusters](/guia/webgpu/n39-forward-plus-y-clustered/), y es la razón por la que casi ningún motor nuevo desde 2016 arranca en deferred puro.

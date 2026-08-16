@@ -1,0 +1,156 @@
+---
+title: "Trabajo pesado sin congelar la interfaz"
+description: "Qué significa bloquear el actor principal, cómo sacar el cálculo a un contexto que no dibuja, cuándo trocear y ceder el turno, y cómo medir si de verdad estabas bloqueando en lugar de suponerlo."
+subject: ios
+level: 15
+order: 4
+position: "15.4"
+duration: "16 min"
+---
+
+<Lead>
+Un usuario percibe un tirón a partir de un fotograma perdido: dieciséis milisegundos en una pantalla de sesenta hercios, ocho en una de ciento veinte. Ese es todo el presupuesto que tiene el actor principal entre dibujo y dibujo, y cualquier cálculo que lo exceda se traduce en una interfaz que se congela. Lo interesante es que la intuición del programador sobre qué lo excede es sistemáticamente mala: sobreestima la red, que casi nunca bloquea, e ignora el parseo y el ordenado, que casi siempre lo hacen.
+</Lead>
+
+<Goals>
+
+- Entender la diferencia entre suspender una tarea y bloquear un ejecutor.
+- Sacar el cálculo del actor principal con `nonisolated` y actores dedicados.
+- Trocear trabajo largo y ceder el turno cuando no se puede trocear.
+- Medir el bloqueo real con las herramientas del sistema en vez de adivinar.
+
+</Goals>
+
+## Suspender no es bloquear
+
+La confusión más costosa de la concurrencia moderna es tratar `await` como sinónimo de "no bloquea". No lo es. `await` marca un punto donde la tarea **puede** suspenderse y liberar el hilo; si la función que hay detrás simplemente calcula sin suspender nunca, el hilo se queda ocupado exactamente igual que con una llamada síncrona.
+
+```swift
+@MainActor
+func ordenar() async {
+    // await, pero cero suspensiones: bloquea el actor principal
+    lista = await ordenarTodo(millonDeElementos)
+}
+
+func ordenarTodo(_ xs: [Item]) async -> [Item] {
+    xs.sorted { $0.peso < $1.peso }   // puro cálculo, ninguna suspensión
+}
+```
+
+Marcar una función como `async` no la mueve a ninguna parte. Si esa función hereda el aislamiento del llamante —cosa que ocurre cuando pertenece a un tipo aislado o captura estado aislado— seguirá ejecutándose en el actor principal, y el `await` habrá sido puro decorado sintáctico. La pregunta correcta nunca es "tiene await", sino **en qué ejecutor corre el cuerpo**.
+
+Hay un segundo modo de bloquear, aún peor, que el modelo estructurado hace tentador: llamadas verdaderamente bloqueantes dentro de una tarea. Un `semaphore.wait`, un `DispatchQueue.sync`, una lectura de fichero síncrona o un `sleep` de Foundation no suspenden la tarea, ocupan el hilo del pool cooperativo. Como ese pool tiene tantos hilos como núcleos, bloquear unos pocos puede paralizar toda la concurrencia del proceso, incluida la que iba a devolverte el resultado que estás esperando.
+
+## Sacar el trabajo del actor que dibuja
+
+Hay tres herramientas, y elegir bien entre ellas es casi todo el trabajo de diseño.
+
+La primera es `nonisolated`: una función pura, sin estado compartido, que puede correr en el pool cooperativo. Es la opción por defecto para transformaciones, parseo y cálculo.
+
+```swift
+@MainActor
+final class InformeViewModel {
+    var filas: [Fila] = []
+
+    nonisolated static func procesar(_ crudo: Data) throws -> [Fila] {
+        try JSONDecoder().decode([Fila].self, from: crudo)
+    }
+
+    func recargar() async {
+        let datos = try? await api.descargar()
+        let filas = try? Self.procesar(datos ?? Data())  // fuera del actor
+        self.filas = filas ?? []                          // vuelta al actor
+    }
+}
+```
+
+La segunda es un **actor dedicado** cuando el trabajo tiene estado propio que debe protegerse: una caché, un índice, una cola de escritura. El actor serializa los accesos sin locks explícitos y sin robar tiempo a la interfaz.
+
+```swift
+actor IndiceBusqueda {
+    private var tabla: [String: [Item.ID]] = [:]
+
+    func indexar(_ items: [Item]) {
+        for item in items {
+            tabla[item.clave, default: []].append(item.id)
+        }
+    }
+
+    func buscar(_ termino: String) -> [Item.ID] { tabla[termino] ?? [] }
+}
+```
+
+La tercera es `Task.detached`, y merece una advertencia: rompe la herencia de prioridad, de valores locales y de cancelación estructurada. Casi siempre que alguien la usa, lo que quería era `nonisolated`. Resérvala para trabajo genuinamente desligado del ciclo de vida que lo originó.
+
+<Callout type="dios" title="El actor principal es un recurso con presupuesto, no un lugar peligroso">
+La retórica habitual dice que hay que sacar cosas del hilo principal porque es *malo* ejecutar ahí. Es una lectura falsa y lleva a arquitecturas peores: gente que empuja al fondo trabajo de microsegundos y paga por ello dos cambios de contexto, dos saltos de ejecutor y una invalidación de caché para ahorrar tres microsegundos de cómputo. La lectura correcta es económica. El actor principal tiene un presupuesto fijo por fotograma y una lista de clientes obligatorios: eventos táctiles, layout, dibujo, animaciones. Tu cálculo compite con ellos. Si cabe holgadamente en el presupuesto sobrante, ejecutarlo ahí es la opción más rápida y más simple, porque cruzar fronteras de actor no es gratis. Si no cabe, ninguna cantidad de cuidado lo hará caber y hay que moverlo. Todo el arte consiste en saber de qué lado de esa frontera estás, y esa es una pregunta empírica que solo responde el instrumental, nunca la intuición.
+</Callout>
+
+## Trocear y ceder
+
+Hay trabajo que no puede moverse porque debe tocar estado aislado: reconstruir un modelo observable elemento a elemento, aplicar mil cambios a una estructura del actor principal. Ahí la técnica es distinta: trocear el trabajo en unidades pequeñas y **ceder el turno** entre ellas para que el ejecutor pueda atender el dibujo.
+
+```swift
+@MainActor
+func aplicar(_ cambios: [Cambio]) async {
+    for (i, cambio) in cambios.enumerated() {
+        modelo.aplicar(cambio)
+        if i.isMultiple(of: 200) {
+            await Task.yield()            // deja pasar un fotograma
+            if Task.isCancelled { return }
+        }
+    }
+}
+```
+
+`Task.yield` suspende voluntariamente y devuelve el ejecutor a la cola. No acelera nada —al contrario, el total tarda algo más— pero convierte una congelación de dos segundos en una interfaz que responde mientras avanza. Es un intercambio consciente de latencia total por fluidez percibida, y casi siempre el usuario prefiere el segundo.
+
+El tamaño del trozo importa: ceder cada iteración multiplica el coste de planificación; ceder cada diez mil no cede nada útil. La calibración se hace midiendo, empezando por un valor que deje cada trozo bien por debajo de un milisegundo.
+
+<Mermaid code={`flowchart TD
+  A[Tengo trabajo caro] --> B{Toca estado aislado del actor principal}
+  B -->|no| C{Tiene estado propio compartido}
+  C -->|no| D[Funcion nonisolated en el pool]
+  C -->|si| E[Actor dedicado]
+  B -->|si| F{Se puede trocear}
+  F -->|si| G[Bucle con Task punto yield]
+  F -->|no| H[Rediseniar el modelo de datos]
+  class D t-green
+  class E t-blue
+  class G t-yellow`} />
+
+## Medir en vez de creer
+
+<Cards>
+  <Card icon="📉" title="Hang detection">
+    Xcode marca en el organizador las congelaciones reales de usuarios y las clasifica por duración. Es la única fuente que refleja hardware y datos reales, no tu simulador.
+  </Card>
+  <Card icon="🔬" title="Instruments">
+    La plantilla de tiempo con el *Main Thread Checker* activo señala exactamente qué pila de llamadas consumió el presupuesto del fotograma.
+  </Card>
+  <Card icon="⏱️" title="Firmas de rendimiento">
+    `OSSignposter` acota regiones de código con nombre y las hace visibles en el mismo eje temporal que el dibujo. Sin ellas, buscas a ciegas.
+  </Card>
+</Cards>
+
+La instrumentación mínima que conviene dejar puesta cuesta muy poco y responde la pregunta importante:
+
+```swift
+let firmante = OSSignposter(subsystem: "app.informes", category: "carga")
+
+func procesarMedido(_ datos: Data) throws -> [Fila] {
+    let estado = firmante.beginInterval("decodificar")
+    defer { firmante.endInterval("decodificar", estado) }
+    return try JSONDecoder().decode([Fila].self, from: datos)
+}
+```
+
+La disciplina completa tiene tres pasos y ninguno es opcional: medir en un dispositivo real y no en el simulador, medir con volumen de datos de producción y no con tres elementos de prueba, y medir **antes** de mover nada. La mitad de las optimizaciones de concurrencia que se escriben cada día atacan código que ya cabía en el presupuesto, y su único efecto neto es añadir complejidad y saltos de ejecutor a una app que iba bien.
+
+<Challenge title="Encuentra tu bloqueo real">
+1. Perfila una pantalla lenta con Instruments en un dispositivo físico y anota qué función consume más del presupuesto por fotograma.
+2. Envuelve esa función con `OSSignposter` y comprueba en el eje temporal si coincide con los fotogramas perdidos.
+3. Muévela a una función `nonisolated` y vuelve a medir: confirma con datos que la mejora existe.
+4. Coge un bucle que deba correr en el actor principal e introduce `Task.yield` cada doscientas iteraciones.
+5. Busca en tu código un `semaphore.wait` o un `DispatchQueue.sync` dentro de una tarea y razona por qué es peligroso.
+</Challenge>

@@ -1,0 +1,145 @@
+---
+title: "Estado offline"
+description: "Persistir mantiene el estado entre sesiones; el modo offline mantiene la aplicación usable cuando la red desaparece. Son problemas distintos y el segundo es más profundo, porque no basta con recordar: hay que seguir aceptando cambios sin poder confirmarlos. La técnica que lo hace posible es la cola de mutaciones pendientes. Cada acción del usuario se aplica de inmediato al store local de forma optimista y, en paralelo, se encola como una mutación durable en `IndexedDB` a la espera de red. Cuando la conexión regresa, la cola se drena en orden contra el servidor, y ahí aparece lo difícil: reintentos, backoff y resolución de conflictos cuando el servidor discrepa de lo que el cliente asumió. El patrón que corona todo esto es offline-first, que invierte la jerarquía habitual: el store local deja de ser un caché del servidor y pasa a ser la fuente de verdad de la interfaz, mientras la red se degrada a un efecto en segundo plano que sincroniza cuando puede. Esta lección construye ese patrón desde su pieza mínima —la mutación encolada— hasta su consecuencia arquitectónica: una interfaz que nunca se bloquea esperando al servidor."
+subject: estado
+level: 13
+order: 4
+position: "13.4"
+duration: "18 min"
+---
+
+<Lead>
+La red es el recurso menos fiable con el que trabaja el frontend, y sin embargo la mayoría de las aplicaciones la tratan como si fuera aire: siempre presente, siempre instantánea. Basta un túnel, un ascensor o un avión para que esa fantasía se rompa y la interfaz se congele esperando una respuesta que no llega. El estado offline es la disciplina de diseñar para el fallo de red como caso normal y no como excepción catastrófica. Su idea central es sencilla de enunciar y difícil de dominar: no hagas que el usuario espere a la red para ver el efecto de sus actos. Cuando pulsa enviar, aplica el cambio al store local de inmediato —optimistamente, como si el servidor ya hubiera dicho que sí— y guarda en una cola durable la intención de sincronizarlo cuando se pueda. La red pasa entonces de portera a mensajera: ya no decide si la acción ocurre, solo la transmite cuando hay señal. Esta inversión, que parece un truco de comodidad, reorganiza toda la arquitectura del estado, porque convierte al store local en la fuente de verdad de lo que el usuario ve y relega al servidor a una verdad eventual con la que hay que reconciliarse. Y donde hay dos verdades que reconciliar, hay conflictos que resolver.
+</Lead>
+
+<Goals>
+
+- Modelar cada acción del usuario como una mutación encolada de forma durable, aplicada optimistamente al store local.
+- Detectar el cambio de conectividad y drenar la cola de mutaciones en orden al reconectar.
+- Resolver los fallos de sincronización con reintentos, backoff y una política explícita de conflictos.
+- Comprender el patrón offline-first como una inversión de la fuente de verdad entre store local y servidor.
+
+</Goals>
+
+## La cola de mutaciones pendientes
+
+La pieza mínima del modo offline es tratar cada acción no como una llamada a la red sino como un dato: una **mutación**, un objeto serializable que describe la intención del usuario y que puede reproducirse más tarde. En lugar de disparar el `fetch` y esperar, aplicas el cambio al store local y añades la mutación a una cola persistida en `IndexedDB`. Así, aunque el usuario cierre la pestaña sin red, la intención sobrevive al reinicio y se ejecutará cuando vuelva.
+
+```ts
+type Mutacion = {
+  id: string           // id local unico para deduplicar
+  tipo: 'crear' | 'editar' | 'borrar'
+  recurso: string
+  carga: unknown
+  intentos: number
+}
+
+async function ejecutar(m: Mutacion) {
+  store.aplicarOptimista(m)          // el usuario ve el efecto YA
+  await encolar(m)                   // durable en IndexedDB, sobrevive al cierre
+  if (navigator.onLine) drenarCola() // intenta sincronizar si hay red
+}
+```
+
+Para que la cola sea reproducible, cada mutación debe ser autocontenida y, en lo posible, idempotente: reenviarla dos veces no debe crear dos recursos. Un identificador local generado en el cliente sirve tanto para deduplicar en el servidor como para casar la respuesta con el elemento optimista que ya pintaste.
+
+El optimismo tiene un reverso obligatorio: si el servidor acaba rechazando la mutación, hay que deshacer el efecto que ya mostraste. Un borrado que el servidor niega debe resucitar el elemento; un envío que falla debe revertirse o volver a marcarse como pendiente. Por eso conviene guardar junto a cada mutación lo necesario para revertirla, o modelar el estado optimista como una capa separada sobre el estado confirmado que puedas retirar de golpe si la sincronización fracasa. Sin ese plan de reversión, el optimismo se convierte en mentira permanente.
+
+## Sincronizar al reconectar
+
+Drenar la cola exige primero saber cuándo hay red, y aquí el navegador miente a medias. `navigator.onLine` y los eventos `online` y `offline` te dicen si hay interfaz de red, pero no si internet responde: un wifi conectado a un router sin salida marca `online` y aun así falla. Por eso la señal más honesta no es la del navegador sino el propio fallo de la petición. Trata `navigator.onLine` como una pista para no intentar en vano, pero confía en el resultado real de cada envío.
+
+Al reconectar, drenas la cola en orden estricto, porque las mutaciones pueden depender unas de otras: no puedes editar un recurso que aún no se ha creado en el servidor. Cada envío que falla no se descarta, se reintenta con un backoff exponencial que evita martillear un servidor que quizá sigue caído.
+
+```ts
+async function drenarCola() {
+  for (const m of await leerCola()) {          // en orden de llegada
+    try {
+      const real = await enviar(m)             // POST/PUT/DELETE al servidor
+      store.reconciliar(m.id, real)            // sustituye id local por id real
+      await quitarDeCola(m.id)
+    } catch (e) {
+      m.intentos++
+      await esperar(backoff(m.intentos))       // 1s, 2s, 4s, 8s...
+      break                                    // corta el drenado, reintenta luego
+    }
+  }
+}
+
+window.addEventListener('online', drenarCola)  // reconexion dispara el drenado
+```
+
+El disparador `online` no basta por sí solo. Conviene además intentar el drenado al arrancar la app —por si quedaron mutaciones de una sesión anterior— y cuando la pestaña vuelve a primer plano con el evento `visibilitychange`, porque un móvil puede haber recuperado la red mientras la pestaña dormía en segundo plano sin emitir ningún evento `online`. La robustez del modo offline se construye acumulando disparadores de sincronización, no confiando en uno solo.
+
+<Callout type="warn" title="El conflicto es inevitable, la política no puede ser implícita">
+Mientras estabas sin red, el servidor pudo cambiar por otra vía: otro dispositivo tuyo, otro usuario, un proceso automático. Cuando tu mutación llega, el estado del servidor ya no es el que tú asumiste. Necesitas una política de conflictos decidida de antemano y no improvisada en el `catch`. Last-write-wins es la más simple pero pierde datos en silencio. La autoridad del servidor —el servidor gana y el cliente se rinde— es honesta pero puede descartar el trabajo del usuario. La fusión campo a campo respeta a ambos pero exige lógica de dominio. No hay opción por defecto correcta; lo incorrecto es no haber elegido.
+</Callout>
+
+## El patrón offline-first
+
+Cuando encadenas la cola durable, el drenado al reconectar y la reconciliación, emerge una arquitectura con nombre propio: offline-first. Su tesis es que la aplicación debe funcionar entera sin red y tratar la conexión como una mejora, no como un requisito. La consecuencia técnica es una inversión de la fuente de verdad. En una app tradicional el servidor manda y el cliente cachea; en offline-first el store local manda para todo lo que el usuario ve, y el servidor es un espejo que se pone al día cuando puede.
+
+<Cards>
+  <Card icon="📥" title="Cola durable">
+    Cada acción es una mutación serializable en `IndexedDB`, aplicada al store al instante. Sobrevive al cierre de la pestaña y es reproducible en orden. Es el corazón del modo offline.
+  </Card>
+  <Card icon="📡" title="Detección de red">
+    `navigator.onLine` y los eventos `online` y `offline` como pista, pero el fallo real de la petición como verdad. Un wifi sin salida a internet marca conectado y aun así falla.
+  </Card>
+  <Card icon="⚖️" title="Política de conflictos">
+    Decidida de antemano: last-write-wins, autoridad del servidor o fusión campo a campo. Lo incorrecto no es elegir mal, es no haber elegido y descubrirlo en producción.
+  </Card>
+  <Card icon="🔗" title="Reconciliación">
+    La respuesta del servidor corrige lo asumido: asigna el id real, rechaza lo inválido, avanza el estado. El store optimista debe absorber esa corrección sin duplicar ni parpadear.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TD
+  A[accion del usuario] --> O[aplicar optimista al store local]
+  O --> Q[encolar mutacion durable en IndexedDB]
+  Q --> N{hay conexion}
+  N -->|no| W[esperar evento online]
+  N -->|si| D[drenar cola en orden]
+  W --> D
+  D --> R{el servidor acepta}
+  R -->|si| C[reconciliar y quitar de la cola]
+  R -->|no| F[reintentar con backoff o resolver conflicto]
+  F --> D
+  class O t-green
+  class F t-yellow`} />
+
+El modo offline también cambia lo que la interfaz debe comunicar. Un cambio aplicado optimistamente pero aún sin confirmar no es lo mismo que uno ya sincronizado, y ocultarle esa diferencia al usuario es arriesgado: creerá guardado lo que todavía vive solo en su dispositivo. Modela un estado de sincronización por elemento —pendiente, sincronizado, con error— y refléjalo con sutileza en la vista, para que el usuario distinga qué está a salvo y qué espera aún a la red.
+
+```ts
+type Item = { id: string; datos: unknown; sync: 'pendiente' | 'ok' | 'error' }
+// pendiente -> reloj tenue    ok -> sin adorno    error -> icono de reintento
+```
+
+La reconciliación es el detalle que separa una demo de un producto. El servidor casi siempre corrige algo de lo que el cliente asumió: asigna el identificador real de un recurso que el cliente creó con un id provisional, rechaza una mutación que violó una regla, o devuelve un estado que ya había avanzado. Tu store optimista debe saber recibir esa corrección y ajustarse sin sobresaltos, reemplazando el id local por el definitivo y revirtiendo con elegancia lo que el servidor rechazó.
+
+Hay un detalle de identidad que agradecerás resolver pronto: si el cliente crea recursos con un id provisional y el servidor asigna otro definitivo, cualquier referencia entre recursos creados sin red —un comentario que apunta a una entrada aún no sincronizada— debe reescribirse cuando lleguen los ids reales. Drenar en orden ayuda, pero para grafos de dependencias conviene mantener un mapa de id provisional a id real y aplicarlo durante la reconciliación.
+
+## No lo construyas todo a mano
+
+Has levantado la cola, el drenado y la reconciliación con tus propias manos, y era imprescindible para entender la mecánica. Pero en producción rara vez se escribe todo esto desde cero, porque el navegador y el ecosistema ya ofrecen piezas probadas que resuelven los casos difíciles que aquí solo hemos rozado.
+
+El navegador aporta dos aliados. El **Service Worker** intercepta las peticiones y puede servir una aplicación entera sin red desde su caché, y la **Background Sync API** permite registrar una sincronización que el navegador ejecutará cuando vuelva la conexión, incluso si el usuario ya cerró la pestaña. Es la cola de mutaciones elevada al nivel del sistema operativo, fuera del ciclo de vida de tu página y por tanto más robusta que cualquier cola que vivas dentro de la pestaña.
+
+Por encima, bibliotecas especializadas empaquetan el patrón completo. `TanStack Query` persiste su caché y encola mutaciones offline con reintento. Motores de sincronización como Replicache, RxDB, WatermelonDB o el veterano PouchDB implementan offline-first de extremo a extremo, y varios resuelven los conflictos con CRDTs, estructuras de datos diseñadas para fusionarse sin pérdida sin importar el orden en que lleguen los cambios. Conocer la mecánica manual no te vuelve inmune a estas herramientas: te vuelve capaz de elegirlas con criterio y de depurarlas cuando su magia falla.
+
+<Callout type="info" title="Los CRDTs eliminan el conflicto en lugar de arbitrarlo">
+La política de conflictos que discutimos asume que el conflicto es inevitable y hay que arbitrarlo. Los tipos de datos replicados sin conflicto, los CRDTs, atacan el problema desde otro ángulo: se diseñan de modo que dos réplicas que recibieron los mismos cambios en distinto orden converjan matemáticamente al mismo estado, sin árbitro. No son gratis —cargan metadatos y no encajan con cualquier modelo de dominio—, pero para edición colaborativa y sincronización multidispositivo son la diferencia entre pelear con los conflictos y no tenerlos.
+</Callout>
+
+<Callout type="dios" title="Offline-first convierte la red en un efecto, no en una portera">
+La lección honda de este nivel no es la cola ni el backoff: es lo que le ocurre a la fuente de verdad. Durante todo este track has perseguido una idea, la de una única fuente de verdad para cada dato. El modo offline la pone a prueba al máximo, porque de golpe tienes dos candidatos —el store local y el servidor— y ambos creen tener la última palabra. La resolución de offline-first es tajante y vale la pena interiorizarla: para lo que el usuario ve y toca, la fuente de verdad es el store local, y el servidor se degrada de portera a mensajera. Fíjate en el eco de niveles anteriores. La cola de mutaciones es, punto por punto, un log de intenciones con nombre —las mismas acciones que viste en el flujo unidireccional—, y sincronizar es reproducir ese log contra el servidor. Has reinventado, sin proponértelo, el corazón del event sourcing: no guardas el estado final, guardas la secuencia de hechos que lo produjo, y esa secuencia es reproducible, inspeccionable y sobrevive a la red. Cuando entiendes que una mutación es un comando-como-dato y que la red es solo el efecto que lo entrega, dejas de programar contra la conexión y empiezas a programar contra una cola de intenciones que el mundo real irá confirmando a su ritmo. La app deja de preguntar hay internet antes de actuar; actúa, registra la intención, y deja que la sincronización sea un problema de fondo y no un muro frente al usuario.
+</Callout>
+
+<Challenge title="Levanta un modo offline mínimo">
+1. Modela una acción de tu app como un objeto `Mutacion` serializable con id local, tipo, recurso y carga, y guárdalo en `IndexedDB`.
+2. Aplica la mutación optimistamente al store local antes de tocar la red, de modo que el usuario vea el efecto al instante.
+3. Escucha los eventos `online` y `offline` y comprueba, desconectando el wifi, que las mutaciones se encolan sin bloquear la interfaz.
+4. Implementa el drenado de la cola en orden con un backoff exponencial y verifica que un servidor caído no provoca una tormenta de reintentos.
+5. Fuerza un conflicto editando el mismo recurso desde otra pestaña y decide, de forma explícita, tu política: last-write-wins, autoridad del servidor o fusión.
+6. Reconcilia la respuesta del servidor sustituyendo el id local provisional por el id real, y confirma que el elemento optimista no se duplica.
+</Challenge>

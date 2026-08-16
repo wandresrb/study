@@ -1,0 +1,144 @@
+---
+title: "Atómicos avanzados: CAS y bits"
+description: "La base de todo lo lock-free: atomic_cmpxchg y atomic_try_cmpxchg (compare-and-swap), el bucle CAS, atomic64_t para contadores que no deben desbordar, y las operaciones de bits atómicas set_bit, clear_bit y test_and_set_bit para flags concurrentes."
+subject: kernel
+level: 14
+order: 4
+position: "14.4"
+duration: "16 min"
+---
+
+<Lead>
+`atomic_inc` resuelve el contador, pero la concurrencia real necesita algo más ambicioso: modificar un valor en función de su estado actual, sin lock, y reintentar si alguien se adelantó. Esa es la operación compare-and-swap, el átomo del que se construye todo el código lock-free del kernel. Y junto a ella, las operaciones de bits atómicas, la forma canónica de manejar flags que varios contextos tocan a la vez.
+</Lead>
+
+<Goals>
+
+- `atomic_cmpxchg` y el bucle compare-and-swap.
+- `atomic_try_cmpxchg`, la forma moderna y eficiente del CAS.
+- `atomic64_t` para contadores de 64 bits que no deben desbordar.
+- Bits atómicos: `set_bit`, `clear_bit` y `test_and_set_bit`.
+</Goals>
+
+## Compare-and-swap: el átomo del lock-free
+
+`atomic_inc` siempre suma uno. Pero, ¿y si quieres poner un valor *solo si* el actual es el que esperabas, para detectar que nadie lo cambió mientras calculabas? Esa es la semántica de **compare-and-swap** (CAS), y en el kernel es `atomic_cmpxchg`:
+
+```c
+/* atomic_cmpxchg(v, old, new):
+ *   si *v == old, escribe new en *v.
+ *   devuelve SIEMPRE el valor que habia en *v (haya cambiado o no).
+ * Todo ello de forma atomica e indivisible. */
+```
+
+Con esa única operación construyes cualquier actualización atómica, por compleja que sea el cálculo, mediante el **bucle CAS**: lees el valor, calculas el nuevo, e intentas el swap; si alguien se te adelantó (el valor ya no es el que leíste), reintentas con el valor fresco:
+
+```c
+int old, nuevo;
+do {
+	old = atomic_read(&v);
+	nuevo = alguna_funcion(old);       /* calculo arbitrario */
+} while (atomic_cmpxchg(&v, old, nuevo) != old);
+```
+
+Esto es lock-free de manual: no hay lock, nadie se bloquea, y aun así la actualización es correcta bajo cualquier entrelazado. El precio es el reintento cuando hay contención, pero el sistema *siempre progresa*.
+
+## try_cmpxchg: la forma moderna
+
+El bucle anterior tiene una ineficiencia: en cada vuelta relees con `atomic_read`, cuando el propio `cmpxchg` fallido ya te devolvió el valor actual. Por eso el kernel moderno (Linux 7.x) prefiere `atomic_try_cmpxchg`, que devuelve un `bool` y, si falla, *recarga* `old` con el valor real por ti:
+
+```c
+int old = atomic_read(&v);
+int nuevo;
+do {
+	nuevo = alguna_funcion(old);
+} while (!atomic_try_cmpxchg(&v, &old, nuevo));
+/* al salir, el swap tuvo exito; old NO hace falta releerlo */
+```
+
+Genera mejor código (aprovecha el flag de estado del procesador tras el `cmpxchg` en lugar de comparar a mano) y expresa la intención con claridad. Un ejemplo real y útil: mantener el máximo visto sin lock.
+
+```c
+static atomic_t max_visto = ATOMIC_INIT(0);
+
+static void registra(int valor)
+{
+	int old = atomic_read(&max_visto);
+
+	while (valor > old) {
+		if (atomic_try_cmpxchg(&max_visto, &old, valor))
+			break;          /* lo subimos nosotros */
+		/* fallo: otro nucleo lo cambio; old ya trae el valor fresco,
+		 * el while reevalua si aun somos mayores */
+	}
+}
+```
+
+## atomic64_t: cuando 32 bits no bastan
+
+`atomic_t` envuelve un `int` de 32 bits. Para estadísticas que cuentan bytes o paquetes durante meses, `2^32` se desborda en segundos. Ahí está `atomic64_t`, con exactamente la misma API sobre un `s64`:
+
+```c
+static atomic64_t bytes_totales = ATOMIC64_INIT(0);
+
+atomic64_add(len, &bytes_totales);        /* suma atomica de 64 bits */
+s64 total = atomic64_read(&bytes_totales);
+```
+
+Toda la familia tiene gemelo de 64 bits: `atomic64_inc`, `atomic64_dec_and_test`, `atomic64_cmpxchg`, `atomic64_try_cmpxchg`. Cuando quieras un entero atómico del tamaño natural del puntero (para índices o direcciones), existe `atomic_long_t`, que es `atomic_t` o `atomic64_t` según la arquitectura sea de 32 o 64 bits.
+
+Un detalle de implementación que importa: en arquitecturas de 32 bits sin una instrucción atómica de 64 bits, `atomic64_t` puede estar respaldado por un spinlock interno por hash de la dirección; en 64 bits es una sola instrucción de hardware. La API es idéntica en ambos casos, pero el coste no lo es, y esa es una de las razones para no usar `atomic64_t` cuando `atomic_t` basta.
+
+## Bits atómicos: flags concurrentes
+
+Muchas veces el estado compartido no es un número sino un puñado de *flags* en una palabra: activo, ocupado, cerrando. Manipular bits sueltos con `|=` y `&=` es, otra vez, un RMW no atómico. La solución es `include/linux/bitops.h`, que opera sobre un `unsigned long *` bit a bit y de forma atómica:
+
+```c
+#include <linux/bitops.h>
+
+#define FLAG_ACTIVO   0
+#define FLAG_OCUPADO  1
+
+static unsigned long estado;
+
+set_bit(FLAG_ACTIVO, &estado);      /* pone el bit 0, atomico */
+clear_bit(FLAG_ACTIVO, &estado);    /* lo quita, atomico */
+if (test_bit(FLAG_ACTIVO, &estado)) {
+	/* consulta el bit (solo lectura) */
+}
+```
+
+Pero la joya es `test_and_set_bit`: pone el bit *y devuelve su valor anterior*, todo en un átomo. Es el patrón canónico para reclamar un recurso una sola vez entre varios contendientes:
+
+```c
+if (!test_and_set_bit(FLAG_OCUPADO, &estado)) {
+	/* El bit estaba a 0 y lo pusimos NOSOTROS.
+	 * Somos el unico que gano la carrera: el recurso es nuestro. */
+} else {
+	/* Ya estaba a 1: otro lo reclamo antes. Nos retiramos. */
+}
+```
+
+El kernel usa esto sin cesar: un driver que solo admite un `open()` a la vez, un flag `sk->sk_flags` de un socket, un `bit` de estado en `dev->state`. Su gemelo `test_and_clear_bit` hace lo simétrico. Cuando ya sostienes un lock que protege la palabra, existen las variantes no atómicas `__set_bit` y `__clear_bit`, más rápidas porque no pagan la barrera.
+
+Cuando un solo `unsigned long` no basta, un *array* de ellos forma un mapa de bits de cualquier tamaño, y el kernel trae helpers para recorrerlo eficientemente: `find_first_bit`, `find_first_zero_bit` y el bucle `for_each_set_bit`. Así se gestionan estructuras como los IRQ en uso, los descriptores libres de un driver o los CPUs de una `cpumask`.
+
+<Callout type="note" title="Cada átomo viene en sabores de orden de memoria">
+Un mismo RMW existe con distintas barreras según lo que ordene a su alrededor: el nombre desnudo (`atomic_cmpxchg`, `xchg`) impone una barrera completa en caso de éxito; `_acquire` ordena los accesos *posteriores*, `_release` los *previos*, y `_relaxed` no ordena nada más allá de la propia atomicidad. Para lock-free de alto rendimiento se eligen con pinzas; mientras aprendes, el sabor completo por defecto es siempre el seguro. Nota el asimétrico: `set_bit` no lleva barrera, pero `test_and_set_bit`, al devolver información sobre la que decides, sí implica una.
+</Callout>
+
+<Callout type="dios" title="Todo lock-free se reduce a compare-and-swap">
+Aquí hay una de las verdades más profundas de la informática de sistemas. Con `atomic_inc` cuentas; pero con `atomic_cmpxchg` puedes construir *cualquier* estructura de datos concurrente sin un solo lock: pilas, colas, listas, contadores de referencia, hasta la implementación interna de los propios spinlocks y mutexes. CAS es una primitiva **universal** en el sentido técnico de Maurice Herlihy: tiene "consensus number" infinito, lo que significa que con ella un número arbitrario de hilos pueden ponerse de acuerdo sobre un valor, algo imposible con operaciones más débiles como un simple read o write atómicos. Toda la teoría de la sincronización sin bloqueo se apoya en este único ladrillo. Cuando escribes un bucle `do ... while (!atomic_try_cmpxchg(...))`, estás usando la operación más poderosa que un procesador de memoria compartida sabe ofrecer: la capacidad de decir "cambia esto a X, pero solo si nadie lo tocó desde que miré". De esa frase, repetida y reintentada, nace toda la concurrencia sin locks. Es poco código y una idea enorme.
+</Callout>
+
+<Callout type="warn" title="El problema ABA acecha al CAS ingenuo">
+CAS comprueba que el valor sea el mismo, no que *nadie lo haya tocado*. Si pasó de `A` a `B` y volvió a `A` mientras calculabas, tu `cmpxchg` tiene éxito creyendo que nada cambió: es el famoso **problema ABA**, la trampa clásica del lock-free con punteros. Para contadores que solo suben es inofensivo, pero al construir estructuras con punteros hace falta protección extra (contadores de generación, `cmpxchg` de doble ancho, o esquemas de reclamación como RCU). Lo lock-free es poderoso y sutil a partes iguales.
+</Callout>
+
+<Challenge title="Construye algo lock-free">
+1. Implementa un contador de máximo con `atomic_try_cmpxchg` como el del ejemplo, lánzalo desde varios kthreads con valores aleatorios y verifica que el máximo final es correcto.
+2. Reescribe el mismo bucle con `atomic_cmpxchg` en vez de `try` y explica la lectura extra que ahora necesitas en cada vuelta.
+3. Cambia un `atomic_t` de estadística por `atomic64_t` y razona en qué escenario real el de 32 bits se desbordaría.
+4. Usa `test_and_set_bit` para que un char device rechace un segundo `open()` mientras el primero esté activo; libéralo con `clear_bit` en `release`.
+5. Investiga el problema ABA: escribe en dos frases por qué tu contador de máximo es inmune pero una pila lock-free con punteros no lo sería.
+</Challenge>

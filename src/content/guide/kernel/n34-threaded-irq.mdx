@@ -1,0 +1,135 @@
+---
+title: "Threaded IRQ: la mitad inferior que sí puede dormir"
+description: "El modelo moderno de request_threaded_irq, donde un manejador primario atómico decide con IRQ_WAKE_THREAD y el trabajo pesado corre en un hilo del kernel dedicado que puede dormir, tomar mutex y hablar por buses lentos; por qué IRQF_ONESHOT es imprescindible y por qué PREEMPT_RT lo convirtió en el modelo por defecto del kernel."
+subject: kernel
+level: 34
+order: 3
+position: "34.3"
+duration: "16 min"
+---
+
+<Lead>
+Las mitades inferiores clásicas heredaron la maldición de la superior: corrían en contexto atómico y tampoco podían dormir. Pero la mayoría de los drivers reales necesitan justo eso —leer un sensor por I2C, tomar un mutex, esperar a un chip— y encadenarlo todo a mano con colas de trabajo era tedioso y frágil. La respuesta moderna es elegante: al registrar la interrupción, entregas dos funciones. Una, atómica, decide en nanosegundos si hay que actuar; la otra corre en un hilo del kernel propio, en contexto de proceso, donde vuelves a tener el derecho a dormir.
+</Lead>
+
+<Goals>
+
+- Registrar un manejador dividido con `request_threaded_irq`.
+- Repartir el trabajo entre el `handler` primario atómico y el `thread_fn` que duerme.
+- Devolver `IRQ_WAKE_THREAD` y entender el papel de `IRQF_ONESHOT`.
+- Comprender por qué el modelo con hilo es hoy el preferido y su vínculo con PREEMPT_RT.
+
+</Goals>
+
+## request_threaded_irq: dos funciones, dos mundos
+
+La firma revela la simetría: un manejador primario y un manejador de hilo, registrados de una vez.
+
+```c
+int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+                         irq_handler_t thread_fn, unsigned long flags,
+                         const char *name, void *dev);
+```
+
+`handler` es el primario: corre en contexto de interrupción dura, atómico, y su único trabajo suele ser mirar el estado y decidir. `thread_fn` es la mitad inferior: el núcleo la ejecuta en un hilo del kernel dedicado a esta línea —lo verás en `ps` como `irq/NN-nombre`— que vive en contexto de proceso y **puede dormir**. El primario dispara al hilo devolviendo `IRQ_WAKE_THREAD`.
+
+```c
+static irqreturn_t sensor_hard(int irq, void *dev_id)
+{
+	struct sensor *s = dev_id;
+	u32 status = readl(s->regs + REG_STATUS);   /* lectura MMIO rápida */
+
+	if (!(status & INT_LISTO))
+		return IRQ_NONE;                    /* no era mío */
+	return IRQ_WAKE_THREAD;                      /* despierta al hilo */
+}
+
+static irqreturn_t sensor_thread(int irq, void *dev_id)
+{
+	struct sensor *s = dev_id;
+	int val;
+
+	val = i2c_smbus_read_word_data(s->client, REG_MUESTRA); /* DUERME: bus I2C */
+	if (val < 0)
+		return IRQ_HANDLED;
+
+	mutex_lock(&s->lock);            /* permitido: contexto de proceso */
+	s->ultima = val;
+	mutex_unlock(&s->lock);
+
+	input_report_abs(s->input, ABS_MISC, val);  /* despierta a la pila de entrada */
+	input_sync(s->input);
+	return IRQ_HANDLED;
+}
+```
+
+El primario habla el idioma del silicio en microsegundos; el hilo se toma su tiempo por el bus I2C, que puede tardar milisegundos, sin bloquear a nadie porque está sujeto al planificador como cualquier otra tarea.
+
+## El primario opcional y IRQF_ONESHOT
+
+Muchos drivers no tienen nada urgente que hacer arriba: les basta con que el hilo se despierte. Para ellos, pasa `handler = NULL` y el núcleo instala uno por defecto, `irq_default_primary_handler`, que se limita a devolver `IRQ_WAKE_THREAD`. Pero ahí acecha una trampa en las líneas por nivel: si el primario no reconoce la interrupción en el hardware, esta sigue activa y reingresa antes de que el hilo la trate. La solución es `IRQF_ONESHOT`:
+
+```c
+/* solo hilo; ONESHOT mantiene la línea enmascarada hasta que el hilo acaba */
+ret = devm_request_threaded_irq(&client->dev, client->irq,
+				NULL, sensor_thread,
+				IRQF_ONESHOT | IRQF_TRIGGER_FALLING,
+				"mi-sensor", s);
+if (ret)
+	return dev_err_probe(&client->dev, ret, "no pude pedir la IRQ\n");
+```
+
+`IRQF_ONESHOT` le dice al núcleo que **no desenmascare la línea al terminar el primario, sino solo cuando el hilo haya devuelto**. Así, entre el disparo y el final del `thread_fn`, la fuente permanece silenciada y no hay tormenta. Es obligatorio siempre que el primario sea `NULL`, y el núcleo rechaza el registro con `-EINVAL` si lo olvidas en ese caso.
+
+<Mermaid code={`sequenceDiagram
+  participant HW as Dispositivo
+  participant P as Primario atomico
+  participant K as Hilo irq/NN
+  HW->>P: eleva la linea
+  P->>P: mira estado, decide
+  P-->>HW: enmascara con ONESHOT
+  P->>K: devuelve IRQ_WAKE_THREAD
+  Note over K: contexto de proceso: puede dormir
+  K->>HW: lee por I2C, procesa, reconoce
+  K-->>HW: desenmascara la linea al terminar`} />
+
+## Por qué es hoy la opción preferida
+
+Tres razones han hecho del threaded IRQ el modelo por defecto del kernel moderno. Primero, **simplicidad**: escribes código que duerme directamente en el `thread_fn`, sin montar tú la fontanería de una cola de trabajo ni gestionar el traspaso. Segundo, **prioridad**: el hilo de IRQ es una entidad del planificador de pleno derecho; se le puede asignar prioridad de tiempo real con `SCHED_FIFO`, de modo que la interrupción de un dispositivo crítico adelante a la de uno trivial, algo imposible con un softirq. Tercero, **aislamiento**: el trabajo pesado es ahora preemptible y contabilizado; un `thread_fn` largo ya no congela la máquina, solo consume su propia rebanada planificada.
+
+```bash
+# los hilos de IRQ son tareas reales; míralos y priorízalos
+ps -eo pid,cls,rtprio,comm | grep 'irq/'
+# subir la prioridad RT del hilo de una línea concreta
+chrt -f -p 50 $(pgrep -f 'irq/48-mi-sensor')
+```
+
+Frente a las alternativas: un softirq o un tasklet no pueden dormir ni recibir prioridad por dispositivo; una workqueue puede, pero te obliga a orquestar el traspaso desde el manejador a mano. El threaded IRQ **empaqueta ese traspaso dentro del propio registro de la interrupción**: una sola llamada te da la mitad superior, la inferior, el hilo y el enmascarado coherente. Para el caso dominante —"atiende esta interrupción, pero déjame dormir mientras lo hago"— es la respuesta más directa y la que recomienda la comunidad para código nuevo.
+
+## El coste: no todo debe ir a un hilo
+
+Threadear no es gratis: cada interrupción paga un despertar y un cambio de contexto hacia el hilo `irq/NN`. Para la inmensa mayoría de dispositivos —sensores, GPIO, finalización de almacenamiento, controladores lentos— ese coste es insignificante frente a la libertad de dormir, y por eso el threaded IRQ es el defecto. Pero en fuentes de altísima frecuencia —una NIC de 40 GbE que interrumpiría millones de veces por segundo— pagar un cambio de contexto por interrupción sería ruinoso; ahí sigue reinando el modelo del softirq con sondeo por lotes (nivel 34.4), donde una mitad superior mínima solo eleva un softirq y no despierta hilo alguno por evento. Como bonus, el hilo de IRQ se puede confinar a una CPU para no perturbar a las demás, algo decisivo en sistemas de baja latencia:
+
+```bash
+# confinar la entrega de la línea 48 y su hilo a la CPU 2
+echo 2 > /proc/irq/48/smp_affinity_list
+taskset -cp 2 $(pgrep -f 'irq/48-mi-sensor')
+```
+
+La regla fina: threaded IRQ cuando necesitas dormir y la frecuencia es moderada; softirq cuando es tan brutal que el propio cambio de contexto se vuelve el cuello de botella.
+
+<Callout type="info" title="PREEMPT_RT hizo de esto la norma">
+Desde que PREEMPT_RT se fusionó en la línea principal, el kernel puede forzar que casi todas las interrupciones corran en hilo (arranque con `threadirqs`, o de serie bajo la configuración de tiempo real). En un sistema RT, un manejador dura que se demore arruina la garantía de latencia acotada; convertirlo en hilo planificable la restaura. Lo que empezó como una opción para drivers que necesitaban dormir terminó siendo la piedra angular del Linux determinista.
+</Callout>
+
+<Callout type="dios" title="La interrupción deja de ser especial y se vuelve un hilo más">
+Aquí se cierra un arco conceptual que empezó dos niveles atrás. La interrupción nació como una costura atómica en el tiempo: sin proceso, sin planificador, sin derecho a dormir, un lugar ontológicamente aparte del resto del kernel. El threaded IRQ disuelve esa excepción. La mitad superior queda reducida a un instante mínimo —a menudo un `handler` nulo que solo dice "despierta al hilo"— y todo el peso de atender el dispositivo migra a un `struct task_struct` corriente, con su PID, su clase de planificación, su prioridad y su contabilidad, indistinguible para el planificador de cualquier otro hilo del sistema. Piénsalo: la interrupción, esa irrupción violenta del hardware que rompía el flujo de ejecución, acaba domesticada en una tarea que se puede priorizar, preemptir, migrar entre CPUs y observar en `ps`. El hardware sigue imponiendo su señal desde fuera, pero la respuesta del software ya no vive en el limbo sin planificador: vive en el mismo reino ordinario donde vive todo lo demás. Esta es la idea que hace posible el tiempo real en Linux, y es más profunda que una API: es la afirmación de que la atomicidad de la interrupción no es una verdad física inevitable sino una elección de diseño que puede reducirse casi a cero. Cuando entiendas que "manejar una interrupción" y "planificar un hilo" son, en el modelo moderno, la misma operación vista desde dos lados, habrás comprendido por qué el determinismo dejó de ser patrimonio de kernels especializados y entró en la corriente principal.
+</Callout>
+
+<Challenge title="Convierte un manejador atómico en threaded">
+1. Toma un manejador que hoy hace todo en contexto de interrupción y sepáralo en un primario que devuelve `IRQ_WAKE_THREAD` y un `thread_fn` que hace el trabajo pesado.
+2. Registra con `request_threaded_irq` pasando `handler = NULL` y `IRQF_ONESHOT`, y explica por qué el núcleo rechazaría el registro sin esa bandera.
+3. En el `thread_fn`, toma un `mutex` y llama a una función que duerme; justifica por qué ahora es legal y antes era un `BUG`.
+4. Localiza el hilo `irq/NN` de tu dispositivo en `ps` y súbele la prioridad con `chrt`; observa el efecto en la latencia bajo carga.
+5. Argumenta en qué caso un primario no nulo sigue mereciendo la pena frente a delegarlo todo al hilo.
+</Challenge>

@@ -1,0 +1,151 @@
+---
+title: "El modificador .task: trabajo con vida propia"
+description: "Cómo .task ancla trabajo asíncrono al ciclo de vida de una vista SwiftUI, qué significa exactamente que se cancele al desaparecer, y por qué la cancelación en Swift es cooperativa y nunca forzosa."
+subject: ios
+level: 15
+order: 1
+position: "15.1"
+duration: "14 min"
+---
+
+<Lead>
+Una vista de SwiftUI no es un objeto: es un valor efímero que el framework crea, compara y destruye docenas de veces por segundo. Anclar trabajo asíncrono a algo tan volátil parecería temerario, y sin embargo `.task` lo consigue con una garantía muy precisa: la tarea vive exactamente lo que vive la identidad de la vista, y muere cancelada —no abortada— cuando esa identidad desaparece. Entender esa diferencia es entender toda la concurrencia de la interfaz.
+</Lead>
+
+<Goals>
+
+- Entender qué crea `.task` y a qué nodo del árbol de vistas queda atado.
+- Distinguir cancelación cooperativa de terminación forzosa.
+- Usar `.task(id:)` para reiniciar el trabajo cuando cambia la entrada.
+- Reconocer qué operaciones ignoran la cancelación y cómo obligarlas a respetarla.
+
+</Goals>
+
+## La vista como raíz de un árbol de tareas
+
+`.task` no es azúcar sintáctico sobre `onAppear` más `Task`. El modificador registra un cierre asíncrono que SwiftUI arranca cuando la vista entra en la jerarquía, y guarda el handle resultante **junto al nodo del árbol de vistas**. Cuando ese nodo se destruye, SwiftUI invoca `cancel` sobre el handle.
+
+```swift
+struct DetalleView: View {
+    let id: Perfil.ID
+    @State private var perfil: Perfil?
+
+    var body: some View {
+        Group {
+            if let perfil { PerfilCard(perfil: perfil) }
+            else { ProgressView() }
+        }
+        .task {
+            perfil = try? await ServicioPerfil.cargar(id)
+        }
+    }
+}
+```
+
+Dos propiedades hacen que esto sea sólido y no una convención frágil:
+
+1. **Hereda el aislamiento de actor del cuerpo de la vista.** El cierre corre en el actor principal, así que asignar a `perfil` es legal sin ceremonia alguna. Lo veremos a fondo en la lección 15.2.
+2. **Es una tarea con contexto estructurado.** Hereda prioridad y valores de tarea locales, y puede ajustarse con `.task(priority: .background)` cuando el resultado no es urgente para el primer fotograma.
+
+La consecuencia práctica: no necesitas guardar el handle en una propiedad, ni cancelarlo en `onDisappear`, ni preocuparte por una vista que ya no existe recibiendo datos. Ese ciclo lo cierra el framework.
+
+## Cancelación cooperativa: nadie te mata, te avisan
+
+Aquí vive el malentendido más caro del modelo. En Swift, `cancel` **no interrumpe** la ejecución: activa un bit en la tarea. Si tu código no lo consulta, sigue corriendo hasta el final, consumiendo CPU y batería para producir un resultado que nadie va a leer.
+
+Las APIs de la biblioteca estándar y de Foundation sí lo consultan, y ahí es donde la mayoría de la gente cree que la cancelación es automática:
+
+```swift
+try await Task.sleep(for: .seconds(2))        // lanza CancellationError
+let (datos, _) = try await URLSession.shared.data(from: url)  // lanza
+```
+
+Pero un bucle de cálculo puro, o un `for await` sobre un flujo que nunca suspende de forma cancelable, no comprueba nada. Ahí la responsabilidad es tuya:
+
+```swift
+.task {
+    for pagina in 0..<total {
+        try Task.checkCancellation()          // aborta lanzando
+        let bloque = await indexar(pagina)
+        guard !Task.isCancelled else { return } // aborta en silencio
+        acumular(bloque)
+    }
+}
+```
+
+`checkCancellation` es la forma correcta cuando quieres propagar el error hacia arriba; `isCancelled` sirve cuando prefieres salir limpiamente conservando el trabajo parcial ya hecho.
+
+Hay un tercer mecanismo, mucho menos conocido y muy útil cuando la cancelación exige liberar un recurso externo. `withTaskCancellationHandler` registra un cierre síncrono que el runtime invoca en el instante en que llega la cancelación, sin esperar al siguiente punto de suspensión:
+
+```swift
+await withTaskCancellationHandler {
+    await lector.consumir(flujo)
+} onCancel: {
+    lector.cerrarConexion()      // se ejecuta ya, no cuando toque
+}
+```
+
+El cierre de `onCancel` puede correr en cualquier hilo y de forma concurrente con el cuerpo, así que solo debe tocar estado seguro para concurrencia. A cambio, es la única vía para cortar de inmediato un socket, un `AVCaptureSession` o cualquier recurso que no consulte el bit por su cuenta.
+
+<Callout type="dios" title="La cancelación es un contrato semántico, no un mecanismo del runtime">
+Muchos sistemas concurrentes ofrecen terminación forzosa: un hilo se mata y punto. Swift la rechazó deliberadamente, y la razón es de corrección, no de comodidad. Matar un hilo en un punto arbitrario deja invariantes rotos: un fichero a medio escribir, un lock adquirido y jamás liberado, una estructura de datos en estado imposible. Con cancelación cooperativa, la tarea **elige** dónde es seguro rendirse, y esos puntos coinciden con las fronteras que ya habías diseñado: entre páginas, entre elementos, entre transacciones. El precio es que la corrección deja de ser automática y pasa a ser tu responsabilidad de diseño: si tu bucle no consulta el bit, tu vista desaparecida seguirá quemando batería en el bolsillo del usuario. Por eso la pregunta correcta al escribir un `.task` no es "esto se cancela", sino "dónde exactamente decido yo que rendirse es seguro".
+</Callout>
+
+## `.task(id:)` y la reidentificación
+
+Si el trabajo depende de una entrada que cambia mientras la vista sigue viva —una selección, un término de búsqueda, un filtro—, `.task` solo no basta: el cierre corrió una vez, con el valor viejo. La variante con identificador resuelve exactamente eso.
+
+```swift
+struct BusquedaView: View {
+    @State private var termino = ""
+    @State private var resultados: [Item] = []
+
+    var body: some View {
+        List(resultados) { ItemRow(item: $0) }
+            .searchable(text: $termino)
+            .task(id: termino) {
+                try? await Task.sleep(for: .milliseconds(300))  // debounce
+                resultados = (try? await api.buscar(termino)) ?? []
+            }
+    }
+}
+```
+
+Cuando `termino` cambia, SwiftUI compara el nuevo valor con el anterior usando `Equatable`, cancela la tarea en curso y arranca una nueva. El `sleep` inicial convierte eso en un debounce gratuito: si el usuario sigue tecleando, la tarea anterior se cancela durante la espera y jamás llega a pedir nada a la red. Es el equivalente declarativo de un operador de tipo *switch to latest*, sin librería reactiva de por medio.
+
+Conviene no confundir dos identidades distintas. El modificador `.id` sobre la vista destruye y reconstruye **todo** su estado, incluidos los `@State`. `.task(id:)` reinicia solo la tarea y deja el estado intacto. Elegir mal el nivel de granularidad es una fuente clásica de parpadeos y de estado perdido.
+
+<Mermaid code={`flowchart TD
+  A[La vista entra en la jerarquia] --> B[SwiftUI arranca la tarea hija]
+  B --> C{Cambia el valor de id}
+  C -->|si| D[Cancel a la tarea anterior]
+  D --> B
+  C -->|no| E{La vista desaparece}
+  E -->|si| F[Cancel y fin del ciclo]
+  E -->|no| G[La tarea sigue viva]
+  class D t-yellow
+  class F t-green`} />
+
+## Las fronteras del modificador
+
+<Cards>
+  <Card icon="🌀" title="No sobrevive a la vista">
+    Si el trabajo debe terminar aunque el usuario navegue atrás —subir una foto, guardar un borrador—, `.task` es el sitio equivocado. Eso pertenece a un actor o a un servicio de larga vida.
+  </Card>
+  <Card icon="⏱️" title="Trabajo síncrono no se cancela">
+    Un `for` que calcula sin suspender ignora el bit de cancelación por completo. Debes insertar comprobaciones explícitas o trocear el trabajo.
+  </Card>
+  <Card icon="🔁" title="Reaparecer relanza">
+    En un `TabView` o una pila de navegación, volver a una vista vuelve a ejecutar el cierre. Si la carga es cara, esa idempotencia hay que diseñarla, no suponerla.
+  </Card>
+</Cards>
+
+La regla mental que conviene interiorizar: `.task` expresa *trabajo cuyo resultado solo interesa mientras esta pantalla exista*. Todo lo demás —persistencia, envíos, sincronización— necesita un dueño con un ciclo de vida más largo, y ese dueño rara vez es una vista.
+
+<Challenge title="Ata el trabajo a la vista">
+1. Sustituye un `onAppear` que lanzaba un `Task` manual por un `.task` y elimina el handle que guardabas.
+2. Añade un bucle largo dentro del cierre y comprueba con un `print` que sigue corriendo tras salir de la pantalla.
+3. Arréglalo insertando `try Task.checkCancellation()` en cada iteración y verifica que ahora sí se detiene.
+4. Convierte un campo de búsqueda a `.task(id:)` con un `Task.sleep` inicial como debounce.
+5. Razona por escrito qué trabajo de tu app **no** debería vivir nunca en un `.task` y dónde lo colocarías.
+</Challenge>

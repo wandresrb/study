@@ -1,0 +1,193 @@
+---
+title: "Forward y el coste O(objetos · luces)"
+description: "Por qué el forward clásico se rompe al crecer el número de luces, cómo las override constants domestican la explosión de variantes de shader, y qué arregla exactamente un depth prepass."
+subject: webgpu
+level: 39
+order: 1
+position: "39.1"
+duration: "20 min"
+---
+
+<Lead>
+El forward rendering es la arquitectura que sale sola: dibujas cada objeto una vez y en su fragment shader recorres las luces. Funciona, es simple, y tiene la propiedad de que todo lo demás —transparencia, MSAA, materiales raros— encaja sin pelear. El problema aparece cuando el número de luces deja de ser tres y pasa a ser cien: el coste no crece, se multiplica. Y antes de eso, mucho antes, te habrá reventado algo menos evidente, que es el número de pipelines distintos que necesitas compilar.
+</Lead>
+
+<Goals>
+
+- Calcular el número real de evaluaciones de luz por fotograma a partir de resolución, overdraw y número de luces.
+- Explicar por qué la especialización por número y tipo de luz produce una explosión combinatoria de pipelines.
+- Usar override constants de WGSL para especializar un shader sin duplicar el fuente.
+- Montar un depth prepass correcto con `depthCompare: 'equal'` y saber cuándo compensa y cuándo no.
+
+</Goals>
+
+## La multiplicación que nadie quiere hacer
+
+Un fragment shader forward tiene esta forma, con variantes cosméticas en todos los motores del mundo:
+
+```wgsl
+@fragment
+fn fs_pbr(entrada: Varyings) -> @location(0) vec4f {
+  let n = normalize(entrada.normalMundo);
+  let v = normalize(camara.posicion - entrada.posMundo);
+  var acumulado = vec3f(0.0);
+
+  for (var i = 0u; i < escena.numLuces; i = i + 1u) {
+    acumulado = acumulado + contribucion(luces[i], entrada.posMundo, n, v);
+  }
+
+  return vec4f(acumulado, 1.0);
+}
+```
+
+El bucle es la arquitectura entera. Cada fragmento que sobrevive al test de profundidad ejecuta ese bucle completo, y la cuenta total es el producto de tres números que la gente suele mirar por separado.
+
+A 1920x1080 hay 2 073 600 píxeles. Ese es el suelo. Encima va el overdraw: en una escena con vegetación, interiores o cualquier cosa que se solape, un overdraw medio de 3 es conservador, y significa 6 220 800 ejecuciones de fragment shader para llenar una pantalla de dos millones de píxeles. Con 100 luces, ese bucle se ejecuta **622 080 000 veces por fotograma**. A 60 fotogramas por segundo son 3,7 · 10¹⁰ evaluaciones de luz por segundo. Si cada contribución cuesta unas veinte operaciones de coma flotante entre atenuación, distribución de microfacetas y Fresnel, estás pidiendo del orden de 7 · 10¹¹ operaciones por segundo solo para iluminar, sin contar texturas, sombras ni post-proceso.
+
+Lo que hace que esto sea insalvable no es el tamaño del número, es su forma. Añadir una luz más no cuesta lo que ilumina esa luz: cuesta 6,2 millones de evaluaciones, ilumine algo o no. Una bombilla de radio dos metros escondida en una habitación cerrada al otro lado del mapa se evalúa en cada fragmento de la pantalla, se atenúa a cero, y se descarta. Has pagado el coste completo por un resultado nulo.
+
+El parche clásico es el culling por objeto en la CPU: para cada malla, calcular qué luces tocan su volumen envolvente y pasarle solo esas. Ayuda, y es lo primero que hay que hacer, pero no cambia la naturaleza del problema. Un suelo grande sigue siendo un objeto, sigue tocando cincuenta luces, y cada uno de sus fragmentos —incluidos los que están a cuarenta metros de todas ellas— evalúa las cincuenta. La granularidad del culling es el objeto, y el objeto es demasiado grande.
+
+## La explosión de variantes y las override constants
+
+El segundo problema del forward es de compilación, no de ejecución. El bucle de arriba lee `escena.numLuces` de un uniform, así que el shader es genérico. Eso tiene un precio: el compilador no puede desenrollar el bucle, no puede eliminar las ramas de tipos de luz que esta malla no usa, y tiene que reservar registros para el peor caso. En un fragment shader la presión de registros determina cuántas invocaciones caben en vuelo a la vez, y por tanto cuánta latencia de memoria puedes esconder. Un shader genérico es un shader lento.
+
+La respuesta histórica fue especializar: compilar una variante por combinación. Y ahí empieza la aritmética incómoda. Si tienes tres tipos de luz —direccional, puntual y de foco— y quieres especializar por cuántas hay de cada tipo, con un máximo de ocho de cada, son nueve valores posibles por tipo, es decir `9³ = 729` combinaciones. Multiplica por dos si el material puede tener sombras o no, por dos más si tiene mapa de normales, por dos por el mapa de oclusión: **2916 pipelines** para un solo material. Cada uno tarda entre decenas y cientos de milisegundos en compilar en el driver. Nadie compila eso al arrancar, así que se compila bajo demanda, y por eso los juegos tienen tirones la primera vez que entras en una sala nueva.
+
+WGSL ataca la mitad del problema con las **override constants**. Se declaran a nivel de módulo con la palabra `override` y admiten los tipos escalares `bool`, `i32`, `u32`, `f32` y `f16`:
+
+```wgsl
+override MAX_LUCES:   u32  = 8u;
+override USA_SOMBRAS: bool = false;
+
+@fragment
+fn fs_pbr(entrada: Varyings) -> @location(0) vec4f {
+  var acumulado = vec3f(0.0);
+  let n = min(MAX_LUCES, escena.numLuces);
+
+  for (var i = 0u; i < n; i = i + 1u) {
+    var c = contribucion(luces[i], entrada);
+    if (USA_SOMBRAS) { c = c * factorSombra(luces[i], entrada.posMundo); }
+    acumulado = acumulado + c;
+  }
+
+  return vec4f(acumulado, 1.0);
+}
+```
+
+El valor se fija al crear el pipeline, no al crear el módulo:
+
+```js
+const module = device.createShaderModule({ code: wgsl, label: 'pbr' });
+
+const pipelineOchoLuces = device.createRenderPipeline({
+  layout: pipelineLayout,
+  vertex:   { module, entryPoint: 'vs' },
+  fragment: {
+    module,
+    entryPoint: 'fs_pbr',
+    constants: { MAX_LUCES: 8, USA_SOMBRAS: 0 },   // los bool se pasan como 0 o 1
+    targets: [{ format: formatoLienzo }],
+  },
+  depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+});
+```
+
+Con `MAX_LUCES` fijado, el compilador conoce la cota superior del bucle y puede desenrollarlo; con `USA_SOMBRAS` en `false`, elimina la rama entera y con ella todos los registros y los bindings de la textura de sombras que esa rama tocaba. Es exactamente la especialización de antes, pero con **un solo fuente WGSL y un solo `GPUShaderModule`**.
+
+Conviene ser preciso con lo que esto sí resuelve y lo que no. No reduce el número de pipelines: sigues creando uno por combinación, y el driver sigue compilando un binario por cada uno. Lo que elimina es la generación de fuentes por concatenación de cadenas, el laberinto de `#define` heredado de GLSL, y el reparse del módulo. Y hay un límite duro que descoloca a mucha gente la primera vez: una override constant **no puede dimensionar un array en un buffer uniform o storage**. WGSL solo admite expresiones de override para el tamaño de un array en el espacio de direcciones `workgroup` y para los argumentos de `@workgroup_size`. Para el array de luces de un uniform tienes que declarar un tamaño máximo constante y recorrer solo la parte útil, que es lo que hace el código de arriba.
+
+## El depth prepass
+
+De los dos costes, el del overdraw tiene una solución exacta y barata. La idea es separar el "quién está delante" del "de qué color es": una primera pasada que solo escribe profundidad, sin fragment shader, y una segunda que sombrea sabiendo ya que cada fragmento que le llega es el ganador definitivo.
+
+En WebGPU el pipeline de la primera pasada se declara literalmente sin etapa de fragmento. El campo `fragment` es opcional en `GPURenderPipelineDescriptor`, y omitirlo es la forma canónica de decir "esto es solo profundidad":
+
+```js
+const prepass = device.createRenderPipeline({
+  label: 'depth prepass',
+  layout: pipelineLayout,
+  vertex: { module, entryPoint: 'vs_solo_posicion', buffers: [layoutVertices] },
+  primitive: { topology: 'triangle-list', cullMode: 'back' },
+  depthStencil: {
+    format: 'depth32float',
+    depthWriteEnabled: true,
+    depthCompare: 'less',
+  },
+  // sin fragment: no hay ningun color attachment y no se ejecuta ningun fragment shader
+});
+
+const sombreado = device.createRenderPipeline({
+  label: 'forward shading',
+  layout: pipelineLayout,
+  vertex:   { module, entryPoint: 'vs_completo', buffers: [layoutVertices] },
+  fragment: { module, entryPoint: 'fs_pbr', targets: [{ format: formatoLienzo }] },
+  primitive: { topology: 'triangle-list', cullMode: 'back' },
+  depthStencil: {
+    format: 'depth32float',
+    depthWriteEnabled: false,
+    depthCompare: 'equal',
+  },
+});
+```
+
+Los dos pases se codifican así, y hay un detalle de la API que casi nadie usa y que aquí es gratis:
+
+```js
+const pase1 = encoder.beginRenderPass({
+  colorAttachments: [],
+  depthStencilAttachment: {
+    view: vistaProfundidad,
+    depthClearValue: 1.0,
+    depthLoadOp:  'clear',
+    depthStoreOp: 'store',
+  },
+});
+// ... dibujar toda la geometria opaca con el pipeline prepass
+pase1.end();
+
+const pase2 = encoder.beginRenderPass({
+  colorAttachments: [{
+    view: vistaLienzo,
+    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+    loadOp: 'clear',
+    storeOp: 'store',
+  }],
+  depthStencilAttachment: {
+    view: vistaProfundidad,
+    depthReadOnly: true,   // no lleva loadOp ni storeOp: seria un error de validacion
+  },
+});
+```
+
+`depthReadOnly: true` declara que el pase no toca la profundidad. La validación entonces **prohíbe** que le des `depthLoadOp` o `depthStoreOp`, y prohíbe usar en él cualquier pipeline con `depthWriteEnabled: true`. A cambio, el driver sabe que no necesita escribir el buffer de vuelta a memoria al terminar, lo cual en una GPU por tiles se traduce en no hacer el store del tile de profundidad.
+
+Queda una trampa, y es la que hace que la técnica falle en producción con síntomas incomprensibles. `depthCompare: 'equal'` compara bits. Si el vertex shader de la primera pasada calcula la posición de recorte con una secuencia de operaciones distinta a la de la segunda —por ejemplo, uno hace `proj * (view * (model * p))` y el otro precalcula `viewProj` en la CPU—, el resultado en coma flotante puede diferir en el último bit y ese fragmento desaparece. El síntoma es moteado de píxeles negros que cambia al mover la cámara. La red de seguridad la da WGSL con el atributo `@invariant`, que solo puede aplicarse al builtin de posición y que obliga al compilador a generar el mismo cálculo en todos los pipelines que compartan ese código:
+
+```wgsl
+struct SalidaVS {
+  @invariant @builtin(position) posicion: vec4f,
+  @location(0) normalMundo: vec3f,
+  @location(1) posMundo:    vec3f,
+};
+```
+
+Ponlo en los dos pipelines y, además, comparte la función que calcula la posición entre ambos. Si el prepass usa un vertex shader recortado, que la parte que produce `posicion` sea literalmente la misma función.
+
+<Callout type="dios" title="El depth prepass no es gratis, y en móvil suele ser una pérdida">
+Se enseña como si fuera una optimización universal y no lo es: es un intercambio, y hay que saber qué lado estás pagando. El prepass duplica el coste de vértices, duplica las llamadas de dibujado y duplica el trabajo de la CPU codificando comandos. Sale a cuenta cuando el fragment shader es caro —muchas luces, muchas texturas, parallax, subsurface— y el overdraw es alto. Con un fragment shader barato o con poco solapamiento, pierdes: pagas dos veces la geometría para ahorrar un sombreado que era trivial. Hay un segundo motivo, menos conocido, para no lanzarse: las GPU modernas ya hacen buena parte de este trabajo solas. El rechazo temprano de profundidad jerárquico descarta bloques enteros de píxeles antes de lanzar sus shaders, y si ordenas la geometría opaca de delante a atrás por su volumen envolvente —que cuesta una ordenación de unos cientos de elementos en la CPU— capturas la mayor parte del beneficio sin una segunda pasada. Y en las GPU de móvil el balance se invierte del todo. Las arquitecturas por tiles con eliminación de superficies ocultas en hardware (PowerVR, y con esquemas equivalentes Mali y Adreno) resuelven la visibilidad dentro del tile antes de sombrear, en memoria on-chip: el overdraw de sombreado ya es prácticamente cero sin que hagas nada, y tu prepass solo añade una pasada completa de geometría y un round trip del buffer de profundidad a memoria principal. La regla operativa: mide con `timestamp-query` el coste del pase de sombreado antes y después. Si el prepass no te devuelve claramente más de lo que cuesta la pasada extra de vértices, quítalo.
+</Callout>
+
+## Lo que el forward hace mejor que nadie
+
+Nada de lo anterior significa que el forward sea una arquitectura de la que haya que escapar. Tiene cuatro propiedades que las alternativas pagan caras, y que conviene tener presentes antes de tirar por la ruta de [desacoplar geometría y sombreado con un G-buffer](/guia/webgpu/n39-el-g-buffer/).
+
+**MSAA nativo y gratis.** El multisampling en forward funciona porque el hardware sombrea una vez por píxel cubierto y almacena la cobertura por muestra: el coste de 4x MSAA en una escena forward es el de la memoria del render target multiplicada por cuatro, no el del sombreado. El resolve lo hace el hardware. Es el antialiasing de mejor calidad por unidad de coste que existe, y no introduce ni desenfoque ni retardo temporal.
+
+**Transparencia natural.** Un objeto translúcido es simplemente un objeto que se dibuja después, con `depthWriteEnabled: false` y una configuración de `blend` en su `GPUColorTargetState`. No hay una segunda ruta de material, ni un shader duplicado, ni un caso especial en la arquitectura. Sigue habiendo que ordenar de atrás a delante, que es un problema real, pero es el mismo problema que tendrías en cualquier otra arquitectura.
+
+**Materiales heterogéneos sin límite.** Cada objeto puede tener su propio modelo de sombreado. Piel con dispersión subsuperficial, pelo con un modelo anisótropo, cristal con refracción, un shader de agua con su propia función de normales: cada uno es un pipeline distinto y ya está. No hay que empaquetar los parámetros de todos ellos en un conjunto común de canales.
+
+**Ancho de banda mínimo.** Una pasada forward escribe cuatro bytes de color por muestra y cuatro de profundidad. A 1080p y 60 fps son unos 0,5 GB/s de tráfico de escritura. Ese número es el que hay que tener en la cabeza como referencia cuando aparezcan los [gigabytes por segundo del deferred](/guia/webgpu/n39-los-problemas-del-deferred/), porque la comparación no es entre dos formas de iluminar: es entre dos órdenes de magnitud de tráfico de memoria.
+
+El forward no falla por lo que hace. Falla por una cosa concreta: la granularidad del culling de luces es el objeto, cuando debería ser la región del espacio. Arreglar eso sin renunciar a las cuatro propiedades de arriba es justamente lo que hacen las [arquitecturas por tiles y por clusters](/guia/webgpu/n39-forward-plus-y-clustered/).

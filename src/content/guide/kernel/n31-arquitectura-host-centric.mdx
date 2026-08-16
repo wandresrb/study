@@ -1,0 +1,132 @@
+---
+title: "La arquitectura USB: un bus con un solo amo"
+description: "Por qué USB invierte el modelo de pares del PCI y coloca todo el poder en un único host, cómo se organiza el árbol escalonado de hubs, y las cuatro capas de abstracción (dispositivo, configuración, interfaz, endpoint) en las que se describe cualquier periférico. La raíz de que USB sea enumerable y conectable en caliente."
+subject: kernel
+level: 31
+order: 1
+position: "31.1"
+duration: "14 min"
+---
+
+<Lead>
+Enchufas un teclado y funciona; lo arrancas en caliente y desaparece sin reiniciar. Detrás de esa comodidad hay una decisión de diseño radical: en USB no hay iguales. Un único host manda y decenas de dispositivos obedecen, hablando solo cuando se les pregunta. Esa asimetría, cara opuesta al PCI de pares del nivel 30, es exactamente lo que hace a USB barato, enumerable y conectable en caliente. Abrimos el nivel desentrañando esa arquitectura: quién manda, cómo se despliega el árbol de hubs, y las cuatro capas en las que el kernel modela cualquier periférico.
+</Lead>
+
+<Goals>
+
+- Entender el modelo host-centric y por qué un dispositivo nunca inicia una transferencia.
+- Recorrer la topología en estrella escalonada de hubs y sus límites (127 direcciones, 7 niveles).
+- Distinguir las cuatro capas de abstracción: `usb_device`, configuración, interfaz y endpoint.
+- Ver por qué USB es un bus enumerable y conectable en caliente.
+
+</Goals>
+
+## El modelo host-centric
+
+En USB el **controlador anfitrión** (el host controller, un xHCI en 2026) es el único maestro del bus. Toda transacción la planifica y la inicia el host; el dispositivo es **pasivo** y no puede hablar por iniciativa propia. Incluso lo que USB llama "interrupt" no es una interrupción que el aparato lance al bus: es el host quien **sondea** periódicamente el endpoint, y el dispositivo responde `NAK` si no tiene nada. La única excepción es la señalización de *remote wakeup*, que despierta un bus suspendido, y aun esa la habilita el host.
+
+La razón es económica. Concentrar la inteligencia y el coste en un componente que hay uno por máquina —el HCD— permite que los periféricos sean **tontos y baratos**: un ratón de dos euros no necesita un motor de DMA ni arbitrar un bus. Es el reverso exacto de PCIe (nivel 30), donde cada dispositivo es un maestro de bus que escribe la RAM por sí mismo (nivel 27). En USB, el DMA hacia la memoria del sistema lo hace el HCD; el periférico solo pone o retira bytes en su cable.
+
+```c
+/* include/uapi/linux/usb/ch9.h — el host fija la velocidad al enumerar */
+enum usb_device_speed {
+	USB_SPEED_UNKNOWN = 0,
+	USB_SPEED_LOW, USB_SPEED_FULL,   /* 1.5 y 12 Mbit/s */
+	USB_SPEED_HIGH,                  /* 480 Mbit/s  (USB 2.0) */
+	USB_SPEED_WIRELESS,              /* obsoleto */
+	USB_SPEED_SUPER,                 /* 5 Gbit/s   (USB 3.0) */
+	USB_SPEED_SUPER_PLUS,            /* 10+ Gbit/s (USB 3.1 y superior) */
+};
+```
+
+## La topología: una estrella escalonada
+
+USB no es un bus compartido a la vieja usanza: cada cable es un enlace **punto a punto**. Lo que crea la ilusión de un bus es el **hub**, un multiplicador de puertos. En el corazón del HCD vive un *root hub*, y de sus puertos cuelgan hubs y dispositivos formando una **estrella escalonada** (*tiered star*): hasta 7 niveles de profundidad y 127 direcciones útiles, porque el campo de dirección es de 7 bits y la dirección 0 se reserva para la enumeración.
+
+```bash
+$ lsusb -t
+/:  Bus 002.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/4p, 10000M
+    |__ Port 002: Dev 002, If 0, Class=Mass Storage, Driver=uas, 10000M
+/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci_hcd/8p, 480M
+    |__ Port 001: Dev 003, If 0, Class=Hub, Driver=hub/4p, 480M
+        |__ Port 003: Dev 005, If 0, Class=Human Interface Device, Driver=usbhid, 1.5M
+```
+
+El kernel refleja esa topología en `struct usb_device`: cada nodo apunta a su hub padre y guarda su profundidad, de modo que el árbol de C es un calco del árbol físico de cables.
+
+```c
+struct usb_device {
+	int			devnum;       /* direccion 1..127 en el bus */
+	enum usb_device_speed	speed;
+	struct usb_device	*parent;      /* el hub del que cuelga; NULL si es root */
+	struct usb_bus		*bus;
+	struct usb_host_config	*actconfig;   /* la configuracion activa */
+	struct usb_host_endpoint *ep_in[16];  /* endpoints de entrada, por numero */
+	struct usb_host_endpoint *ep_out[16]; /* endpoints de salida */
+	u8			portnum;
+	u8			level;        /* nivel en el arbol de hubs */
+	int			maxchild;     /* puertos, si este dispositivo es hub */
+	/* ... */
+};
+```
+
+<Mermaid code={`flowchart TD
+  HCD[Host controller xHCI] --> RH[Root hub]
+  RH --> H1[Hub externo]
+  RH --> SSD[SSD almacenamiento masivo]
+  H1 --> KBD[Teclado HID]
+  H1 --> CAM[Webcam]`} />
+
+## Las cuatro capas: dispositivo, configuración, interfaz, endpoint
+
+Todo periférico se describe con cuatro niveles de contención anidados, y entenderlos es la mitad del nivel. Un **dispositivo** ofrece una o varias **configuraciones** mutuamente excluyentes: solo una está activa a la vez (por ejemplo, un modo alimentado por el bus frente a otro autoalimentado). Cada configuración agrupa **interfaces**, y aquí está la sutileza clave: una interfaz es una **función independiente**, y el kernel enlaza los drivers a interfaces, no a dispositivos. Una webcam expone a la vez una interfaz de control de vídeo, otra de streaming de vídeo y otra de audio, cada una capturada por su propio driver.
+
+Dentro de cada interfaz viven los **endpoints**: las tuberías unidireccionales por las que fluyen de verdad los datos. Una interfaz puede tener varios *alternate settings* que combinan endpoints y ancho de banda distintos (crucial en audio y vídeo, nivel 31.5). Y por encima de todos hay un endpoint universal: el **endpoint 0**, bidireccional, que todo dispositivo posee y por el que discurre la enumeración.
+
+El kernel calca esa contención en C: cada estructura contiene un array de la capa inferior, y el driver se enlaza justamente al `struct device` de la interfaz.
+
+```c
+/* include/linux/usb.h — las cuatro capas anidadas, tal como las ve el kernel */
+struct usb_host_config {
+	struct usb_config_descriptor desc;
+	struct usb_interface *interface[USB_MAXINTERFACES];  /* sus interfaces */
+};
+struct usb_interface {
+	struct usb_host_interface *altsetting;      /* array de alt settings */
+	struct usb_host_interface *cur_altsetting;  /* el activo ahora mismo */
+	unsigned num_altsetting;
+	struct device dev;                          /* el driver se enlaza AQUI */
+};
+struct usb_host_interface {
+	struct usb_interface_descriptor desc;
+	struct usb_host_endpoint *endpoint;         /* sus endpoints */
+};
+```
+
+<Cards>
+  <Card icon="🔌" title="Dispositivo">
+    La unidad física con una dirección en el bus. Lleva un descriptor con su identidad (`idVendor`, `idProduct`) y una o varias configuraciones.
+  </Card>
+  <Card icon="🧩" title="Interfaz">
+    Una función lógica dentro de la configuración activa. El punto de enlace del driver: una webcam presenta varias, cada una para un subsistema distinto.
+  </Card>
+</Cards>
+
+## Enumerable y conectable en caliente
+
+Cuando conectas algo, el hub detecta el cambio de estado en su puerto y lo notifica al host por su endpoint de interrupción. El host resetea el puerto, lee los descriptores del recién llegado (nivel 31.2), le asigna una dirección y busca un driver. Todo ese descubrimiento funciona porque el dispositivo es **autodescriptivo**: carga en ROM su propia identidad y sus capacidades, de modo que el host no necesita conocerlo de antemano. Ese es el motor del *plug and play*, y el abismo que separa a USB de los buses legados donde había que fijar puentes y puertos de E/S a mano.
+
+<Callout type="info" title="Enumerar no es opcional">
+Un dispositivo que no responde correctamente a la secuencia de enumeración —reset, lectura del descriptor, asignación de dirección— sencillamente no existe para el sistema: nunca aparece en `/sys/bus/usb/devices` ni recibe driver. La enumeración es la aduana obligatoria por la que se cruza para entrar en el bus.
+</Callout>
+
+<Callout type="dios" title="Un solo amo es la raíz de todo lo demás">
+Detente en la inversión que acabas de cruzar, porque de ella brota, en cascada, todo el nivel. Durante los niveles de buses anteriores el dispositivo era un igual: en PCIe inicia transacciones, hace de maestro del bus y escribe tu RAM sin permiso. USB abole ese privilegio y lo concentra en un único host. Y esa decisión, que parece una mera cuestión de arbitraje eléctrico, es en realidad la fuente de las tres virtudes que definen a USB. Primero, el **bajo coste**: si toda la inteligencia vive en el host, los periféricos pueden ser triviales, y por eso hay un puerto USB en cada objeto de tu casa y no un puerto PCIe. Segundo, la **enumeración**: como el host es el único que pregunta, basta con que el dispositivo sepa responder describiéndose a sí mismo, y de ahí nace el plug and play universal. Tercero, la **conexión en caliente**: como nadie más que el host planifica el tráfico, un dispositivo puede aparecer o desaparecer en cualquier microsegundo sin corromper el bus, porque no había ninguna transacción suya en vuelo que él controlara. No memorices "USB es host-centric" como un dato; interiorízalo como el axioma del que se deducen la topología de hubs, el modelo de descriptores y la disciplina de hot-unplug que gobernará cada driver que escribas en este nivel.
+</Callout>
+
+<Challenge title="Cartografía tu propio bus">
+1. Ejecuta `lsusb -t` y dibuja el árbol: identifica el root hub, los hubs intermedios y en qué nivel cuelga cada dispositivo.
+2. Recorre `/sys/bus/usb/devices/` y localiza para un dispositivo los archivos `bDeviceClass`, `speed` y `maxchild`. Explica qué significa `maxchild` cero.
+3. Con `lsusb -v` cuenta cuántas interfaces expone tu webcam o auriculares y razona por qué el kernel les asigna drivers distintos.
+4. Argumenta en tres líneas por qué un dispositivo USB no puede lanzar una interrupción al bus por sí mismo, y qué hace en su lugar un endpoint de tipo interrupt.
+</Challenge>

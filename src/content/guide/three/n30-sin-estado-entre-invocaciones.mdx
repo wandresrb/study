@@ -1,0 +1,176 @@
+---
+title: "Sin estado: dónde vive la memoria de un shader"
+description: "Un shader olvida todo al terminar. Las cuatro vías por las que entra información y el patrón de doble búfer que da memoria a un fragment shader."
+subject: three
+level: 30
+order: 5
+position: "30.5"
+duration: "20 min"
+---
+
+<Lead>
+Una invocación de shader nace, lee sus entradas, calcula y muere. No queda nada. No hay variables estáticas, no hay memoria entre cuadros, no hay forma de recordar qué pasó la vez anterior. Esa ausencia total de estado es lo que permite el paralelismo, y también lo que obliga a que cualquier cosa que evolucione con el tiempo se materialice fuera del shader, en una textura. Aprender dónde vive el estado es aprender a diseñar sistemas en GPU.
+</Lead>
+
+<Goals>
+
+- Enumerar las cuatro vías por las que la información entra en un shader y su granularidad.
+- Implementar el patrón de doble búfer con `WebGLRenderTarget` en Three.js.
+- Elegir el tipo de textura correcto para almacenar estado numérico.
+- Reconocer los límites de precisión que arruinan una simulación acumulativa.
+
+</Goals>
+
+## Las cuatro vías de entrada
+
+Toda la información que un shader puede leer entra por exactamente cuatro sitios, y cada uno tiene una granularidad distinta. Esa granularidad es la que decide dónde va cada dato.
+
+**Uniforms.** Un valor por dibujado, idéntico para todas las invocaciones. Los escribe la CPU antes de cada `drawElements`. Granularidad: el objeto entero.
+
+**Attributes.** Un valor por vértice, leído desde un buffer de la geometría, solo accesible en el vertex shader. Granularidad: el vértice.
+
+**Varyings.** Escritas por el vertex shader, leídas interpoladas por el fragment shader. Granularidad: el fragmento, pero derivadas de los vértices.
+
+**Texturas.** Memoria de solo lectura, direccionable arbitrariamente desde cualquier etapa. Granularidad: el téxel, y tú eliges qué téxel. Ésta es la única de las cuatro que permite acceso aleatorio, y por eso es donde vive todo lo demás.
+
+Lo que **no** hay: variables globales persistentes. Una declaración global en GLSL crea una variable por invocación, no compartida. Se inicializa cada vez y se pierde cada vez.
+
+```glsl
+// Esto NO es un contador global. Es una variable local a cada invocacion.
+float contador = 0.0;
+
+void main() {
+  contador += 1.0;   // siempre vale 1.0 al terminar. Siempre.
+  ...
+}
+```
+
+## Dar memoria a un fragment shader
+
+Si el estado no cabe dentro del shader, tiene que estar fuera. La forma canónica es guardarlo en una textura y hacer que el shader que lo actualiza escriba en **otra** textura, porque leer y escribir la misma en la misma pasada no está permitido: el orden entre invocaciones no está definido y no hay garantía de que el téxel que lees no lo haya sobrescrito ya otra invocación.
+
+De ahí el patrón de doble búfer, o ping-pong: dos objetivos de render, uno de lectura y otro de escritura, que se intercambian cada paso.
+
+```js
+import * as THREE from 'three';
+
+const LADO = 256;
+
+const opciones = {
+  type: THREE.HalfFloatType,
+  format: THREE.RGBAFormat,
+  minFilter: THREE.NearestFilter,
+  magFilter: THREE.NearestFilter,
+  wrapS: THREE.ClampToEdgeWrapping,
+  wrapT: THREE.ClampToEdgeWrapping,
+  depthBuffer: false,
+  stencilBuffer: false,
+  generateMipmaps: false,
+};
+
+let leer = new THREE.WebGLRenderTarget( LADO, LADO, opciones );
+let escribir = new THREE.WebGLRenderTarget( LADO, LADO, opciones );
+
+const materialSim = new THREE.ShaderMaterial( {
+  uniforms: {
+    uEstado: { value: null },
+    uDelta: { value: 0 },
+    uTiempo: { value: 0 },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D uEstado;
+    uniform float uDelta;
+    varying vec2 vUv;
+
+    void main() {
+      vec4 estado = texture2D( uEstado, vUv );
+      vec2 posicion = estado.xy;
+      vec2 velocidad = estado.zw;
+
+      velocidad += vec2( 0.0, -0.6 ) * uDelta;     // gravedad
+      posicion += velocidad * uDelta;
+
+      // rebote contra el suelo
+      if ( posicion.y < -1.0 ) {
+        posicion.y = -1.0;
+        velocidad.y = abs( velocidad.y ) * 0.7;
+      }
+
+      gl_FragColor = vec4( posicion, velocidad );
+    }
+  `,
+} );
+
+const quad = new THREE.Mesh( new THREE.PlaneGeometry( 2, 2 ), materialSim );
+const escenaSim = new THREE.Scene().add( quad );
+const camaraSim = new THREE.OrthographicCamera( -1, 1, 1, -1, 0.1, 10 );
+camaraSim.position.z = 1;
+
+function paso( dt ) {
+  materialSim.uniforms.uEstado.value = leer.texture;
+  materialSim.uniforms.uDelta.value = dt;
+
+  renderer.setRenderTarget( escribir );
+  renderer.render( escenaSim, camaraSim );
+  renderer.setRenderTarget( null );
+
+  const t = leer;
+  leer = escribir;
+  escribir = t;
+}
+```
+
+El `if` del rebote es coherente para la mayoría de grupos —las partículas cercanas en la textura suelen estar en estados parecidos— y su alternativa aritmética no ahorraría nada, así que aquí está bien.
+
+Después de cada paso, `leer.texture` contiene el estado nuevo y puedes usarlo como uniform del material que dibuja las partículas de verdad, leyendo la posición desde el vertex shader con un atributo que diga a cada partícula qué téxel le corresponde.
+
+## Sembrar el estado inicial
+
+El primer estado no puede venir de una pasada anterior, así que hay que crearlo. Lo más limpio es una `DataTexture` y una pasada de copia, o directamente escribir el estado inicial con un shader de inicialización que no lea nada.
+
+```js
+function crearEstadoInicial( lado ) {
+  const datos = new Float32Array( lado * lado * 4 );
+  for ( let i = 0; i < lado * lado; i ++ ) {
+    datos[ i * 4 + 0 ] = ( Math.random() - 0.5 ) * 2;   // posicion x
+    datos[ i * 4 + 1 ] = Math.random() * 2;             // posicion y
+    datos[ i * 4 + 2 ] = ( Math.random() - 0.5 ) * 0.4; // velocidad x
+    datos[ i * 4 + 3 ] = 0;                             // velocidad y
+  }
+  const textura = new THREE.DataTexture(
+    datos, lado, lado, THREE.RGBAFormat, THREE.FloatType
+  );
+  textura.needsUpdate = true;
+  return textura;
+}
+```
+
+## Elegir el tipo de textura
+
+Aquí se decide si la simulación funciona o no, y las opciones no son intercambiables.
+
+`UnsignedByteType` da ocho bits por canal y valores en el rango cero a uno. Sirve para máscaras y colores, y no sirve para posiciones ni velocidades: 256 niveles discretos producen un movimiento a saltos visible desde el primer segundo.
+
+`HalfFloatType` da coma flotante de dieciséis bits, con once bits efectivos de mantisa. Es el tipo por defecto sensato para simulación: rango amplio, precisión relativa suficiente para posiciones en un mundo de tamaño moderado, y la mitad de ancho de banda que el flotante completo.
+
+`FloatType` da treinta y dos bits. Es lo que necesitas si acumulas mucho o si el rango dinámico es grande.
+
+Y hay una comprobación obligatoria: dibujar **a** una textura de coma flotante requiere una extensión, aunque leerla no.
+
+```js
+const puedeFloat = renderer.extensions.has( 'EXT_color_buffer_float' );
+const tipo = puedeFloat ? THREE.HalfFloatType : THREE.UnsignedByteType;
+```
+
+Dos ajustes más que no son opcionales. `NearestFilter` en los dos filtros: estás leyendo datos, no una imagen, y una interpolación bilineal entre el estado de dos partículas distintas no significa nada. Y `generateMipmaps: false`, porque los mipmaps de un búfer de estado son basura que además se recalcula cada pasada.
+
+<Callout type="dios" title="Un acumulador en media precision deja de moverse y no lo notas hasta que es tarde">
+La coma flotante de dieciséis bits tiene once bits de mantisa, lo que significa que la distancia entre dos valores representables consecutivos crece con la magnitud del valor. Cerca de 1.0 esa distancia es de aproximadamente 0.0005. Cerca de 1024.0 es de 1.0. Cerca de 2048.0 es de 2.0. La consecuencia mata simulaciones enteras: si acumulas un pequeño incremento sobre un valor grande, **llega un punto en el que la suma no cambia nada**. `2048.0 + 0.001` es exactamente `2048.0` en media precisión, así que la partícula se congela y no hay ningún error. Esto ocurre continuamente con dos cosas: el tiempo transcurrido, si lo acumulas dentro de la propia textura de estado en vez de pasarlo como uniform, y las posiciones en un mundo grande, donde una partícula que se aleja hasta la coordenada 3000 empieza a moverse a tirones de tres unidades. Hay tres remedios y conviene conocer los tres. El primero es guardar posiciones **relativas** a un origen móvil en vez de absolutas, que es lo que hacen los motores de mundos grandes. El segundo es separar la parte entera de la fraccionaria en dos canales distintos de la textura y recomponerlas en el shader, que da precisión efectiva de veintidós bits al precio de un canal. El tercero es subir a `FloatType`, que dobla el ancho de banda pero da veinticuatro bits de mantisa y aplaza el problema hasta magnitudes de dieciséis millones. La forma de detectarlo antes de que te lo cuente un usuario es una prueba de dos líneas: deja la simulación corriendo diez minutos y comprueba si el estado sigue cambiando.
+</Callout>

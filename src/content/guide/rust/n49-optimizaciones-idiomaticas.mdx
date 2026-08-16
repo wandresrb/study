@@ -1,0 +1,161 @@
+---
+title: "Optimizaciones idiomáticas: menos asignaciones, mejor layout, cero clones de más"
+description: "La microoptimización de mayor rendimiento no es SIMD, es dejar de asignar. Cow para prestar y solo asignar si hay que cambiar, SmallVec para lo pequeño en la pila, reusar buffers con clear, mem::take para mover sin clonar. Más el layout de datos del nivel 19 —reordenar campos, boxear la variante gorda de un enum— y la disciplina de aceptar &str y &[T] en vez de clonar para contentar al borrow checker."
+subject: rust
+level: 49
+order: 4
+position: "49.4"
+duration: "19 min"
+---
+
+<Lead>
+Antes de pensar en SIMD o en intrinsics, hay una familia de optimizaciones más humildes y de mayor rendimiento por unidad de esfuerzo: **dejar de asignar en el heap y dejar de clonar sin necesidad**. Cada asignación es cara —negocia con el asignador, toca memoria fría, puede tomar un cerrojo interno— y cada `clone` que pusiste solo para acallar al borrow checker copia bytes que nadie necesitaba. Lo idiomático en Rust resulta ser, casi siempre, lo eficiente: prestar en vez de poseer, guardar lo pequeño en la pila, reutilizar el buffer que ya tienes, mover en vez de copiar. A esto se suma el *layout* de datos del nivel 19 —cómo se disponen los bytes de tus structs y enums—, que decide cuántas líneas de caché toca tu bucle caliente. Esta lección reúne el repertorio del optimizador idiomático: las técnicas que casi nunca sacrifican claridad y casi siempre ganan velocidad.
+</Lead>
+
+<Goals>
+
+- Reducir asignaciones con `Cow`, `SmallVec` y la reutilización de buffers.
+- Eliminar clones innecesarios prestando, aceptando slices y moviendo con `mem::take`.
+- Aprovechar el layout del nivel 19: reordenar campos y boxear la variante gorda de un enum.
+- Distinguir el clon barato del caro y no pagar por copias que nadie usa.
+
+</Goals>
+
+## El coste de asignar, y cómo no pagarlo
+
+Reservar memoria en el heap parece instantáneo, pero no lo es: el asignador busca un hueco, actualiza sus estructuras, a veces sincroniza entre hilos, y la memoria que devuelve suele estar fría en caché. En una ruta caliente que asigna en cada vuelta, ese coste domina. La primera herramienta para evitarlo es `Cow` —*clone on write*—, que presta mientras puede y solo asigna si de verdad hay que modificar. Es el tipo ideal para una función que *a veces* transforma su entrada y a veces la devuelve intacta:
+
+```rust
+use std::borrow::Cow;
+
+// Devuelve prestado si no hay nada que cambiar; solo asigna cuando debe.
+fn normaliza(entrada: &str) -> Cow<'_, str> {
+    if entrada.contains(' ') {
+        Cow::Owned(entrada.replace(' ', "_"))   // hubo que cambiar: asigna
+    } else {
+        Cow::Borrowed(entrada)                    // caso comun: cero asignaciones
+    }
+}
+```
+
+La segunda es `SmallVec` (del crate `smallvec`) y sus parientes `ArrayVec` y `tinyvec`: colecciones que guardan hasta `N` elementos **en la pila** y solo se derraman al heap si crecen más allá. Para el caso frecuente —una lista casi siempre pequeña— eliminan la asignación por completo, a cambio de un tipo algo más grande y una rama por acceso.
+
+```rust
+use smallvec::SmallVec;
+
+// Hasta 4 elementos viven en la pila; a partir de ahi, se derrama al heap.
+let mut hijos: SmallVec<[u32; 4]> = SmallVec::new();
+hijos.push(1);
+hijos.push(2);                 // sin tocar el heap todavia
+```
+
+La tercera, y la más infravalorada, es **reutilizar el buffer**. `Vec::clear` y `String::clear` vacían el contenido pero **conservan la capacidad ya reservada**, de modo que en un bucle puedes rellenar y vaciar el mismo buffer sin asignar más que la primera vez. El antipatrón es crear un `Vec` nuevo en cada iteración; el patrón es sacar la asignación fuera del bucle.
+
+```rust
+use std::io::BufRead;
+
+let mut linea = String::new();
+while lector.read_line(&mut linea)? != 0 {
+    procesar(&linea);
+    linea.clear();             // reutiliza la asignacion en cada vuelta
+}
+```
+
+## Clones que no hacen falta
+
+Muchos `clone` de un programa Rust novato no existen por necesidad, sino como soborno al borrow checker: "no sé cómo satisfacerlo, así que clono y sigo". Casi siempre hay una forma de prestar. La disciplina empieza en las **firmas**: acepta `&str` en vez de `String`, `&[T]` en vez de `Vec<T>` (el poder de los slices del nivel 11), de modo que quien te llama no se vea forzado a poseer ni a clonar. Un `impl AsRef<str>` va más lejos y admite ambos sin copiar.
+
+```rust
+// EVITAR: obliga a quien llama a tener o clonar un String y un Vec.
+fn contar_malo(texto: String, items: Vec<i32>) -> usize { /* ... */ 0 }
+
+// IDIOMATICO: presta. El llamador no clona nada; funciona con cualquier fuente.
+fn contar(texto: &str, items: &[i32]) -> usize {
+    items.iter().filter(|&&x| x > 0).count() + texto.len()
+}
+```
+
+Cuando de verdad necesitas *sacar* un valor de una estructura sin clonarlo, `std::mem::take` (y sus primos `replace` y `swap`) lo **mueven** dejando un `Default` en su lugar: coste de mover un puntero, no de copiar el contenido. Y cuando varios necesitan el mismo dato, `Rc` o `Arc` lo **comparten** con un contador en vez de duplicarlo. Reestructurar en lugar de clonar es casi siempre posible —es la lección del nivel 12— y casi siempre más rápido.
+
+```rust
+use std::mem;
+
+struct Procesador { pendientes: Vec<String> }
+
+impl Procesador {
+    // Saca el Vec entero moviendo, sin clonar ni una cadena.
+    fn drenar(&mut self) -> Vec<String> {
+        mem::take(&mut self.pendientes)   // deja un Vec vacio en su lugar
+    }
+}
+```
+
+<Callout type="tip" title="No todo clon es pecado: distingue el barato del caro">
+La cruzada contra `clone` tiene un límite sensato. Clonar un `Copy` pequeño —un `u64`, un `[f32; 4]`— es mover unos bytes en la pila y no cuesta nada medible; clonar un `Rc` solo incrementa un contador. El clon *caro* es el que asigna: duplicar un `String` largo, un `Vec` de miles de elementos, un árbol entero. La regla no es "nunca clones", sino "no clones lo que asigna en una ruta caliente". Un `clone` en código frío, ejecutado una vez al arrancar, es gratis en la práctica y no merece contorsiones para eliminarlo. Como siempre, el perfil (lección 2) decide qué clon importa.
+</Callout>
+
+## El layout de los datos
+
+Cómo se disponen los bytes de tus tipos decide cuántas líneas de caché toca tu bucle —el corazón del nivel 19—. Dos técnicas son puro provecho. La primera: Rust, salvo que pongas `#[repr(C)]`, **reordena los campos** de un struct para minimizar el relleno (*padding*) que la alineación impone. No necesitas hacer nada, pero conviene entenderlo, porque explica por qué un mismo struct ocupa menos de lo que la suma ingenua de sus campos sugiere.
+
+```rust
+use std::mem::size_of;
+
+#[repr(C)]                                   // orden fijo: sufre el padding
+struct ConReprC { a: u8, b: u64, c: u8 }     // 8 + 8 + 8 = 24 bytes por alineacion
+
+struct Compacta { a: u8, b: u64, c: u8 }     // Rust reordena: cabe en 16 bytes
+
+fn main() {
+    assert_eq!(size_of::<ConReprC>(), 24);
+    assert_eq!(size_of::<Compacta>(), 16);   // mismos campos, menos memoria
+}
+```
+
+La segunda, más impactante, atañe a los **enums**: un enum ocupa el tamaño de su variante *más grande* más la etiqueta. Una sola variante gorda infla **todos** los valores del enum, aunque el 99 % sean variantes pequeñas. La cura es **boxear la variante grande**, dejándola tras un puntero para que el enum vuelva a caber en pocos bytes:
+
+```rust
+// MAL: la variante Datos infla el enum entero a mas de 1 KB.
+enum Mensaje {
+    Ping,
+    Datos([u8; 1024]),
+}
+
+// BIEN: Box mete la carga en el heap; el enum vuelve a ser diminuto.
+enum MensajeCompacto {
+    Ping,
+    Datos(Box<[u8; 1024]>),   // un Ping ya no arrastra 1 KB de peso muerto
+}
+```
+
+Y para el bucle caliente, la técnica reina del nivel 19: pasar de un **array de estructuras** a una **estructura de arrays**, para que los campos que recorres juntos vivan contiguos y cada línea de caché venga cargada de datos útiles. No es magia de instrucciones; es poner los bytes donde la máquina los quiere.
+
+<Mermaid code={`flowchart TB
+  P[Ruta caliente que asigna y clona de mas] --> C[Cow presta y solo asigna si cambia]
+  P --> S[SmallVec guarda lo pequeno en la pila]
+  P --> R[Reusar buffer con clear conserva la capacidad]
+  P --> M[mem take mueve el valor en vez de clonar]
+  P --> L[Layout reordenar campos y boxear la variante gorda]
+  C --> W[Menos presion sobre el asignador y la cache]
+  S --> W
+  R --> W
+  M --> W
+  L --> W
+  class P t-red
+  class W t-green`} />
+
+<Callout type="dios" title="Lo idiomático en Rust no es lo lento con buena conciencia: suele ser lo rápido">
+Existe un prejuicio, importado de lenguajes donde la elegancia se paga cara, según el cual el código "bonito" es un lujo que cuesta rendimiento, y para ir rápido hay que ensuciarse las manos. En Rust ese prejuicio es casi siempre falso, y esta lección es la prueba acumulada. Prestar en vez de poseer no es solo más limpio: evita la asignación y la copia. Aceptar `&str` en la firma no es solo más flexible: libera a quien te llama de clonar. Reutilizar un buffer no es solo ordenado: elimina un tráfico de asignaciones que el perfilador habría delatado. Boxear la variante gorda de un enum no es solo prolijo: encoge cada valor y multiplica cuántos caben en una línea de caché. La convergencia entre lo idiomático y lo eficiente no es casualidad; es una decisión de diseño profunda de Rust, que construyó su vocabulario de tipos —`Cow`, los slices, `Rc`, el reordenamiento de campos, el sistema de ownership entero— precisamente para que expresar la intención correcta produzca el código rápido. En otros lenguajes tienes que elegir entre el `String` cómodo y el `&str` eficiente, entre la copia segura y el movimiento veloz; Rust te empuja hacia la eficiente y te hace la ineficiente incómoda de escribir. Por eso el mejor consejo de optimización para el noventa por ciento del código no es "aplica esta técnica exótica", sino "escríbelo de forma idiomática y confía": presta, mueve, comparte con `Rc`, no clones lo que asigna, deja que el compilador reordene tus campos. Y por eso el clon que sí sobra —el que pusiste para callar al borrow checker— es tan sintomático: no es un problema de rendimiento aislado, es la señal de que aún no piensas en términos de propiedad, de que estás traduciendo hábitos de un lenguaje con recolector a uno que te ofrecía una salida mejor. Interiorizar este repertorio es dejar de ver el rendimiento como algo que *añades* al final, feo y a regañadientes, y empezar a verlo como una consecuencia natural de escribir Rust como Rust quiere ser escrito.
+</Callout>
+
+<Callout type="note" title="Lo esencial de las optimizaciones idiomáticas">
+La optimización de mayor rendimiento por esfuerzo es dejar de asignar y de clonar de más. `Cow` presta y solo asigna si hay que modificar; `SmallVec` guarda lo pequeño en la pila; `clear` reutiliza la capacidad de un buffer entre vueltas. Elimina clones prestando en las firmas (`&str`, `&[T]`, `impl AsRef`), moviendo con `mem::take` y compartiendo con `Rc`/`Arc`, y reestructura en vez de clonar (nivel 12) —pero no persigas el clon barato de un `Copy` o un `Rc`, solo el que asigna en ruta caliente—. El layout del nivel 19 remata: Rust reordena campos para minimizar padding, boxear la variante gorda de un enum encoge todos sus valores, y la estructura de arrays alimenta la caché en el bucle caliente.
+</Callout>
+
+<Challenge title="Optimiza sin ensuciar">
+1. Escribe una función que quite espacios de un `&str` devolviendo `Cow<str>`; razona en qué caso no asigna nada y compárala con una que siempre devuelve `String`.
+2. Sustituye un `Vec` que crece dentro de un bucle por un `SmallVec<[T; N]>` con un `N` sensato; explica cuándo deja de tocar el heap y qué coste asumes a cambio.
+3. Reescribe un bucle que crea un buffer nuevo por iteración para que reutilice uno solo con `clear`; mide con `criterion` (lección 2) la diferencia en asignaciones.
+4. Toma una función con parámetros `String` y `Vec<i32>` y cámbialos a `&str` y `&[i32]`; explica qué clones del código llamante desaparecen.
+5. Define un enum con una variante de 1 KB y comprueba con `size_of` cuánto ocupa; boxea esa variante y verifica cuánto encoge el enum entero.
+</Challenge>

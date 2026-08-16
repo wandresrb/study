@@ -1,0 +1,151 @@
+---
+title: "La memoria: el recolector 2.0 y el entierro de los objetos congelados"
+description: "Durante años Kotlin/Native impuso un modelo de memoria propio en el que compartir un objeto entre hilos exigía congelarlo, y esa restricción contaminó el diseño de toda biblioteca multiplataforma escrita antes de 2023. Esta lección reconstruye por qué existió ese modelo, qué lo hacía insufrible, cómo funciona el recolector concurrente que lo sustituyó, qué significa hoy compartir estado mutable entre hilos en Native, y qué clase de fuga sigue siendo responsabilidad exclusiva del programador incluso con el recolector nuevo."
+subject: kotlin
+level: 34
+order: 2
+position: "34.2"
+duration: "24 min"
+---
+
+<Lead>
+Hay una generación entera de código multiplataforma que arrastra cicatrices de una decisión que ya no existe. Entre 2017 y 2022, Kotlin/Native no permitía que dos hilos vieran el mismo objeto mutable: para compartir algo había que congelarlo, y congelar significaba volverlo inmutable de forma transitiva, permanente e irreversible, propagándose por todo el grafo alcanzable. Aquello no era una recomendación sino una comprobación en tiempo de ejecución que lanzaba una excepción en cuanto alguien escribía en un objeto congelado, casi siempre en producción y casi siempre lejos del punto donde se había cometido el error. Ese modelo está enterrado. Entender qué prometía y por qué fracasó no es arqueología: es la única forma de leer con criterio las bibliotecas que todavía lo suponen y de no reproducir sus contorsiones en código nuevo.
+</Lead>
+
+<Goals>
+
+- Reconstruir el modelo de objetos congelados y explicar qué problema real intentaba resolver.
+- Describir cómo funciona el recolector concurrente actual y qué garantías ofrece respecto a las pausas.
+- Compartir estado mutable entre hilos en Native con las mismas herramientas que en la JVM.
+- Identificar la clase de fuga que ningún recolector puede resolver por ti en la frontera con Objective-C.
+
+</Goals>
+
+## Lo que había antes: congelar para poder compartir
+
+El modelo antiguo partía de una tesis defendible: si el compilador impide que dos hilos accedan al mismo estado mutable, las carreras de datos dejan de ser posibles por construcción. La implementación se apoyaba en conteo de referencias por hilo, lo que hacía barato liberar memoria pero volvía imposible que un contador fuera actualizado desde dos hilos sin sincronización. La salida fue el congelado: `freeze()` marcaba un objeto y todo lo alcanzable desde él como inmutable para siempre, y solo los objetos congelados podían cruzar la frontera entre hilos.
+
+```kotlin
+// Modelo antiguo, hoy eliminado. Se documenta para poder leer codigo de la epoca.
+val config = Configuracion(url = "https://api.ejemplo.com")
+config.freeze()                       // transitivo e irreversible
+worker.execute(TransferMode.SAFE, { config }) { c -> descargar(c.url) }
+
+val estado = AtomicReference(EstadoInicial().freeze())   // unica mutacion permitida
+```
+
+Las consecuencias eran desproporcionadas. Un `object` de nivel superior estaba congelado desde el arranque, de modo que cualquier caché global era ilegal salvo envolviéndola en referencias atómicas de valores congelados. Anotaciones como `@SharedImmutable` y `@ThreadLocal` existían para negociar excepciones puntuales. Los `Worker` transferían grafos de objetos desconectándolos del hilo emisor, y el compilador no verificaba nada: el fallo llegaba como `InvalidMutabilityException` en tiempo de ejecución. Cualquier biblioteca de terceros escrita para JVM y reutilizada en Native fallaba sin aviso porque en ningún sitio de su código decía nada de congelar.
+
+<Callout type="note" title="Por qué se derrumbó">
+El modelo era coherente y seguro, pero exigía que todo el ecosistema pensara en sus términos, y ese ecosistema ya existía escrito para la JVM. Un modelo de memoria solo triunfa si el código escrito ignorándolo funciona por defecto; el de Kotlin/Native exigía lo contrario, y esa asimetría fue la que lo condenó, no ningún defecto técnico de la implementación.
+</Callout>
+
+## El recolector 2.0
+
+La sustitución fue un recolector de trazado clásico, y con él la desaparición completa del congelado: hoy cualquier objeto se puede tocar desde cualquier hilo, exactamente igual que en la JVM, con exactamente las mismas consecuencias si no sincronizas. El recolector actual marca y barre, es generacional —la mayoría de los objetos mueren jóvenes y recorrer solo la generación joven abarata enormemente el caso común— y, sobre todo, es concurrente: el marcado ocurre en paralelo con los hilos de la aplicación en lugar de detenerlos mientras dura.
+
+Esa última propiedad es la que da nombre a la segunda generación del recolector y la que resuelve el problema práctico que quedaba. Con marcado no concurrente, la pausa crecía con el tamaño del montículo, lo cual es tolerable en una herramienta de línea de comandos e inaceptable en una aplicación con presupuesto por fotograma. Con marcado concurrente, la parte del ciclo que exige detener los hilos se reduce a las fases de sincronización, y el coste deja de escalar con la cantidad de objetos vivos.
+
+<Mermaid code={`flowchart TD
+  A[Modelo antiguo] --> B[Conteo de referencias por hilo]
+  B --> C[Objetos congelados para compartir]
+  C --> D[Workers y transferencia de grafos]
+  D --> E[Errores en tiempo de ejecucion]
+  F[Modelo actual] --> G[Recolector de trazado generacional]
+  G --> H[Marcado concurrente sin pausa larga]
+  H --> I[Estado compartido libre entre hilos]
+  I --> J[Corrutinas multihilo como norma]`} />
+
+Merece la pena señalar un efecto colateral importante: al pasar de conteo de referencias a trazado, los ciclos de objetos dentro del montículo de Kotlin dejaron de ser fugas. En el modelo antiguo, dos objetos que se referenciaban mutuamente no se liberaban nunca; hoy el recolector los alcanza y los recoge sin que el programador tenga que romper el ciclo con referencias débiles.
+
+Hay un matiz de calibración que conviene tener presente al comparar con la JVM. El recolector de Kotlin/Native es joven en comparación con dos décadas de trabajo sobre los recolectores de la máquina virtual, y su ruta de reserva no es tan barata como la reserva por avance de puntero en un búfer local al hilo que la JVM lleva perfeccionando desde siempre. En cargas que asignan objetos pequeños de forma masiva, esa diferencia es medible, y es una de las razones por las que el rendimiento sostenido en Native se queda por debajo. La planificación de las recolecciones también es ajustable: el recolector decide cuándo actuar en función de la memoria reservada desde el ciclo anterior y del tiempo transcurrido, y esos umbrales se pueden mover para cargas con perfiles atípicos.
+
+El comportamiento del recolector es observable y ajustable. Se pueden activar registros de ejecución para ver cada ciclo, consultar estadísticas desde el propio programa y forzar recolecciones en pruebas deterministas.
+
+```kotlin
+import kotlin.native.runtime.GC
+import kotlin.native.runtime.NativeRuntimeApi
+
+@OptIn(NativeRuntimeApi::class)
+fun medirRetencion(bloque: () -> Unit) {
+    GC.collect()
+    val antes = GC.lastGCInfo?.memoryUsageAfter
+    bloque()
+    GC.collect()
+    val despues = GC.lastGCInfo?.memoryUsageAfter
+    println("delta=$antes -> $despues")
+}
+```
+
+## Compartir estado hoy
+
+La frase que resume el cambio es incómoda y hay que decirla entera: en Kotlin/Native ya se puede compartir estado mutable entre hilos, y por eso ya se pueden escribir carreras de datos. La seguridad que antes imponía el runtime pasó a ser responsabilidad del programador, que es exactamente el trato que siempre tuvo la JVM. El instrumental es el mismo y todo lo estudiado sobre concurrencia estructurada aplica sin asteriscos.
+
+```kotlin
+import kotlin.concurrent.AtomicInt
+import kotlin.concurrent.Volatile
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+class Registro {
+    private val procesados = AtomicInt(0)
+    @Volatile var ultimo: String? = null     // visibilidad, no atomicidad
+    private val mutex = Mutex()
+    private val pendientes = mutableListOf<String>()
+
+    fun registrar(id: String) {
+        procesados.incrementAndGet()
+        ultimo = id
+    }
+
+    suspend fun encolar(id: String) = mutex.withLock { pendientes += id }
+}
+
+suspend fun procesar(ids: List<String>, r: Registro) = withContext(Dispatchers.Default) {
+    ids.map { async { r.encolar(it); r.registrar(it) } }.awaitAll()
+}
+```
+
+Tres detalles del ejemplo anterior merecen lectura atenta porque condensan todo lo que cambió. El campo marcado como volátil garantiza visibilidad entre hilos pero no atomicidad, de modo que leer, decidir y escribir sobre él sigue siendo una carrera; el contador atómico sí es indivisible pero no coordina con nada más, así que combinarlo con la lista no produce una operación conjunta; y el `Mutex` es lo único que protege una invariante que abarca varios campos. Exactamente el mismo razonamiento que se aplicaría en la JVM, palabra por palabra, y esa coincidencia es la noticia.
+
+Tres piezas concretas sustituyen a las del mundo antiguo. Los `Worker` y su transferencia de grafos quedan reemplazados por corrutinas sobre despachadores multihilo, que en Native funcionan igual que en JVM. Las referencias atómicas congeladas quedan reemplazadas por los tipos atómicos de `kotlin.concurrent`. Y `@SharedImmutable` desaparece sin sustituto porque su significado —esto se puede leer desde varios hilos— pasó a ser el comportamiento por defecto de cualquier valor.
+
+<Callout type="tip" title="Migrar bibliotecas antiguas es sobre todo borrar">
+Cuando adaptes código de la época del congelado, la operación dominante es la eliminación: fuera las llamadas a congelar, fuera las anotaciones de compartición, fuera las referencias atómicas que solo existían para poder mutar algo congelado, y fuera los `Worker`. Lo que queda casi siempre es código idiomático que ya habría funcionado en la JVM, y el resultado suele ser bastante más corto que el original.
+</Callout>
+
+## La fuga que sigue siendo tuya
+
+Queda un caso que ningún recolector resuelve y que produce la mayoría de las fugas reales en aplicaciones de iOS con lógica en Kotlin. Kotlin/Native gestiona su montículo por trazado; Objective-C y Swift gestionan el suyo por conteo automático de referencias. Son dos administradores independientes, cada uno con su noción de alcanzabilidad, y ninguno ve el grafo del otro.
+
+Si un objeto Kotlin retiene una referencia fuerte a un objeto Objective-C que a su vez retiene al primero, se forma un ciclo que cruza la frontera. El recolector de Kotlin ve el objeto Kotlin alcanzado desde el lado nativo y no lo toca; el conteo del lado Apple nunca llega a cero porque Kotlin lo sostiene. Ninguno de los dos está equivocado y la memoria no se libera jamás. El remedio es el clásico del mundo Apple aplicado a la frontera: romper el ciclo explícitamente con una referencia débil en el lado que actúa como observador, típicamente el delegado o el bloque de retorno registrado desde Kotlin hacia una vista.
+
+```kotlin
+// El ciclo tipico: el modelo Kotlin sostiene la vista y la vista sostiene el modelo.
+class Presentador {
+    var vista: UIViewController? = null          // fuerte: sostiene al lado Apple
+    fun refrescar() { vista?.setNeedsLayout() }
+}
+
+// Version que no fuga: el observador no retiene a quien observa.
+class PresentadorCorrecto {
+    private var vistaDebil: WeakReference<UIViewController>? = null
+    fun enlazar(vc: UIViewController) { vistaDebil = WeakReference(vc) }
+    fun refrescar() { vistaDebil?.get()?.setNeedsLayout() }
+}
+```
+
+Hay además un desfase temporal que despista al medir. La liberación en el lado Apple es determinista y ocurre cuando el contador llega a cero; la del lado Kotlin ocurre cuando el recolector decide pasar. Un objeto Objective-C retenido únicamente por un objeto Kotlin ya inalcanzable seguirá vivo hasta el siguiente ciclo de recolección, de modo que una prueba de fugas que compruebe la liberación inmediatamente después de soltar la referencia dará un falso positivo. Forzar una recolección antes de comprobar es la diferencia entre una prueba útil y una fuente de ruido.
+
+<Callout type="dios" title="El congelado no fracasó por ser incorrecto sino por exigir que el mundo entero se escribiera dos veces, y esa es la lección de diseño que sobrevive al modelo que la produjo">
+Conviene resistir la tentación de contar esta historia como el triunfo de una implementación mejor sobre una peor, porque el modelo de objetos congelados era técnicamente impecable en el sentido que más se valora en la academia: eliminaba una clase entera de errores por construcción, con una comprobación barata y una semántica que se podía explicar en un párrafo, y lo hacía sin pedirle al programador que razonara sobre visibilidad, barreras ni ordenamiento de memoria, que es precisamente donde todo el mundo se equivoca en la JVM. Lo que lo hundió no fue ningún defecto interno sino una propiedad externa y menos discutida: un modelo de memoria no compite contra otros modelos de memoria, compite contra el corpus de código ya escrito, y el único modelo que puede ganar esa competición es el que hace funcionar por defecto el código que se escribió sin conocerlo. Kotlin/Native exigía lo contrario. Una biblioteca de serialización escrita en 2019 para la JVM, sin una sola línea sobre concurrencia, fallaba en Native con una excepción de mutabilidad porque en algún punto guardaba una caché en un objeto de nivel superior; y el autor de esa biblioteca no tenía ningún incentivo para aprender un modelo ajeno, de modo que el coste de la incompatibilidad recaía íntegro sobre quien intentaba usar Kotlin fuera de la JVM. El resultado fue una espiral perfectamente medible: cada biblioteca que no compilaba en Native reducía el número de proyectos que lo adoptaban, y cada proyecto que no lo adoptaba reducía la presión sobre los autores para adaptarse. Lo que la migración al recolector concurrente compró no fue rendimiento, aunque también, sino compatibilidad semántica: hoy el código escrito ignorando por completo la existencia de Kotlin/Native se comporta en Native como se comporta en la JVM, con sus mismas garantías y sus mismas carreras de datos. Aceptar de vuelta esa clase de errores fue una decisión consciente y correcta, y encierra el principio que conviene llevarse: la seguridad que se compra al precio de que nadie pueda reutilizar lo ya escrito no es seguridad, es aislamiento, y el aislamiento en un ecosistema de software se paga siempre con la extinción.
+</Callout>
+
+<Challenge title="Enterrar el modelo antiguo con las manos">
+1. Busca en una biblioteca multiplataforma pública anterior a 2023 todas las llamadas de congelado y las anotaciones de compartición. Explica qué problema resolvía cada aparición y qué queda al eliminarla.
+2. Escribe deliberadamente una carrera de datos en Native con un contador incrementado desde varios hilos sin sincronizar. Comprueba que compila, ejecuta y da un resultado incorrecto.
+3. Corrígela tres veces: con un tipo atómico, con un `Mutex` y confinando el estado. Mide las tres versiones.
+4. Activa los registros del recolector, genera basura en un bucle y observa la diferencia entre las recolecciones de la generación joven y las completas.
+5. Construye a propósito un ciclo entre un objeto Kotlin y uno Objective-C, demuestra con instrumentación que no se libera, y rómpelo con una referencia débil.
+</Challenge>

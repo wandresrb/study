@@ -13,7 +13,7 @@ import { execSync } from 'node:child_process';
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const GUIDE = 'src/content/guia';
+const GUIDE = 'src/content/guide';
 const BLOCK = /<Mermaid\s+code=\{`([\s\S]*?)`\}/g;
 const STYLE = /^[ \t]*style\s+(\S+)\s+(.*)$/;
 
