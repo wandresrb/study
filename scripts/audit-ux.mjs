@@ -296,6 +296,8 @@ async function focusRing(page, sample = 25) {
     const hit = await page.evaluate(() => {
       const el = document.activeElement;
       if (!el || el === document.body || el === document.documentElement) return null;
+      // The Astro dev toolbar is not part of the site.
+      if (el.tagName.toLowerCase().startsWith('astro-')) return null;
       const s = getComputedStyle(el);
       const cls = typeof el.className === 'string' ? el.className : '';
       const outlined = s.outlineStyle !== 'none' && parseFloat(s.outlineWidth) > 0;

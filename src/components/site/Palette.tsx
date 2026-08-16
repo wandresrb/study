@@ -252,7 +252,7 @@ export default function Palette(props: Props) {
         type="button"
         onClick={show}
         aria-label="Buscar en el sitio"
-        class="inline-flex shrink-0 cursor-pointer items-center gap-2 rounded-full border border-borde bg-crust/60 px-3 py-1.5 font-mono text-sm text-overlay1 transition-colors hover:border-surface1 hover:text-subtext0"
+        class="inline-flex min-h-6 shrink-0 cursor-pointer items-center gap-2 rounded-full border border-borde bg-crust/60 px-3 py-1.5 text-sm text-overlay1 transition-colors hover:border-surface1 hover:text-subtext0"
       >
         <span aria-hidden="true">⌕</span>
         <span class="hidden sm:inline">Buscar</span>
@@ -285,13 +285,13 @@ export default function Palette(props: Props) {
               aria-controls="palette-list"
               aria-autocomplete="list"
               aria-activedescendant={results().length ? optionId(cursor()) : undefined}
-              class="w-full border-0 border-b border-surface1 bg-transparent px-4 py-3.5 font-mono text-base text-text outline-none placeholder:text-overlay0"
+              class="w-full border-0 border-b border-surface1 bg-transparent px-4 py-3.5 text-base text-text outline-none placeholder:text-overlay0"
             />
 
             <Show
               when={results().length > 0}
               fallback={
-                <p class="m-0 px-4 py-6 font-mono text-sm text-overlay1">Nada para «{query()}».</p>
+                <p class="m-0 px-4 py-6 text-sm text-overlay1">Nada para «{query()}».</p>
               }
             >
               <ul
