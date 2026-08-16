@@ -187,7 +187,12 @@ function probe({ aaText, aaLarge, minTarget }) {
     // A 1x1 box is a visually-hidden control (skip link, sr-only): it is not a
     // target the pointer is meant to hit, so size rules do not apply to it.
     if (rect.width <= 1 && rect.height <= 1) continue;
-    if (rect.width < minTarget || rect.height < minTarget) {
+    // WCAG 2.5.8 exempts a link sitting in a sentence — you cannot grow it
+    // without breaking the line it belongs to.
+    const inSentence =
+      el.tagName === 'A' &&
+      !!el.closest('p, li, td, th, dd, dt, figcaption, blockquote');
+    if (!inSentence && (rect.width < minTarget || rect.height < minTarget)) {
       tooSmall.push({ at: where(el), w: Math.round(rect.width), h: Math.round(rect.height), text: label(el).slice(0, 24) });
     }
   }

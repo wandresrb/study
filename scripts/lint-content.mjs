@@ -5,7 +5,19 @@ import { DatabaseSync } from 'node:sqlite';
 
 const GUIDE = 'src/content/guia';
 const ICONS = 'src/lib/icons.ts';
+const CONTENT_COMPONENTS = 'src/components/content';
 const DB = 'db/catalog.db';
+
+/** Component name → the props it declares, to catch a rename the content missed. */
+const PROPS = new Map();
+for (const file of (await readdir(CONTENT_COMPONENTS)).filter((f) => f.endsWith('.astro'))) {
+  const block = (await readFile(join(CONTENT_COMPONENTS, file), 'utf8')).match(
+    /interface Props\s*\{([\s\S]*?)\n\}/,
+  );
+  if (!block) continue;
+  const names = [...block[1].matchAll(/^\s*(?:\/\*\*.*\*\/\s*)?([a-zA-Z]\w*)\??\s*:/gm)].map((m) => m[1]);
+  if (names.length) PROPS.set(basename(file, '.astro'), new Set(names));
+}
 
 const COMPONENTS = new Set([
   'Callout', 'KeyCap', 'Kbd', 'Mermaid', 'Cards', 'Card', 'PluginCard',
@@ -112,6 +124,22 @@ for (const track of folders) {
       .replace(/`[^`\n]*`/g, '');
     // Las expresiones JSX ({'ci"<Esc>'}, opciones={[…]}) son JS, no marcado:
     // un <Esc> ahí dentro es texto. Se pelan de dentro afuera.
+    // Props, antes de pelar el JSX: el renombrado a inglés dejó
+    // <KeyboardMap teclas={…}> apuntando a una prop que ya no existe, y el fallo
+    // no salió hasta renderizar esa página concreta en un build entero.
+    for (const [, tag, attrs] of prose.matchAll(/<([A-Z]\w*)((?:[^<>]|\n)*?)\/?>/g)) {
+      const known = PROPS.get(tag);
+      if (!known) continue;
+      // Los valores se pelan primero: `doc="set bufhidden=hide"` lleva dentro
+      // una opción de Vim que no es una prop, y `keys={{…}}` va anidado.
+      let bare = attrs.replace(/=\s*"[^"]*"/g, '=_').replace(/=\s*'[^']*'/g, '=_');
+      for (let i = 0; i < 6; i++) bare = bare.replace(/\{[^{}]*\}/g, '_');
+      for (const [, prop] of bare.matchAll(/(?:^|\s)([a-z]\w*)=/g)) {
+        if (prop.startsWith('client') || known.has(prop)) continue;
+        fail(path, `<${tag}> recibe "${prop}", que no está en sus Props`);
+      }
+    }
+
     for (let i = 0; i < 6; i++) prose = prose.replace(/\{[^{}]*\}/g, '');
     for (const [, tag] of prose.matchAll(/<([A-Z]\w*)[\s/>]/g)) {
       if (!COMPONENTS.has(tag)) fail(path, `<${tag}> no está registrado en guide/[...slug].astro`);
