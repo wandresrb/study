@@ -44,7 +44,7 @@ const chrome = EditorView.theme(
     '.cm-vim-panel input': { color: 'var(--text)', fontFamily: 'var(--font-mono)' },
     '.cm-tooltip': {
       backgroundColor: 'var(--mantle)',
-      border: '1px solid var(--border)',
+      border: '1px solid var(--line)',
       borderRadius: 'var(--radius-sm)',
     },
     '.cm-tooltip-autocomplete ul li[aria-selected]': {
