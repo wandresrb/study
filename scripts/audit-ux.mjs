@@ -44,13 +44,23 @@ function probe({ aaText, aaLarge, minTarget }) {
     return 0.2126 * r + 0.7152 * g + 0.0722 * b;
   };
 
-  // Walk up for the first painted background: the ratio needs what is behind.
-  const backdrop = (node) => {
+  // Walk up for the first painted background. A gradient leaves backgroundColor
+  // transparent, so a naive walk-up would compare the text against an ancestor
+  // it never sits on — that alone invented a 1.05:1 on a button that reads at
+  // 8.7:1. Sample the gradient stops and let the caller take the worst.
+  const backdrops = (node) => {
     for (let el = node; el; el = el.parentElement) {
-      const bg = getComputedStyle(el).backgroundColor;
-      if (bg && luminance(bg) !== null) return bg;
+      const style = getComputedStyle(el);
+      if (style.backgroundImage && style.backgroundImage !== 'none') {
+        const stops = (style.backgroundImage.match(/rgba?\([^)]*\)/g) ?? []).filter(
+          (c) => luminance(c) !== null,
+        );
+        if (stops.length) return stops;
+      }
+      const bg = style.backgroundColor;
+      if (bg && luminance(bg) !== null) return [bg];
     }
-    return 'rgb(0, 0, 0)';
+    return ['rgb(0, 0, 0)'];
   };
 
   const contrast = (fg, bg) => {
@@ -60,12 +70,22 @@ function probe({ aaText, aaLarge, minTarget }) {
     return Number(((Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05)).toFixed(2));
   };
 
+  // textContent, not just innerText: a control inside a closed <details> or a
+  // collapsed menu renders nothing but still has a perfectly good name.
   const label = (el) =>
     (el.innerText || '').trim() ||
+    (el.textContent || '').trim() ||
     el.getAttribute('aria-label') ||
     el.getAttribute('title') ||
     (el.querySelector('img')?.alt ?? '') ||
     (el.querySelector('svg title')?.textContent ?? '');
+
+  // Only judge what the user can actually see: hidden controls have no ring to
+  // show and no target to hit, so counting them manufactures findings.
+  const visible = (el) =>
+    typeof el.checkVisibility === 'function'
+      ? el.checkVisibility({ contentVisibilityAuto: true, opacityProperty: true, visibilityProperty: true })
+      : el.getBoundingClientRect().width > 0;
 
   const where = (el) => {
     const cls = typeof el.className === 'string' ? el.className : '';
@@ -106,9 +126,12 @@ function probe({ aaText, aaLarge, minTarget }) {
   const tooSmall = [];
   for (const el of controls) {
     const rect = el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) continue;
+    if (rect.width === 0 || rect.height === 0 || !visible(el)) continue;
     const interactive = /^(A|BUTTON)$/.test(el.tagName) || el.getAttribute('role') === 'button';
     if (interactive && !label(el)) unnamed.push({ at: where(el), href: el.getAttribute('href') });
+    // A 1x1 box is a visually-hidden control (skip link, sr-only): it is not a
+    // target the pointer is meant to hit, so size rules do not apply to it.
+    if (rect.width <= 1 && rect.height <= 1) continue;
     if (rect.width < minTarget || rect.height < minTarget) {
       tooSmall.push({ at: where(el), w: Math.round(rect.width), h: Math.round(rect.height), text: label(el).slice(0, 24) });
     }
@@ -122,8 +145,11 @@ function probe({ aaText, aaLarge, minTarget }) {
     const size = parseFloat(style.fontSize);
     const weight = Number(style.fontWeight);
     const large = size >= 24 || (size >= 18.66 && weight >= 700);
-    const ratio = contrast(style.color, backdrop(el));
-    if (ratio === null) continue;
+    const ratios = backdrops(el)
+      .map((bg) => contrast(style.color, bg))
+      .filter((r) => r !== null);
+    if (!ratios.length) continue;
+    const ratio = Math.min(...ratios);
     const floor = large ? aaLarge : aaText;
     if (ratio < floor) {
       contrastFails.push({
@@ -159,10 +185,17 @@ function probe({ aaText, aaLarge, minTarget }) {
     seen.count++;
     used.set(key, seen);
   }
+  // A face that failed to fetch also answers false to check(), which would read
+  // as faux bold when the real story is "the font never arrived". Keep them
+  // apart: one is a design bug, the other is a broken dev cache.
+  const failed = loaded.filter((f) => f.status === 'error');
+  const brokenFamilies = new Set(failed.map((f) => f.family));
+
   // document.fonts.check() is the browser's own answer to "can I render this
   // without faking it?" — the only reliable way to catch faux bold / faux italic.
   const synthesised = [];
   for (const entry of used.values()) {
+    if (brokenFamilies.has(entry.family)) continue;
     const spec = `${entry.style} ${entry.weight} 16px "${entry.family}"`;
     let available = true;
     try {
@@ -230,6 +263,7 @@ function probe({ aaText, aaLarge, minTarget }) {
     contrast: { measured: withText.length, fails: contrastFails.sort((a, b) => a.ratio - b.ratio) },
     typography: {
       loaded,
+      failed,
       used: [...used.values()].sort((a, b) => b.count - a.count),
       synthesised,
       column,
@@ -248,32 +282,37 @@ function probe({ aaText, aaLarge, minTarget }) {
   };
 }
 
-/** Focus has to be driven from outside the page: tab through and watch the ring. */
+/**
+ * Real Tab presses, not el.focus(): `:focus-visible` only matches keyboard
+ * focus, so a programmatic focus reports every control as ringless — which is
+ * exactly the false positive this replaced.
+ */
 async function focusRing(page, sample = 25) {
-  return page.evaluate((max) => {
-    const ring = (el) => {
+  const invisible = [];
+  const seen = new Set();
+  let checked = 0;
+  for (let i = 0; i < sample; i++) {
+    await page.keyboard.press('Tab');
+    const hit = await page.evaluate(() => {
+      const el = document.activeElement;
+      if (!el || el === document.body || el === document.documentElement) return null;
       const s = getComputedStyle(el);
-      return `${s.outlineStyle}|${s.outlineWidth}|${s.outlineColor}|${s.boxShadow}|${s.borderColor}`;
-    };
-    const targets = [...document.querySelectorAll('a[href], button, input, select, textarea')]
-      .filter((el) => {
-        const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      })
-      .slice(0, max);
-    const invisible = [];
-    for (const el of targets) {
-      const before = ring(el);
-      el.focus();
-      const after = ring(el);
-      if (before === after) {
-        const cls = typeof el.className === 'string' ? el.className : '';
-        invisible.push(`${el.tagName.toLowerCase()}${cls ? `.${cls.trim().split(/\s+/)[0]}` : ''}`);
-      }
-      el.blur();
+      const cls = typeof el.className === 'string' ? el.className : '';
+      const outlined = s.outlineStyle !== 'none' && parseFloat(s.outlineWidth) > 0;
+      const shadowed = s.boxShadow !== 'none';
+      return {
+        at: `${el.tagName.toLowerCase()}${cls ? `.${cls.trim().split(/\s+/)[0]}` : ''}`,
+        ringed: outlined || shadowed,
+      };
+    });
+    if (!hit) continue;
+    checked++;
+    if (!hit.ringed && !seen.has(hit.at)) {
+      seen.add(hit.at);
+      invisible.push(hit.at);
     }
-    return { checked: targets.length, invisible };
-  }, sample);
+  }
+  return { checked, invisible };
 }
 
 const bullet = (n, one, many) => `${n} ${n === 1 ? one : many}`;
@@ -346,6 +385,10 @@ async function main() {
     if (page.contrast.fails.length) {
       const worst = page.contrast.fails[0];
       lines.push(`contraste: ${page.contrast.fails.length}/${page.contrast.measured} bajo AA (peor ${worst.ratio}:1 en ${worst.at} «${worst.text}»)`);
+    }
+    if (page.typography.failed.length) {
+      const families = [...new Set(page.typography.failed.map((f) => f.family))];
+      lines.push(`${page.typography.failed.length} caras no cargaron (${families.join(', ')}) — suele ser la caché de dev, no el sitio`);
     }
     if (page.typography.synthesised.length) {
       lines.push(`tipografía sintetizada (faux bold/italic): ${page.typography.synthesised.map((f) => `${f.family} ${f.weight} ${f.style}`).join(', ')}`);
