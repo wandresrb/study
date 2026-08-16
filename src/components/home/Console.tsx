@@ -16,7 +16,9 @@ import {
 const PANEL = 'rounded-sm border border-overlay0 overflow-hidden';
 const BAR = 'm-0 border-b border-surface1 bg-crust px-3.5 py-2 font-mono';
 
-export default function Console(props: { code: string }) {
+
+function RunButton() {
+
   let timers: number[] = [];
 
   const run = () => {
@@ -39,20 +41,45 @@ export default function Console(props: { code: string }) {
   };
 
   return (
+    <button
+      type="button"
+      onClick={run}
+      disabled={phase() !== 'inicio'}
+      class="inline-flex cursor-pointer items-center gap-2.5 justify-self-start px-4 py-2.5 font-mono text-sm text-green transition-colors bg-green/20 focus-visible:bg-green/20 disabled:cursor-default disabled:opacity-45"
+    >
+      <span aria-hidden="true" class="text-2xs">
+        ▶
+      </span>
+      <span>Run</span>
+      <kbd class="inline-grid min-w-5 place-items-center rounded border border-b-2 border-green/35 bg-mantle/80 px-1.5 py-px text-2xs text-green/70">
+        ⏎
+      </kbd>
+    </button>
+  )
+}
+
+
+export default function Console(props: { code: string }) {
+
+
+  return (
     <div>
       <div class="mt-3 grid gap-3" classList={{ hidden: collapsed() }}>
-        <div class={`${PANEL} bg-mantle shadow-flotante`}>
-          <p class={`${BAR} flex items-center gap-1.5 text-xs text-subtext0`}>
-            <span aria-hidden="true" class="size-2 rounded-full bg-surface1" />
-            <span aria-hidden="true" class="size-2 rounded-full bg-surface1" />
-            <span aria-hidden="true" class="size-2 rounded-full bg-surface1" />
-            <b class="ml-2 font-normal">main.rs</b>
-          </p>
+        <div class={`${PANEL} bg-mantle`}>
+          <div class='flex justify-between'>
+            <p class={`${BAR} flex items-center gap-1.5 text-xs text-subtext0`}>
+              <span aria-hidden="true" class="size-2 rounded-full bg-surface1" />
+              <span aria-hidden="true" class="size-2 rounded-full bg-surface1" />
+              <span aria-hidden="true" class="size-2 rounded-full bg-surface1" />
+              <b class="ml-2 font-normal">main.rs</b>
+            </p>
+            <RunButton />
+          </div>
 
           <div class="editor" innerHTML={props.code} />
 
           <p class="m-0 flex items-center gap-3 border-t border-surface1 bg-crust px-3.5 py-1.5 font-mono text-2xs text-overlay1">
-            <b class="rounded-xs bg-blue px-2 py-0.5 font-semibold tracking-versalita text-crust">
+            <b class="bg-blue px-2 py-0.5 font-semibold tracking-versalita text-crust">
               NORMAL
             </b>
             <span class="text-subtext0">main.rs</span>
@@ -87,20 +114,6 @@ export default function Console(props: { code: string }) {
           </pre>
         </div>
 
-        <button
-          type="button"
-          onClick={run}
-          disabled={phase() !== 'inicio'}
-          class="inline-flex cursor-pointer items-center gap-2.5 justify-self-start px-4 py-2.5 font-mono text-sm text-green transition-colors hover:not-disabled:bg-green/20 focus-visible:bg-green/20 disabled:cursor-default disabled:opacity-45"
-        >
-          <span aria-hidden="true" class="text-2xs">
-            ▶
-          </span>
-          <span>Run</span>
-          <kbd class="inline-grid min-w-5 place-items-center rounded border border-b-2 border-green/35 bg-mantle/80 px-1.5 py-px text-2xs text-green/70">
-            ⏎
-          </kbd>
-        </button>
       </div>
     </div>
   );

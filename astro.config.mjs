@@ -13,6 +13,8 @@ import tailwindcss from '@tailwindcss/vite';
 
 import pagefind from 'astro-pagefind';
 
+import { SHIKI_THEMES } from './src/lib/themes.ts';
+
 import { fileTitleTransformer } from './src/lib/shiki-file-title.ts';
 import catalog from './src/integrations/catalog.ts';
 
@@ -62,11 +64,7 @@ export default defineConfig({
       rehypePlugins: [[rehypeKatex, { throwOnError: true, strict: 'error' }]],
     }),
     shikiConfig: {
-      themes: {
-        kanagawa: 'kanagawa-wave',
-        catppuccin: 'catppuccin-mocha',
-        everforest: 'everforest-dark',
-      },
+      themes: SHIKI_THEMES,
       defaultColor: false,
       wrap: false,
       transformers: [fileTitleTransformer],

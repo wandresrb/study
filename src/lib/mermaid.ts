@@ -1,3 +1,5 @@
+import { DEFAULT_THEME } from './themes';
+
 type Mermaid = typeof import('mermaid').default;
 
 let mermaid: Mermaid | null = null;
@@ -17,7 +19,7 @@ async function paint() {
 
   if (!mermaid) ({ default: mermaid } = await import('mermaid'));
 
-  const theme = document.documentElement.dataset.theme ?? 'kanagawa';
+  const theme = document.documentElement.dataset.theme ?? DEFAULT_THEME;
   if (themed !== theme) {
     themed = theme;
     const css = getComputedStyle(document.documentElement);

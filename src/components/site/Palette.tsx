@@ -2,6 +2,7 @@ import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid
 import { Portal } from 'solid-js/web';
 import { navigate } from 'astro:transitions/client';
 import { fold } from '../../lib/fold';
+import { THEMES, isTheme } from '../../lib/themes';
 
 type Entry = [string, string, string];
 
@@ -27,12 +28,8 @@ const SHORTCUTS: Entry[] = [
   ['Sobre el sitio', 'ir a', '/about/'],
 ];
 
-// Proto-omnibar: until the Modo Normal chrome lands, :theme lives here.
-const THEME_CMDS: Entry[] = [
-  ['Tema: Kanagawa', 'tema', ':theme kanagawa'],
-  ['Tema: Catppuccin', 'tema', ':theme catppuccin'],
-  ['Tema: Everforest', 'tema', ':theme everforest'],
-];
+// Proto-omnibar: until the Modo Normal chrome lands, :theme lives here too.
+const THEME_CMDS: Entry[] = THEMES.map((t) => [`Tema: ${t.name}`, 'tema', `:theme ${t.id}`]);
 
 interface CatalogData {
   lessons: [string, string, string][];
@@ -145,6 +142,7 @@ export default function Palette(props: Props) {
   const go = (path: string) => {
     if (path.startsWith(':theme ')) {
       const theme = path.slice(7);
+      if (!isTheme(theme)) return;
       try {
         localStorage.setItem('theme', theme);
       } catch {
