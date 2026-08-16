@@ -30,13 +30,13 @@ Necesitas **Node.js 22.12+** (lo pide Astro 7). El gestor de paquetes es **bun**
 bun install
 bun dev                       # → http://localhost:4321
 bun run check                 # astro check sobre los 73 ficheros de código
-bun run lint:contenido        # las 5078 lecciones, en segundos
+bun run lint:content        # las 5078 lecciones, en segundos
 bun run build                 # producción en ./dist
 bun run preview
 bun run deploy                # build + wrangler deploy
 ```
 
-No hay tests. La red son dos comandos: `astro check` para el código y `lint:contenido` para el
+No hay tests. La red son dos comandos: `astro check` para el código y `lint:content` para el
 contenido —frontmatter, numeración sin huecos ni duplicados, y componentes de MDX sin registrar, que
 no dan error y salen como texto en la página—. El resto de errores de datos los caza el esquema de
 las colecciones durante el build.
@@ -51,7 +51,7 @@ iterar, `bun dev` basta.
 nvim-dios/                        (nombre heredado; hoy es un hub multi-tema)
 ├── astro.config.mjs              # Astro 7 + MDX + Shiki + fuentes autohospedadas
 ├── wrangler.jsonc                # Cloudflare: solo assets estáticos, sin Worker
-├── scripts/lint-contenido.mjs    # el linter de las lecciones
+├── scripts/lint-content.mjs    # el linter de las lecciones
 ├── src/
 │   ├── content.config.ts         # las cinco colecciones y sus relaciones
 │   ├── content/
@@ -89,9 +89,9 @@ Las relaciones entre colecciones se declaran con `reference()`, que da tipos y v
 3. `src/content/guia/<id>/*.mdx` — las lecciones, con `subject: <id>`, `level`, `order` y `posicion`
    (la posición dentro del nivel: `"3.1"`).
 4. Su icono de Lucide en el mapa `TRACK_ICON` de `src/lib/iconos.ts` — **obligatorio**: sin él lo
-   canta `lint:contenido` y el render lanza.
+   canta `lint:content` y el render lanza.
 5. Opcional: `src/content/cheatsheets/<id>.json`. El enlace aparece solo si existe la entrada.
-6. Pon el track en `"disponible"` cuando ya se pueda leer, y pasa `bun run lint:contenido <id>`.
+6. Pon el track en `"disponible"` cuando ya se pueda leer, y pasa `bun run lint:content <id>`.
 
 El hub, la barra lateral y la portada del tema se generan solos a partir de esos datos.
 

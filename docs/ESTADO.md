@@ -4,7 +4,7 @@
 
 ```
 bun run check            77 ficheros · 0 errores · 0 warnings · 0 hints
-bun run lint:contenido   5.078 lecciones · 28 tracks · 0 errores · 27 avisos
+bun run lint:content   5.078 lecciones · 28 tracks · 0 errores · 27 avisos
 bun run build            5.140 páginas en 52 s
 ```
 

@@ -9,7 +9,7 @@ const DB = 'db/catalog.db';
 
 const COMPONENTS = new Set([
   'Callout', 'KeyCap', 'Kbd', 'Mermaid', 'Cards', 'Card', 'PluginCard',
-  'Objetivos', 'Reto', 'Lead', 'Drill', 'Paso', 'Instalar',
+  'Objetivos', 'Reto', 'Lead', 'Exercise', 'Paso', 'Instalar',
   'Predict', 'ModeMap', 'KeyboardMap', 'Pipeline',
   'UndoTree', 'WindowLayout', 'CommandAnatomy', 'Run',
   'Fragment',

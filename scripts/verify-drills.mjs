@@ -1,6 +1,6 @@
 // El oráculo: cada drill interactivo se ejecuta contra un Neovim REAL.
 //
-//   node scripts/verificar-drills.mjs [track]
+//   node scripts/verify-drills.mjs [track]
 //
 // Extrae de los MDX los <Drill> con doc/solucion/objetivo, reproduce la
 // solución en `nvim --clean --headless` con feedkeys, y compara el buffer

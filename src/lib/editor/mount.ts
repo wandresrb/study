@@ -1,5 +1,5 @@
 // Keeps core.ts out of every page that has no editor. Same shape as
-// lib/vim/drill-mount.ts, which already proved it against the vim engine.
+// lib/vim/mount.ts, which already proved it against the vim engine.
 import type { Editor, EditorOptions } from './core';
 
 type Core = typeof import('./core');

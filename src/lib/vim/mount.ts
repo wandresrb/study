@@ -5,13 +5,12 @@
 // Con <ClientRouter/> los módulos corren UNA vez: todo cuelga de
 // astro:page-load y es idempotente (data-montado marca lo ya hecho).
 
-import { completarDrill, estadoDrill, porLeccion } from './progreso';
-import { lessonIdOf, markRead } from '../progress';
-import type { DefDrill, Drill } from './drill-engine';
+import { byLesson, complete, get, lessonIdOf, markRead } from '../learner';
+import type { DefDrill, Drill } from './engine';
 
-type Motor = typeof import('./drill-engine');
+type Motor = typeof import('./engine');
 let motor: Promise<Motor> | null = null;
-const cargarMotor = () => (motor ??= import('./drill-engine'));
+const cargarMotor = () => (motor ??= import('./engine'));
 
 const vivos = new WeakMap<HTMLElement, Drill>();
 
@@ -19,6 +18,10 @@ function montarUno(raiz: HTMLElement, api: Motor) {
   const def = JSON.parse(raiz.querySelector('script[type="application/json"]')!.textContent!) as DefDrill;
   const id = raiz.dataset.id!;
   const reto = raiz.dataset.reto ?? '';
+  // The store holds every track, so a drill's hash is only unique per lesson.
+  // Replayed out of context (the review page) the origin travels in data-*.
+  const lesson = raiz.dataset.lesson ?? lessonIdOf(location.href);
+  const drillId = raiz.dataset.itemId ?? `${lesson}#${id}`;
   const term = raiz.querySelector<HTMLElement>('[data-term]')!;
   term.querySelector('pre')?.remove(); // el fallback SSR: el editor lo sustituye
   const modoEl = raiz.querySelector<HTMLElement>('[data-modo]')!;
@@ -35,7 +38,7 @@ function montarUno(raiz: HTMLElement, api: Motor) {
       'font-mono text-sm ' +
       (dominio === 2 ? 'text-yellow' : dominio !== undefined ? 'text-green' : 'text-overlay0');
   };
-  pintarEstado(estadoDrill(id)?.dominio);
+  void get(drillId).then((r) => pintarEstado(r?.mastery));
 
   const drill = api.montar(term, def, {
     onModo(modo) {
@@ -58,22 +61,25 @@ function montarUno(raiz: HTMLElement, api: Motor) {
     },
     onExito({ pulsaciones }) {
       const enPresupuesto = def.presupuesto !== undefined && pulsaciones <= def.presupuesto;
-      completarDrill(id, {
-        def,
-        reto,
-        leccion: location.pathname,
-        sinPista: !usoPista,
-        enPresupuesto,
-      });
-      pintarEstado(estadoDrill(id)?.dominio);
       explicaEl?.removeAttribute('hidden');
       raiz.dispatchEvent(new CustomEvent('drill:exito', { bubbles: true }));
       celebrar(raiz, enPresupuesto);
-      // practicar marca la lección: si todos los drills de la página están
-      // hechos, cae el tick de leída del sistema de progreso del sitio
-      const total = document.querySelectorAll('[data-vim-drill]').length;
-      const hechos = porLeccion().get(location.pathname)?.hechos ?? 0;
-      if (total > 0 && hechos >= total) void markRead(lessonIdOf(location.href));
+      void (async () => {
+        await complete(drillId, {
+          kind: 'exercise',
+          lesson,
+          label: reto,
+          data: def,
+          noHint: !usoPista,
+          withinBudget: enPresupuesto,
+        });
+        pintarEstado((await get(drillId))?.mastery);
+        // practicar marca la lección: si todos los drills de la página están
+        // hechos, cae el tick de leída
+        const total = document.querySelectorAll('[data-vim-exercise]').length;
+        const hechos = (await byLesson()).get(lesson)?.done ?? 0;
+        if (total > 0 && hechos >= total) void markRead(lesson);
+      })();
     },
   });
   vivos.set(raiz, drill);
@@ -128,7 +134,7 @@ const montar = (el: HTMLElement) => {
 
 /** Monta lo que haya sin montar. Exportada: el dojo inyecta drills y la llama. */
 export function montarPendientes() {
-  const drills = document.querySelectorAll<HTMLElement>('[data-vim-drill]:not([data-montado])');
+  const drills = document.querySelectorAll<HTMLElement>('[data-vim-exercise]:not([data-montado])');
   if (drills.length === 0) return;
 
   // Lo cercano se monta YA, por geometría: los IntersectionObserver se
@@ -162,7 +168,7 @@ else document.addEventListener('DOMContentLoaded', () => montarPendientes(), { o
 document.addEventListener('astro:page-load', montarPendientes);
 document.addEventListener('astro:before-swap', () => {
   // CM engancha listeners al DOM que el swap va a tirar: limpieza explícita
-  document.querySelectorAll<HTMLElement>('[data-vim-drill][data-montado]').forEach((el) => {
+  document.querySelectorAll<HTMLElement>('[data-vim-exercise][data-montado]').forEach((el) => {
     vivos.get(el)?.destruir();
   });
 });

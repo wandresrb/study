@@ -16,7 +16,7 @@ bun run deploy     # astro build && wrangler deploy  → Cloudflare (sitio está
 ```
 
 No hay tests de código; la red son dos comandos — y un oráculo para los drills:
-`bun run verificar:drills [track]` ejecuta la `solucion` de cada `<Drill>` interactivo contra un
+`bun run verify:drills [track]` ejecuta la `solucion` de cada `<Drill>` interactivo contra un
 `nvim --headless` real (o `vim --clean` si no hay nvim; `ORACULO_BIN` lo fuerza) y compara el
 buffer resultante con `objetivo`. **Un drill no se publica como interactivo si diverge**: o la
 solución está mal, o la emulación del navegador no cubre ese comando — en ambos casos se deja
@@ -35,8 +35,8 @@ La capa interactiva del track de neovim (plan en `_PLAN-RUTA-INTERACTIVA.md`):
   El motor (`lib/vim/drill-engine.ts`, ~90 KB) se carga con `import()` al entrar el primer drill
   en pantalla (`lib/vim/drill-mount.ts`, IntersectionObserver); la piel del terminal se tematiza
   desde JS con `EditorView.theme`, no con CSS global.
-- **Progreso y SRS** en `lib/vim/progreso.ts` (localStorage `nvdios:v1`): dominio ○/✓/★ por drill,
-  racha, y cola de repaso 1/3/7/21 días que consume **`/neovim/dojo/`**. Completar todos los
+- **Progreso y SRS** en `lib/vim/drill-progress.ts` (localStorage `nvdios:v1`): dominio ○/✓/★ por drill,
+  racha, y cola de repaso 1/3/7/21 días que consume **`/neovim/recall/`**. Completar todos los
   drills de una página marca la lección como leída en el sistema de `lib/progress.ts`.
 - **Diagramas**: Mermaid está siendo sustituido por familias de componentes (`Pipeline`, `ModeMap`,
   `KeyboardMap` — registradas en `guide/[...slug].astro` y en el linter). `ModeMap` es la máquina
@@ -47,7 +47,7 @@ La capa interactiva del track de neovim (plan en `_PLAN-RUTA-INTERACTIVA.md`):
 0 warnings, 0 hints**; si tu cambio añade uno, quítalo antes de seguir. Comprueba el estado *antes*
 de empezar: hoy no está en cero por trabajo en vuelo ajeno, y esos no son tuyos.
 
-`bun run lint:contenido [track]` cubre las 5.088 lecciones en segundos: reconstruye la base,
+`bun run lint:content [track]` cubre las 5.088 lecciones en segundos: reconstruye la base,
 valida frontmatter, `subject` contra la carpeta, `posicion` contra `level.order`, numeración sin
 huecos ni duplicados, componentes sin registrar en `guide/[...slug].astro` —que no dan error, salen
 como texto en la página— y `style … fill:#hex` dentro de un `<Mermaid>`. Los `throw` de
@@ -247,7 +247,7 @@ todas. Los otros 16 registrados ya están en inglés.
 | `Instalar` | `content/Install.astro` | legado |
 | `Callout`, `KeyCap`/`Kbd`, `Mermaid`, `Cards`/`Card`, `PluginCard`, `Lead`, `Drill`, `Predict`, `Pipeline`, `ModeMap`, `KeyboardMap`, `UndoTree`, `WindowLayout`, `CommandAnatomy` | igual | |
 
-`scripts/lint-contenido.mjs` lleva esa lista en `COMPONENTS` **con los nombres del MDX**: si
+`scripts/lint-content.mjs` lleva esa lista en `COMPONENTS` **con los nombres del MDX**: si
 registras uno nuevo, añádelo también ahí.
 
 **Trampa medida: MDX recorta la indentación de una expresión multilínea en un atributo.** Quita
@@ -282,7 +282,7 @@ Es el patrón de `getTrack`/`getLevels`: sin él, un track sin icono daba «Unab
 no dice cuál. El `import type { AstroComponent } from '@lucide/astro'` de la cabecera parece un
 barril y no lo es — se borra en compilación—; los iconos siguen entrando uno a uno por su ruta.
 
-La red de verdad, sin embargo, es `lint:contenido`: cruza las claves del mapa contra la tabla
+La red de verdad, sin embargo, es `lint:content`: cruza las claves del mapa contra la tabla
 `track` **en las dos direcciones**, así que caza tanto el track sin icono —en segundos, en vez de
 con un build de ~5.100 páginas— como la clave huérfana, que el build no ve nunca porque solo falla
 en la otra dirección (había una, `local-first-patron`).
@@ -415,7 +415,7 @@ el orden es pedagógico, no alfabético. Para tocar la config, edita el `.lua`, 
 5. Opcional: `db/seeds/05-cheatsheets.sql` (el enlace aparece solo).
 
 Hub, sidebar y portada del track se generan a partir de eso. Comprueba con
-`bun run lint:contenido <id>`, que reconstruye la base antes de mirar nada.
+`bun run lint:content <id>`, que reconstruye la base antes de mirar nada.
 
 ## Estilo
 

@@ -4,7 +4,7 @@
 // en pantalla, y todas las instancias de la página comparten el módulo.
 //
 // La semántica es del emulador (10 años de batalla en Replit); la piel es
-// nuestra. scripts/verificar-drills.mjs contrasta cada solución contra un
+// nuestra. scripts/verify-drills.mjs contrasta cada solución contra un
 // nvim --headless real: si divergen, el drill no se publica como interactivo.
 
 import { EditorState, type Extension } from '@codemirror/state';
