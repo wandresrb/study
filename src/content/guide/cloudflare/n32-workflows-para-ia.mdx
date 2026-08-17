@@ -1,0 +1,152 @@
+---
+title: "Workflows para IA: pipelines largos que sobreviven al fallo"
+description: "Un agente conversa; un Workflow produce. Cuando el trabajo son cientos de documentos que hay que trocear, incrustar, indexar y resumir, con proveedores que devuelven errores de cuota y pasos que cuestan dinero cada vez que se ejecutan, la ejecución durable deja de ser un lujo y pasa a ser el único diseño sensato. Vemos por qué el bucle agéntico no es el sitio para un pipeline largo, cómo trazar las fronteras de paso alrededor de las llamadas caras, cómo configurar reintentos que respetan los límites de cuota, cuándo un error no debe reintentarse jamás y cómo el agente y el Workflow se reparten el trabajo sin pisarse."
+subject: cloudflare
+level: 32
+order: 4
+position: "32.4"
+duration: "18 min"
+---
+
+<Lead>
+Hay una tentación muy común al descubrir los agentes: meterlo todo dentro del bucle. Si el modelo sabe decidir sus pasos, que decida también los mil pasos de la ingesta nocturna del catálogo. Es un error de categoría, y sale caro. Un bucle agéntico está pensado para conversar con alguien que espera al otro lado, en horizontes de segundos y con un puñado de decisiones; un pipeline de ingesta es lo contrario: sabes perfectamente qué pasos hay y en qué orden, no hay nada que decidir, y lo que necesitas es que trescientas llamadas caras a un modelo no se repitan porque el proveedor devolvió un error de cuota en la doscientas ochenta. Ese trabajo tiene nombre desde el nivel dieciséis: ejecución durable. Y en un sistema con IA, la durabilidad importa más que en ningún otro sitio, porque aquí cada paso repetido se paga en dinero contante.
+</Lead>
+
+<Goals>
+
+- Decidir cuándo un trabajo pertenece al bucle del agente y cuándo a un Workflow.
+- Trazar las fronteras de paso alrededor de las llamadas caras y no deterministas.
+- Configurar reintentos con espera adaptada a los errores de cuota de los proveedores.
+- Distinguir el fallo transitorio del terminal y reaccionar con `NonRetryableError` o compensación.
+
+</Goals>
+
+## Dos motores, dos trabajos
+
+El agente y el Workflow no compiten: resuelven problemas distintos y se complementan bien. La diferencia de fondo está en quién decide el plan. En el agente lo decide el modelo en tiempo de ejecución, y por eso hay que acotarlo. En el Workflow lo decides tú al escribir el código, y por eso puede garantizarse el progreso.
+
+| El agente es para | El Workflow es para |
+| --- | --- |
+| Un plan que se descubre paso a paso | Un plan conocido de antemano |
+| Horizontes de segundos con alguien esperando | Horizontes de minutos, horas o días |
+| Estado conversacional y canal abierto | Progreso persistido paso a paso |
+| Decisiones no deterministas | Trabajo repetible y verificable |
+
+En la práctica se combinan constantemente. El usuario le pide al agente que procese un lote de facturas; el agente reconoce la intención, valida los parámetros y arranca una instancia de Workflow; el Workflow hace el trabajo pesado durante veinte minutos y el agente informa del avance por su WebSocket. Cada uno hace aquello para lo que su motor está diseñado, y el identificador de la instancia es la costura entre ambos.
+
+Antes de escribir nada conviene descartar los dos motores vecinos, porque la mitad de los pipelines que se construyen como Workflow no lo necesitaban.
+
+<Cards>
+  <Card icon="🤖" title="Agente">
+    Cuando el plan lo descubre el modelo y hay alguien esperando la respuesta. Estado conversacional y horizonte de segundos.
+  </Card>
+  <Card icon="🧵" title="Workflow">
+    Cuando los pasos son conocidos, caros y encadenados, y el progreso debe sobrevivir al fallo. Horizonte de minutos a días.
+  </Card>
+  <Card icon="📬" title="Cola">
+    Cuando el trabajo es un montón de unidades independientes sin orden entre ellas. Lo que quieres es rendimiento, no memoria.
+  </Card>
+  <Card icon="⏰" title="Cron">
+    Cuando basta con arrancar algo a una hora fija y ese algo cabe en una invocación. Suele ser el disparador del Workflow.
+  </Card>
+</Cards>
+
+```ts
+export class AgenteIngesta extends Agent<Env, Estado> {
+  private herramientas() {
+    return {
+      procesarLote: tool({
+        description: "Arranca la ingesta de un lote de documentos. Devuelve el identificador.",
+        inputSchema: z.object({ lote: z.string(), documentos: z.number().int().max(500) }),
+        execute: async ({ lote, documentos }) => {
+          const instancia = await this.env.INGESTA.create({ params: { lote, documentos } });
+          this.setState({ ...this.state, instanciaActiva: instancia.id });
+          return { id: instancia.id, estado: await instancia.status() };
+        },
+      }),
+    };
+  }
+}
+```
+
+## El paso como frontera de reintento
+
+Dentro de un Workflow, la pregunta de diseño ya no es qué hace el código sino dónde se cortan los pasos. Cada `step.do` es un punto de guardado: lo que hay dentro se ejecuta hasta que sale bien y su resultado se persiste; si el proceso muere después, el motor reanuda sin repetirlo. Trazar mal esa frontera es el error clásico, y en IA se paga dos veces.
+
+La regla es simple de enunciar: un paso, un efecto caro. Si metes en el mismo `step.do` la generación de cien incrustaciones y su escritura en el índice, un fallo al escribir te obliga a volver a pagar las cien generaciones. Si los separas, el reintento afecta solo a la escritura. Y al revés: si troceas demasiado fino, multiplicas los registros de progreso y te acercas al límite de pasos por instancia, que son diez mil de partida y hasta veinticinco mil si lo configuras.
+
+```ts
+export class Ingesta extends WorkflowEntrypoint<Env, Params> {
+  async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
+    const texto = await step.do("extraer texto", async () => {
+      return await extraer(event.payload.lote);
+    });
+
+    const trozos = await step.do("trocear", async () => trocear(texto, 800));
+
+    const vectores = await step.do(
+      "generar embeddings",
+      {
+        retries: {
+          limit: 5,
+          delay: ({ ctx, error }) =>
+            error.message.includes("rate limit") ? `${ctx.attempt * 30} seconds` : "10 seconds",
+          backoff: "exponential",
+        },
+        timeout: "10 minutes",
+      },
+      async () => {
+        const salida = await this.env.AI.run("@cf/baai/bge-base-en-v1.5", { text: trozos });
+        return salida.data;
+      },
+    );
+
+    await step.do("indexar en vectorize", async () => {
+      await this.env.INDICE.upsert(vectores.map((v, i) => ({ id: `${event.payload.lote}-${i}`, values: v })));
+    });
+  }
+}
+```
+
+Esa función `delay` dinámica es el detalle que separa un pipeline de juguete de uno de producción. Los proveedores de modelos no fallan al azar: fallan por cuota, y ante una cuota agotada reintentar rápido es contraproducente, porque cada intento consume el mismo cupo que estás esperando recuperar. Distinguir el error de cuota del error de red, y esperar más en el primero, convierte un pipeline que se rinde en uno que simplemente tarda un poco más.
+
+## Fallos que no se reintentan y efectos que se deshacen
+
+No todos los errores merecen otra oportunidad. Una credencial revocada, un documento que incumple la política de contenido, un lote con el esquema equivocado: reintentarlos cinco veces solo retrasa lo inevitable y gasta cuota. Para eso existe `NonRetryableError`, que detiene los reintentos del paso y hace fallar la instancia de inmediato.
+
+```ts
+import { NonRetryableError } from "cloudflare:workflows";
+
+await step.do("validar lote", async () => {
+  if (!event.payload.lote.startsWith("L-")) {
+    throw new NonRetryableError("identificador de lote con formato invalido");
+  }
+});
+```
+
+El caso simétrico es el de los efectos ya consumados cuando el proceso falla más adelante. Si el paso tres reservó un índice y el paso cinco fracasa sin remedio, alguien tiene que deshacer la reserva. Un `step.do` admite un manejador de compensación que el motor ejecuta en orden inverso cuando la instancia falla, que es la vieja idea de las sagas puesta al alcance de la mano: como no hay transacción distribuida posible, cada paso lleva escrito cómo se desanda.
+
+<Mermaid code={`flowchart LR
+  E[extraer texto] --> T[trocear]
+  T --> EMB[generar embeddings]
+  EMB -->|cuota agotada| EMB
+  EMB --> IDX[indexar en vectorize]
+  IDX --> RES[resumen final]
+  EMB -.fallo terminal.-> ROLL[compensar y fallar]
+  class EMB t-yellow
+  class ROLL t-red
+  class RES t-green`} />
+
+Queda una tercera figura, la más útil y la que más sorprende: la espera. Un Workflow puede dormir con `step.sleep` sin consumir recursos ni contar para el límite de pasos, y puede quedarse detenido en `step.waitForEvent` hasta que llegue un suceso externo. Eso permite pipelines que esperan a que un humano revise el resultado, o a que un proveedor termine un trabajo por lotes, sin sondear nada y sin mantener nada vivo. Un proceso que duerme tres días y despierta exactamente donde estaba es la clase de garantía que, construida a mano, se lleva por delante un trimestre de trabajo.
+
+<Callout type="dios" title="En IA, la idempotencia no es higiene: es la unidad de control de coste">
+Todo ingeniero ha oído que los reintentos deben ser idempotentes, y casi todos lo han archivado como una buena práctica más, del montón de las que se cumplen a medias sin que pase nada grave. En un sistema con modelos de por medio, esa relajación deja de ser gratis, y conviene entender por qué. En el software tradicional, repetir una operación cuesta un poco de CPU y algo de latencia; el precio de un reintento innecesario es tan bajo que la industria entera se acostumbró a poner reintentos en todas partes como forma barata de fiabilidad. Con inferencia en el bucle, esa aritmética se rompe. Cada repetición se paga en tokens con precio de catálogo, así que un paso mal delimitado no produce un error, produce una factura, y lo hace en silencio. Ahí está el giro: la frontera de un paso deja de ser una decisión de estilo y se convierte en la unidad de coste de tu sistema. Trazar los pasos es presupuestar. Y hay un segundo filo, más sutil: los modelos no son deterministas, de modo que repetir un paso no solo cuesta, sino que puede devolver algo distinto de lo que devolvió la primera vez. Un pipeline sin puntos de guardado no es simplemente lento cuando falla, es irreproducible, porque el resultado depende de en qué intento tuvo suerte. Persistir la salida de cada paso caro no es solo ahorro: es lo que convierte un proceso estadístico en un artefacto auditable, con una traza fija que puedes inspeccionar, comparar y defender ante quien pregunte por qué el sistema decidió lo que decidió. Por eso la ejecución durable encaja con la IA mejor que con casi cualquier otra carga: no fue diseñada para ella, pero resuelve a la vez sus dos problemas más caros, el dinero y la reproducibilidad, con el mismo mecanismo. El ingeniero que lo entiende deja de preguntarse cuántos reintentos poner y empieza a preguntarse qué resultado no puedo permitirme volver a calcular, que es la pregunta que dibuja el pipeline entero.
+</Callout>
+
+<Challenge title="Convierte un pipeline de IA en un proceso durable">
+1. Toma un proceso real con varias llamadas a modelos y dibuja sus fronteras de paso. Justifica cada corte nombrando el efecto caro que protege.
+2. Implementa el `WorkflowEntrypoint` con esos pasos y ejecútalo forzando un fallo en el paso más caro. Comprueba que al reanudar no se vuelve a pagar.
+3. Añade una política de reintentos con espera dinámica que distinga el error de cuota del error de red. Mide la diferencia en intentos consumidos.
+4. Identifica un fallo terminal de tu dominio y lánzalo como `NonRetryableError`. Añade compensación al paso que deja un efecto a medias.
+5. Reparte el trabajo entre agente y Workflow: qué herramienta arranca la instancia, qué guarda el agente en su estado y cómo informa del avance al usuario.
+</Challenge>

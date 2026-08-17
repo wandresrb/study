@@ -1,0 +1,175 @@
+---
+title: "Escribir un procesador: del símbolo al fichero"
+description: "Anatomía completa de un procesador KSP: el proveedor que lo instancia, el recorrido de las declaraciones anotadas, la generación de un fichero con sus dependencias declaradas, y las dos cosas que separan un procesador de juguete de uno serio, que son el manejo de errores y el modelo de rondas."
+subject: kotlin
+level: 32
+order: 3
+position: "32.3"
+duration: "25 min"
+---
+
+<Lead>
+Un procesador de símbolos es, en su forma mínima, una clase con un método que recibe un buscador de símbolos y devuelve una lista. Esa simplicidad es engañosa en los dos sentidos: por un lado, el esqueleto se escribe en cinco minutos y funciona; por otro, la distancia entre ese esqueleto y un procesador que se comporta bien en un proyecto real es considerable, y casi toda esa distancia está en dos asuntos que el ejemplo introductorio de cualquier tutorial omite. El primero es qué hacer cuando algo va mal, porque un procesador que lanza una excepción produce un mensaje ilegible mientras que uno que informa correctamente produce un error de compilación tan bueno como el del propio compilador. El segundo es el modelo de rondas, es decir, el hecho de que el código que tú generas puede a su vez contener anotaciones que alguien debe procesar, y que por tanto el proceso se repite hasta que se estabiliza. Esta lección recorre el camino completo con un procesador que genera funciones de conversión a mapa.
+</Lead>
+
+<Goals>
+
+- Implementar el par formado por `SymbolProcessorProvider` y `SymbolProcessor` y registrarlo como servicio.
+- Localizar y recorrer las declaraciones anotadas con seguridad, incluida la validación previa.
+- Generar ficheros declarando correctamente sus dependencias para no romper la construcción incremental.
+- Manejar errores mediante el registro de diagnósticos y aplazar los símbolos aún no resolubles.
+
+</Goals>
+
+## El proveedor y el procesador
+
+KSP no instancia tu procesador directamente: instancia un proveedor, que recibe el entorno de la construcción y decide cómo construir el procesador. Esta indirección parece burocrática pero cumple una función real, porque permite que el procesador reciba por constructor exactamente las piezas que necesita y no un objeto de entorno global, lo cual facilita enormemente probarlo.
+
+```kotlin
+class AMapaProcessorProvider : SymbolProcessorProvider {
+    override fun create(environment: SymbolProcessorEnvironment): SymbolProcessor =
+        AMapaProcessor(
+            codeGenerator = environment.codeGenerator,
+            logger = environment.logger,
+            paquetePorDefecto = environment.options["aMapa.paquete"] ?: "generado",
+        )
+}
+
+class AMapaProcessor(
+    private val codeGenerator: CodeGenerator,
+    private val logger: KSPLogger,
+    private val paquetePorDefecto: String,
+) : SymbolProcessor {
+    override fun process(resolver: Resolver): List<KSAnnotated> { /* ... */ return emptyList() }
+}
+```
+
+El proveedor se descubre mediante el mecanismo de servicios de la plataforma, así que hay que declararlo en un fichero de recursos cuyo nombre es el de la interfaz y cuyo contenido es el nombre completo de tu clase. Olvidarse de ese fichero produce el síntoma más desconcertante de todos, que es un procesador que compila perfectamente y no se ejecuta jamás.
+
+```kotlin
+// modulo del procesador
+dependencies {
+    implementation("com.google.devtools.ksp:symbol-processing-api:2.2.20-2.0.4")
+}
+// recurso: META-INF/services/com.google.devtools.ksp.processing.SymbolProcessorProvider
+// contenido unico: com.ejemplo.AMapaProcessorProvider
+```
+
+Conviene además que el procesador viva en su propio módulo, separado del módulo de las anotaciones. Quien use tu herramienta necesita las anotaciones en tiempo de compilación normal y el procesador solo como dependencia de procesamiento; mezclarlos arrastra la implementación entera al binario de todos tus usuarios.
+
+## Recorrer lo anotado
+
+El buscador de símbolos ofrece una consulta directa por nombre completo de anotación. Lo que devuelve es una secuencia perezosa de elementos anotables, y el primer trabajo del procesador es filtrar los que no son del tipo que espera y rechazarlos con un mensaje claro en lugar de dejar que fallen más adelante con un error de conversión.
+
+Antes de generar nada hay que validar. Un símbolo puede referirse a tipos que todavía no existen porque los generará otro procesador en esta misma construcción; intentar resolverlos ahora daría un tipo erróneo. La llamada de validación comprueba precisamente eso, y los símbolos que no la superan no se descartan: se devuelven al final para que se reintenten en la ronda siguiente.
+
+```kotlin
+override fun process(resolver: Resolver): List<KSAnnotated> {
+    val simbolos = resolver.getSymbolsWithAnnotation("com.ejemplo.AMapa")
+    val (validos, aplazados) = simbolos.partition { it.validate() }
+
+    validos.filterIsInstance<KSClassDeclaration>()
+        .filter { comprobarForma(it) }
+        .forEach { generarPara(it) }
+
+    validos.filterNot { it is KSClassDeclaration }
+        .forEach { logger.error("AMapa solo se aplica a clases", it) }
+
+    return aplazados
+}
+
+private fun comprobarForma(clase: KSClassDeclaration): Boolean = when {
+    Modifier.DATA !in clase.modifiers -> {
+        logger.error("AMapa exige una clase de datos", clase); false
+    }
+    clase.typeParameters.isNotEmpty() -> {
+        logger.error("AMapa no admite clases genericas", clase); false
+    }
+    else -> true
+}
+```
+
+Para recorrer estructuras más profundas conviene usar el visitante en vez de anidar condicionales sobre el tipo de cada nodo. La variante que acumula datos permite ir construyendo el modelo intermedio mientras se baja por el árbol, y evita el patrón de mutar una lista externa desde dentro del recorrido.
+
+<Callout type="tip" title="Construye un modelo intermedio">
+Los procesadores que se mantienen bien no generan texto mientras recorren. Recorren primero y producen una estructura de datos propia, sencilla y sin dependencias de KSP; después una función pura convierte esa estructura en código. Esa separación hace que la parte difícil sea probable con pruebas unitarias normales.
+</Callout>
+
+## Generar el fichero
+
+La escritura pasa siempre por el generador de código, nunca por el sistema de ficheros directamente. La razón es la declaración de dependencias: al crear un fichero se indica de qué fuentes depende su contenido, y con esa información la herramienta sabe qué debe regenerar cuando algo cambia. Un procesador que declara mal sus dependencias produce construcciones incrementales incorrectas, que es el peor tipo de fallo porque solo aparece cuando alguien edita justo el fichero equivocado.
+
+```kotlin
+private fun generarPara(clase: KSClassDeclaration) {
+    val fuente = clase.containingFile ?: return
+    val paquete = clase.packageName.asString()
+    val nombre = clase.simpleName.asString()
+    val props = clase.getAllProperties()
+        .filter { it.hasBackingField }
+        .map { it.simpleName.asString() }
+        .toList()
+
+    codeGenerator.createNewFile(
+        dependencies = Dependencies(aggregating = false, fuente),
+        packageName = paquete,
+        fileName = nombre + "AMapa",
+    ).bufferedWriter().use { out ->
+        out.appendLine("package " + paquete)
+        out.appendLine()
+        out.appendLine("fun " + nombre + ".aMapa(): Map<String, Any?> = mapOf(")
+        props.forEach { p -> out.appendLine("    \"" + p + "\" to " + p + ",") }
+        out.appendLine(")")
+    }
+}
+```
+
+La distinción entre agregar y no agregar es la que más errores causa. Un fichero no agregador depende solo de las fuentes indicadas, de modo que cambiar otra clase no lo invalida; es el caso de un fichero generado por cada clase anotada. Un fichero agregador depende de todo el conjunto anotado, porque su contenido resume el conjunto; es el caso de un registro central o un índice. Marcar como no agregador algo que en realidad agrega produce índices desactualizados sin ningún aviso.
+
+<Mermaid code={`flowchart TD
+  A[Ronda con fuentes iniciales] --> B[process recibe el resolver]
+  B --> C[Simbolos validos generan ficheros]
+  B --> D[Simbolos no validados se devuelven]
+  C --> E[Ficheros generados entran como fuentes]
+  D --> E
+  E --> F{Hubo ficheros nuevos}
+  F -->|Si| B
+  F -->|No| G[finish y luego onError si procede]`} />
+
+Escribir texto a mano funciona para casos pequeños, pero en cuanto aparecen genéricos, importaciones y nulabilidad conviene usar un constructor de ficheros que gestione las importaciones por ti. La regla es la misma que en cualquier generación de código: concatenar cadenas escala mal, y el primer sitio donde se nota es en los nombres cualificados que colisionan.
+
+## Errores y rondas
+
+Un procesador nunca debe comunicar problemas lanzando excepciones. El registro de diagnósticos ofrece cuatro niveles, y el que importa es el de error, porque marca la compilación como fallida y, si le pasas el símbolo como segundo argumento, sitúa el mensaje en el fichero y la línea exactos. Un buen mensaje dice qué regla se ha incumplido y qué hacer, igual que haría el compilador.
+
+El ciclo completo tiene tres momentos. El método principal se ejecuta una vez por ronda mientras se sigan generando ficheros nuevos; el método de finalización se ejecuta una sola vez al terminar bien, y es el sitio natural para emitir ficheros agregados; el método de error se ejecuta si algo falló, y sirve para liberar recursos o dar un diagnóstico final.
+
+<Cards>
+  <Card icon="🔁" title="Rondas">
+    Lo que devuelves de la ronda actual es lo que se reintenta en la siguiente. Devolver siempre la lista vacía funciona hasta que otro procesador genera el tipo que necesitabas.
+  </Card>
+  <Card icon="🧨" title="Nada de excepciones">
+    Una excepción produce una traza que el usuario de tu procesador no puede interpretar. Un error registrado produce un mensaje con fichero y línea.
+  </Card>
+  <Card icon="🏁" title="Cierre">
+    El resumen global se emite al finalizar, no en la primera ronda, porque hasta entonces no sabes cuántos elementos hay.
+  </Card>
+  <Card icon="🧪" title="Pruebas">
+    Existen bibliotecas de compilación en memoria que permiten ejecutar el procesador sobre fuentes de prueba y afirmar sobre el código generado y sobre los mensajes.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="El bucle infinito de rondas">
+Si tu procesador genera en cada ronda un fichero que a su vez lleva la anotación que él mismo busca, la construcción no termina nunca. Marca lo generado para no reprocesarlo, o comprueba explícitamente si el origen del símbolo es un fichero que tú produjiste.
+</Callout>
+
+<Callout type="dios" title="Un procesador es una API cuyos usuarios solo la ven cuando falla">
+Merece la pena detenerse en un cambio de perspectiva que casi nadie hace al escribir su primer procesador y que separa las herramientas que la gente agradece de las que la gente maldice. Cuando escribes una librería normal, tus usuarios interactúan con ella constantemente: leen sus firmas, autocompletan sus nombres, siguen sus tipos. Cuando escribes un procesador, en cambio, tus usuarios solo escriben una anotación y se olvidan; el código que produces funciona en silencio y nadie lo lee jamás. Eso significa que toda tu superficie de contacto real con ellos son los mensajes de error. Un procesador que falla diciendo que hubo una excepción de conversión de tipos en la línea ciento y pico de una clase interna deja a su usuario en el peor sitio posible, porque no ha hecho nada visiblemente incorrecto y no tiene forma de saber qué regla ha violado. El mismo fallo, informado como que la anotación exige una clase de datos y esta no lo es, con el cursor colocado sobre la declaración exacta, se corrige en cinco segundos y no genera ni una sola pregunta. La conclusión práctica es que en un procesador la validación no es defensa contra el mal uso, es la interfaz de usuario, y merece tanto cuidado como el código que genera. Hay un corolario que también conviene tener presente: como el código generado no lo lee nadie, tampoco lo revisa nadie, de modo que un procesador es uno de los pocos lugares de un proyecto donde un fallo puede replicarse doscientas veces sin que ninguna revisión lo detecte. Por eso los procesadores serios se prueban compilando de verdad y afirmando sobre la salida, no comparando cadenas; y por eso la primera versión de un procesador debería generar el código más aburrido y explícito posible, porque la elegancia en el código generado no beneficia a nadie y la claridad al depurarlo beneficia a todos.
+</Callout>
+
+<Challenge title="Tu primer procesador que no avergüence">
+1. Implementa el par proveedor y procesador para una anotación propia y verifica que se ejecuta añadiendo un mensaje informativo.
+2. Añade la validación de forma y comprueba que los mensajes aparecen situados en la declaración correcta.
+3. Genera un fichero por clase anotada declarando bien sus dependencias y verifica el comportamiento incremental tocando una sola clase.
+4. Añade un fichero agregado en la finalización con el índice de todo lo procesado y observa qué cambia al marcarlo como agregador.
+5. Escribe una prueba que compile en memoria una fuente incorrecta y afirme el mensaje de error exacto que produce tu procesador.
+</Challenge>

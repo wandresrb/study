@@ -1,0 +1,126 @@
+---
+title: "Los schedulers de blk-mq: none, mq-deadline, BFQ y Kyber"
+description: "El catálogo de planificadores de la capa de bloques moderna y la lógica para elegir: none para el NVMe veloz donde reordenar solo estorba, mq-deadline para garantías de latencia con bajo coste, BFQ para fairness proporcional en el escritorio y Kyber para baja latencia dirigida por objetivos. Cómo cambiarlo en caliente y de forma persistente."
+subject: kernel
+level: 36
+order: 2
+position: "36.2"
+duration: "16 min"
+---
+
+<Lead>
+La capa de bloques ofrece cuatro planificadores y ninguno es el mejor: cada uno es la respuesta óptima a una pregunta distinta. ¿El dispositivo es tan rápido que reordenar cuesta más de lo que ahorra? Entonces `none`. ¿Necesitas que ninguna lectura tarde más de medio segundo sin gastar apenas CPU? `mq-deadline`. ¿Un proceso no debe poder ahogar a los demás en un escritorio interactivo? `BFQ`. ¿Quieres baja latencia sostenida en un SSD multicola marcando objetivos explícitos? `Kyber`. Elegir bien no es memorizar nombres: es leer el medio, la carga y la meta, y colocar el punto justo en el triángulo entre latencia, throughput y fairness.
+</Lead>
+
+<Goals>
+
+- Conocer los cuatro planificadores de blk-mq y el mecanismo interno de cada uno.
+- Emparejar cada planificador con el tipo de dispositivo y de carga que lo justifica.
+- Entender por qué el kernel elige `none` o `mq-deadline` por defecto según el hardware.
+- Cambiar el planificador en caliente por `sysfs` y fijarlo con reglas de udev.
+
+</Goals>
+
+## El catálogo: cuatro respuestas a cuatro preguntas
+
+Los cuatro planificadores no forman una escala de "peor a mejor": forman un espacio de compromisos. Dos de ellos —`none` y `mq-deadline`— son ligerísimos; los otros dos —`BFQ` y `Kyber`— gastan CPU a cambio de política.
+
+<Cards>
+  <Card icon="🏎️" title="none">
+    No reordena: entrega las peticiones tal como llegan, sin cola de planificación. Coste casi nulo. La elección correcta para NVMe y SSD veloces, donde no hay seeks que amortizar y cualquier reorden solo añade latencia y contención.
+  </Card>
+  <Card icon="⏱️" title="mq-deadline">
+    Ordena por sector pero impone un plazo a cada petición: si una lectura envejece más de `read_expire`, salta la cola. Barato y predecible. El defecto sensato para SATA y HDD de una sola cola.
+  </Card>
+  <Card icon="⚖️" title="BFQ">
+    Budget Fair Queueing: reparte tiempo de disco de forma proporcional entre procesos y cgroups, midiendo el servicio en sectores. Prioriza la interactividad. Coste de CPU alto; hecho para el escritorio y el HDD.
+  </Card>
+  <Card icon="🎯" title="Kyber">
+    Mide la latencia real de lecturas y escrituras y estrangula el envío para no rebasar objetivos que tú fijas en nanosegundos. Sencillo y ligero. Pensado para SSD y NVMe multicola muy cargados.
+  </Card>
+</Cards>
+
+## mq-deadline: garantizar que nadie envejezca
+
+`mq-deadline` es el heredero directo del ascensor con una salvaguarda contra la inanición. Mantiene las peticiones en dos árboles ordenados por sector (uno de lectura, otro de escritura) para poder barrer eficientemente, pero **también** las encola en dos listas FIFO por orden de llegada, cada una con un plazo de caducidad. Mientras nadie caduque, despacha en orden de sector para el throughput; en cuanto la cabeza de una FIFO rebasa su plazo, rompe el orden y la atiende. Las lecturas tienen prioridad porque suelen ser síncronas: un proceso espera bloqueado por ellas.
+
+```bash
+# los mandos de mq-deadline viven en queue/iosched
+$ cat /sys/block/sda/queue/iosched/read_expire
+500        # ms: una lectura no debe esperar mas de medio segundo
+$ cat /sys/block/sda/queue/iosched/write_expire
+5000       # ms: las escrituras toleran mas retraso, son asincronas
+$ cat /sys/block/sda/queue/iosched/writes_starved
+2          # cuantos lotes de lectura antes de forzar uno de escritura
+$ cat /sys/block/sda/queue/iosched/fifo_batch
+16         # peticiones despachadas en orden de sector antes de revisar plazos
+```
+
+La virtud de `mq-deadline` es que da una **garantía de cola superior** de latencia casi sin coste: un puñado de listas y árboles, ninguna contabilidad por proceso. Por eso es el defecto para dispositivos de una sola cola y una elección segura cuando dudas.
+
+## BFQ frente a Kyber: fairness contra latencia dirigida
+
+Los dos planificadores caros resuelven problemas distintos. `BFQ` reparte el disco como un planificador de CPU justo reparte el procesador: asigna a cada proceso un **presupuesto** medido en sectores y le concede el disco en exclusiva hasta agotarlo, garantizando que un `dd` glotón no congele tu editor. Respeta `ionice` y los pesos de `cgroup`, y añade heurísticas de baja latencia para las aplicaciones interactivas. Su precio es CPU por petición, asumible en un escritorio con HDD pero prohibitivo a millones de IOPS.
+
+`Kyber`, en cambio, no reparte nada: **mide y estrangula**. Vigila la latencia real de las lecturas y escrituras que salen del dispositivo y limita cuántas peticiones deja en vuelo para que la latencia observada no rebase los objetivos que fijas. Es diminuto comparado con BFQ y está pensado para SSD multicola rápidos donde quieres acotar la cola sin pagar la contabilidad de la justicia.
+
+```bash
+# Kyber: objetivos de latencia, en nanosegundos
+$ echo kyber > /sys/block/nvme0n1/queue/scheduler
+$ cat /sys/block/nvme0n1/queue/iosched/read_lat_nsec
+2000000      # 2 ms de objetivo para lecturas
+$ cat /sys/block/nvme0n1/queue/iosched/write_lat_nsec
+10000000     # 10 ms para escrituras
+
+# BFQ: peso proporcional por cgroup v2
+$ echo bfq > /sys/block/sda/queue/scheduler
+$ echo "8:0 300" > /sys/fs/cgroup/interactivo/io.bfq.weight
+```
+
+## Cómo se elige: defecto, caliente y persistente
+
+El kernel no deja el dispositivo sin planificador: al registrarlo, elige uno por defecto según su forma. Para un dispositivo con **una sola cola hardware** —un HDD SATA, un SSD SATA— escoge `mq-deadline`, porque ahí reordenar todavía ayuda. Para uno con **varias colas hardware** —un NVMe— escoge `none`, porque el paralelismo del hardware ya reparte el trabajo y cualquier planificador central sería un cuello de botella.
+
+Cambiarlo en caliente es una escritura en `sysfs`, pero se pierde al reiniciar; para fijarlo se usa una regla de udev que dispara en cada aparición de dispositivo.
+
+```bash
+# cambio inmediato, volatil
+$ echo none > /sys/block/nvme0n1/queue/scheduler
+```
+
+```
+# /etc/udev/rules.d/60-ioschedulers.rules  (persistente)
+# NVMe: sin planificador, el hardware ya paraleliza
+ACTION=="add|change", KERNEL=="nvme[0-9]*", ATTR{queue/scheduler}="none"
+# SSD SATA (no rotacional): Kyber, baja latencia barata
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="kyber"
+# HDD rotacional: BFQ, fairness de escritorio
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
+```
+
+<Mermaid code={`flowchart TD
+  Q[Como es el dispositivo]
+  Q -->|NVMe multicola veloz| NONE[none]
+  Q -->|Una sola cola, dudo| MQD[mq-deadline]
+  Q -->|Escritorio, HDD, interactividad| BFQ[BFQ]
+  Q -->|SSD muy cargado, objetivo de latencia| KYBER[Kyber]
+  NONE --> T[Menor coste por peticion]
+  MQD --> G[Garantia de plazo barata]
+  BFQ --> F[Reparto justo por proceso]
+  KYBER --> L[Latencia acotada por medicion]`} />
+
+<Callout type="warn" title="elevator= en la línea de arranque ya no hace nada">
+Durante años se fijaba el planificador con el parámetro de kernel `elevator=`. Ese parámetro pertenecía a la vieja capa de bloques de cola única, que ya no existe: hoy todo es blk-mq y el kernel **ignora** `elevator=`. Si lo ves en un `GRUB_CMDLINE` heredado, bórralo y usa una regla de udev. Fijar el planificador es hoy una decisión por dispositivo, no global, precisamente porque un mismo sistema mezcla NVMe, SSD y HDD que quieren respuestas distintas.
+</Callout>
+
+<Callout type="dios" title="No hay un planificador correcto, hay una carga y un medio">
+Resiste la tentación de preguntar cuál de los cuatro es el mejor, porque la pregunta está mal formada y esconde la única idea que este nivel quiere grabarte. Un planificador de E/S no es una implementación más o menos buena de una función fija: es la **materialización de una política**, y una política solo tiene sentido relativa a una meta y a un medio. `none` es óptimo exactamente cuando la meta es minimizar el coste por petición y el medio no tiene seeks; en un HDD sería un desastre. `BFQ` es óptimo cuando la meta es que ningún proceso ahogue a otro y sobra CPU; en un servidor NVMe a un millón de IOPS su contabilidad sería el cuello de botella que destruye el rendimiento que pretendía repartir. La lección profunda es que el kernel separó deliberadamente el **mecanismo** —encolar, etiquetar, despachar, completar, que vive en blk-mq y es común a todos— de la **política** —fusionar, reordenar, priorizar, repartir, que vive en el planificador y es intercambiable en caliente—. Esa separación es una de las formas más puras del principio que gobierna todo el diseño de sistemas: no incrustes la decisión en la maquinaria, porque la maquinaria sobrevive a la decisión. El hardware cambió de HDD a NVMe y el mecanismo de blk-mq siguió intacto; lo único que hubo que cambiar fue enchufar `none` donde antes iba el ascensor. Cuando entiendas que elegir planificador es declarar qué te importa —velocidad bruta, justicia, o un plazo— y no qué es "mejor", habrás dejado de configurar por superstición y empezado a razonar sobre compromisos.
+</Callout>
+
+<Challenge title="Elige con criterio, no por costumbre">
+1. Lista los planificadores de cada bloque de tu máquina y, para cada uno, justifica si el defecto del kernel es el adecuado dado su `queue/rotational`.
+2. Cambia el planificador de un disco a `mq-deadline`, baja `read_expire` a 100 y explica qué le pasa al throughput y a la latencia de cola bajo una carga mixta.
+3. Con `BFQ` activo, lanza dos `dd` en cgroups con pesos 300 y 100 y razona qué proporción de disco esperas que reciba cada uno.
+4. Explica por qué `none` gana a `mq-deadline` en un NVMe pero pierde estrepitosamente en un HDD, apelando al coste del seek del nivel anterior.
+5. Escribe la regla de udev que pondría `kyber` en tus SSD SATA y `none` en tus NVMe, y explica por qué no basta con `echo` a `sysfs`.
+</Challenge>

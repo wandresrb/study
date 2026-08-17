@@ -1,0 +1,148 @@
+---
+title: "Mantenimiento incremental: recalcular solo el delta"
+description: "Derivar el cambio del resultado a partir del cambio de la entrada es trivial para filtros, incómodo para uniones, traicionero para agregados y ordenaciones, y es la razón por la que los motores reactivos restringen su lenguaje de consulta."
+subject: local-first
+level: 15
+order: 3
+position: "15.3"
+duration: "19 min"
+---
+
+<Lead>
+Las tres estrategias anteriores comparten una suposición que nadie discutió: cuando algo cambia, la consulta se vuelve a ejecutar. La cuarta la abandona. Si el resultado anterior sigue en memoria y sabes exactamente qué filas entraron y salieron de las tablas base, quizá no necesites recorrer nada: quizá puedas derivar el resultado nuevo aplicando al viejo una corrección proporcional al cambio y no al tamaño de los datos. La idea es vieja, tiene nombre desde los años ochenta —mantenimiento incremental de vistas materializadas— y es la única que rompe la dependencia entre el coste de mantener una pantalla al día y el volumen de la base. También es la que se resiste con más elegancia a que la implementes bien, y el motivo de esa resistencia enseña más sobre diseño de sistemas que la técnica misma.
+</Lead>
+
+<Goals>
+
+- Formular la regla del delta y comprobar para qué operadores se cumple de forma inmediata.
+- Entender por qué una unión obliga a conservar índices de ambos lados y por qué el coste deja de ser proporcional al cambio.
+- Distinguir los agregados que admiten inversa de los que no, y saber qué estructura auxiliar rescata a los segundos.
+- Reconocer las retracciones y las multiplicidades negativas como la pieza que hace componible todo el edificio.
+
+</Goals>
+
+## La regla del delta y los operadores dóciles
+
+Piensa en una vista como en una función que transforma tablas base en un resultado. Mantenerla de forma incremental significa encontrar, para cada operador de esa función, una regla que calcule el cambio de la salida a partir del cambio de la entrada sin volver a mirar la entrada entera. Para toda una familia de operadores esa regla es de una simplicidad casi decepcionante, porque **distribuyen sobre el cambio**: aplicar el operador al delta produce el delta de la salida.
+
+```js
+// Proyeccion y filtro: el delta se transforma pieza a pieza
+const deltaSalida = deltaEntrada
+  .filter((fila) => fila.despues && cumple(fila.despues))
+  .map(proyectar);
+
+// Union de dos entradas: los deltas simplemente se concatenan
+const deltaUnion = deltaIzquierda.concat(deltaDerecha);
+```
+
+Un matiz que se escapa al leer ese fragmento demasiado deprisa: incluso en el caso dócil hace falta el valor anterior de la fila, no solo el nuevo. Una fila que se modifica y deja de cumplir el filtro tiene que **salir** del resultado, y para saberlo hay que evaluar el predicado también sobre lo que había. Un delta que solo transporta el estado final es insuficiente por construcción, y este es el punto exacto donde muchas implementaciones caseras se rompen sin que nadie entienda por qué las filas modificadas se quedan pegadas a la lista. El gancho de fila del motor entrega ambos valores precisamente por esto, y descartar el anterior para ahorrar memoria es una economía que se paga con corrección.
+
+Aquí ya se gana casi todo lo que hay que ganar en el caso frecuente. Una lista filtrada y ordenada por clave, que es lo que alimenta la mayoría de las pantallas reales, se mantiene al día con un trabajo proporcional al número de filas que cambiaron, sin tocar las que no cambiaron y sin que el coste crezca cuando la tabla pasa de mil a un millón de registros. Que esto suene modesto es engañoso: es exactamente la propiedad que separa una aplicación que se mantiene fluida cuando el usuario lleva tres años acumulando datos de otra que se degrada sin que nadie sepa señalar el punto donde empezó.
+
+## Dónde se rompe: uniones, agregados y ventanas
+
+**La unión.** Una fila nueva en el lado izquierdo produce en la salida tantas filas como parejas encuentre en el lado derecho, y para saber cuántas hay que buscar en el lado derecho entero. La regla clásica descompone el cambio de una unión en tres términos: el delta izquierdo contra el lado derecho completo, el lado izquierdo completo contra el delta derecho, y el delta contra el delta. Dos de esos tres términos exigen acceso al estado completo del otro lado, lo cual tiene dos consecuencias importantes. La primera es de memoria: hay que conservar en el operador un índice de ambas entradas, y ese índice es tan grande como los datos que indexa. La segunda es de coste: aunque el delta sea de una sola fila, la salida puede ser de miles si la unión abre en abanico, de modo que el trabajo es proporcional al cambio del resultado y no al de la entrada. Un mantenimiento incremental de una unión mal elegida puede ser bastante peor que reconsultar.
+
+```js
+// La regla de los tres terminos, con los indices de ambos lados sostenidos aparte
+function deltaUnion(dIzq, dDer, idxIzq, idxDer) {
+  const salida = [];
+  for (const c of dIzq) salida.push(...casar(c, idxDer));   // delta contra el lado derecho entero
+  for (const c of dDer) salida.push(...casar(c, idxIzq));   // el lado izquierdo entero contra el delta
+  for (const c of dIzq) salida.push(...casar(c, dDer));     // delta contra delta, para no contar de menos
+  aplicar(idxIzq, dIzq);                                    // y solo despues se actualizan los indices
+  aplicar(idxDer, dDer);
+  return salida;
+}
+```
+
+El comentario de la penúltima línea señala el error de implementación más frecuente: si actualizas los índices antes de calcular los tres términos, el primero de ellos ya verá el cambio del otro lado y contarás filas dos veces. El orden importa, y no de una manera que produzca un fallo evidente sino multiplicidades ligeramente equivocadas que solo se notan cuando un recuento aguas abajo empieza a desviarse.
+
+**Los agregados.** Aquí la línea divisoria es nítida y vale la pena tenerla presente porque decide qué consultas puedes mantener y cuáles no. Un recuento y una suma admiten inversa: retirar una fila es restar, y el acumulador se actualiza en tiempo constante sin mirar el grupo. Un mínimo y un máximo no la admiten: mientras las filas entran, el acumulador se actualiza en tiempo constante, pero en cuanto se borra precisamente la fila que ostentaba el extremo hay que recorrer el grupo entero para encontrar el siguiente. El remedio es guardar más de lo que se muestra —un montículo, o simplemente los `k` mejores valores del grupo— y aceptar un recorrido completo solo cuando esa reserva se agota. La media se mantiene guardando suma y recuento por separado; la desviación necesita además la suma de cuadrados, con el conocido problema de precisión numérica que eso arrastra; y un valor distinto exige contar multiplicidades, porque borrar una aparición no significa que el valor haya desaparecido.
+
+Hay un concepto de la literatura clásica que ordena todo este apartado y que conviene tener a mano porque convierte una intuición difusa en un criterio verificable: una vista es **automantenible** si su delta se puede calcular a partir del delta de las entradas y del propio resultado actual, sin volver a consultar las tablas base. Una proyección con filtro lo es. Un recuento y una suma lo son. Una unión no lo es, porque necesita mirar el otro lado. Un mínimo tampoco, porque al perder el extremo tiene que ir a buscar el siguiente. La utilidad práctica de la etiqueta es que separa las vistas que puedes mantener con memoria acotada de las que solo puedes mantener conservando una réplica de sus entradas, que es una diferencia de coste de otro orden y no un matiz.
+
+**El orden con límite.** Una consulta que muestra los cincuenta elementos más recientes tiene un enemigo específico: una fila que cambia fuera de la ventana visible puede desplazar a otra que estaba dentro, y una fila borrada dentro de la ventana obliga a traer la primera de fuera, que por definición no está en el estado del operador. La solución práctica es mantener una reserva por debajo del límite y volver a consultar la base únicamente cuando la reserva se vacía, lo cual convierte el operador en un híbrido honesto entre las dos técnicas.
+
+<Mermaid code={`flowchart LR
+  D[Delta de las tablas base] --> F[Filtro y proyeccion transforman pieza a pieza]
+  F --> J[Union necesita indices completos de ambos lados]
+  J --> G[Agregado suma o resta sobre el acumulador]
+  G --> O[Orden con limite consulta si se agota la reserva]
+  O --> R[Delta del resultado]
+  R --> V[Vista al dia sin reconsultar nada]
+  class D t-blue
+  class J t-yellow
+  class V t-green`} />
+
+## Retracciones: por qué un cambio son dos hechos
+
+Todo lo anterior se sostiene sobre una pieza conceptual que no es evidente y sin la cual el edificio no compone: un cambio no es una operación sino un par de hechos, la retirada de lo que había y la afirmación de lo que hay. Modificar una fila es retractarla y volver a afirmarla con el valor nuevo; borrarla es retractarla sin más. Formalmente esto se consigue tratando cada colección como un multiconjunto donde cada elemento lleva asociada una multiplicidad entera que puede ser **negativa**, de modo que combinar dos deltas es sumar multiplicidades y una fila desaparece cuando su suma llega a cero.
+
+```js
+// Un delta es un conjunto de pares fila y multiplicidad
+const delta = [
+  { fila: { id: 3, estado: 'abierta' }, mult: -1 },  // retraccion de lo que habia
+  { fila: { id: 3, estado: 'cerrada' }, mult: +1 },  // afirmacion de lo nuevo
+];
+
+// Un recuento por grupo se mantiene sumando multiplicidades
+for (const { fila, mult } of delta) {
+  const g = fila.estado;
+  acumulador.set(g, (acumulador.get(g) ?? 0) + mult);
+  if (acumulador.get(g) === 0) acumulador.delete(g);
+}
+```
+
+La ventaja de esta representación es que **los operadores se vuelven componibles sin casos especiales**. No hay una regla para las altas, otra para las bajas y otra para las modificaciones: hay una sola regla que opera sobre multiplicidades y que se comporta correctamente en los tres casos porque los tres son el mismo caso. Y aparece de regalo el operador que sin ella era imposible: una negación, una diferencia o un `NOT EXISTS` pueden convertir un borrado en una entrada nueva del resultado, algo que ninguna formulación basada en altas y bajas maneja con naturalidad y que las multiplicidades negativas resuelven sin tocar nada.
+
+Esta representación tiene además una consecuencia práctica que conviene anticipar antes de depurarla a las tres de la madrugada: un delta puede cancelarse consigo mismo. Si una transacción modifica una fila y la deja como estaba, o si dos cambios sucesivos se compensan, la suma de multiplicidades da cero y el operador no debe emitir nada. Implementar esa cancelación no es opcional, porque sin ella el sistema propaga trabajo por cambios que no cambiaron nada, y ese trabajo se multiplica al atravesar cada operador del grafo. Comprobar que la salida es vacía cuando la entrada se anula es la prueba unitaria más informativa que puedes escribir sobre un mantenedor incremental.
+
+La otra pieza, la que hace falta en cuanto los deltas dejan de llegar de uno en uno y en orden, es una marca temporal lógica que acompañe a cada cambio. Sin ella, dos deltas que atraviesan caminos distintos del grafo de operadores y se reencuentran en una unión pueden combinarse desalineados y producir resultados que nunca existieron en ningún estado real de la base. Con ella, cada operador puede retener lo que le llega hasta que sabe que ya no le llegará nada anterior, y emitir solo entonces. Es la idea central de lo que se conoce como flujo de datos diferencial, y es también lo que permite mantener consultas recursivas, donde el resultado depende de sí mismo y hay que iterar hasta que deja de cambiar.
+
+<Callout type="warn" title="El estado intermedio es el coste que nadie presupuesta">
+Al hablar de mantenimiento incremental todo el mundo mira el ahorro de tiempo por escritura y casi nadie mira el gasto de memoria permanente. Cada operador con estado —cada unión, cada agregación por grupo, cada distinto, cada ventana ordenada— retiene índices que en el peor caso son del tamaño de sus entradas, y ese peso lo pagas mientras la consulta viva esté suscrita, no mientras se ejecuta. Una sola vista incremental sobre una unión de dos tablas grandes puede ocupar más memoria en el hilo principal que toda la interfaz junta. Presupuesta las vistas incrementales como si fueran índices: pocas, elegidas, y solo donde reconsultar ya se ha demostrado insuficiente con números.
+</Callout>
+
+## Qué motores lo intentan y qué renuncia hacen
+
+<Cards>
+  <Card icon="🌊" title="Flujo de datos diferencial">
+    La formulación general, nacida en el mundo de los sistemas distribuidos y llevada a producción por motores analíticos. Multiplicidades negativas, marcas temporales parcialmente ordenadas y soporte de recursión. Existen portes a JavaScript pensados para el navegador.
+  </Card>
+  <Card icon="🧩" title="Vistas parcialmente materializadas">
+    La línea de investigación que materializa solo la parte de la vista que alguien está mirando y calcula el resto bajo demanda. Es la respuesta directa al problema de la memoria y la que mejor encaja con una interfaz donde solo hay una pantalla visible.
+  </Card>
+  <Card icon="🧮" title="Motores locales con lenguaje propio">
+    Varios motores reactivos para local-first exponen un lenguaje de consulta acotado en lugar de SQL completo, precisamente para que cada consulta expresable tenga un plan incremental. La restricción no es una carencia: es el mecanismo.
+  </Card>
+  <Card icon="🪝" title="SQLite y los ganchos de fila">
+    El motor más usado en local-first no mantiene vistas incrementalmente. Lo que ofrece son ganchos que notifican fila a fila y al confirmar, es decir, la materia prima del delta. Lo que se construya encima es tuyo.
+  </Card>
+</Cards>
+
+Frente a ese panorama, la pregunta útil al evaluar cualquiera de ellos no es si soporta mantenimiento incremental, porque todos dirán que sí, sino estas cuatro:
+
+- **Qué subconjunto del lenguaje garantiza mantener sin reconsultar**, y qué hace exactamente cuando escribes una consulta que cae fuera.
+- **Si degrada en silencio o avisa**, porque un motor que reconsulta calladamente cuando no puede incrementalizar no tiene modelo de coste, tiene una promesa.
+- **Cuánta memoria retiene por vista viva**, medida sobre tus tablas y no sobre el ejemplo de la documentación.
+- **Qué ocurre al arrancar en frío**, es decir, cuánto cuesta construir el estado de todos los operadores antes de poder entregar el primer resultado.
+
+Conviene mirar con atención esa tercera tarjeta, porque contiene la decisión de diseño más reveladora de todo el ecosistema. Cuando un motor reactivo local te ofrece un lenguaje de consulta más pequeño que SQL —sin subconsultas arbitrarias, con uniones limitadas a caminos declarados, con un catálogo cerrado de agregados— la tentación es leerlo como inmadurez del producto. Es lo contrario. **Un lenguaje que solo deja expresar consultas incrementalizables es la única forma de prometer un modelo de coste**, porque garantiza que ninguna consulta que un desarrollador pueda escribir caerá fuera del conjunto que el motor sabe mantener sin reconsultar. SQL completo no admite esa promesa: siempre habrá una sentencia válida cuyo plan incremental no exista o sea peor que ejecutarla entera, y en el momento en que el motor tiene que degradar a reconsultar sin avisar, el modelo de coste que vendía deja de existir.
+
+<Callout type="tip" title="La primera vez sigue costando lo que cueste">
+Un detalle que arruina presupuestos y que no aparece en ninguna descripción entusiasta de la técnica: el mantenimiento incremental abarata las actualizaciones, no la inicialización. Suscribirse a una vista incremental exige construirla desde cero —recorrer las tablas, poblar los índices de cada unión, calcular todos los acumuladores—, y ese arranque cuesta como mínimo lo que costaría ejecutar la consulta entera, a menudo bastante más porque además hay que materializar estado que la consulta normal no guardaría. En una pantalla que se abre y se cierra continuamente puedes acabar pagando la construcción una y otra vez para amortizarla durante tres segundos. Mide siempre las dos cifras por separado, coste de arranque y coste por escritura, y decide con el cociente entre ellas y la vida media real de la pantalla.
+</Callout>
+
+<Callout type="dios" title="Restringir el lenguaje para comprar una propiedad es el mismo movimiento que hace un CRDT">
+Si en este punto tienes la sensación de haber visto antes esta forma de razonar, es porque la has visto, y reconocer el parentesco vale más que cualquiera de las técnicas concretas de la lección. El mantenimiento incremental funciona exactamente cuando un operador cumple una propiedad algebraica —que distribuya sobre la composición de cambios, que su acumulador admita inversa, que su combinación sea asociativa y conmutativa para que el orden de llegada de los deltas no altere el resultado—, y falla exactamente cuando esa propiedad no se cumple. Fíjate en la lista: distributividad, existencia de inversa, asociatividad, conmutatividad. Es palabra por palabra el mismo inventario de propiedades que hace converger un CRDT, y no es una coincidencia estética sino una identidad estructural, porque los dos problemas son el mismo problema formulado sobre ejes distintos. Un CRDT necesita que dos réplicas que reciben las mismas operaciones en cualquier orden lleguen al mismo estado; una vista incremental necesita que un resultado construido aplicando deltas sea idéntico al que se obtendría recalculando desde cero. Ambas son afirmaciones sobre la conmutación entre una operación y una composición, y ambas se compran de la única manera en que estas cosas se compran: restringiendo lo que se puede decir. Un CRDT no te deja escribir cualquier tipo de dato, solo los que forman un semirretículo; un motor reactivo no te deja escribir cualquier consulta, solo las que tienen plan incremental. En los dos casos la renuncia a expresividad no es un peaje que pagas a regañadientes por una implementación imperfecta, es el mecanismo mismo por el que se obtiene la garantía, y en los dos casos el error de diseño característico consiste en intentar recuperar la expresividad perdida a base de casos especiales, que es como se construyen los sistemas que funcionan en las demostraciones y divergen en producción. La lección práctica es incómoda pero clara: cuando elijas motor reactivo, no compares por cuántas consultas admite sino por cuáles garantiza mantener sin reconsultar, y desconfía especialmente del que las admite todas.
+</Callout>
+
+<Challenge title="Construye tu propio delta">
+1. Implementa un mantenedor incremental para un recuento por grupo usando multiplicidades con signo. Comprueba que una modificación se comporta como una retracción seguida de una afirmación.
+2. Añade el mínimo por grupo y provoca el caso malo: borra la fila que ostenta el extremo. Mide cuánto cuesta y después implementa la reserva de los mejores valores.
+3. Escribe la regla de los tres términos para una unión y cuenta cuánta memoria ocupan los índices de ambos lados con tus tablas reales.
+4. Construye una consulta ordenada con límite de cincuenta, mantenla incrementalmente y cuenta cuántas veces tienes que volver a la base porque la reserva se agotó.
+5. Compara sobre tu base más grande el tiempo por escritura de la vista incremental frente al de reconsultar, y anota también la memoria retenida. Decide con esos dos números, no con uno.
+6. Toma tres consultas reales de tu aplicación y clasifícalas: incrementalizable sin estado, incrementalizable con estado costoso, o mejor reconsultar. Justifica cada clasificación por escrito.
+</Challenge>

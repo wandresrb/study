@@ -1,0 +1,136 @@
+---
+title: "virtio: el invitado que sabe que está virtualizado"
+description: "Por qué emular hardware real es lento y cómo la paravirtualización lo evita: el estándar virtio y sus drivers virtio-net y virtio-blk, la virtqueue como anillo de memoria compartida entre invitado y anfitrión con su tabla de descriptores y sus anillos disponible y usado, el mecanismo de notificación kick e interrupción con su supresión, y vhost, que baja el camino de datos al kernel para acercarse a la velocidad nativa."
+subject: kernel
+level: 53
+order: 4
+position: "53.4"
+duration: "17 min"
+---
+
+<Lead>
+Emular una tarjeta de red real es una tragedia de rendimiento. El invitado, que no sabe que está virtualizado, habla con los registros de un chip Intel `e1000` como si existiera, y cada uno de esos accesos es un VM exit que despierta a QEMU para fingir ser un transistor. `virtio` rompe el teatro. En lugar de emular hardware que nadie fabricó para ser virtualizado, define un dispositivo *nacido* para vivir dentro de una máquina virtual, y le dice al invitado la verdad: estás virtualizado, deja de fingir, hablemos por un protocolo eficiente de anillos en memoria compartida. El invitado coopera, el número de VM exits se desploma y la E/S se acerca a la velocidad nativa. `virtio` es la paravirtualización hecha estándar de la industria.
+</Lead>
+
+<Goals>
+
+- Entender por qué emular hardware real multiplica los VM exits y ahoga la E/S.
+- Diseccionar la virtqueue: tabla de descriptores, anillo disponible y anillo usado.
+- Comprender la notificación por `kick` e interrupción y por qué se suprime.
+- Situar `vhost` y explicar por qué `virtio` alcanza velocidad casi nativa.
+
+</Goals>
+
+## El coste de emular hardware real
+
+Cuando el invitado usa un driver de un dispositivo físico —una NIC `e1000`, un disco `IDE`— cree estar programando registros de control mapeados en memoria. Cada lectura o escritura de esos registros es un acceso `MMIO` que provoca un `KVM_EXIT_MMIO`, sale del invitado, despierta al hilo de QEMU, ejecuta cientos de líneas de emulación y vuelve a entrar. Enviar un solo paquete puede costar una decena de estos viajes de ida y vuelta, cada uno de miles de ciclos. El hardware real fue diseñado para hablar con silicio, no con software; forzarlo a ser emulado es pagar en VM exits el precio de una compatibilidad que el invitado ni siquiera necesita.
+
+`virtio` parte de una premisa opuesta. Si el invitado *sabe* que está en una máquina virtual —y siempre lo sabe, basta con instalarle el driver adecuado— no hay razón para imitar un chip. Se define entonces un dispositivo abstracto cuya interfaz no son registros que se tocan uno a uno, sino colas en memoria que ambos lados comparten. El invitado deposita muchas peticiones en la cola y avisa **una vez**; el anfitrión las procesa en lote y avisa **una vez** de las terminadas. La aritmética del rendimiento cambia de raíz.
+
+## La virtqueue: anillos en memoria compartida
+
+El mecanismo de transporte de `virtio` es la **virtqueue**. En su forma clásica —la *split virtqueue*— consta de tres estructuras que viven en memoria que el invitado asigna y el anfitrión puede leer. La primera es la **tabla de descriptores**: un arreglo donde cada entrada describe un fragmento de un búfer por su dirección física de invitado, su longitud y unas banderas.
+
+```c
+/* include/uapi/linux/virtio_ring.h: un descriptor de la virtqueue */
+struct vring_desc {
+	__virtio64 addr;    /* direccion fisica de invitado del buffer */
+	__virtio32 len;     /* longitud en bytes */
+	__virtio16 flags;   /* VRING_DESC_F_NEXT, _WRITE, _INDIRECT */
+	__virtio16 next;    /* encadena varios descriptores en uno logico */
+};
+```
+
+Las otras dos son anillos que marcan la dirección del flujo. El **anillo disponible** (*available*) lo escribe el invitado —el *driver*— para publicar qué descriptores tiene listos para que el dispositivo los consuma. El **anillo usado** (*used*) lo escribe el anfitrión —el *device*— para devolver los descriptores ya procesados, con la longitud realmente escrita. Un puntero por cada lado avanza en círculo; de ahí el nombre de anillo.
+
+```c
+struct vring {
+	unsigned int num;             /* tamano de la cola, potencia de dos */
+	struct vring_desc  *desc;     /* tabla de descriptores */
+	struct vring_avail *avail;    /* el driver publica aqui */
+	struct vring_used  *used;     /* el device completa aqui */
+};
+```
+
+Desde el driver del invitado no se manipulan estas estructuras a mano: la API `virtqueue` de `linux/virtio.h` las esconde. Añadir un búfer de salida, notificar y recoger lo completado es este trío de llamadas, el mismo que usan `virtio-net` y `virtio-blk`:
+
+```c
+/* encolar un buffer hacia el dispositivo */
+struct scatterlist sg;
+sg_init_one(&sg, buf, len);
+virtqueue_add_outbuf(vq, &sg, 1, buf, GFP_ATOMIC);   /* ocupa un descriptor */
+
+/* avisar al anfitrion solo si hace falta */
+if (virtqueue_kick_prepare(vq))
+	virtqueue_notify(vq);            /* el kick: un VM exit, no uno por buffer */
+
+/* mas tarde, en el manejador de interrupcion, recoger lo terminado */
+unsigned int largo;
+while ((buf = virtqueue_get_buf(vq, &largo)) != NULL)
+	procesar_completado(buf, largo);
+```
+
+Lo que viaja en esos descriptores depende del dispositivo. En `virtio-blk`, por ejemplo, el primer descriptor de cada petición lleva una cabecera que dice qué operación es y sobre qué sector, seguida de los descriptores con los datos y uno final para el estado:
+
+```c
+/* include/uapi/linux/virtio_blk.h: cabecera de una petición de bloque */
+struct virtio_blk_outhdr {
+	__virtio32 type;    /* VIRTIO_BLK_T_IN leer, VIRTIO_BLK_T_OUT escribir */
+	__virtio32 ioprio;
+	__virtio64 sector;  /* sector inicial en el disco virtual */
+};
+```
+
+Esta forma clásica de tres estructuras separadas —la *split virtqueue*— dispersa los accesos del invitado y del anfitrión por varias líneas de caché. `virtio` 1.1 introdujo la **packed virtqueue**: un único anillo donde cada descriptor lleva en sus banderas un bit de fase que marca de quién es el turno, con lo disponible y lo usado fundidos en la misma estructura. Menos saltos de caché y menos escrituras cruzadas entre ambos lados; por eso la prefieren los dispositivos de alto rendimiento y el hardware `vDPA`.
+
+## Notificación: kick e interrupción, y su supresión
+
+Los anillos permiten mover datos sin trampas, pero sigue haciendo falta que cada lado despierte al otro cuando hay trabajo. El invitado notifica al anfitrión con un **kick**: una escritura a un registro de notificación que sí provoca un VM exit. El anfitrión notifica al invitado inyectando una **interrupción**. Si se hiciera un kick por búfer y una interrupción por completado, no habríamos ganado nada. La clave está en **amortizar**: encolar muchos búferes y dar un solo kick, completar muchos y lanzar una sola interrupción.
+
+`virtio` va más allá y permite **suprimir** las notificaciones cuando el otro lado está mirando de todos modos. Con la característica `VIRTIO_F_EVENT_IDX`, cada lado publica hasta qué punto del anillo quiere ser avisado; mientras el productor no rebase ese umbral, se salta la notificación por completo. Bajo carga alta, cuando el anfitrión ya está procesando la cola sin parar, el invitado deja de hacer kicks: la E/S fluye por memoria compartida con cero VM exits durante ráfagas enteras. Es la misma idea del *NAPI* en las redes reales —dejar de interrumpir cuando el tráfico es continuo— trasladada a la frontera entre invitado y anfitrión.
+
+<Mermaid code={`sequenceDiagram
+  participant D as Driver en el invitado
+  participant Q as Virtqueue en memoria compartida
+  participant V as Device en el anfitrion
+  D->>Q: escribe buffers en la tabla de descriptores
+  D->>Q: publica indices en el anillo disponible
+  D->>V: kick, un unico VM exit para varios buffers
+  V->>Q: procesa y marca el anillo usado
+  V->>D: una interrupcion para varios completados
+  Note over D,V: con EVENT_IDX ambas notificaciones se suprimen bajo carga`} />
+
+## vhost y la velocidad casi nativa
+
+Aun con `virtio`, el kick despierta a QEMU en el espacio de usuario para mover los datos, y ese salto al *userspace* cuesta. La optimización decisiva es **vhost**: llevar el extremo del anfitrión —el *device*— dentro del propio kernel. Con `vhost-net`, el procesamiento de la virtqueue de red ocurre en un hilo del kernel que lee los anillos y habla directamente con la pila de red, sin volver a QEMU en el camino de datos. QEMU solo interviene en la configuración inicial; los paquetes ni lo rozan.
+
+Registrar un driver `virtio` en el invitado es tan sencillo como el modelo de buses que ya conoces: se declara un `virtio_driver` con su tabla de identificadores de dispositivo y sus rutinas, y una macro lo enchufa al bus.
+
+```c
+static struct virtio_driver virtio_net_driver = {
+	.driver.name = KBUILD_MODNAME,
+	.id_table    = id_table,        /* VIRTIO_ID_NET */
+	.probe       = virtnet_probe,
+	.remove      = virtnet_remove,
+	.config_changed = virtnet_config_changed,
+};
+module_virtio_driver(virtio_net_driver);   /* registra en el bus virtio */
+```
+
+La suma de todo —anillos en memoria compartida, notificaciones amortizadas y suprimibles, camino de datos en el kernel con `vhost`, e incluso descarga al hardware con `vDPA` en las NIC modernas que hablan `virtio` de forma nativa— es lo que lleva la E/S paravirtualizada a rozar el rendimiento del hierro. El invitado paga el precio de saber que está virtualizado, y ese precio resulta ser una ganga.
+
+<Callout type="info" title="virtio es un estándar, no solo un driver de Linux">
+`virtio` lo mantiene OASIS como especificación abierta e independiente del sistema operativo. Por eso hay drivers `virtio` para Windows, los BSD, e incluso firmware; y por eso QEMU, Firecracker (nivel 53.5), Cloud Hypervisor y los hipervisores propietarios lo implementan por igual. Cuando aprovisionas una máquina en cualquier nube, sus discos y sus redes son casi con certeza dispositivos `virtio`.
+</Callout>
+
+<Callout type="dios" title="La honestidad rinde más que la ilusión perfecta">
+Detente en la inversión filosófica que encierra `virtio`, porque contradice el instinto que gobernó la virtualización durante veinte años. El ideal declarado era la ilusión perfecta: un invitado que no pudiera notar, ni con el microscopio más fino, que no corría sobre hardware real. Toda la virtualización completa perseguía esa mentira impecable, emulando hasta el último registro de chips que llevaban décadas en el mercado, porque la compatibilidad total parecía el bien supremo. Y sin embargo la ilusión perfecta era una cárcel de rendimiento, precisamente porque era perfecta: para no delatarse tenía que fingir ser un hardware que fue diseñado para hablar con electrones, no con software, y cada gesto de esa farsa costaba una trampa al hipervisor. `virtio` hace lo contrario y por eso gana. Le dice al invitado la verdad —estás dentro de una máquina virtual— y, lejos de degradarlo, esa honestidad lo libera. Un invitado que sabe dónde está deja de malgastar energía imitando movimientos de un hardware ausente y adopta un protocolo pensado para su condición real: colas en memoria que ambos comparten, avisos en lote, silencio cuando el otro ya está atento. La lección desborda la virtualización y toca el diseño de sistemas entero. La abstracción que oculta por completo la realidad subyacente es cómoda hasta que su coste te alcanza; entonces descubres que una abstracción *honesta*, que revela lo justo de lo que hay debajo para que el de arriba coopere, casi siempre rinde más que la ilusión impecable. `virtio` es la prueba de que a veces el mejor favor que le puedes hacer a la capa de arriba no es mentirle mejor, sino dejar de mentirle.
+</Callout>
+
+<Challenge title="Sigue el rastro de la paravirtualización">
+1. En una máquina virtual, ejecuta `lspci` y `ls /sys/bus/virtio/devices`; identifica sus dispositivos `virtio-net` y `virtio-blk`.
+2. Explica en cuatro líneas el papel de la tabla de descriptores, el anillo disponible y el anillo usado, y quién escribe en cada uno.
+3. Razona por qué un kick por búfer anularía la ventaja de `virtio`, y cómo `VIRTIO_F_EVENT_IDX` llega a cero notificaciones bajo carga.
+4. Compara, con `kvm_stat` o los tracepoints `kvm:kvm_exit`, los VM exits de un disco emulado `IDE` frente a uno `virtio-blk`.
+5. Describe qué mueve `vhost-net` al kernel y por qué eso acerca la E/S de red a la velocidad nativa sin pasar por QEMU en el camino de datos.
+</Challenge>

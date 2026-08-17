@@ -1,0 +1,138 @@
+---
+title: "Por qué el kernel es concurrente por defecto"
+description: "Antes de un solo lock: por qué tu código del kernel ya corre en paralelo. SMP, preempción, reentrancy y contexto de interrupción, y qué es una condición de carrera y por qué aquí es letal."
+subject: kernel
+level: 14
+order: 1
+position: "14.1"
+duration: "15 min"
+---
+
+<Lead>
+En userspace, un programa de un solo hilo vive tranquilo: nadie toca sus datos mientras trabaja. En el kernel esa paz no existe. Tu función corre a la vez en varios núcleos, la interrumpen a media instrucción, y vuelven a entrar en ella desde una interrupción. La concurrencia no es una opción que activas: es el suelo sobre el que ya estás de pie.
+</Lead>
+
+<Goals>
+
+- SMP: varios núcleos ejecutando tu código a la vez.
+- Preempción del kernel y reentrancy.
+- El contexto de interrupción y sus reglas de hierro.
+- Qué es una condición de carrera y por qué aquí es letal.
+
+</Goals>
+
+## Cuatro fuentes de concurrencia
+
+Cuando escribes una función del kernel, cuatro fuerzas distintas pueden hacer que se ejecute "a la vez" que otra cosa que toca los mismos datos. Entenderlas es el requisito para todo lo que viene:
+
+**1. SMP (Symmetric Multi-Processing).** Con `CONFIG_SMP`, la máquina tiene varios núcleos y todos ejecutan código del kernel simultáneamente. Tu `driver_read()` puede correr en la CPU 0 mientras otro proceso ejecuta *esa misma función* en la CPU 3. No hay dos hilos "lógicos": hay dos núcleos físicos pisando la misma memoria en el mismo nanosegundo.
+
+```c
+#include <linux/smp.h>
+#include <linux/cpumask.h>
+
+/* Esta funcion puede correr a la vez en varios nucleos */
+static void driver_read(void)
+{
+	unsigned int cpu = smp_processor_id();   /* nucleo actual */
+
+	pr_info("driver_read en CPU %u de %u activas\n",
+		cpu, num_online_cpus());
+	/* Si aqui tocas datos globales, otra CPU ya puede estar tocandolos */
+}
+```
+
+<Callout type="tip" title="Hasta preguntar dónde estás tiene reglas">
+Llamar a `smp_processor_id()` en código preemptible es un bug latente: entre que lees el número de CPU y lo usas, el planificador puede migrarte a otro núcleo y el valor quedar obsoleto. Su uso seguro exige `get_cpu()` —que desactiva la preempción y te devuelve la CPU— emparejado con `put_cpu()`. Que hasta *saber en qué núcleo corres* sea una operación con reglas de concurrencia te dice en qué mundo has entrado.
+</Callout>
+
+**2. Preempción del kernel.** Con `CONFIG_PREEMPT` (y en Linux 7.x, con `PREEMPT_RT` ya en el mainline), el planificador puede *expulsar* tu hilo del kernel a media función para dar la CPU a una tarea de mayor prioridad. Aunque haya un solo núcleo, tu código puede quedar congelado en la línea 5 mientras otro corre. `preempt_disable()` y `preempt_enable()` marcan tramos donde eso no puede pasar; `preempt_count()` cuenta cuántas veces se ha inhibido.
+
+**3. Reentrancy.** Es la consecuencia de las dos anteriores: la *misma* función puede entrarse de nuevo antes de que la primera invocación termine, ya sea porque te preemptan y reprograman, o porque una interrupción salta y llama a un camino de código que vuelve a tu función. El código del kernel debe ser reentrante por diseño, y un simple buffer estático lo rompe:
+
+```c
+/* NO reentrante: el buffer estatico se comparte entre invocaciones */
+static char buffer[128];
+
+static void formatea(const char *s)
+{
+	strscpy(buffer, s, sizeof(buffer));   /* otra entrada aqui lo pisa */
+	usar(buffer);                          /* y ya lees datos ajenos */
+}
+```
+
+Si te preemptan o te interrumpen entre `strscpy` y `usar`, la segunda invocación machaca `buffer` y la primera continúa con datos que no son suyos. La cura es no tener estado compartido oculto: usa la pila o memoria por invocación.
+
+**4. Interrupciones.** El hardware lanza una IRQ y el kernel ejecuta tu rutina de servicio (ISR) *encima* de lo que estuviera corriendo. Si tu código de proceso estaba a mitad de actualizar una variable y la ISR toca esa misma variable, tienes dos escritores sobre el mismo dato sin ningún orden garantizado. Piensa en un driver que avanza el índice de un ring buffer mientras su propia ISR, al llegar un dato, avanza ese mismo índice: sin protección, un evento se pierde. Y aquí hay una trampa mortal: contra una ISR no vale un `spin_lock()` normal, sino `spin_lock_irqsave()`, que además desactiva las IRQs locales; si el hilo tuviera el lock y la ISR intentara adquirirlo en el mismo núcleo, la máquina se autobloquearía para siempre.
+
+## El contexto de interrupción
+
+El kernel ejecuta en dos contextos radicalmente distintos, y confundirlos cuelga la máquina:
+
+- **Contexto de proceso.** Hay una tarea detrás (`current` es válido). Puedes dormir: llamar a `mutex_lock()`, a `kmalloc(GFP_KERNEL)`, a `copy_to_user()`.
+- **Contexto de interrupción.** No hay tarea: nadie a quien dormir. Debe ser *corto* y *no puede bloquear jamás*. Nada de `mutex_lock()`, nada de `GFP_KERNEL`, nada de `copy_to_user()`.
+
+```c
+#include <linux/interrupt.h>
+#include <linux/preempt.h>
+
+static unsigned long eventos;   /* dato compartido con el ISR */
+
+/* Contexto de proceso: puede dormir */
+static void proc_ctx(void)
+{
+	eventos++;              /* ventana de carrera con el ISR */
+}
+
+/* Contexto de interrupcion: NO puede dormir, debe ser corto */
+static irqreturn_t mi_isr(int irq, void *dev)
+{
+	if (in_hardirq())      /* estamos en hard IRQ */
+		eventos++;     /* misma variable, otro contexto */
+
+	return IRQ_HANDLED;
+}
+```
+
+Las macros `in_task()`, `in_hardirq()`, `in_serving_softirq()` e `in_interrupt()` te dicen dónde estás. Para cerrar la puerta a las IRQs locales en un tramo crítico, `local_irq_save(flags)` y `local_irq_restore(flags)`. Pero fíjate en el comentario "ventana de carrera": esas dos funciones tocan `eventos` sin ningún acuerdo entre ellas. Eso es exactamente el problema.
+
+Y no hay un solo tipo de interrupción. Están las *hard IRQ* (la ISR inmediata que acabas de ver), las *softirq* y *tasklets* (trabajo diferido que corre todavía en contexto atómico, sin poder dormir), y las *threaded IRQ* (manejadores que sí corren en un kthread y por tanto pueden bloquear). El `preempt_count` de la tarea codifica en qué anidamiento estás: cuántas hard IRQ, cuántas softirq y cuántos `preempt_disable` hay activos, empaquetados en un solo entero. Cuando ese contador no es cero estás en *contexto atómico*, y cualquier intento de dormir es un `BUG: scheduling while atomic`.
+
+## La condición de carrera
+
+Una **condición de carrera** aparece cuando se dan tres cosas a la vez: (1) datos compartidos, (2) acceso concurrente desde cualquiera de las cuatro fuentes, y (3) al menos un escritor, todo ello (4) sin sincronización que ordene los accesos. El resultado deja de depender solo del código y pasa a depender del *tiempo*: qué núcleo llegó antes, cuándo saltó la interrupción. El tramo de código donde el desastre puede ocurrir se llama **sección crítica**.
+
+<Mermaid code={`flowchart TD
+  A[CPU 0 ejecuta driver_read] --> S[Dato compartido contador]
+  B[CPU 3 ejecuta driver_read] --> S
+  I[ISR tras la interrupcion] --> S
+  P[Hilo preemptado y reprogramado] --> S
+  S --> R[Sin sincronizacion la carrera corrompe el dato]
+  class S t-yellow
+  class R t-red`} />
+
+¿Por qué es *letal* aquí y no solo molesto? En userspace, una carrera corrompe la memoria de *un* proceso: en el peor caso, ese programa muere. En el kernel, corrompes estructuras compartidas por *toda* la máquina: una lista de procesos, la caché de un sistema de archivos, la tabla de un driver. El resultado no es un programa que cae, sino un `kernel panic`, un deadlock que congela el sistema, una corrupción silenciosa de tu disco, o —lo más temido— un `use-after-free` explotable. Una fracción enorme de los CVE del kernel son, en el fondo, condiciones de carrera.
+
+<Callout type="dios" title="Ya eres concurrente; la única pregunta es si lo sabes">
+Este es el cambio de mentalidad que separa al programador de aplicaciones del de kernel. En userspace, la concurrencia es algo que *añades* cuando creas un hilo: por defecto estás solo. En el kernel es al revés: en el instante en que tu función toca un dato que otro contexto también puede tocar, ya firmaste un contrato con el hardware, lo supieras o no. No hay un modo "secuencial" al que volver. Por eso la pregunta correcta nunca es "¿necesito sincronizar esto?", sino "¿quién más puede tocar este dato, y desde qué contexto?". Si la respuesta es "nadie, jamás", tienes suerte. En cualquier otro caso, cada acceso sin protección es una bomba de relojería que estallará no en tu portátil, sino en el datacenter de otro, seis meses después, un martes a las tres de la mañana. Programar el kernel es, en gran medida, aprender a responder esa pregunta antes de escribir la línea.
+</Callout>
+
+## De la amenaza a las herramientas
+
+Ahora ves el terreno: cuatro fuentes de concurrencia, dos contextos, y un dato compartido en medio. El resto de este nivel es el arsenal para defenderlo. Antes de operaciones atómicas, spinlocks, mutexes y RCU, necesitas el instinto de mirar un trozo de código y ver *dónde* está la sección crítica. Ese instinto lo entrena la siguiente lección, con la carrera más famosa de todas: el contador.
+
+<Callout type="info" title="La vía de escape: no compartir">
+La forma más barata de ganar una carrera es no correrla. Si cada núcleo tiene su propia copia del dato —variables *per-CPU* con `DEFINE_PER_CPU` y `this_cpu_inc()`— entonces no hay dato compartido y no hay nada que sincronizar. No siempre es posible, pero cuando lo es, bate a cualquier lock en rendimiento y en simplicidad. Tenlo presente durante todo el track: a veces la mejor sincronización es un diseño que la vuelve innecesaria.
+</Callout>
+
+<Callout type="warn" title="La regla que ya conoces, ahora con más motivos">
+Nunca desarrolles concurrencia del kernel en tu máquina principal. Una carrera mal resuelta no crashea un proceso: cuelga el sistema o corrompe el disco. Trabaja siempre en una máquina virtual (QEMU, nivel 6). Aquí un fallo se paga caro, y un deadlock puede dejarte sin más pista que una pantalla congelada.
+</Callout>
+
+<Challenge title="Aprende a ver la concurrencia">
+1. Compila un kernel con `CONFIG_SMP` y `CONFIG_PREEMPT` y arráncalo en QEMU con varios núcleos (`-smp 4`). Imprime `smp_processor_id()` desde un módulo y observa que varía.
+2. Coge un driver sencillo (el char device del nivel 13) e identifica cada dato global que comparte entre `read`, `write` y `open`.
+3. Para cada dato, clasifica *quién* puede tocarlo: ¿otro núcleo por SMP? ¿una ISR? ¿un hilo preemptado?
+4. Marca sobre el código la sección crítica exacta: la línea donde empieza y donde acaba la ventana de peligro.
+5. Investiga un CVE reciente del kernel que sea una condición de carrera (busca "race condition use-after-free") y localiza qué dato compartido no estaba protegido.
+</Challenge>

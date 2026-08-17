@@ -1,0 +1,134 @@
+---
+title: "El Virtual File System: una interfaz para todos los discos"
+description: "La capa de abstracción que hace que ext4, Btrfs, NFS y un pendrive FAT se abran, lean y escriban con las mismas syscalls. Por qué en Unix todo es un archivo y cómo el VFS materializa ese polimorfismo con tablas de punteros a función."
+subject: kernel
+level: 37
+order: 1
+position: "37.1"
+duration: "15 min"
+---
+
+<Lead>
+Un archivo en un SSD NVMe formateado como ext4, otro en un Btrfs con snapshots, otro servido por NFS desde una máquina a mil kilómetros y otro en un pendrive FAT: cuatro formatos en disco que no se parecen en nada. Y sin embargo `cat` los lee a los cuatro sin saber cuál es cuál, con la misma `read()`. Esa ilusión de uniformidad no es casualidad ni cortesía de los sistemas de archivos: es una capa entera del núcleo, el Virtual File System, cuyo único trabajo es traducir un puñado de syscalls genéricas a las operaciones concretas de cualquier formato imaginable. El VFS es el idioma común que Linux impone a todos los discos ajenos.
+</Lead>
+
+<Goals>
+
+- Entender qué problema resuelve el VFS y qué significa de verdad que todo sea un archivo.
+- Reconocer los cuatro objetos del VFS: superbloque, inodo, dentry y file.
+- Ver el polimorfismo del VFS como una vtable de C escrita a mano con punteros a función.
+- Registrar un `file_system_type` y seguir la indirección de la syscall al sistema de archivos concreto.
+
+</Goals>
+
+## Un idioma común para formatos incompatibles
+
+Cuando un programa llama a `read(fd, buf, n)`, no dice ni sabe si detrás hay ext4, un socket o un dispositivo de caracteres. La syscall entra al núcleo y aterriza en el VFS, una capa que no conoce ningún formato en disco: solo conoce **objetos genéricos** y **tablas de operaciones**. El VFS toma la petición, localiza el objeto adecuado y delega la parte específica en el sistema de archivos que la registró. Ese reparto de trabajo es lo que permite montar decenas de formatos distintos sin tocar una línea del código que implementa `read`, `write` o `stat`.
+
+<Mermaid code={`flowchart TD
+  APP[Programa] --> SC[syscall read write open stat]
+  SC --> VFS[Capa VFS generica]
+  VFS --> E[ext4]
+  VFS --> B[btrfs]
+  VFS --> N[nfs]
+  VFS --> F[vfat en el pendrive]
+  E --> D1[bloques en disco]
+  N --> NET[peticion por red]`} />
+
+La frontera es nítida: por encima del VFS, el mundo habla el idioma abstracto de archivos y directorios; por debajo, cada sistema de archivos hace lo que quiera con bloques, extents o paquetes de red. El VFS es el punto donde ambos mundos se encuentran sin que ninguno conozca los detalles del otro.
+
+## Los cuatro objetos del VFS
+
+Toda la abstracción se sostiene sobre cuatro estructuras. Conviene fijarlas desde el principio porque el resto del nivel las diseca una a una:
+
+<Cards>
+  <Card icon="🗄️" title="super_block">
+    Un sistema de archivos montado. Guarda el tamaño de bloque, la raíz y las operaciones globales. Uno por montaje.
+  </Card>
+  <Card icon="📄" title="inode">
+    Un archivo o directorio y sus metadatos: permisos, tamaño, dueño, punteros a datos. No tiene nombre.
+  </Card>
+  <Card icon="🏷️" title="dentry">
+    Una entrada de directorio: asocia un nombre con un inodo dentro de un padre. Vive en la dcache.
+  </Card>
+  <Card icon="📂" title="file">
+    Un archivo abierto por un proceso. Guarda el offset y los flags. Uno por cada `open()`.
+  </Card>
+</Cards>
+
+La relación entre ellos es una jerarquía de vidas distintas. El `super_block` persiste mientras el sistema esté montado; el `inode` mientras el archivo exista en disco; la `dentry` es una caché volátil del nombre; y el `struct file` nace y muere con cada apertura. Un mismo inodo puede tener varios nombres (enlaces duros, varias dentries) y estar abierto muchas veces a la vez (varios `struct file`).
+
+## Polimorfismo en C: la vtable a mano
+
+C no tiene métodos virtuales, pero el VFS los emula con precisión quirúrgica. Cada uno de los cuatro objetos lleva un puntero a una tabla `const` de punteros a función: `super_operations`, `inode_operations`, `dentry_operations` y `file_operations`. El código genérico invoca la operación sin saber quién la implementa:
+
+```c
+/* fs/read_write.c (esquema) */
+ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+{
+	if (!(file->f_mode & FMODE_READ))
+		return -EBADF;
+	if (unlikely(!file->f_op->read && !file->f_op->read_iter))
+		return -EINVAL;
+
+	if (file->f_op->read)
+		return file->f_op->read(file, buf, count, pos);   /* forma simple */
+	else
+		return new_sync_read(file, buf, count, pos);      /* usa read_iter */
+}
+```
+
+La línea `file->f_op->read_iter(...)` es la esencia del VFS: una llamada indirecta a través de un puntero que ext4, NFS o tu driver rellenaron con su propia función. Es exactamente una vtable de la programación orientada a objetos, solo que declarada a mano. El objeto es el `struct file`; sus datos son sus campos; sus métodos son `file_operations`.
+
+## Registrar un sistema de archivos
+
+Para que el VFS pueda delegar en un formato, ese formato debe presentarse primero con un `struct file_system_type`, que es su carné de identidad ante el núcleo:
+
+```c
+/* include/linux/fs.h (recortado) */
+struct file_system_type {
+	const char *name;                       /* "ext4", "btrfs", "nfs"... */
+	int fs_flags;
+	int (*init_fs_context)(struct fs_context *);  /* API de montaje moderna */
+	const struct fs_parameter_spec *parameters;
+	void (*kill_sb)(struct super_block *);   /* desmontar y liberar */
+	struct module *owner;
+	struct file_system_type *next;
+	struct hlist_head fs_supers;             /* montajes vivos de este tipo */
+};
+```
+
+Un sistema de archivos real lo rellena y lo registra en su carga. Así lo hace ext4 en los núcleos actuales, ya con la API de montaje basada en `fs_context`:
+
+```c
+/* fs/ext4/super.c */
+static struct file_system_type ext4_fs_type = {
+	.owner           = THIS_MODULE,
+	.name            = "ext4",
+	.init_fs_context = ext4_init_fs_context,
+	.parameters      = ext4_param_specs,
+	.kill_sb         = ext4_kill_sb,
+	.fs_flags        = FS_REQUIRES_DEV | FS_ALLOW_IDMAP | FS_MGTIME,
+};
+
+/* en la inicializacion del modulo */
+register_filesystem(&ext4_fs_type);
+```
+
+Registrarse solo anuncia "sé montar volúmenes con este formato". El trabajo real empieza en el `mount`, cuando el núcleo llama a `init_fs_context`, este construye el `super_block` y a partir de ahí toda petición se resuelve por los punteros a función de los cuatro objetos.
+
+<Callout type="info" title="La API de montaje moderna">
+Los sistemas de archivos antiguos exponían un callback `mount` que recibía las opciones como una cadena cruda. El árbol actual prefiere `init_fs_context`, que valida opciones tipadas con `fs_parameter_spec` antes de tocar el disco. Verás ambos campos coexistir en `file_system_type` durante la larga transición.
+</Callout>
+
+<Callout type="dios" title="Todo es un archivo significa todo responde al mismo juego de operaciones">
+El eslogan de Unix se suele recitar mal. No dice que todo *sea* literalmente un archivo en disco: un socket TCP, un proceso en `/proc`, tu tarjeta gráfica y una tubería no tienen bloques que guardar. Lo que dice, entendido a fondo, es que todo expone la **misma interfaz**: se abre, se lee, se escribe y se cierra a través de un `struct file` y su tabla de `file_operations`. La igualdad no está en la sustancia sino en el protocolo. Y esa es una decisión de diseño de una potencia asombrosa, porque convierte a `read` y `write` en un lenguaje universal: la misma tubería que vale para un archivo vale para un pipe, un socket o un dispositivo, y por eso los shells pueden encadenar programas con `|` sin que ninguno sepa qué hay al otro lado. El VFS es la maquinaria que hace verdadero el eslogan. Cada vez que añades un tipo de objeto al núcleo —un sistema de archivos, un driver, un pseudo-archivo de depuración— tu única obligación es rellenar las tablas de operaciones, y a cambio heredas gratis todo el ecosistema de herramientas que ya hablan el idioma de los archivos. La abstracción no es documentación ni cortesía: es la ley que todo objeto del núcleo debe cumplir para existir en el universo de los descriptores de archivo.
+</Callout>
+
+<Challenge title="Cartografía el VFS de tu máquina">
+1. Ejecuta `cat /proc/filesystems` y distingue los sistemas de archivos que requieren dispositivo (`ext4`) de los que no (`tmpfs`, `proc`).
+2. Con `mount | column -t`, identifica cuántos `super_block` distintos hay vivos ahora mismo en tu sistema.
+3. En las fuentes del núcleo, localiza la definición de `file_operations` y cuenta cuántos punteros a función tiene: esa es la superficie del polimorfismo del VFS.
+4. Explica por qué `read()` sobre un archivo ext4 y sobre un socket ejecutan código completamente distinto pese a ser la misma syscall.
+5. Razona qué gana un desarrollador de un sistema de archivos nuevo con solo rellenar las cuatro tablas de operaciones en lugar de reimplementar las syscalls.
+</Challenge>

@@ -1,0 +1,151 @@
+---
+title: "Cancelación cooperativa: pedir, observar y limpiar"
+description: "Por qué `cancel` no detiene nada, cómo se propaga la marca por el árbol de tareas, cuándo usar `Task.isCancelled` frente a `checkCancellation`, qué resuelve `withTaskCancellationHandler` y cómo escribir limpieza que sobreviva a una tarea ya cancelada."
+subject: swift
+level: 26
+order: 5
+position: "26.5"
+duration: "19 min"
+---
+
+<Lead>
+La palabra cancelar sugiere una acción con efecto inmediato, y esa sugerencia es la fuente de casi todos los malentendidos. En Swift, `cancel` no interrumpe nada, no aborta ningún cálculo y no desvía ninguna ejecución: se limita a marcar la tarea y a despertar sus suspensiones. A partir de ahí, si el código no pregunta, no pasa nada en absoluto; un bucle que suma enteros durante treinta segundos seguirá sumando exactamente treinta segundos aunque alguien lo haya cancelado en el primer milisegundo. La cancelación es, literalmente, un dato observable que viaja por el árbol de tareas, y convertir ese dato en comportamiento es responsabilidad del programador. Esa decisión de diseño, que a primera vista parece una debilidad, es lo que hace que la cancelación sea segura: nadie es interrumpido con las manos dentro de una invariante a medio restaurar.
+</Lead>
+
+<Goals>
+
+- Explicar qué hace exactamente `cancel` y cómo se propaga la marca por el subárbol de tareas.
+- Elegir con criterio entre `Task.isCancelled`, `Task.checkCancellation` y devolver un resultado parcial.
+- Usar `withTaskCancellationHandler` para interrumpir esperas que no son puntos de suspensión de Swift.
+- Escribir limpieza correcta sabiendo que tras la cancelación toda espera nueva del mismo árbol falla de inmediato.
+
+</Goals>
+
+## La marca y su propagación
+
+Cancelar es cambiar una bandera y propagarla hacia abajo. Es una operación barata, idempotente y sin vuelta atrás: una tarea cancelada no puede descancelarse.
+
+```swift
+let t = Task { await trabajoLargo() }
+t.cancel()          // marca t y todo su subarbol; retorna de inmediato
+```
+
+La propagación sigue las aristas del árbol, no las del código. Cancelar una tarea marca a todas sus hijas presentes y futuras: una hija creada después de la cancelación **nace cancelada**. Un padre nunca se cancela porque se cancele una hija; la señal solo desciende. Y como las tareas sin estructura no son hijas de nadie, la marca no las alcanza jamás, por muy anidada que esté su creación en el texto.
+
+Además de propagarse, la cancelación **despierta las suspensiones que saben de ella**. Las funciones del sistema escritas para cooperar —dormir, leer de la red, iterar una secuencia asíncrona bien construida— reaccionan lanzando `CancellationError` o terminando. Un cálculo síncrono largo, en cambio, no tiene ningún punto donde reaccionar, y por eso troceárlo con comprobaciones periódicas es la única forma de hacerlo cancelable.
+
+```swift
+func sumar(_ datos: [Bloque]) async throws -> Total {
+    var total = Total.cero
+    for (i, b) in datos.enumerated() {
+        if i.isMultiple(of: 64) { try Task.checkCancellation() }   // trocear
+        total += procesar(b)
+    }
+    return total
+}
+```
+
+<Callout type="tip" title="La granularidad correcta">
+Comprobar en cada iteración de un bucle muy caliente cuesta más de lo que ahorra; comprobar una vez cada minuto de cálculo hace la cancelación inútil. Una regla razonable es comprobar con la frecuencia suficiente para que el tiempo entre la petición y la salida sea imperceptible para quien la pidió, típicamente unas decenas de milisegundos.
+</Callout>
+
+## Preguntar o lanzar
+
+Hay dos formas de observar la marca y no son intercambiables, porque expresan contratos distintos.
+
+`Task.isCancelled` es una propiedad booleana. No lanza, y por tanto permite decidir qué hacer: salir con lo que se lleva hecho, guardar un resultado parcial, escribir una traza. Es la herramienta cuando la cancelación tiene una salida **con sentido semántico**.
+
+```swift
+for pagina in paginas {
+    if Task.isCancelled { return .parcial(acumulado) }   // salida valida
+    acumulado += await descargar(pagina)
+}
+```
+
+`Task.checkCancellation` lanza `CancellationError` si la tarea está marcada. Es la herramienta cuando la única respuesta correcta es abortar y dejar que el error suba, que es el caso mayoritario, porque un resultado incompleto que se devuelve como si fuera completo es peor que un fallo.
+
+```swift
+try Task.checkCancellation()
+let datos = try await api.descargar(id)
+```
+
+La elección tiene consecuencias en quien llama. Devolver un valor parcial obliga al llamante a saber distinguirlo, y si el tipo de retorno no lo expresa —si `.parcial` y `.completo` no están en el tipo— acabas de crear un error silencioso. Lanzar, en cambio, usa el canal que ya existía y no requiere que nadie recuerde nada. Por eso la regla por defecto es lanzar, y devolver parcial solo cuando el tipo de retorno lo modela explícitamente.
+
+Un tercer patrón, frecuente y correcto: ignorar la cancelación durante una sección corta y crítica que debe completarse para no dejar el estado a medias, y comprobar justo al salir de ella. La cancelación cooperativa lo permite precisamente porque no interrumpe.
+
+```swift
+await escribirCabecera()      // seccion critica: no se comprueba nada
+await escribirCuerpo()
+await cerrarFichero()
+try Task.checkCancellation()  // frontera segura: aqui si
+```
+
+Queda una decisión que suele pasarse por alto: qué hacer con `CancellationError` cuando llega arriba. No es un fallo del sistema ni algo que reportar al usuario, porque describe algo que alguien pidió; tratarlo como un error de red produce alertas absurdas al cerrar una pantalla. Lo correcto es distinguirlo en el punto donde se manejan los errores y, casi siempre, no hacer nada con él.
+
+```swift
+do { modelo.datos = try await cargar() }
+catch is CancellationError { }                 // silencio deliberado
+catch { modelo.error = error }
+```
+
+## Interrumpir lo que no sabe esperar
+
+`checkCancellation` solo actúa cuando la ejecución pasa por su línea. Si la tarea está detenida esperando algo que no es un punto de suspensión de Swift —una llamada bloqueante de una biblioteca en C, un lector de fichero de otra API, un temporizador del sistema—, ninguna comprobación se ejecutará nunca. Para ese caso existe `withTaskCancellationHandler`, que instala una clausura que se dispara **en el instante mismo** de la cancelación.
+
+```swift
+try await withTaskCancellationHandler {
+    try await lector.leerHastaElFinal()      // espera opaca al runtime
+} onCancel: {
+    lector.abortar()                         // sincrono, Sendable, otro hilo
+}
+```
+
+El perfil de esa clausura impone disciplina y conviene memorizarlo. Es **síncrona**: no puedes esperar dentro. Es `@Sendable` y puede ejecutarse en cualquier hilo, incluso concurrentemente con la operación principal, de modo que todo lo que toque debe ser seguro por su cuenta. Y puede dispararse **antes de que la operación empiece**, si la tarea ya venía cancelada, lo que obliga a que abortar un trabajo no iniciado sea inofensivo.
+
+<Mermaid code={`flowchart TB
+  C[Alguien llama a cancel] --> M[Se marca la tarea y su subarbol]
+  M --> S[Se despiertan las suspensiones cooperantes]
+  M --> H[Se dispara onCancel de forma inmediata]
+  S --> O1[isCancelled: decidir y salir con parcial]
+  S --> O2[checkCancellation: lanzar CancellationError]
+  H --> O3[Abortar el recurso externo que no sabe esperar]
+  O2 --> L[Limpieza en defer o en tarea nueva]
+  O1 --> L
+  O3 --> L
+  class M t-blue
+  class L t-green`} />
+
+## Limpiar cuando ya no se puede esperar
+
+Aquí está la trampa que más código correcto en apariencia arruina: **dentro de una tarea cancelada, cualquier nueva suspensión que coopere falla de inmediato**. Un `defer` que hace `await` para cerrar una sesión no cerrará nada, porque esa espera nace ya cancelada.
+
+```swift
+// mal: la limpieza asincrona no llega a ejecutarse
+defer { Task { await sesion.cerrar() } }   // esta Task si funciona; sin ella, no
+```
+
+Hay tres salidas, y elegir bien depende del recurso. La primera es que la limpieza sea **síncrona**: cerrar un descriptor, soltar un candado, poner una bandera. Es la mejor, y muchas liberaciones pueden reescribirse así. La segunda es lanzar una tarea nueva desde la limpieza: como no es hija de la tarea cancelada, no nace marcada y puede completar su trabajo; a cambio, sale del árbol y nadie la espera, lo que la hace inadecuada si el cierre debe haber terminado antes de que el programa siga. La tercera es reservar una sección no cancelable para el cierre, ejecutando la operación crítica antes de comprobar nada y aceptando que ese tramo dure lo que dure.
+
+<Cards>
+  <Card icon="🙋" title="Si no preguntas, no eres cancelable">
+    Un código sin comprobaciones y sin esperas cooperantes ignora la cancelación por completo. No es un fallo del sistema: es una omisión tuya.
+  </Card>
+  <Card icon="🧯" title="Limpieza síncrona primero">
+    Toda liberación que pueda escribirse sin `await` es una liberación que funcionará también en el peor momento posible.
+  </Card>
+  <Card icon="⏱️" title="Plazo no es cancelación">
+    Un tiempo máximo se construye con una carrera entre trabajo y espera, y termina llamando a `cancel`. La marca sigue siendo la misma.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Por qué la terminación forzosa fracasó y qué exige a cambio la cooperativa">
+La historia de la informática concurrente contiene un experimento repetido y concluyente: cada vez que un sistema ha ofrecido la posibilidad de matar un hilo desde fuera, esa posibilidad ha terminado desaconsejada, obsoleta o retirada. Ocurrió con el método de terminación de hilos de Java, marcado como inseguro y desaprobado apenas dos años después de su aparición; ocurrió con la cancelación asíncrona de POSIX, técnicamente disponible y prácticamente inutilizable fuera de un puñado de puntos definidos; ocurrió con las abortadas de dominios de aplicación en otras plataformas. La razón es siempre la misma y es estructural, no de implementación: un punto arbitrario de un programa no es un lugar seguro para desaparecer, porque la mayoría de esos puntos están **a mitad de una transición entre dos estados válidos** —un candado tomado y aún no liberado, un fichero abierto y aún no cerrado, una estructura con la mitad de sus campos actualizados—. Interrumpir ahí no cancela el trabajo: lo deja congelado en un estado que ninguna invariante del programa contempla, y a partir de ese momento todo razonamiento sobre el sistema es falso. La cancelación cooperativa invierte la carga: en lugar de dar al que cancela el poder de detener, le da el poder de **informar**, y reserva la decisión de cuándo morir al único código que sabe si sus invariantes están sanas, que es el que se está ejecutando. Esto tiene un precio que hay que aceptar sin resentimiento —la cancelación es una petición, no una orden, y un código mal escrito puede ignorarla para siempre— y una virtud que compensa con creces: convierte la terminación en un suceso **ordinario** del programa, indistinguible en su manejo de cualquier otro error recuperable, que viaja por el mismo canal, se maneja con las mismas herramientas y se prueba de la misma forma. La consecuencia para tu diseño es directa y va más allá de Swift: cuando construyas cualquier operación de larga duración, en cualquier lenguaje, pregúntate no si puede ser detenida sino **dónde son sus fronteras seguras**, porque esos puntos —y no el instante en que alguien pulsa cancelar— son los únicos lugares del programa donde la terminación tiene un significado; y si al mirar tu función no encuentras ninguno, lo que has escrito no es una operación cancelable sino una promesa de que nadie cambiará de opinión.
+</Callout>
+
+<Challenge title="Hacer cancelable lo que no lo es">
+1. Escribe un cálculo síncrono de diez segundos, cancélalo y comprueba que sigue hasta el final; después trocéalo y mide el retardo real de salida.
+2. Implementa la misma operación con `isCancelled` devolviendo un parcial y con `checkCancellation` lanzando, y compara qué obliga a saber al llamante.
+3. Envuelve una API bloqueante con `withTaskCancellationHandler` y verifica que la clausura se dispara también cuando la tarea ya venía cancelada.
+4. Escribe una limpieza asíncrona en un `defer` con y sin una tarea nueva y explica con trazas por qué una de las dos no llega a completarse.
+5. Construye un plazo máximo con un grupo de tareas donde una hija duerma y la otra trabaje, y comprueba que la perdedora se cancela siempre.
+</Challenge>

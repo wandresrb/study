@@ -1,0 +1,127 @@
+---
+title: "io_uring frente a epoll, en serio: batching, completado universal y cifras"
+description: "epoll perfeccionó el aviso de disponibilidad, pero seguía cobrando una syscall por operación y solo servía para descriptores de red. io_uring hace muchas operaciones con una sola llamada, completa cualquier tipo de E/S incluido el disco con O_DIRECT, encadena operaciones dentro del kernel y, con un hilo de sondeo, llega a no gastar ninguna syscall. La comparación honesta y las cifras."
+subject: kernel
+level: 40
+order: 4
+position: "40.4"
+duration: "17 min"
+---
+
+<Lead>
+Comparar io_uring con epoll poniéndolos a resolver el mismo problema de red es tentador pero injusto con ambos, porque no compiten en la misma dimensión. epoll es el mejor detector de disponibilidad que existe: te dice, en tiempo constante, cuáles de cien mil descriptores están listos. io_uring no compite en detectar: compite en *ejecutar*. La pregunta correcta no es "cuál avisa mejor", sino "cuántas veces cruzas la frontera al kernel para atender N operaciones, y para cuántos tipos de E/S sirve el truco". En esas dos preguntas —el batching y la universalidad del completado— io_uring no mejora a epoll: juega a otro juego.
+</Lead>
+
+<Goals>
+
+- Amortizar el coste de la syscall enviando muchos SQEs con una sola `io_uring_enter`.
+- Ver que el completado sirve para archivos, `O_DIRECT` y sockets, no solo para la red.
+- Encadenar operaciones con `IOSQE_IO_LINK` y eliminar syscalls con `IORING_SETUP_SQPOLL`.
+- Interpretar con criterio las cifras de rendimiento frente a epoll y a la AIO nativa.
+
+</Goals>
+
+## Batching: una syscall para un lote entero
+
+El bucle epoll paga `1 + N` syscalls por ronda: una para saber quién está listo y una por cada `read()` o `write()`. io_uring colapsa ese coste. Preparas todos los SQEs que quieras en la cola compartida y los entregas de una vez:
+
+```c
+/* preparar ocho lecturas y entregarlas TODAS con una sola syscall */
+for (int i = 0; i < 8; i++) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    io_uring_prep_read(sqe, fds[i], bufs[i], 4096, 0);
+    io_uring_sqe_set_data64(sqe, i);
+}
+io_uring_submit_and_wait(&ring, 8);   /* 1 syscall: envia 8, espera 8 */
+```
+
+Ocho operaciones, una llamada al sistema. A escala de un proxy que mueve millones de peticiones por segundo, pasar de `1 + N` a algo cercano a `1` por lote no es un ahorro marginal: es la diferencia entre saturar el kernel de cruces o dedicar la CPU al trabajo real.
+
+<Mermaid code={`flowchart TD
+  subgraph epoll_atiende_N
+    E1[epoll_wait una syscall] --> E2[read syscall 1] --> E3[read syscall 2] --> E4[read syscall N]
+  end
+  subgraph iouring_atiende_N
+    I1[N SQEs en la cola compartida] --> I2[un solo io_uring_enter] --> I3[N CQEs cosechados]
+  end`} />
+
+La aritmética es implacable: donde epoll gasta `1 + N` cruces de frontera, io_uring gasta uno, y con `IORING_SETUP_SQPOLL` ni siquiera ese.
+
+## Completado universal: mucho más que la red
+
+epoll solo sabe de descriptores que pueden decir "todavía no": sockets, pipes, `eventfd`, `timerfd`. El disco, ya lo vimos, queda fuera. io_uring no tiene esa frontera, porque no pregunta por disponibilidad sino que ejecuta la operación completa, y por eso su catálogo de opcodes abarca casi toda la superficie de syscalls de E/S:
+
+```c
+io_uring_prep_read(sqe, fd, buf, len, off);     /* archivo regular, bufferizado o O_DIRECT */
+io_uring_prep_recv(sqe, sock, buf, len, 0);     /* red */
+io_uring_prep_accept(sqe, lfd, NULL, NULL, 0);  /* aceptar conexiones */
+io_uring_prep_openat(sqe, AT_FDCWD, ruta, O_RDONLY, 0); /* incluso abrir archivos */
+io_uring_prep_statx(sqe, fd, "", AT_EMPTY_PATH, STATX_SIZE, &stx);
+io_uring_prep_fsync(sqe, fd, 0);                /* durabilidad, tambien asincrona */
+```
+
+Un único bucle de eventos, un único mecanismo, atiende a la vez la conexión entrante, la lectura del socket, la lectura del NVMe con `O_DIRECT` y el `fsync` de durabilidad. Esa unificación —red y almacenamiento bajo la misma cola— es algo que Unix nunca tuvo y que epoll, atado a la disponibilidad, no podía dar.
+
+## Encadenar y sondear: exprimir hasta la última syscall
+
+io_uring va más allá del batching con dos técnicas. La primera, los *enlaces*: con `IOSQE_IO_LINK` marcas que un SQE no debe arrancar hasta que el anterior complete, y el kernel encadena la secuencia sin devolverte el control entre pasos. Una copia lectura-a-escritura ocurre entera dentro del kernel:
+
+```c
+/* copia encadenada: el write no arranca hasta que el read completa, sin volver a userspace */
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, fd_in, buf, 4096, off);
+io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK);     /* enlaza con el siguiente */
+
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_write(sqe, fd_out, buf, 4096, off);
+io_uring_submit(&ring);                          /* una syscall para las dos */
+```
+
+La segunda técnica lleva el ahorro al límite: `IORING_SETUP_SQPOLL` arranca un hilo del kernel que *sondea* la Submission Queue por su cuenta. Publicas SQEs moviendo el índice y el hilo los recoge sin que toques `io_uring_enter` en absoluto: E/S sin ninguna syscall.
+
+```c
+struct io_uring_params p = { 0 };
+p.flags = IORING_SETUP_SQPOLL;
+p.sq_thread_idle = 2000;                 /* el hilo duerme tras 2 s ocioso */
+io_uring_queue_init_params(256, &ring, &p);
+/* ahora io_uring_submit puede no ejecutar NINGUNA llamada al sistema */
+```
+
+## Las cifras, con honestidad
+
+Los números dependen del hardware, del kernel y de la carga, así que léelos como órdenes de magnitud y no como promesas. En almacenamiento, `fio` sobre un NVMe con `IORING_SETUP_IOPOLL` y búferes registrados (nivel 41) supera con holgura el millón de operaciones por segundo *por núcleo*, y un sistema completo rebasa los diez millones —cifras sencillamente inalcanzables con la AIO nativa o con un `pread` síncrono por hilo—. En red, frente a un bucle epoll bien afinado, io_uring reduce las llamadas al sistema por petición de varias a esencialmente una, y su ventaja crece con la concurrencia: a decenas de miles de conexiones activas, el ahorro de cruces se traduce en más rendimiento y menos latencia de cola. La mejora no viene de que io_uring "sea más rápido" por dentro, sino de que hace *menos* del trabajo caro —cruzar la frontera— para la misma cantidad de E/S útil.
+
+```bash
+# el coste real, en llamadas al sistema por unidad de trabajo
+strace -c -f ./servidor_epoll     # una read/write por operacion domina el perfil
+strace -c -f ./servidor_iouring   # io_uring_enter domina, con muchas menos syscalls
+
+# techo de almacenamiento: sondeo + O_DIRECT sobre NVMe (millones de IOPS por nucleo)
+fio --name=nvme --ioengine=io_uring --hipri=1 --direct=1 \
+    --rw=randread --bs=4k --iodepth=128 --numjobs=1
+```
+
+<Cards>
+  <Card icon="🔔" title="epoll · readiness">
+    Avisa de qué descriptores están listos en tiempo constante. Solo red y afines; el trabajo real sigue costando una syscall por operación. Insuperable para *detectar*, ciego para el disco.
+  </Card>
+  <Card icon="🚀" title="io_uring · completion">
+    Ejecuta la operación y devuelve el resultado. Batching de un lote por syscall, cualquier tipo de E/S, enlaces dentro del kernel y sondeo sin syscalls. Otro juego.
+  </Card>
+</Cards>
+
+<Callout type="note" title="La receta moderna: SINGLE_ISSUER y DEFER_TASKRUN">
+En los kernels 7.x, el consejo de rendimiento actual para un anillo por hilo es combinar `IORING_SETUP_SINGLE_ISSUER` (prometes que un solo hilo envía) con `IORING_SETUP_DEFER_TASKRUN` (el trabajo de completado se ejecuta cuando esperas CQEs, no en cada interrupción). Juntas recortan la contención y los despertares espurios, y son hoy la configuración recomendada por defecto para servidores nuevos.
+</Callout>
+
+<Callout type="dios" title="El cuello de botella se movió del aviso al trabajo mismo">
+Retrocede y mira la trayectoria completa de la E/S escalable en Linux, porque io_uring solo se entiende como el último paso de una fuga. Al principio, el cuello de botella era *saber a quién atender*: `select` y `poll` recorrían linealmente miles de descriptores en cada ronda, y el coste crecía con el número de conexiones aunque casi ninguna tuviera trabajo. epoll mató ese cuello de botella volviéndolo constante: te avisa solo de los listos, sin recorrer el resto. Fue una victoria histórica, pero al ganarla dejó al descubierto el *siguiente* cuello de botella, que había estado oculto detrás: una vez sabes a quién atender, sigues pagando una syscall por cada atención. Cuando epoll hizo el aviso casi gratis, el peaje de cruzar la frontera —N veces por ronda— pasó a ser lo caro, y encima el hardware moderno lo encareció: cada syscall arrastra ahora el coste de las mitigaciones de Spectre y Meltdown, el vaciado de predicciones, el cambio de tablas. io_uring es la respuesta a ese cuello de botella recién revelado, y por eso ataca justo la syscall como unidad de trabajo: la amortiza con batching, la elimina con sondeo, la evita encadenando en el kernel. Pero fíjate en la forma del argumento, porque es una ley del diseño de sistemas: cada vez que optimizas el recurso que hoy es escaso, no llegas al paraíso, sino que destapas cuál era el segundo recurso más escaso, que hasta entonces vivía a la sombra del primero. select destapó el coste del escaneo; epoll destapó el coste de la syscall; io_uring, al abaratar la syscall casi a cero, destapa el siguiente —la copia de datos, la latencia del propio dispositivo, la coherencia de cachés entre núcleos—, y de ahí vienen la copia cero, los búferes registrados y el sondeo del nivel 41. No existe la optimización final; existe la disciplina de saber siempre cuál es, ahora mismo, el muro contra el que chocas.
+</Callout>
+
+<Challenge title="Mide el batching y el completado universal">
+1. Escribe dos versiones de un lector de ocho archivos: una con ocho `pread` síncronos y otra con ocho SQEs y un solo `io_uring_submit_and_wait`; compara las syscalls con `strace -c`.
+2. Añade a un mismo bucle io_uring una lectura de socket y una lectura de archivo con `O_DIRECT`, y confirma que ambas se atienden por la misma cola.
+3. Encadena un `read` y un `write` con `IOSQE_IO_LINK` y comprueba que el `write` recibe los bytes del `read` sin que tu código intervenga entre ambos.
+4. Activa `IORING_SETUP_SQPOLL` y verifica con `strace` que `io_uring_submit` deja de generar llamadas al sistema.
+5. Argumenta por qué la ventaja de io_uring crece con la concurrencia y qué recurso escaso destapará una vez la syscall deje de ser el cuello de botella.
+</Challenge>

@@ -1,0 +1,160 @@
+---
+title: "Proto DataStore: un esquema tipado y cuándo compensa"
+description: "La segunda cara de DataStore sustituye el mapa de claves sueltas por un objeto con esquema declarado en protobuf, y con ello cambia la naturaleza del problema: deja de haber claves que puedan faltar y pasa a haber un tipo que siempre está completo. Esta lección cubre el fichero de esquema y la generación de código, el serializador que hay que escribir a mano y el papel exacto del valor por defecto, la escritura mediante constructor inmutable, la evolución del esquema con números de campo estables y la regla de compatibilidad, y sobre todo el análisis honesto de cuándo el coste de la infraestructura se paga y cuándo es sobreingeniería disfrazada de rigor."
+subject: android
+level: 17
+order: 3
+position: "17.3"
+duration: "20 min"
+---
+
+<Lead>
+Las preferencias sueltas tienen un defecto que ninguna mejora de la implementación puede arreglar, porque no está en la implementación sino en el modelo: un mapa de claves independientes no puede expresar que dos valores forman una unidad con sentido. Cada clave puede existir o no existir, cada una tiene su valor por defecto aplicado en un sitio distinto del código, y la comprobación de que el conjunto es coherente no ocurre en ninguna parte porque no hay ninguna parte donde el conjunto exista como tal. `Proto DataStore` responde a eso cambiando la unidad de almacenamiento: en lugar de guardar claves guarda un objeto, definido por un esquema, que está completo por construcción. El precio es una dependencia, un lenguaje de definición y un paso de generación de código. La pregunta interesante no es cómo se usa, que es sencillo, sino cuándo ese precio compensa.
+</Lead>
+
+<Goals>
+
+- Definir un esquema en `protobuf` y comprender qué código genera y con qué garantías.
+- Escribir el serializador, el valor por defecto y el manejo de corrupción que la biblioteca exige.
+- Leer y escribir el objeto completo con el patrón de constructor sobre un tipo inmutable.
+- Evolucionar el esquema sin romper las instalaciones existentes, y decidir con criterio si conviene adoptarlo.
+
+</Goals>
+
+## El esquema como fuente de verdad
+
+Un fichero de esquema declara los campos, sus tipos y su número. Ese número es lo importante: es el identificador que viaja en el formato binario, mientras que el nombre existe solo para el código generado. Cambiar el nombre de un campo es inocuo; cambiar su número destruye la compatibilidad con lo ya escrito en los dispositivos.
+
+```protobuf
+syntax = "proto3";
+
+option java_package = "com.ejemplo.ajustes";
+option java_multiple_files = true;
+
+message AjustesUsuario {
+  string tema = 1;
+  bool notificaciones = 2;
+  int32 tamano_fuente = 3;
+  repeated string temas_seguidos = 4;
+}
+```
+
+El complemento de compilación toma ese fichero y genera una clase inmutable con acceso a cada campo, un constructor mutable para producir copias modificadas y las rutinas de lectura y escritura del formato binario. La clase generada no admite campos ausentes: un campo que nunca se escribió devuelve el valor por defecto de su tipo, que en la versión tres del lenguaje está fijado y no se puede personalizar en el esquema. Cadena vacía, cero, falso, lista vacía.
+
+Esa característica merece atención porque es a la vez la mayor ventaja y la trampa más frecuente. La ventaja es que nunca hay nulos y nunca hay que preguntarse si una clave existe. La trampa es que el valor por defecto del tipo casi nunca coincide con el valor por defecto del dominio: un tamaño de fuente cero no significa nada, un tema con cadena vacía no es un tema. La solución no es luchar contra el formato sino declarar explícitamente el valor por defecto del dominio en el serializador, que es el único sitio donde el objeto se construye desde cero.
+
+<Callout type="tip" title="Enumerados con un cero que signifique desconocido">
+Cuando un campo es un enumerado, el formato obliga a que el primer valor tenga el número cero y ese será el valor por defecto. Aprovecharlo declarando ahí un miembro explícito para lo no especificado, en lugar de colocar el primer valor real, convierte una ambigüedad en información: sabes distinguir entre el usuario que eligió la primera opción y el usuario que nunca eligió.
+</Callout>
+
+## El serializador, el valor por defecto y la corrupción
+
+La biblioteca no sabe convertir tu tipo a bytes, así que hay que decírselo. El serializador implementa tres cosas: el valor que se devuelve cuando no hay fichero, cómo leer desde un flujo de entrada y cómo escribir a un flujo de salida. Es código mecánico y se escribe una sola vez por esquema.
+
+```kotlin
+object AjustesSerializer : Serializer<AjustesUsuario> {
+
+    override val defaultValue: AjustesUsuario = AjustesUsuario.newBuilder()
+        .setTema("sistema")          // el defecto del dominio, no el del tipo
+        .setTamanoFuente(16)
+        .setNotificaciones(true)
+        .build()
+
+    override suspend fun readFrom(input: InputStream): AjustesUsuario =
+        try {
+            AjustesUsuario.parseFrom(input)
+        } catch (e: InvalidProtocolBufferException) {
+            throw CorruptionException("Ajustes ilegibles", e)
+        }
+
+    override suspend fun writeTo(t: AjustesUsuario, output: OutputStream) =
+        t.writeTo(output)
+}
+```
+
+La conversión de la excepción del parseo en la excepción de corrupción no es un detalle de estilo: es lo que permite que el manejador de corrupción entre en acción y reescriba el fichero con un contenido válido. Sin esa conversión, un fichero dañado produce un fallo en cada arranque para siempre. Con ella, el primer arranque tras el daño restaura los valores por defecto y la aplicación sigue funcionando.
+
+La instancia se declara igual que en el caso de las preferencias, con el serializador y el manejador de corrupción como parámetros, y con la misma regla inflexible de unicidad por fichero y por proceso.
+
+```kotlin
+val Context.ajustesProto: DataStore<AjustesUsuario> by dataStore(
+    fileName = "ajustes.pb",
+    serializer = AjustesSerializer,
+    corruptionHandler = ReplaceFileCorruptionHandler { AjustesSerializer.defaultValue },
+)
+```
+
+## Leer un objeto entero y escribirlo con el constructor
+
+La lectura vuelve a ser un flujo, pero ahora emite el objeto completo en lugar de un mapa. Extraer un campo ya no requiere valor por defecto porque el campo siempre está.
+
+```kotlin
+val tema: Flow<String> = context.ajustesProto.data
+    .catch { e -> if (e is IOException) emit(AjustesSerializer.defaultValue) else throw e }
+    .map { it.tema }
+    .distinctUntilChanged()
+```
+
+La escritura usa `updateData`, que es la contraparte de `edit` y conserva las tres propiedades que ya conocemos: suspendida, transaccional y con acceso al valor previo. La diferencia es que el bloque no muta nada, sino que recibe el objeto actual y debe devolver el objeto nuevo, construido a partir del anterior mediante su constructor.
+
+```kotlin
+suspend fun cambiarTamano(nuevo: Int) {
+    context.ajustesProto.updateData { actual ->
+        actual.toBuilder()
+            .setTamanoFuente(nuevo.coerceIn(12, 28))   // la invariante vive aqui
+            .build()
+    }
+}
+```
+
+El detalle que da valor real al modelo está en esa línea de restricción del rango. Con claves sueltas, cualquier módulo puede escribir un valor absurdo y nadie se entera hasta que la interfaz se rompe. Con un objeto y una función de actualización por operación de dominio, el punto de escritura es único y es el sitio natural donde vive la regla que mantiene el objeto válido. El esquema garantiza el tipo; la función de actualización garantiza el significado.
+
+<Mermaid code={`flowchart LR
+  A[Fichero binario] --> B[Serializador lee y parsea]
+  B --> C[Objeto inmutable completo]
+  C --> D[Flujo data emite el objeto]
+  D --> E[Interfaz mapea el campo que necesita]
+  F[updateData con bloque] --> G[toBuilder aplica cambios]
+  G --> H[Nuevo objeto validado]
+  H --> I[Escritura atomica en disco]
+  I --> D`} />
+
+## Evolucionar el esquema y decidir si compensa
+
+Un esquema que vive en dispositivos ajenos solo se puede cambiar de ciertas maneras. Añadir un campo con un número nuevo es seguro: las versiones viejas del binario lo ignoran y las nuevas leen el valor por defecto en los ficheros escritos antes. Renombrar es seguro porque el nombre no viaja. Eliminar un campo exige reservar su número para que nadie lo reutilice más adelante y reinterprete bytes viejos como otra cosa. Y cambiar el tipo de un campo existente es, salvo entre tipos compatibles a nivel de codificación, una forma segura de romper las instalaciones que ya existen.
+
+```protobuf
+message AjustesUsuario {
+  reserved 3;                    // tamano_fuente se retiro; nadie puede reusar el 3
+  reserved "tamano_fuente";
+  string tema = 1;
+  bool notificaciones = 2;
+  repeated string temas_seguidos = 4;
+  int32 densidad = 5;            // sustituto con numero nuevo
+}
+```
+
+Queda la pregunta que importa, y merece una respuesta honesta en lugar de un entusiasmo automático por lo tipado. La infraestructura cuesta: una dependencia más, un complemento de compilación, un lenguaje adicional que todo el equipo debe entender, código generado en el árbol de compilación y una disciplina de compatibilidad que hay que sostener durante años. Ese coste se paga muy bien en unas condiciones concretas y muy mal en otras.
+
+<Cards>
+  <Card icon="🧬" title="Compensa cuando">
+    Los valores se relacionan entre sí, hay estructuras anidadas o listas, existen invariantes que mantener, el conjunto se lee y escribe como una unidad, o el mismo esquema ya se usa en la comunicación con el servidor.
+  </Card>
+  <Card icon="🪶" title="No compensa cuando">
+    Son cinco banderas independientes, cada una con su significado aislado, escritas desde sitios distintos y sin ninguna relación entre ellas. Ahí el esquema añade ceremonia sin añadir garantías.
+  </Card>
+</Cards>
+
+Hay además una condición intermedia que conviene conocer: cuando el proyecto ya usa serialización de Kotlin, se puede obtener casi toda la ventaja del modelo de objeto escribiendo un serializador propio sobre una clase de datos anotada, sin introducir `protobuf` en absoluto. Se pierde la compatibilidad binaria disciplinada y la interoperabilidad con otros lenguajes, y se gana no tener que mantener un esquema en un lenguaje aparte. Para un almacén puramente local que nadie más consume, ese intercambio suele salir a favor de la opción sencilla.
+
+<Callout type="dios" title="El esquema no es un detalle de formato, es la única memoria escrita de tus decisiones">
+Conviene extraer de esta lección algo que va mucho más allá de elegir entre un mapa y un mensaje binario, y que se hace visible precisamente cuando uno se ve obligado a escribir un fichero de esquema. Un esquema es una declaración explícita de qué información compone el estado de la aplicación, con qué tipos, con qué cardinalidad y bajo qué nombre. En un almacén de claves sueltas esa declaración también existe, pero no está escrita en ninguna parte: vive repartida entre los puntos de lectura, cada uno con su valor por defecto, cada uno con su suposición sobre el tipo, y ninguno con conocimiento de los demás. Nadie puede responder a la pregunta de qué guarda esta aplicación sin recorrer el código entero, y como esa pregunta se hace pocas veces, la respuesta se vuelve desconocida con una rapidez notable. Lo que ocurre a partir de ahí es siempre lo mismo: aparecen claves que ya nadie lee pero que nadie se atreve a borrar, aparecen dos claves distintas que significan lo mismo escritas por dos equipos, y aparece la situación característica en que el valor por defecto de una preferencia es distinto en dos pantallas porque cada una lo escribió por su cuenta. Ninguno de esos problemas es de almacenamiento; todos son problemas de conocimiento perdido. La segunda mitad del argumento es la que decide la elección práctica, y es contraria al reflejo del ingeniero que aprecia el rigor. Un esquema tiene valor exactamente en la medida en que el estado que describe tiene estructura. Si tus datos son cinco interruptores mutuamente ajenos, el esquema no captura ninguna relación porque no hay ninguna relación que capturar, y lo único que has añadido es un paso de compilación y una obligación de compatibilidad para toda la vida del producto. La disciplina se justifica por la complejidad que domina, nunca por sí misma, y confundir ambas cosas produce arquitecturas impecables sobre problemas que no existían. La pregunta correcta antes de escribir la primera línea del fichero no es si el tipado es mejor, porque siempre lo parece, sino si eres capaz de enunciar una sola invariante que relacione dos de tus campos. Si la respuesta es sí, el esquema se paga solo. Si la respuesta es no, acabas de encontrar tu propia justificación para no escribirlo.
+</Callout>
+
+<Challenge title="Modela un estado que las claves sueltas no saben expresar">
+1. Escribe un esquema para el estado de una sesión donde el identificador y la fecha de caducidad solo tienen sentido juntos, y demuestra que no puede existir uno sin el otro.
+2. Implementa el serializador con un valor por defecto de dominio distinto del valor por defecto del tipo en al menos tres campos.
+3. Coloca un enumerado con un miembro no especificado en la posición cero y contrasta el comportamiento con otro que empiece por un valor real.
+4. Añade un campo nuevo, publica, y comprueba sobre un fichero escrito por la versión anterior que la lectura sigue funcionando. Después retira un campo con la reserva correspondiente.
+5. Toma tus preferencias actuales, cuenta cuántas invariantes existen entre pares de claves y decide con ese número si tu caso justifica la infraestructura.
+</Challenge>

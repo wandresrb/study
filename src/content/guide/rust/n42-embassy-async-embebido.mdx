@@ -1,0 +1,119 @@
+---
+title: "Embassy: async/await en el metal, sin heap y sin RTOS"
+description: "El mismo trait `Future` que mueve a Tokio en un servidor de 64 núcleos mueve a Embassy en un chip de 64 KB, porque el async de Rust se diseñó agnóstico del runtime y sin asignación desde el primer día. Embassy es el ejecutor cooperativo que sintetiza máquinas de estados a partir de código secuencial, duerme el núcleo entre eventos y despierta las tareas desde las interrupciones. Async encaja en un microcontrolador mejor que los hilos, porque un MCU es puro esperar a que ocurra algo."
+subject: rust
+level: 42
+order: 5
+position: "42.5"
+duration: "20 min"
+---
+
+<Lead>
+Un microcontrolador se pasa la vida esperando: a que venza un temporizador, a que llegue un byte por el bus, a que un DMA termine de mover un bloque, a que un pin cambie de flanco. Su trabajo es reaccionar a eventos, no calcular sin descanso. Y "espera a que ocurra esto y sigue" es, letra por letra, lo que expresa un `.await`. Por eso el modelo asíncrono de Rust —el trait `Future`, el `poll`, el `waker` que ya diseccionaste en la concurrencia async— encaja en el metal con una naturalidad que los hilos nunca tuvieron. **Embassy** es el framework que lo trae al embebido: un ejecutor cooperativo que sintetiza máquinas de estados a partir de código de aspecto secuencial, funciona sin heap y sin sistema operativo, duerme el núcleo cuando no hay nada que hacer y despierta cada tarea desde la interrupción que la concierne. La tesis de esta lección es que el async de Rust no fue nunca una función de servidores: fue siempre un modelo universal de concurrencia por E/S, y el microcontrolador es donde su promesa de coste cero se ve con más claridad.
+</Lead>
+
+<Goals>
+
+- Entender por qué un MCU, dominado por la espera de E/S, es el hábitat natural del async.
+- Ver cómo Embassy ejecuta futures sin heap: una máquina de estados de tamaño fijo por tarea.
+- Comprender el ejecutor cooperativo que duerme el núcleo y lo despierta desde interrupciones.
+- Escribir tareas Embassy con `#[embassy_executor::main]` y `#[embassy_executor::task]`.
+
+</Goals>
+
+## Por qué async encaja en un microcontrolador
+
+Recupera el modelo async: una `async fn` no ejecuta nada al llamarla, sino que devuelve un `Future`, una máquina de estados que el compilador genera a partir de tu código; cada `.await` es un punto donde la máquina puede suspenderse, cediendo el control, y reanudarse después. En un servidor, ese diseño brilla porque el cuello de botella es la E/S de red: miles de conexiones que pasan el rato esperando. Un microcontrolador es *el mismo problema llevado al extremo*. Casi todo lo que hace es esperar a un periférico, y esa espera, en código bloqueante, se paga girando en un bucle ocupado —quemando ciclos y batería— o hilando a mano una maraña de manejadores de interrupción y banderas globales.
+
+Async disuelve esa disyuntiva. Escribes la lógica como si fuera secuencial, y el `.await` marca dónde el trabajo se detiene a esperar un evento del hardware sin bloquear a nadie:
+
+```rust
+// Aspecto secuencial; por dentro, una maquina de estados que se suspende en cada await
+async fn medir(i2c: &mut impl embedded_hal_async::i2c::I2c) -> Result<i16, ()> {
+    i2c.write(0x48, &[0x01]).await.map_err(|_| ())?; // arranca la conversion y espera
+    Timer::after_millis(10).await;                    // espera sin quemar ciclos
+    let mut buf = [0u8; 2];
+    i2c.read(0x48, &mut buf).await.map_err(|_| ())?;  // espera el DMA por interrupcion
+    Ok(i16::from_be_bytes(buf))
+}
+```
+
+Ese código *parece* que bloquea tres veces, pero no gasta un ciclo esperando: en cada `.await` la tarea se aparta y deja el núcleo libre para otras. La máquina de estados que hace posible ese ir y venir la escribe el compilador, no tú. Es el fin de la falsa elección entre el bucle ocupado que malgasta energía y el laberinto de interrupciones que malgasta cordura.
+
+## Async sin heap: una máquina de estados de tamaño fijo
+
+Aquí está la propiedad que hace a Embassy viable en un chip diminuto. Un `Future` es una máquina de estados cuyo tamaño se conoce *en compilación*: ocupa exactamente lo que necesitan las variables locales que sobreviven a través de sus puntos de `.await`, ni un byte más. El macro `#[embassy_executor::task]` reserva para cada tarea una ranura estática de ese tamaño, de una vez y para siempre. No hay heap, no hay asignación dinámica, no hay pila por tarea.
+
+Contrasta con un RTOS clásico. Allí cada tarea es un hilo, y cada hilo necesita su propia pila dimensionada para el peor caso —a menudo kilobytes— reservada esté o no en uso; con diez tareas, decenas de KB comprometidos por si acaso. El `Future` de Embassy invierte el trato: en vez de una pila del peor caso reservada de antemano, guarda solo el estado que de verdad cruza cada suspensión. En un dispositivo con 64 KB de RAM, esa diferencia es la que decide si tu diseño cabe.
+
+<Callout type="tip" title="El tamaño de una tarea es el de su estado vivo entre awaits">
+Una variable local que solo se usa entre dos `.await` consecutivos no cuenta para el tamaño de la tarea: nace y muere sin cruzar ninguna suspensión. Solo lo que *sobrevive* a un `.await` debe guardarse en la máquina de estados. Por eso las tareas Embassy suelen ser asombrosamente compactas, y por eso escribir el bucle con cuidado —minimizando lo que vive a través de las esperas— se traduce directamente en bytes de RAM ahorrados.
+</Callout>
+
+## El ejecutor que duerme el núcleo
+
+El **ejecutor** de Embassy es un planificador cooperativo, no preemptivo: cada tarea corre hasta que se topa con un `.await` cuyo evento aún no ha ocurrido, momento en que devuelve el control. El ejecutor pasa a la siguiente tarea lista. Y cuando *todas* están a la espera, hace lo que ningún bucle ocupado haría: ejecuta una instrucción `WFE` o `WFI` y **duerme el núcleo**, dejándolo en bajo consumo hasta que una interrupción lo despierte. Para un dispositivo a pilas, eso es la diferencia entre semanas y años de autonomía.
+
+El puente entre el hardware y el software es el mismo `waker` de la teoría async, con el reactor cambiado: donde en un servidor era `epoll`, aquí es el controlador de interrupciones. Cuando el periférico que una tarea esperaba dispara su interrupción, el manejador invoca el `waker` de esa tarea; el ejecutor la marca como lista y, al despertar, la vuelve a sondear con `poll`, y la máquina de estados avanza hasta el siguiente `.await`.
+
+<Mermaid code={`flowchart TD
+  RUN[Una tarea corre] --> AW[Llega a un await pendiente]
+  AW --> YIELD[Cede el control al ejecutor]
+  YIELD --> MORE[Queda alguna tarea lista]
+  MORE -->|Si| RUN
+  MORE -->|No| SLEEP[WFI y el nucleo duerme en bajo consumo]
+  IRQ[Interrupcion del periferico] --> WAKER[Dispara el waker de la tarea]
+  SLEEP --> WAKER
+  WAKER --> POLL[El ejecutor sondea la tarea con poll]
+  POLL --> RUN
+  class SLEEP t-blue
+  class WAKER t-peach
+  class RUN t-green`} />
+
+En la práctica, el programa se escribe con dos macros. `#[embassy_executor::main]` arranca el ejecutor y te entrega un `Spawner`; `#[embassy_executor::task]` marca cada tarea concurrente, que lanzas con `spawner.spawn(...)`. Los HAL de Embassy —`embassy-stm32`, `embassy-nrf`, `embassy-rp`— son asíncronos de raíz: su I2C, su SPI y su UART usan DMA e interrupciones por debajo, implementando los traits de `embedded-hal-async`.
+
+```rust
+#![no_std]
+#![no_main]
+
+use embassy_executor::Spawner;
+use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_time::Timer;
+use {defmt_rtt as _, panic_probe as _};
+
+#[embassy_executor::task]
+async fn parpadeo(mut led: Output<'static>) {
+    loop {
+        led.toggle();
+        Timer::after_millis(250).await; // aqui el nucleo puede dormir
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_stm32::init(Default::default());
+    let led = Output::new(p.PC13, Level::High, Speed::Low);
+    spawner.spawn(parpadeo(led)).unwrap();  // lanza la tarea concurrente
+    // main queda libre para atender otras tareas a la vez
+}
+```
+
+<Callout type="info" title="Embassy y RTIC no compiten: cubren dos formas de tiempo">
+No elijes uno "mejor". RTIC es preemptivo y gobernado por prioridades del hardware: su fuerte es el tiempo real duro, donde un evento debe atenderse en un plazo garantizado aunque interrumpa a todo lo demás. Embassy es cooperativo: su fuerte es la E/S concurrente y el bajo consumo, orquestar muchas esperas a periféricos con código legible. Un firmware puede incluso combinarlos. La pregunta no es cuál, sino si tu problema es "reaccionar en un plazo garantizado" o "esperar muchas cosas gastando poco".
+</Callout>
+
+<Callout type="dios" title="El async de Rust no era una función de servidores: era un modelo universal de E/S, y el MCU lo demuestra">
+Cuando aprendiste async en el contexto de Tokio y las redes, era razonable pensar que `Future`, `poll` y `waker` eran maquinaria de servidores: cosas para exprimir miles de conexiones en un centro de datos. Embassy revela que esa lectura se quedaba corta, y la revelación reordena tu idea de lo que el async de Rust *es*. Recuerda la decisión de diseño que en su día pareció austera: Rust no metió un runtime async en el lenguaje. Dejó en la biblioteca `core` solo el trait `Future` y el mecanismo de `poll` y `waker`, y externalizó el ejecutor y el reactor. Aquella renuncia —tener que traer un Tokio a mano— es exactamente lo que ahora permite que un ejecutor de doscientas líneas quepa en un microcontrolador. El trait `Future` no sabe si lo sondea un servidor de sesenta y cuatro núcleos o un chip con sesenta y cuatro kilobytes; no sabe si el reactor que despierta sus wakers es `epoll` o el controlador de interrupciones del silicio; no asigna, no impone pila, no exige sistema operativo. Es una descripción pura de "trabajo que puede suspenderse a la espera de un evento", y esa pureza es lo que lo hace teletransportable del servidor al metal desnudo sin cambiar una coma del lenguaje. Y hay algo más profundo todavía. En el servidor, el async compite con los hilos y gana por eficiencia. En el microcontrolador gana por *identidad*: un MCU no es una máquina de computar que a veces espera, es una máquina de esperar que a veces computa, y async es la única abstracción que modela la espera como ciudadana de primera clase sin pagar ni un heap ni una pila por tarea ni un runtime. Un `Future` de tamaño exacto sustituye a la pila del peor caso de un hilo; un `.await` sobre un temporizador se traduce, literalmente, en dormir la CPU hasta la interrupción. Ahí, donde no hay margen para el desperdicio, es donde la promesa de "abstracción de coste cero" del async de Rust deja de ser un eslogan y se vuelve visible a simple vista. El mismo lenguaje, el mismo trait, la misma sintaxis que orquesta un backend planetario, orquestando un sensor a pilas. Esa continuidad no es una casualidad afortunada: es lo que se gana cuando una abstracción se diseña por lo que *es* y no por dónde se usó primero.
+</Callout>
+
+<Callout type="note" title="Lo esencial de Embassy">
+Un microcontrolador vive esperando eventos de E/S, y `.await` expresa esa espera de forma nativa, así que el async de Rust encaja en el metal mejor que los hilos. Embassy lo trae sin heap: cada tarea es un `Future`, una máquina de estados de tamaño fijo conocido en compilación —solo el estado que sobrevive a los `.await`—, reservada en una ranura estática, frente a la pila del peor caso que reserva cada hilo de un RTOS. Su ejecutor es cooperativo: las tareas ceden en cada `.await` pendiente y, cuando todas esperan, duerme el núcleo con `WFI` hasta que una interrupción dispara un `waker` y lo hace sondear de nuevo. Se programa con `#[embassy_executor::main]` y `#[embassy_executor::task]`, sobre HAL asíncronos que implementan `embedded-hal-async`. El mismo `Future` de Tokio, con el reactor cambiado por el controlador de interrupciones.
+</Callout>
+
+<Challenge title="Lleva el async al metal">
+1. Explica por qué un microcontrolador, dominado por la espera de periféricos, es un hábitat aún más natural para async que un servidor de red. Da tres ejemplos de esperas que un `.await` modela.
+2. Razona por qué un `Future` de Embassy no necesita heap y compara su coste en RAM con la pila del peor caso que reserva un hilo de un RTOS.
+3. Describe qué hace el ejecutor cuando todas las tareas están a la espera, y por qué `WFI` es decisivo para un dispositivo a pilas.
+4. Traza el camino completo interrupción a `waker` a `poll`: qué dispara la interrupción del periférico y cómo reanuda eso la tarea correcta.
+5. Escribe un programa con `#[embassy_executor::main]` que lance dos tareas con `spawner.spawn`, cada una parpadeando un LED a distinto ritmo, y explica por qué corren de forma concurrente sin bloquearse.
+</Challenge>

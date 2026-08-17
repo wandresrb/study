@@ -1,0 +1,241 @@
+---
+title: "Desplazar en el vertex shader: la respuesta correcta"
+description: "Cómo inyectar un desplazamiento en un MeshStandardMaterial sin perder el PBR, la trampa de la clave de caché de programas, y las cuatro cosas que se rompen al deformar en la GPU."
+subject: three
+level: 12
+order: 4
+position: "12.4"
+duration: "20 min"
+---
+
+<Lead>
+El desplazamiento en el vertex shader convierte una deformación de miles de operaciones por frame en el hilo principal en una sola subida de un flotante. Es una diferencia de dos órdenes de magnitud y no tiene contrapartida en rendimiento. Lo que sí tiene son cuatro contrapartidas de corrección: el raycasting deja de acertar, el culling se equivoca, las sombras se quedan planas y las normales dejan de describir la superficie. Las tres primeras se tapan con una línea cada una; la cuarta merece lección propia.
+</Lead>
+
+<Goals>
+
+- Inyectar un desplazamiento en un material PBR con `onBeforeCompile`.
+- Evitar la trampa de la clave de caché de programas al capturar variables.
+- Usar `displacementMap` cuando el desplazamiento viene de una textura.
+- Reparar el culling y las sombras de una geometría desplazada en la GPU.
+
+</Goals>
+
+## Subir parámetros, no geometría
+
+El cambio de mentalidad es este: en lugar de calcular las cuarenta mil posiciones y enviarlas, envías **la función** una vez, en el momento de compilar el shader, y luego solo los parámetros que cambian. Un flotante por frame en lugar de medio megabyte.
+
+La ruta más directa es un `ShaderMaterial`, donde escribes el vertex shader entero:
+
+```js
+import * as THREE from 'three';
+
+const material = new THREE.ShaderMaterial( {
+  uniforms: {
+    uTiempo: { value: 0 },
+    uAmplitud: { value: 0.6 },
+    uColor: { value: new THREE.Color( 0x89b4fa ) }
+  },
+  vertexShader: `
+    uniform float uTiempo;
+    uniform float uAmplitud;
+    varying float vAltura;
+
+    void main() {
+      vec3 p = position;
+      p.y += sin( p.x * 0.6 + uTiempo ) * cos( p.z * 0.4 - uTiempo * 0.7 ) * uAmplitud;
+      vAltura = p.y;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4( p, 1.0 );
+    }
+  `,
+  fragmentShader: `
+    uniform vec3 uColor;
+    varying float vAltura;
+
+    void main() {
+      gl_FragColor = vec4( uColor * ( 0.6 + vAltura * 0.4 ), 1.0 );
+    }
+  `
+} );
+```
+
+Funciona, cuesta nada y **pierdes todo el PBR**: no hay luces, ni sombras, ni entorno, ni mapas. Para efectos abstractos es lo correcto; para algo que tiene que integrarse con la iluminación de la escena, no.
+
+## onBeforeCompile sin perder el PBR
+
+La alternativa es interceptar el shader que Three.js ya ha construido para un `MeshStandardMaterial` e inyectar el desplazamiento en el sitio adecuado. El método es `onBeforeCompile( shaderobject, renderer )`, se llama una vez al compilar el programa, y recibe un objeto con `vertexShader`, `fragmentShader` y `uniforms`.
+
+El punto de inyección es el fragmento `begin_vertex`, que es literalmente donde el shader estándar declara la variable de trabajo:
+
+```glsl
+// El contenido de #include <begin_vertex>
+vec3 transformed = vec3( position );
+```
+
+Todo lo que va después opera sobre `transformed`. Añadir código justo detrás basta:
+
+```js
+import * as THREE from 'three';
+
+const geometria = new THREE.PlaneGeometry( 10, 10, 200, 200 );
+geometria.rotateX( - Math.PI / 2 );
+
+const material = new THREE.MeshStandardMaterial( { color: 0x89b4fa, roughness: 0.35 } );
+
+material.onBeforeCompile = ( shader ) => {
+  shader.uniforms.uTiempo = { value: 0 };
+  shader.uniforms.uAmplitud = { value: 0.6 };
+
+  shader.vertexShader = shader.vertexShader
+    .replace( '#include <common>', `
+      #include <common>
+      uniform float uTiempo;
+      uniform float uAmplitud;
+
+      float altura( vec2 p ) {
+        return sin( p.x * 0.6 + uTiempo ) * cos( p.y * 0.4 - uTiempo * 0.7 ) * uAmplitud;
+      }
+    ` )
+    .replace( '#include <begin_vertex>', `
+      #include <begin_vertex>
+      transformed.y += altura( transformed.xz );
+    ` );
+
+  material.userData.shader = shader;   // para poder tocar los uniforms después
+};
+
+const malla = new THREE.Mesh( geometria, material );
+malla.frustumCulled = false;   // la esfera envolvente no sabe del desplazamiento
+scene.add( malla );
+
+const reloj = new THREE.Timer();
+reloj.connect( document );
+
+renderer.setAnimationLoop( ( tiempo ) => {
+  reloj.update( tiempo );
+  const s = material.userData.shader;
+  if ( s ) s.uniforms.uTiempo.value = reloj.getElapsed();
+  renderer.render( scene, camera );
+} );
+```
+
+Con esto tienes el desplazamiento **y** toda la iluminación física, los mapas, el entorno y las sombras del material estándar. El coste por frame es una escritura en un objeto.
+
+El guardado en `userData` es necesario porque `onBeforeCompile` se llama una sola vez y los uniforms añadidos allí solo son accesibles a través de ese objeto. Hay una variante que evita la comprobación de nulidad: como `shader.uniforms` es el mismo objeto del que el renderer sube los valores, puedes asignar ahí un objeto de uniform que ya tenías declarado fuera y mutarlo directamente.
+
+**Y ahora la trampa.** Three.js cachea los programas de shader compilados, y la clave de caché para un material con `onBeforeCompile` es, por defecto, esto:
+
+```js
+customProgramCacheKey() {
+  return this.onBeforeCompile.toString();
+}
+```
+
+El **texto fuente de la función**. Eso significa que dos materiales cuyo `onBeforeCompile` tenga el mismo código fuente comparten programa compilado, aunque las variables que capturan sean distintas. Si tu función inyecta código diferente según una variable capturada del entorno, los dos materiales acabarán usando el shader del primero que se compiló, y el fallo es completamente desconcertante porque el código parece correcto.
+
+```js
+// PELIGRO: mismo texto fuente, comportamiento distinto según `modo`.
+function parche( modo ) {
+  return ( shader ) => {
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <begin_vertex>',
+      `#include <begin_vertex>
+       transformed.y += ${ modo === 'alto' ? '2.0' : '0.5' };`
+    );
+  };
+}
+
+materialA.onBeforeCompile = parche( 'alto' );
+materialB.onBeforeCompile = parche( 'bajo' );
+// Los dos comparten programa. Uno de los dos está mal.
+```
+
+La solución es sobrescribir la clave para que refleje lo que de verdad distingue los programas:
+
+```js
+materialA.customProgramCacheKey = () => 'onda-alto';
+materialB.customProgramCacheKey = () => 'onda-bajo';
+```
+
+Es una línea y evita una de las depuraciones más ingratas del ecosistema.
+
+## displacementMap: la ruta integrada
+
+Si el desplazamiento viene de una textura y no de una fórmula, no hace falta parchear nada: los materiales estándar ya lo traen.
+
+```js
+const material = new THREE.MeshStandardMaterial( {
+  map: colorMap,
+  displacementMap: alturaMap,
+  displacementScale: 1.5,
+  displacementBias: - 0.75
+} );
+```
+
+Lee el canal rojo de la textura y desplaza cada vértice **a lo largo de su normal** una cantidad `valor · displacementScale + displacementBias`. El sesgo sirve para centrar: con una textura de alturas donde el gris medio es el nivel cero, `displacementBias` a la mitad negativa de la escala reparte el desplazamiento hacia arriba y hacia abajo.
+
+Dos cosas hay que saber. La primera es la más incumplida: **el desplazamiento actúa sobre vértices, no sobre fragmentos**, así que una textura de alturas de dos mil por dos mil aplicada a un plano de dos triángulos no hace absolutamente nada visible. Necesitas tantos vértices como detalle quieras, y ahí es donde los segmentos de la geometría sí importan.
+
+La segunda es que **tampoco recalcula las normales**. `displacementMap` desplaza y ya está; para que la iluminación responda hace falta además un `normalMap` coherente, que es exactamente el motivo de que ambos mapas se generen juntos en cualquier cadena de horneado.
+
+## Lo que se rompe y cómo taparlo
+
+Cuatro cosas dejan de funcionar cuando la deformación vive en la GPU. Tres tienen arreglo directo.
+
+**El culling.** El volumen envolvente describe la geometría sin desplazar. Si el shader mueve vértices hacia fuera, el objeto puede desaparecer al acercarse al borde de la pantalla. Dos salidas:
+
+```js
+// Opción A: apagarlo. Cuesta una llamada de dibujo por frame.
+malla.frustumCulled = false;
+
+// Opción B: ampliar el volumen con el desplazamiento máximo.
+geometria.computeBoundingSphere();
+geometria.boundingSphere.radius += DESPLAZAMIENTO_MAXIMO;
+```
+
+Para un objeto grande y único, la opción A. Para muchos objetos repartidos, la B, con el número escrito en la misma constante que usa el shader para que no se descoordinen.
+
+**El raycasting.** El rayo intersecta la geometría de reposo. No hay arreglo barato: hay que evaluar la misma función de desplazamiento en JavaScript para el punto que te interese. Es la duplicación deliberada de la que hablábamos, y es tolerable porque en la CPU solo evalúas la función en unos pocos puntos por frame, no en cuarenta mil.
+
+```js
+// La misma fórmula que el shader, en JavaScript, para los pocos puntos que hagan falta.
+function alturaCPU( x, z, t, amplitud ) {
+  return Math.sin( x * 0.6 + t ) * Math.cos( z * 0.4 - t * 0.7 ) * amplitud;
+}
+```
+
+**Las sombras.** La pasada de sombra usa un material de profundidad distinto, que no lleva tu parche, así que la sombra proyectada es la de la geometría plana. La solución es dar a la malla un material de profundidad propio con el mismo desplazamiento:
+
+```js
+const materialProfundidad = new THREE.MeshDepthMaterial( {
+  depthPacking: THREE.RGBADepthPacking
+} );
+materialProfundidad.onBeforeCompile = material.onBeforeCompile;
+materialProfundidad.customProgramCacheKey = () => 'onda-profundidad';
+
+malla.customDepthMaterial = materialProfundidad;
+```
+
+Los uniforms hay que actualizarlos también en ese material, así que en la práctica conviene compartir los objetos de uniform entre los dos en lugar de crearlos por separado.
+
+**Las normales.** Esta es la que no se tapa con una línea, porque desplazar las posiciones invalida las perpendiculares y no hay ninguna propiedad que lo arregle. Es el tema de la siguiente lección.
+
+<Callout type="dios" title="onBeforeCompile es una API de parcheo de cadenas, y eso tiene consecuencias que conviene aceptar">
+Merece la pena ser honesto sobre lo que es `onBeforeCompile`: **es sustituir texto en un fuente de GLSL generado por otro**. No hay tipos, no hay contrato, no hay verificación. Si Three.js renombra un fragmento entre versiones, tu `replace` deja de encontrar la cadena, **no lanza ningún error** y el shader se compila sin tu código. El efecto simplemente desaparece, y la única pista es que la escena se ve plana. He visto actualizaciones de versión que rompen media docena de efectos exactamente así. La defensa mínima cuesta tres líneas y casi nadie las escribe: comprobar que la sustitución ha ocurrido de verdad.
+
+```js
+const antes = shader.vertexShader;
+shader.vertexShader = antes.replace( '#include <begin_vertex>', '...' );
+if ( shader.vertexShader === antes ) console.error( 'El parche no encontró el punto de inyección' );
+```
+
+Y en el horizonte está la respuesta estructural, que es la razón por la que r184 empuja hacia el sistema de nodos. TSL no parchea cadenas: construye un grafo tipado que se compila a GLSL o a WGSL según el renderer, y sustituir el desplazamiento de un `MeshStandardNodeMaterial` es asignar a `material.positionNode` en lugar de buscar una cadena mágica. Eso convierte un parche frágil en una composición verificable, elimina el problema de la clave de caché —porque el grafo es la clave— y funciona igual en WebGL y en WebGPU. Mientras tanto, `onBeforeCompile` sigue siendo la herramienta con la que está escrito el noventa por ciento del código que hay ahí fuera, y por eso hay que conocerla y hay que protegerla con comprobaciones.
+</Callout>
+
+<Challenge title="Desplaza en la GPU">
+1. Monta la ola con `onBeforeCompile` y compara el tiempo de CPU con la versión del bucle en JavaScript.
+2. Quita `frustumCulled = false` y encuentra el ángulo de cámara donde la malla desaparece.
+3. Crea dos materiales con el mismo `onBeforeCompile` y distinta variable capturada, y observa el fallo de caché.
+4. Añade el `customDepthMaterial` y verifica que la sombra sigue la deformación.
+5. Rompe deliberadamente la cadena del `replace` y comprueba que no salta ningún error.
+</Challenge>

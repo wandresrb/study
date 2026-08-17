@@ -1,0 +1,165 @@
+---
+title: "io_uring en la red: por qué puede batir a epoll"
+description: "`epoll` te avisa de que un socket está listo y luego haces tú el `recv`; `io_uring` hace el `accept`, `recv`, `send` o `connect` y te avisa de que ya están hechos. El modelo de completado, combinado con búferes proporcionados, multishot y envío zero-copy, es lo que permite a un servidor de red superar al reactor de readiness que definió veinticinco años de Unix."
+subject: kernel
+level: 41
+order: 4
+position: "41.4"
+duration: "19 min"
+---
+
+<Lead>
+`epoll` respondió durante una década a una pregunta: ¿qué descriptores están listos? Pero *listo* es una promesa sobre el futuro —para cuando actúas puede haber cambiado— y aun así pagas una syscall por cada socket para hacer el trabajo. `io_uring` responde a otra pregunta: ¿qué operaciones terminaron? Eso es un hecho del pasado, accionable sin una sola syscall más. En la red esa diferencia, sumada a búferes proporcionados, multishot y zero-copy, es lo que hace que los servidores de mayor rendimiento de 2026 abandonen el modelo que definió la programación de red en Unix.
+</Lead>
+
+<Goals>
+
+- Contrastar el modelo de *readiness* de `epoll` con el de *completado* de `io_uring`.
+- Aceptar y recibir con `multishot` y búferes proporcionados (`IOSQE_BUFFER_SELECT`).
+- Enviar sin copia con `IORING_OP_SEND_ZC` y su CQE de notificación.
+- Enumerar por qué supera a `epoll` a escala, y cuándo `epoll` sigue bastando.
+
+</Goals>
+
+## Del modelo de readiness al de completado
+
+Con `epoll` haces dos pasos: una syscall pregunta quién está listo, y luego, por cada descriptor listo, otra syscall hace el `recv`. El dato no está hasta el segundo paso.
+
+```c
+/* epoll: modelo de PREPARADO. Te avisa que el socket está listo; TÚ haces el recv */
+int n = epoll_wait(epfd, events, MAXEV, -1);      /* syscall 1: quién está listo */
+for (int i = 0; i < n; i++) {
+	int fd = events[i].data.fd;
+	ssize_t r = recv(fd, buf, len, 0);            /* syscall 2..N: una por socket listo */
+	/* ...procesar r bytes... */
+}
+```
+
+`io_uring` hace un solo paso: pides el `recv` y, cuando el CQE llega, el dato **ya está** en el búfer. El envío puede ir en lote (una syscall para muchas operaciones) o incluso sin syscall con SQPOLL (lección 2).
+
+```c
+/* io_uring: modelo de COMPLETADO. Pides el recv; te avisa cuando YA está hecho */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_recv(sqe, fd, buf, len, 0);
+io_uring_submit(&ring);
+
+struct io_uring_cqe *cqe;
+io_uring_wait_cqe(&ring, &cqe);
+ssize_t r = cqe->res;                             /* el dato ya está en buf, sin otra syscall */
+io_uring_cqe_seen(&ring, cqe);
+```
+
+Como el kernel realiza la operación, puede aplicar semánticas que en el modelo de readiness exigían tu bucle. Un `recv` con `MSG_WAITALL` no vuelve hasta llenar el búfer o cerrarse la conexión, ahorrándote el clásico ciclo de lecturas parciales:
+
+```c
+/* recv que no retorna hasta reunir len bytes: el kernel gestiona las lecturas parciales */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_recv(sqe, fd, buf, len, MSG_WAITALL);
+io_uring_submit(&ring);
+```
+
+Las cuatro operaciones de socket tienen su forma: `io_uring_prep_accept`, `io_uring_prep_recv`, `io_uring_prep_send` e `io_uring_prep_connect`. Un cliente puede encadenar `connect` y `send` con `IOSQE_IO_LINK` (lección 3) y establecer la conexión y mandar la primera petición en un único envío.
+
+```c
+/* Cliente: connect encadenado con send; conexión y primera petición en un solo envío */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_connect(sqe, sock, (struct sockaddr *)&addr, sizeof(addr));
+sqe->flags |= IOSQE_IO_LINK;                      /* el send espera a que el connect complete */
+
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_send(sqe, sock, req, req_len, 0);
+io_uring_submit(&ring);                           /* handshake y petición sin round-trip extra */
+```
+
+## Un servidor multishot con búferes proporcionados
+
+El modelo de completado tiene un coste latente: si comprometes un búfer a cada `recv` pendiente, un millón de conexiones ociosas gasta un millón de búferes. Los **búferes proporcionados** lo resuelven: publicas un anillo de búferes libres y el kernel elige uno **cuando el dato llega**, no antes.
+
+```c
+/* Anillo de búferes proporcionados: el kernel toma uno libre al llegar el dato */
+struct io_uring_buf_ring *br;
+int ret;
+br = io_uring_setup_buf_ring(&ring, NBUFS, /*bgid=*/1, 0, &ret);
+for (int i = 0; i < NBUFS; i++)
+	io_uring_buf_ring_add(br, bufs[i], BUF_SIZE, /*bid=*/i,
+	                      io_uring_buf_ring_mask(NBUFS), i);
+io_uring_buf_ring_advance(br, NBUFS);            /* publica los NBUFS búferes al grupo 1 */
+```
+
+```c
+/* recv multishot: una sqe recibe muchos mensajes; el kernel saca búferes del grupo 1 */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_recv_multishot(sqe, conn_fd, NULL, 0, 0);
+sqe->flags     |= IOSQE_BUFFER_SELECT;
+sqe->buf_group  = 1;
+io_uring_submit(&ring);
+
+/* en cada CQE, el id del búfer usado viaja en cqe->flags */
+int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;  /* qué búfer trae este mensaje */
+/* ...procesar y luego devolver el búfer al anillo con io_uring_buf_ring_add... */
+```
+
+Así, un búfer no se ata a una conexión hasta que de verdad hay bytes: un millón de conexiones ociosas cuesta cero memoria de datos. Es la pieza que hace viable el C10M —diez millones de conexiones— sobre el modelo de completado. Tras procesar cada mensaje devuelves su búfer al anillo para que vuelva al pool:
+
+```c
+/* Reciclar el búfer bid de vuelta al grupo, disponible para el siguiente recv */
+io_uring_buf_ring_add(br, bufs[bid], BUF_SIZE, bid, io_uring_buf_ring_mask(NBUFS), 0);
+io_uring_buf_ring_advance(br, 1);
+```
+
+El riesgo a vigilar es agotar el pool: si llegan más mensajes que búferes libres, el `recv` multishot recibe `-ENOBUFS`, pierde su `IORING_CQE_F_MORE` y hay que rearmarlo tras reponer búferes. Dimensionar el anillo y reciclar rápido es parte del diseño.
+
+## Envío zero-copy
+
+Para cargas grandes, copiar el búfer del usuario al del socket es puro desperdicio. `io_uring_prep_send_zc` (opcode `IORING_OP_SEND_ZC`) envía **desde tu búfer** fijando sus páginas, sin la copia intermedia.
+
+```c
+/* send_zc: la NIC transmite desde tu búfer sin copiarlo al socket; ideal para payloads grandes */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_send_zc(sqe, fd, buf, len, 0, 0);
+io_uring_submit(&ring);
+/* Llegan DOS CQE: el resultado del envío, y otro con IORING_CQE_F_NOTIF avisando */
+/* de que el búfer ya se puede reutilizar (sus páginas dejaron de estar en vuelo en la NIC) */
+```
+
+El CQE de notificación desacopla dos hechos que la copia fundía en uno: *enviado* y *seguro reutilizar el búfer*. Para payloads pequeños el coste de fijar páginas no compensa y el envío normal gana; zero-copy brilla con búferes grandes. Su variante `io_uring_prep_sendmsg_zc` acepta un `msghdr` con vectores dispersos, ideal para juntar cabecera y cuerpo sin copiarlos a un búfer contiguo; y combinado con búferes registrados (lección 1), el kernel se ahorra incluso el paso de fijar páginas, porque ya están ancladas.
+
+<Mermaid code={`flowchart LR
+  subgraph epoll_readiness
+    E1[epoll_wait dice listo] --> E2[recv por cada fd] --> E3[procesar]
+  end
+  subgraph io_uring_completado
+    U1[prep recv en lote] --> U2[CQE con el dato ya dentro] --> U3[procesar]
+  end`} />
+
+## Por qué supera a epoll, y cuándo no
+
+<Cards>
+  <Card icon="⚡" title="Menos syscalls">
+    La operación se pliega en el completado; los envíos van en lote y, con SQPOLL, a cero syscalls. `epoll` paga siempre el segundo paso por descriptor.
+  </Card>
+  <Card icon="🧩" title="Composición">
+    Multishot accept y recv, búferes proporcionados, enlaces y descriptores fijos montan un pipeline de conexión con casi ninguna syscall por cliente.
+  </Card>
+  <Card icon="🔀" title="Disco y red unificados">
+    Un mismo anillo mezcla E/S de archivo y de socket. Un proxy que lee disco y escribe red usa un solo modelo; `epoll` nunca supo de archivos.
+  </Card>
+</Cards>
+
+`epoll`, sin embargo, sigue siendo la elección sensata para conteos de conexión modestos, aplicaciones simples y portabilidad: está en todo Linux desde hace décadas, no depende de una versión reciente y no lo desactiva ningún administrador por seguridad (lección 5). La ventaja de `io_uring` crece con la escala y con las cargas que mezclan almacenamiento y red; por debajo de cierto umbral, la complejidad extra no se paga.
+
+<Callout type="info" title="Busy polling de red con NAPI, integrado en el anillo">
+Para latencia de recepción extrema, los kernels 7.x integran el busy-polling de NAPI en `io_uring` vía `io_uring_register_napi`: mientras espera completados, el anillo sondea directamente la cola de la NIC en vez de dormir hasta la interrupción, recortando microsegundos a costa de CPU. Es el equivalente en red del `IORING_SETUP_IOPOLL` de almacenamiento (lección 2), y otra pieza que `epoll` no ofrece de forma nativa.
+</Callout>
+
+<Callout type="dios" title="Readiness es una promesa sobre el futuro; completado es un hecho del pasado">
+Aquí está la revelación que reordena veinticinco años de programación de red en Unix. `select`, `poll` y `epoll` construyeron toda una era sobre la pregunta *¿qué descriptores están listos?*. Pero la disponibilidad es una afirmación sobre el porvenir, y el porvenir miente: entre que `epoll_wait` te dice *listo* y que tú llamas al `recv`, el mundo pudo cambiar —el par cerró, otro hilo consumió el dato— y, en el mejor caso, todavía debes gastar una syscall por descriptor para convertir esa promesa en trabajo hecho. `io_uring` cambia el verbo y con él la filosofía: no pregunta qué está listo, informa de qué **terminó**. Un completado no es una predicción, es un hecho consumado sobre el pasado, y sobre un hecho no hace falta actuar de nuevo: el dato ya está en tu búfer. De ese giro brota todo lo demás. Como el kernel realiza la operación en vez de solo señalar disponibilidad, puede elegir el búfer en el último instante (proporcionados), repetir la operación sin ti (multishot), encadenar el siguiente paso en el núcleo (enlaces) y unificar bajo un mismo modelo el disco y la red —algo que `epoll` jamás pudo, porque un archivo regular *siempre* está listo y la pregunta de readiness no significa nada para él—. El servidor deja de ser un reactor que se despierta a preguntar y actuar, y se vuelve un pipeline por el que el trabajo fluye. No es que `io_uring` haga `epoll` más rápido: hace obsoleta la pregunta que `epoll` respondía. Entender eso es entender por qué el futuro de los servidores de red no es un `epoll` mejor afinado, sino otro modelo de mundo.
+</Callout>
+
+<Challenge title="Cambia readiness por completado">
+1. Escribe un eco TCP con `epoll` de disparo por flanco y cuenta las syscalls por conexión con `strace -c`.
+2. Reescríbelo con `multishot_accept` más `recv` de un solo disparo y compara el recuento de syscalls.
+3. Añade un anillo de búferes proporcionados y `recv` multishot con `IOSQE_BUFFER_SELECT`; verifica que las conexiones ociosas no consumen búfer de datos.
+4. Sustituye el `send` por `send_zc` con un payload grande y observa los dos CQE, incluido el de `IORING_CQE_F_NOTIF`.
+5. Argumenta en qué escala y qué tipo de carga hacen que `io_uring` bata a `epoll`, y en cuáles `epoll` sigue siendo la elección correcta.
+</Challenge>

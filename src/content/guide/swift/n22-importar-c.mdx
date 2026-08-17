@@ -1,0 +1,154 @@
+---
+title: "Importar C: cuando una cabecera se vuelve un módulo"
+description: "Swift no envuelve C: lo importa. El importador de Clang lee una cabecera y sintetiza una API Swift con reglas deterministas. Mapeo de tipos escalares, punteros, structs, enumeraciones y punteros a función; la disciplina de vida de la memoria prestada; y cómo declarar una librería del sistema con un `module.modulemap`."
+subject: swift
+level: 22
+order: 1
+position: "22.1"
+duration: "20 min"
+---
+
+<Lead>
+La interoperabilidad con C no es una biblioteca ni un puente en tiempo de ejecución: es una parte del compilador. Swift incorpora Clang entero, y cuando escribes `import CJson` lo que ocurre es que Clang analiza las cabeceras de esa librería, construye su árbol de declaraciones y un componente llamado importador traduce cada declaración a una declaración Swift equivalente, en memoria, sin generar una sola línea de código intermedio. No hay envoltorio, no hay marshalling, no hay coste en ejecución: una función C importada se llama con exactamente la misma instrucción de máquina que emitiría un compilador de C. Lo que sí hay es una traducción de reglas, y esas reglas —qué tipo Swift corresponde a cada tipo C, qué se vuelve opcional, qué se vuelve tupla, qué desaparece— son el objeto de esta lección.
+</Lead>
+
+<Goals>
+
+- Explicar el papel del importador de Clang y por qué la interoperabilidad con C es de coste cero.
+- Traducir escalares, punteros, structs, enumeraciones y punteros a función entre ambos lenguajes.
+- Aplicar la disciplina de vida de los punteros prestados que Swift entrega a una API en C.
+- Declarar una librería del sistema mediante un `module.modulemap` y un objetivo de SwiftPM.
+
+</Goals>
+
+## El importador de Clang
+
+El importador no ve archivos, ve **módulos**. Un módulo Clang es un conjunto de cabeceras declarado en un archivo `module.modulemap`, y esa unidad es lo que Swift sabe importar. Cuando una librería no trae mapa de módulo —el caso habitual en C clásico— eres tú quien debe escribirlo. Dentro de un proyecto de Xcode con Objective-C el papel lo cumple el `bridging header`, que veremos en la tercera lección; en SwiftPM el mecanismo canónico es el mapa.
+
+La traducción es puramente sintáctica y sucede una vez por compilación. Toma esta cabecera:
+
+```c
+// incluye/geo.h
+typedef struct { double x, y; } Punto;
+typedef struct Region Region;              // tipo opaco: definicion oculta
+
+Region *region_crear(const char *nombre);
+void    region_liberar(Region *r);
+double  region_area(const Region *r, const Punto *vertices, size_t n);
+```
+
+El importador produce, sin que nadie escriba nada, una API Swift razonable: `Punto` se convierte en un struct Swift con inicializador por miembros y con inicializador de ceros, `Region` en un `OpaquePointer` porque su definición no es visible, y las tres funciones en funciones libres de nivel de módulo. La conversión conserva los nombres tal cual: C no tiene espacios de nombres, así que el módulo importado es un saco plano de símbolos.
+
+<Callout type="info" title="Qué se queda fuera">
+El importador ignora lo que no puede representar: macros con cuerpo arbitrario, funciones variádicas de estilo C —salvo las que se declaran con `va_list`, que llegan como `CVaListPointer`—, campos de bits y uniones con semántica de solapamiento. Las macros de constante simples sí sobreviven, y una macro que define un entero o una cadena literal aparece como una constante Swift del tipo inferido.
+</Callout>
+
+## El mapa de correspondencias
+
+La tabla siguiente cubre casi todo lo que encontrarás. La columna de la derecha es lo que verás en la ayuda rápida de Xcode al inspeccionar el símbolo importado.
+
+| Declaración en C | Tipo Swift importado |
+| --- | --- |
+| `int`, `unsigned int` | `Int32`, `UInt32` |
+| `long`, `size_t` | `Int`, `Int` en plataformas LP64 |
+| `char` | `CChar`, que es `Int8` |
+| `float`, `double` | `Float`, `Double` |
+| `bool` de `stdbool.h` | `Bool` |
+| `const T *` | `UnsafePointer<T>?` |
+| `T *` | `UnsafeMutablePointer<T>?` |
+| `void *` | `UnsafeMutableRawPointer?` |
+| `struct Opaco *` sin definición | `OpaquePointer?` |
+| `struct` con definición visible | `struct` con inicializador por miembros |
+| `T campo[8]` | tupla homogénea de ocho elementos |
+| `T (*f)(A)` | `@convention(c) (A) -> T` opcional |
+
+Dos entradas merecen comentario. La primera son los **opcionales**: todo puntero llega opcional porque en C cualquier puntero puede ser nulo y el importador no tiene forma de saberlo. Las macros de anotación de nulabilidad, `_Nonnull` y `_Nullable`, existen justamente para corregirlo; una cabecera bien anotada produce una API Swift mucho más limpia, y por eso conviene envolver las declaraciones entre `NS_ASSUME_NONNULL_BEGIN` y su cierre cuando la librería es tuya.
+
+La segunda son los **arrays de tamaño fijo**, que se convierten en tuplas. Un campo declarado como sesenta y cuatro caracteres llega a Swift como una tupla de sesenta y cuatro elementos, imposible de indexar con un entero. La salida idiomática es tomar el puntero al campo y reinterpretarlo:
+
+```swift
+var cfg = Config()                       // inicializador de ceros sintetizado
+let nombre = withUnsafeBytes(of: &cfg.nombre) { crudo in
+    String(cString: crudo.bindMemory(to: CChar.self).baseAddress!)
+}
+```
+
+Las enumeraciones tienen dos destinos según cómo se declaren. Una enumeración marcada con `NS_ENUM` o con `__attribute__((enum_extensibility(closed)))` llega como un `enum` Swift auténtico, con exhaustividad en el `switch`. Una enumeración C corriente llega como un struct que conforma a `RawRepresentable` con constantes estáticas, porque el importador no puede prometer que el conjunto de casos esté cerrado: en C nada impide almacenar un valor fuera de rango en una variable del tipo enumerado, y construir un `enum` Swift sobre esa premisa sería un comportamiento indefinido esperando su turno.
+
+## Memoria prestada
+
+El punto donde más gente tropieza no es el mapeo de tipos, sino la **vida** de los punteros. Swift ofrece conversiones implícitas muy cómodas al llamar a una función importada: un `Array` se pasa donde se espera un puntero a su elemento, un `String` se pasa donde se espera un puntero a `CChar`, y una variable pasada con `&` se convierte en puntero a sí misma. La comodidad esconde una regla dura: **esos punteros solo son válidos durante la llamada**.
+
+```swift
+let puntos = [Punto(x: 0, y: 0), Punto(x: 1, y: 0), Punto(x: 0, y: 1)]
+let area = region_area(r, puntos, puntos.count)   // valido: dura la llamada
+
+let colgante = puntos.withUnsafeBufferPointer { $0.baseAddress }
+// colgante ya no apunta a nada garantizado: el prestamo termino
+```
+
+La segunda línea compila sin una queja y es memoria corrompida en potencia. La razón es que Swift no promete dónde vive el almacenamiento de un array ni durante cuánto tiempo; solo promete que, mientras dura la llamada donde se hizo la conversión, hay un buffer contiguo y estable en esa dirección. Si la librería en C guarda el puntero para usarlo más tarde, la conversión implícita es la herramienta equivocada y necesitas memoria que tú controles con `UnsafeMutablePointer.allocate` y su `deallocate` correspondiente.
+
+<Callout type="warn" title="Las tres reglas del préstamo">
+Primera: un puntero obtenido dentro de un cierre `withUnsafe...` muere al salir del cierre. Segunda: pasar un `String` donde se espera `const char *` crea una copia con terminador nulo cuya vida termina con la llamada; si la API lo retiene, usa `strdup` y libera tú. Tercera: nunca devuelvas desde el cierre el puntero, ni lo asignes a una variable externa, ni lo captures en una tarea asíncrona.
+</Callout>
+
+## Declarar una librería del sistema
+
+Para consumir una librería instalada en el sistema desde SwiftPM necesitas dos piezas. La primera es el mapa de módulo, que le dice a Clang qué cabecera constituye el módulo y con qué librería enlazar:
+
+```c
+module CZstd [system] {
+    header "shim.h"
+    link "zstd"
+    export *
+}
+```
+
+El atributo `[system]` es más importante de lo que parece: silencia los avisos de esas cabeceras, que de otro modo inundarían tu compilación con advertencias de código que no controlas. La cabecera `shim.h` suele ser un archivo de una línea que incluye la cabecera real; ese rodeo permite fijar la ruta sin depender de dónde la haya instalado cada máquina. La segunda pieza es el objetivo en el manifiesto:
+
+```swift
+.systemLibrary(
+    name: "CZstd",
+    path: "Fuentes/CZstd",
+    pkgConfig: "libzstd",
+    providers: [.brew(["zstd"]), .apt(["libzstd-dev"])]
+)
+```
+
+El campo `pkgConfig` es el que hace el trabajo real: SwiftPM consulta `pkg-config` para obtener las rutas de inclusión y las banderas de enlace de la máquina donde se compila. Los `providers` no instalan nada, solo mejoran el mensaje de error cuando la librería falta.
+
+<Mermaid code={`flowchart TB
+  H[Cabeceras en C] --> MM[module.modulemap]
+  MM --> CL[Clang construye el modulo]
+  CL --> IMP[Importador de Swift]
+  IMP --> API[Declaraciones Swift en memoria]
+  API --> SC[Tu codigo llama sin envoltorio]
+  SC --> OBJ[Mismo codigo maquina que en C]
+  class MM t-yellow
+  class IMP t-mauve
+  class OBJ t-green`} />
+
+<Cards>
+  <Card icon="🧭" title="Sin espacio de nombres">
+    C aporta un saco plano de símbolos globales. Si dos módulos importados declaran el mismo nombre, el conflicto es real y se resuelve renombrando en la cabecera, no en Swift.
+  </Card>
+  <Card icon="🕳️" title="Opcional por defecto">
+    Todo puntero llega opcional porque C no distingue el puntero que nunca es nulo. Las anotaciones de nulabilidad son la única forma de recuperar esa información.
+  </Card>
+  <Card icon="📐" title="Tamaños de plataforma">
+    `long`, `size_t` y los enteros de la librería estándar cambian de anchura entre plataformas. Escribe siempre contra el alias importado, nunca contra el entero que suponías.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Importar es traducir un contrato, no ejecutar una conversión">
+Merece la pena detenerse en lo que hace único a este mecanismo, porque casi ningún otro lenguaje moderno funciona así. La ruta habitual para hablar con C es una interfaz de funciones foráneas: declaras a mano la firma de cada función, un runtime empaqueta los argumentos en el momento de la llamada, y pagas una conversión por invocación. Swift no hace nada de eso. Al incorporar Clang dentro del compilador, la frontera deja de ser un evento de ejecución y se convierte en un **acto de traducción en tiempo de compilación**: el importador no genera adaptadores, reinterpreta el contrato que la cabecera ya expresaba usando el vocabulario del sistema de tipos de Swift. Por eso una llamada importada compila a la misma instrucción que en C, y por eso el trabajo difícil se traslada íntegro al plano del significado. El importador debe decidir si un puntero puede ser nulo sin que la cabecera lo diga, si una enumeración está cerrada sin que nadie lo garantice, si `long` mide cuatro u ocho bytes en la plataforma de destino. Cada una de esas decisiones es una apuesta epistémica sobre información que C simplemente no codifica, y cuando la información falta el importador elige siempre la opción conservadora: opcional en vez de no opcional, struct en vez de `enum`, `Unsafe` en el nombre del tipo. Ahí está la lección profunda de todo este nivel: la interoperabilidad no es un problema de llamadas, es un problema de **garantías**. C promete muy poco y Swift promete mucho, de modo que cada símbolo que cruza la frontera llega con menos garantías de las que el resto de tu programa da por sentadas. Las anotaciones de nulabilidad, los atributos de extensibilidad y los mapas de módulo no son burocracia: son el vocabulario con el que le devuelves al compilador la información que el lenguaje de origen perdió. Y cada anotación que añades convierte una comprobación que hacías mentalmente en una que hace la máquina.
+</Callout>
+
+<Challenge title="Cruza la frontera a mano">
+1. Escribe una cabecera con un struct, un tipo opaco y una función que reciba un array con su longitud; impórtala en un paquete SwiftPM y observa la firma que produce el importador.
+2. Añade `NS_ASSUME_NONNULL_BEGIN` a esa cabecera y compara las firmas antes y después: cuenta cuántos opcionales desaparecen.
+3. Declara una enumeración de dos formas, con `NS_ENUM` y sin ella, y comprueba en qué caso el `switch` exige un caso por defecto.
+4. Provoca deliberadamente un puntero colgante devolviendo `baseAddress` desde un `withUnsafeBufferPointer` y localiza el fallo con el desinfectante de direcciones.
+5. Empaqueta una librería del sistema de tu máquina con un `module.modulemap` y `pkgConfig`, y haz que compile en dos equipos con rutas de instalación distintas.
+</Challenge>

@@ -1,0 +1,156 @@
+---
+title: "Navegación en UIKit dirigida por el estado"
+description: "La regla del Nivel 16 no se relaja al bajar a UIKit: la navegación sigue siendo un dato del estado y nunca una consecuencia directa de un toque. Lo que cambia es que aquí hay que escribir el reconciliador a mano, o delegarlo en los ayudantes de la capa de UIKit. Esta lección construye el bucle que traduce `@Presents` y `StackState` en llamadas a `present` y `pushViewController`, muestra cómo evitar presentaciones duplicadas durante una animación, y se detiene en el problema decisivo del sentido inverso: los gestos que cierran una pantalla sin pasar por tu código y que hay que interceptar uno a uno para que el estado no mienta."
+subject: tca
+level: 27
+order: 4
+position: "27.4"
+duration: "22 min"
+---
+
+<Lead>
+UIKit guarda la navegación en sus propios objetos. La pila de una app vive dentro del array `viewControllers` de un `UINavigationController`, y qué hoja está presentada vive en una propiedad de un controlador. Eso significa que la verdad sobre dónde está el usuario reside en un lugar que no puedes construir en un test, ni serializar para restaurar una sesión, ni recibir desde un enlace profundo sin simular una secuencia de toques. Es, con diferencia, el peor sitio donde poner un dato importante, y es donde lleva estando desde 2008. Llevar esa información al `State` no es una excentricidad de TCA sino la reparación de un defecto estructural, y el precio a pagar es escribir el pequeño reconciliador que mantiene sincronizados el dato y los objetos. Esta lección lo escribe entero y después enseña a no escribirlo.
+</Lead>
+
+<Goals>
+
+- Traducir un estado de presentación opcional en llamadas idempotentes a `present` y `dismiss`.
+- Construir la pila de controladores a partir de un `StackState` y reconciliarla ante cada cambio.
+- Interceptar los cierres iniciados por el usuario y convertirlos en acciones para que el estado no diverja.
+- Sustituir el reconciliador manual por los ayudantes de presentación de la capa de UIKit, incluidas las alertas.
+
+</Goals>
+
+## Presentar como consecuencia del estado
+
+El modelado del dominio es idéntico al que ya conoces: un destino opcional anotado con `@Presents`, un `enum` de destinos si hay varios, y la acción del hijo enrutada hacia el padre. El controlador no toca nada de eso; lo único que hace es observar y reaccionar.
+
+```swift
+@Reducer
+struct Bandeja {
+  @ObservableState
+  struct State: Equatable {
+    @Presents var destino: Destino.State?
+    var mensajes: IdentifiedArrayOf<Mensaje> = []
+  }
+  enum Action {
+    case filaSeleccionada(id: Mensaje.ID)
+    case destino(PresentationAction<Destino.Action>)
+  }
+}
+```
+
+El reconciliador manual es un bloque de observación dedicado que compara lo que el estado dice con lo que hay presentado y aplica la diferencia. La clave está en llevar una referencia al controlador que presentaste, porque sin ella no puedes distinguir *no hay nada presentado* de *hay presentado algo que tú no pusiste*.
+
+```swift
+private weak var presentado: UIViewController?
+
+private func observarDestino() {
+  observe { [weak self] in
+    guard let self else { return }
+    switch (store.destino, presentado) {
+    case (.some, .none):
+      guard let hijo = store.scope(state: \.destino?.detalle, action: \.destino.detalle)
+      else { return }
+      let vc = DetalleViewController(store: hijo)
+      presentado = vc
+      present(vc, animated: true)
+    case (.none, .some(let vc)):
+      presentado = nil
+      vc.dismiss(animated: true)
+    default:
+      break
+    }
+  }
+}
+```
+
+Tres cosas merecen atención. La reconciliación es idempotente por construcción: si el estado dice que hay destino y ya hay uno presentado, no hace nada, y por eso las ejecuciones de más del bloque no producen dos hojas apiladas. La referencia se anula *antes* de pedir el cierre, para que una reejecución durante la animación no vuelva a entrar por la rama de cierre. Y el store del hijo se obtiene rebanando el del padre, con lo que el controlador presentado ignora por completo quién lo presentó: recibe su `StoreOf` y nada más, igual que una vista de fila en el Nivel 15.
+
+<Callout type="warn" title="Presentar durante una animación en curso es el fallo más frecuente">
+UIKit ignora en silencio un `present` emitido mientras otra presentación se está animando, y el estado se queda diciendo que hay una hoja abierta que nadie ve. Por eso la reconciliación debe consultar siempre el objeto realmente presentado y no una bandera propia, y por eso conviene desconfiar de cualquier lógica que dispare presentaciones desde varios sitios. Un destino, un reconciliador.
+</Callout>
+
+## El sentido inverso: quién avisa de que se cerró
+
+Aquí está la asimetría que hace difícil la navegación en UIKit y que casi nadie anticipa. La dirección estado a pantalla es una función que tú calculas y que por tanto controlas. La dirección pantalla a estado no lo es, porque UIKit le ofrece al usuario varias formas de cerrar una pantalla que no pasan por tu código: arrastrar una hoja hacia abajo, pulsar el botón de retroceso de la barra, hacer el gesto interactivo de vuelta desde el borde. Si no interceptas cada una de esas salidas, el controlador desaparece de la pantalla y el estado sigue afirmando que está ahí. A partir de ese instante, el modelo y lo que el usuario ve son dos relatos distintos, y todo lo que se apoye en el primero —efectos que siguen vivos, una acción que llega tarde, una restauración— se comporta de forma incomprensible.
+
+```swift
+extension BandejaViewController: UIAdaptivePresentationControllerDelegate {
+  func presentationControllerDidDismiss(_ controller: UIPresentationController) {
+    presentado = nil
+    store.send(.destino(.dismiss))
+  }
+}
+
+// Para el retroceso de una pila, en el controlador hijo
+override func didMove(toParent parent: UIViewController?) {
+  super.didMove(toParent: parent)
+  if parent == nil { store.send(.cerradoPorElUsuario) }
+}
+```
+
+Repara en que ese envío no es una excepción a la regla de que el manejador no decide: informar de que el usuario cerró la hoja es exactamente el tipo de hecho que debe entrar como acción. Lo que sería una violación es que el manejador pusiera `store.destino` a nulo por su cuenta, cosa que además no puede hacer porque el estado no es escribible desde fuera del reducer.
+
+## Pilas de controladores y `StackState`
+
+Una pila es el mismo problema con cardinalidad variable: en lugar de dos casos hay que comparar dos secuencias y aplicar el mínimo de operaciones. La capa de UIKit resuelve el caso general con un `NavigationStackController` que recibe el `scope` de la pila y una fábrica de controladores por caso, en simetría exacta con el `NavigationStack` de SwiftUI.
+
+```swift
+let controlador = NavigationStackController(
+  path: $store.scope(state: \.camino, action: \.camino)
+) {
+  RaizViewController(store: store)
+}
+
+// dentro de la raiz, para empujar un destino
+store.send(.detallePulsado(id: id))
+```
+
+La ganancia respecto al reconciliador manual no es solo de líneas. Un empujón manual exige decidir qué hacer cuando el estado añade dos elementos de golpe, cuando quita tres, o cuando reemplaza el camino entero por un enlace profundo; el ayudante ya resolvió esa comparación. Y para las alertas y los diálogos de confirmación existe un puente directo desde `AlertState`, de modo que el mismo valor que se afirma en un test construye el `UIAlertController` real.
+
+```swift
+present(item: $store.scope(state: \.alerta, action: \.alerta)) { estado in
+  UIAlertController(state: estado) { accion in
+    store.send(.alerta(.presented(accion)))
+  }
+}
+```
+
+<Cards>
+  <Card icon="🧭" title="El dato manda">
+    Un toque envía una acción; el reducer decide el destino; el controlador solo obedece al estado resultante.
+  </Card>
+  <Card icon="♻️" title="Reconciliar, no ejecutar">
+    El bloque compara lo que hay con lo que debería haber y aplica la diferencia. Repetirlo no puede hacer daño.
+  </Card>
+  <Card icon="🚪" title="Cierra todas las salidas">
+    Cada gesto que UIKit ofrece para cerrar sin tu permiso necesita un delegado que lo convierta en acción.
+  </Card>
+  <Card icon="🔗" title="Enlace profundo gratis">
+    Si la pila es un valor, abrir la app en la pantalla siete es construir ese valor. No hay secuencia que simular.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TD
+  A[Toque en una fila] --> S[store punto send accion]
+  S --> R[Reducer asigna el destino en el estado]
+  R --> O[Bloque de reconciliacion]
+  O --> P[present o pushViewController]
+  G[Gesto de cierre del usuario] --> D[Delegado de presentacion]
+  D --> S2[store punto send accion de cierre]
+  S2 --> R2[Reducer pone el destino a nulo]
+  R2 --> O
+  class O t-blue`} />
+
+<Callout type="dios" title="La navegación en UIKit es estado que se le regaló al framework, y recuperarlo es el mayor rendimiento de la migración">
+Hay una razón por la que llevar la navegación al modelo produce más beneficio en UIKit que en SwiftUI, y no es que UIKit sea peor: es que en UIKit el defecto lleva tanto tiempo normalizado que dejó de verse como defecto. Piensa en qué clase de dato es *dónde está el usuario*. Es un dato de negocio de primer orden: determina qué se le puede enseñar, qué peticiones tienen sentido, qué se restaura al volver, qué significa un enlace que llega desde fuera y qué hay que reproducir para entender un informe de fallo. Y sin embargo, durante quince años ese dato vivió dentro de un array propiedad de un objeto del sistema, accesible solo mediante mutaciones imperativas, imposible de construir sin instanciar controladores reales, imposible de comparar con otro salvo inspeccionando tipos, e imposible de escribir en un test sin arrancar la interfaz. Nada de eso se percibía como una pérdida porque no había alternativa a mano, del mismo modo que nadie echa de menos una herramienta que no existe. Al declarar `StackState` el dato vuelve a tu dominio, y con él vuelven todas las operaciones que se pueden hacer sobre valores: se puede construir un camino de cinco pantallas en una línea y afirmar que la app llega ahí; se puede recibir una URL y traducirla a un valor sin simular ni un solo toque; se puede guardar la posición al salir y restaurarla al entrar asignando un valor; se puede comprobar en un test que una acción del hijo hace que el padre se retire. El reconciliador que escribes a cambio parece un impuesto, y en realidad es la revelación del trabajo que UIKit venía haciendo por ti a cambio de quedarse con la verdad. Cuando lo escribes se ve, además, que ese trabajo tiene dos mitades muy distintas: una es una función total del estado a la pantalla, que es fácil, determinista y verificable; la otra es la intercepción de cada vía de escape que el framework le concede al usuario, que es aburrida, incompleta por naturaleza y la fuente de todos los fallos de la categoría. Esa segunda mitad es la definición operativa de lo que significa *divergencia*: cualquier camino por el que la pantalla puede cambiar sin que el estado se entere. Un sistema unidireccional no es el que evita la divergencia por magia, sino el que reduce las divergencias posibles a una lista finita y enumerable, corta, que puedes revisar una tarde y cerrar de una en una. Eso es todo lo que promete la arquitectura, y resulta ser exactamente lo que hacía falta.
+</Callout>
+
+<Challenge title="Recupera la navegación de una pantalla real">
+1. Toma un flujo tuyo de dos pantallas donde el empujón se dispare desde el manejador del toque y anota cuántos sitios llaman a `pushViewController`.
+2. Declara el destino en el `State` con `@Presents`, envía una acción desde el toque y deja que el reducer asigne el destino.
+3. Escribe el bloque de reconciliación con la referencia débil al controlador presentado y comprueba que ejecutar el bloque dos veces seguidas no duplica nada.
+4. Enumera todas las formas en que el usuario puede cerrar esa pantalla sin tocar tu código y añade un delegado para cada una. Verifica en el depurador que el estado vuelve a nulo en todas.
+5. Escribe un test que asigne el destino directamente en el estado inicial y afirme una acción del hijo, sin instanciar ningún controlador. Ese test es el rendimiento de todo el ejercicio.
+</Challenge>

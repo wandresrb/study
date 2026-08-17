@@ -1,0 +1,154 @@
+---
+title: "La travesía de la notificación: avisar sin inundar el canal"
+description: "Si la base vive en otro hilo, el aviso de cambio también cruza la frontera, y todo el diseño consiste en emitirlo al confirmar, agregarlo hasta que quepa en un mensaje pequeño y repartirlo entre pestañas sin multiplicar el trabajo."
+subject: local-first
+level: 15
+order: 4
+position: "15.4"
+duration: "18 min"
+---
+
+<Lead>
+El cambio se detecta dentro del Worker, donde vive el motor, y hay que consumirlo fuera, donde vive la interfaz. Entre ambos puntos está la misma frontera que el nivel 10 obligó a levantar, con su clonado, su cola y su coste por mensaje, solo que ahora la atraviesa un tráfico de naturaleza distinta: no peticiones que alguien pidió, sino avisos que nadie pidió y que se generan al ritmo de las escrituras. Una importación de diez mil filas puede disparar diez mil ganchos, y si cada uno se convierte en un mensaje habrás construido un mecanismo que ahoga precisamente el hilo que intentabas mantener fluido. Esta lección trata de cómo se recoge ese torrente, cómo se comprime hasta que cabe en un aviso pequeño y cómo se reparte entre todas las pestañas sin que el coste se multiplique por su número.
+</Lead>
+
+<Goals>
+
+- Recoger los cambios en el gancho de fila y emitir un único resumen al confirmar, nunca antes.
+- Acotar el tamaño del aviso con agregación y degradación, de modo que no dependa del volumen escrito.
+- Repartir el aviso entre pestañas con un canal de difusión y evitar que las ocultas trabajen.
+- Diseñar el protocolo con un número de versión para que perder un aviso sea recuperable y no fatal.
+
+</Goals>
+
+## Dónde nace el aviso y cuándo sale
+
+La materia prima está en los ganchos del motor. SQLite ofrece un gancho de actualización que se dispara **por cada fila** insertada, modificada o borrada, y ganchos separados para la confirmación y la reversión de la transacción. Esa separación no es un detalle de la API: es el eje del diseño. El gancho de fila se dispara mientras la transacción todavía puede deshacerse, así que emitir desde ahí significa anunciar hechos que quizá nunca ocurran, y un suscriptor que pinte uno de esos hechos y después vea cómo desaparece está mostrando una alucinación al usuario.
+
+La regla, por tanto, es acumular durante la transacción y emitir en la confirmación.
+
+```js
+// Dentro del worker de datos
+let pendiente = new Map();   // tabla -> conjunto de claves tocadas
+let version = 0;
+
+db.alCambiarFila((tabla, clave) => {         // se dispara por fila, dentro de la transaccion
+  if (!pendiente.has(tabla)) pendiente.set(tabla, new Set());
+  pendiente.get(tabla).add(clave);
+});
+
+db.alConfirmar(() => {
+  version++;
+  emitir(resumir(pendiente, version));       // un unico aviso por transaccion
+  pendiente = new Map();
+});
+
+db.alRevertir(() => {
+  pendiente = new Map();                     // nada de lo acumulado ocurrio jamas
+});
+```
+
+Fíjate en el gancho de reversión, que es la línea que se olvida y la que produce el peor fallo posible de este subsistema: una interfaz que muestra el resultado de una transacción abortada es indistinguible de una base de datos corrupta para quien la usa, y no hay ningún mensaje de error que lo delate.
+
+Queda una decisión sobre la frecuencia. Un aviso por transacción confirmada es lo correcto semánticamente, pero doscientas transacciones seguidas producen doscientos mensajes y doscientos clonados. La solución no es emitir menos hechos sino agrupar los avisos en una ventana temporal muy corta, fundiendo los resúmenes acumulados y quedándote con la versión más alta. Con una ventana del orden del fotograma se pierde una latencia que nadie percibe y se recorta el tráfico en un factor enorme durante las ráfagas.
+
+## Que el aviso sea pequeño y acotado
+
+El error clásico consiste en meter los datos dentro del aviso, y es tan tentador que casi todo el mundo lo comete: como el Worker ya tiene las filas que cambiaron, parece un ahorro mandarlas junto con la noticia y evitarle a la interfaz una consulta. No lo es. Ese aviso se clona una vez por destinatario, y con varias pestañas abiertas acabas copiando el mismo lote de filas cuatro o cinco veces para que la mayoría lo descarten porque no estaban mirando esa pantalla. **El aviso transporta el hecho, no el dato**: cada destinatario decide después si le importa y, solo entonces, pide lo que necesita.
+
+La segunda propiedad imprescindible es que su tamaño esté acotado con independencia de lo escrito. Un conjunto de claves por tabla funciona bien mientras la transacción toque pocas filas y se convierte en un problema en cuanto alguien importa un fichero. La técnica es degradar por umbral: por debajo de cierto número de claves se manda el detalle, y por encima se manda simplemente que esa tabla cambió por completo.
+
+```js
+const UMBRAL = 200;   // decision de diseno propia, calibrada con tus transacciones reales
+
+function resumir(pendiente, version) {
+  const tablas = {};
+  for (const [tabla, claves] of pendiente) {
+    tablas[tabla] = claves.size > UMBRAL
+      ? { todo: true }                        // degradacion: la tabla cambio, sin detalle
+      : { claves: [...claves] };
+  }
+  return { tipo: 'cambio', version, tablas };
+}
+```
+
+La degradación es una pérdida de precisión perfectamente aceptable porque cae del lado seguro: una tabla marcada entera provoca refrescos de más, que la comparación de resultados absorbe sin repintar nada. Lo que la degradación garantiza a cambio es que ninguna escritura, por grande que sea, pueda producir un mensaje desmesurado que bloquee el hilo receptor mientras se clona.
+
+<Callout type="tip" title="Devuelve el eco al que escribió, y devuélvelo pronto">
+Hay una asimetría que conviene explotar. El usuario que acaba de pulsar guardar espera ver el efecto de inmediato; los demás pueden esperar unas decenas de milisegundos sin que nadie lo note. Aprovecha que la respuesta de la escritura ya viaja hacia la pestaña que la originó y adjunta ahí mismo el resumen del cambio, en el propio mensaje de respuesta. Esa pestaña refresca sin esperar a ningún canal de difusión ni a ninguna ventana de agrupación, y el resto del reparto puede ser tan perezoso como quieras. Es una línea de código y elimina de golpe la percepción de retardo en el único sitio donde el usuario la estaba buscando.
+</Callout>
+
+## Del Worker a todas las pestañas
+
+Cómo se reparte el aviso depende de dónde viva el motor, y hay dos topologías con propiedades distintas. Si el escritor está en un `SharedWorker`, o en un Worker dedicado de la pestaña elegida líder mediante `Web Locks`, existe un único punto que conoce todos los cambios y el reparto es una difusión desde él. Si cada pestaña tiene su propio Worker y compiten por el fichero, el reparto tiene que ocurrir entre iguales.
+
+En ambos casos la herramienta es la misma: un canal de difusión por origen, al que cualquier contexto de la aplicación puede escribir y del que todos los demás leen. Dos detalles suyos importan aquí. El primero es que **no entrega al emisor**, lo cual encaja exactamente con el eco directo de la sección anterior y evita el doble refresco. El segundo es que su carga también se clona, una vez por destinatario, lo cual refuerza la regla de mantener el aviso pequeño.
+
+<Mermaid code={`sequenceDiagram
+  participant W as Worker de datos
+  participant P as Pestana que escribio
+  participant C as Canal de difusion
+  participant O as Otras pestanas
+  W->>W: acumula filas tocadas durante la transaccion
+  W->>P: al confirmar responde con el resumen y la version 42
+  P->>P: refresca de inmediato solo lo afectado
+  P->>C: difunde el mismo resumen
+  C->>O: entrega a cada contexto salvo al emisor
+  O->>O: las visibles refrescan y las ocultas se marcan sucias`} />
+
+La tormenta que hay que evitar tiene una forma concreta y es fácil de calcular: con cuatro pestañas abiertas y veinte consultas vivas en cada una, una escritura puede desencadenar ochenta reejecuciones. La mitigación más rentable no es ninguna sofisticación del filtrado, sino una observación sobre para qué sirve refrescar: **una pestaña que nadie está mirando no necesita estar al día, solo necesita saber que ha dejado de estarlo**. Marcarla sucia con la versión pendiente y refrescar al volverse visible recorta el trabajo en proporción directa al número de pestañas de fondo, que en un navegador real suelen ser casi todas.
+
+```js
+let versionVista = 0;
+let sucio = false;
+
+canal.onmessage = ({ data }) => {
+  if (data.version <= versionVista) return;            // idempotencia por version
+  if (document.visibilityState !== 'visible') {        // oculta: solo anotar
+    sucio = true;
+    return;
+  }
+  aplicar(data);
+};
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && sucio) {
+    refrescarTodo();                                   // barrido de reincorporacion
+    sucio = false;
+  }
+});
+```
+
+Conviene además coalescer en el receptor y no solo en el emisor. Si una pestaña estaba ocupada y le llegan siete avisos, aplicarlos uno a uno es hacer siete veces el trabajo para llegar al mismo sitio: fúndelos en un único resumen acumulado y aplícalo una vez. La regla general es que una notificación debe ser **idempotente y absorbible**, es decir, que aplicarla dos veces dé lo mismo que aplicarla una y que aplicar el resumen de varias dé lo mismo que aplicarlas en secuencia.
+
+## El protocolo mínimo que sobrevive
+
+<Cards>
+  <Card icon="🔢" title="Versión monótona">
+    Un entero que crece con cada confirmación. Permite descartar duplicados, detectar huecos y responder sin consultar si una proyección está al día. Es la pieza que hace barato todo lo demás.
+  </Card>
+  <Card icon="📉" title="Resumen degradable">
+    Claves cuando son pocas, tabla entera cuando son muchas. El tamaño del mensaje deja de depender del tamaño de la escritura, que es la única forma de que las ráfagas no bloqueen a nadie.
+  </Card>
+  <Card icon="👁️" title="Sensible a la visibilidad">
+    Las pestañas ocultas anotan y no trabajan. Es la mitigación con mejor relación entre esfuerzo y ahorro de todo el subsistema, y no requiere tocar el filtrado.
+  </Card>
+  <Card icon="🩹" title="Recuperación por hueco">
+    Si la versión recibida no es la siguiente a la conocida, algo se perdió. La respuesta correcta no es investigar: es refrescar todo y seguir. Barato, simple y siempre correcto.
+  </Card>
+</Cards>
+
+Esa última tarjeta es la que decide si el diseño aguanta el mundo real, porque los avisos se pierden y no hay forma de impedirlo. Una pestaña congelada por el navegador para ahorrar batería no recibe nada mientras duerme. Una página restaurada desde la caché de retroceso vuelve a la vida con un estado de hace media hora y un canal que se cerró. Un Worker terminado por presión de memoria en un móvil se lleva por delante lo que tuviera acumulado. Un canal de difusión no ofrece ninguna garantía de entrega ni de orden entre contextos distintos. Diseñar suponiendo que ninguna de esas cosas pasa produce un sistema que funciona en desarrollo y se desincroniza en producción de formas que nadie consigue reproducir.
+
+<Callout type="dios" title="Diseña el aviso para poder perderlo">
+La conclusión de fondo de esta lección no es ninguna de sus técnicas, sino la inversión de perspectiva que las ordena, y es también la idea que más lejos llega fuera de este nivel. La tentación natural al construir un canal de notificación es tratarlo como el portador de la verdad: cada aviso lleva un hecho, los hechos hay que aplicarlos todos y en orden, y el estado de la interfaz es la suma de los avisos recibidos desde el principio. Ese diseño es un registro de replicación, y un registro de replicación es una cosa exigente: necesita entrega garantizada, orden total, detección de duplicados, reintentos y un mecanismo de reincorporación para el que se quedó atrás. Nada de eso te lo da un canal de difusión entre pestañas, ni te lo va a dar, ni merece la pena construirlo encima. La alternativa es renunciar a que el aviso sea la verdad y degradarlo deliberadamente a una pista: no dice qué pasó, solo dice que pasó algo por aquí, y la verdad sigue estando donde estaba desde el principio, en el disco, a una consulta de distancia. En cuanto aceptas eso, todos los requisitos duros se evaporan de golpe. El orden deja de importar porque el aviso no aporta contenido que pueda desordenarse. Los duplicados dejan de importar porque aplicar dos veces una pista es leer dos veces el mismo estado. La pérdida deja de ser fatal porque un número de versión revela el hueco y un barrido lo cierra. Y la agregación deja de ser una optimización arriesgada para convertirse en algo trivialmente seguro, porque fundir diez pistas en una no pierde ninguna información que alguien fuera a usar. Reconocerás este movimiento porque es exactamente el que hacen los sistemas de replicación serios cuando distinguen entre propagar el cambio y propagar la invalidación, y el que hace un protocolo de sincronización cuando decide que el mensaje periódico solo lleve un resumen y que el contenido se pida aparte. Es, en el fondo, la misma disciplina que gobierna todo el software local-first: la copia local es la autoridad, la red —aunque esa red mida cuatro milímetros y se llame canal de difusión— es un detalle de propagación, y ningún componente cuya corrección dependa de que un mensaje llegue sobrevive al contacto con el mundo.
+</Callout>
+
+<Challenge title="Levanta el canal de avisos">
+1. Conecta los ganchos de fila, confirmación y reversión de tu motor. Demuestra con una transacción abortada que no se emite absolutamente nada.
+2. Implementa el resumen con degradación por umbral y comprueba que el tamaño del mensaje no crece al importar diez mil filas.
+3. Añade la agrupación por ventana en el emisor y mide cuántos mensajes ahorra durante una ráfaga de sincronización.
+4. Adjunta el resumen a la respuesta de la escritura y comprueba que la pestaña que escribió refresca antes de que el canal de difusión entregue nada.
+5. Abre cuatro pestañas y cuenta las reejecuciones totales por escritura. Añade después la lógica de visibilidad y vuelve a contar.
+6. Simula un aviso perdido saltándote una versión a propósito. Verifica que el receptor detecta el hueco y se recupera con un barrido, sin intervención de nadie.
+</Challenge>

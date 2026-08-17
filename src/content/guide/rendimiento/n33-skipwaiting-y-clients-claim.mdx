@@ -1,0 +1,158 @@
+---
+title: "skipWaiting y clients.claim: qué rompes exactamente al usarlos"
+description: "Qué hace cada una de las dos llamadas que saltan el ciclo de vida, los tres fallos concretos que producen cuando se ponen sin pensar, y el patrón de actualización con consentimiento del usuario."
+subject: rendimiento
+level: 33
+order: 2
+position: "33.2"
+duration: "19 min"
+---
+
+<Lead>
+Las dos llamadas que aparecen en el noventa por ciento de los ejemplos de internet son las dos que desactivan las garantías del ciclo de vida. `skipWaiting` elimina la espera; `clients.claim` toma el control de páginas que no lo pidieron. Ninguna de las dos es incorrecta, y las dos tienen usos legítimos, pero copiarlas sin entender qué apagan produce una clase de fallo particularmente desagradable: intermitente, dependiente del momento del despliegue, e imposible de reproducir en local.
+</Lead>
+
+<Goals>
+
+- Describir con precisión qué transición fuerza `skipWaiting` y cuál `clients.claim`.
+- Enumerar los tres fallos concretos que produce la actualización inmediata.
+- Implementar el patrón de actualización con consentimiento y recarga controlada.
+- Decidir cuándo la actualización inmediata es aceptable y cuándo no.
+
+</Goals>
+
+## Qué hace cada una
+
+**`self.skipWaiting()`** fuerza la transición de `waiting` a `activating` sin esperar a que se cierren los clientes de la versión anterior. Se puede llamar en cualquier momento antes de activarse; lo habitual es dentro del manejador de `install`, o al recibir un mensaje desde la página.
+
+**`self.clients.claim()`** hace que el worker ya activado se convierta en el controlador de todos los clientes de su ámbito que actualmente no tienen controlador o tienen otro. Se llama dentro de `activate`.
+
+Son ortogonales y resuelven problemas distintos, aunque se citen siempre juntas:
+
+| Situación | Sin las llamadas | Con `skipWaiting` | Con `clients.claim` |
+|---|---|---|---|
+| Primera visita, worker recién instalado | No controla el documento actual; controlará el siguiente | Igual: no hay a quién esperar | Controla el documento actual desde ese instante |
+| Despliegue de versión nueva con pestañas abiertas | Espera a que se cierren todas | Se activa de inmediato | Toma el control de las pestañas abiertas |
+
+De ahí sale la observación más útil: **en la primera visita `skipWaiting` no hace nada**, porque no hay ningún worker anterior al que sustituir. Quien la pone para que "el worker funcione ya en la primera carga" está poniendo la llamada equivocada; la que hace eso es `clients.claim`.
+
+## Los tres fallos que produce la actualización inmediata
+
+Cuando el worker nuevo toma el control de un documento que fue servido por el anterior, hay tres cosas que se rompen. No son hipotéticas: son las tres incidencias que aparecen sistemáticamente.
+
+**Uno: los recursos con hash que ya no existen.** El documento en pantalla es de la versión 1 y sus referencias apuntan a `/assets/app.a3f9.js`. El worker de la versión 2 acaba de activarse y su primera tarea, en `activate`, ha sido borrar las cachés antiguas. Ahora el usuario abre un menú que carga un fragmento diferido, la petición de ese fichero pasa por el worker nuevo, no está en su caché, va a la red, y el servidor tampoco lo tiene porque el despliegue lo eliminó. El fragmento no carga y el menú no se abre. El usuario ve una aplicación rota sin haber hecho nada raro.
+
+**Dos: el contrato de la API cambia bajo los pies.** Si el worker nuevo transforma peticiones, reescribe rutas o cachea respuestas de la API con un formato distinto, el código de la versión 1 recibe respuestas que no sabe interpretar. El error suele ser un `TypeError` al leer una propiedad que ya no existe, muy lejos del sitio real del problema.
+
+**Tres: el estado en memoria de la página queda inconsistente con el estado en disco.** La página tiene datos en memoria que vinieron de la caché vieja; el worker nuevo tiene otra base de datos, otro esquema en almacenamiento indexado, otra versión de las claves. Las escrituras del código antiguo van a un esquema que el nuevo no espera.
+
+El primero es con diferencia el más frecuente. Y tiene un matiz que lo hace más traicionero: **solo afecta a los usuarios que tenían la pestaña abierta en el momento exacto del despliegue**. En local nunca lo reproduces, en pruebas automatizadas tampoco, y en producción llega como un puñado de errores raros en tu registro que nadie sabe correlacionar con nada.
+
+## El patrón correcto: preguntar antes de cambiar
+
+La solución que resuelve los tres problemas a la vez consiste en separar dos decisiones que la gente junta: **cuándo se activa el worker nuevo** y **cuándo se recarga la página**. Si se activa y se recarga a la vez, no hay ventana de inconsistencia.
+
+El mecanismo tiene tres piezas: el worker no llama a `skipWaiting` por su cuenta sino que espera un mensaje; la página detecta que hay un worker esperando y se lo dice al usuario; y cuando el usuario acepta, la página manda el mensaje y se recarga al confirmarse el cambio de controlador.
+
+```js
+// sw.js
+const VERSION = 'v14';
+
+self.addEventListener('install', (evento) => {
+  evento.waitUntil(
+    caches.open(VERSION).then((c) => c.addAll(['/', '/app.css', '/app.js']))
+  );
+  // Nada de skipWaiting aqui. Se espera al mensaje.
+});
+
+self.addEventListener('activate', (evento) => {
+  evento.waitUntil(
+    (async () => {
+      const nombres = await caches.keys();
+      await Promise.all(
+        nombres.filter((n) => n !== VERSION).map((n) => caches.delete(n))
+      );
+      await self.clients.claim();
+    })()
+  );
+});
+
+self.addEventListener('message', (evento) => {
+  if (evento.data?.tipo === 'ACTIVAR_YA') self.skipWaiting();
+});
+```
+
+```js
+// actualizacion.js, en la pagina
+export async function vigilarActualizaciones(alHaberVersionNueva) {
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (!reg) return;
+
+  // Evita el bucle de recargas si algo falla.
+  let recargando = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (recargando) return;
+    recargando = true;
+    window.location.reload();
+  });
+
+  const proponer = (sw) => alHaberVersionNueva(() =>
+    sw.postMessage({ tipo: 'ACTIVAR_YA' })
+  );
+
+  // Ya habia una esperando cuando cargamos.
+  if (reg.waiting) proponer(reg.waiting);
+
+  // O aparece una mientras la pagina esta abierta.
+  reg.addEventListener('updatefound', () => {
+    const nuevo = reg.installing;
+    if (!nuevo) return;
+    nuevo.addEventListener('statechange', () => {
+      // installed con controlador presente significa que esta en espera.
+      if (nuevo.state === 'installed' && navigator.serviceWorker.controller) {
+        proponer(nuevo);
+      }
+    });
+  });
+
+  // Buscar version nueva cada media hora en sesiones largas.
+  setInterval(() => reg.update(), 30 * 60 * 1000);
+}
+```
+
+```js
+// Uso: una barra discreta, no un dialogo modal.
+vigilarActualizaciones((aplicar) => {
+  const barra = document.getElementById('aviso-version');
+  barra.hidden = false;
+  barra.querySelector('button').addEventListener('click', aplicar, { once: true });
+});
+```
+
+Tres detalles del código que no son adorno. La bandera `recargando` evita el bucle infinito de recargas, que es el fallo clásico de esta pieza y que deja el sitio inutilizable. La comprobación de `navigator.serviceWorker.controller` dentro del `statechange` distingue una actualización de una primera instalación: sin ella, la primera visita muestra un aviso de "hay una versión nueva" que no tiene sentido. Y el `reg.update()` periódico existe porque en una aplicación de una sola página no hay navegaciones que disparen la comprobación, así que sin él una pestaña abierta durante días nunca se entera de nada.
+
+## Cuándo la actualización inmediata sí vale
+
+No todo necesita este cuidado. `skipWaiting` incondicional es aceptable en tres situaciones concretas:
+
+**Cuando el worker no cachea nada de la aplicación.** Si solo cachea recursos de terceros, fuentes o imágenes de contenido, no hay contrato que romper con el código de la página.
+
+**Cuando el sitio son documentos independientes y no una aplicación con estado.** Un blog, una documentación, un catálogo. El usuario navega entre páginas completas, cada navegación es un documento nuevo, y no hay fragmentos diferidos que puedan desaparecer. El peor caso es que una página recién cargada tenga estilos de otra versión durante un instante.
+
+**Cuando el despliegue mantiene los ficheros antiguos.** Si tu proceso conserva los recursos de las últimas cinco versiones en el servidor —que es una buena idea por sí sola y cuesta muy poco almacenamiento—, el fallo número uno desaparece, porque la petición del fragmento antiguo llega a la red y encuentra el fichero. Esta medida sola resuelve la mayor parte del riesgo y no requiere ninguna coordinación con el cliente.
+
+Fuera de esos casos, la actualización inmediata está cambiando fiabilidad por unos segundos de frescura, y la frescura casi nunca es urgente.
+
+Sobre `clients.claim`, la decisión es más sencilla. En la primera visita es lo que quieres si el worker aporta algo de valor inmediato; el riesgo es que el documento actual se cargó **sin** worker y de repente empieza a tener uno, y si tu lógica de `fetch` asume que las peticiones anteriores también pasaron por ella, te llevas una sorpresa. La regla práctica: `clients.claim` sí, y en `activate`, después de haber limpiado las cachés viejas, nunca antes.
+
+<Callout type="dios" title="El despliegue de un service worker es un despliegue distribuido a máquinas que no controlas: piénsalo como una migración, no como una subida de ficheros">
+Aquí está la razón profunda de por qué este tema cuesta tanto y por qué los ejemplos de internet son tan malos. Todos los reflejos del despliegue web moderno están construidos sobre una premisa que damos por evidente sin enunciarla nunca: **el servidor es la única fuente de verdad, y cuando cambias el servidor, cambias lo que ve todo el mundo.** Con esa premisa, desplegar es sustituir ficheros y ya está. Un service worker rompe esa premisa por completo. A partir del momento en que registras uno, hay una parte de tu aplicación —una que decide qué se descarga y qué no— ejecutándose en el disco duro de cada usuario, con su propio calendario de actualización, que no controlas y que puede llevar semanas de retraso respecto a lo que tienes desplegado. Es, literalmente, software instalado en el equipo del cliente. Y en cuanto lo aceptas, todo lo que llevaba décadas sabiéndose sobre distribuir software instalado se vuelve aplicable de golpe: compatibilidad hacia atrás entre versiones consecutivas, ventanas de convivencia, migraciones de esquema con dos direcciones, banderas de funcionalidad para desactivar sin desplegar, y un camino de vuelta. Nada de eso es nuevo; lo nuevo es tener que aplicarlo en frontend, donde una generación entera de ingenieros creció con la idea reconfortante de que un despliegue malo se arregla con otro despliegue en tres minutos. Con un service worker, un despliegue malo puede no arreglarse con otro despliegue, y ese es el asunto del final del nivel. La consecuencia práctica más valiosa es un cambio de pregunta en las revisiones de código. Deja de preguntar "¿esto está bien?" y empieza a preguntar **"¿qué le pasa a alguien que tiene la versión de hace dos meses en el disco cuando reciba esto?"**. Esa pregunta, hecha en voz alta en cada cambio del worker, detecta prácticamente todos los fallos de esta lección antes de que lleguen a nadie. Y detecta también los que no son de rendimiento: los esquemas de almacenamiento que cambian de forma, las claves de caché que se renombran, los formatos de mensaje entre página y worker que ganan un campo obligatorio. En un despliegue normal esas cosas son triviales porque cliente y servidor cambian a la vez. Aquí no cambian a la vez, y esa es toda la diferencia.
+</Callout>
+
+<Challenge title="Prueba la ventana de inconsistencia">
+1. Monta el patrón de actualización con consentimiento completo y comprueba que el aviso no aparece en la primera visita.
+2. Con una pestaña abierta, despliega una versión que borra las cachés antiguas y usa `skipWaiting` incondicional. Intenta cargar un fragmento diferido desde la pestaña vieja y observa el fallo.
+3. Repite el experimento conservando los ficheros de la versión anterior en el servidor. Comprueba que ya no falla.
+4. Provoca el bucle de recargas quitando la bandera `recargando`. Míralo una vez para no volver a olvidarla.
+5. Deja una pestaña abierta doce horas con el `reg.update()` periódico y confirma que detecta un despliegue hecho por el camino.
+</Challenge>

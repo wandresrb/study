@@ -1,0 +1,150 @@
+---
+title: "TestClock: avanzar el tiempo a mano"
+description: "El reloj de test no avanza solo: se mueve cuando tú se lo ordenas, y ese control convierte la temporización en algo que se afirma en lugar de suponerse. Esta lección detalla la semántica exacta de `advance(by:)` y `advance(to:)` —qué suspensiones libera un salto y en qué orden—, aplica el mecanismo a los tres casos que más se testean con reloj: el temporizador que late, el debounce del que hay que fijar el umbral por sus dos lados y la escalera de reintentos con espera exponencial, y termina catalogando los cuatro modos de fallo que producen un test colgado, un latido de más o un verde inmerecido. Todo ello en microsegundos y sin una sola espera real."
+subject: tca
+level: 22
+order: 2
+position: "22.2"
+duration: "19 min"
+---
+
+<Lead>
+Con el reloj ya declarado como dependencia, el test deja de ser un espectador del tiempo y pasa a ser quien lo dicta. `TestClock` no avanza por su cuenta ni un nanosegundo: se queda exactamente donde lo dejaste hasta que le ordenas un salto, y entonces despierta —en orden estricto de vencimiento— a todas las suspensiones que ese salto ha dejado atrás. La consecuencia práctica es que cualquier comportamiento temporal se vuelve una secuencia de afirmaciones ordinarias: avanzo tanto, recibo exactamente esto, el estado queda así. La consecuencia teórica es más interesante y es la que da valor a la lección: un umbral solo queda demostrado si se prueba por los dos lados, y hasta ahora ese *otro lado* —el instante inmediatamente anterior, donde no debe pasar nada— era territorio inaccesible.
+</Lead>
+
+<Goals>
+
+- Describir la semántica exacta de `advance(by:)`, `advance(to:)` y `run()`, y qué suspensiones libera cada llamada.
+- Testear un temporizador comprobando que un avance de N segundos produce exactamente N latidos.
+- Fijar el umbral de un debounce por sus dos lados: silencio justo antes, efecto justo después.
+- Verificar una escalera de reintentos con espera exponencial sin pagar un solo milisegundo real.
+
+</Goals>
+
+## La semántica del salto
+
+Un `TestClock` empieza en un instante propio de valor cero y mantiene una lista ordenada de suspensiones pendientes, cada una anotada con el instante en que vence. Cuando llamas a `advance(by:)`, el reloj no espera nada: mueve su noción de ahora y despierta, en orden de vencimiento, a las suspensiones cuyo plazo haya quedado atrás. La llamada es asíncrona y hay que esperarla, porque el reloj cede el control al código despertado antes de devolvértelo, y solo así el efecto tiene ocasión de enviar sus acciones antes de que tú las reclames.
+
+```swift
+let clock = TestClock()
+
+await clock.advance(by: .seconds(1))   // salto relativo
+await clock.advance(to: .init(offset: .seconds(5)))  // salto absoluto
+await clock.run()                      // agota todas las suspensiones pendientes
+```
+
+El instante inicial de un reloj de test es un cero convencional y no una lectura del sistema, de manera que los instantes que aparecen en los mensajes de fallo son pequeños, legibles y comparables entre ejecuciones. Es un detalle menor que se agradece a diario: los diagnósticos hablan de *el instante mil quinientos* y no de una marca de tiempo absoluta imposible de interpretar de un vistazo.
+
+Las tres formas responden a necesidades distintas. El salto relativo es el pan de cada día y el que mejor documenta la intención, porque el número que escribes es el mismo que aparece en el reducer. El salto absoluto sirve cuando la lógica razona sobre instantes y no sobre intervalos —una caducidad fijada en el estado, por ejemplo—. Y `run()` es la vía rápida: avanza hasta que no queda ninguna suspensión pendiente, lo cual resulta cómodo para atravesar una cadena de esperas cuyos tramos individuales no te interesan, y es exactamente lo que *no* debes usar cuando el reparto de esos tramos es lo que estás probando.
+
+<Mermaid code={`sequenceDiagram
+  participant T as Test
+  participant C as TestClock
+  participant E as Efecto
+  E->>C: sleep hasta el instante 1000
+  E->>C: sleep hasta el instante 3000
+  T->>C: advance de 1500
+  C-->>E: despierta la suspension de 1000
+  Note over C: la de 3000 sigue pendiente
+  T->>C: advance de 1500
+  C-->>E: despierta la suspension de 3000`} />
+
+Hay un detalle de orden que conviene interiorizar desde el principio: el efecto tiene que haber *llegado* a su suspensión antes de que tú avances, o el reloj no tendrá a quién despertar y el salto caerá en el vacío. En la práctica esto se resuelve solo si respetas la disciplina de esperar el `send` que arranca el efecto antes de tocar el reloj, porque el `TestStore` no devuelve el control hasta que el efecto ha empezado a correr. Cuando alguien invierte ese orden, el síntoma es siempre el mismo y desconcierta mucho: el test falla al terminar denunciando una tarea en vuelo que nunca despertó.
+
+## El temporizador: N segundos, N latidos
+
+El caso canónico es un tren de latidos. El reducer arranca una secuencia asíncrona de intervalo fijo y emite una acción por cada pulso; el test comprueba que el número de pulsos corresponde con exactitud al tiempo transcurrido.
+
+```swift
+@Test
+func elTemporizadorLateUnaVezPorSegundo() async {
+  let clock = TestClock()
+  let store = TestStore(initialState: Temporizador.State()) {
+    Temporizador()
+  } withDependencies: {
+    $0.continuousClock = clock
+  }
+
+  await store.send(.iniciar)
+  await clock.advance(by: .seconds(3))
+  await store.receive(\.tick) { $0.segundos = 1 }
+  await store.receive(\.tick) { $0.segundos = 2 }
+  await store.receive(\.tick) { $0.segundos = 3 }
+  await store.send(.parar)
+}
+```
+
+Lee lo que ese test demuestra, porque es más de lo que aparenta. Los tres `receive` prueban que el avance liberó tres latidos: si el reducer emitiera dos, el tercer `receive` fallaría por no llegar nunca; si emitiera cuatro, el test fallaría al terminar por una acción no reclamada. La cardinalidad queda fijada por arriba y por abajo sin necesidad de contar nada a mano, que es una elegancia del `TestStore` exhaustivo digna de notarse: la ausencia de aserciones adicionales *es* la aserción de que no hubo nada más.
+
+Hay además una asimetría útil entre los dos modos de fallo. Si el reducer emite de menos, el test se detiene en el `receive` que espera en vano y el diagnóstico apunta a la línea exacta; si emite de más, el fallo aparece al final y menciona la acción sobrante con su carga útil. Ambos mensajes son precisos, pero conviene saber de antemano cuál corresponde a cuál, porque un fallo al final de un test largo tiende a interpretarse como un problema de la última línea cuando en realidad habla de algo ocurrido mucho antes.
+
+El `send(.parar)` final tampoco es cortesía. Un temporizador es un efecto de larga vida y, si el test acabara con él corriendo, el `TestStore` lo denunciaría. Esa severidad merece agradecerse: la fuga que el test detecta es la misma que en producción mantendría un bucle vivo después de que la pantalla desapareciera.
+
+## El umbral por sus dos lados
+
+Un debounce de trescientos milisegundos afirma dos cosas, y solo una de ellas se puede comprobar esperando. La primera es que a los trescientos milisegundos de silencio sale la petición; la segunda, mucho más valiosa, es que antes de eso no sale nada. Con el reloj en la mano, la segunda es tan barata como la primera.
+
+```swift
+@Test
+func elDebounceFijaSuUmbralPorLosDosLados() async {
+  let clock = TestClock()
+  let store = TestStore(initialState: Busqueda.State()) {
+    Busqueda()
+  } withDependencies: {
+    $0.continuousClock = clock
+    $0.clienteBusqueda.buscar = { _ in [.demo] }
+  }
+
+  await store.send(.consultaCambiada("sw")) { $0.consulta = "sw" }
+  await clock.advance(by: .milliseconds(299))
+  await store.send(.consultaCambiada("swift")) { $0.consulta = "swift" }
+  await clock.advance(by: .milliseconds(299))
+  await clock.advance(by: .milliseconds(1))
+  await store.receive(\.respuesta) { $0.resultados = [.demo] }
+}
+```
+
+Los dos avances consecutivos que suman trescientos son deliberados y no un capricho estilístico. El primero deja el reloj a un milisegundo del vencimiento y, como no hay ningún `receive` entre ambos, el test afirma implícitamente que en ese punto no había llegado nada; el segundo cruza la frontera y libera la petición. Esa pareja de líneas convierte el umbral en una propiedad demostrada en vez de supuesta: si alguien cambiara el reducer a doscientos milisegundos, la acción llegaría durante el primer avance y quedaría sin reclamar; si lo subiera a cuatrocientos, el `receive` esperaría en vano. El test acota el valor por ambos lados, que es justo lo que un test de un umbral debe hacer y lo que ninguna espera real puede ofrecer.
+
+## Escaleras de reintentos y cuatro modos de fallo
+
+La espera exponencial es el otro patrón que exige control fino, porque su corrección está enteramente en el reparto de los intervalos: uno, dos, cuatro segundos. Un test con reloj lo verifica tramo a tramo.
+
+```swift
+await store.send(.cargar)
+await store.receive(\.intentoFallido) { $0.intentos = 1 }
+await clock.advance(by: .seconds(1))
+await store.receive(\.intentoFallido) { $0.intentos = 2 }
+await clock.advance(by: .seconds(2))
+await store.receive(\.intentoFallido) { $0.intentos = 3 }
+await clock.advance(by: .seconds(4))
+await store.receive(\.abandonado) { $0.error = .agotado }
+```
+
+Aquí `run()` habría sido un error sutil: llevaría el test al final correcto sin comprobar que las esperas crecen, y una implementación con tres reintentos separados por un segundo fijo pasaría igual. La regla se repite en todas sus formas: la granularidad del avance debe corresponder con la granularidad de lo que afirmas.
+
+Ese mismo criterio decide la otra pregunta frecuente de la espera exponencial, la del jitter. Añadir una perturbación aleatoria a cada tramo es una buena práctica en producción porque evita que mil clientes reintenten a la vez, y arruinaría el test anterior si el azar entrase por la puerta de atrás. La solución no es renunciar al jitter sino declararlo: el generador de números aleatorios es una dependencia más, y con una semilla fija la secuencia sigue siendo estadísticamente dispersa y a la vez exactamente reproducible en cada ejecución de la suite.
+
+| Modo de fallo | Síntoma | Corrección |
+| --- | --- | --- |
+| Avanzar antes de que el efecto se suspenda | Tarea en vuelo al terminar \| test colgado | Esperar el `send` que arranca el efecto |
+| Avanzar de más | Acción recibida que nadie reclamó | Partir el salto en tramos afirmables |
+| Olvidar cancelar un efecto de larga vida | Fallo al final por efecto vivo | Enviar la acción de parada o cancelar |
+| Usar un reloj inmediato donde tocaba el de test | Verde que sobrevive a borrar la lógica | Volver a `TestClock` y probar el umbral |
+
+<Callout type="warn" title="Un umbral probado por un solo lado no esta probado">
+Es tentador escribir solo el avance que hace llegar la acción y dar el test por bueno. Ese test verifica que el efecto ocurre *alguna vez* antes de ese instante, no que ocurra *en* ese instante, y sobrevive intacto a que alguien reduzca el umbral a la mitad o lo elimine. Cada vez que un número temporal aparezca en un reducer, el test debería contener dos avances: uno que se detenga justo antes sin recibir nada y otro que cruce la frontera. Cuesta una línea y es la diferencia entre fijar el contrato y describir una coincidencia.
+</Callout>
+
+<Callout type="dios" title="Controlar el avance convierte la temporizacion en una propiedad falsable">
+Merece la pena precisar qué clase de conocimiento produce un test con reloj controlado, porque es de una naturaleza distinta al que produce un test con espera. Un test que duerme trescientos cincuenta milisegundos y encuentra el resultado esperado establece una correlación: en esta máquina, con esta carga, el efecto había terminado. La proposición es contingente respecto del entorno y no distingue entre las muchas implementaciones que la satisfarían, así que su poder de refutación es casi nulo; y un enunciado que casi nada puede refutar casi nada afirma. Un test que avanza el reloj doscientos noventa y nueve milisegundos, comprueba el silencio, avanza uno más y comprueba el efecto establece otra cosa: que la función que va del tiempo al comportamiento tiene una discontinuidad exactamente en trescientos. Eso ya no es una correlación sino una propiedad del reducer, y es falsable de la manera más brutal posible: cualquier cambio en el umbral, en cualquier dirección y por mínimo que sea, rompe el test. Ahí está el salto conceptual del nivel. La razón de que sea posible es que el tiempo dejó de ser el medio en el que el test transcurre para convertirse en una variable que el test manipula, y esa distinción entre *estar dentro* de una dimensión y *disponer* de ella es la misma que separa observar un fenómeno de experimentar con él. El experimentador controla la variable independiente y observa la dependiente; el que espera solo observa. Por eso la suite entera cambia de carácter cuando el reloj entra por una dependencia: comportamientos que se verificaban mirando la pantalla y confiando pasan a describirse con la misma precisión que una función matemática, y con ellos desaparece la clase de bug más cara de todas, la que solo se manifiesta cuando las cosas ocurren en un orden o a una velocidad que nadie llegó nunca a reproducir a mano.
+</Callout>
+
+<Challenge title="Fija por completo el contrato temporal de una feature">
+1. Toma un temporizador real de tu proyecto y escribe el test que avanza tres intervalos y afirma tres latidos. Después borra el último `receive` y comprueba que el test falla por acción no reclamada.
+2. Añade el avance previo al umbral en un test de debounce: doscientos noventa y nueve milisegundos de silencio y uno más para cruzar. Cambia después el umbral en el reducer y verifica que el test rompe en ambas direcciones.
+3. Sustituye una escalera de reintentos exponencial por una de intervalo fijo sin tocar el test. Si el test sigue verde, reescríbelo con avances tramo a tramo hasta que deje de estarlo.
+4. Provoca a propósito los cuatro modos de fallo de la tabla y guarda el mensaje de error de cada uno. Reconocerlos de un vistazo ahorra horas de depuración futura.
+5. Reemplaza una secuencia larga de avances por una sola llamada a `run()` y razona por escrito qué garantías has perdido y en qué casos esa pérdida es aceptable.
+6. Escribe un test de una caducidad de treinta días usando el salto absoluto y mide su duración. Compara ese número con lo que habría costado esperarla de verdad.
+</Challenge>

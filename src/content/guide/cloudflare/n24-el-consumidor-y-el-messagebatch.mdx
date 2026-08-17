@@ -1,0 +1,149 @@
+---
+title: "El consumidor: el manejador queue y el MessageBatch"
+description: "El consumidor no recibe mensajes sueltos: recibe lotes, y esa decisión de diseño lo explica casi todo. Diseccionamos el manejador queue y la anatomía de un MessageBatch —el identificador, la marca de tiempo, el contador de intentos y el cuerpo—, la diferencia crucial entre confirmar mensaje a mensaje con ack y dejar que el retorno del manejador confirme todo, por qué una excepción sin capturar reintenta el lote entero incluyendo lo que ya funcionó, y cómo max_batch_size, max_batch_timeout y max_concurrency gobiernan el equilibrio entre latencia, coste y presión aguas abajo."
+subject: cloudflare
+level: 24
+order: 3
+position: "24.3"
+duration: "17 min"
+---
+
+<Lead>
+Del lado del consumidor, Cloudflare Queues toma una decisión que condiciona todo lo demás: no te entrega un mensaje, te entrega un lote. El manejador `queue` se invoca con un `MessageBatch` que agrupa varios mensajes de la misma cola, y esa agrupación no es un detalle de rendimiento sino la unidad de razonamiento del sistema entero. Un lote es una invocación, un presupuesto de CPU, una oportunidad de escribir en bloque aguas abajo. Y dentro de ese lote, cada mensaje conserva su destino individual: puede confirmarse o reintentarse por su cuenta, sin arrastrar a los demás. Entender esa doble escala —el lote como unidad de ejecución, el mensaje como unidad de destino— es entender el consumidor.
+</Lead>
+
+<Goals>
+
+- Escribir un manejador `queue` y leer la anatomía completa de un `MessageBatch` y de cada `Message`.
+- Distinguir la confirmación implícita al retornar del manejador de la confirmación explícita con `ack`.
+- Evitar el fallo clásico: una excepción sin capturar que reintenta también los mensajes ya procesados.
+- Ajustar el tamaño del lote, la espera máxima y la concurrencia según la latencia y la presión aguas abajo.
+
+</Goals>
+
+## El manejador queue
+
+Un Worker se vuelve consumidor exportando un segundo manejador junto a `fetch`. Igual que `fetch` responde a peticiones HTTP y `scheduled` a un reloj, `queue` responde a la llegada de mensajes. No lo invoca nadie de fuera: es la plataforma quien decide cuándo hay lote suficiente y llama.
+
+```ts
+export default {
+  async queue(
+    batch: MessageBatch<Tarea>,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    console.log(`cola ${batch.queue}: ${batch.messages.length} mensajes`);
+    for (const mensaje of batch.messages) {
+      await procesar(mensaje.body, env);
+    }
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+El tipo `MessageBatch` es genérico sobre el cuerpo de tus mensajes, así que declarar `MessageBatch<Tarea>` te da `mensaje.body` tipado sin castings. Es un detalle pequeño con un efecto grande: el contrato entre productor y consumidor deja de ser una convención mental y pasa a comprobarlo el compilador.
+
+Fíjate en que el consumidor no pide mensajes ni consulta si hay trabajo: la plataforma lo invoca cuando lo hay. Esa inversión —el modelo push, frente al pull clásico donde un proceso pregunta en bucle— es lo que elimina el trabajador siempre encendido esperando a que caiga algo. Sin cola vacía que sondear, no hay coste cuando no hay trabajo, y la escala hacia arriba y hacia abajo la decide la propia profundidad de la cola en lugar de una política que tengas que escribir tú.
+
+El lote trae dos propiedades: `batch.queue`, el nombre de la cola de origen —útil cuando un mismo Worker consume de varias—, y `batch.messages`, el array de mensajes. Y cada mensaje es más que su cuerpo.
+
+| Propiedad | Tipo | Qué contiene |
+| --- | --- | --- |
+| `id` | `string` | Identificador único que asigna la cola. La base natural para deduplicar |
+| `timestamp` | `Date` | Instante en que el mensaje se encoló, no en que se entregó |
+| `body` | genérico | El valor que envió el productor, ya deserializado |
+| `attempts` | `number` | Cuántas veces se ha intentado entregar. Empieza en `1` |
+| `ack()` | método | Confirma este mensaje. No se volverá a entregar |
+| `retry()` | método | Devuelve este mensaje a la cola para otro intento |
+
+`attempts` merece atención especial: es la única señal que tiene tu código de que este mensaje ya falló antes. Con ella puedes degradar el comportamiento —probar una ruta alternativa en el tercer intento, registrar una alerta a partir del quinto— en lugar de repetir ciegamente lo que ya no funcionó.
+
+Un detalle de arquitectura que conviene decidir pronto: el consumidor puede vivir en el mismo Worker que el productor o en uno separado. Empezar juntos es cómodo y perfectamente válido. Separarlos gana sentido en cuanto el trabajo asíncrono crece, porque cada Worker se despliega, se versiona y se observa por su cuenta: puedes corregir un fallo del consumidor sin tocar el código que atiende peticiones de usuarios, y un error que rompa el consumidor no deja tu sitio caído. La cola, que ya desacoplaba en el tiempo, pasa entonces a desacoplar también el ciclo de vida del despliegue.
+
+## Confirmar el lote o confirmar cada mensaje
+
+Aquí está el punto donde más consumidores se escriben mal, y la causa es que el comportamiento por defecto parece cómodo. Si tu manejador termina sin lanzar una excepción, la plataforma confirma automáticamente todos los mensajes que no confirmaste a mano. Si tu manejador lanza una excepción, la plataforma reintenta **todos** los mensajes que no habías confirmado. Lote entero.
+
+Imagina un lote de diez mensajes donde los nueve primeros se procesan bien y el décimo revienta. Sin confirmación explícita, la excepción sube, y los diez vuelven a la cola. En el siguiente intento se reprocesan nueve trabajos que ya estaban hechos: nueve correos duplicados, nueve cobros repetidos, nueve miniaturas regeneradas. Y como el décimo probablemente vuelva a fallar, el ciclo se repite hasta agotar los reintentos, multiplicando el daño en cada vuelta.
+
+<Callout type="warn" title="Una excepción sin capturar reintenta lo que ya funcionó">
+El error se ve poco en desarrollo, donde los lotes son de uno o dos mensajes, y explota en producción, donde son de diez o de cien. La regla es tajante: envuelve el procesamiento de cada mensaje en su propio `try` y decide su destino individualmente. Nunca dejes que un fallo aislado se propague hasta el borde del manejador, porque en ese borde la única decisión posible ya es sobre el lote entero.
+</Callout>
+
+```ts
+async queue(batch: MessageBatch<Tarea>, env: Env): Promise<void> {
+  for (const mensaje of batch.messages) {
+    try {
+      await procesar(mensaje.body, env);
+      mensaje.ack(); // este ya esta hecho, pase lo que pase con el resto
+    } catch (error) {
+      console.error(`fallo ${mensaje.id} intento ${mensaje.attempts}`, error);
+      mensaje.retry(); // solo este vuelve a la cola
+    }
+  }
+}
+```
+
+Hay una decisión más escondida en ese bucle: procesar en serie con `await` dentro del `for`. Es lo correcto por defecto, porque limita cuánta presión ejerces a la vez sobre lo que hay aguas abajo y hace el flujo trivial de razonar. Si el trabajo es puramente de espera de red y el destino aguanta la concurrencia, puedes cambiarlo por un `Promise.allSettled` sobre el lote entero y ganar mucha latencia; pero entonces debes decidir el destino de cada mensaje inspeccionando su resultado individual, y el riesgo de aplastar al servicio externo pasa a ser tuyo. Empieza en serie y paraleliza solo cuando midas que compensa.
+
+Ese patrón —`try` por mensaje, `ack` al éxito, `retry` al fallo— es la forma canónica de un consumidor y debería ser tu punto de partida siempre. Existen también `batch.ackAll()` y `batch.retryAll()`, que aplican la decisión a todo el lote de golpe; son útiles cuando el fallo es evidentemente global, como una base de datos caída donde reintentar mensaje a mensaje no tiene sentido, pero fuera de ese caso son un atajo que borra la granularidad que la cola te regaló.
+
+<Mermaid code={`flowchart TB
+  B[Lote de 10 mensajes] --> L[Por cada mensaje]
+  L -->|procesado| A[ack y fuera de la cola]
+  L -->|excepcion capturada| R[retry y vuelve solo este]
+  L -->|excepcion sin capturar| T[Los 10 vuelven a la cola]
+  class A t-green
+  class R t-yellow
+  class T t-red`} />
+
+## El tamaño del lote y la concurrencia
+
+Cuándo se invoca tu consumidor y con cuántos mensajes lo gobiernan unos pocos ajustes del manifiesto. La plataforma espera a acumular `max_batch_size` mensajes o a que pasen `max_batch_timeout` segundos, lo que ocurra primero, y entonces llama.
+
+```jsonc
+{
+  "queues": {
+    "consumers": [
+      {
+        "queue": "tareas",
+        "max_batch_size": 25,
+        "max_batch_timeout": 10,
+        "max_concurrency": 4,
+        "max_retries": 5
+      }
+    ]
+  }
+}
+```
+
+Nada de eso obliga a que el lote llegue lleno. Si solo hay tres mensajes cuando vence el tiempo, tu manejador recibe tres; los ajustes son techos, no cuotas que deban cumplirse. Por eso un consumidor correcto nunca asume un tamaño concreto: recorre `batch.messages` sea cual sea su longitud, y ni siquiera da por hecho que haya más de uno.
+
+`max_batch_size` llega hasta cien mensajes y `max_batch_timeout` hasta sesenta segundos. Entre ambos hay una tensión que debes resolver a conciencia: un lote grande amortiza el arranque, permite escrituras agrupadas aguas abajo y abarata el coste por mensaje, pero obliga a esperar más a que se llene y concentra más trabajo en un único presupuesto de CPU. Un lote pequeño reacciona antes y arriesga menos, a costa de más invocaciones.
+
+<Cards>
+  <Card icon="🐢" title="Lotes grandes y espera larga">
+    Para trabajo tolerante al retraso: informes, sincronizaciones, escrituras masivas en D1. Menos invocaciones, menos coste, escrituras agrupadas.
+  </Card>
+  <Card icon="🐇" title="Lotes pequeños y espera corta">
+    Para trabajo que el usuario percibe: correos, notificaciones, actualizaciones de estado. Más invocaciones, pero el mensaje sale casi al instante.
+  </Card>
+  <Card icon="🎚️" title="max_concurrency">
+    El freno de mano. Limita cuántas invocaciones corren a la vez para no aplastar una API externa con cuota o una base con pocas conexiones.
+  </Card>
+</Cards>
+
+Hay además un límite físico que ninguna configuración esquiva: el lote entero se procesa en una sola invocación, con un único presupuesto de CPU y de memoria. Cien mensajes que solo escriben una fila caben de sobra; cien mensajes que decodifican una imagen cada uno, no. La señal de que te pasaste es un consumidor que empieza a fallar por límites en lugar de por errores de tu lógica, y la cura es bajar `max_batch_size` hasta que el trabajo del lote quepa con holgura. Dimensiona por el coste del mensaje más caro, no por el promedio.
+
+`max_concurrency` es el ajuste que más se olvida y el que más incidentes evita. Sin él, el consumidor escala solo hacia arriba conforme crece la cola, y esa elasticidad —maravillosa cuando el trabajo es autocontenido— se convierte en un ataque de denegación de servicio contra tu propio proveedor de correo si este admite diez peticiones por segundo. Fijar la concurrencia convierte la cola en un regulador de caudal: la profundidad crece, pero el ritmo de salida se mantiene dentro de lo que aguanta el eslabón más frágil.
+
+<Callout type="dios" title="El lote no es una optimización: es el lugar donde vive tu presupuesto de fallo">
+Casi todo el mundo llega al lote por el lado del rendimiento, y no se equivoca: agrupar amortiza el arranque, permite un solo `INSERT` múltiple en vez de veinticinco, y abarata el coste por unidad de trabajo. Pero quedarse ahí deja fuera lo que de verdad significa un lote, que es una decisión sobre el radio de daño. Cuando la plataforma te entrega veinticinco mensajes en una invocación, te está entregando también veinticinco destinos que se juegan en el mismo presupuesto de CPU, en la misma memoria y bajo la misma excepción no capturada. El lote es simultáneamente tu unidad de eficiencia y tu unidad de riesgo, y esas dos magnitudes crecen juntas: cuanto más agrupas, más ahorras y más pierdes cuando algo revienta a mitad. Por eso el `ack` por mensaje no es un refinamiento opcional sino la pieza que desactiva esa correlación. Confirmar cada mensaje en cuanto está hecho convierte el lote en una agrupación puramente física —cómo llegó el trabajo— sin dejar que se contamine la dimensión lógica —qué trabajo está terminado—. Sin `ack` explícito, esas dos dimensiones se funden y el lote pasa a comportarse como una transacción que nadie diseñó como transacción: todo o nada, pero sin las garantías de una de verdad, porque los efectos externos que ya provocaste —el correo enviado, el cobro hecho— no se deshacen al reintentar. Ahí está el matiz que hay que interiorizar: la plataforma puede reintentar la ejecución, jamás sus consecuencias en el mundo. De esa asimetría se derivan las tres disciplinas del consumidor maduro. La primera, que cada mensaje se confirme lo antes posible tras completar su efecto observable, porque la ventana entre ambos es la ventana de duplicación. La segunda, que el trabajo se ordene poniendo primero lo reversible y al final lo irreversible, de forma que un fallo temprano no deje huella. Y la tercera, que la idempotencia se apoye en `mensaje.id`, que la cola te da estable a través de los reintentos, y no en un valor que generes tú al procesar. Quien escribe consumidores pensando solo en el caso feliz descubre estas tres reglas en producción, y las descubre leyendo quejas de usuarios que recibieron el mismo correo cinco veces.
+</Callout>
+
+<Challenge title="Escribe un consumidor que no duplique">
+1. Escribe un manejador `queue` con `try` por mensaje, `ack` al éxito y `retry` al fallo, y registra `mensaje.id` y `mensaje.attempts` en cada rama.
+2. Provoca a propósito un fallo en el último mensaje de un lote de cinco sin confirmación explícita y observa cuántas veces se reprocesan los cuatro primeros.
+3. Usa `attempts` para cambiar de estrategia a partir del tercer intento, por ejemplo llamando a un proveedor alternativo.
+4. Elige `max_batch_size` y `max_batch_timeout` para dos colas tuyas de naturaleza opuesta y justifica cada número.
+5. Fija `max_concurrency` a partir de la cuota real de un servicio externo tuyo y explica qué habría pasado sin ese límite en un pico de tráfico.
+</Challenge>

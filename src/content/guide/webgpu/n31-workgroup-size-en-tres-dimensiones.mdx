@@ -1,0 +1,137 @@
+---
+title: "@workgroup_size y los límites de la especificación"
+description: "Las tres dimensiones del workgroup, los límites garantizados que ningún dispositivo baja, y cómo parametrizar el tamaño sin duplicar shaders."
+subject: webgpu
+level: 31
+order: 3
+position: "31.3"
+duration: "18 min"
+---
+
+<Lead>
+El atributo `@workgroup_size` parece un detalle de sintaxis y es en realidad la decisión de arquitectura más importante de un compute shader. Fija cuántas invocaciones comparten memoria rápida, cuántas pueden sincronizarse entre sí, cuánto espacio de registros consume cada grupo y, por consecuencia, cuántos grupos caben a la vez en el chip. Y una vez compilado el módulo, no se puede cambiar desde JavaScript. Salvo que uses el mecanismo que WebGPU dejó preparado exactamente para eso.
+</Lead>
+
+<Goals>
+
+- Escribir `@workgroup_size` en sus formas de una, dos y tres dimensiones.
+- Citar los cuatro límites de la especificación que acotan un workgroup y sus valores garantizados.
+- Comprobar los límites reales de un dispositivo y solicitar los que necesitas.
+- Parametrizar el tamaño del workgroup con una `override` sin recompilar el módulo.
+
+</Goals>
+
+## Las tres formas del atributo
+
+El atributo admite uno, dos o tres argumentos. Los que faltan valen uno.
+
+```wgsl
+@compute @workgroup_size(64)        fn a() { }   // 64 x 1 x 1 = 64 invocaciones
+@compute @workgroup_size(8, 8)      fn b() { }   //  8 x 8 x 1 = 64 invocaciones
+@compute @workgroup_size(4, 4, 4)   fn c() { }   //  4 x 4 x 4 = 64 invocaciones
+```
+
+Las tres declaraciones producen exactamente 64 invocaciones por workgroup. Lo que cambia es la forma de `local_invocation_id`, y con ella la forma natural del dominio que quieres recorrer. Nada más. El hardware no sabe nada de las dimensiones: internamente aplana el workgroup al índice que ya conoces, `x + y·sx + z·sx·sy`, y lo reparte en grupos SIMD por ese orden.
+
+Eso tiene una consecuencia que no es evidente. Con `@workgroup_size(8, 8)`, las ocho invocaciones de la primera fila —`y` igual a cero, `x` de cero a siete— caen en las ocho primeras posiciones del índice aplanado. En una máquina con warps de 32, el primer warp contiene las cuatro primeras filas del bloque. Por eso un acceso a textura con `gid.xy` es coalescente en `x` y salta en `y`: dentro de un warp hay cuatro tramos contiguos de ocho píxeles, no uno de 32.
+
+Los argumentos deben ser expresiones constantes en tiempo de creación del pipeline. Pueden ser literales, `const` de WGSL, o `override` (con las condiciones de la última sección). No pueden ser un uniform ni depender de nada que cambie en ejecución.
+
+## Los límites que acota la especificación
+
+WebGPU define límites por defecto que **todo** dispositivo conforme cumple. Son el suelo garantizado: si te ciñes a ellos, tu shader funciona en cualquier navegador y en cualquier GPU con soporte.
+
+| límite | valor por defecto | qué acota |
+|---|---|---|
+| `maxComputeWorkgroupSizeX` | 256 | primer argumento de `@workgroup_size` |
+| `maxComputeWorkgroupSizeY` | 256 | segundo argumento |
+| `maxComputeWorkgroupSizeZ` | 64 | tercer argumento |
+| `maxComputeInvocationsPerWorkgroup` | 256 | el **producto** de los tres |
+| `maxComputeWorkgroupStorageSize` | 16384 bytes | total de `var` en address space `workgroup` |
+| `maxComputeWorkgroupsPerDimension` | 65535 | cada argumento de `dispatchWorkgroups` |
+
+El que muerde es `maxComputeInvocationsPerWorkgroup`. Vale 256, no 65536: aunque X e Y admitan 256 cada uno por separado, `@workgroup_size(256, 256)` no compila en ningún dispositivo por defecto porque el producto es 65536. La forma correcta de leer la tabla es "cada dimensión no puede pasar de su tope **y además** el producto no puede pasar de 256".
+
+El límite de almacenamiento, 16384 bytes, es el otro techo real. Son 4096 valores `f32` o 1024 `vec4f`. Un tile de 64 por 64 flotantes ocupa 16384 bytes exactos, o sea que no cabe junto con nada más; un tile de 32 por 32 ocupa 4096 y deja sitio de sobra. Volveremos a esta cuenta en [el tiling de la multiplicación de matrices](/guia/webgpu/n37-tiling-en-memoria-compartida/), donde es el factor que decide el tamaño del tile.
+
+Muchos dispositivos ofrecen más. Consultar el límite real y pedirlo es trivial, pero conviene entender que pedirlo tiene un precio: si lo pides y el dispositivo no lo da, `requestDevice` rechaza.
+
+```js
+const adapter = await navigator.gpu.requestAdapter();
+
+const quiero = 1024;
+const puedo  = adapter.limits.maxComputeInvocationsPerWorkgroup;   // p. ej. 1024
+const usar   = Math.min(quiero, puedo);
+
+const device = await adapter.requestDevice({
+  requiredLimits: {
+    // Solo pedimos lo que el adaptador ya nos ha dicho que tiene.
+    maxComputeInvocationsPerWorkgroup: usar,
+    maxComputeWorkgroupSizeX: usar,
+  },
+});
+```
+
+El patrón es siempre ese: leer del adaptador, quedarse con el mínimo entre lo que quieres y lo que hay, y pedir ese mínimo. Pedir el máximo del adaptador "por si acaso" es contraproducente, porque algunas implementaciones asignan recursos en función de lo que declaras y un límite alto puede reducir el número de grupos concurrentes.
+
+## Parametrizar el tamaño sin duplicar el shader
+
+Aquí está la utilidad menos conocida de las `override` constants. WGSL permite usar una `override` como argumento de `@workgroup_size`, y el valor se fija al crear el pipeline, no al compilar el módulo. Un mismo `GPUShaderModule` puede producir varios pipelines con tamaños de workgroup distintos.
+
+```wgsl
+override TAM: u32 = 64u;
+
+@group(0) @binding(0) var<storage, read>       entrada: array<f32>;
+@group(0) @binding(1) var<storage, read_write> salida:  array<f32>;
+
+@compute @workgroup_size(TAM)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= arrayLength(&entrada)) { return; }
+  salida[i] = sqrt(entrada[i]);
+}
+```
+
+```js
+const module = device.createShaderModule({ code: wgsl });
+
+function pipelineCon(tam) {
+  return device.createComputePipeline({
+    layout: 'auto',
+    compute: { module, entryPoint: 'main', constants: { TAM: tam } },
+  });
+}
+
+const p64  = pipelineCon(64);
+const p256 = pipelineCon(256);
+```
+
+Con esto puedes medir en el dispositivo real cuál va mejor y quedarte con el ganador, sin mantener dos copias del código. Es la forma limpia de afinar sin adivinar, y encaja con el criterio de la [lección siguiente](/guia/webgpu/n31-elegir-el-tamano-de-workgroup/).
+
+Hay una restricción importante: **una `override` no puede usarse para dimensionar un `var` del address space `workgroup`**. El tamaño de un array en memoria compartida debe ser una expresión constante en tiempo de compilación del módulo, no de creación del pipeline. Así que este código no compila:
+
+```wgsl
+override TAM: u32 = 64u;
+var<workgroup> buf: array<f32, TAM>;   // ERROR: TAM no es const
+```
+
+La salida es declarar el array con el tamaño máximo que vayas a usar y trabajar solo con la parte que toca, o usar `const` de verdad y generar el código WGSL como plantilla desde JavaScript. La segunda opción es la que usan casi todas las librerías serias: el shader es una función que devuelve una cadena, y el tamaño entra por interpolación.
+
+```js
+const wgsl = (TAM) => `
+const TAM: u32 = ${TAM}u;
+var<workgroup> buf: array<f32, TAM>;
+
+@compute @workgroup_size(TAM)
+fn main(@builtin(local_invocation_index) li: u32) {
+  buf[li] = f32(li);
+  workgroupBarrier();
+  // ...
+}`;
+```
+
+Es menos elegante que una `override`, pero es la única forma de tener un array de memoria compartida cuyo tamaño coincida siempre con el del workgroup, que es lo que quieres en todos los algoritmos de [reducción y scan](/guia/webgpu/n33-la-reduccion-en-arbol/).
+
+<Callout type="dios" title="El tamano del workgroup y el tamano del array compartido tienen que ser el mismo numero, y el compilador no te va a avisar">
+La restricción de que una `override` no dimensione memoria `workgroup` genera un fallo tan común que merece nombre propio. Alguien declara `var<workgroup> buf: array<f32, 256>` porque 256 es el máximo, pone `@workgroup_size(TAM)` con `TAM` configurable, y crea el pipeline con `TAM` igual a 64. El shader compila, se ejecuta y produce resultados incorrectos sin ningún aviso: la reducción en árbol recorre 256 posiciones de las que 192 nunca se escribieron, y como la memoria `workgroup` está inicializada a cero, una suma sale bien —los ceros no molestan— pero un mínimo sale cero siempre y un máximo sale mal en cuanto los datos son negativos. Es un bug que se manifiesta solo con ciertos operadores y ciertos datos, lo cual lo convierte en un infierno de depuración. La disciplina que lo evita es sencilla y no negociable: **el bucle de reducción nunca se escribe contra el tamaño del array, se escribe contra el tamaño del workgroup**, y esos dos números salen de la misma constante. Si generas el WGSL como plantilla, hay un único sitio del que salen los dos y el problema desaparece de raíz. Si insistes en la `override`, entonces tienes que pasar el tamaño efectivo y comparar contra él en cada iteración, lo cual añade una comparación por invocación y por paso a cambio de nada.
+</Callout>

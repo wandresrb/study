@@ -1,0 +1,159 @@
+---
+title: "Batching: una propagación en lugar de cinco"
+description: "Cinco escrituras seguidas sobre un mismo grafo producen cinco recorridos completos del cono de dependientes, cinco tandas de efectos y cinco parches al DOM, cuando el resultado observable es idéntico al de una sola pasada. El batching convierte ese trabajo cuadrático en lineal agrupando las escrituras en una única propagación diferida. Esta lección analiza el batching como técnica de rendimiento: qué ahorra exactamente, dónde están sus fronteras, qué sabores de vaciado existen y por qué su beneficio crece con el solapamiento entre los conos de las escrituras agrupadas."
+subject: estado
+level: 24
+order: 3
+position: "24.3"
+duration: "16 min"
+---
+
+<Lead>
+Un manejador de evento rara vez escribe un solo dato. Abre un modal, marca un elemento como seleccionado, actualiza un contador y limpia un mensaje de error, y lo hace en cuatro líneas consecutivas. Si cada línea dispara su propia propagación, el sistema recorre cuatro veces un grafo que en gran parte es el mismo, ejecuta cuatro veces efectos que producen la misma salida final y toca el DOM cuatro veces para que el usuario vea un único cambio. El batching es la respuesta a este desperdicio: retener las escrituras, acumular los nodos sucios y propagar una sola vez cuando el bloque termina. No es una optimización marginal, es la diferencia entre pagar por escritura y pagar por transición.
+</Lead>
+
+<Goals>
+
+- Cuantificar el trabajo redundante que produce propagar cada escritura por separado.
+- Implementar un agrupador con contador de profundidad y conjunto de nodos pendientes.
+- Distinguir los sabores de vaciado y su efecto sobre la latencia percibida.
+- Identificar las fronteras que rompen el agrupamiento automático y cómo repararlas.
+
+</Goals>
+
+## La factura de propagar cinco veces
+
+Sean cinco escrituras consecutivas sobre señales distintas cuyos conos de dependientes se solapan. Sin agrupar, el coste total es la suma de los cinco conos, y cada nodo compartido se recalcula tantas veces como escrituras lo alcanzan. Agrupando, el coste es el tamaño de la unión de los conos, y cada nodo se recalcula exactamente una vez.
+
+```ts
+// sin batching: cinco propagaciones independientes
+setAbierto(true)      // recorre su cono
+setSeleccion(id)      // recorre su cono, que solapa con el anterior
+setContador(n + 1)    // recorre su cono
+setError(null)        // recorre su cono
+setFiltro("todos")    // recorre su cono
+// coste: suma de los cinco conos, nodos compartidos recalculados cinco veces
+
+// con batching: una sola propagacion
+batch(() => {
+  setAbierto(true); setSeleccion(id); setContador(n + 1)
+  setError(null);   setFiltro("todos")
+})
+// coste: union de los cinco conos, cada nodo recalculado una vez
+```
+
+El ahorro depende por completo del solapamiento. Si los cinco conos son disjuntos, agrupar ahorra las cuatro tandas de efectos y los cuatro parches redundantes al DOM, pero el trabajo de recálculo es el mismo. Si los cinco conos convergen en un nodo raíz caro, por ejemplo una lista derivada que ordena y filtra miles de elementos, agrupar reduce cinco ejecuciones de esa función a una sola. Por eso el batching rinde más cuanto más profundo y compartido es el grafo, que es exactamente la situación de cualquier aplicación no trivial.
+
+Vale la pena expresar la relación con números. Si las cinco escrituras alcanzan un derivado común cuyo recálculo cuesta un milisegundo, sin agrupar se pagan cinco milisegundos y con lote uno, y el ahorro no depende de lo rápido que sea el motor sino de la aritmética del solapamiento. Si además ese derivado alimenta a diez efectos, sin agrupar se ejecutan cincuenta y con lote diez. El batching es, en este sentido, una de las poquísimas optimizaciones cuyo beneficio se puede predecir sobre el papel antes de medir, porque no depende de constantes ocultas del entorno sino de la forma del grafo.
+
+<Callout type="info" title="Dos ahorros distintos bajo el mismo nombre">
+Conviene separar lo que se ahorra en el grafo de lo que se ahorra en la salida. En el grafo, el batching elimina recálculos duplicados de nodos derivados compartidos, y su beneficio es proporcional al solapamiento entre conos. En la salida, elimina ejecuciones redundantes de efectos y escrituras al DOM, y su beneficio es proporcional al número de escrituras, con independencia del solapamiento. El segundo ahorro suele ser el que se nota, porque tocar el DOM y disparar recálculos de estilo son operaciones caras que además pueden provocar lecturas forzadas de geometría.
+</Callout>
+
+## Cómo se agrupa por dentro
+
+Un agrupador correcto necesita solo dos cosas: un contador de profundidad para soportar anidamiento y un conjunto de nodos pendientes. Mientras el contador sea mayor que cero, escribir solo apila; al volver a cero, se drena todo en orden de dependencias y recién entonces corren los efectos.
+
+```ts
+let profundidad = 0
+const pendientes = new Set<Nodo>()
+
+function batch<T>(fn: () => T): T {
+  profundidad++
+  try { return fn() }
+  finally { if (--profundidad === 0) drenar() }
+}
+
+function marcarSucio(n: Nodo): void {
+  pendientes.add(n)                    // el Set deduplica escrituras repetidas
+  if (profundidad === 0) drenar()      // sin lote abierto se propaga al instante
+}
+
+function drenar(): void {
+  const cono = ordenarPorAltura(pendientes)  // orden topologico
+  pendientes.clear()
+  for (const n of cono) n.recalcular()
+  correrEfectos()                            // una sola tanda, con valores finales
+}
+```
+
+El uso de un conjunto es lo que convierte tres escrituras sobre la misma señal en una sola marca, y el contador de profundidad es lo que hace que componer funciones que ya agrupan por su cuenta no multiplique las pasadas: solo el cierre del lote más externo dispara el vaciado. Es la misma semántica que las transacciones anidadas de una base de datos, donde únicamente el commit exterior es observable.
+
+<Mermaid code={`sequenceDiagram
+  participant U as codigo
+  participant P as pendientes
+  participant G as grafo
+  participant E as efectos
+  U->>P: cinco escrituras marcan nodos sucios
+  U->>G: cierre del lote dispara el drenado
+  G->>G: ordena por altura y recalcula la union de conos
+  G->>E: una sola tanda de efectos con valores finales
+  E->>E: un unico parche al DOM`} />
+
+Hay dos detalles de implementación que separan un agrupador de juguete de uno utilizable. El primero es qué ocurre si un efecto escribe durante el drenado: el conjunto de pendientes se está recorriendo mientras alguien lo modifica, y sin un límite explícito de iteraciones un ciclo entre dos efectos produce un bucle infinito en lugar de un error diagnosticable. El segundo es la seguridad frente a excepciones: si el bloque agrupado lanza, el contador debe decrementarse igualmente, porque un lote que queda abierto convierte todas las escrituras posteriores de la aplicación en marcas que nadie drena, y el síntoma es una interfaz que deja de responder sin ningún error en la consola.
+
+```ts
+function drenarSeguro(): void {
+  let vueltas = 0
+  while (pendientes.size > 0) {
+    if (++vueltas > 100) throw new Error("ciclo de efectos no convergente")
+    const lote = ordenarPorAltura(pendientes)
+    pendientes.clear()
+    for (const n of lote) n.recalcular()
+  }
+  correrEfectos()
+}
+```
+
+## Sabores de vaciado y latencia
+
+Todos los sistemas agrupan, pero difieren en el momento del vaciado, y esa elección cambia el perfil de latencia mucho más que el de trabajo total.
+
+<Cards>
+  <Card icon="⚡" title="Síncrono al cerrar">
+    El vaciado ocurre en la misma pila, al salir del `batch`. Predecible y fácil de razonar, pero cada bloque explícito paga su propagación de inmediato y no coalesce con el siguiente.
+  </Card>
+  <Card icon="🌀" title="Microtarea">
+    El vaciado se pospone al final del tick actual. Agrupa todas las escrituras síncronas sin que el programador escriba nada, a cambio de que los efectos corran un instante después de la escritura.
+  </Card>
+  <Card icon="🎬" title="Alineado al frame">
+    Para efectos que tocan el DOM, vaciar en `requestAnimationFrame` evita trabajo visual entre dos pinturas y elimina parches que nadie llegaría a ver.
+  </Card>
+  <Card icon="🕓" title="Por prioridad">
+    Un planificador concurrente vacía primero lo urgente y difiere lo costoso, de modo que una entrada de teclado no espera a que termine de recalcularse una lista enorme.
+  </Card>
+</Cards>
+
+La regla de diseño que atraviesa los cuatro sabores es que un efecto con salida observable debe ejecutarse una sola vez por transición y con valores finales. El cuándo se elige por latencia; el cuántas veces siempre debe ser uno. En 2026 la convergencia es casi total: React agrupa automáticamente todas las actualizaciones de un tick incluidas las que ocurren tras una promesa, Vue vacía su cola en el `nextTick`, Angular planifica los efectos de señales en una fase agrupada, Svelte vacía sus runes en una microtarea, y la propuesta de Signals de TC39 delega el vaciado en un observador que el consumidor programa a su gusto.
+
+<Callout type="warn" title="La frontera del lote implícito es el tick, no la función">
+El agrupamiento automático solo alcanza a las escrituras que ocurren en el mismo turno del bucle de eventos. Una escritura después de un `await`, dentro de un `setTimeout` o en el callback de un lector de archivos cae en otra tarea y abre su propia propagación. El caso más costoso es un bucle que espera una promesa por elemento y escribe en cada vuelta: cien elementos producen cien propagaciones completas aunque el código parezca un bloque. La reparación consiste en acumular los resultados en una estructura local y hacer una sola escritura al final, o en envolver explícitamente el tramo síncrono que aplica todos los cambios.
+</Callout>
+
+```ts
+// MAL: una propagacion por elemento, cien recorridos del grafo
+for (const id of ids) {
+  const item = await cargar(id)
+  añadirAlEstado(item)          // cada await rompe el lote implicito
+}
+
+// BIEN: se acumula fuera del estado y se escribe una vez
+const items = await Promise.all(ids.map(cargar))
+batch(() => { for (const it of items) añadirAlEstado(it) })
+```
+
+<Callout type="tip" title="Cuenta propagaciones, no milisegundos">
+Instrumenta el drenado con un contador y registra cuántas propagaciones produce una interacción típica. Si un clic genera más de una, hay agrupamiento roto en alguna parte, y encontrarlo suele revelar un `await` mal colocado o una escritura dentro de un bucle. Este número es mucho más estable que cualquier medición de tiempo porque no depende de la máquina, y además señala directamente la línea culpable en lugar de un punto caliente difuso en el perfil.
+</Callout>
+
+<Callout type="dios" title="Agrupar es negarse a que el tiempo interno se filtre al exterior">
+El batching se explica casi siempre como una optimización, y lo es, pero su naturaleza profunda es otra: es una decisión sobre qué instantes del programa merecen existir para un observador. Entre el estado antes de una interacción y el estado después, el sistema atraviesa una secuencia de configuraciones internas que son artefactos del orden en que el programador decidió escribir las líneas, no hechos sobre el dominio. Que el modal se abriera antes de que se limpiara el error no significa nada para el usuario ni para el servidor; es una consecuencia de que una línea va antes que otra. Propagar cada escritura por separado equivale a declarar que todos esos instantes accidentales son observables, y una vez declarados observables hay que pagarlos: pagarlos en recálculos que se descartan, en efectos que escriben algo que se sobrescribirá, en peticiones de red disparadas desde un estado a medio construir, y sobre todo en la imposibilidad de razonar, porque un sistema donde cualquier paso intermedio puede ser leído es un sistema donde ninguna invariante que relacione dos campos puede sostenerse. El lote traza una frontera y afirma que dentro de ella el tiempo es privado. Lo que ocurre entre la apertura y el cierre pertenece a la implementación; lo único que el mundo ve es la transición completa de un estado consistente al siguiente. Por eso el ahorro de trabajo, con ser real y a veces enorme, es el beneficio menor: el beneficio mayor es que las invariantes vuelven a ser expresables, y con ellas la posibilidad de razonar sobre el estado como si cambiara a saltos discretos en lugar de fluir de manera continua e inspeccionable.
+</Callout>
+
+<Challenge title="Reduce tus propagaciones a una">
+1. Instrumenta el drenado de tu librería con un contador global y registra cuántas propagaciones produce el manejador de evento más complejo de tu aplicación.
+2. Construye un grafo donde cinco señales converjan en un derivado caro; mide el tiempo con y sin agrupar y comprueba que la diferencia es proporcional al solapamiento.
+3. Implementa `batch` con contador de profundidad y demuestra que dos lotes anidados producen un único vaciado.
+4. Escribe un bucle que espere una promesa por elemento y cuenta las propagaciones; reescríbelo acumulando fuera del estado y vuelve a contar.
+5. Cambia el sabor de vaciado de síncrono a microtarea en un caso real y describe qué cambió en el número de parches al DOM y en la latencia percibida.
+</Challenge>

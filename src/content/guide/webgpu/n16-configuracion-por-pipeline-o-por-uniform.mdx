@@ -1,0 +1,94 @@
+---
+title: "Configuración por pipeline o por uniform: cómo decidir"
+description: "Los tres niveles donde puede vivir un parámetro, los cuatro criterios que deciden entre ellos, y el coste de cambiar de pipeline que hace que más variantes no siempre sean más rápidas."
+subject: webgpu
+level: 16
+order: 5
+position: "16.5"
+duration: "18 min"
+---
+
+<Lead>
+Cada parámetro de un renderer vive en uno de tres sitios: horneado en el texto del shader, fijado al crear el pipeline, o leído de memoria en cada dibujado. La elección parece un detalle de implementación y es una decisión de arquitectura, porque determina cuántos pipelines existen, y el número de pipelines determina cuántas veces hay que cambiar de estado en el bucle de dibujado.
+</Lead>
+
+<Goals>
+
+- Clasificar cualquier parámetro en uno de los tres niveles con criterio.
+- Aplicar los cuatro factores que deciden entre `override` y uniform.
+- Cuantificar el coste de cambiar de pipeline en un bucle de dibujado.
+- Diseñar una configuración híbrida que no multiplique variantes.
+
+</Goals>
+
+## Los tres niveles
+
+| Nivel | Se fija | Coste de cambiarlo | Qué permite al compilador |
+|---|---|---|---|
+| `const` | al escribir el shader | recompilar el módulo y el pipeline | todo |
+| `override` | al crear el pipeline | crear otro pipeline | eliminar ramas, desenrollar bucles |
+| uniform | al escribir el buffer | escribir unos bytes | nada |
+
+El salto de coste entre el segundo y el tercero es de varios órdenes de magnitud. Cambiar una uniform es escribir en un buffer; crear un pipeline es invocar al compilador del driver y puede costar decenas o cientos de milisegundos.
+
+Y el salto de capacidad va en la dirección contraria: una uniform no permite al compilador suponer nada, mientras que un `override` le permite reescribir el shader entero.
+
+## Los cuatro criterios
+
+**Frecuencia de cambio.** Si el valor cambia dentro de un fotograma, es una uniform y no hay discusión. Si cambia entre sesiones o al abrir un menú de opciones, puede ser `override`. Si no cambia nunca, es `const`.
+
+**Efecto sobre la estructura del código.** Un valor que solo multiplica o suma no gana nada siendo `override`, porque una operación con un valor de memoria cuesta lo mismo que con un literal. Un valor que decide si existen quince líneas con muestreos de textura, o cuántas veces se repite un bucle, gana mucho.
+
+**Número de combinaciones.** Cada combinación es un pipeline. Con tres banderas booleanas son ocho; con seis, sesenta y cuatro. El número tiene que caber en el presupuesto de carga, y hay que contarlo antes de añadir la siguiente bandera.
+
+**Cuántos objetos comparten cada valor.** Si el noventa por ciento de los objetos de la escena usan la misma configuración, especializar tiene sentido. Si cada objeto tiene la suya, cada objeto es un pipeline distinto y has convertido un problema de shader en un problema de estado.
+
+## El coste que se olvida
+
+Aquí está el factor que rara vez entra en la discusión y que a menudo decide el resultado: **cambiar de pipeline en un render pass tiene coste**.
+
+`setPipeline` no es gratis. Implica validación en la CPU y, en el driver, un cambio de estado que puede vaciar parte de la canalización de la GPU. Y lo que es peor, obliga a **ordenar el bucle de dibujado por pipeline** para no cambiar más de lo necesario, lo cual entra en conflicto con ordenar por profundidad, que es lo que optimiza la prueba de profundidad temprana, y con ordenar por bind group, que es lo que minimiza los cambios de recursos.
+
+La cuenta que hay que hacer es esta. Con cinco mil objetos y un solo pipeline, hay un `setPipeline` por fotograma. Con cinco mil objetos repartidos en cuarenta variantes ordenadas por pipeline, hay cuarenta. Eso sigue siendo poco. Pero si los objetos hay que ordenarlos de cerca a lejos para la profundidad y sus variantes están entremezcladas, el número de cambios se acerca al número de objetos, y ahí sí duele.
+
+De ahí sale una conclusión que va contra la intuición: **por encima de cierto número de variantes, la versión con ramas dinámicas y un solo pipeline gana**, no porque el shader sea más rápido, sino porque el bucle de dibujado deja de fragmentarse. Es el mismo argumento que llevó a los motores comerciales de la explosión de permutaciones a los shaders unificados con ramificación uniforme.
+
+## Cómo decidir en la práctica
+
+La configuración que funciona en la mayoría de los renderers es híbrida y tiene esta forma:
+
+**`const` para todo lo que sea matemáticas, tablas y estructura interna.** Es el grupo más numeroso y no genera ninguna decisión.
+
+**`override` para dos o tres ejes de calidad, cuantizados a pocos escalones.** Típicamente uno de calidad global, uno de número de luces cuantizado y uno de familia de material. Eso da entre cuatro y doce variantes reales, que se compilan en la carga en paralelo y no fragmentan el bucle porque los objetos se agrupan de forma natural por ellas.
+
+**Uniform para todo lo demás**, incluidas las banderas de material que varían objeto a objeto. Una máscara de bits en un `u32` dentro de la struct de material cubre veinte banderas en cuatro bytes, y el coste de comprobarlas es una operación de bits por fragmento.
+
+```wgsl
+// Estructura: se decide al crear el pipeline.
+override CALIDAD_SOMBRA : u32 = 1u;
+
+// Variacion por objeto: se lee del material.
+struct Material {
+  colorBase  : vec4f,
+  banderas   : u32,      // bit 0 mapa de normales, bit 1 emision, bit 2 ...
+  rugosidad  : f32,
+  metalico   : f32,
+  _relleno   : f32,
+};
+
+fn tieneMapaNormal(m : Material) -> bool { return (m.banderas & 1u) != 0u; }
+```
+
+La regla que resume la división: **`override` para lo que cambia la forma del shader, uniform para lo que cambia sus números**.
+
+<Callout type="dios" title="La industria fue de las permutaciones al shader unificado y volvió a medias, y el motivo es que el cuello de botella cambió">
+Merece la pena conocer esta historia porque explica por qué los consejos que encuentras por ahí se contradicen entre sí, y porque te dice cómo decidir en tu caso concreto.
+
+**Primera época, permutaciones.** A mediados de los dos mil, la ramificación en GPU era muy cara: un salto podía costar decenas de ciclos y la divergencia era catastrófica. La respuesta obvia fue especializar todo con el preprocesador. Los motores acabaron con decenas de miles de variantes, tiempos de compilación de horas en el proceso de construcción y cachés de shaders de gigabytes.
+
+**Segunda época, shaders unificados.** Con hardware capaz de ramificar barato cuando la condición es uniforme, y con presupuestos de carga que ya no aguantaban miles de compilaciones, el péndulo se fue al otro lado: un único shader grande con ramas sobre uniforms. La compilación pasó a ser trivial y el bucle de dibujado se simplificó, a cambio de shaders que usan más registros de los necesarios —el compilador reserva para el caso peor de todas las ramas— y por tanto tienen peor ocupación.
+
+**Tercera época, la actual.** El cuello de botella se movió otra vez, y ahora está en el coste de CPU por objeto y en el ancho de banda. Eso favorece **pocos pipelines con mucha ramificación uniforme**, porque permite agrupar miles de objetos en un solo dibujado indirecto, y esa agrupación vale más que los registros que se ahorrarían especializando. Pero al mismo tiempo, las `override` de WGSL hacen que las pocas variantes que sí importan sean casi gratis de mantener.
+
+La lección que se saca, y que vale para tu renderer sin necesidad de repetir la historia: **el número correcto de variantes no depende de tu shader, depende de dónde esté tu cuello de botella**. Si estás limitado por CPU o por número de dibujados, menos variantes y más ramas. Si estás limitado por el fragment shader y tienes pocos objetos grandes, más variantes y menos ramas. Y como el cuello cambia entre escenas y entre dispositivos, la decisión no es permanente: por eso conviene que las banderas puedan moverse de `override` a uniform con un cambio pequeño, y por eso la máscara de bits en el material es tan buena idea. Diseñar para poder cambiar de opinión es más valioso que acertar a la primera.
+</Callout>

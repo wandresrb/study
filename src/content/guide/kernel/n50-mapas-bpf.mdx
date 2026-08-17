@@ -1,0 +1,161 @@
+---
+title: "Los mapas: estado compartido entre kernel y usuario"
+description: "La memoria persistente de eBPF. Cómo los mapas resuelven dos problemas a la vez: guardar estado entre disparos de un programa y comunicar resultados entre el kernel y el espacio de usuario. Hash, array, variantes per-CPU y el ring buffer como flujo moderno de eventos."
+subject: kernel
+level: 50
+order: 4
+position: "50.4"
+duration: "16 min"
+---
+
+<Lead>
+Un programa eBPF nace y muere en cada disparo: se ejecuta cuando su evento ocurre y no recuerda nada de la vez anterior. Sin memoria persistente sería inútil para contar, medir o correlacionar. Los mapas son esa memoria. Son estructuras de datos que viven en el kernel, sobreviven entre invocaciones y —esto es lo decisivo— pueden leerse y escribirse tanto desde el programa en anillo 0 como desde un proceso en espacio de usuario. Con una sola abstracción, eBPF resuelve a la vez el problema del estado y el de la comunicación entre los dos lados del sistema.
+</Lead>
+
+<Goals>
+
+- Entender el mapa como estado persistente y como puente entre kernel y espacio de usuario.
+- Manejar los dos mapas fundamentales: hash y array, con sus auxiliares.
+- Ver por qué las variantes per-CPU eliminan carreras y contención de caché.
+- Usar el ring buffer como flujo eficiente de eventos hacia el espacio de usuario.
+
+</Goals>
+
+## Estado y puente en una sola abstracción
+
+Un mapa es un almacén clave-valor gestionado por el kernel. Se declara en el propio programa con metadatos BTF, y `libbpf` lo crea al cargar. Desde el lado del kernel se accede con auxiliares —`bpf_map_lookup_elem`, `bpf_map_update_elem`, `bpf_map_delete_elem`—; desde el lado del usuario, con la llamada `bpf()` o, en algunos tipos, con `mmap`. El mismo mapa es visible por ambos, y ahí reside su poder: el programa acumula datos en anillo 0 y el proceso los lee sin copias ni bloqueos costosos.
+
+```c
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 10240);
+	__type(key, u32);
+	__type(value, u64);
+} syscalls_por_pid SEC(".maps");
+```
+
+<Mermaid code={`flowchart LR
+  P[programa eBPF en anillo 0] -->|bpf_map_update_elem| M[mapa en el kernel]
+  M -->|bpf_map_lookup_elem| P
+  U[proceso en espacio de usuario] -->|syscall bpf o mmap| M
+  M -->|lectura sin copia| U`} />
+
+## Hash y array: los dos mapas fundamentales
+
+El mapa **hash** admite claves arbitrarias y crece dinámicamente hasta su tope; es el que usarías para contar por PID, por dirección IP o por nombre de función. El mapa **array** usa un índice entero como clave, está preasignado por completo y es más rápido y predecible, ideal para tablas de configuración o histogramas de tamaño fijo. Un contador de llamadas al sistema por proceso, sobre un mapa hash:
+
+```c
+SEC("tp/raw_syscalls/sys_enter")
+int cuenta(void *ctx)
+{
+	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u64 *n = bpf_map_lookup_elem(&syscalls_por_pid, &pid);
+
+	if (n)
+		__sync_fetch_and_add(n, 1);     /* incremento atómico sobre el valor */
+	else {
+		u64 uno = 1;
+		bpf_map_update_elem(&syscalls_por_pid, &pid, &uno, BPF_ANY);
+	}
+	return 0;
+}
+```
+
+Fíjate en un detalle sutil: `bpf_map_lookup_elem` devuelve un **puntero directo** al valor dentro del kernel, no una copia. Por eso puedes modificarlo en el sitio con un incremento atómico. Pero también por eso, si dos CPUs tocan la misma entrada a la vez, hay una carrera —y el incremento atómico es la forma mínima de evitar que se pierdan cuentas—.
+
+## Per-CPU: evitar carreras repartiendo el estado
+
+La solución elegante a esa contención es no compartir. Las variantes `BPF_MAP_TYPE_PERCPU_HASH` y `BPF_MAP_TYPE_PERCPU_ARRAY` mantienen **una copia del valor por cada CPU**. Cada núcleo actualiza la suya sin bloqueos ni operaciones atómicas y sin hacer rebotar la línea de caché entre procesadores; el espacio de usuario suma después las copias para obtener el total:
+
+```c
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} bytes_totales SEC(".maps");
+
+SEC("xdp")
+int contabiliza(struct xdp_md *ctx)
+{
+	u32 clave = 0;
+	u64 len = ctx->data_end - ctx->data;
+	u64 *acc = bpf_map_lookup_elem(&bytes_totales, &clave);
+
+	if (acc)
+		*acc += len;    /* sin átomos: esta CPU es dueña de su copia */
+	return XDP_PASS;
+}
+```
+
+En un XDP que procesa millones de paquetes por segundo, la diferencia entre un contador compartido con átomos y un contador per-CPU es la diferencia entre saturarse y volar. El coste es que la lectura debe agregar; la ganancia es que la escritura, en el camino caliente, no compite con nadie.
+
+<Cards>
+  <Card icon="🗂️" title="Hash frente a array">
+    El hash admite claves arbitrarias y crece según se usa; el array indexa por entero y se preasigna entero. Elige hash para claves ricas, array para tablas densas y rápidas.
+  </Card>
+  <Card icon="🧮" title="Compartido frente a per-CPU">
+    Un mapa normal se ve igual desde todas las CPUs y exige átomos o `bpf_spin_lock`; el per-CPU da a cada núcleo su copia sin sincronización, a cambio de agregar al leer.
+  </Card>
+</Cards>
+
+## El ring buffer: el flujo de eventos al espacio de usuario
+
+Los contadores resumen; a veces necesitas el evento entero. Para transmitir un flujo de registros del kernel al usuario, el tipo `BPF_MAP_TYPE_RINGBUF` —incorporado en Linux 5.8— es hoy la respuesta canónica. Es un búfer circular único de varios productores y un consumidor, que preserva el orden de los eventos, notifica por `epoll` y desperdicia mucha menos memoria que el antiguo búfer per-CPU de `perf`. Su API reserva espacio, lo rellena y lo confirma:
+
+```c
+struct evento { u32 pid; u8 comm[16]; };
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);   /* tamaño en bytes, potencia de dos */
+} eventos SEC(".maps");
+
+SEC("tp/sched/sched_process_exec")
+int al_exec(void *ctx)
+{
+	struct evento *e = bpf_ringbuf_reserve(&eventos, sizeof(*e), 0);
+	if (!e)
+		return 0;                              /* búfer lleno: se descarta */
+
+	e->pid = bpf_get_current_pid_tgid() >> 32;
+	bpf_get_current_comm(&e->comm, sizeof(e->comm));
+	bpf_ringbuf_submit(e, 0);                      /* visible ya para el usuario */
+	return 0;
+}
+```
+
+Del lado del usuario, `libbpf` ofrece un lector que despierta con `epoll` y entrega cada registro a una función:
+
+```c
+static int al_evento(void *ctx, void *data, size_t len)
+{
+	const struct evento *e = data;
+	printf("exec pid=%u comm=%s\n", e->pid, e->comm);
+	return 0;
+}
+
+struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(skel->maps.eventos),
+					  al_evento, NULL, NULL);
+while (!parar)
+	ring_buffer__poll(rb, 100 /* ms */);
+```
+
+<Callout type="tip" title="Reservar y confirmar, no copiar y enviar">
+La virtud del ring buffer es que `bpf_ringbuf_reserve` te da un puntero *dentro* del búfer: escribes el evento directamente en su destino final y `bpf_ringbuf_submit` solo hace visible lo ya escrito. No hay copia intermedia. Y si decides que el evento no interesa, `bpf_ringbuf_discard` lo tira sin coste. Reservar, rellenar, confirmar o descartar: ese patrón sustituyó al viejo `bpf_perf_event_output` en casi todo el código nuevo.
+</Callout>
+
+<Callout type="info" title="Un zoo de mapas más allá de los cuatro básicos">
+Hash, array, per-CPU y ring buffer son el núcleo, pero el catálogo es enorme y cada tipo resuelve un problema concreto. `LRU_HASH` desaloja las entradas menos usadas cuando se llena, ideal para cachés. `LPM_TRIE` indexa por prefijo de bits y es la base de las tablas de enrutamiento. `PROG_ARRAY` guarda descriptores de programas para las *tail calls*. `SK_STORAGE` y `TASK_STORAGE` cuelgan datos directamente de un socket o de un `task_struct`, con su mismo ciclo de vida. Y los *map-in-map* —`ARRAY_OF_MAPS`, `HASH_OF_MAPS`— permiten intercambiar mapas enteros en caliente. Para exclusión a nivel de valor existe `bpf_spin_lock`, embebible dentro del propio valor del mapa.
+</Callout>
+
+<Callout type="dios" title="El mapa disuelve la frontera más antigua del sistema operativo">
+Detente en lo que un mapa realmente derriba, porque es una de las divisiones más sagradas de la informática de sistemas. Desde el primer Unix, el espacio de usuario y el espacio del kernel son dos mundos separados por un abismo diseñado a propósito: la llamada al sistema, con su cambio de privilegio, su validación de argumentos y su copia explícita de datos de un lado a otro. Toda comunicación entre ambos pagaba ese peaje, y con razón, porque esa frontera es lo que protege al núcleo de los procesos. El mapa introduce una tercera cosa que no es ni memoria de usuario ni memoria de kernel al uso: es una región gobernada por el kernel, con tipos declarados y accesos controlados, que ambos lados comparten como iguales. El programa en anillo 0 escribe; el proceso en anillo 3 lee; y no hubo una llamada al sistema por cada dato, ni una copia byte a byte, ni una interfaz nueva que diseñar y mantener. Piensa en la cascada de consecuencias. La observabilidad deja de significar arrancar torrentes de texto por un fichero de traza y pasa a significar un programa que agrega en el kernel y un consumidor que lee el resumen ya digerido. El estado de un cortafuegos, de un balanceador, de un monitor de seguridad, deja de vivir en tablas rígidas del kernel configuradas desde fuera y pasa a vivir en mapas que un control en espacio de usuario actualiza en caliente mientras el plano de datos en anillo 0 los consulta a velocidad de línea. Esa separación entre un plano de datos rápido dentro del kernel y un plano de control flexible fuera de él —unidos por mapas en vez de por llamadas al sistema— es la arquitectura que hace posibles a Cilium, a Falco y a la observabilidad moderna. El mapa no es una estructura de datos más: es el material con el que eBPF cose los dos lados del sistema operativo sin romper la frontera que los protege.
+</Callout>
+
+<Challenge title="Construye tu propio flujo de eventos">
+1. Escribe el contador de llamadas al sistema por PID sobre un mapa hash y vuélcalo desde el usuario con `bpftool map dump`.
+2. Convierte un contador global de bytes a `BPF_MAP_TYPE_PERCPU_ARRAY` y explica por qué en el camino caliente de XDP desaparecen los incrementos atómicos.
+3. Implementa el ring buffer de `exec` y su lector con `ring_buffer__poll`; provoca ejecuciones y compruébalas en tiempo real.
+4. Razona por qué `bpf_ringbuf_reserve` devuelve un puntero al interior del búfer y qué copia exacta te ahorra frente al viejo `bpf_perf_event_output`.
+</Challenge>

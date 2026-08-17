@@ -1,0 +1,157 @@
+---
+title: "La herencia de Erlang y Akka: supervisión y let it crash"
+description: "Dejar que un proceso muera no es negligencia, es una estrategia de corrección. Esta lección reconstruye la doctrina de OTP desde su premisa real: el único estado cuya validez has demostrado es el inicial, y por eso reiniciar es la reparación más barata que existe. Recorre la anatomía de la señal de salida, la diferencia entre enlace y monitor, las estrategias de reinicio y la intensidad que convierte un bucle de fallos en una escalada ordenada, la separación entre fallo de dominio y fallo de invariante, y termina mostrando qué queda por construir a mano cuando el runtime no trae árbol de supervisión de fábrica."
+subject: maquinas
+level: 21
+order: 2
+position: "21.2"
+duration: "22 min"
+---
+
+<Lead>
+La frase `let it crash` se ha divulgado tan mal que suena a permiso para no manejar errores, cuando es exactamente lo contrario: es una tesis sobre dónde debe vivir el manejo de errores y quién tiene derecho a decidir la reparación. Su premisa es incómoda y verificable: de todos los estados por los que pasa un proceso a lo largo de su vida, el único cuya consistencia has demostrado de verdad es el inicial. Si aceptas eso, reintentar dentro de un proceso corrompido es apostar por un estado que nadie certificó, y volver al principio bajo la vigilancia de otro proceso pasa a ser la reparación más barata y más honesta disponible. Erlang construyó centrales telefónicas con años de servicio ininterrumpido sobre esa idea, y Akka la trajo a la JVM casi intacta.
+</Lead>
+
+<Goals>
+
+- Justificar `let it crash` desde el argumento del estado cuya corrección está probada.
+- Distinguir enlace, monitor y señal de salida, y ver cómo un supervisor los usa.
+- Elegir estrategia e intensidad de reinicio según el acoplamiento entre hermanos.
+- Reconstruir un árbol de supervisión cuando el runtime no lo trae de fábrica.
+
+</Goals>
+
+## El núcleo del error y la separación de caminos
+
+El argumento se apoya en una taxonomía de Jim Gray que sigue siendo la mejor descripción de por qué fallan los sistemas en producción. Los fallos deterministas y reproducibles se eliminan en desarrollo; los que sobreviven al despliegue son mayoritariamente transitorios, dependientes de una interleaving concreta, de un temporizador que venció mal o de un dato que llegó en un orden improbable. Un fallo transitorio no se cura entendiéndolo en el momento: se cura volviendo a un punto conocido y repitiendo, porque la condición que lo produjo casi nunca se reproduce. Reiniciar no es rendirse, es aplicar la reparación que estadísticamente funciona.
+
+De ahí sale la separación de caminos que define el estilo OTP. El código de un actor escribe solo el camino feliz y deja de defenderse: nada de comprobar si el argumento era nulo, nada de envolver todo en un manejador que traga la excepción y sigue con datos dudosos. Si una invariante se rompe, el proceso muere. El código que decide qué hacer con esa muerte vive fuera, en el supervisor, y ese reparto tiene una consecuencia estructural: la lógica de negocio queda legible porque no está entretejida con la lógica de recuperación, y la lógica de recuperación queda revisable porque está concentrada en un puñado de lugares.
+
+<Callout type="tip" title="El nucleo del error decide la granularidad">
+El patrón hermano de `let it crash` es el núcleo del error. Coloca el estado que no puedes permitirte perder en el actor más pequeño, más simple y más estable del árbol, y empuja hacia las hojas todo lo que es volátil, hablador o expuesto al exterior. Un actor que solo custodia una tabla y responde consultas casi nunca falla; un actor que habla con una API ajena falla a menudo. Si ambos son el mismo actor, el fallo del segundo destruye el estado del primero, y ninguna estrategia de reinicio te salvará de un diseño que mezcló lo frágil con lo irreemplazable.
+</Callout>
+
+Falta el matiz que separa a quien ha leído el eslogan de quien ha operado el sistema: no todo fallo debe ser una caída. Un pago rechazado, un formulario inválido o un recurso inexistente son desenlaces previstos del dominio, y modelarlos como excepciones que matan al proceso es tan erróneo como tragarse una invariante rota. La regla practicable es de dos filos. Lo esperado se modela como estado o como evento y viaja por el grafo; lo inesperado —la invariante violada, el caso que no sabías que existía— se deja caer y se delega en el supervisor.
+
+## Enlaces, monitores y la señal de salida
+
+La supervisión no es una función del lenguaje sino una consecuencia de dos primitivas muy pequeñas. Un enlace es bidireccional: si dos procesos están enlazados y uno muere, el otro recibe una señal de salida y, por omisión, muere también, propagando el fallo por el grupo. Un monitor es unidireccional y silencioso: el observador recibe un mensaje normal cuando el observado muere, sin que su propia vida corra peligro. La tercera pieza es la que convierte un proceso cualquiera en supervisor: la capacidad de atrapar señales, que transforma esas señales en mensajes ordinarios de su buzón en lugar de en muertes.
+
+```ts
+// Las tres primitivas, escritas como el protocolo minimo que son.
+type Salida = { readonly tipo: 'salida'; readonly quien: Direccion; readonly motivo: unknown }
+
+type Vigilancia = {
+  enlazar(otro: Direccion): void      // bidireccional, propaga la muerte
+  monitorizar(otro: Direccion): void  // unidireccional, solo notifica
+  atraparSalidas(activo: boolean): void // convierte la senal en mensaje
+}
+```
+
+Con esas tres piezas, un supervisor es un actor absolutamente corriente: atrapa salidas, se enlaza a sus hijos y su comportamiento recibe mensajes de tipo salida junto con los demás. No hay magia de runtime, no hay excepción que suba por una pila. La muerte de un hijo llega al padre como llega cualquier otra cosa: como un mensaje en el buzón, procesado en su turno, decidido por la misma función de comportamiento que todo lo demás. Esa uniformidad es lo que hace que los árboles de supervisión se compongan sin límite.
+
+<Mermaid code={`flowchart TD
+  RAIZ[supervisor raiz] --> S1[supervisor de sesiones]
+  RAIZ --> S2[supervisor de sincronizacion]
+  S1 --> H1[sesion 1]
+  S1 --> H2[sesion 2]
+  S2 --> W1[lector remoto]
+  S2 --> W2[escritor remoto]
+  W1 -. senal de salida .-> S2
+  S2 -. escala si insiste .-> RAIZ
+  class RAIZ t-mauve
+  class W1 t-red`} />
+
+## Estrategias e intensidad de reinicio
+
+Cuando el supervisor recibe la noticia debe responder dos preguntas independientes: a quién afecta el reinicio y cuántas veces está dispuesto a intentarlo antes de admitir que el problema no es del hijo.
+
+| Estrategia | A quién reinicia | Cuándo es la correcta |
+| --- | --- | --- |
+| uno por uno | solo al hijo caído | los hermanos son independientes entre sí |
+| todos por uno | a todos los hermanos | comparten una sesión o un recurso que quedó incoherente |
+| resto por uno | al caído y a los posteriores | hay una cadena de dependencias por orden de arranque |
+| dinámica | a hijos homogéneos creados bajo demanda | una conexión, una sesión o una tarea por cliente |
+
+La segunda pregunta es la que separa un supervisor de un bucle infinito. La intensidad de reinicio fija cuántos reinicios se toleran dentro de una ventana temporal; superarla significa que el fallo no era transitorio, y entonces el supervisor no insiste: se rinde y muere él mismo, entregando la decisión a su propio padre. Esa escalada es el mecanismo por el cual un árbol convierte un fallo local en una reconfiguración cada vez más amplia, hasta que alguien con contexto suficiente puede repararlo de verdad. Sin intensidad, `let it crash` degenera en un ciclo de reinicios que consume la máquina y oculta el problema en el registro.
+
+Akka expresa lo mismo con otra notación pero idéntica semántica: una función de decisión que recibe el fallo y devuelve una directiva de cuatro valores. Reanudar conserva el estado y descarta el mensaje culpable, y es la opción que casi nunca se debe usar porque contradice la premisa del estado no verificado. Reiniciar recrea el comportamiento desde su definición inicial. Detener retira el actor definitivamente. Escalar delega hacia arriba. La riqueza está en que la decisión depende del tipo del fallo, no del hijo: un tiempo de espera agotado y una invariante rota merecen respuestas distintas aunque provengan del mismo actor.
+
+<Callout type="warn" title="Reiniciar no restaura lo que estaba a medias">
+Un reinicio devuelve el comportamiento a su estado inicial, no al mundo. Los mensajes que el actor tenía en el buzón se descartan o se reencolan según la configuración, la operación externa que estaba a medio completar no se deshace y quien esperaba una respuesta puede no recibirla jamás. Por eso la supervisión sola no da corrección: hace falta que los protocolos toleren la desaparición de un interlocutor, con tiempos de espera del lado del cliente y con idempotencia del lado del efecto. Un árbol de supervisión sobre protocolos frágiles reparte el daño con más elegancia, pero no lo evita.
+</Callout>
+
+Queda un cabo suelto que conviene atar antes de bajar al código: si reiniciar devuelve al estado inicial, qué ocurre con los actores cuyo estado no es desechable. La respuesta canónica es el actor persistente, que no guarda su estado sino la secuencia de hechos que lo produjeron y lo reconstruye reproduciéndolos al arrancar, con instantáneas periódicas para que esa reproducción no crezca sin límite. La combinación es más natural de lo que parece: el buzón ya impone un orden serial sobre los comandos que llegan a un actor, así que el registro de hechos que genera es secuencial y libre de conflictos por construcción. Supervisión y abastecimiento por eventos no congenian por casualidad, sino porque la segunda nació de la necesidad de reiniciar sin perder la historia.
+
+```ts
+import { createActor } from 'xstate'
+
+// Reiniciar sin amnesia: la instantanea guardada es el punto conocido al que volver.
+const actor = createActor(supervisado, {
+  snapshot: recuperarInstantanea(), // indefinido en el primer arranque
+})
+actor.subscribe(() => guardarInstantanea(actor.getPersistedSnapshot()))
+actor.start()
+```
+
+## Supervisión sin OTP: lo que te toca construir
+
+Un runtime en proceso como el de XState hereda el vocabulario del modelo pero no el árbol de OTP: no hay señales de salida, no hay enlaces, no hay intensidad de reinicio. Lo que sí hay es el punto de decisión, y está donde debe estar: en el padre que invoca. Un hijo que falla notifica al padre, el padre está en un estado concreto cuando recibe la noticia y ese estado decide. Reiniciar consiste en volver a entrar en el estado que invoca, porque reentrar reinvoca; escalar consiste en no manejar el error y dejar que suba.
+
+```ts
+import { setup, assign, fromPromise } from 'xstate'
+
+export const supervisado = setup({
+  types: {
+    context: {} as { reinicios: number },
+    events: {} as { type: 'ARRANCAR' } | { type: 'RENDIRSE' },
+  },
+  actors: {
+    trabajo: fromPromise(async () => {
+      throw new Error('invariante rota')
+    }),
+  },
+  guards: {
+    quedaMargen: ({ context }) => context.reinicios < 3,
+  },
+  delays: {
+    ESPERA: ({ context }) => 2 ** context.reinicios * 250,
+  },
+}).createMachine({
+  initial: 'inactivo',
+  context: { reinicios: 0 },
+  states: {
+    inactivo: { on: { ARRANCAR: 'corriendo' } },
+    corriendo: {
+      invoke: {
+        src: 'trabajo',
+        onDone: { target: 'inactivo', actions: assign({ reinicios: 0 }) },
+        onError: [
+          { target: 'enfriando', guard: 'quedaMargen' },
+          { target: 'escalado' },
+        ],
+      },
+    },
+    enfriando: {
+      entry: assign({ reinicios: ({ context }) => context.reinicios + 1 }),
+      after: { ESPERA: 'corriendo' },
+    },
+    escalado: { type: 'final' },
+  },
+})
+```
+
+Ese grafo diminuto contiene las cuatro piezas de OTP traducidas: la señal de salida es `onError`, el reinicio es la reentrada en `corriendo`, la intensidad es la guarda sobre el contador, y la escalada es un estado final cuya salida el padre de esta máquina puede observar. Lo que sigue faltando es la propagación entre hermanos, que aquí hay que escribir explícitamente enviando eventos, y la persistencia del contador entre reinicios del proceso entero. Reconocer esas ausencias importa más que lamentarlas: te dice exactamente qué garantías puedes prometer y cuáles estás fingiendo.
+
+<Callout type="dios" title="La tolerancia a fallos no es codigo defensivo: es una topologia de la confianza">
+Lo que Erlang descubrió y casi nadie transporta a otros lenguajes no es una técnica sino una reasignación de responsabilidades. En el estilo defensivo, cada función carga con la doble tarea de hacer su trabajo y sobrevivir a todos los mundos posibles en los que ese trabajo sale mal, y el resultado es un código en el que la lógica está diluida entre comprobaciones que nadie ha probado y manejadores que devuelven valores plausibles pero mentirosos. La reasignación consiste en separar quien hace de quien repara, y esa separación solo es posible si existe una frontera dura entre ambos: si el que hace comparte memoria con el que repara, la corrupción cruza la frontera y el reparador queda tan dañado como el reparado. Aquí es donde el modelo de actores deja de ser una elegancia teórica y se vuelve la condición de posibilidad de la tolerancia a fallos, porque el aislamiento total es justo lo que garantiza que la muerte de un actor sea un evento observable y no una contaminación silenciosa. De ahí que el árbol no sea un detalle de organización sino el artefacto central: cada nivel representa un ámbito de confianza y una hipótesis distinta sobre la causa del fallo, y la escalada es un algoritmo de diagnóstico que sube por hipótesis cada vez más generales hasta encontrar a alguien con contexto para arreglarlo. Diseñar un sistema tolerante a fallos, por tanto, no es escribir más manejadores: es dibujar el árbol antes que el código, decidir qué estado merece vivir cerca de la raíz, aceptar que casi todo lo demás es desechable y reponible, y escribir protocolos que sobrevivan a la desaparición de cualquiera de sus participantes. Cuando esa topología está bien elegida, el código de negocio se queda extrañamente limpio, y esa limpieza no es un efecto secundario agradable: es la señal de que la responsabilidad quedó donde tocaba.
+</Callout>
+
+<Challenge title="Dibuja el arbol antes que el codigo">
+1. Toma un módulo tuyo lleno de bloques defensivos y reescríbelo sin ninguno, delegando toda la reparación a un supervisor explícito.
+2. Clasifica diez fallos reales de tu sistema en esperados del dominio e inesperados por invariante, y decide para cada uno si debe ser evento o caída.
+3. Sitúa el estado irreemplazable de tu aplicación en el actor más simple posible y justifica por qué ese actor casi nunca puede fallar.
+4. Elige estrategia de reinicio para tres grupos de hermanos y defiende por qué en uno de ellos reiniciar solo al caído sería incorrecto.
+5. Añade intensidad y ventana temporal a la máquina supervisada del ejemplo y prueba que tras agotarlas escala en lugar de reintentar.
+6. Enumera qué garantías de OTP no puedes ofrecer con tu runtime actual y qué le prometes al equipo en su lugar.
+</Challenge>

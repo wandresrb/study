@@ -1,0 +1,106 @@
+---
+title: "perf events: contadores de hardware y muestreo estadístico"
+description: "El libro mayor secreto de la CPU: cómo la PMU cuenta ciclos, fallos de caché y predicciones erróneas en silicio, cómo perf pasa de contar a muestrear mediante el desbordamiento de un contador y una interrupción NMI, qué es el skid y cómo lo corrige el muestreo preciso PEBS, y cómo el multiplexado y el análisis top-down encuentran el cuello de botella real."
+subject: kernel
+level: 49
+order: 4
+position: "49.4"
+duration: "18 min"
+---
+
+<Lead>
+Dentro de cada núcleo de tu procesador hay un contable silencioso que nadie programó y que nunca descansa: la unidad de monitorización de rendimiento. Lleva un libro mayor de todo lo que ocurre en el silicio —cada ciclo, cada instrucción retirada, cada fallo de caché, cada predicción de salto que resultó errónea— y lo hace en hardware dedicado, sin coste para el código que observa. `perf` no calcula estas cifras: se limita a leer los registros donde la PMU ya las anotó. Y cuando de contar el total pasa a preguntar *dónde* ocurren, inventa uno de los trucos más bellos de la ingeniería de sistemas: dejar que un contador se desborde y provoque una interrupción que fotografíe el instante exacto.
+</Lead>
+
+<Goals>
+
+- Leer los contadores de hardware `cycles`, `instructions`, `cache-misses` y `branch-misses`.
+- Derivar métricas: IPC, tasa de fallo de caché y tasa de predicción errónea.
+- Entender el muestreo por desbordamiento e interrupción NMI y el sesgo del skid.
+- Usar el muestreo preciso PEBS o IBS y comprender el multiplexado de contadores.
+
+</Goals>
+
+## El libro mayor de la PMU
+
+La PMU expone un puñado de contadores programables —unos fijos, unos pocos de propósito general— que se configuran por registros del modelo específico (MSR) para contar un evento concreto. `perf list` enumera los que tu procesador soporta; los más universales son los eventos de hardware canónicos. Contarlos juntos revela la salud microarquitectónica de una función.
+
+```bash
+perf stat -e cycles,instructions,cache-references,cache-misses,\
+branch-instructions,branch-misses ./mi_programa
+```
+
+```text
+     4.512.334.900      cycles
+     8.901.223.145      instructions              #    1,97  insn per cycle
+       210.884.771      cache-references
+        63.180.442      cache-misses              #   29,96% of all cache refs
+     1.678.442.001      branches
+        12.334.567      branch-misses             #    0,73% of all branches
+```
+
+Ninguna cifra vale por sí sola; el diagnóstico vive en los **cocientes**. El IPC (`instructions` entre `cycles`) mide cuánto trabajo útil hace la CPU por ciclo: alto es bueno, bajo delata parálisis. La tasa de fallo de caché (`cache-misses` entre `cache-references`) mide cuántas veces el dato no estaba cerca: un 30% es altísimo y grita "limitado por memoria". La tasa de predicción errónea (`branch-misses` entre `branches`) mide cuánto se equivoca el predictor de saltos, cuyo castigo es vaciar la tubería. Hay también eventos de caché más finos —`L1-dcache-load-misses`, `LLC-load-misses`— para localizar en qué nivel de la jerarquía se pierde el dato.
+
+## De contar a muestrear
+
+Contar da el total, pero no dónde. El salto conceptual es el muestreo por desbordamiento. En lugar de leer el contador al final, lo **precargas** con un valor negativo —el período— y lo dejas contar hacia arriba; cuando desborda, la PMU eleva una interrupción de rendimiento, que en x86 es una NMI para poder llegar incluso con las interrupciones normales deshabilitadas. El manejador de perf captura en ese instante el puntero de instrucción, la pila y una marca de tiempo, rearma el contador con el período y sigue. Una muestra cada N eventos.
+
+<Mermaid code={`sequenceDiagram
+  participant PMU
+  participant NMI as Interrupcion NMI
+  participant H as Manejador de perf
+  participant B as Buffer en anillo
+  PMU->>PMU: cuenta hasta desbordar el periodo
+  PMU->>NMI: eleva la interrupcion de rendimiento
+  NMI->>H: entrega la muestra
+  H->>B: registra IP mas pila mas marca de tiempo
+  H->>PMU: rearma el contador con el periodo`} />
+
+Tienes dos formas de fijar el ritmo. Con `-c` das un **período** fijo: una muestra cada N eventos, exacto pero peligroso si el evento es irregular. Con `-F` das una **frecuencia** objetivo en hercios, y el kernel ajusta solo el período para acercarse a esa tasa de muestras por segundo. `perf record -F 99` es el idioma habitual: unas cien muestras por segundo, suficiente resolución sin ahogar la máquina, y el 99 en vez de 100 evita entrar en fase con temporizadores periódicos.
+
+## El skid y el muestreo preciso
+
+Hay un problema físico. Entre el evento que desborda el contador y el momento en que la NMI congela la CPU pasan varias instrucciones: la tubería está fuera de orden, hay latencia de entrega. El puntero de instrucción que perf anota no es el de la instrucción culpable, sino uno unas cuantas más adelante. Ese desfase se llama **skid**, y puede atribuir el fallo de caché a la línea equivocada.
+
+La solución es hardware. Intel ofrece PEBS (Precise Event-Based Sampling): la propia PMU escribe en un búfer el estado preciso —el IP exacto, los registros— en el momento del evento, sin esperar a la NMI. AMD tiene su equivalente, IBS. Se piden con los modificadores de precisión: `:p`, `:pp`, `:ppp`, cada nivel más exacto.
+
+```bash
+# muestreo preciso de ciclos: sin skid, el IP apunta a la instruccion real
+perf record -e cycles:pp -F 999 -g ./mi_programa
+```
+
+Sin PEBS, un perfil de fallos de caché te señala la instrucción siguiente a la que falló; con `:pp`, la que de verdad falló. Para depurar cuellos de botella de memoria a nivel de instrucción, la precisión no es un lujo, es la diferencia entre acertar y perseguir un fantasma.
+
+## Multiplexado y hallar el cuello de botella
+
+Los contadores físicos son escasos: unos cuatro de propósito general por núcleo. Si pides más eventos que contadores, el kernel los **multiplexa** en el tiempo: mide cada uno durante una fracción y extrapola al total. Por eso `perf stat` con muchos eventos muestra un porcentaje entre corchetes —la fracción de tiempo que ese evento estuvo realmente contado— y los números pasan a ser estimaciones escaladas, no cuentas exactas.
+
+```text
+     8.901.223.145      instructions   #  1,97  insn per cycle  [83,33%]
+        63.180.442      cache-misses                            [83,29%]
+```
+
+Para hallar el cuello de botella real, el método moderno es el análisis top-down, que reparte cada ciclo emitido de la CPU en cuatro cubos: retirando trabajo útil, especulación fallida, atascado por el front-end o atascado por el back-end. Un back-end alto con IPC bajo y `cache-misses` alto es la firma inequívoca de una carga limitada por memoria.
+
+```bash
+# reparte los slots de emision en las categorias top-down
+perf stat --topdown -a sleep 5
+# o pide una metrica derivada concreta
+perf stat -M Backend_Bound ./mi_programa
+```
+
+<Callout type="warn" title="El multiplexado miente en pequeñas dosis">
+Cuando veas porcentajes por debajo del 100% en `perf stat`, recuerda que esas cifras son extrapolaciones. Si el evento es muy irregular y la fracción medida cae al 25%, la estimación puede desviarse notablemente del total real. La cura es medir menos eventos a la vez —cabiendo todos en los contadores físicos— o alargar la ventana con `-r` para promediar. No trates un número escalado con la misma confianza que una cuenta al 100%.
+</Callout>
+
+<Callout type="dios" title="La estadística como forma de conocer sin mirarlo todo">
+Interioriza el salto epistemológico que separa contar de muestrear, porque es el mismo que separa el censo de la encuesta, y gobierna casi toda la observabilidad a escala. Contar es exhaustivo: la PMU ve cada evento y el total es exacto, pero no sabe *dónde* ocurrió cada uno sin registrarlos todos, lo cual sería ruinoso. Muestrear renuncia a la exhaustividad y a cambio gana lo que de verdad importa: una fotografía del puntero de instrucción cada N eventos construye, muestra a muestra, una distribución de probabilidad sobre dónde vive el código caliente. El perfil no es una lista de lo que pasó; es una estimación de dónde se concentra la masa de eventos, y su corrección no descansa en haberlo visto todo, sino en la ley de los grandes números: con suficientes muestras, la fracción que cae en cada función converge a la fracción real del tiempo que allí se gasta. Piensa en lo que esto te libera. No necesitas instrumentar el código, no necesitas frenar el sistema, no necesitas registrar cada instrucción; dejas que el silicio cuente y, de vez en cuando, robas una instantánea del estado. El coste del muestreo es casi nulo precisamente porque es raro, y su fidelidad crece con el tiempo de observación en vez de con la intrusión. Aquí está la sabiduría transferible: para entender un sistema enorme no hace falta observarlo entero, hace falta muestrearlo bien. El skid te recuerda que hasta la instantánea tiene su física y su sesgo, y que la precisión —PEBS— cuesta silicio; pero la idea madre permanece, y es una de las más profundas del oficio: se puede conocer la forma de un todo interrogando al azar una parte, siempre que preguntes suficientes veces y sepas qué sesgo arrastra cada pregunta.
+</Callout>
+
+<Challenge title="Diagnostica un cuello de botella con la PMU">
+1. Escribe dos bucles que sumen un array de diez millones de enteros, uno recorriéndolo en orden y otro a saltos grandes, y compara sus `cache-misses` e IPC con `perf stat`; explica la diferencia con la jerarquía de caché.
+2. Perfila el bucle a saltos con `perf record -e cache-misses:pp -g` y confirma que el IP preciso señala la instrucción de acceso a memoria, no la siguiente.
+3. Repite el perfil sin el modificador `:pp` y describe cómo el skid desplaza la atribución de las muestras.
+4. Lanza `perf stat` con ocho eventos a la vez, observa los porcentajes de multiplexado entre corchetes y razona por qué las cifras dejan de ser exactas.
+5. Corre `perf stat --topdown` sobre ambos bucles y clasifica cada uno como limitado por front-end, back-end o especulación, justificándolo con los contadores crudos.
+</Challenge>

@@ -1,0 +1,142 @@
+---
+title: "Qué gana WebGPU: las cuatro decisiones de diseño y su precio"
+description: "Estado precompilado, validación adelantada, cómputo de primera clase y grabación de comandos: qué resuelve cada decisión, qué cuesta, y cómo cambia la arquitectura de tu aplicación."
+subject: webgpu
+level: 1
+order: 5
+position: "1.5"
+duration: "18 min"
+---
+
+<Lead>
+Las cuatro decisiones que definen WebGPU no son mejoras incrementales sobre WebGL: son inversiones de una premisa. Donde WebGL confiaba en la implementación para adivinar, WebGPU obliga a declarar. Cada una de esas inversiones compra algo concreto y cobra algo concreto, y conocer las dos caras es lo que evita tanto el entusiasmo ingenuo como la resistencia por comodidad.
+</Lead>
+
+<Goals>
+
+- Explicar las cuatro decisiones de diseño de WebGPU y qué problema resuelve cada una.
+- Nombrar el coste que impone cada decisión sobre la arquitectura de la aplicación.
+- Reorganizar un bucle de render según la separación entre creación y grabación.
+- Justificar cuándo la migración desde WebGL merece la pena y cuándo no.
+
+</Goals>
+
+## Las cuatro decisiones
+
+### Decisión uno: el estado se precompila
+
+Todo el estado gráfico que WebGL mantenía en variables globales vive en WebGPU dentro de un `GPURenderPipeline` inmutable. Shaders, formato de entrada de vértices, topología, orientación de caras frontales, descarte, formato y comparación de profundidad, número de muestras, formatos de salida, ecuación de mezcla por salida. Todo junto, validado al crearse, congelado después.
+
+**Lo que compra:** un `setPipeline` sustituye a treinta llamadas de configuración, y esas treinta llamadas dejan de existir en el fotograma. Además, la implementación puede traducir la configuración completa a un objeto nativo —un `VkPipeline`, un `MTLRenderPipelineState`— con antelación, en lugar de reconstruirlo al vuelo.
+
+**Lo que cuesta:** cada combinación distinta de estado es un objeto distinto. Un material que puede dibujarse con y sin mezcla, con y sin prueba de profundidad, y contra dos formatos de salida, son ocho pipelines. La explosión combinatoria es real y hay que administrarla con una caché indexada por la configuración, no crear pipelines a demanda y olvidarse.
+
+**Lo que cambia en tu código:** aparece una fase de construcción que en WebGL no existía. Los pipelines se crean al cargar, idealmente con `createRenderPipelineAsync`, y se guardan en un mapa. El bucle de render no crea nada.
+
+### Decisión dos: la validación se adelanta
+
+Ya no se comprueba la coherencia en cada dibujo, sino al construir cada objeto. Crear un pipeline valida los shaders y los formatos; crear un bind group valida tipos, usos y alineaciones; empezar un pase valida los adjuntos.
+
+**Lo que compra:** el coste por dibujo se desploma, y los errores se detectan en el sitio donde están, no cientos de líneas después.
+
+**Lo que cuesta:** hay que declarar de antemano cosas que WebGL deducía. El `usage` de cada búfer, el formato exacto de cada textura, la disposición completa de cada grupo de recursos. Y hay que declararlas bien, porque un `usage` que no incluye lo que luego haces es un error de validación, no una degradación silenciosa.
+
+**Lo que cambia en tu código:** los errores llegan por un canal asíncrono. WebGPU no lanza excepciones para los errores de validación: emite un evento `uncapturederror` en el dispositivo, o resuelve la promesa de `popErrorScope()` si has abierto un ámbito de error. Instalar un manejador desde la primera línea del proyecto es obligatorio en la práctica:
+
+```js
+device.addEventListener('uncapturederror', (e) => {
+  console.error('[webgpu]', e.error.message);
+});
+```
+
+Y para localizar el origen de un error concreto, los ámbitos:
+
+```js
+device.pushErrorScope('validation');
+const pipeline = device.createRenderPipeline(descriptor);
+const err = await device.popErrorScope();
+if (err) console.error('el pipeline no es valido:', err.message);
+```
+
+Los tres filtros posibles son `'validation'`, `'out-of-memory'` e `'internal'`.
+
+### Decisión tres: el cómputo es de primera clase
+
+Un `GPUComputePipeline` y un `GPUComputePassEncoder` tienen exactamente el mismo rango que sus equivalentes de render, y comparten con ellos búferes, texturas, bind groups y cola.
+
+**Lo que compra:** algoritmos que en WebGL eran imposibles o absurdamente caros. Y algo menos obvio y más importante en la arquitectura: **cero copias entre el cómputo y el render**. Un búfer de almacenamiento que una simulación acaba de escribir se puede enlazar como búfer de vértices en el pase siguiente, dentro del mismo command buffer.
+
+**Lo que cuesta:** un modelo de ejecución nuevo que hay que entender de verdad. Tamaños de grupo de trabajo, jerarquía de identificadores, memoria compartida, barreras, condiciones de carrera. Es la parte de WebGPU con la curva de aprendizaje más pronunciada, y la única donde un error produce resultados no deterministas.
+
+**Lo que cambia en tu código:** el fotograma deja de ser «actualizo en CPU, dibujo en GPU» y pasa a ser «lanzo cómputo, dibujo lo que produjo». El estado del mundo puede vivir enteramente en memoria de GPU y no volver nunca a la CPU, que es justo lo que hace que escale.
+
+### Decisión cuatro: los comandos se graban
+
+`createCommandEncoder()` abre una grabación, los pases delimitan ámbitos, `finish()` produce un `GPUCommandBuffer` inmutable y `queue.submit([...])` lo entrega.
+
+**Lo que compra:** tres cosas. Un solo cruce de frontera por lote en lugar de uno por llamada. La posibilidad de grabar en varios hilos, porque un worker con su propio dispositivo puede preparar su propio command buffer sin tocar el hilo principal. Y la posibilidad de pregrabar secuencias que no cambian, con `GPURenderBundle`.
+
+**Lo que cuesta:** una separación temporal que hay que interiorizar. Cuando `submit()` retorna no ha pasado nada. La GPU trabajará después. Cualquier cosa que quiera ver el resultado tiene que esperar de forma asíncrona, y esa espera es cara.
+
+**Lo que cambia en tu código:** aparece la estructura que ya no se abandona.
+
+```js
+// Fase de construccion: una vez.
+const pipeline = await device.createRenderPipelineAsync(descPipeline);
+const uniformes = device.createBuffer({
+  size: 64,
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+});
+const grupo = device.createBindGroup({
+  layout: pipeline.getBindGroupLayout(0),
+  entries: [{ binding: 0, resource: { buffer: uniformes } }],
+});
+
+// Fase de fotograma: solo escribir datos y grabar comandos.
+function frame(t) {
+  device.queue.writeBuffer(uniformes, 0, matrices);
+
+  const encoder = device.createCommandEncoder({ label: 'frame' });
+  const pase = encoder.beginRenderPass({
+    colorAttachments: [{
+      view: contexto.getCurrentTexture().createView(),
+      clearValue: { r: 0.05, g: 0.05, b: 0.08, a: 1 },
+      loadOp: 'clear',
+      storeOp: 'store',
+    }],
+  });
+  pase.setPipeline(pipeline);
+  pase.setBindGroup(0, grupo);
+  pase.draw(3);
+  pase.end();
+  device.queue.submit([encoder.finish()]);
+
+  requestAnimationFrame(frame);
+}
+```
+
+Fíjate en lo que **no** hay en `frame`: ninguna llamada `create`. Esa es la prueba de que la arquitectura es correcta, y es un criterio de revisión de código perfectamente aplicable.
+
+## Cuándo migrar y cuándo no
+
+Con las cuatro decisiones sobre la mesa, la decisión de migrar deja de ser ideológica.
+
+**Migra si necesitas cómputo.** No hay alternativa y no la va a haber. Es el único caso en que la respuesta es incondicional.
+
+**Migra si estás limitado por llamadas de dibujo** y ya has agotado la instanciación y la agrupación por material. Los experimentos para saberlo son de cinco minutos.
+
+**No migres si estás limitado por relleno de píxeles o por ancho de banda.** La misma GPU hará el mismo trabajo. Optimiza la resolución, el sobredibujado y los shaders.
+
+**No migres una base de código grande por higiene.** Los shaders hay que reescribirlos de GLSL a WGSL, el modelo de recursos es distinto, y el resultado funcional es idéntico. Hazlo cuando haya una razón.
+
+**Y en cualquier caso, la cobertura sigue mandando.** WebGL2 sigue siendo la base más segura por dispositivos antiguos; el planteamiento correcto es mejora progresiva, no sustitución.
+
+<Callout type="dios" title="El coste real de la migración no es el código, es que WebGPU no perdona lo que WebGL toleraba">
+Traducir de WebGL a WebGPU es mecánico y lleva menos tiempo del que la gente teme. Lo que descoloca es otra cosa: **cosas que funcionaban en WebGL dejan de funcionar, y no porque WebGPU sea más estricto por gusto, sino porque estaban mal y nadie lo sabía**.
+
+Los tres casos que aparecen siempre. Uno: un `struct` de uniformes cuya disposición en JavaScript no coincidía con la del shader. En GLSL con `std140` mucha gente acertaba por casualidad porque sus campos eran todos `vec4`; en cuanto hay un `vec3` seguido de un `f32`, las reglas de alineación de WGSL colocan los bytes donde el código de JavaScript no los escribió, y el resultado son valores absurdos sin ningún error. Dos: leer una textura que en el mismo pase se está escribiendo. WebGL a veces lo dejaba pasar con resultado indefinido; WebGPU lo rechaza en la validación. Tres: depender de que una textura sin mipmaps completos se muestree con filtrado lineal.
+
+De ahí la recomendación de método que ahorra más tiempo que cualquier otra: **migra primero un caso mínimo y verifica los números, no la imagen**. Un solo objeto, un solo uniforme, y un `console.log` del contenido del búfer leído de vuelta comparado con lo que creías haber escrito. Si la disposición de memoria está bien en el caso mínimo, el resto de la migración es traducción. Si no lo está, lo vas a descubrir de todas formas, pero dentro de dos semanas y con cuarenta shaders migrados encima.
+</Callout>
+
+Con el porqué resuelto, lo que hace falta antes de escribir código es entender la máquina a la que le vas a hablar: [la GPU por dentro](/guia/webgpu/n2-cpu-frente-a-gpu/).

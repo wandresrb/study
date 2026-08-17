@@ -1,0 +1,124 @@
+---
+title: "DMA en PCI: bus mastering, la máscara y el camino a la RAM"
+description: "Cómo un dispositivo PCI hace DMA a la RAM: el bus mastering (pci_set_master) que lo habilita como iniciador, la máscara de DMA sobre &pdev->dev, y el camino completo del descriptor a la memoria. El puente &pdev->dev que conecta el dispositivo PCI con la DMA API genérica del nivel 27."
+subject: kernel
+level: 30
+order: 5
+position: "30.5"
+duration: "16 min"
+---
+
+<Lead>
+Un dispositivo PCI ya tiene identidad (30.1), una ventana en el mapa físico (30.2), un driver que lo reclama (30.3) y una voz para avisar (30.4). Le falta lo último y más poderoso: **manos**. El DMA es la capacidad de alcanzar directamente la RAM, y para un dispositivo PCI empieza por convertirse en **maestro del bus**. A partir de ahí, todo lo que aprendiste en el nivel 27 —máscara, coherente frente a streaming, IOMMU— se aplica sin cambios, porque un dispositivo PCI es exactamente el segundo actor sobre la malla de memoria que aquel nivel describía en abstracto.
+</Lead>
+
+<Goals>
+
+- Habilitar al dispositivo como iniciador de transacciones con `pci_set_master`.
+- Declarar el alcance de direccionamiento con la máscara de DMA sobre `&pdev->dev`.
+- Seguir el camino completo: descriptor coherente, dirección de bus programada por MMIO, escritura a RAM.
+- Ver `&pdev->dev` como el puente que conecta PCI con la DMA API genérica del nivel 27.
+
+</Goals>
+
+## Bus mastering: encender al dispositivo como iniciador
+
+Por defecto, un dispositivo PCI es **pasivo**: solo responde a las transacciones que la CPU dirige a sus BARs. Para hacer DMA necesita **iniciar** transacciones de memoria él mismo, y eso se llama ser **maestro del bus** (*bus master*). `pci_set_master` activa el bit `PCI_COMMAND_MASTER` del registro de comando; sin él, las escrituras DMA del dispositivo simplemente no salen —se descartan en silencio, uno de los bugs más desconcertantes para un novato.
+
+```c
+pci_set_master(pdev);   /* activa PCI_COMMAND_MASTER: ya puede iniciar transacciones */
+```
+
+No hace falta un `pci_clear_master` explícito en el camino de limpieza: `pci_disable_device` ya apaga el bit de bus master al desligar. La regla mental es simple: **habilitar el mastering es dar permiso físico**; el dispositivo pasa de solo-responder a poder conducir el bus.
+
+## La máscara de DMA: hasta dónde alcanza el dispositivo
+
+No todo dispositivo puede direccionar toda la RAM. Uno legado de 32 bits no llega por encima de los 4 GiB. El dispositivo declara su alcance con la **máscara de DMA**, y la infraestructura la respeta: si un buffer cae fuera, recurre a un buffer de rebote o, con IOMMU, entrega una dirección dentro del alcance. La clave para un dispositivo PCI es *sobre qué* se declara: sobre el `struct device` incrustado en el `pci_dev`, accesible como `&pdev->dev`. El viejo `pci_set_dma_mask` desapareció; hoy se usa la API genérica:
+
+```c
+/* declarar 64 bits, con reserva a 32 si la plataforma no da mas */
+ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+if (ret) {
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	if (ret) {
+		dev_err(&pdev->dev, "sin DMA utilizable\n");
+		return ret;
+	}
+	dev_info(&pdev->dev, "limitado a DMA de 32 bits\n");
+}
+```
+
+Ese `&pdev->dev` no es un detalle: es la costura por la que el mundo PCI se cose al modelo de dispositivos genérico. La DMA API del nivel 27 nunca habló de PCI; habló de `struct device`. Y `&pdev->dev` es cómo un endpoint PCIe *se convierte* en ese `struct device` genérico.
+
+## El camino completo: del descriptor a la RAM
+
+Con el mastering encendido y la máscara declarada, el driver monta la maquinaria del nivel 27. Un **anillo de descriptores coherente** para la metadata compartida, y **mapeos streaming** para cada carga útil. La dirección de bus del anillo se programa en el dispositivo escribiéndola en un registro del BAR por MMIO:
+
+```c
+static int midev_dma_init(struct pci_dev *pdev, struct midev *dev)
+{
+	pci_set_master(pdev);
+
+	/* anillo compartido CPU-dispositivo: memoria coherente (nivel 27.2) */
+	dev->ring = dma_alloc_coherent(&pdev->dev, RING_BYTES,
+				       &dev->ring_dma, GFP_KERNEL);
+	if (!dev->ring)
+		return -ENOMEM;
+
+	/* programar la direccion de BUS del anillo en el dispositivo, por MMIO */
+	iowrite32(lower_32_bits(dev->ring_dma), dev->regs + REG_RING_LO);
+	iowrite32(upper_32_bits(dev->ring_dma), dev->regs + REG_RING_HI);
+	return 0;
+}
+```
+
+En el camino de transmisión, cada buffer se presta al dispositivo con un mapeo streaming, se anota su dirección de bus en un descriptor, y se toca el "timbre" (*doorbell*) tras una barrera que asegura que el descriptor sea visible antes:
+
+```c
+dma_addr_t h = dma_map_single(&pdev->dev, buf, len, DMA_TO_DEVICE);
+if (dma_mapping_error(&pdev->dev, h))
+	return -ENOMEM;
+
+dev->ring[i].addr = cpu_to_le64(h);      /* direccion de bus, no puntero del kernel */
+dev->ring[i].len  = cpu_to_le32(len);
+dma_wmb();                               /* descriptor visible antes del timbre */
+iowrite32(i + 1, dev->regs + REG_TAIL);  /* doorbell: el dispositivo empieza a leer */
+```
+
+A partir del timbre, el dispositivo —como maestro del bus— emite transacciones de escritura PCIe que atraviesan el switch y el root complex, pasan (si existe) por el IOMMU que traduce y confina la dirección, y aterrizan en la RAM. Al terminar, dispara un MSI (30.4). La CPU no tocó un solo byte del trasiego.
+
+<Mermaid code={`flowchart LR
+  DRV[Driver escribe descriptor y toca el doorbell] --> DEV[Dispositivo maestro del bus]
+  DEV -->|escritura PCIe| RC[Root Complex]
+  RC -->|traduce y confina| IO[IOMMU]
+  IO --> RAM[RAM del sistema]
+  DEV -. MSI al terminar .- CPU[CPU]`} />
+
+<Callout type="warn" title="La dirección de bus no es un puntero del kernel">
+Lo que programas en `REG_RING_LO`/`HI` y anotas en el descriptor es la `dma_addr_t` que devolvió la DMA API, **no** `virt_to_phys` ni el puntero de `kmalloc`. En un x86 sencillo puede que coincidan y el bug se esconda; con IOMMU o desplazamiento de bus, entregar la dirección equivocada corrompe memoria ajena. El dispositivo ve la RAM con sus propios ojos: dale siempre la dirección que la API fabricó para él.
+</Callout>
+
+## Recuperar el buffer: sincronizar y desmapear
+
+Cuando el dispositivo termina y dispara el MSI, el buffer vuelve a ser de la CPU —pero no antes—. En un mapeo streaming, si la CPU va a leer lo que el dispositivo escribió, hay que **sincronizar la caché** con `dma_sync_single_for_cpu` antes de mirar, y devolverlo al dispositivo con `dma_sync_single_for_device` si se reutiliza. Al acabar del todo, `dma_unmap_single` cierra el préstamo con la misma dirección, tamaño y sentido que el `map`:
+
+```c
+/* en el manejador de la interrupcion de fin de transferencia */
+dma_sync_single_for_cpu(&pdev->dev, h, len, DMA_FROM_DEVICE);
+consumir(buf);                                          /* la CPU ya ve datos frescos */
+dma_unmap_single(&pdev->dev, h, len, DMA_FROM_DEVICE);  /* cierra el prestamo */
+```
+
+Ese vaivén de propiedad —la CPU cede en el `map`, el dispositivo trabaja, la CPU recupera en el `sync` y el `unmap`— es exactamente el modelo del nivel 27.3, y en PCI es el pan de cada paquete recibido. Olvidar el `sync` en una plataforma sin coherencia de caché devuelve datos rancios; olvidar el `unmap` con IOMMU deja una ventana abierta en la tabla de traducción.
+
+<Callout type="dios" title="Donde PCI se disuelve en el modelo de dispositivos y el arco se cierra">
+Mira el detalle que parece trivial y es la clave de bóveda del nivel entero: `&pdev->dev`. Durante cuatro lecciones, PCI ha sido un mundo con leyes propias —espacio de configuración, BARs, `BDF`, MSI-X—, y podrías creer que su DMA también es especial. No lo es, y ese "no lo es" es la lección profunda. La DMA API del nivel 27 jamás mencionó PCI; razonó sobre un `struct device` abstracto, con su máscara, sus buffers de rebote y su dominio de IOMMU. `pci_set_master` y `&pdev->dev` son el puente entre ambos mundos: el primero es la **capacidad física** —el endpoint puede ahora conducir el bus—, y el segundo es el **asa de software** por la que toda la maquinaria genérica de DMA se aplica a este PCIe concreto. Un dispositivo PCI haciendo DMA *es* el segundo iniciador sobre la malla de memoria que el nivel 27 abstraía; PCI era el caso canónico todo el tiempo. Y con ello el arco de este nivel se cierra en una simetría perfecta. La topología y la enumeración (30.1) le dieron al dispositivo una **identidad** y un lugar. Los BARs (30.2) le abrieron una **ventana** hacia el mundo de la CPU. El driver (30.3) lo **reclamó** y lo enchufó al modelo de dispositivos. Las interrupciones (30.4) le dieron una **voz** para hablar de vuelta. Y el DMA le da **manos** para alcanzar la RAM por sí mismo. Un dispositivo PCI plenamente realizado es un **par de la CPU**, no un periférico subordinado: es direccionado y direcciona de vuelta, es interrumpido e interrumpe, es leído y lee la memoria por su cuenta. Esa reciprocidad —no el número de lanes ni el protocolo de enlace— es lo que significa de verdad "un dispositivo en el bus". El PCI Express no conecta un esclavo a un amo; admite a un igual en la malla compartida de la memoria. Todo el nivel ha sido la historia de cómo el kernel le concede esa igualdad sin perder el control.
+</Callout>
+
+<Challenge title="Un DMA de PCI de principio a fin">
+1. En tu driver de 30.3, añade `pci_set_master` y `dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))` con reserva a 32 bits.
+2. Reserva un anillo con `dma_alloc_coherent(&pdev->dev, ...)` y programa su `dma_addr_t` en un registro del BAR por MMIO; libéralo con `dma_free_coherent`.
+3. Explica por qué olvidar `pci_set_master` hace que el DMA falle en silencio y cómo lo verificarías en `lspci -v` mirando el flag `BusMaster`.
+4. Traza en el árbol de fuentes dónde `&pdev->dev` conecta con un dominio de IOMMU, y relaciónalo con la fusión de scatter-gather del nivel 27.5.
+5. Argumenta, con la simetría del cierre, por qué un dispositivo PCI que direcciona, interrumpe y hace DMA es un par de la CPU y no un esclavo.
+</Challenge>

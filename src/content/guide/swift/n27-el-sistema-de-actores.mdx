@@ -1,0 +1,156 @@
+---
+title: "El sistema de actores: identidad, resolución y transporte"
+description: "Swift no incluye ninguna red. Lo que incluye es un hueco con forma exacta: el protocolo `DistributedActorSystem`, que asigna identidades, resuelve referencias y transporta invocaciones. Entender ese protocolo es entender qué hace el lenguaje y qué queda siempre en manos de la biblioteca."
+subject: swift
+level: 27
+order: 2
+position: "27.2"
+duration: "20 min"
+---
+
+<Lead>
+La pregunta obvia después de ver `resolve` funcionar es quién hace el trabajo. La respuesta es que el lenguaje no hace casi ninguno: se limita a sintetizar el andamiaje y a delegar cada decisión real en un tipo que tú eliges, el sistema de actores. Ese tipo decide cómo se ve una identidad, cómo se descubre a quién pertenece, cómo se codifica una invocación, por qué cable viaja y qué significa que no vuelva. `DistributedActorSystem` es, en ese sentido, uno de los protocolos más reveladores de la biblioteca estándar: enumera con precisión quirúrgica el conjunto mínimo de responsabilidades que hay que cubrir para que la palabra `distributed` signifique algo, y deja fuera todo lo demás.
+</Lead>
+
+<Goals>
+
+- Enumerar los tipos asociados y las operaciones que exige `DistributedActorSystem` y por qué cada uno es necesario.
+- Trazar el ciclo de vida de una identidad desde `assignID` hasta `resignID` y explicar qué invariante protege cada paso.
+- Distinguir el camino de salida, con `remoteCall`, del de entrada, con `executeDistributedTarget`.
+- Elegir un sistema adecuado para pruebas, para procesos vecinos o para un clúster real.
+
+</Goals>
+
+## El hueco con forma exacta
+
+El protocolo se lee como una lista de las cosas que un lenguaje no puede decidir por ti. Sus tipos asociados fijan el vocabulario y sus métodos, el mecanismo.
+
+```swift
+protocol DistributedActorSystem: Sendable {
+    associatedtype ActorID: Hashable & Sendable & Codable
+    associatedtype InvocationEncoder: DistributedTargetInvocationEncoder
+    associatedtype InvocationDecoder: DistributedTargetInvocationDecoder
+    associatedtype SerializationRequirement
+    associatedtype ResultHandler: DistributedTargetInvocationResultHandler
+
+    func assignID<Act>(_ actorType: Act.Type) -> ActorID
+    func actorReady<Act>(_ actor: Act)
+    func resignID(_ id: ActorID)
+    func resolve<Act>(id: ActorID, as actorType: Act.Type) throws -> Act?
+    func makeInvocationEncoder() -> InvocationEncoder
+    // remoteCall y remoteCallVoid: los añade el compilador con requisitos
+    // que el sistema de tipos actual no puede expresar directamente.
+}
+```
+
+Merece la pena leer `SerializationRequirement` con atención, porque es el mecanismo por el que un sistema impone su propia regla sobre qué puede cruzar el cable. Un sistema que hable JSON declarará `Codable`; uno que use un formato binario propio podrá exigir otro protocolo. El compilador toma esa declaración y **la comprueba en cada firma** de cada miembro `distributed` del actor: la restricción no se descubre al ejecutar, se descubre al compilar.
+
+El otro detalle notable es que `resolve` devuelve un opcional. Un valor devuelto significa «esta identidad es una instancia viva en este proceso, tómala». Un `nil` significa «no es de aquí, fabrica un proxy remoto», y quien fabrica ese proxy es el runtime, no tú. Lanzar, en cambio, significa «esta identidad ni siquiera es válida para mí».
+
+```swift
+func resolve<Act>(id: ActorID, as tipo: Act.Type) throws -> Act? {
+    guard id.sistema == self.identificador else { throw Fallo.identidadAjena }
+    guard let vivo = registro[id] else { return nil }   // nil: sera un proxy
+    guard let tipado = vivo as? Act else { throw Fallo.tipoIncompatible }
+    return tipado
+}
+```
+
+Esa firma de tres resultados —valor, `nil` o error— codifica una distinción que muchos protocolos de red confunden: no es lo mismo «no está aquí» que «esto no tiene sentido». Lo primero es rutina y se resuelve con un proxy; lo segundo es un fallo de contrato y debe explotar cuanto antes.
+
+## El ciclo de vida de una identidad
+
+La identidad no la elige el actor: se la asigna el sistema, y lo hace antes de que el actor exista del todo. Esa secuencia es la que permite que una referencia sea resoluble desde el instante en que alguien podría preguntar por ella.
+
+```swift
+distributed actor Sesion {
+    typealias ActorSystem = ClusterSystem
+    private var pasos = 0
+
+    init(actorSystem: ActorSystem) {
+        self.actorSystem = actorSystem   // aqui ocurre assignID
+    }                                    // al terminar el init: actorReady
+}
+```
+
+<Mermaid code={`sequenceDiagram
+  participant I as Init del actor
+  participant S as Sistema
+  participant R as Registro local
+  I->>S: assignID para este tipo
+  S-->>I: devuelve un ActorID unico
+  I->>S: actorReady al terminar la inicializacion
+  S->>R: publica la instancia como resoluble
+  Note over R: desde aqui resolve devuelve la instancia
+  I->>S: deinit dispara resignID
+  S->>R: retira la identidad`} />
+
+Los tres momentos protegen invariantes distintas. `assignID` ocurre al asignar `actorSystem` dentro del inicializador, y su contrato es producir una identidad única dentro del sistema; muchos sistemas incrustan ahí el nodo de origen, un identificador aleatorio y, opcionalmente, un nombre estable elegido por el programador. `actorReady` se llama cuando la instancia está completamente inicializada, y solo a partir de ese instante el registro puede entregarla: publicar antes permitiría que llegara un mensaje a un actor con propiedades sin inicializar. `resignID` se dispara en el `deinit` y evita que el registro retenga identidades muertas, que es la fuga de memoria clásica de todo sistema de mensajería.
+
+<Callout type="tip" title="Identidad estable frente a identidad efímera">
+Si un nodo se reinicia y quieres que sus clientes reencuentren al mismo actor lógico, necesitas una identidad **derivada de un nombre del dominio**, no aleatoria. Los sistemas serios permiten ambas cosas: aleatoria por defecto para actores anónimos, y con nombre explícito para los que forman parte de la topología conocida.
+</Callout>
+
+## La invocación de ida y la de vuelta
+
+Una llamada distribuida atraviesa dos mitades simétricas, y el compilador genera el pegamento de ambas. En el lado del llamante, el runtime detecta que la referencia es remota y en lugar de ejecutar el cuerpo construye un encoder, le recita la invocación pieza a pieza y se la entrega al sistema.
+
+```swift
+// Lo que el runtime hace por ti cuando `ref` resulta ser remota
+var inv = sistema.makeInvocationEncoder()
+try inv.recordArgument(RemoteCallArgument(value: 19.5, label: "a", name: "grados"))
+try inv.recordReturnType(Void.self)
+try inv.recordErrorType(Never.self)
+try inv.doneRecording()
+
+let resultado = try await sistema.remoteCall(
+    on: ref,
+    target: RemoteCallTarget("nombre mangled del metodo"),
+    invocation: &inv,
+    throwing: Never.self,
+    returning: Double.self
+)
+```
+
+Aquí es donde el sistema decide todo lo que importa: qué formato binario usa, si abre una conexión o reutiliza una existente, si añade un plazo, si reintenta, si numera los mensajes. El lenguaje no opina.
+
+En el lado receptor no hay ningún `switch` sobre nombres de método escrito a mano. El sistema recibe unos bytes, reconstruye la identidad, resuelve el actor local, envuelve los argumentos en un decoder y llama a una función del runtime que hace el despacho reflexivo.
+
+```swift
+try await executeDistributedTarget(
+    on: actorLocal,
+    target: RemoteCallTarget(nombreDelObjetivo),
+    invocationDecoder: &decoder,
+    handler: MiResultHandler(respuesta: canal)
+)
+```
+
+`RemoteCallTarget` transporta el nombre decorado del método, que es la clave con la que el runtime encuentra el accesor generado en tiempo de compilación. El `handler` recibe el resultado por `onReturn`, `onReturnVoid` u `onThrow`, y es quien decide cómo se devuelve al origen. Nótese lo que esto implica: **el emisor y el receptor deben compartir la definición del actor**, porque el nombre decorado codifica módulo, tipo, firma y tipos de los parámetros. Es una consecuencia técnica con enormes efectos de diseño, y la retomaremos en la última lección.
+
+<Cards>
+  <Card icon="🧪" title="Sistema de pruebas">
+    `LocalTestingDistributedActorSystem` implementa el protocolo sin red: todo resuelve local y toda llamada remota falla. Sirve para probar la forma del código.
+  </Card>
+  <Card icon="🧩" title="Sistema propio">
+    Sobre XPC, sobre una tubería o sobre WebSocket. Implementar el protocolo es trabajo real, pero acotado y comprobable.
+  </Card>
+  <Card icon="🌐" title="Sistema de clúster">
+    `ClusterSystem` de `swift-distributed-actors` aporta membresía, descubrimiento y detección de fallos sobre TCP.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Por qué el lenguaje se quedó con el protocolo y regaló el transporte">
+La decisión de diseño más importante del nivel entero no está en la palabra `distributed` sino en lo que Swift deliberadamente no metió detrás de ella. Habría sido perfectamente posible incluir un transporte canónico —un formato, un puerto, un protocolo de handshake— y la ergonomía inicial habría sido mejor. Habría sido también un error histórico, y la razón es que las decisiones que un transporte toma no son técnicas neutrales sino compromisos con un modelo de fallo concreto: cuántas veces se reintenta define si tu semántica es *como mucho una vez* o *al menos una vez*; si hay plazo y de cuánto define qué significa el silencio; si el canal preserva el orden define qué invariantes puede asumir tu lógica; si la entrega es fiable define si tu código necesita idempotencia. Ninguna de esas respuestas es correcta en abstracto. Un canal XPC entre dos procesos de la misma máquina y un canal TCP entre dos centros de datos comparten la sintaxis de la llamada y no comparten ni una sola de esas propiedades. Al convertir el transporte en un tipo conforme a un protocolo, Swift hizo tres cosas a la vez que merecen leerse como una lección general de diseño de API. Primero, **hizo el modelo de fallo intercambiable sin tocar el código de dominio**: el mismo actor corre bajo un sistema de pruebas determinista y bajo un clúster real, y esa sustituibilidad es lo que hace verificable un sistema distribuido. Segundo, **movió la comprobación de serialización al compilador** vía `SerializationRequirement`, de modo que la política del transporte se convierte en una restricción de tipos y no en un fallo de ejecución. Y tercero, y esto es lo más sutil, **no unificó la semántica**: no promete entrega, ni orden, ni exactamente una vez, porque prometer cualquiera de las tres obligaría a implementarla en todos los transportes, incluidos aquellos donde es imposible o carísima. El patrón transferible es el que separa a un buen punto de extensión de un mal marco de trabajo: define el vocabulario mínimo y el ciclo de vida —identidad, resolución, codificación, entrega, retirada— y no decidas nada cuya respuesta correcta dependa de dónde se despliegue el código. Un lenguaje que hubiera incluido el cable habría envejecido con ese cable.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+El lenguaje sintetiza `id` y `actorSystem`, marca los puntos del ciclo de vida y genera los accesores; el sistema decide identidad, formato, transporte y modelo de fallo. `resolve` que devuelve `nil` significa remoto, no error. El nombre decorado del método obliga a que ambos extremos compartan la definición del tipo.
+</Callout>
+
+<Challenge title="Implementa un sistema mínimo">
+1. Escribe un `DistributedActorSystem` en memoria con un diccionario de identidades y comprueba con trazas el orden exacto de `assignID`, `actorReady` y `resignID`.
+2. Haz que `resolve` devuelva `nil` para una identidad ajena y observa que el runtime fabrica el proxy sin que tú escribas ninguna clase.
+3. Implementa `remoteCall` sobre dos tareas del mismo proceso conectadas por un `AsyncStream` y consigue una llamada de ida y vuelta completa.
+4. Añade un plazo al lado emisor y decide qué error propagas cuando expira. Argumenta si un reintento automático sería correcto para tu semántica.
+5. Provoca deliberadamente una fuga: omite `resignID` y demuestra con un contador que el registro crece sin límite.
+</Challenge>

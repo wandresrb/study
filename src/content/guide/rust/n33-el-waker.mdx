@@ -1,0 +1,150 @@
+---
+title: "El Waker: cómo un future dormido pide que lo despierten"
+description: "Un future que devuelve Pending no puede limitarse a decir 'aún no': debe dejar dicho cómo avisar cuando esté listo. Ese aviso es el Waker que viaja en el Context. Clonarlo, guardarlo y dispararlo con wake es lo que convierte la espera activa en sueño, y lo que separa al reactor que vigila el mundo del executor que reencola tareas."
+subject: rust
+level: 33
+order: 3
+position: "33.3"
+duration: "18 min"
+---
+
+<Lead>
+La lección anterior dejó una deuda: `Poll::Pending` obliga a "avisar cuando haya progreso", pero ¿avisar cómo, y a quién? La respuesta es el `Waker`, quizá la pieza más ingeniosa del modelo. Un future que cede no se limita a devolver `Pending`: antes **clona el `Waker`** que viaja en el `Context`, lo guarda, y se lo entrega a quien sí sabe cuándo llegarán los datos —el sistema operativo, un temporizador, otro hilo—. Cuando ese progreso ocurre, alguien invoca `wake()` sobre el waker, y el executor vuelve a poner la tarea en la cola para otro `poll`. Sin este mecanismo, un runtime tendría que sondear en bucle preguntando "¿ya? ¿ya?" y quemar un núcleo entero girando. El `Waker` es lo que transforma esa rueda de hámster en un sueño tranquilo del que solo se despierta cuando hay trabajo real.
+</Lead>
+
+<Goals>
+
+- Entender por qué `Pending` sin un aviso condenaría al runtime a la espera activa.
+- Localizar el `Waker` dentro del `Context` y saber por qué se clona y se guarda.
+- Fijar el contrato del waker: devolver `Pending` obliga a disponer que `wake` se llame.
+- Separar los papeles del *reactor*, que dispara el waker, y del *executor*, que reencola.
+
+</Goals>
+
+## El problema: Pending sin aviso es una rueda de hámster
+
+Imagina un runtime ingenuo, sin wakers. Tiene una lista de tareas y las recorre sondeándolas: si una da `Ready`, la retira; si da `Pending`, pasa a la siguiente y, al terminar la vuelta, empieza otra vez desde el principio. Ese bucle **funciona**, pero es ruinoso: gira sin descanso preguntando a cada future "¿ya estás listo?" millones de veces por segundo, aunque no haya llegado ni un byte. Un núcleo al 100 % para, en el fondo, esperar. Eso es *busy-polling*, y es exactamente lo que la asincronía prometía evitar.
+
+```rust
+// El runtime INGENUO sin wakers: gira sin descanso quemando un nucleo.
+loop {
+    for tarea in &mut tareas {
+        let _ = tarea.poll(cx); // pregunta "ya?" haya o no datos que leer
+    }
+    // nunca duerme: aunque TODAS devuelvan Pending, vuelve a empezar la vuelta
+}
+```
+
+El arreglo no puede ser "que el future avise", porque un future es pasivo: solo existe cuando alguien lo sondea, y entre `poll` y `poll` no corre. La fuente del progreso no es el future, es **el mundo exterior**: el socket que recibe datos, el temporizador que vence, el hilo que termina un cálculo. Hace falta un canal por el que ese mundo exterior pueda decirle al runtime "la tarea que esperaba esto ya puede avanzar". Ese canal es el `Waker`.
+
+## El Waker vive en el Context, se clona y se guarda
+
+Cada llamada a `poll` recibe un `&mut Context<'_>`, y del contexto se saca el waker:
+
+```rust
+use std::task::{Context, Poll, Waker};
+
+fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    if self.listo() {
+        Poll::Ready(())
+    } else {
+        // Clona el waker de ESTA tarea y guardalo donde el mundo exterior lo alcance.
+        let waker: Waker = cx.waker().clone();
+        self.guardar_waker(waker);
+        Poll::Pending
+    }
+}
+```
+
+Dos gestos importan. Primero, se **clona**: `cx.waker()` presta el waker solo durante la llamada, pero el future necesita conservarlo *más allá* del `poll` —hasta que el dato llegue, quizá milisegundos después—, así que se queda con una copia propia. Clonar un `Waker` es barato por diseño; internamente es poco más que un puntero contado y una tabla de funciones. Segundo, se **guarda** en un sitio que el productor del dato pueda alcanzar: típicamente un `Arc<Mutex<Option<Waker>>>` compartido con el hilo o el reactor que completará la operación.
+
+El waker identifica **una tarea concreta**: llamar a `wake()` sobre él le dice al executor "reencola *esta* tarea", no otra. Por eso cada tarea tiene el suyo, tejido por el executor cuando la hace `spawn`.
+
+<Callout type="info" title="Guarda siempre el waker más reciente">
+Un future puede ser sondeado varias veces antes de completarse, y —detalle sutil— puede migrar de hilo o de tarea entre sondeos, con lo que el waker válido *cambia*. La regla del contrato es clonar y **sobrescribir** el waker guardado en cada `poll` que devuelva `Pending`, no solo la primera vez. Guardar el de la primera llamada y no actualizarlo puede hacer que despiertes a una tarea que ya no es la correcta, o que el aviso se pierda. En la práctica, `waker.clone_from(cx.waker())` o reasignar el `Option` en cada `poll` pendiente es lo idiomático.
+</Callout>
+
+Ese "sitio donde guardarlo" suele ser una estructura compartida entre el future y quien completará la operación:
+
+```rust
+struct EstadoCompartido {
+    listo: bool,
+    waker: Option<Waker>, // el reactor o el hilo productor lo tomara y disparara
+}
+// se comparte como Arc<Mutex<EstadoCompartido>> entre el future y la fuente del dato
+```
+
+## El contrato: Pending obliga a que wake se llame
+
+Aquí se cierra la deuda de la lección anterior con una regla inflexible:
+
+> Si `poll` devuelve `Pending`, debe haber dispuesto que, tarde o temprano, se invoque `wake()` sobre el waker de la tarea. De lo contrario, la tarea no se volverá a sondear **nunca**.
+
+No es una recomendación de rendimiento: es lo que separa una tarea que progresa de una colgada para siempre. El runtime, tras recibir `Pending`, aparca la tarea y se olvida de ella activamente —esa es la ganancia, deja de girar—; lo único que la resucita es un `wake()`. Si nadie lo llama, la tarea duerme hasta el fin del programa, sin panic ni error, solo silencio. Por eso disparar el waker es responsabilidad ineludible de quien devuelve `Pending`.
+
+El `Waker` ofrece dos formas de disparar, según lo que tengas a mano:
+
+```rust
+waker.wake();          // consume el waker: uso tipico tras take() del Option
+waker.wake_by_ref();   // dispara sin consumirlo: util si lo necesitas de nuevo
+```
+
+Llamar a `wake()` no ejecuta el future en el acto ni lo sondea: solo lo **marca como listo para sondear** y lo devuelve a la cola del executor, que lo atenderá cuando le toque. Despertar es encolar, no correr.
+
+## Reactor y executor: quién despierta a quién
+
+El modelo reparte el trabajo en dos mitades que conviene no confundir:
+
+- El **executor** es el motor que *ejecuta*: mantiene la cola de tareas listas y las sondea con `poll`. Es quien fabrica los wakers y quien, al recibir un `wake()`, reencola la tarea.
+- El **reactor** es el vigía que *observa el mundo*: se apoya en `epoll`, `kqueue` o `io_uring` para vigilar miles de descriptores a la vez, y cuando uno se vuelve legible, dispara el waker que el future hoja dejó registrado.
+
+El waker es el **puente** entre ambos. Un future hoja que lee de un socket, al recibir `Pending` del sistema, guarda su waker en el reactor asociado a ese descriptor. El reactor duerme sobre `epoll` vigilando todos los descriptores de golpe. Cuando el socket recibe datos, `epoll` despierta al reactor, que localiza el waker de esa tarea y llama a `wake()`; eso la reencola en el executor, que la vuelve a `poll`; esta vez la lectura tiene datos y el future avanza. Ningún hilo estuvo *esperando* a ese socket en particular: uno solo vigilaba todos.
+
+```rust
+// El reparto de papeles, en pseudocodigo:
+//   [reactor]   epoll_wait(descriptores)  ->  fd listo  ->  waker.wake()
+//   [waker]     wake()  ->  encola la tarea en la cola de listas del executor
+//   [executor]  saca la tarea de la cola  ->  fut.poll(cx)  ->  Ready o Pending
+```
+
+<Cards>
+  <Card icon="⚙️" title="Executor">
+    Sondea las tareas listas con `poll` y fabrica los wakers. Al recibir `wake`, reencola la tarea. Es quien *corre* el código.
+  </Card>
+  <Card icon="👁️" title="Reactor">
+    Vigila miles de descriptores con `epoll` o `kqueue`. Cuando uno progresa, dispara el waker registrado. Es quien *observa* el mundo.
+  </Card>
+  <Card icon="🌉" title="Waker">
+    El puente entre ambos. Identifica una tarea; `wake` la marca lista y la devuelve a la cola. Se clona barato y se guarda.
+  </Card>
+  <Card icon="😴" title="Sueño, no giro">
+    Sin waker habría busy-poll; con él, el executor duerme y solo despierta ante progreso real. Cero ciclos malgastados esperando.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart LR
+  L[Future hoja devuelve Pending] --> G[Guarda el waker clonado en el reactor]
+  G --> R[El reactor vigila el descriptor con epoll]
+  R -->|el socket recibe datos| K[El reactor llama a wake sobre el waker]
+  K --> E[El executor reencola la tarea]
+  E --> P[Nuevo poll ahora la lectura avanza]
+  class L t-peach
+  class R t-blue
+  class K t-mauve
+  class P t-green`} />
+
+<Callout type="dios" title="El waker es inversión de control: la espera deja de preguntar y pasa a ser avisada">
+El `Waker` resuelve, con una elegancia que roza lo mínimo, el problema central de toda espera eficiente: cómo enterarte de que algo ocurrió sin quedarte mirándolo. Hay dos filosofías para ello, y son opuestas. La del *sondeo* —preguntar repetidamente "¿ya? ¿ya?"— es simple pero derrocha: consume ciclos en proporción a la frecuencia con que preguntas, y con miles de tareas se vuelve una rueda de hámster colectiva. La del *aviso* —"no me llames, yo te llamo"— invierte el control: en vez de que el interesado interrogue, el productor del suceso notifica. El waker es esa segunda filosofía reificada en un valor que se puede clonar, mover entre hilos y guardar hasta que haga falta. Y lo hondo es *dónde* traza la frontera. Toda la maquinaria async de una aplicación —los cientos de futures compuestos por `.await`— es pasiva y se limita a propagar hacia arriba el `Pending` y hacia abajo el waker; ninguno de esos futures intermedios sabe nada del mundo real. El contacto con la realidad ocurre solo en las *hojas*: un puñado de futures que hablan con el sistema operativo o con hardware, y que son los únicos que registran el waker en un reactor de verdad. Esa separación es la que hace componible el modelo entero: puedes anidar mil futures y solo los de la base tocan `epoll`; el resto heredan gratis el mecanismo de despertar sin implementarlo. El waker desacopla, además, la política del mecanismo. El trait `Future` fija *cómo* se avisa —hay un waker, se llama `wake`—, pero no *quién* avisa ni *cuándo*: eso lo decide el runtime, que puede vigilar con `epoll` en Linux o `kqueue` en macOS, reencolar con prioridad o sin ella, robar tareas entre hilos o no, todo sin que el future se entere. Por eso el mismo future corre bajo Tokio, bajo async-std o bajo un executor de doscientas líneas para un microcontrolador sin sistema operativo: solo cambia quién construye el waker y qué hace su `wake`. Cuando comprendes que `Pending` no es "reintenta" sino "aquí tienes mi timbre, tócalo cuando haya algo", entiendes por qué la asincronía de Rust puede dormir a millones de tareas sobre ocho hilos sin gastar un solo ciclo en esperar: nadie espera preguntando, todos esperan siendo avisados.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+Un future que devuelve `Pending` debe **clonar el `Waker`** de `cx.waker()`, guardarlo donde el productor del dato lo alcance, y solo entonces ceder; guardar el más reciente en cada `poll` pendiente. El contrato es inflexible: sin un `wake()` posterior, la tarea duerme para siempre en silencio. `wake()` no ejecuta el future, solo lo **reencola** en el executor. El trabajo se reparte entre el *reactor*, que vigila el mundo con `epoll` o `kqueue` y dispara el waker, y el *executor*, que sondea y reencola. El waker es el puente que convierte la espera activa en sueño y desacopla el mecanismo de aviso de la política del runtime.
+</Callout>
+
+<Challenge title="Sigue el timbre">
+1. Describe el runtime ingenuo sin wakers y calcula, con tus palabras, qué recurso derrocha y por qué escala mal con muchas tareas ociosas.
+2. Explica por qué el future **clona** el waker en vez de quedarse con la referencia `cx.waker()`, y dónde suele guardarlo para que otro hilo lo alcance.
+3. Implementa mentalmente el pecado del nivel anterior: un `poll` que devuelve `Pending` sin tocar el waker. Predice el síntoma exacto que verá el usuario y por qué no habrá panic.
+4. Distingue `wake()` de `wake_by_ref()` y di en qué caso usarías cada uno respecto a un `Option<Waker>` que guardas.
+5. Reparte estas frases entre *reactor* y *executor*: "duermo sobre epoll vigilando descriptores", "mantengo la cola de tareas listas", "fabrico los wakers", "disparo el waker cuando el socket recibe datos". Justifica cada asignación.
+</Challenge>

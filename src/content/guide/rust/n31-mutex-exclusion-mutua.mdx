@@ -1,0 +1,142 @@
+---
+title: "Mutex: exclusión mutua con la cerradura pegada al dato"
+description: "Un Mutex garantiza que solo un hilo toque el dato a la vez. lock() no devuelve el dato: devuelve un guard RAII que da acceso exclusivo y libera la cerradura al salir de scope. Y si un hilo entra en pánico con el lock tomado, el Mutex queda envenenado para que nadie lea a ciegas un estado a medio romper."
+subject: rust
+level: 31
+order: 1
+position: "31.1"
+duration: "18 min"
+---
+
+<Lead>
+Compartir un dato mutable entre hilos es, sin ceremonia, la definición misma de una **carrera de datos**: dos hilos tocando la misma memoria, al menos uno escribiendo, sin orden que los coordine. El resultado es corrupción no determinista, el peor bug que existe. La respuesta clásica es la **exclusión mutua**: un turno que solo un hilo posee a la vez. Rust materializa ese turno en `Mutex<T>`, pero con un giro que lo distingue de casi cualquier otro lenguaje: la cerradura no es un objeto *aparte* del dato que protege, sino que **envuelve** el dato. No existe forma de mirar el interior sin antes tomar el turno. La disciplina que en C vivía en tu cabeza y en los comentarios, aquí vive en el sistema de tipos.
+</Lead>
+
+<Goals>
+
+- Entender la exclusión mutua y por qué `Mutex<T>` fusiona la cerradura con el dato protegido.
+- Usar `lock()` y el `MutexGuard` que devuelve, un valor RAII con `Deref`, `DerefMut` y `Drop`.
+- Controlar la vida del guard: liberación al salir de scope y liberación temprana con `drop`.
+- Comprender el **envenenamiento** (`poisoning`) y cómo se recupera el dato con `into_inner`.
+
+</Goals>
+
+## El dato vive dentro de la cerradura
+
+En pthreads o en Java el mutex y el dato son objetos separados; nada del lenguaje impide leer el dato sin bloquear primero. En Rust eso es imposible por construcción:
+
+```rust
+use std::sync::Mutex;
+
+let saldo = Mutex::new(100u64);      // el dato queda envuelto por el Mutex
+
+{
+    let mut guard = saldo.lock().unwrap();  // tomamos el turno
+    *guard += 50;                           // acceso exclusivo via DerefMut
+    println!("saldo interno: {}", *guard);
+}                                            // fin de scope: Drop libera la cerradura
+
+let total = *saldo.lock().unwrap();          // otro turno, ya liberado el anterior
+```
+
+`Mutex::new` **consume** el valor y lo esconde: a partir de ahí `saldo` es un `Mutex<u64>`, no un `u64`, y no hay campo público que leer. El único camino al `u64` es `lock()`. Fíjate en un detalle central: `lock()` devuelve `&Mutex<T>` desde una referencia **compartida** y aun así te entrega acceso *mutable* al interior. Eso es **mutabilidad interior** sincronizada: `Mutex` es, para el mundo multihilo, lo que `RefCell` es para el monohilo, pero comprobando la exclusividad con un turno real en vez de con un contador de préstamos.
+
+<Callout type="info" title="lock() devuelve un Result, no el dato">
+La firma real es `lock(&self) -> LockResult<MutexGuard<T>>`, es decir `Result<MutexGuard<T>, PoisonError<MutexGuard<T>>>`. El `.unwrap()` que ves en casi todos los ejemplos no oculta un fallo de adquisición —adquirir siempre acaba teniendo éxito, aunque haya que esperar—, sino que gestiona el **envenenamiento** que verás abajo. Existe también `try_lock`, que no bloquea y devuelve `Err` si la cerradura está ocupada, útil cuando prefieres hacer otra cosa antes que esperar.
+</Callout>
+
+## El guard es RAII: adquirir es construir, liberar es destruir
+
+`lock()` no devuelve tu `T`; devuelve un `MutexGuard<'_, T>`, un valor que **prueba en tiempo de ejecución que sostienes el turno**. El guard implementa `Deref` y `DerefMut`, por eso `*guard` te da el `&T` o `&mut T`; e implementa `Drop`, por eso liberar la cerradura no es una llamada que puedas olvidar, sino la consecuencia automática de que el guard salga de scope.
+
+```rust
+use std::sync::Mutex;
+
+let m = Mutex::new(String::new());
+
+let mut g = m.lock().unwrap();
+g.push_str("hola");
+drop(g);                 // liberacion explicita y TEMPRANA
+// aqui la cerradura ya esta libre; g no existe
+
+let g2 = m.lock().unwrap();
+println!("{}", *g2);     // g2 se liberara al final del bloque
+```
+
+La liberación temprana con `drop(g)` importa más de lo que parece: mientras sostienes el guard **nadie más puede entrar**, así que la duración del guard *es* la duración de la sección crítica. Mantén esa sección mínima. Si tras mutar el dato vas a hacer trabajo largo —un cálculo pesado, una llamada de red—, copia lo que necesites, suelta el guard y trabaja fuera del turno. Un guard sostenido de más es contención gratuita, y sostenerlo mientras llamas a código ajeno es una receta de interbloqueo que verás en la última lección.
+
+<Callout type="tip" title="Con acceso exclusivo al Mutex, sáltate la cerradura">
+Si tienes un `&mut Mutex<T>` —posesión exclusiva del propio Mutex, no de un `Arc` compartido— usa `get_mut()`: devuelve `&mut T` **sin sincronizar nada**. El `&mut` ya es prueba estática de que ningún otro hilo lo comparte, así que no hay turno que negociar. Es el mismo principio que gobierna todo Rust: donde el compilador ya demuestra la exclusividad, el coste en ejecución desaparece.
+</Callout>
+
+## Envenenamiento: un pánico con el lock tomado deja cicatriz
+
+¿Qué ocurre si un hilo toma el guard, empieza a mutar el dato y entra en `panic!` a mitad, dejando la invariante rota? El desenrollado libera el guard —es `Drop`, se ejecuta—, pero el dato puede haber quedado en un estado inconsistente. Rust no lo oculta: marca el `Mutex` como **envenenado**. A partir de ahí, todo `lock()` devuelve `Err(PoisonError)`.
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+let datos = Arc::new(Mutex::new(vec![1, 2, 3]));
+
+let d = Arc::clone(&datos);
+let _ = thread::spawn(move || {
+    let mut v = d.lock().unwrap();
+    v.push(4);
+    panic!("fallo con el lock tomado");   // envenena el Mutex al desenrollar
+}).join();
+
+match datos.lock() {
+    Ok(v) => println!("intacto: {v:?}"),
+    Err(envenenado) => {
+        let v = envenenado.into_inner();  // reclamamos el dato, asumiendo el riesgo
+        println!("recuperado tras panico: {v:?}");
+    }
+}
+```
+
+El envenenamiento no es un castigo: es una **notificación de tipo**. El `Err` te obliga a reconocer explícitamente que el dato pudo quedar a medio construir antes de seguir usándolo. Si decides que el estado es aceptable, `PoisonError::into_inner()` te devuelve el guard y sigues; el `.unwrap()` habitual toma la decisión opuesta —propagar el pánico— que casi siempre es la correcta, porque un dato compartido corrupto es exactamente la clase de fallo que no quieres arrastrar en silencio.
+
+<Mermaid code={`flowchart TD
+  A[Hilo llama a lock] --> B[Si el Mutex esta ocupado el hilo espera su turno]
+  B --> C[Al liberarse recibe un MutexGuard]
+  C --> D[Lee o muta el dato via Deref y DerefMut]
+  D --> E[Al salir de scope Drop libera la cerradura]
+  E --> F[El siguiente hilo ya puede adquirirla]
+  D --> G[Si entra en panico con el lock tomado el Mutex queda envenenado]
+  G --> H[El proximo lock devuelve Err para no leer a ciegas]
+  class A t-blue
+  class C t-green
+  class E t-mauve
+  class G t-red`} />
+
+## El coste, los atómicos y las alternativas
+
+Un `Mutex` no es la única herramienta, ni siempre la más barata. Para un dato que es un simple entero o una bandera, un tipo **atómico** evita el candado por completo: la operación viaja directa al hardware, sin turno ni bloqueo.
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PETICIONES: AtomicU64 = AtomicU64::new(0);
+
+PETICIONES.fetch_add(1, Ordering::Relaxed);   // incremento atomico, sin lock
+let total = PETICIONES.load(Ordering::Relaxed);
+```
+
+Los atómicos (`AtomicU64`, `AtomicBool`, `AtomicUsize`) sirven cuando el estado compartido *es* un número o un puntero; para cualquier cosa más rica —una struct, un `Vec`, un `HashMap`— sigue haciendo falta el `Mutex`. Y si el envenenamiento te estorba, o mides que el candado de `std` es un cuello de botella, `parking_lot::Mutex` ofrece un candado de terceros más rápido, sin envenenamiento, y cuyo `lock()` devuelve el guard directamente, sin `Result`. La regla: el dato más simple que resuelva tu problema —atómico si es un número, `Mutex` si es una estructura, candado externo solo si la medición lo justifica—.
+
+<Callout type="dios" title="La cerradura no es una disciplina aparte: es la forma del tipo">
+En casi todos los lenguajes con hilos, un mutex y el dato que protege son dos entidades distintas, unidas solo por una convención que vive en la cabeza del programador y, con suerte, en un comentario. Nada en el compilador impide leer el dato sin haber tomado el lock; el bug clásico —acceso sin sincronizar— es *representable*, y por tanto inevitable a escala. La decisión de Rust de meter el dato **dentro** del `Mutex` no es cosmética: reorganiza la relación entre cerradura y dato hasta volver ese bug *inexpresable*. El único valor que te da acceso a `&mut T` es el `MutexGuard`, y el `MutexGuard` solo se obtiene tomando el turno; el guard no es un permiso que pides, es la **prueba en ejecución** de que lo tienes. Que sea RAII cierra el círculo por el otro extremo: no puedes olvidar liberar porque no hay que liberar —la liberación es la destrucción del guard, garantizada por `Drop` incluso si el hilo se desenrolla por un pánico—. Y el envenenamiento extiende la misma honestidad al caso patológico: si un hilo muere a mitad de una mutación, el tipo se niega a entregar el dato en silencio, porque la invariante que prometía podría estar rota. Súmalo todo y verás que `Mutex<T>` no es "un mutex más una variable", sino una afirmación de tipos: *este dato solo se toca teniendo exclusividad, la exclusividad se demuestra con un guard, el guard se libera solo, y si algo se rompió mientras lo sostenías, te enterarás*. La exclusión mutua deja de ser una disciplina que puedes incumplir y se vuelve la geometría del tipo que usas. Ahí está la diferencia entre "documentar el protocolo" y "hacer el protocolo infalsificable".
+</Callout>
+
+<Callout type="note" title="Lo esencial de Mutex">
+`Mutex<T>` envuelve el dato: el único acceso es `lock()`, que devuelve un `MutexGuard` RAII con `Deref`, `DerefMut` y `Drop`, así que la cerradura se libera sola al salir de scope, o antes con `drop`. Mantén la sección crítica mínima. Un `panic!` con el guard tomado **envenena** el Mutex y los siguientes `lock()` devuelven `Err`; se recupera con `into_inner`. Con `&mut Mutex<T>`, `get_mut` da acceso sin sincronizar. Para un número desnudo, un atómico es más barato.
+</Callout>
+
+<Challenge title="Toma el turno, suéltalo, y rómpelo a propósito">
+1. Envuelve un `Vec<i32>` en un `Mutex`, tómalo desde un bloque, empuja tres elementos y comprueba que fuera del bloque la cerradura ya está libre porque el guard se destruyó.
+2. Reescribe ese código sustituyendo el bloque por un `drop(guard)` explícito antes de trabajo posterior; explica qué gana la sección crítica al acortarse.
+3. Provoca un `panic!` con el guard tomado dentro de un hilo, únelo con `join`, y demuestra que el siguiente `lock()` en el hilo principal devuelve `Err`. Recupera el dato con `into_inner`.
+4. Cambia un `Mutex<T>` por acceso vía `get_mut` cuando tienes `&mut Mutex<T>`; argumenta por qué ahí no hace falta sincronizar nada.
+5. Explica con tus palabras por qué "olvidé bloquear antes de leer" es un bug imposible de escribir con `Mutex<T>`, y qué lo hacía posible en C.
+</Challenge>

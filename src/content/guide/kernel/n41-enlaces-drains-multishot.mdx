@@ -1,0 +1,172 @@
+---
+title: "Cadenas, drains y multishot: dependencias dentro del ring"
+description: "`IOSQE_IO_LINK` encadena `sqe` para que cada uno arranque al completar el anterior; `IOSQE_IO_HARDLINK` e `IOSQE_IO_DRAIN` matizan el orden; y el modo multishot convierte una petición en una suscripción que produce muchos completados. La E/S deja de ser un lote de trabajos sueltos y se vuelve un pequeño grafo ejecutado en el kernel."
+subject: kernel
+level: 41
+order: 3
+position: "41.3"
+duration: "18 min"
+---
+
+<Lead>
+Hasta ahora cada `sqe` era independiente: los enviabas en lote y el kernel los ejecutaba en cualquier orden. Pero el trabajo real tiene dependencias —recibe y luego reenvía, abre y luego lee y luego cierra— y expresarlas volviendo a espacio de usuario entre paso y paso desperdicia todo lo que ganaste con el lote. `io_uring` deja describir esas dependencias **dentro del anillo**: enlaces que ordenan operaciones y peticiones multishot que se rearman solas. La E/S empieza a parecerse a un programa.
+</Lead>
+
+<Goals>
+
+- Encadenar operaciones dependientes con `IOSQE_IO_LINK` y su semántica de fallo.
+- Distinguir `IOSQE_IO_HARDLINK` (enlace duro) de `IOSQE_IO_DRAIN` (barrera global).
+- Usar el modo multishot para que una `sqe` produzca muchos CQE.
+- Leer el flag `IORING_CQE_F_MORE` para saber si la petición sigue viva.
+
+</Goals>
+
+## IOSQE_IO_LINK: encadenar operaciones
+
+Marcar `sqe->flags |= IOSQE_IO_LINK` crea una cadena: el siguiente `sqe` **no arranca** hasta que este complete. El caso canónico es un proxy que recibe de un socket y reenvía a otro sin volver a espacio de usuario entre medias.
+
+```c
+/* Cadena recv -> send: reenviar lo recibido sin pasar por userspace */
+struct io_uring_sqe *sqe;
+
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_recv(sqe, conn_fd, buf, len, 0);
+sqe->flags |= IOSQE_IO_LINK;         /* el send NO arranca hasta que este recv complete */
+
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_send(sqe, peer_fd, buf, len, 0);
+io_uring_submit(&ring);              /* un solo envío para las dos operaciones dependientes */
+```
+
+La semántica de fallo es lo importante: si un eslabón devuelve error, la cadena se **corta** y todos los eslabones siguientes se cancelan con `-ECANCELED`. Ojo con el valor: si el `recv` es corto, el `send` de arriba enviaría `len` bytes contando basura; una cadena que dependa del *resultado* (no solo de la *finalización*) exige longitudes fijas, `MSG_WAITALL`, o partir en dos pasos. El enlace ordena, no propaga valores por sí solo.
+
+Todos los eslabones de una cadena se envían en un **único** `io_uring_submit`: el kernel construye la lista enlazada al leer los `sqe` y la ejecuta entera sin devolverte el control entre pasos. Por defecto intenta cada operación en línea, de forma no bloqueante; solo si bloquearía la delega a un hilo trabajador (`io-wq`). Puedes forzar esa ejecución asíncrona con `IOSQE_ASYNC` cuando sabes de antemano que la operación va a dormir, evitando el intento en línea que fracasaría.
+
+## Cadenas con descriptores directos
+
+Cuando el eslabón siguiente necesita un descriptor que produjo el anterior —abrir y luego leer— la pieza que lo hace funcionar son los descriptores directos de la lección 1: `openat_direct` deposita el descriptor en una ranura conocida y el `read` la usa con `IOSQE_FIXED_FILE`.
+
+```c
+/* open -> read -> close encadenados, pasando el descriptor por la tabla registrada */
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_openat_direct(sqe, AT_FDCWD, path, O_RDONLY, 0, /*file_index=*/7);
+sqe->flags |= IOSQE_IO_LINK;
+
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, /*index=*/7, buf, len, 0);
+sqe->flags |= (IOSQE_FIXED_FILE | IOSQE_IO_LINK);
+
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_close_direct(sqe, /*file_index=*/7);
+io_uring_submit(&ring);              /* tres operaciones, un envío, cero regresos a userspace */
+```
+
+## HARDLINK y DRAIN: matices del orden
+
+`IOSQE_IO_LINK` corta la cadena al primer error. A veces quieres que **continúe** pase lo que pase (por ejemplo, cerrar siempre aunque la lectura falle): eso es `IOSQE_IO_HARDLINK`, que mantiene el orden pero no aborta ante un fallo del eslabón previo.
+
+```c
+sqe->flags |= IOSQE_IO_HARDLINK;     /* enlace duro: ordena, pero no cancela si el previo falla */
+```
+
+Distinto es `IOSQE_IO_DRAIN`, que no es un enlace local entre vecinos sino una **barrera global**: la operación marcada no arranca hasta que **todo** lo enviado antes en el anillo haya completado, y nada posterior la adelanta. Sirve para puntos de sincronización, como un `fsync` que debe ver todas las escrituras previas.
+
+```c
+sqe->flags |= IOSQE_IO_DRAIN;        /* barrera: espera a que TODO lo previo del ring complete */
+```
+
+El drain es caro: obliga a vaciar todo lo pendiente y frena el paralelismo del anillo, así que se reserva para verdaderos puntos de consistencia. No lo confundas con el enlace: `LINK` ordena dos vecinos y deja que el resto del anillo vuele en paralelo; `DRAIN` es una pared que atraviesa todo el flujo.
+
+Un enlace tiene un peligro: si un eslabón se cuelga —un `recv` de un cliente que nunca envía—, la cadena queda bloqueada. Para eso existe `IORING_OP_LINK_TIMEOUT`, un temporizador enlazado que cancela la operación previa si tarda demasiado:
+
+```c
+/* LINK_TIMEOUT: cancelar el recv del eslabón previo si supera 5 segundos */
+struct __kernel_timespec ts = { .tv_sec = 5 };
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_recv(sqe, fd, buf, len, 0);
+sqe->flags |= IOSQE_IO_LINK;                 /* el timeout se enlaza a este recv */
+
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_link_timeout(sqe, &ts, 0);     /* si el recv tarda, recibe -ECANCELED y el timeout -ETIME */
+io_uring_submit(&ring);
+```
+
+Un tercer modificador, `IOSQE_ASYNC`, no toca el orden sino el *dónde* se ejecuta la operación:
+
+```c
+/* Forzar ejecución en un hilo io-wq cuando sabes que la operación va a bloquear */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, fd_lento, buf, len, 0);
+sqe->flags |= IOSQE_ASYNC;           /* salta el intento en línea no bloqueante */
+io_uring_submit(&ring);
+```
+
+<Mermaid code={`flowchart LR
+  subgraph Enlace_local
+    L1[recv] -->|LINK| L2[send] -->|LINK| L3[close]
+  end
+  subgraph Barrera_global
+    D0[op A] --> B[fsync con DRAIN]
+    D1[op B] --> B
+    B --> D2[op posterior]
+  end`} />
+
+## Multishot: una petición, muchos completados
+
+Un `accept` normal produce **un** CQE y hay que reenviarlo para la siguiente conexión: un envío por conexión. El modo **multishot** invierte esa proporción: una sola `sqe` acepta conexiones indefinidamente y postea un CQE por cada una. El flag `IORING_CQE_F_MORE` indica que la petición sigue armada.
+
+```c
+/* accept multishot: UNA sqe acepta conexiones sin cesar */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_multishot_accept(sqe, listen_fd, NULL, NULL, 0);
+io_uring_submit(&ring);
+
+struct io_uring_cqe *cqe;
+while (io_uring_wait_cqe(&ring, &cqe) == 0) {
+	int conn_fd = cqe->res;                   /* cada conexión entrante es un CQE */
+	if (!(cqe->flags & IORING_CQE_F_MORE)) {
+		/* F_MORE=0: la petición multishot terminó; hay que re-armarla */
+	}
+	io_uring_cqe_seen(&ring, cqe);
+}
+```
+
+Multishot existe también para `poll`, que se vuelve una suscripción de eventos en vez de un aviso de un solo uso: en lugar de rearmar el `poll` tras cada evento como obliga `epoll` en disparo por flanco, lo armas una vez y recibes un CQE por cada transición.
+
+```c
+/* poll multishot: una suscripción que dispara un CQE por cada evento, sin rearmar */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_poll_multishot(sqe, fd, POLLIN);
+io_uring_submit(&ring);
+/* mientras cqe->flags tenga IORING_CQE_F_MORE, la suscripción sigue activa */
+```
+
+Y para `recv`, que necesita búferes proporcionados (lección 4). Si la cola de completado se desborda, el kernel puede terminar la petición multishot —limpia `F_MORE`— y toca al programa re-armarla.
+
+<Callout type="warn" title="Multishot obliga a vigilar F_MORE y el desbordamiento de la CQ">
+Una petición multishot vive hasta que algo la termina: un error, un cierre, o que la *completion queue* se llene y el kernel no pueda postar más. Cuando eso ocurre, el último CQE llega **sin** `IORING_CQE_F_MORE` y la petición muere silenciosamente; si no la re-armas, dejas de aceptar conexiones o de recibir datos sin ningún error visible. Regla de oro: comprueba `F_MORE` en cada CQE de una petición multishot y ten preparada la lógica de rearme. Dimensionar la CQ con `IORING_SETUP_CQSIZE` reduce la frecuencia de esos cortes.
+</Callout>
+
+<Cards>
+  <Card icon="🔗" title="LINK / HARDLINK">
+    Dependencia local entre `sqe` vecinos. `LINK` corta al primer error; `HARDLINK` mantiene el orden pero no aborta. Dataflow dentro del anillo.
+  </Card>
+  <Card icon="🚧" title="DRAIN">
+    Barrera global: no arranca hasta que todo lo previo del anillo completó. Para puntos de sincronización como un `fsync` que debe verlo todo.
+  </Card>
+  <Card icon="📡" title="Multishot">
+    Una `sqe`, muchos CQE. `accept`, `poll` y `recv` como suscripción que se rearma. `IORING_CQE_F_MORE` dice si sigue viva.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="El anillo deja de ser un lote y se vuelve un grafo de dataflow">
+Da un paso atrás y mira lo que acabas de construir. Un `io_uring` sin enlaces es una lista de trabajos independientes: eficiente, pero tonta; toda la lógica de qué-va-después vive en tu bucle de espacio de usuario, que despierta, decide y vuelve a enviar. Los enlaces y el multishot mueven esa lógica **al kernel**. `IOSQE_IO_LINK` es una arista en un grafo de dependencias; `IOSQE_IO_DRAIN` es una barrera de sincronización; el multishot es un bucle que se ejecuta sin ti. Ensámblalos y el anillo deja de describir *operaciones* para describir un pequeño **programa de dataflow** que el kernel ejecuta de principio a fin, tomando decisiones de orden y de repetición que antes exigían un ida y vuelta por cada paso. Ese es el patrón que más gana a escala, porque el impuesto que de verdad duele no era la copia de datos —eso lo resolvieron el DMA y el zero-copy— sino el **regreso a espacio de usuario** por cada decisión trivial: despertar un hilo, mirar un resultado, decidir la operación obvia siguiente, volver a dormir. Los enlaces pagan ese peaje una vez por grafo en vez de una vez por operación. Y fíjate hacia dónde apunta la flecha: si el anillo ya ejecuta un grafo con ramas y bucles, el siguiente paso natural es dejar que ese grafo tenga *condicionales* —código que decida el próximo eslabón según el resultado del anterior—, y ese código, ejecutándose seguro dentro del kernel, es exactamente eBPF (lección 5). El multishot y los enlaces no son trucos de rendimiento sueltos: son los primeros compases de la E/S entendida como un programa que corre donde están los datos.
+</Callout>
+
+<Challenge title="Programa el anillo, no el bucle">
+1. Monta un proxy TCP encadenando `recv` y `send` con `IOSQE_IO_LINK`; provoca un error en el `recv` y observa el `-ECANCELED` del `send`.
+2. Reescribe una cadena `open`-`read`-`close` con descriptores directos y `IOSQE_FIXED_FILE`; confirma que sale un solo envío en `strace`.
+3. Cambia un `LINK` por `HARDLINK` y comprueba que el `close` se ejecuta aunque la lectura falle.
+4. Añade un `fsync` con `IOSQE_IO_DRAIN` tras varias escrituras y razona por qué el drain garantiza que las ve todas.
+5. Sustituye un bucle de `accept` de un envío por conexión por `multishot_accept`; cuenta cuántos `io_uring_submit` haces ahora y explica el papel de `IORING_CQE_F_MORE`.
+</Challenge>

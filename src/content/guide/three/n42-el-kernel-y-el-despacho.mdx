@@ -1,0 +1,194 @@
+---
+title: "El kernel: Fn, workgroups y el tamaño del despacho"
+description: "Cómo se escribe el cuerpo de un compute shader en TSL, qué controla el tamaño de workgroup, la diferencia entre count y dispatchSize, y cómo se escribe control de flujo que no destruya el paralelismo."
+subject: three
+level: 42
+order: 3
+position: "42.3"
+duration: "20 min"
+---
+
+<Lead>
+El kernel es donde vive la lógica. TSL te deja escribirlo con la misma sintaxis que un material —`Fn`, operaciones encadenadas, `If`, `Loop`— pero el contexto es radicalmente distinto: no hay fragmento, no hay interpolación, no hay salida implícita. Solo un índice, memoria, y un modelo de ejecución en el que miles de invocaciones avanzan en lockstep dentro de grupos. Entender ese modelo es lo que separa un kernel que va rápido de uno que ocupa la GPU sin usarla.
+</Lead>
+
+<Goals>
+
+- Escribir kernels con `Fn`, incluyendo variables locales y parámetros tipados.
+- Elegir un tamaño de workgroup y justificar la elección.
+- Distinguir `count` de `dispatchSize` y usar despachos multidimensionales.
+- Escribir control de flujo con `If`, `Loop` y `Switch` sin provocar divergencia innecesaria.
+
+</Goals>
+
+## Anatomía de un kernel
+
+Un kernel TSL es una función sin retorno cuyo efecto es escribir en memoria. La variable local se declara con `.toVar()`, que fuerza al generador a emitir una variable real en lugar de reinsertar la expresión en cada uso.
+
+```js
+import * as THREE from 'three/webgpu';
+import { Fn, instancedArray, instanceIndex, uniform, vec3, float, If } from 'three/tsl';
+
+const total = 200000;
+
+const posiciones = instancedArray( total, 'vec3' );
+const velocidades = instancedArray( total, 'vec3' );
+
+const gravedad = uniform( - 0.0098 );
+const rebote = uniform( 0.8 );
+
+const actualizar = Fn( () => {
+
+	const p = posiciones.element( instanceIndex );
+	const v = velocidades.element( instanceIndex );
+
+	// Variable local real: se calcula una vez y se reutiliza.
+	const nuevaY = p.y.add( v.y ).toVar();
+
+	v.addAssign( vec3( 0, gravedad, 0 ) );
+	p.addAssign( v );
+
+	If( p.y.lessThan( 0 ), () => {
+
+		p.y = float( 0 );
+		v.y = v.y.negate().mul( rebote );
+
+	} );
+
+} )().compute( total );
+```
+
+Sin `.toVar()`, una expresión usada tres veces se genera tres veces. TSL es un grafo de nodos, no un árbol de sintaxis abstracta con análisis de subexpresiones comunes: si escribes `p.y.add( v.y )` en tres sitios, el compilador emite tres sumas. En un fragment shader eso es despreciable; en un kernel que corre un millón de veces por frame, no.
+
+Los uniforms funcionan igual que en un material: `uniform( valor )` crea un nodo cuyo `.value` puedes modificar desde JavaScript entre despachos. Es el canal correcto para pasar tiempo, delta, parámetros de simulación y posiciones de interacción. Cambiar un uniform no recompila nada.
+
+Cuando el kernel necesita parámetros, `Fn` los recibe como en cualquier función:
+
+```js
+const aplicarFuerza = Fn( ( [ indice, centro, radio ] ) => {
+
+	const p = posiciones.element( indice );
+	const v = velocidades.element( indice );
+
+	const d = p.distance( centro );
+	const fuerza = radio.sub( d ).max( 0 ).mul( 0.01 );
+
+	v.addAssign( p.sub( centro ).normalize().mul( fuerza ) );
+
+} );
+
+// Se invoca dentro de otro Fn.
+const golpe = Fn( () => {
+
+	aplicarFuerza( instanceIndex, posicionClic, float( 3 ) );
+
+} )().compute( total );
+```
+
+Los parámetros llegan desestructurados de un array. Si quieres que TSL genere una función real en el shader —en lugar de insertar el cuerpo en el sitio de llamada— declara un layout con tipos: `Fn( fn, { indice: 'uint', centro: 'vec3', radio: 'float', return: 'void' } )`. Con layout se emite una función; sin layout se hace inlining. El inlining suele ser más rápido para cuerpos pequeños y hace explotar el tamaño del shader para cuerpos grandes.
+
+## Workgroups y ocupación
+
+La GPU no ejecuta invocaciones sueltas. Las agrupa en **workgroups**, y los workgroups se reparten entre las unidades de cómputo del chip. Dentro de un workgroup las invocaciones pueden compartir memoria rápida y sincronizarse con barreras; entre workgroups distintos no hay ninguna garantía de orden.
+
+En Three.js el tamaño de workgroup es el segundo argumento de `.compute()` y su valor por defecto es `[ 64 ]`:
+
+```js
+// Por defecto: 64 invocaciones por workgroup en X.
+const k1 = miKernel().compute( total );
+
+// Explicito, unidimensional.
+const k2 = miKernel().compute( total, [ 128 ] );
+
+// Bidimensional: util cuando el problema es una rejilla.
+const k3 = miKernel().compute( total, [ 8, 8 ] );
+```
+
+El array admite uno, dos o tres elementos, y Three.js lo rellena con unos hasta tres dimensiones, igual que hace WGSL con el atributo `workgroup_size`. El producto de las dimensiones es el número de invocaciones por grupo.
+
+¿Qué tamaño elegir? La respuesta corta: 64 está bien casi siempre, y es el valor por defecto por eso. La respuesta larga tiene que ver con la unidad de ejecución real del hardware, que es más pequeña que el workgroup: 32 hilos en la mayoría de GPUs de NVIDIA, 64 en las de AMD, y variable en las móviles. Un workgroup debería ser múltiplo de ese tamaño para no desperdiciar hilos, y suficientemente grande para que la unidad de cómputo tenga trabajo con el que tapar la latencia de memoria. Un workgroup de 8 deja la mayoría de los carriles vacíos; uno de 1024 consume tantos registros que reduce cuántos grupos caben simultáneamente en cada unidad, que es lo que se llama *ocupación*.
+
+La regla práctica: quédate en 64 o 128 salvo que estés midiendo, y si mides, prueba 32, 64, 128 y 256 sobre tu hardware objetivo. Las diferencias suelen estar por debajo del 20 % excepto en kernels con memoria compartida, donde el tamaño del grupo condiciona el algoritmo entero.
+
+## count frente a dispatchSize
+
+Esta distinción es la que más errores silenciosos causa, y el código de `ComputeNode` la deja clarísima: si el argumento de `.compute()` es un **número**, se guarda en `count`; si es un **array**, se guarda en `dispatchSize`.
+
+```js
+// count = 200000. Three.js calcula los workgroups y añade la comprobacion de limite.
+const a = kernel().compute( 200000 );
+
+// dispatchSize = [ 64, 64, 1 ]. Se despachan 64*64 workgroups. Sin comprobacion.
+const b = kernel().compute( [ 64, 64, 1 ] );
+```
+
+Con `count`, el generador antepone al cuerpo del kernel una salida temprana equivalente a `if ( instanceIndex >= count ) return;` usando un uniform interno. Es la red de seguridad que hace que puedas pasar cualquier número sin pensar en múltiplos de 64.
+
+Con `dispatchSize` estás diciendo "despacha exactamente esta rejilla de workgroups", y la responsabilidad de acotar es tuya. Lo necesitas cuando el problema es intrínsecamente bidimensional o tridimensional —una textura, un volumen, una rejilla de simulación— y quieres que los identificadores integrados de WGSL reflejen esa forma. El número total de invocaciones es el producto de `dispatchSize` por el producto de `workgroupSize`.
+
+<Callout type="tip" title="Cuenta antes de despachar">
+Si usas `dispatchSize` para una rejilla de `ancho` por `alto`, el número de workgroups en cada eje es `Math.ceil( ancho / wx )` y `Math.ceil( alto / wy )`. Ese techo es precisamente el que produce invocaciones sobrantes en los bordes. Acótalas tú con un `If` al principio del kernel comparando contra las dimensiones reales, o acepta escrituras fuera de rango.
+</Callout>
+
+## Control de flujo sin destruir el paralelismo
+
+TSL ofrece `If`, `Loop` y `Switch`. Los tres generan control de flujo real en el shader, y los tres tienen el mismo coste conceptual: **divergencia**.
+
+```js
+import { Fn, If, Loop, instanceIndex, float, int } from 'three/tsl';
+
+const kernel = Fn( () => {
+
+	const v = valores.element( instanceIndex );
+
+	If( v.greaterThan( 1 ), () => {
+
+		v.assign( float( 1 ) );
+
+	} ).ElseIf( v.lessThan( 0 ), () => {
+
+		v.assign( float( 0 ) );
+
+	} ).Else( () => {
+
+		v.mulAssign( float( 0.99 ) );
+
+	} );
+
+	// Bucle de 8 iteraciones con indice disponible.
+	Loop( { start: int( 0 ), end: int( 8 ) }, ( { i } ) => {
+
+		v.addAssign( float( i ).mul( 0.001 ) );
+
+	} );
+
+} )().compute( total );
+```
+
+La divergencia ocurre porque las invocaciones de un mismo grupo de ejecución comparten contador de programa. Si dentro de un grupo unas toman la rama verdadera y otras la falsa, el hardware ejecuta **las dos** ramas de forma secuencial, enmascarando los carriles que no corresponden. Un `If` con dos ramas de coste similar sobre datos aleatorios cuesta aproximadamente lo mismo que ejecutar ambas siempre.
+
+De ahí salen dos técnicas que valen su peso en oro. La primera es sustituir ramas por aritmética cuando las dos ramas son baratas:
+
+```js
+// Con rama: potencialmente divergente.
+If( v.lessThan( 0 ), () => { v.assign( float( 0 ) ); } );
+
+// Sin rama: siempre el mismo coste, sin divergencia.
+v.assign( v.max( 0 ) );
+```
+
+`max`, `min`, `clamp`, `step` y `mix` existen precisamente para esto. Un `mix( a, b, factor )` con el factor calculado por un `step` es casi siempre preferible a un `If` cuando las dos ramas son expresiones cortas.
+
+La segunda es **agrupar por coherencia**. Si tu condición depende de datos que están ordenados en memoria, los hilos vecinos tomarán la misma rama y no habrá divergencia. Es la razón por la que ordenar partículas por celda espacial acelera las simulaciones de fluidos mucho más de lo que sugiere el coste del propio ordenamiento: no es solo localidad de caché, es coherencia de rama.
+
+<Callout type="dios" title="Loop no es un bucle de JavaScript, y a veces sí lo es">
+Aquí hay una asimetría que confunde a todo el mundo la primera vez. En TSL tienes **dos** formas de repetir código y producen shaders completamente distintos. Un `for` normal de JavaScript dentro de un `Fn` se ejecuta **en tiempo de construcción del grafo**: cada iteración añade nodos al grafo, y el shader resultante tiene el cuerpo repetido literalmente N veces. Es desenrollado total. Un `Loop( ... )` de TSL, en cambio, genera un bucle real en el código del shader, con su contador y su comparación. La consecuencia práctica es enorme. Con `for` de JavaScript, el número de iteraciones tiene que ser una constante conocida al construir el grafo, el shader crece linealmente con ella, y la GPU no paga ningún coste de control de flujo. Con `Loop`, el número de iteraciones puede ser un uniform que cambies desde JavaScript sin recompilar, el shader se mantiene compacto, y pagas la comparación en cada vuelta. ¿Cuándo cada uno? Para tres, cuatro u ocho iteraciones fijas, el `for` de JavaScript casi siempre gana: el desenrollado elimina el control de flujo y permite al compilador del driver reordenar instrucciones libremente. Para treinta y dos, o para un número que dependa de la configuración del usuario, `Loop` es obligatorio: un shader con el cuerpo repetido treinta y dos veces tarda un tiempo desagradable en compilar y puede agotar el presupuesto de instrucciones en móviles. Y hay un límite duro que descubres tarde si no lo sabes: el desenrollado con `for` de JavaScript convierte un bucle de simulación de mil pasos en un shader de decenas de miles de líneas que el compilador del driver puede tardar **segundos** en procesar, bloqueando el hilo principal en el primer frame que use ese material. Cuando veas un tirón inexplicable la primera vez que aparece un objeto en pantalla, mira si hay un `for` de JavaScript grande dentro de un `Fn`.
+</Callout>
+
+<Challenge title="Mide la divergencia">
+1. Escribe un kernel con un `If` cuya condición dependa de `instanceIndex.mod( 2 )` y mide su tiempo.
+2. Cambia la condición para que dependa de `instanceIndex.div( 64 ).mod( 2 )`, de modo que grupos enteros tomen la misma rama, y vuelve a medir.
+3. Sustituye el `If` por un `mix` equivalente y compara los tres resultados.
+4. Escribe el mismo bucle de 16 iteraciones con `for` de JavaScript y con `Loop`, e inspecciona el tamaño del shader generado.
+5. Prueba tamaños de workgroup de 32, 64, 128 y 256 sobre el mismo kernel y anota si la diferencia supera el ruido de medición.
+</Challenge>

@@ -1,0 +1,150 @@
+---
+title: "El evento de actualización de versión"
+description: "La única ventana donde existe el esquema de IndexedDB: una transacción exclusiva que llega por evento pero bloquea la base entera, y que negocia con las demás pestañas antes de poder ejecutarse."
+subject: local-first
+level: 7
+order: 2
+position: "7.2"
+duration: "16 min"
+---
+
+<Lead>
+En IndexedDB el esquema no se declara: se negocia. Crear un almacén o un índice solo es legal dentro de un evento concreto, disparado por una apertura que pide una versión mayor que la guardada, y que abre una transacción exclusiva sobre toda la base. Ese evento es al mismo tiempo asíncrono —llega cuando el motor decide— y bloqueante —nada más puede tocar la base mientras dura—, una combinación rara que explica casi todos los bloqueos misteriosos que verás en producción cuando el usuario tiene dos pestañas abiertas.
+</Lead>
+
+<Goals>
+
+- Entender la apertura como una negociación de versión y no como una simple conexión.
+- Situar la transacción de actualización: qué permite, qué prohíbe y cuál es su alcance.
+- Coordinar varias pestañas con los eventos de bloqueo y de cambio de versión.
+- Escribir migraciones acumulativas que funcionen desde cualquier versión previa.
+
+</Goals>
+
+## La ceremonia de apertura
+
+Abrir una base es pedirle al motor una versión concreta. Si la versión almacenada coincide, la conexión se establece y punto. Si la que pides es mayor, el motor dispara `upgradeneeded` antes de darte la conexión. Y si es menor, la petición falla con `VersionError`: IndexedDB no tiene camino de vuelta.
+
+Dentro de ese evento recibes una transacción especial en modo `versionchange`, accesible como `event.target.transaction`. Es la única en la que `createObjectStore`, `deleteObjectStore`, `createIndex` y `deleteIndex` son operaciones legales. Fuera de ella, esos métodos lanzan `InvalidStateError` sin excepción.
+
+<Mermaid code={`flowchart TD
+  A[Llamada a open con nombre y version] --> B{Version pedida frente a version guardada}
+  B -->|Menor| C[Error de version y no hay conexion]
+  B -->|Igual| D[Evento success con la conexion lista]
+  B -->|Mayor| E{Hay otras conexiones abiertas}
+  E -->|Si| F[Evento blocked y espera indefinida]
+  F --> G[Las otras pestanas reciben versionchange y cierran]
+  G --> H[Transaccion exclusiva de actualizacion]
+  E -->|No| H
+  H --> I[Se crean o borran almacenes e indices]
+  I --> D`} />
+
+<Callout type="note" title="La versión es un entero, no una cadena">
+La versión se guarda como entero sin signo de 64 bits. Nada te obliga a usar números correlativos, pero cualquier esquema de numeración que inventes tiene que ser monotónicamente creciente, porque bajar no es una opción que la especificación contemple.
+</Callout>
+
+## Asíncrono y bloqueante a la vez
+
+La contradicción aparente se resuelve en cuanto separas dos planos. En el plano del hilo de JavaScript, el evento es asíncrono: llega en un turno posterior del bucle de eventos, tu código no se detiene esperándolo y no puedes escribir la migración de forma secuencial encima de la apertura.
+
+En el plano de la base de datos, la transacción de actualización es tan exclusiva como puede serlo una transacción: su alcance implícito son **todos** los almacenes, y mientras dure ninguna otra transacción, de esta o de cualquier otra conexión, puede ejecutarse. Es el único momento en la vida de la base en el que tienes garantizado que nadie más está leyendo ni escribiendo.
+
+<Cards>
+  <Card icon="🔒" title="Alcance total">
+    No declaras almacenes: los tienes todos. Es la única transacción con alcance implícito sobre la base completa.
+  </Card>
+  <Card icon="✍️" title="Lee y escribe datos">
+    Además de tocar el esquema, puedes leer y reescribir registros para adaptarlos a la forma nueva, todo dentro de la misma transacción atómica.
+  </Card>
+  <Card icon="↩️" title="Todo o nada">
+    Si la transacción aborta, no avanza la versión y no queda ni un almacén a medio crear. Una migración fallida deja la base exactamente como estaba.
+  </Card>
+  <Card icon="⏳" title="No admite esperas ajenas">
+    No puedes esperar a una petición de red dentro de la migración: la transacción se cerraría sola y la actualización quedaría incompleta.
+  </Card>
+</Cards>
+
+## Las otras pestañas
+
+Aquí está el problema real. Si el usuario tiene la aplicación abierta en dos pestañas y despliegas una versión nueva, la pestaña recargada pedirá una versión mayor mientras la vieja mantiene su conexión abierta. El motor no puede empezar la actualización: dispara `blocked` en la conexión nueva y espera, sin límite de tiempo.
+
+La coordinación es responsabilidad tuya y consiste en un contrato de dos partes: toda conexión escucha `versionchange` y se cierra al recibirlo; toda apertura escucha `blocked` y avisa al usuario si la espera se alarga.
+
+Conviene subrayar que `blocked` no es un error ni un tiempo agotado: es un aviso de que la actualización está en cola y seguirá esperando indefinidamente. El motor no forzará jamás el cierre de las conexiones antiguas, porque hacerlo podría abortar transacciones en vuelo en otra pestaña.
+
+```js
+function abrir(nombre, version) {
+  const peticion = indexedDB.open(nombre, version);
+
+  peticion.onblocked = () => {
+    // Otra pestana sigue con la version antigua abierta
+    avisar("Cierra las demas pestanas para completar la actualizacion");
+  };
+
+  peticion.onsuccess = () => {
+    const db = peticion.result;
+    // Contrato: si alguien pide actualizar, nos apartamos
+    db.onversionchange = () => {
+      db.close();
+      avisar("La aplicacion se actualizo, recarga la pagina");
+    };
+  };
+
+  return peticion;
+}
+```
+
+<Callout type="warn" title="El despliegue continuo rompe la dirección única">
+Si un usuario abre una pestaña con la versión nueva y luego otra con la vieja servida desde caché, la vieja recibirá `VersionError` al abrir. No hay forma de degradar el esquema: la única salida sensata es detectar ese error y forzar una recarga que traiga el código actualizado.
+</Callout>
+
+## Migraciones acumulativas
+
+Nunca escribas la migración pensando en el salto de la versión anterior a la actual. Escríbela pensando en un usuario que abrió la aplicación hace catorce meses y vuelve hoy: su base está en la versión dos y tú vas por la siete. El patrón canónico es un `switch` sin `break`, deliberadamente encadenado.
+
+```js
+peticion.onupgradeneeded = (evento) => {
+  const db = evento.target.result;
+  const tx = evento.target.transaction;
+
+  switch (evento.oldVersion) {
+    case 0:
+      db.createObjectStore("notas", { keyPath: "id", autoIncrement: true });
+    case 1:
+      tx.objectStore("notas").createIndex("por_fecha", "creado");
+    case 2: {
+      // Migracion de datos dentro de la misma transaccion
+      const cursorPeticion = tx.objectStore("notas").openCursor();
+      cursorPeticion.onsuccess = () => {
+        const cursor = cursorPeticion.result;
+        if (!cursor) return;
+        const nota = cursor.value;
+        if (nota.etiquetas === undefined) {
+          nota.etiquetas = [];
+          cursor.update(nota);
+        }
+        cursor.continue();
+      };
+    }
+  }
+};
+```
+
+El valor de `oldVersion` es cero cuando la base no existía, lo que convierte la creación inicial en un caso más de la escalera y elimina la rama especial de instalación. Cada `case` es un delta, no un estado final: esa es toda la disciplina que exige el patrón.
+
+Hay dos operaciones que la API no ofrece y que tendrás que componer a mano. Renombrar un almacén no existe: se crea el nuevo, se copian los registros con un cursor y se borra el viejo, todo dentro de la misma migración. Cambiar la definición de un índice tampoco: se borra con `deleteIndex` y se vuelve a crear, lo que obliga al motor a reconstruir la proyección entera recorriendo el almacén.
+
+<Callout type="tip" title="Comprueba antes de crear, siempre">
+Usa `db.objectStoreNames.contains` y `store.indexNames.contains` antes de crear cualquier cosa. Una migración que asume el estado del esquema en lugar de comprobarlo funcionará en tu máquina y fallará con `ConstraintError` en la de un usuario que llegó por un camino que no previste.
+</Callout>
+
+<Callout type="dios" title="La migración de esquema es el punto donde una aplicación local-first se juega los datos del usuario">
+En una arquitectura clásica el esquema vive en un servidor que tú controlas, y una migración es una operación que ejecutas una vez, a una hora que eliges, sobre una base que puedes respaldar antes y revisar después. En local-first nada de eso es cierto: el esquema vive replicado en cada dispositivo, la migración se ejecuta en un navegador que no controlas, a una hora que decide el usuario al abrir la pestaña, sobre datos de los que no tienes copia y que quizá sean los únicos que existan. Por eso el evento de actualización no es un detalle de API sino el punto de mayor riesgo estructural de todo el sistema, y por eso la especificación lo blindó con una transacción exclusiva y atómica: si algo falla a mitad, la versión no avanza y la base queda intacta, de modo que el peor resultado posible es que el usuario siga con el esquema viejo, no que se quede con uno corrupto. De ahí se deducen las tres reglas que no deberías negociar nunca. La primera es que las migraciones son acumulativas y se escriben para un dispositivo que puede llevar años apagado, porque en local-first la cola de versiones antiguas no caduca jamás. La segunda es que dentro de la migración no se espera nada externo: ni red, ni permisos, ni entrada del usuario, porque cualquier espera ajena mata la transacción y con ella la atomicidad que te protegía. La tercera es que la coordinación entre pestañas es parte de la migración y no un adorno, porque una conexión vieja que nadie cierra convierte una actualización de doscientos milisegundos en un cuelgue silencioso e indefinido que el usuario interpretará como que tu aplicación está rota. Quien trata este evento como un lugar donde poner cuatro llamadas a `createObjectStore` acaba descubriendo, meses después, que la parte difícil de local-first no era sincronizar: era cambiar de forma sin perder a nadie por el camino.
+</Callout>
+
+<Challenge title="Domina la ventana del esquema">
+1. Abre una base en la versión 3 desde una pestaña y, sin cerrarla, ábrela en la versión 4 desde otra: observa el evento de bloqueo y cronometra cuánto espera.
+2. Implementa el contrato completo de cambio de versión y repite la prueba: la actualización debe completarse sin intervención manual.
+3. Escribe una escalera de migraciones desde `oldVersion` cero hasta tres y verifica que un usuario en cualquier versión intermedia llega al estado final.
+4. Provoca un error a mitad de la migración y comprueba que la versión no avanzó y que el esquema quedó exactamente como estaba.
+</Challenge>

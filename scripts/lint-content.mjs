@@ -3,7 +3,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const GUIDE = 'src/content/guia';
+const GUIDE = 'src/content/guide';
 const ICONS = 'src/lib/icons.ts';
 const CONTENT_COMPONENTS = 'src/components/content';
 const DB = 'db/catalog.db';
@@ -21,7 +21,7 @@ for (const file of (await readdir(CONTENT_COMPONENTS)).filter((f) => f.endsWith(
 
 const COMPONENTS = new Set([
   'Callout', 'KeyCap', 'Kbd', 'Mermaid', 'Cards', 'Card', 'PluginCard',
-  'Objetivos', 'Reto', 'Lead', 'Exercise', 'Paso', 'Instalar',
+  'Goals', 'Challenge', 'Lead', 'Exercise', 'Step', 'Install',
   'Predict', 'ModeMap', 'KeyboardMap', 'Pipeline',
   'UndoTree', 'WindowLayout', 'CommandAnatomy',
   'Fragment',
@@ -100,22 +100,22 @@ for (const track of folders) {
     total++;
     if (!fm) { fail(path, 'sin frontmatter'); continue; }
 
-    for (const field of ['title', 'description', 'subject', 'level', 'order', 'posicion']) {
+    for (const field of ['title', 'description', 'subject', 'level', 'order', 'position']) {
       if (!fm[field]) fail(path, `falta "${field}"`);
     }
     if (fm.subject && fm.subject !== track) {
       fail(path, `subject "${fm.subject}" no coincide con la carpeta "${track}"`);
     }
-    if (fm.posicion && !/^\d+(\.\d+)?$/.test(fm.posicion)) {
-      fail(path, `posicion "${fm.posicion}" no tiene la forma «17» o «17.5»`);
+    if (fm.position && !/^\d+(\.\d+)?$/.test(fm.position)) {
+      fail(path, `position "${fm.position}" no tiene la forma «17» o «17.5»`);
     }
     const level = Number(fm.level);
     const order = Number(fm.order);
     if (!Number.isInteger(level) || level < 0) fail(path, `level "${fm.level}" inválido`);
     else if (!levels.has(level)) fail(path, `level ${level} no existe en db/seeds/04-levels.sql`);
     if (!Number.isInteger(order) || order < 1) fail(path, `order "${fm.order}" inválido`);
-    if (fm.posicion && fm.posicion !== `${level}.${order}`) {
-      warn(path, `posicion "${fm.posicion}" debería ser "${level}.${order}"`);
+    if (fm.position && fm.position !== `${level}.${order}`) {
+      warn(path, `position "${fm.position}" debería ser "${level}.${order}"`);
     }
 
     let prose = text

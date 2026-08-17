@@ -1,0 +1,143 @@
+---
+title: "Patrones: mini-base de datos por entidad, colas y batching"
+description: "Con storage, SQLite y alarmas en la mano, emergen tres patrones que definen el estilo Durable Object. Un objeto como base de datos por entidad, que reparte el dominio en millones de bases diminutas y coubicadas. Una cola durable con alarmas, donde el objeto acumula trabajo y se despierta para drenarlo. Y el batching de escrituras, que absorbe eventos en el almacén rápido y los vuelca por lotes a un destino externo. Los combinamos en un solo primitivo con estado."
+subject: cloudflare
+level: 22
+order: 5
+position: "22.5"
+duration: "21 min"
+---
+
+<Lead>
+Ya tienes las tres piezas: un almacén transaccional, una base de datos SQLite dentro del objeto y alarmas que lo despiertan solo. Por separado son capacidades; juntas dan lugar a un puñado de patrones que, una vez los ves, reorganizan tu forma de diseñar backend en el edge. Tres destacan sobre los demás: el objeto como base de datos por entidad, la cola durable gobernada por alarmas, y el batching de escrituras hacia un almacén externo. No son trucos sueltos; son las formas naturales que toma el estado cuando cómputo, memoria y tiempo comparten dueño.
+</Lead>
+
+<Goals>
+
+- Diseñar un Durable Object como mini-base de datos por entidad y enrutar cada entidad a su objeto.
+- Construir una cola durable donde el objeto acumula trabajo y una alarma lo drena.
+- Aplicar el batching de escrituras para absorber eventos y volcarlos por lotes a un destino externo.
+- Combinar los tres patrones en un primitivo con estado, y saber cuándo un objeto deja de ser la respuesta.
+
+</Goals>
+
+## Un objeto como base de datos por entidad
+
+El patrón fundacional es tratar cada objeto como la base de datos de una sola entidad. En lugar de una tabla `salas` gigante con millones de filas en una base central, tienes un objeto `Sala` por sala, y cada uno lleva su propio SQLite con solo sus mensajes. La identidad hace de clave: derivas el objeto del identificador de la entidad con `idFromName`, y la plataforma se encarga de que siempre caigas en la misma instancia.
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const salaId = new URL(request.url).searchParams.get("sala") ?? "general";
+    // el nombre de la entidad se convierte en la identidad del objeto
+    const id = env.SALA.idFromName(salaId);
+    const sala = env.SALA.get(id);
+    return sala.fetch(request);
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+Cada sala queda así aislada, consistente y coubicada con su propio estado. El dominio se reparte en millones de bases diminutas que no se coordinan entre sí, y la escala se consigue teniendo más objetos, no un objeto más grande. Es la traducción directa del principio del nivel: un único dueño por cada porción de estado.
+
+La elección de `idFromName` frente a `newUniqueId` no es un detalle menor. `idFromName` es determinista: el mismo nombre de entidad —el identificador de la sala, el correo del usuario— produce siempre el mismo objeto, sin que tengas que guardar en ninguna parte la correspondencia entre entidad y objeto. Esa función pura de nombre a identidad es lo que convierte al esquema de nombres de tu dominio en el índice de tu enjambre de objetos, y lo que hace que enrutar a la entidad correcta sea tan barato como calcular un identificador.
+
+## Colas durables con alarmas
+
+El segundo patrón nace de casar el almacén con las alarmas. Un objeto puede aceptar trabajo, guardarlo en su almacén como una cola ordenada por clave, y programar una alarma para drenarlo más tarde. Entre encolar y procesar el objeto puede dormirse: la cola es durable y la alarma lo despertará. Es un planificador de trabajo por entidad, sin cola externa ni proceso vigilante.
+
+```ts
+export class ColaTareas {
+  constructor(private state: DurableObjectState, private env: Env) {}
+
+  async encolar(tarea: Tarea): Promise<void> {
+    const clave = `t:${Date.now()}:${crypto.randomUUID()}`;
+    await this.state.storage.put(clave, tarea);
+    // si no hay alarma pendiente, programa el drenaje
+    if ((await this.state.storage.getAlarm()) === null) {
+      await this.state.storage.setAlarm(Date.now() + 1_000);
+    }
+  }
+
+  async alarm(): Promise<void> {
+    const lote = await this.state.storage.list<Tarea>({ prefix: "t:", limit: 50 });
+    for (const [clave, tarea] of lote) {
+      await procesar(tarea);
+      await this.state.storage.delete(clave);
+    }
+    // si queda trabajo, vuelve a citarse
+    if ((await this.state.storage.list({ prefix: "t:", limit: 1 })).size > 0) {
+      await this.state.storage.setAlarm(Date.now() + 1_000);
+    }
+  }
+}
+```
+
+<Mermaid code={`flowchart TB
+  E[eventos que llegan] --> BUF[buffer en el almacen del objeto]
+  BUF -.alarma cada segundo.-> DR[alarm drena un lote]
+  DR --> OUT[procesa y borra las claves hechas]
+  DR -.queda trabajo.-> BUF
+  class DR t-green`} />
+
+## Batching de escrituras
+
+El tercer patrón resuelve un problema de coste y de límites. Imagina miles de eventos por segundo —clics, métricas, latidos— que quieres registrar en un destino externo caro o con cupo, como D1 o una API. Escribir uno por uno es lento y se estrella contra los límites. La solución es interponer un objeto: los eventos entran en su almacén rápido y local, y una alarma vuelca todo lo acumulado en un solo lote cada pocos segundos. El objeto absorbe la ráfaga y la convierte en un goteo ordenado.
+
+<Cards>
+  <Card icon="🗃️" title="Base de datos por entidad">
+    Un objeto por sala, usuario o documento. Cada uno con su SQLite aislado y consistente. Escalas multiplicando entidades, no engordando una tabla central.
+  </Card>
+  <Card icon="📥" title="Cola durable con alarma">
+    El objeto acepta trabajo en su almacén y se cita para drenarlo. La cola sobrevive a reinicios y el trabajo diferido se procesa por lotes, sin planificador externo.
+  </Card>
+  <Card icon="🪣" title="Batching de escrituras">
+    Absorbe ráfagas en el almacén local y vuelca por lotes hacia un destino externo con cupo. Cambias muchas escrituras caras por una barata y periódica.
+  </Card>
+</Cards>
+
+## Los tres, en un solo objeto
+
+Los patrones no viven separados: se componen. Un mismo objeto por entidad puede ser a la vez su base de datos, su cola y su amortiguador. Mira un agregador de métricas por proyecto: cada evento se inserta en el SQLite local, una alarma se asegura de volcar el lote a un destino externo cada pocos segundos, y todo ocurre dentro de un único dueño que nadie más toca.
+
+```ts
+export class MetricasProyecto {
+  constructor(private state: DurableObjectState, private env: Env) {
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS buffer (evento TEXT, ts INTEGER)",
+    );
+  }
+
+  async registrar(evento: string): Promise<void> {
+    this.state.storage.sql.exec("INSERT INTO buffer VALUES (?, ?)", evento, Date.now());
+    // programa el volcado solo si no hay uno ya pendiente
+    if ((await this.state.storage.getAlarm()) === null) {
+      await this.state.storage.setAlarm(Date.now() + 10_000);
+    }
+  }
+
+  async alarm(): Promise<void> {
+    const filas = this.state.storage.sql.exec("SELECT evento, ts FROM buffer").toArray();
+    if (filas.length === 0) return;
+    await this.env.DESTINO.enviarLote(filas);   // un solo viaje externo por lote
+    this.state.storage.sql.exec("DELETE FROM buffer");
+  }
+}
+```
+
+Un solo objeto de treinta líneas reúne el almacenamiento estructurado, la cola durable y el batching temporizado —tres piezas que, cableadas con servicios sueltos, habrían sido un pequeño sistema distribuido con sus propios modos de fallo—. Y es correcto por construcción, porque un único hilo gobierna a la vez el buffer, la alarma y el volcado, sin carreras entre el evento que entra y el lote que sale.
+
+<Callout type="info" title="Un objeto no siempre es la respuesta">
+El Durable Object brilla cuando el estado tiene identidad y pide coordinacion: una sala, una sesion, un contador que muchos tocan. Pero no es un martillo universal. Para lecturas globales masivas de datos que cambian poco, KV suele ganar; para objetos grandes e inmutables, R2; para consultas relacionales sobre todo el conjunto a la vez, D1. La pregunta de diseno es si tu estado se parte de forma natural en entidades con un dueno, o si de verdad necesita una vista global unica.
+</Callout>
+
+<Callout type="dios" title="El objeto con estado como nuevo primitivo de arquitectura">
+Durante quince años, la palabra serverless significó una cosa muy concreta y muy limitada: funciones sin estado que aparecen, atienden una petición y se desvanecen, apoyadas siempre en una base de datos central que era la única que de verdad recordaba algo. Ese modelo empujó toda la coordinación, toda la memoria y todo el estado hacia un solo lugar compartido, que se volvía a la vez el corazón y el cuello de botella del sistema. El Durable Object propone otra cosa, y los tres patrones de esta lección son las caras de una misma idea: el estado con identidad como primitivo de primera clase. Un objeto reúne en un mismo punto lo que la arquitectura tradicional mantenía disperso —el cómputo que decide, la memoria que recuerda, el reloj que agenda y la identidad que lo hace único— y lo hace por entidad, no por sistema. De ahí que los patrones se compongan solos: la base de datos por entidad te da el dueño único; la cola con alarmas le da voluntad para diferir trabajo; el batching le da un amortiguador entre la ráfaga del mundo y el cupo de lo externo. Junta los tres y tienes algo que antes exigía media docena de servicios cosidos con cuidado —una cola, un planificador, una caché de escritura, una base de datos, un candado distribuido— resuelto dentro de un solo objeto de unas pocas decenas de líneas, correcto por construcción porque solo un hilo lo toca. El cambio de mentalidad es el que cierra este nivel entero. Dejas de imaginar tu backend como funciones anémicas orbitando una base de datos central, y empiezas a imaginarlo como un enjambre de agentes diminutos, cada uno dueño de su porción del mundo, cada uno con su memoria durable y su propio reloj, coubicados con los usuarios a los que sirven. La base de datos deja de ser el centro del sistema y pasa a ser, cuando hace falta, un destino más al que estos agentes vuelcan por lotes lo que ya decidieron. Ese es el estilo Durable Object: no un truco de almacenamiento, sino una manera distinta de repartir el estado, la coordinación y el tiempo por todo el edge.
+</Callout>
+
+<Challenge title="Compón un primitivo con estado">
+1. Enruta con `idFromName` cada entidad de tu dominio a su propio objeto y comprueba que dos identidades distintas no comparten ni una clave de almacén.
+2. Implementa la `ColaTareas`: encola trabajo en el almacén, programa la alarma solo si no hay una pendiente, y drena por lotes reprogramándose mientras quede trabajo.
+3. Construye un objeto de batching que absorba cien eventos y los vuelque en un único lote a un destino externo cada cinco segundos. Compara su coste con escribir uno por uno.
+4. Combina los tres patrones en un solo objeto por entidad que sea a la vez su base de datos, su cola y su amortiguador de escrituras.
+5. Para un caso real tuyo, argumenta si un Durable Object es la herramienta correcta o si KV, R2 o D1 encajan mejor, y justifica la frontera que trazas.
+</Challenge>

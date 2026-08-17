@@ -1,0 +1,151 @@
+---
+title: "Trocear ficheros grandes: bloques, cortes y deduplicación"
+description: "Un fichero se parte en bloques que se enlazan en un DAG, y si el corte lo decide el contenido en vez de la posición, un cambio pequeño invalida un solo bloque y la deduplicación funciona de verdad."
+subject: local-first
+level: 46
+order: 3
+position: "46.3"
+duration: "21 min"
+---
+
+<Lead>
+Las dos lecciones anteriores trabajaron con grafos cuyos nodos ya venían dados: un directorio con sus entradas, un documento con sus campos. Falta la capa de abajo, la que fabrica nodos donde no había ninguno, porque el dato original es una tira continua de bytes sin estructura interna. Un vídeo de cuatro gigabytes, una imagen de disco, un volcado de base de datos: nada de eso cabe en un bloque, y todo eso necesita convertirse en un DAG para participar del esquema. La operación se llama trocear, y su parte interesante no es partir —eso lo hace cualquiera— sino decidir dónde se corta. Esa decisión, que parece un parámetro de implementación sin importancia, determina si la deduplicación funciona o si es puramente decorativa, y la diferencia entre las dos opciones evidentes es tan grande que conviene entenderla antes de escribir una línea de código.
+</Lead>
+
+<Goals>
+
+- Entender por qué un fichero grande debe convertirse en un DAG de bloques y qué gana con ello más allá de caber.
+- Diagnosticar el problema de desplazamiento de fronteras que arruina el troceado de tamaño fijo.
+- Manejar el troceado definido por el contenido con una huella deslizante y sus parámetros reales.
+- Evaluar honestamente qué gana la deduplicación con eso y qué cuesta en metadatos, en índice y en privacidad.
+
+</Goals>
+
+## Por qué un fichero se convierte en un grafo
+
+Hay una razón obvia y cuatro que importan más. La obvia es el tamaño: los transportes, los almacenes y las memorias trabajan con unidades acotadas, y un bloque de cuatro gigabytes no se mueve, no se cachea y no se verifica sin materializarlo entero. Las otras cuatro justifican el troceado incluso cuando el tamaño no aprieta. Primera, la granularidad de la verificación: con un solo hash sobre el fichero entero no puedes comprobar nada hasta tener el último byte, mientras que con bloques verificas cada uno al llegar y detectas la corrupción en el acto. Segunda, la descarga paralela desde varias fuentes, que solo tiene sentido si cada trozo se autentica por separado. Tercera, la lectura parcial: si quieres el minuto cuarenta de un vídeo no deberías descargar los treinta y nueve anteriores. Cuarta, la reutilización entre versiones, que es el asunto central de esta lección.
+
+La forma habitual del resultado es un grafo de dos clases de nodos. Las hojas contienen bytes de datos y nada más. Los nodos intermedios no contienen datos: contienen una lista ordenada de identificadores de hijos, cada uno acompañado del número de bytes que cuelgan por debajo de él. Esa segunda columna es lo que permite responder a la pregunta qué bloque contiene el byte número doscientos millones descendiendo por el grafo y sumando tamaños, sin leer un solo byte de datos.
+
+```text
+Un fichero como DAG, con tamanos acumulados en los enlaces
+
+  raiz del fichero
+    enlace 0 -> nodo intermedio A   ...  1 048 576 bytes
+    enlace 1 -> nodo intermedio B   ...  1 048 576 bytes
+    enlace 2 -> nodo intermedio C   ...    262 144 bytes
+
+  nodo intermedio A
+    enlace 0 -> hoja h1  ... 262 144 bytes
+    enlace 1 -> hoja h2  ... 262 144 bytes
+    ...
+
+  buscar el byte 1 300 000 es descender sumando, no leer datos
+```
+
+<Callout type="info" title="La aridad del árbol no es un detalle: es un compromiso con dos extremos malos">
+Cada nodo intermedio guarda un identificador por hijo, así que la aridad decide a la vez la profundidad del grafo y el tamaño de los nodos internos. Con aridad baja, el árbol se estira: muchos saltos para llegar a una hoja, muchas rondas de red al descender y más nodos internos que almacenar. Con aridad muy alta, el árbol se aplana pero cada nodo interno se vuelve un bloque grande que hay que descargar entero para leer una sola entrada, y una modificación mínima en cualquier hoja obliga a reescribirlo completo. Los valores que se ven en implementaciones reales rondan las pocas centenas de enlaces por nodo con hojas de unos cientos de kilobytes, y esa combinación no es arbitraria: sitúa el nodo interno en el mismo orden de magnitud que una hoja, de modo que ninguna de las dos clases domina el coste.
+</Callout>
+
+## El troceado de tamaño fijo y su fragilidad
+
+La forma inmediata de partir es cortar cada N bytes. Es trivial de implementar, produce bloques uniformes, permite calcular la posición de cualquier byte con una división y funciona perfectamente mientras el fichero no cambie nunca. En cuanto cambia, revela un defecto que lo invalida para casi todo uso interesante.
+
+El defecto es el desplazamiento de fronteras. Inserta un byte al principio de un fichero de un gigabyte troceado en bloques de doscientos cincuenta y seis kilobytes. El primer bloque cambia, evidentemente. Pero también cambia el segundo, porque su primer byte es ahora el que antes era el último del primero, y así todos: cada frontera se ha corrido un byte y por tanto cada bloque tiene un contenido distinto y un identificador distinto. Una inserción de un byte ha invalidado cuatro mil bloques y la deduplicación entre las dos versiones es exactamente cero.
+
+```js
+// Troceado de tamano fijo: correcto, simple y catastrofico ante inserciones
+function trocearFijo(bytes, tam = 262144) {
+  const trozos = [];
+  for (let i = 0; i < bytes.length; i += tam) trozos.push(bytes.slice(i, i + tam));
+  return trozos;   // insertar un byte al principio cambia todos los trozos
+}
+```
+
+Merece la pena notar que el troceado de tamaño fijo no es inútil: sigue siendo la elección correcta cuando los datos son inmutables por naturaleza y solo se busca granularidad de verificación y descarga paralela, como en la distribución de artefactos que nunca se editan. El error consiste en aplicarlo a datos que evolucionan y esperar de él una deduplicación que estructuralmente no puede dar. Elegir el método de corte es, por tanto, una decisión sobre el ciclo de vida de los datos y no sobre su tamaño.
+
+Conviene ver por qué esto no es un caso rebuscado. Editar un documento, añadir una fila al principio de un registro, cambiar una cabecera, recomprimir con otra versión de la herramienta: todas esas operaciones desplazan contenido. El troceado de tamaño fijo solo deduplica bien cuando los cambios son sustituciones que respetan la longitud, que es el caso menos frecuente en datos reales. Y la raíz del problema se puede nombrar con precisión: **la frontera depende de la posición absoluta**, que es justamente la magnitud que cualquier inserción o borrado altera.
+
+## El troceado definido por el contenido
+
+La solución invierte la dependencia. En lugar de cortar donde lo dice el contador, se corta donde lo dice el contenido. Se recorre el fichero con una ventana deslizante de unas pocas decenas de bytes y se calcula sobre ella una huella barata de actualizar —una huella que se puede recalcular al avanzar un byte quitando el que sale y añadiendo el que entra, sin rehacer la ventana entera—. Cuando esa huella cumple un predicado, por ejemplo que sus últimos bits sean todos cero, se declara una frontera ahí mismo.
+
+```js
+// Troceado por contenido: la frontera la decide la ventana, no el indice
+function trocearPorContenido(bytes, { min = 65536, medio = 262144, max = 1048576 }) {
+  const mascara = medio - 1;          // longitud media esperada de 2 elevado a k
+  const trozos = [];
+  let huella = 0, inicio = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    huella = rodar(huella, bytes[i], bytes[i - 48]);   // ventana de 48 bytes
+    const largo = i - inicio + 1;
+    if (largo < min) continue;                          // suelo para no fragmentar
+    if ((huella & mascara) === 0 || largo >= max) {     // frontera o techo
+      trozos.push(bytes.slice(inicio, i + 1));
+      inicio = i + 1;
+      huella = 0;
+    }
+  }
+  if (inicio < bytes.length) trozos.push(bytes.slice(inicio));
+  return trozos;
+}
+```
+
+La propiedad que se obtiene a cambio es la resincronización local. Si insertas un byte en medio del fichero, la ventana deslizante cambia solo mientras el byte insertado está dentro de ella, es decir, durante unas decenas de posiciones. Las fronteras anteriores no se enteran porque dependen de bytes que no se han tocado, y las posteriores tampoco, porque en cuanto la ventana deja atrás la zona alterada vuelve a ver exactamente la misma secuencia que antes. El daño queda confinado al bloque que contiene la inserción y, como mucho, al siguiente.
+
+<Mermaid code={`flowchart LR
+  V1[version original] --> C1[bloque a] --> C2[bloque b] --> C3[bloque c] --> C4[bloque d]
+  V2[version con insercion en b] --> D1[bloque a] --> D2[bloque b prima] --> D3[bloque c] --> D4[bloque d]
+  class C1 t-green
+  class D1 t-green
+  class C3 t-green
+  class D3 t-green
+  class D2 t-red`} />
+
+Los tres parámetros del código merecen comentario porque su elección tiene consecuencias medibles. La máscara fija la longitud media esperada, que sigue una distribución geométrica: la mayoría de los bloques rondan la media, pero la cola es larga. El mínimo evita que una racha desafortunada produzca bloques diminutos que disparen los metadatos, y el máximo evita el caso contrario, un tramo de datos muy uniformes —una región de ceros, por ejemplo— donde la huella nunca cumple el predicado y el bloque crecería sin freno. Sin esos dos topes el algoritmo funciona igual pero su varianza lo hace inservible en producción.
+
+<Callout type="note" title="La huella deslizante no necesita ser criptográfica, y confundirlo cuesta rendimiento">
+Conviene separar dos funciones que aparecen en la misma frase y que tienen requisitos opuestos. La huella que decide dónde cortar solo necesita distribuir bien y actualizarse en un puñado de instrucciones al avanzar un byte; su salida no nombra nada, no se publica y no se verifica, así que la resistencia a colisiones le sobra por completo. El hash que nombra el bloque resultante sí es criptográfico, porque de él dependen la identidad y la integridad. Usar una función criptográfica para el corte multiplica el coste del troceado sin comprar ninguna propiedad útil, y es uno de los errores de implementación más frecuentes en este terreno.
+</Callout>
+
+Hay un matiz sobre el troceado por contenido que suele omitirse y que cambia las expectativas. El corte estable protege ante inserciones y borrados, pero no protege ante transformaciones que reescriben todo el flujo de bytes. Comprimir un fichero, cifrarlo con un modo que encadena bloques o volver a codificarlo produce una secuencia completamente distinta desde el primer byte, y la deduplicación cae a cero por muy bueno que sea el algoritmo de corte. De ahí una regla práctica que ahorra decepciones: **si quieres deduplicar, trocea antes de comprimir y antes de cifrar**, y comprime o cifra cada bloque por separado, aceptando la peor ratio de compresión que eso implica.
+
+## Lo que gana la deduplicación y lo que cuesta
+
+Y hay un efecto colateral del troceado por contenido que rara vez se enuncia y que conviene aprovechar: como el corte es determinista y depende solo de los bytes, dos personas que troceen el mismo fichero con los mismos parámetros obtienen exactamente los mismos bloques sin haberse coordinado. El troceado deja de ser una decisión privada de cada almacén y pasa a ser una función pública del contenido, y por eso los parámetros —ventana, máscara, mínimo y máximo— forman parte del contrato del sistema tanto como el formato de los nodos. Cambiarlos en una versión nueva rompe la deduplicación con todo lo troceado antes.
+
+Con fronteras estables ante desplazamientos, la deduplicación pasa de anecdótica a estructural, y actúa en cuatro planos distintos que conviene no mezclar. Dentro de un mismo fichero, cuando hay contenido repetido. Entre versiones sucesivas del mismo fichero, que es el caso que motiva todo. Entre ficheros distintos que comparten regiones, como dos imágenes de máquina virtual con el mismo sistema base. Y entre usuarios distintos de un almacén compartido, donde el ahorro se multiplica por el número de participantes sin que ninguno haga nada.
+
+<Cards>
+  <Card icon="🧩" title="Fronteras que resisten al desplazamiento">
+    Insertar o borrar bytes solo altera los bloques cercanos, porque el corte depende del contenido y no del índice.
+  </Card>
+  <Card icon="💾" title="Ahorro en cuatro planos">
+    Se deduplica dentro del fichero, entre versiones, entre ficheros distintos y entre usuarios del mismo almacén.
+  </Card>
+  <Card icon="⚖️" title="Metadatos proporcionales">
+    Bloques más pequeños deduplican mejor y multiplican los identificadores, los nodos internos y las entradas del índice.
+  </Card>
+  <Card icon="🕵️" title="Fuga por confirmación">
+    En un almacén compartido, preguntar por un identificador revela si ese contenido exacto ya estaba guardado.
+  </Card>
+</Cards>
+
+La tercera tarjeta es el compromiso central y conviene ponerle números aproximados. Con hojas de un kilobyte, un fichero de un gigabyte genera un millón de bloques, un millón de identificadores en nodos internos y un millón de entradas en el índice que traduce identificador a ubicación; el ahorro por deduplicación se lo come la contabilidad. Con hojas de un megabyte, la contabilidad es despreciable pero cualquier cambio invalida un megabyte entero y el ahorro se desploma. El punto razonable está en el medio y depende del perfil de los datos, no de una constante universal.
+
+Conviene añadir que el índice de identificador a ubicación es la pieza que más se subestima al planificar. No es un fichero de configuración: es una tabla con una entrada por bloque distinto del almacén, que debe consultarse en cada escritura para saber si el bloque ya estaba, y que por tanto quiere vivir en memoria o en una estructura muy rápida. Cuando el almacén crece hasta cientos de millones de bloques, ese índice se convierte en el recurso limitante del sistema entero, y la decisión de tamaño de bloque acaba tomándose en función de él y no del ahorro en datos.
+
+La cuarta tarjeta señala un riesgo que se olvida con frecuencia porque no es de rendimiento. Si un almacén compartido deduplica entre usuarios, alguien que sospeche qué fichero tienes puede trocearlo él mismo, calcular los identificadores y preguntar si existen; una respuesta afirmativa confirma la sospecha sin haber accedido a nada. La deduplicación entre usuarios y la confidencialidad frente al operador del almacén son objetivos en tensión, y resolverlo exige o bien renunciar a la deduplicación cruzada, o bien derivar las claves del propio contenido, con las implicaciones que eso tiene y que el track retomará al hablar de cifrado.
+
+<Callout type="dios" title="Cuando la frontera la decide el dato, la identidad deja de depender de la posición">
+Detrás del troceado por contenido hay un principio general que conviene extraer del caso concreto, porque reaparece en sitios que nada tienen que ver con ficheros. El troceado de tamaño fijo falla por una razón que se puede enunciar sin mencionar bytes: **hace que la identidad de una parte dependa de una coordenada global** —su posición absoluta— y las coordenadas globales son exactamente lo que cualquier inserción o borrado invalida en cascada. Es el mismo defecto, con otro disfraz, que hacía imposible usar índices numéricos para colocar una edición concurrente en los niveles de CRDT: el índice es una coordenada global y por tanto no sobrevive a que alguien modifique algo antes que él. La solución tiene también la misma forma en los dos casos: **sustituir la coordenada global por una relación local y verificable con el contenido vecino**, sea la identidad del carácter de al lado o la huella de los últimos cuarenta y ocho bytes. Una vez hecha esa sustitución, un cambio deja de propagarse porque nada aguas abajo estaba definido en términos de lo que había aguas arriba. Merece la pena fijarse en el precio, porque es el mismo en ambos casos y es siempre el mismo: se pierde la uniformidad y se gana la estabilidad. Los bloques dejan de tener todos el mismo tamaño, la aritmética directa de posición a bloque desaparece y hay que descender por un índice; a cambio, el sistema tolera que los datos cambien en medio, que es lo que los datos hacen. Y de ahí sale el criterio práctico que conviene llevarse: **cuando diseñes una partición de cualquier cosa que vaya a evolucionar —bloques, particiones de una tabla, segmentos de un índice, lotes de un flujo—, mira primero de qué depende cada frontera**. Si depende de un contador, una inserción al principio te obligará a rehacerlo todo, y descubrirás esa factura el día que tengas datos de verdad y ya sea caro cambiar de esquema. Si depende del contenido local, pagarás varianza y un poco de complejidad, y tendrás un sistema que se autoalinea solo después de cada cambio.
+</Callout>
+
+<Challenge title="Trocea y mide el ahorro real">
+1. Coge un fichero de al menos cien megabytes y trocéalo con tamaño fijo, anotando el conjunto de identificadores.
+2. Inserta un byte al principio, vuelve a trocear y cuenta cuántos identificadores se repiten entre las dos versiones.
+3. Implementa una huella deslizante sencilla y repite los dos pasos anteriores con troceado por contenido.
+4. Representa la distribución de tamaños de bloque que obtienes y comprueba el efecto de los topes mínimo y máximo.
+5. Trocea dos versiones de un mismo proyecto real y calcula el porcentaje de bloques compartidos con cada método.
+6. Repite el experimento con hojas de un kilobyte y de un megabyte, y suma en cada caso el espacio de datos más el de metadatos.
+</Challenge>

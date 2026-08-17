@@ -1,0 +1,141 @@
+---
+title: "struct bio: la unidad de E/S de bloques"
+description: "Cómo struct bio describe una transferencia hacia o desde el disco: el sector de destino y el tamaño residual en bi_iter, el arreglo de segmentos bio_vec que apunta a páginas físicas con su offset y longitud, la operación y las banderas en bi_opf, cómo se asigna con bio_alloc y se puebla con bio_add_page, cómo se recorre con bio_for_each_segment y bio_for_each_bvec, y cómo se encadenan bios grandes con bio_chain."
+subject: kernel
+level: 35
+order: 2
+position: "35.2"
+duration: "16 min"
+---
+
+<Lead>
+Si el block layer es una fábrica que reescribe la E/S, la `struct bio` es la pieza que entra por la cinta. Es la descripción completa y autosuficiente de una transferencia: a qué sector del dispositivo, en qué dirección, y desde qué páginas de memoria física. No copia datos ni los toca; solo los señala. Esa indirección —una `bio` es un mapa, no una carga— es lo que permite al kernel fusionarla, trocearla, encolarla y completarla sin mover un solo byte hasta el último instante. Entender sus campos es entender el vocabulario en el que se dice absolutamente toda la E/S de bloques del sistema.
+</Lead>
+
+<Goals>
+
+- Leer los campos clave de `struct bio`: `bi_iter`, `bi_io_vec`, `bi_opf`, `bi_end_io`.
+- Entender el `bio_vec` como segmento página + offset + longitud.
+- Asignar una `bio` con `bio_alloc` y poblarla con `bio_add_page`.
+- Recorrer segmentos con `bio_for_each_segment` y encadenar con `bio_chain`.
+
+</Goals>
+
+## Anatomía de una bio
+
+Una `bio` reúne cuatro clases de información: **a dónde** va en el dispositivo, **qué operación** es, **de qué memoria** sale o entra, y **a quién avisar** al terminar. En el Linux de 2026 su forma esencial es esta:
+
+```c
+struct bio {
+	struct bio          *bi_next;      /* enlace en la request que la agrupa */
+	struct block_device *bi_bdev;      /* el dispositivo destino */
+	blk_opf_t            bi_opf;        /* operacion (bits bajos) + banderas (altos) */
+	unsigned short       bi_flags;
+	blk_status_t         bi_status;     /* resultado, al completarse */
+	struct bvec_iter     bi_iter;       /* sector + cuanto queda por transferir */
+	bio_end_io_t        *bi_end_io;     /* callback de completado */
+	void                *bi_private;    /* dato opaco del emisor */
+	unsigned short       bi_vcnt;       /* cuantos bio_vec hay poblados */
+	unsigned short       bi_max_vecs;   /* capacidad del arreglo */
+	struct bio_vec      *bi_io_vec;     /* el arreglo de segmentos */
+	atomic_t             __bi_cnt;      /* cuenta de referencias */
+	struct bio_vec       bi_inline_vecs[]; /* vecs pequenos, en linea */
+};
+```
+
+Dos campos merecen detenerse. `bi_opf` empaqueta en un solo `blk_opf_t` la operación en los bits bajos —`REQ_OP_READ`, `REQ_OP_WRITE`, `REQ_OP_FLUSH`, `REQ_OP_DISCARD`— y las banderas de modificador en los altos —`REQ_SYNC`, `REQ_FUA`, `REQ_META`—. Se lee con los accesores `bio_op(bio)` y `bio_data_dir(bio)`, nunca comparando a mano. Y `bi_end_io` es el pilar de la asincronía: la `bio` no se espera, se **entrega**; cuando el hardware termina, el block layer invoca ese callback, que es donde el emisor recoge el resultado en `bi_status`.
+
+## bi_iter y bio_vec: dónde en el disco, dónde en la RAM
+
+La transferencia tiene dos extremos. El del **dispositivo** lo fija `bi_iter`, un iterador que además avanza a medida que la `bio` se consume:
+
+```c
+struct bvec_iter {
+	sector_t     bi_sector;     /* sector inicial, en unidades de 512 B */
+	unsigned int bi_size;       /* bytes que quedan por transferir */
+	unsigned int bi_idx;        /* indice del bio_vec actual */
+	unsigned int bi_bvec_done;  /* bytes ya hechos dentro del vec actual */
+};
+```
+
+El extremo de la **memoria** lo describe el arreglo `bi_io_vec`, cuyos elementos son `bio_vec`: cada uno señala una página física con su desplazamiento y longitud. Una transferencia no tiene por qué salir de memoria contigua; puede reunir trozos dispersos, y por eso es un *vector* de segmentos, no un puntero único.
+
+```c
+struct bio_vec {
+	struct page *bv_page;    /* la pagina fisica */
+	unsigned int bv_len;     /* cuantos bytes desde el offset */
+	unsigned int bv_offset;  /* offset dentro de la pagina */
+};
+```
+
+<Callout type="info" title="Multipage bvec: un segmento puede abarcar varias páginas">
+Desde hace años un `bio_vec` no se limita a una página: si varias páginas son **físicamente contiguas**, el kernel las funde en un único segmento con `bv_len` mayor que `PAGE_SIZE`. Por eso `bi_vcnt` suele ser mucho menor que el número de páginas de la transferencia, y por eso hay dos formas de recorrer: `bio_for_each_bvec` te da los segmentos multipágina tal cual (lo que quiere el driver, que arma descriptores de DMA), y `bio_for_each_segment` los parte en trozos de una página (lo que quiere el código que razona página a página). Elegir el iterador equivocado no rompe la corrección, pero desperdicia entradas de scatter-gather.
+</Callout>
+
+## Construir y recorrer una bio
+
+Crear una `bio` en un driver o un filesystem sigue un patrón fijo: asignar, apuntar al sector, añadir páginas, fijar el callback y entregar. La firma moderna de `bio_alloc` recibe ya el dispositivo y la operación en el momento de asignar:
+
+```c
+struct bio *bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
+if (!bio)
+	return -ENOMEM;
+
+bio->bi_iter.bi_sector = sector;             /* a que sector del disco */
+bio_add_page(bio, page, PAGE_SIZE, 0);       /* de que pagina de RAM */
+bio->bi_end_io = mi_endio;                   /* a quien avisar al terminar */
+bio->bi_private = ctx;                        /* mi contexto para recuperarlo */
+submit_bio(bio);                              /* lo entrego: no bloquea */
+```
+
+`bio_add_page` respeta los límites del dispositivo (`max_segments`, `max_hw_sectors`) y devuelve cuántos bytes admitió; si no cabe todo, se encadena otra `bio`. Del lado del que consume —el driver, o el propio block layer al fusionar— el recorrido es simétrico:
+
+```c
+struct bio_vec bv;
+struct bvec_iter iter;
+
+bio_for_each_segment(bv, bio, iter) {
+	void *buf = bvec_kmap_local(&bv);        /* mapea el segmento */
+	/* ... tocar bv.bv_len bytes del dispositivo hacia/desde buf ... */
+	kunmap_local(buf);
+}
+```
+
+## Encadenar: cuando una bio no basta
+
+Una `bio` tiene un tope de tamaño impuesto por el hardware y por su número de segmentos. Cuando una operación lógica excede ese tope —leer 8 MiB de golpe—, no se agranda la `bio`: se **encadenan** varias con `bio_chain`, formando un árbol de padre e hijas donde la del padre solo se completa cuando todas las hijas lo han hecho. El contador atómico `__bi_remaining` sostiene esa espera sin bloqueo.
+
+```c
+struct bio *hija = bio_alloc(bdev, nr, REQ_OP_READ, GFP_KERNEL);
+bio_chain(hija, padre);   /* el completado de hija cuenta hacia el de padre */
+submit_bio(hija);
+/* padre->bi_end_io no correra hasta que todas sus hijas terminen */
+```
+
+El propio block layer usa este mecanismo al **trocear** (`bio_split`) una `bio` demasiado grande para el dispositivo: parte un trozo que sí cabe, lo encadena al original, y repite. El emisor pidió una transferencia; el hardware ve varias; y el callback original solo se dispara cuando el conjunto está completo. Toda esa contabilidad ocurre sin que ni el filesystem de arriba ni el driver de abajo tengan que enterarse.
+
+<Mermaid code={`flowchart LR
+  BIO[struct bio] --> ITER[bi_iter sector y tamano residual]
+  BIO --> OPF[bi_opf operacion y banderas]
+  BIO --> VEC[bi_io_vec arreglo de segmentos]
+  VEC --> BV0[bio_vec 0]
+  VEC --> BV1[bio_vec 1]
+  BV0 --> P0[pagina fisica mas offset mas len]
+  BV1 --> P1[pagina fisica mas offset mas len]
+  BIO --> END[bi_end_io callback de completado]
+  BIO --> NEXT[bi_next hacia la request o la cadena]
+  class BIO t-blue
+  class VEC t-yellow
+  class END t-green`} />
+
+<Callout type="dios" title="La bio es un puntero a datos, no los datos: ahí está toda su potencia">
+La decisión de diseño más honda de la `bio` es la que menos se nota: **no contiene los datos, los señala**. Un `bio_vec` es una página, un offset y una longitud —una dirección, no una carga—. Piensa en lo que eso desbloquea, porque es la clave silenciosa de todo el rendimiento de la E/S de Linux. Como la `bio` es un mapa y no un contenedor, fusionar dos peticiones adyacentes es concatenar dos listas de punteros, no copiar kilobytes; trocear una es repartir esos punteros en dos mapas; encolarla en una cola de hardware es mover un puntero; y completarla es recorrer los segmentos avisando a cada dueño. En ningún momento de ese viaje —desde que el filesystem la crea hasta que el DMA del dispositivo lee la RAM— se copia el dato útil. La página que el page cache llenó es la misma que el controlador de disco leerá por DMA (nivel 27), sin intermediarios. Esta es la diferencia física entre un sistema operativo de juguete, que copia el buffer en cada capa, y Linux, que hace *zero-copy* precisamente porque su unidad de E/S describe la memoria en vez de poseerla. Y explica por qué la `bio` tiene la forma que tiene: el iterador `bi_iter` que avanza sin destruir permite que la misma `bio` sea consumida en trozos por capas distintas; la cuenta de referencias permite que padre e hijas compartan páginas sin duplicarlas; el `bio_vec` multipágina exprime la contigüidad física para minimizar descriptores de scatter-gather. Cada campo es una consecuencia de la misma renuncia inicial a poseer los datos. Cuando interiorices que mover E/S en el kernel es mover descripciones de datos y no datos, habrás entendido no solo la `bio`, sino por qué el almacenamiento en Linux escala a millones de operaciones por segundo sin que la memoria se convierta en el cuello de botella.
+</Callout>
+
+<Challenge title="Diseca una transferencia">
+1. Escribe la secuencia mínima para leer un sector: `bio_alloc` con `REQ_OP_READ`, fija `bi_iter.bi_sector`, `bio_add_page`, `bi_end_io` y `submit_bio`; describe qué recibe tu callback.
+2. Explica la diferencia entre `bio_for_each_segment` y `bio_for_each_bvec` y en qué caso cada uno ahorra entradas de scatter-gather.
+3. Razona por qué `bi_vcnt` puede ser mucho menor que el número de páginas de la transferencia, apoyándote en los multipage bvec.
+4. Dibuja un árbol padre-hijas con `bio_chain` para una transferencia de 8 MiB troceada, y explica quién dispara el `bi_end_io` del padre y cuándo.
+5. Argumenta, en términos de zero-copy, por qué el dato que llenó el page cache es el mismo que leerá el DMA del dispositivo sin copia intermedia.
+</Challenge>

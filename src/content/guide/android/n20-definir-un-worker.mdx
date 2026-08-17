@@ -1,0 +1,159 @@
+---
+title: "Definir un Worker: entrada, salida y resultado"
+description: "Un trabajador es la unidad de ejecución de este sistema y tiene una forma muy concreta: una clase con un constructor fijo, una función suspendida que hace el trabajo y un valor de retorno con exactamente tres significados posibles. Esta lección construye un `CoroutineWorker` desde cero, explica por qué su entrada y su salida viajan en un contenedor serializable con un límite de tamaño deliberadamente pequeño, analiza la semántica precisa de éxito, reintento y fallo con el criterio para elegir entre ellos, y cierra con la cancelación cooperativa, el límite de diez minutos y la elección del despachador correcto."
+subject: android
+level: 20
+order: 2
+position: "20.2"
+duration: "20 min"
+---
+
+<Lead>
+El trabajador es donde se paga la factura de todo lo anterior. La garantía de ejecución solo tiene valor si lo que se ejecuta está escrito para sobrevivir a las condiciones bajo las que se ejecutará, y esas condiciones son bastante más hostiles que las de una corrutina normal: el trabajador puede arrancar en un proceso recién creado en el que ninguna de tus variables globales está inicializada, puede arrancar horas después de que se encolara y con datos que ya no son válidos, puede ser detenido a mitad sin previo aviso porque el usuario dejó de estar en una red no medida, y puede volver a ejecutarse desde el principio después de haber completado parcialmente su efecto. Escribir un trabajador es, por tanto, un ejercicio distinto de escribir una función: no basta con que haga lo correcto, tiene que hacer lo correcto empezando desde cero, varias veces si hace falta, y tiene que saber decir con precisión si lo consiguió, si quiere que le den otra oportunidad o si es inútil insistir.
+</Lead>
+
+<Goals>
+
+- Escribir un `CoroutineWorker` con su constructor obligatorio y su función suspendida de trabajo.
+- Pasar datos de entrada y devolver datos de salida respetando el límite del contenedor serializable.
+- Elegir con criterio entre éxito, reintento y fallo, entendiendo qué provoca cada uno en el planificador.
+- Manejar la cancelación cooperativa, el límite de tiempo de ejecución y la elección del despachador.
+
+</Goals>
+
+## La forma de un trabajador
+
+La jerarquía tiene una raíz común y tres ramas. La raíz es la clase base que el sistema conoce y sabe instanciar; de ella descienden la variante síncrona clásica, que ejecuta en un hilo de un pool y bloquea, la variante reactiva para quien use flujos observables, y la variante de corrutinas, que es la que corresponde a cualquier código Kotlin moderno y la única que trataremos aquí.
+
+Un `CoroutineWorker` es una clase con un constructor de dos parámetros —el contexto de aplicación y el objeto de parámetros— y una única función suspendida que contiene el trabajo. Esa firma no es negociable, y la razón es que el sistema instancia tu clase por reflexión a partir de su nombre guardado en la base de datos, en un proceso que puede no tener nada más inicializado.
+
+```kotlin
+class SubirFotoWorker(
+    context: Context,
+    params: WorkerParameters,
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): Result {
+        val uri = inputData.getString(CLAVE_URI) ?: return Result.failure()
+
+        return try {
+            val remota = api.subir(uri.toUri())
+            Result.success(workDataOf(CLAVE_URL to remota.url))
+        } catch (e: IOException) {
+            Result.retry()
+        } catch (e: HttpException) {
+            if (e.code() in 500..599) Result.retry() else Result.failure()
+        }
+    }
+
+    companion object {
+        const val CLAVE_URI = "uri"
+        const val CLAVE_URL = "url"
+    }
+}
+```
+
+De ese esqueleto conviene subrayar dos consecuencias que no se ven a simple vista. La primera es que el contexto que recibes es el de aplicación y no el de una actividad: no tienes interfaz, no tienes tema, no tienes ventana, y cualquier intento de tocar la pantalla desde aquí es un error conceptual. La segunda, y más importante en la práctica, es que la instanciación por reflexión exige un constructor público con esos dos parámetros exactos, lo que choca de frente con la inyección de dependencias. Cuando necesitas que tu trabajador reciba un repositorio, la solución es una fábrica de trabajadores registrada en la configuración, que en la práctica se resuelve con la anotación de trabajador asistido del marco de inyección que uses.
+
+El objeto de parámetros trae además información contextual que el trabajo puede consultar y que resulta valiosísima: el identificador único de esta ejecución, las etiquetas con las que se encoló y, sobre todo, el número de intento en curso. Ese contador es la base de cualquier política de rendición razonable, porque permite distinguir el primer intento del séptimo y decidir que a partir de cierto punto insistir ya no tiene sentido.
+
+<Callout type="tip" title="El trabajador no es el sitio donde vive la lógica">
+Un trabajador bien escrito es delgado: lee su entrada, invoca una función de tu capa de dominio o de datos y traduce el resultado a uno de los tres valores. Toda la lógica que metas dentro deja de ser comprobable con un test normal y pasa a exigir el marco de pruebas de la librería. Tratarlo como un adaptador entre el planificador del sistema y tu código real es lo que mantiene ambos lados sanos.
+</Callout>
+
+## Entrada y salida: un contenedor pequeño a propósito
+
+Los datos que entran y salen de un trabajador no son objetos de tu dominio: viajan en un contenedor de pares clave y valor con tipos primitivos, sus arrays y cadenas, que se serializa para escribirse en la base de datos junto con el resto de la descripción del trabajo. Se construye con una función auxiliar y se lee con captadores tipados que aceptan un valor por defecto.
+
+```kotlin
+val datos = workDataOf(
+    "uri" to uri.toString(),
+    "calidad" to 85,
+    "reintentable" to true,
+)
+
+// dentro del trabajador
+val calidad = inputData.getInt("calidad", 100)
+```
+
+El límite de tamaño es de unos diez kilobytes por contenedor, y superarlo lanza una excepción en el momento del encolado. Esa cifra parece una limitación mezquina hasta que se entiende su función: no es una restricción técnica arbitraria, es una decisión de diseño que te empuja a no usar la cola de trabajos como almacén. Los datos reales pertenecen a tu base de datos o a tu almacenamiento de archivos; lo que viaja en el contenedor es una referencia a ellos —un identificador, una ruta, una URI— y unos pocos parámetros de configuración.
+
+Esa disciplina tiene además una consecuencia de corrección que va mucho más allá del tamaño. Un trabajo puede ejecutarse horas después de encolarse, y todo lo que copiaste dentro de su entrada quedó congelado en ese instante. Si pasas el contenido de un formulario y el usuario lo edita después, subirás la versión vieja. Si pasas un identificador y lees el registro al arrancar, subirás lo que sea cierto en el momento de la ejecución. Casi siempre lo segundo es lo que quieres, y el límite de diez kilobytes es la manera que tiene la librería de recordártelo constantemente.
+
+La salida funciona igual y se entrega junto con el resultado de éxito. Su destino es doble: quien observe el trabajo desde la interfaz podrá leerla, y el siguiente trabajo de una cadena la recibirá como su entrada, mecanismo que veremos en detalle más adelante. Conviene recordar que la salida de un trabajo fallido también se puede adjuntar, y que es el sitio natural para dejar un código de error legible en lugar de obligar a quien observe a adivinar qué pasó.
+
+## Los tres significados del resultado
+
+El valor devuelto tiene tres formas y cada una es una instrucción distinta para el planificador. Confundirlas es la fuente más común de trabajos que se reintentan eternamente y de trabajos que desaparecen sin dejar rastro.
+
+<Cards>
+  <Card icon="✅" title="Éxito">
+    El trabajo cumplió su propósito. El estado pasa a terminado con éxito, la salida queda disponible y, si hay cadena, los trabajos siguientes se desbloquean.
+  </Card>
+  <Card icon="🔁" title="Reintento">
+    No se pudo ahora, pero podría poderse luego. El trabajo vuelve a la cola con el retraso que dicte su política de retroceso y el contador de intentos aumenta.
+  </Card>
+  <Card icon="⛔" title="Fallo">
+    No se podrá nunca con esta entrada. El estado pasa a fallido de forma definitiva, no habrá más intentos y en una cadena los trabajos posteriores se cancelan en bloque.
+  </Card>
+</Cards>
+
+La regla para elegir es más simple de lo que parece y se formula como una pregunta: ¿cambiar el momento cambiaría el resultado? Un fallo de red, un servidor caído, una respuesta de la familia quinientos o un almacenamiento momentáneamente lleno son condiciones transitorias y merecen reintento. Una entrada malformada, un archivo que ya no existe, una respuesta de la familia cuatrocientos que indica petición inválida o autenticación caducada son condiciones que se repetirán idénticas dentro de una hora y merecen fallo. Devolver reintento ante un error permanente construye un bucle que consume batería durante días sin ninguna posibilidad de éxito.
+
+Hay un matiz que suele pasarse por alto: no existe un límite de reintentos incorporado. Un trabajo que devuelva reintento indefinidamente lo hará hasta que alguien lo cancele, con el retroceso creciendo pero topado en cinco horas. La rendición hay que programarla, y el contador de intentos es la herramienta.
+
+```kotlin
+override suspend fun doWork(): Result {
+    if (runAttemptCount >= MAX_INTENTOS) {
+        return Result.failure(workDataOf("motivo" to "agotados los intentos"))
+    }
+    // ...
+}
+```
+
+Una precaución final sobre las excepciones. Si tu función suspendida lanza una excepción no capturada, la librería la trata como fallo definitivo. Eso significa que un fallo de red no capturado se convierte silenciosamente en un trabajo perdido para siempre, que es justo lo contrario de lo que querías. Capturar de forma explícita y traducir a resultado es obligatorio, no una cuestión de estilo.
+
+<Mermaid code={`flowchart TD
+  A[doWork se ejecuta] --> B{Que ocurrio}
+  B -->|Todo bien| C[Result success con datos de salida]
+  B -->|Error transitorio| D[Result retry]
+  B -->|Error permanente| E[Result failure]
+  B -->|Excepcion no capturada| E
+  D --> F[Espera con retroceso creciente]
+  F --> A
+  C --> G[Se desbloquea el siguiente de la cadena]
+  E --> H[Se cancela el resto de la cadena]
+  class C t-green
+  class E t-red`} />
+
+## Cancelación, tiempo límite y despachador
+
+Un trabajador puede ser detenido en cualquier momento y por varios motivos: el usuario canceló el trabajo, una restricción dejó de cumplirse, el sistema necesita recursos o se agotó el tiempo máximo de ejecución, que es de unos diez minutos. En una corrutina esa detención llega como cancelación del ámbito, lo que significa que se propaga sola a través de cualquier llamada suspendida que respete la cooperación.
+
+Ahí está la trampa de los bucles de cómputo puro, que no suspenden nunca y por tanto no observan la cancelación. Un trabajador que recorre diez mil archivos comprimiendo seguirá comprimiendo después de haber sido detenido, gastando batería para nada y produciendo efectos que ya nadie espera. La comprobación explícita es la solución.
+
+```kotlin
+for (archivo in archivos) {
+    if (isStopped) return Result.failure()
+    comprimir(archivo)
+    setProgress(workDataOf("hechos" to hechos++))
+}
+```
+
+En las versiones recientes de la librería se puede además consultar el motivo de la detención, lo que permite distinguir una cancelación del usuario —donde rendirse es correcto— de una restricción que dejó de cumplirse o un tiempo agotado, donde lo razonable es devolver reintento para retomar el trabajo cuando las condiciones vuelvan.
+
+Sobre el límite de diez minutos conviene ser tajante: no es negociable para un trabajo normal, y un trabajador que tarde más será detenido a mitad. Las dos salidas legítimas son partir el trabajo en trozos que quepan holgadamente y encadenarlos, o convertirlo en trabajo de larga duración con notificación visible en primer plano, que es un régimen distinto con su propio contrato ante el usuario.
+
+Por último, el despachador. La función suspendida se ejecuta por defecto en el despachador de cómputo, no en el principal, de modo que ya estás fuera del hilo de interfaz sin hacer nada. Pero cómputo no es lo mismo que entrada y salida: si vas a leer archivos o a esperar en un socket, corresponde envolver esa parte con el despachador de entrada y salida, exactamente igual que en cualquier otro código de corrutinas. La librería no te exime de pensar en el hilo, solo te garantiza que no será el principal.
+
+<Callout type="dios" title="El trabajador es una función de su entrada persistida, no de tu programa">
+La dificultad real de escribir trabajadores no está en la API, que se aprende en veinte minutos, sino en un cambio de mentalidad que cuesta bastante más y que casi nadie enuncia. Cuando escribes una función normal, esa función vive dentro de un programa en marcha: puede leer una variable global que alguien inicializó al arrancar, puede asumir que el usuario que abrió sesión hace un minuto sigue con la sesión abierta, puede confiar en que el archivo que acaba de crearse sigue ahí, puede dar por hecho que su contexto de ejecución es una continuación del contexto en el que fue invocada. Un trabajador no tiene nada de eso. Su invocación y su ejecución están separadas por un abismo que puede medirse en horas y que puede contener un reinicio del dispositivo, una actualización de la aplicación, un cambio de usuario, un vaciado de caché y la desaparición de todo lo que hubiera en memoria. Lo único que cruza ese abismo intacto son dos cosas: lo que escribiste en su contenedor de entrada y lo que hay en tu almacenamiento persistente. Todo lo demás es humo. De esa observación se derivan, sin necesidad de memorizar nada, casi todas las reglas de esta lección: por qué la entrada es pequeña y de tipos primitivos, porque tiene que caber en una fila de base de datos; por qué conviene pasar identificadores y no contenidos, porque el contenido de hace tres horas puede ser mentira y el identificador nunca lo es; por qué el trabajador debe ser idempotente, porque puede reejecutarse desde cero después de haber hecho la mitad; por qué la lógica no debe vivir dentro de él, porque un adaptador entre dos mundos no es el sitio donde poner las reglas de tu negocio. Escribir un trabajador es escribir una función pura de dos argumentos: su entrada congelada y el estado actual del disco. En cuanto empiezas a tratarlo así, deja de sorprenderte en producción; mientras lo trates como un trozo de tu programa que se ejecuta un poco más tarde, seguirá fallando exactamente en los casos que nunca reproduces en tu mesa.
+</Callout>
+
+<Challenge title="Construye un trabajador honesto">
+1. Escribe un trabajador que suba un archivo pasando únicamente su identificador de base de datos y razona qué pasaría si pasaras el contenido.
+2. Intenta encolar un contenedor de más de diez kilobytes y observa exactamente en qué punto falla y con qué excepción.
+3. Provoca los tres resultados de forma deliberada y comprueba en cada caso qué hace el planificador con el trabajo.
+4. Escribe un bucle de cómputo largo sin comprobar la detención, cancélalo desde la interfaz y verifica con un registro que sigue trabajando.
+5. Añade una rendición basada en el contador de intentos y comprueba que el trabajo termina en fallo con un motivo legible en su salida.
+</Challenge>

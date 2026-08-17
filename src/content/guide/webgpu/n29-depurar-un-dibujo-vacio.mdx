@@ -1,0 +1,96 @@
+---
+title: "Depurar un dibujo indirecto que no dibuja nada"
+description: "El procedimiento ordenado para encontrar por qué una llamada indirecta no produce píxeles, empezando por leer el buffer de argumentos y terminando por las causas que no tienen nada que ver con lo indirecto."
+subject: webgpu
+level: 29
+order: 4
+position: "29.4"
+duration: "16 min"
+---
+
+<Lead>
+Un dibujado indirecto que no produce nada es un caso de depuración incómodo porque la consola está limpia, la validación está satisfecha y la pantalla está vacía. Hay exactamente ocho cosas que pueden estar pasando y se pueden descartar en orden, de la más barata de comprobar a la más cara. Hacerlo en ese orden convierte una tarde de conjeturas en veinte minutos de método, y la primera comprobación —leer lo que hay realmente en el búfer— resuelve la mayoría de los casos por sí sola.
+</Lead>
+
+<Goals>
+
+- Leer el contenido de un búfer de la GPU desde JavaScript para inspeccionarlo.
+- Aplicar un orden de descarte que empiece por lo más barato de comprobar.
+- Distinguir los fallos propios del dibujado indirecto de los que no lo son.
+- Instrumentar los shaders con valores centinela para localizar dónde se pierde el dato.
+
+</Goals>
+
+## Lo primero: mirar el búfer
+
+No hay ninguna razón para adivinar el contenido de un búfer cuando se puede leer. El procedimiento es siempre el mismo: un búfer intermedio con `COPY_DST` y `MAP_READ`, una copia grabada en el encoder, y un mapeo asíncrono después del `submit`.
+
+```js
+// Creado una vez, no por fotograma.
+const lectura = device.createBuffer({
+  label: 'lectura de argumentos',
+  size: NUM_LOTES * 20,
+  usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+});
+
+async function volcarArgumentos(encoder) {
+  encoder.copyBufferToBuffer(argumentos, 0, lectura, 0, NUM_LOTES * 20);
+  device.queue.submit([encoder.finish()]);
+
+  await lectura.mapAsync(GPUMapMode.READ);
+  // slice copia: el rango mapeado deja de ser valido tras unmap.
+  const v = new Uint32Array(lectura.getMappedRange().slice(0));
+  lectura.unmap();
+
+  for (let i = 0; i < NUM_LOTES; i++) {
+    const b = i * 5;
+    console.log(`lote ${i}`, {
+      indexCount:    v[b + 0],
+      instanceCount: v[b + 1],
+      firstIndex:    v[b + 2],
+      baseVertex:    v[b + 3],
+      firstInstance: v[b + 4],
+    });
+  }
+}
+```
+
+Con esa tabla delante, casi todos los casos se resuelven de un vistazo:
+
+**Todo a cero.** El compute que rellena los argumentos no se ha ejecutado, o ha escrito en otro búfer, o su `dispatchWorkgroups` recibió cero grupos por un redondeo mal hecho.
+
+**`indexCount` correcto e `instanceCount` a cero.** El compute funciona; lo que no encuentra nada es el criterio de selección. El problema está en la matriz de la cámara, en los volúmenes envolventes o en el signo de alguna prueba, no en el dibujado indirecto.
+
+**Valores enormes y sin sentido.** Estás leyendo con el formato equivocado: cuatro campos donde había cinco, o al revés, o el desplazamiento en unidades de bloque en lugar de bytes.
+
+**`firstInstance` distinto de cero.** Ahí está. Sin la feature `indirect-first-instance`, la llamada entera se trata como una operación nula, sin ningún aviso. Ponlo a cero y usa la indirección en el shader.
+
+## El orden de descarte
+
+Si el búfer tiene buena pinta, se sigue por aquí, y conviene respetar el orden porque está ordenado por coste de comprobación.
+
+**Uno: comprueba que hay errores de validación capturados.** Envuelve el fotograma con `device.pushErrorScope('validation')` y su `popErrorScope()`, y registra el resultado. Un error que has dejado escapar puede haber invalidado el pass entero, y entonces no dibuja nada por una razón que sí tiene mensaje.
+
+**Dos: sustituye la llamada indirecta por una directa con los mismos números.** Si la versión directa dibuja y la indirecta no, el problema está en el búfer o en la disposición. Si tampoco dibuja la directa, el problema no tiene nada que ver con lo indirecto y te acabas de ahorrar el resto de la lista.
+
+**Tres: comprueba el búfer de índices.** El formato que pasaste a `setIndexBuffer` —`'uint16'` o `'uint32'`— tiene que coincidir con cómo generaste los índices. Con el formato equivocado, los índices se leen a mitad de valor o de dos en dos y la geometría sale como confeti o no sale. Y `firstIndex` más `indexCount` tiene que caber dentro del búfer.
+
+**Cuatro: comprueba el sentido de las caras.** Un `cullMode: 'back'` con el `frontFace` equivocado descarta exactamente toda la geometría. Ponlo a `'none'` un momento: si aparece, era eso.
+
+**Cinco: comprueba la profundidad.** Un valor de limpieza incoherente con el operador de comparación vacía la escena; la pareja correcta está en [las funciones de comparación](/guia/webgpu/n25-las-funciones-de-comparacion/). Y si has adoptado profundidad invertida a medias, la mitad del renderizador descartará todo lo de la otra mitad.
+
+**Seis: comprueba que el objeto está donde crees.** Dibuja un solo lote con `instanceCount` forzado a uno y una matriz identidad. Si aparece en el centro de la pantalla, el problema son los datos por instancia y no el dibujado.
+
+**Siete: comprueba el layout de vértices.** Un `arrayStride` equivocado hace que cada vértice lea desde una posición desplazada, y el resultado suele ser geometría que se dispara fuera de la pantalla y por tanto invisible, no geometría deformada visible.
+
+**Ocho: mira si el shader descarta.** Un `discard` con una condición que siempre se cumple produce exactamente el mismo síntoma que no dibujar. Devuelve un color constante desde el fragment shader para descartarlo.
+
+<Callout type="dios" title="Cuando la decisión se muda a la GPU, pierdes el depurador, y lo que lo sustituye son invariantes escritas en los datos">
+El coste oculto del renderizado dirigido por la GPU no es de rendimiento ni de complejidad de código: es que **desaparece la observabilidad**. En un renderizador clásico puedes poner un punto de interrupción en el bucle de dibujado y ver la lista de objetos visibles, sus matrices y sus materiales. En uno dirigido por la GPU, ese bucle no existe: lo que hay es un búfer de veinte bytes por lote que alguien ha escrito en algún momento del pipeline y que nadie ha mirado nunca. Y no puedes poner un punto de interrupción dentro de un compute shader. La disciplina que sustituye al depurador es la misma que usan los sistemas distribuidos cuando no pueden inspeccionar sus nodos: **escribir invariantes en los datos y comprobarlas fuera**. En la práctica son tres hábitos que conviene adoptar el primer día y no cuando ya duele. Primero, **rellena los búferes con un centinela reconocible** en lugar de con ceros —`0xDEADBEEF` es tradicional— de modo que al volcarlos distingas de un vistazo «esto nadie lo ha escrito» de «esto lo escribieron con el valor cero», que son dos diagnósticos completamente distintos y que con ceros son indistinguibles. Segundo, **reserva un búfer de depuración** al que cada compute shader escriba unos cuantos valores: cuántas invocaciones entraron, cuántas pasaron el criterio, cuál fue el máximo del contador. Cuesta unas líneas, se puede compilar condicionalmente con una constante `override`, y convierte una caja negra en algo que emite telemetría. Y tercero, **comprueba las invariantes en el propio shader** y marca el fallo en ese búfer: si el contador de un lote supera la capacidad reservada, si un índice se sale del rango, si una matriz tiene un NaN. En una GPU no puedes lanzar una excepción, pero sí puedes escribir un uno en una posición que la CPU lee cada pocos fotogramas y que dispara un aviso. La diferencia entre un pipeline dirigido por GPU que se puede mantener y uno que no está casi enteramente en si alguien montó esta instrumentación antes de que hiciera falta.
+</Callout>
+
+## Un consuelo sobre la seguridad
+
+Merece decirse, porque quien viene de las APIs nativas lo teme: un `vertexCount` absurdo en un búfer indirecto **no cuelga el dispositivo ni lee memoria ajena**. WebGPU garantiza accesos acotados: las lecturas de vértices fuera del rango del búfer devuelven ceros en lugar de leer memoria arbitraria, que es una de las condiciones para que esta API se pueda exponer a una página web cualquiera.
+
+Lo que sí puede pasar es que la GPU pase mucho tiempo procesando millones de vértices inexistentes, y que el navegador acabe considerando que el dispositivo no responde y lo pierda. El síntoma es un `device.lost` con motivo desconocido después de un parón. Si te ocurre justo al empezar a usar dibujado indirecto, revisa `vertexCount` e `indexCount` antes que ninguna otra cosa: casi siempre es un contador que se escribió en el campo equivocado.

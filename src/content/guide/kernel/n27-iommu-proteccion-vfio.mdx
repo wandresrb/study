@@ -1,0 +1,109 @@
+---
+title: "El IOMMU: la MMU de los dispositivos que protege la RAM"
+description: "La unidad de gestión de memoria de E/S traduce las direcciones que emiten los dispositivos y, sobre todo, confina lo que cada uno puede tocar: un periférico comprometido ya no puede leer toda la RAM. Grupos IOMMU, ataques por DMA, y su papel en la virtualización con VFIO e IOMMUFD."
+subject: kernel
+level: 27
+order: 4
+position: "27.4"
+duration: "17 min"
+---
+
+<Lead>
+La CPU tiene una MMU que traduce direcciones y aísla procesos: ningún proceso puede tocar la memoria de otro. Pero los dispositivos que hacen DMA se saltaban esa MMU y podían escribir cualquier dirección física del sistema. El IOMMU cierra ese agujero: es la MMU de los dispositivos. Traduce sus direcciones y, sobre todo, **los confina**, de modo que un periférico defectuoso o comprometido ya no puede leer toda tu RAM.
+</Lead>
+
+<Goals>
+
+- Entender el IOMMU como la MMU de los dispositivos: traduce IOVA a física con tablas de página propias.
+- Ver su papel de protección y cómo frena los ataques por DMA.
+- Conocer los grupos IOMMU como unidad mínima de aislamiento.
+- Relacionar el IOMMU con la virtualización segura mediante VFIO e IOMMUFD.
+
+</Goals>
+
+## Una MMU para los dispositivos
+
+El **IOMMU** (I/O Memory Management Unit) se interpone entre el DMA del dispositivo y la RAM. El dispositivo emite una dirección virtual de E/S —una **IOVA**—, y el IOMMU la traduce a física recorriendo tablas de página de E/S propias, distintas de las de la CPU y organizadas por dispositivo. En hardware son Intel VT-d, AMD-Vi y el SMMU de ARM; en el kernel los orquesta el subsistema `iommu` y el backend `iommu-dma`, que es quien atiende tus llamadas a la DMA API cuando hay traducción activa.
+
+```bash
+# ¿hay IOMMU activo? sus grupos aparecen en sysfs
+ls /sys/kernel/iommu_groups/
+# habilitarlo desde la linea de comandos del kernel:
+#   intel_iommu=on      (Intel VT-d)
+#   amd_iommu=on        (AMD-Vi)
+```
+
+Esta traducción, por sí sola, ya resuelve dos problemas del nivel anterior. Un dispositivo de 32 bits puede alcanzar cualquier página física porque el IOMMU le da una IOVA baja que traduce a una física alta, sin buffer de rebote. Y páginas físicamente dispersas pueden presentarse al dispositivo como un rango de IOVA contiguo (la fusión del nivel 27.5).
+
+## Protección: confinar, no confiar
+
+<Cards>
+  <Card icon="🗺️" title="Traducir">
+    Convierte IOVA en física con tablas de página de E/S. Da a un dispositivo de 32 bits acceso a RAM alta sin rebote y presenta páginas dispersas como un rango contiguo.
+  </Card>
+  <Card icon="🔒" title="Proteger">
+    Confina cada dispositivo a las páginas que su driver le mapeó. Un acceso fuera de esa jaula se rechaza con un fallo. Es lo que frena los ataques por DMA.
+  </Card>
+</Cards>
+
+El verdadero salto no es la traducción sino la **protección**. Cuando `dma_map_single` instala una entrada en las tablas del IOMMU, está diciendo: "este dispositivo puede tocar *esta* página y ninguna otra". Cualquier acceso del dispositivo a una IOVA no mapeada se rechaza y genera un fallo. El dispositivo pasa de tener acceso total a la RAM a vivir en una jaula que solo contiene lo que explícitamente le prestaste.
+
+```bash
+# desmapear estricto: cada unmap purga la IOTLB al instante (mas seguro, mas lento)
+#   iommu.strict=1
+# modo diferido: se agrupan las purgas (mas rapido, ventana breve de mapeo obsoleto)
+#   iommu.strict=0
+# passthrough: mapa identidad, sin proteccion, maximo rendimiento
+#   iommu.passthrough=1   (equivale a iommu=pt)
+```
+
+<Mermaid code={`flowchart LR
+  DEV[Dispositivo] -->|IOVA| IOMMU[IOMMU]
+  IOMMU -->|traduce y comprueba| OK[Paginas mapeadas para el]
+  IOMMU -. rechaza el acceso .- NO[Resto de la RAM]`} />
+
+Esto es exactamente lo que frena los **ataques por DMA**. Un portátil sin IOMMU es vulnerable a un periférico malicioso conectado por Thunderbolt o PCIe que, como maestro del bus, lee la RAM entera y roba claves de disco o de sesión: son los ataques Thunderclap, la clase *evil maid* y herramientas como PCILeech. Con el IOMMU activo y en modo estricto, ese periférico solo ve las poquísimas páginas que su driver le mapeó, y su intento de barrer la memoria muere en un fallo de traducción.
+
+<Callout type="danger" title="La ventana previa al arranque del kernel">
+El IOMMU protege solo cuando ya está configurado. Existe un momento peligroso entre encender la máquina y que el kernel active la traducción, en el que un dispositivo conectado podría hacer DMA libre. Por eso el firmware moderno ofrece *Kernel DMA Protection* (basada en VT-d/pre-boot DMA remapping): mantiene los puertos externos bloqueados hasta que el sistema operativo toma el control del IOMMU. Sin ese eslabón, cifrar el disco no basta: la clave vive en RAM y un periférico la lee antes de que exista defensa alguna.
+</Callout>
+
+<Callout type="warn" title="El compromiso entre estricto y diferido es de seguridad">
+`iommu.strict=1` purga la IOTLB en cada `unmap`, así que una página desmapeada deja de ser accesible de inmediato; es lo correcto frente a dispositivos no confiables. El modo diferido agrupa las purgas para ganar rendimiento, a costa de una ventana breve en la que una IOVA ya "liberada" sigue traduciendo a su página. Frente a hardware potencialmente hostil, la latencia de la seguridad importa: elige estricto.
+</Callout>
+
+## Grupos IOMMU: la unidad de aislamiento
+
+El IOMMU no siempre puede distinguir dos dispositivos. Por la topología PCIe —puentes sin *ACS*, funciones que comparten origen— a veces varios dispositivos son indistinguibles desde el punto de vista de la traducción. El kernel los agrupa en un **grupo IOMMU**: el conjunto más pequeño que puede aislarse del resto. Todo el grupo comparte destino, y por eso es la granularidad mínima con la que puedes ceder un dispositivo a otro dominio.
+
+```bash
+# ver qué dispositivos comparten grupo (todos se ceden juntos, o ninguno)
+for d in /sys/kernel/iommu_groups/*/devices/*; do
+	echo "grupo $(basename $(dirname $(dirname $d))): $(basename $d)"
+done
+```
+
+## Virtualización segura: VFIO e IOMMUFD
+
+Aquí el IOMMU cambia de "medida de seguridad interna" a "habilitador de arquitecturas enteras". **VFIO** (Virtual Function I/O) permite ceder un dispositivo físico directamente a una máquina virtual o a un proceso de usuario **con seguridad**, precisamente porque el IOMMU confina el DMA de ese dispositivo a la memoria del huésped: el dispositivo cedido no puede escribir fuera de la RAM asignada a la VM. Es la base del *passthrough* de PCI en KVM y de los drivers en espacio de usuario de alto rendimiento como DPDK y SPDK.
+
+```bash
+# ceder un dispositivo PCI a vfio-pci para pasarlo a una VM bajo control del IOMMU
+echo 0000:03:00.0 > /sys/bus/pci/devices/0000:03:00.0/driver/unbind
+echo vfio-pci     > /sys/bus/pci/devices/0000:03:00.0/driver_override
+echo 0000:03:00.0 > /sys/bus/pci/drivers_probe
+```
+
+En los kernels actuales, **IOMMUFD** (`/dev/iommu`) moderniza ese modelo: expone la gestión de espacios de direcciones de E/S como un objeto de primera clase, con control fino de las tablas y soporte para anidamiento (el IOMMU de un huésped sobre el del anfitrión). VFIO se apoya cada vez más en él. La idea de fondo no cambia: el IOMMU es lo que hace *seguro* dar hardware crudo a software no confiable.
+
+<Callout type="dios" title="El IOMMU completa la historia del aislamiento: del proceso al periférico">
+Levanta la vista y mira la simetría, porque es una de las más bellas del kernel. En el nivel 24 la MMU de la CPU te dio el aislamiento de procesos: cada proceso vive en su propio espacio de direcciones y no puede tocar la memoria de otro; el privilegio de acceso a la RAM se otorga página a página. El IOMMU es *esa misma idea*, aplicada al otro conjunto de iniciadores del bus: los dispositivos. Antes de él, la seguridad de la memoria era un perímetro con un agujero enorme —confiabas en cada trozo de silicio con capacidad de DMA como si fuera parte del núcleo—, y bastaba una tarjeta comprometida para que todo el modelo de procesos, cuidadosamente aislado por la CPU, se derrumbara por debajo: el periférico leía la RAM del kernel y de todos los procesos a la vez. El IOMMU sella ese agujero llevando el **principio de mínimo privilegio hasta el hardware**: cada dispositivo obtiene su propio espacio de direcciones y solo se le mapea lo que necesita para la transferencia en curso. Ese único mecanismo transforma tres cosas a la vez. Convierte a los periféricos de entidades de plena confianza en sujetos confinados, y con ello hace defendible un portátil frente al puerto Thunderbolt. Convierte el *passthrough* de un dispositivo a una VM no confiable de temeridad en operación rutinaria. Y convierte los drivers en espacio de usuario —DPDK, SPDK— de agujero de seguridad en técnica legítima de alto rendimiento. Cuando internalizas que MMU e IOMMU son el mismo teorema demostrado sobre dos poblaciones distintas de actores, entiendes que la seguridad de la memoria moderna no es un muro sino una malla de espacios de direcciones mutuamente ciegos, y que cada iniciador con acceso a la RAM —CPU o dispositivo— necesita su propio traductor para que esa ceguera sea completa.
+</Callout>
+
+<Challenge title="Inspecciona y razona sobre tu IOMMU">
+1. Arranca con `intel_iommu=on` (o `amd_iommu=on`) y lista `/sys/kernel/iommu_groups/`; identifica qué dispositivos comparten grupo en tu máquina.
+2. Explica por qué el grupo, y no el dispositivo individual, es la unidad que puedes ceder por VFIO.
+3. Describe paso a paso un ataque por DMA vía Thunderbolt y en qué punto exacto lo detiene el IOMMU en modo estricto.
+4. Argumenta el compromiso de rendimiento y seguridad entre `iommu.strict=1`, `iommu.strict=0` e `iommu.passthrough=1`.
+5. Relaciona la protección del IOMMU con el aislamiento de la MMU de la CPU: ¿qué población de "actores" aísla cada una?
+</Challenge>

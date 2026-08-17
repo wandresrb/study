@@ -1,0 +1,164 @@
+---
+title: "El coste de crear un pipeline y cómo no pagarlo en mitad del frame"
+description: "Qué ocurre entre createRenderPipeline y el pipeline listo, por qué la versión asíncrona existe, la caché por descriptor, y la estrategia de precalentamiento."
+subject: webgpu
+level: 24
+order: 5
+position: "24.5"
+duration: "19 min"
+---
+
+<Lead>
+Crear un render pipeline compila los shaders al lenguaje intermedio de la plataforma, y en muchos backends también al código máquina de la GPU concreta, con todo el estado gráfico como entrada de la compilación. Eso cuesta entre unos milisegundos y varias decenas por pipeline. Si ocurre en mitad del bucle de dibujado, produce el tirón más característico y más evitable de las aplicaciones gráficas en la web.
+</Lead>
+
+<Goals>
+
+- Describir qué trabajo hace la implementación al crear un pipeline.
+- Usar `createRenderPipelineAsync` y saber en qué se diferencia de la versión síncrona.
+- Montar una caché de pipelines indexada por el contenido del descriptor.
+- Diseñar una fase de precalentamiento que elimine los tirones del primer uso.
+
+</Goals>
+
+## Qué pasa por dentro
+
+`createRenderPipeline` hace cuatro cosas. Valida el descriptor entero contra el pipeline layout y contra los módulos. Traduce el WGSL al lenguaje intermedio del backend —SPIR-V en Vulkan, MSL en Metal, HLSL o DXIL en D3D12—. Especializa esa traducción con el estado gráfico: los formatos de los targets, el estado de mezcla, la topología, los override constants. Y en muchos backends invoca al compilador del driver para generar el código máquina definitivo.
+
+Esa última etapa es la cara, y es la que hace que el coste no sea predecible: depende del driver, del tamaño del shader y de si el driver tiene una caché en disco de compilaciones anteriores. Un shader PBR completo puede tardar de 5 a 50 ms la primera vez y menos de 1 ms cuando la caché del driver ya lo tiene.
+
+Lo importante es que el coste **se paga por combinación de estado**, no por shader. El mismo módulo compilado con dos formatos de target distintos son dos compilaciones. Con dos valores de override constants, dos compilaciones. Con blending y sin blending, dos compilaciones. La explosión combinatoria de variantes es real y es el motivo por el que los motores grandes tienen sistemas de gestión de variantes.
+
+<Callout type="warn" title="El primer draw también puede costar">
+Algunas implementaciones difieren parte de la compilación hasta el primer uso real del pipeline en un draw. Eso significa que crear el pipeline en la carga no siempre basta: hay que **usarlo** al menos una vez. La técnica de precalentamiento de la última sección lo tiene en cuenta.
+</Callout>
+
+## La versión asíncrona
+
+`createRenderPipelineAsync` devuelve una promesa que resuelve cuando el pipeline está listo para usarse sin bloqueos adicionales:
+
+```js
+const pipeline = await device.createRenderPipelineAsync({
+  label: 'opaco-pbr',
+  layout: pipelineLayout,
+  vertex: { module, entryPoint: 'vs', buffers },
+  fragment: { module, entryPoint: 'fs', targets },
+});
+```
+
+La diferencia no es que sea más rápida: es que **no bloquea el hilo de JavaScript** mientras el driver compila. Con la versión síncrona, esos 30 ms son 30 ms de hilo principal congelado, con la animación parada y los eventos de entrada en cola. Con la asíncrona, el trabajo va a un hilo del navegador y tu bucle sigue corriendo.
+
+La promesa se rechaza con un `GPUPipelineError` si la creación falla, en vez de producir un objeto inválido con un error de validación. Es un modo de error más manejable:
+
+```js
+try {
+  const p = await device.createRenderPipelineAsync(descriptor);
+} catch (e) {
+  // e es un GPUPipelineError con e.reason: 'validation' o 'internal'
+  console.error('pipeline fallido:', e.reason, e.message);
+}
+```
+
+Existe la equivalente `createComputePipelineAsync` con la misma semántica.
+
+La regla práctica es clara: **usa siempre la versión asíncrona salvo durante el arranque**, donde el bloqueo no molesta y el código secuencial es más simple. Nunca uses la síncrona dentro del bucle de dibujado.
+
+## La caché por descriptor
+
+Como el pipeline es una función determinista de su descriptor, una caché por contenido elimina las creaciones duplicadas. La clave se construye serializando los campos relevantes:
+
+```js
+function crearCacheDePipelines(device) {
+  const cache = new Map();
+  const idsLayout = new WeakMap();
+  let siguienteId = 0;
+
+  // Los layouts se identifican por objeto, no por contenido:
+  // dos layouts estructuralmente iguales NO son intercambiables.
+  function idDeLayout(layout) {
+    if (layout === 'auto') return 'auto';
+    let id = idsLayout.get(layout);
+    if (id === undefined) { id = `pl${siguienteId++}`; idsLayout.set(layout, id); }
+    return id;
+  }
+
+  function clave(d) {
+    return JSON.stringify({
+      layout: idDeLayout(d.layout),
+      vs: [d.vertex.module.label, d.vertex.entryPoint, d.vertex.constants,
+           d.vertex.buffers],
+      fs: d.fragment && [d.fragment.module.label, d.fragment.entryPoint,
+                         d.fragment.constants, d.fragment.targets],
+      primitive: d.primitive, depthStencil: d.depthStencil,
+      multisample: d.multisample,
+    });
+  }
+
+  return async function obtener(descriptor) {
+    const k = clave(descriptor);
+    let p = cache.get(k);
+    if (!p) {
+      p = device.createRenderPipelineAsync(descriptor);   // guardamos la promesa
+      cache.set(k, p);
+    }
+    return p;
+  };
+}
+```
+
+Dos detalles hacen que esta caché funcione y no la mayoría de las que se escriben a mano.
+
+El primero es guardar la **promesa**, no el pipeline resuelto. Si dos partes del código piden el mismo pipeline antes de que la primera termine, ambas esperan la misma compilación en vez de lanzar dos.
+
+El segundo es la identificación de layouts por objeto. Dos `GPUPipelineLayout` con la misma estructura producen pipelines cuyos bind groups no son intercambiables, como vimos en la [lección de compatibilidad](/guia/webgpu/n18-pipeline-layout-compartido/). Una caché que los tratara como iguales devolvería el pipeline equivocado y produciría errores de validación imposibles de rastrear.
+
+Los módulos se identifican por su `label`, lo que obliga a etiquetarlos de forma única. La alternativa —usar el código fuente como clave— funciona pero produce claves enormes; un `WeakMap` de módulos a identificadores, como el de los layouts, es la versión limpia.
+
+## El precalentamiento
+
+Aunque los pipelines se creen en la carga, algunas implementaciones difieren trabajo hasta el primer draw. La técnica que lo elimina es dibujar una vez cada pipeline contra un target diminuto antes de mostrar nada:
+
+```js
+async function precalentar(device, pipelines, formatos) {
+  const dummy = device.createTexture({
+    size: [1, 1], format: formatos.color,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  const dummyDepth = device.createTexture({
+    size: [1, 1], format: formatos.profundidad,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+
+  const encoder = device.createCommandEncoder({ label: 'precalentado' });
+  const pass = encoder.beginRenderPass({
+    colorAttachments: [{ view: dummy.createView(),
+      loadOp: 'clear', storeOp: 'discard', clearValue: [0, 0, 0, 0] }],
+    depthStencilAttachment: { view: dummyDepth.createView(),
+      depthLoadOp: 'clear', depthStoreOp: 'discard', depthClearValue: 1 },
+  });
+
+  for (const { pipeline, grupos } of pipelines) {
+    pass.setPipeline(pipeline);
+    grupos.forEach((g, i) => pass.setBindGroup(i, g));
+    pass.draw(3);          // un triángulo que no cubre nada útil
+  }
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+
+  dummy.destroy();
+  dummyDepth.destroy();
+}
+```
+
+El target de 1×1 hace que el coste de rasterizado sea despreciable, y `storeOp: 'discard'` evita incluso escribirlo. Lo único que importa es que cada pipeline pase por un `draw` real.
+
+`onSubmittedWorkDone()` espera a que la GPU termine, de modo que puedas mostrar la pantalla de carga hasta que todo esté listo de verdad.
+
+<Callout type="dios" title="El problema real no son los pipelines sino cuántos hay">
+Toda esta infraestructura —asíncrono, caché, precalentamiento— resuelve el síntoma. La causa suele ser que el número de variantes creció sin que nadie lo mirara. Un sistema de materiales con seis opciones booleanas produce 64 variantes de shader; si además hay dos formatos de target, tres estados de mezcla y dos configuraciones de MSAA, son 768 pipelines posibles, y precalentarlos todos son treinta segundos de carga. La disciplina que lo evita es contar: instrumenta la caché para que registre cuántos pipelines distintos se crean en una sesión real, y mira el número. Casi siempre descubrirás que de las 768 combinaciones posibles se usan doce, y que la explosión es teórica. Cuando no lo es —cuando de verdad se usan cientos—, la solución no es compilarlas más rápido sino reducirlas: convertir opciones booleanas de compilación en ramas uniformes en tiempo de ejecución, unificar formatos de target, y aceptar un shader ligeramente más caro a cambio de una fracción de las variantes. Un shader un 5 % más lento que compila en un segundo en vez de en treinta es casi siempre el mejor negocio.
+</Callout>
+
+<Challenge>
+Instrumenta la caché de pipelines de arriba con un contador de aciertos y fallos, y con un `performance.now()` alrededor de cada creación. Ejecuta tu aplicación durante una sesión normal y registra cuántos pipelines se crearon, cuánto tardó cada uno y cuántas peticiones acertaron en la caché. Ese informe te dirá si tu problema es de compilación o de arquitectura de variantes.
+</Challenge>

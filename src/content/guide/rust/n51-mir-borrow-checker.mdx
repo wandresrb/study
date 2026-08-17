@@ -1,0 +1,129 @@
+---
+title: "MIR: el grafo donde vive el borrow checker"
+description: "El HIR aún se parece a tu código; el MIR ya no. La Mid-level IR es un grafo de flujo de control hecho de bloques básicos, locales y terminadores: la representación que rustc diseñó a propósito para poder demostrar seguridad de memoria. Aquí habita el borrow checker —y su sucesor Polonius—, comprobando los préstamos no sobre tu sintaxis, sino sobre las aristas del grafo, midiendo en qué puntos vive cada referencia."
+subject: rust
+level: 51
+order: 2
+position: "51.2"
+duration: "21 min"
+---
+
+<Lead>
+El `HIR` de la lección anterior todavía se lee como Rust: es un árbol, tiene `match`, tiene `loop`. El `MIR` rompe con eso por completo. Es un **grafo de flujo de control** —bloques básicos unidos por saltos— donde no queda ni rastro de la forma de tu programa, solo su flujo desnudo. Y no es una representación cualquiera: es la que el equipo de Rust construyó *expresamente* para poder **demostrar seguridad de memoria**. Aquí vive el borrow checker, la pieza más famosa del compilador, y aquí lo veremos hacer su trabajo: recorrer el grafo midiendo, punto a punto, dónde vive cada préstamo.
+</Lead>
+
+<Goals>
+
+- Leer la anatomía del `MIR`: bloques básicos, locales, *places*, *rvalues* y terminadores.
+- Entender por qué un grafo de flujo de control es el sustrato idóneo para analizar préstamos.
+- Ver cómo el borrow checker calcula regiones de vida sobre ese grafo bajo `NLL`.
+- Situar a Polonius como reformulación por hechos y su relación con el `MIR`.
+
+
+</Goals>
+
+## La anatomía del MIR
+
+El `MIR` (`rustc_middle::mir`) descompone cada función en **bloques básicos**: tramos de código sin saltos internos, etiquetados `bb0`, `bb1`, `bb2`. Cada bloque es una lista de *statements* seguida de un único **terminador**, que decide a qué bloque se salta después. Los datos ya no tienen nombres: se numeran como **locales**, donde `_0` es siempre el valor de retorno, `_1` en adelante son argumentos y temporales.
+
+El vocabulario es pequeño y regular, y ese es justo el punto. Un *place* es una posición de memoria: un local más *proyecciones* —un campo `.0`, un desreferenciado `*`, un índice—. Un *rvalue* es lo que produce un valor: un `Use`, un `BinaryOp`, un `Ref` que toma un préstamo, un `Aggregate` que construye una struct. Un *statement* es casi siempre una asignación `place = rvalue`, más marcas `StorageLive` y `StorageDead` que abren y cierran la vida de cada local. Y un terminador es un `Goto`, un `SwitchInt` que ramifica, un `Call`, un `Return` o un `Drop`.
+
+```rust
+// Fuente
+fn maximo(a: i32, b: i32) -> i32 {
+    if a > b { a } else { b }
+}
+```
+
+```rust
+// MIR simplificado de maximo (no es codigo que escribas)
+fn maximo(_1: i32, _2: i32) -> i32 {
+    let mut _0: i32;   // valor de retorno
+    let mut _3: bool;  // temporal para la condicion
+
+    bb0: {
+        _3 = Gt(copy _1, copy _2);              // _3 = a > b
+        switchInt(move _3) -> [0: bb2, otherwise: bb1];
+    }
+    bb1: { _0 = copy _1; goto -> bb3; }         // rama then
+    bb2: { _0 = copy _2; goto -> bb3; }         // rama else
+    bb3: { return; }                             // devuelve _0
+}
+```
+
+Fíjate en lo que ha desaparecido: el `if` ya no es una expresión, es un `switchInt` con dos aristas que vuelven a confluir en `bb3`. La estructura anidada de tu código se ha aplanado en un grafo.
+
+Los terminadores más reveladores aparecen cuando hay efectos. Una llamada a función no es un *statement* cualquiera: es un terminador `Call`, porque podría no retornar —podría entrar en pánico— y el grafo necesita modelar esa bifurcación con una arista de éxito y otra de desenrollado. Un `Drop` es otro terminador, insertado en el punto exacto donde un valor debe liberarse, materializando la semántica de ownership que en tu código era implícita. Y las marcas `StorageLive` y `StorageDead` que salpican los bloques delimitan la vida física de cada local: el compilador sabe, en cada punto del grafo, qué locales tienen almacenamiento asignado. Nada de esto se veía en tu texto; el `MIR` lo hace explícito precisamente para poder razonar sobre ello.
+
+## Por qué un grafo: analizar el flujo, no la sintaxis
+
+¿Por qué molestarse en descender a algo tan distinto de tu código? Porque razonar sobre préstamos exige razonar sobre **flujo de control**, y la sintaxis es un pésimo mapa del flujo. Un `?` en mitad de una expresión, un `break` con etiqueta, un `return` temprano dentro de un `match`: en el `AST` son formas heterogéneas; en el `MIR` son todas la misma cosa, una arista entre dos bloques. Al uniformar el flujo, problemas que en la superficie serían un laberinto de casos especiales se vuelven un análisis de grafo estándar.
+
+El `MIR` hace explícito, además, todo lo que tu código dejaba implícito. Los `Drop` aparecen como terminadores en los puntos exactos donde un valor debe liberarse —la *drop elaboration* que materializa el nivel de ownership—. Las marcas `StorageLive` y `StorageDead` delimitan la vida física de cada local. Nada queda sobreentendido: si un valor se destruye, hay un nodo que lo dice.
+
+Ese sustrato regular sirve para más que el borrow checker. El intérprete `Miri`, que evalúa constantes en tiempo de compilación, **ejecuta `MIR`**. Las optimizaciones tempranas (*mir-opt*: propagación de constantes, *inlining* simple, eliminación de código muerto) también operan aquí, antes de entregar el testigo al backend. El `MIR` es el punto donde el compilador por fin tiene una vista limpia y analizable de lo que tu programa *hace*.
+
+<Callout type="info" title="MIR se inventó para el borrow checker">
+No es casualidad que el borrow checker viva aquí: el `MIR` nació, en gran parte, para hacerlo posible. El chequeo de préstamos original operaba sobre el `HIR` y razonaba en términos de ámbitos léxicos, lo que lo obligaba a rechazar código seguro por pura rigidez sintáctica. Diseñar una representación de flujo explícito fue el paso que desbloqueó los *non-lexical lifetimes*. La forma del `MIR` está moldeada por la pregunta que debía responder: dónde vive, exactamente, cada referencia.
+</Callout>
+
+## El borrow checker camina el grafo
+
+Con el `MIR` sobre la mesa, el borrow checker (`rustc_borrowck`) hace algo que sobre tu sintaxis sería imposible: para cada préstamo, calcula su **región**, el conjunto de puntos del grafo donde la referencia *podría seguir usándose*. Esa región no es el ámbito léxico donde la declaraste, sino el tramo real de flujo entre que nace y su último uso. De ahí el nombre *non-lexical lifetimes*, `NLL`: la vida de un préstamo se mide por el flujo, no por las llaves.
+
+El algoritmo es, en esencia, un análisis de *liveness* sobre el grafo. Recorre las aristas propagando qué préstamos están vivos en cada punto, y después aplica la regla de oro que ya conoces del nivel de ownership: en ningún punto puede coexistir un préstamo mutable con cualquier otro préstamo del mismo dato. Si en algún nodo del grafo se solapan, es un error; si no, el programa pasa.
+
+```rust
+fn ejemplo() {
+    let mut v = vec![1, 2, 3];
+    let primero = &v[0];    // nace un prestamo compartido de v
+    println!("{primero}");  // ultimo uso del prestamo: aqui termina su region
+    v.push(4);              // &mut v: valido, porque en este punto el prestamo ya murio
+}
+```
+
+Bajo el viejo chequeo léxico, `primero` habría vivido hasta el cierre del bloque y habría chocado con el `push`. Bajo `NLL`, su región termina en la última línea que lo usa —el `println!`—, y cuando el flujo llega al `push` no hay ningún préstamo vivo con el que colisionar. El mismo código, aceptado o rechazado, según si el análisis mira el ámbito o el flujo. El `MIR` es lo que permite mirar el flujo.
+
+El grafo habilita, además, refinamientos impensables sobre la sintaxis. Los *préstamos en dos fases* (*two-phase borrows*) son el ejemplo canónico: en `v.push(v.len())`, el préstamo mutable de `v` que exige `push` y el préstamo compartido que necesita `v.len()` parecen colisionar de frente. Pero el borrow checker distingue en el grafo la *reserva* de un préstamo mutable de su *activación*, y permite que el préstamo compartido de `v.len()` se cuele entre ambos momentos. Es un análisis que solo cobra sentido cuando dispones de un orden preciso de puntos —el que ofrece el `MIR`— y que sería imposible expresar razonando sobre ámbitos léxicos.
+
+<Mermaid code={`flowchart TB
+  bb0[bb0 nace el prestamo de v] --> bb1[bb1 println usa el prestamo]
+  bb1 --> bb2[bb2 ultimo uso aqui muere la region]
+  bb2 --> bb3[bb3 v.push pide un prestamo mutable]
+  bb3 --> ok[Ningun prestamo vivo aqui la comprobacion pasa]
+  class bb0 t-blue
+  class bb2 t-peach
+  class ok t-green`} />
+
+## De regiones a hechos: Polonius
+
+`NLL` es potente, pero su modelo tiene un límite estructural que ya diseccionaste en el nivel de ownership: al representar cada préstamo como una única región *convexa* del grafo, engorda de más cuando los usos viven en ramas distintas, y rechaza patrones seguros como devolver una referencia solo en un camino. **Polonius** es la reformulación de nueva generación que corrige ese punto ciego.
+
+El cambio es de teoría, no de afinado. En vez de preguntar "¿hasta dónde vive este préstamo?", Polonius pregunta, en cada punto del grafo, "¿qué préstamos podrían usarse desde aquí?", y resuelve la cuestión como una deducción lógica al estilo Datalog: un conjunto de *hechos* —aquí nace un préstamo, aquí se accede a través de él, este punto sucede tras aquel— y reglas que los propagan por las aristas. Esa granularidad *location-sensitive*, atada a cada punto del flujo, distingue caminos que `NLL` confunde. Ambos análisis, eso sí, comparten sustrato: los dos leen el `MIR`. Cambia la lógica que corre sobre el grafo, no el grafo.
+
+Merece la pena situar esto en la trayectoria completa que ya recorriste: del chequeo léxico —que razonaba sobre ámbitos y rechazaba multitudes de programas sanos— a `NLL` —que midió el flujo real sobre el `MIR`— a Polonius —que refina la lógica hasta distinguir caminos que `NLL` funde en uno—. Los tres persiguen la misma asíntota: aceptar exactamente los programas seguros, ni uno menos. Y los tres avances fueron posibles porque existía, debajo, un sustrato de flujo explícito sobre el que razonar. Sin el `MIR`, esa evolución no habría tenido dónde ocurrir.
+
+<Cards>
+  <Card icon="📏" title="NLL · regiones sobre el grafo">
+    Modela cada préstamo como una región convexa de puntos del `MIR` y comprueba solapamientos. El motor por defecto en estable en 2026.
+  </Card>
+  <Card icon="🌊" title="Polonius · hechos por punto">
+    Deduce en cada punto qué préstamos podrían usarse, al estilo Datalog. Distingue caminos que `NLL` funde. Avanza en `nightly`.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="El MIR es una representación diseñada para demostrar, no solo para ejecutar">
+Detente en la audacia de la idea. La mayoría de los compiladores tienen una IR intermedia, sí, pero su propósito es la *optimización*: acercar el código a la máquina. El `MIR` de Rust tiene un propósito distinto y casi filosófico: existe para que una **demostración** sea posible. Cuando el borrow checker acepta tu programa, no está adivinando ni aplicando heurísticas prudentes: está ejecutando un análisis de flujo sobre un grafo cuya forma fue elegida, deliberadamente, para que ese análisis pudiera ser correcto y completo dentro de sus reglas. La garantía de Rust —ni *use-after-free*, ni *data races*, ni referencias colgantes— no es una promesa de marketing ni el resultado de mucho testing: es una propiedad que se *deriva* de recorrer este grafo. Y esto ilumina toda la trayectoria del lenguaje. El chequeo léxico era tosco porque razonaba sobre la sintaxis, que miente sobre el flujo. `NLL` fue un salto porque construyó un sustrato donde el flujo era explícito. Polonius es el siguiente porque cambia la *lógica* que corre sobre ese mismo sustrato, acercándose a la asíntota de aceptar exactamente lo seguro. Programar en Rust es, en el fondo, escribir programas que un demostrador automático pueda certificar; y el `MIR` es el lenguaje en el que ese demostrador piensa. Quien entiende el `MIR` deja de ver el borrow checker como un guardián caprichoso y empieza a verlo como lo que es: un teorema recorriendo un grafo.
+</Callout>
+
+<Callout type="note" title="Lo esencial del MIR">
+El `MIR` descompone cada función en un grafo de flujo de control: bloques básicos con *statements* —asignaciones `place = rvalue`, marcas de almacenamiento— y un terminador que salta. Aplana el `if`, el `for` y el `?` en aristas uniformes, hace explícitos los `Drop`, y por eso es el sustrato ideal para analizar préstamos. Sobre él, `NLL` calcula la región de cada préstamo como el tramo de flujo donde vive y comprueba solapamientos; Polonius reformula lo mismo por hechos punto a punto. En 2026 `NLL` es el motor estable y Polonius avanza en `nightly`, ambos leyendo el mismo `MIR`.
+</Callout>
+
+<Challenge title="Recorre el grafo">
+1. Dibuja el grafo de bloques básicos de `fn signo(x: i32) -> i32 { if x < 0 { -1 } else { 1 } }` e identifica el `switchInt` y el punto de confluencia.
+2. Explica qué es un *place* y qué es un *rvalue*, y clasifica `_3 = Gt(copy _1, copy _2)` en esos términos.
+3. Toma el ejemplo del `&v[0]` seguido de `v.push(4)` y razona por qué el chequeo léxico lo rechazaría y `NLL` lo acepta, señalando dónde termina la región del préstamo.
+4. Argumenta por qué hacer explícitos los `Drop` como terminadores del `MIR` es necesario para un análisis correcto de la vida de los valores.
+5. Formula en una frase la diferencia de pregunta entre `NLL` (regiones convexas) y Polonius (hechos por punto), y por qué ambos necesitan igualmente el `MIR`.
+</Challenge>

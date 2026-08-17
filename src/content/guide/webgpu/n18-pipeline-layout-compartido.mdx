@@ -1,0 +1,113 @@
+---
+title: "Compartir el pipeline layout para reutilizar bind groups"
+description: "La regla de compatibilidad de layouts, por qué preserva los grupos atados al cambiar de pipeline, y cómo diseñar un prefijo común entre todos los pipelines del renderer."
+subject: webgpu
+level: 18
+order: 3
+position: "18.3"
+duration: "18 min"
+---
+
+<Lead>
+Cambiar de pipeline en mitad de un render pass no tiene por qué invalidar los bind groups ya atados. La especificación define exactamente cuándo se conservan, y la regla depende de que los pipeline layouts compartan un prefijo común. Explotar esa regla es la diferencia entre reatar cuatro grupos en cada cambio de pipeline y no reatar ninguno.
+</Lead>
+
+<Goals>
+
+- Enunciar la regla de compatibilidad de layouts y sus dos condiciones.
+- Diseñar una familia de pipeline layouts con el prefijo común más largo posible.
+- Usar huecos nulos para mantener alineados los índices entre pipelines distintos.
+- Medir cuántos `setBindGroup` ahorra el prefijo común en un bucle real.
+
+</Goals>
+
+## La regla exacta
+
+Cuando llamas a `setPipeline` dentro de un render pass, los bind groups atados hasta ese momento no se descartan automáticamente. La especificación dice que un bind group atado en el índice `i` sigue siendo válido para el pipeline nuevo si los pipeline layouts del pipeline viejo y del nuevo son **compatibles hasta el índice `i`**, lo que significa dos cosas a la vez: que los bind group layouts de los índices 0 a `i` son los mismos objetos, y que el prefijo es común desde el índice 0 sin saltos.
+
+La consecuencia práctica es que la compatibilidad es un prefijo, no un conjunto. Si dos pipeline layouts comparten los índices 0 y 2 pero difieren en el 1, **solo se conserva el 0**. El grupo 2 hay que reatarlo aunque su layout sea idéntico, porque la cadena se rompió en el 1.
+
+```js
+// A: [frame, materialPBR, objeto]
+// B: [frame, materialPBR, objeto]        -> compatible hasta el 2: no reatas nada
+// C: [frame, materialToon, objeto]       -> compatible hasta el 0: reatas 1 y 2
+// D: [frame, null,         objeto]       -> compatible hasta el 0: reatas 2
+```
+
+La segunda condición, la de identidad de objeto, es la que sorprende. Dos `GPUBindGroupLayout` creados con descriptores idénticos son objetos distintos y **no** son compatibles. Solo lo son si son la misma referencia o si ambos derivan del mismo `GPUPipelineLayout` explícito. Esto obliga a un patrón concreto: crear cada bind group layout **una sola vez** en todo el renderer y pasar esa referencia a todos los pipeline layouts que la necesiten.
+
+<Callout type="warn" title="Crear el layout dentro de una función de fábrica es el error clásico">
+Una función `crearPipelineDeMaterial()` que llama a `createBindGroupLayout` en su interior devuelve, en cada llamada, un pipeline con layouts nuevos e incompatibles con todos los demás. El código parece limpio y destruye la compatibilidad entera. Los layouts van en un módulo que se evalúa una vez; las fábricas los reciben como argumento.
+</Callout>
+
+## Diseñar el prefijo común
+
+Con la regla clara, el diseño se convierte en un problema de ordenación: hay que colocar en los índices bajos los layouts que **más pipelines comparten**, y en los altos los que varían.
+
+Toma un renderer con cuatro familias de pipeline: opaco PBR, opaco toon, transparente PBR y sombras. Los recursos de frame los comparten los cuatro. Los de objeto los comparten los cuatro. Los de material solo los comparten los que usan el mismo modelo de sombreado, y el pass de sombras no usa ninguno.
+
+El reparto que maximiza el prefijo es este:
+
+```js
+// Los layouts se crean UNA vez, en el ámbito del módulo.
+const bglFrame    = device.createBindGroupLayout({ label: 'frame',     entries: [...] });
+const bglObjeto   = device.createBindGroupLayout({ label: 'objeto',    entries: [...] });
+const bglMatPBR   = device.createBindGroupLayout({ label: 'mat-pbr',   entries: [...] });
+const bglMatToon  = device.createBindGroupLayout({ label: 'mat-toon',  entries: [...] });
+
+// Frame y objeto en los índices bajos: los comparte todo el mundo.
+const plPBR    = device.createPipelineLayout({
+  label: 'pbr',    bindGroupLayouts: [bglFrame, bglObjeto, bglMatPBR] });
+const plToon   = device.createPipelineLayout({
+  label: 'toon',   bindGroupLayouts: [bglFrame, bglObjeto, bglMatToon] });
+const plSombra = device.createPipelineLayout({
+  label: 'sombra', bindGroupLayouts: [bglFrame, bglObjeto] });
+```
+
+Ahora el grupo 0 y el grupo 1 se conservan al pasar de PBR a toon y al pasar a sombras. Solo el grupo 2, el de material, se reata cuando cambia la familia. Y el pipeline layout de sombras, que es más corto, sigue siendo compatible en su prefijo: un pipeline layout más corto es compatible con uno más largo hasta donde alcanza.
+
+Fíjate en que este reparto invierte el orden natural: pone el objeto en el índice 1 y el material en el 2, en contra de la convención de "menor índice, menor frecuencia". Es una decisión consciente: el material es lo que **varía entre pipelines**, mientras que el objeto lo comparten todos. La convención de frecuencias y la de compartición no siempre apuntan al mismo sitio, y cuando chocan gana la que mida mejor en tu bucle real.
+
+## Huecos nulos para no romper el prefijo
+
+Cuando un pipeline no usa un grupo intermedio, la tentación es acortar el array. Es exactamente lo que rompe la compatibilidad. La forma correcta es dejar un `null`:
+
+```js
+// MAL: el objeto pasa al índice 1, incompatible con los demás.
+const plPost = device.createPipelineLayout({ bindGroupLayouts: [bglFrame, bglPost] });
+
+// BIEN: el hueco se preserva, el índice 2 sigue significando lo mismo.
+const plPost = device.createPipelineLayout({
+  bindGroupLayouts: [bglFrame, null, bglPost],
+});
+```
+
+El `null` no reserva recursos ni ocupa presupuesto de bindings. Lo único que hace es mantener la numeración, y con ella la compatibilidad del prefijo y la legibilidad del WGSL, donde `@group(0)` significa lo mismo en los diez shaders del proyecto.
+
+Hay un matiz que conviene saber: un `null` en el índice `i` **rompe** la compatibilidad más allá de `i` con un pipeline layout que sí tenga algo en `i`. Es decir, `[frame, null, post]` y `[frame, objeto, material]` solo son compatibles hasta el 0. El hueco preserva los índices, no la compatibilidad.
+
+<Callout type="dios" title="La compatibilidad se pierde también al reatar el pipeline layout entero">
+Hay un detalle de la especificación que muerde a quien lo descubre tarde: los bind groups atados se invalidan cuando cambias a un pipeline cuyo layout no es compatible, pero **también** hay que contar con `setBindGroup(i, null)`, que desata explícitamente. Lo importante es la otra cara: dentro de un mismo render pass, si nunca cambias de pipeline layout, los grupos atados sobreviven a cualquier número de `setPipeline`. Esto convierte una estrategia entera en viable: **un único pipeline layout para todo el renderer**, con los materiales resueltos por variantes de shader en vez de por layouts distintos. Cuesta disciplina —todos los materiales tienen que aceptar el mismo conjunto de texturas, rellenando con texturas de 1×1 las que no usen— y a cambio el bucle de dibujado no reata nada salvo el grupo de objeto. Es lo que hacen los motores que presumen de cero cambios de estado, y no requiere ninguna extensión: solo un layout bien pensado.
+</Callout>
+
+## Medir lo que ahorra
+
+La forma honesta de saber si el prefijo común sirve de algo es contar. Envuelve el encoder con un contador y compara dos ordenaciones del mismo frame:
+
+```js
+function envolver(pass) {
+  const cuenta = [0, 0, 0, 0];
+  const original = pass.setBindGroup.bind(pass);
+  pass.setBindGroup = (i, ...resto) => { cuenta[i]++; return original(i, ...resto); };
+  return cuenta;
+}
+
+const cuenta = envolver(pass);
+dibujarEscena(pass, escena);
+pass.end();
+console.table(cuenta);   // [1, 1, 50, 2000] frente a [1, 2000, 2000, 2000]
+```
+
+Ese `console.table` es el único argumento que convence. Si el índice 0 marca 1 y el 3 marca el número de objetos, el prefijo funciona. Si el 0 marca más de una vez por pass, algo está reatando la cámara y merece una tarde de investigación.
+
+El coste real de cada una de esas llamadas y cómo medirlo en tiempo de GPU y de CPU es el tema de la [lección siguiente](/guia/webgpu/n18-el-coste-de-setbindgroup/).

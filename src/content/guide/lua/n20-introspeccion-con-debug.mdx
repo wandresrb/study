@@ -1,0 +1,155 @@
+---
+title: "Introspección: getinfo, hooks y un profiler"
+description: "La biblioteca `debug` como interfaz con las tripas de la máquina virtual: `debug.getinfo` para saber quién llamó y desde qué línea, los hooks de llamada, retorno, línea y cuenta con `debug.sethook`, y la construcción de un profiler por muestreo y de un depurador rudimentario con puntos de ruptura y acceso a las locales."
+subject: lua
+level: 20
+order: 4
+position: "20.4"
+duration: "19 min"
+---
+
+<Lead>
+Las tres lecciones anteriores han tratado la metaprogramación como producción: código que fabrica código. Esta trata la dirección contraria, que es igual de metaprogramación y bastante menos comentada: código que **observa** código mientras se ejecuta. La biblioteca `debug` no añade nada al lenguaje; abre una ventana a estructuras que la máquina virtual ya mantiene para su propio uso —la pila de marcos, la tabla de líneas de cada prototipo, los nombres de las locales, los upvalues de cada closure— y las expone como valores de Lua corrientes. Con esa ventana y un contador de instrucciones se construye, en menos de cincuenta líneas, un profiler que funciona y un depurador que para donde le dices.
+</Lead>
+
+<Goals>
+
+- Consultar la pila de llamadas con `debug.getinfo` por nivel y por función, pidiendo solo los campos necesarios.
+- Explicar por qué una llamada de cola destruye la información sobre quién llamó, y detectarlo.
+- Instalar hooks de llamada, retorno, línea y cuenta con `debug.sethook`, y conocer su relación con las corrutinas.
+- Construir un profiler por muestreo y un depurador con puntos de ruptura y lectura de locales.
+
+</Goals>
+
+## Quién me ha llamado
+
+`debug.getinfo` acepta una función o un **nivel de la pila**, y devuelve una tabla con lo que sepa de ese marco. El nivel cero es la propia `getinfo`; el uno es la función que la llamó; el dos, la que llamó a esa. El segundo argumento es una cadena de letras que selecciona qué campos rellenar, y no es una optimización cosmética: reconstruir el nombre de una función es caro y pedir solo lo que necesitas puede dividir el coste por varias veces.
+
+```lua
+local function auditar(accion)
+  local yo    = debug.getinfo(1, "n")
+  local quien = debug.getinfo(2, "Sl")
+  if not quien then return end
+  print(string.format("%s ejecutada desde %s linea %d",
+    accion, quien.short_src, quien.currentline))
+end
+
+local function pagar() auditar("pago") end
+pagar()   --> pago ejecutada desde @cuentas.lua linea 12
+```
+
+Los campos que importan se agrupan por letra. Con `"S"` llegan `source`, `short_src`, `linedefined`, `lastlinedefined` y `what`, que vale `"Lua"`, `"C"` o `"main"`. Con `"l"` llega `currentline`, que es el campo barato. Con `"n"` llegan `name` y `namewhat`, y conviene entender que ese nombre es una **reconstrucción**: Lua averigua con qué nombre se invocó la función mirando la instrucción de llamada del marco anterior, y por eso `namewhat` puede valer `"global"`, `"local"`, `"method"`, `"field"`, `"upvalue"` o la cadena vacía cuando no hay manera de saberlo. Una función no tiene nombre; tiene el nombre por el que alguien la llamó esta vez. Con `"u"` llegan `nups`, `nparams` e `isvararg`; con `"f"`, la función misma en el campo `func`; con `"L"`, la tabla de líneas donde se puede parar, que es justo lo que necesita un depurador para validar un punto de ruptura.
+
+Hay un caso en el que la pregunta *quién me ha llamado* no tiene respuesta, y no es un fallo de la biblioteca. Cuando la llamada es una llamada de cola, la máquina virtual **reutiliza el marco** en lugar de apilar uno nuevo, que es toda la razón de ser de la optimización que vimos en el nivel 7. El marco del llamante ya no existe, así que su información se ha perdido de forma irrecuperable. Lua no miente al respecto: el campo `istailcall` vale verdadero y las trazas imprimen una línea que dice explícitamente que hubo llamadas de cola en medio.
+
+<Callout type="warn" title="getinfo no es barato">
+Cada llamada recorre la pila hasta el nivel pedido y, si pides `"n"`, además descompila la instrucción de llamada del marco anterior. Un `getinfo` en una ruta caliente puede costar más que el trabajo que estás midiendo. Úsalo en el borde —al entrar en una función pública, al construir un mensaje de error, dentro de un hook de muestreo— y nunca dentro de un bucle.
+</Callout>
+
+## Los hooks
+
+`debug.sethook(hook, mascara, cuenta)` instala una función a la que la máquina virtual llama en cuatro momentos posibles. La máscara es una cadena que puede contener `"c"` para cada llamada, `"r"` para cada retorno y `"l"` para cada línea nueva de código fuente. El cuarto argumento, si es mayor que cero, añade el hook de **cuenta**: la función se llama cada tantas instrucciones de la máquina virtual, independientemente de lo que esté ocurriendo.
+
+El hook recibe el nombre del evento como primer argumento —`"call"`, `"tail call"`, `"return"`, `"line"` o `"count"`— y, en el caso de las líneas, el número de línea como segundo. Dentro del hook, los hooks están desactivados, de modo que no hay recursión posible; y el nivel de la función observada es el **dos**, porque el uno es el propio hook.
+
+<Mermaid code={`flowchart TD
+  VM[Maquina virtual ejecutando bytecode] --> M1[Entra en una funcion]
+  VM --> M2[Cambia de linea]
+  VM --> M3[Retorna]
+  VM --> M4[Cuenta N instrucciones]
+  M1 --> H[Hook con evento call]
+  M2 --> H2[Hook con evento line mas numero]
+  M3 --> H3[Hook con evento return]
+  M4 --> H4[Hook con evento count]
+  H4 --> G[debug.getinfo del nivel dos]
+  G --> R[Acumula la muestra]`} />
+
+Dos advertencias que cuestan horas si no se conocen. La primera: los hooks son **por hilo**. Instalar uno en el hilo principal no afecta a las corrutinas que se creen después, así que un profiler o un limitador de instrucciones que ignore las corrutinas deja de ver la mitad del programa; hay que instalarlo también en cada corrutina, pasando el hilo como primer argumento. La segunda: un error lanzado dentro de un hook se propaga al código observado, en un punto arbitrario que ese código no espera. El cuerpo de un hook serio va envuelto en `pcall`.
+
+## Un profiler por muestreo
+
+Hay dos maneras de medir dónde se va el tiempo, y solo una de ellas es utilizable. La instrumentada usa la máscara `"cr"` y acumula la diferencia de `os.clock` entre la entrada y la salida de cada función. Es exacta en el recuento de llamadas y desastrosa en los tiempos, porque añade dos llamadas a Lua por cada llamada del programa: distorsiona más justamente a las funciones pequeñas y muy invocadas, que son las que querías encontrar.
+
+La de muestreo usa el hook de cuenta y no toca las llamadas.
+
+```lua
+local muestras, total = {}, 0
+
+local function muestrear()
+  local info = debug.getinfo(2, "Sl")
+  if not info then return end
+  local clave = info.short_src .. ":" .. info.currentline
+  muestras[clave] = (muestras[clave] or 0) + 1
+  total = total + 1
+end
+
+debug.sethook(muestrear, "", 100000)   -- mascara vacia, solo cuenta
+trabajo_pesado()
+debug.sethook()                        -- sin argumentos, desinstala
+
+local orden = {}
+for k, v in pairs(muestras) do orden[#orden + 1] = { k, v } end
+table.sort(orden, function(a, b) return a[2] > b[2] end)
+for i = 1, math.min(10, #orden) do
+  print(string.format("%6.2f%%  %s", 100 * orden[i][2] / total, orden[i][1]))
+end
+```
+
+El coste se controla con el intervalo: con cien mil instrucciones entre muestras, la sobrecarga es del orden del uno por ciento y la resolución sigue siendo suficiente para encontrar un punto caliente. Subir el intervalo abarata y desenfoca; bajarlo hace lo contrario.
+
+Conviene ser honesto sobre lo que este profiler **no** mide. El hook cuenta instrucciones de la máquina virtual, no tiempo. Una llamada a una función de C que tarde un segundo entero —una lectura de disco, una consulta a la base de datos, una espera de red— cuenta como una sola instrucción y por tanto es invisible en el histograma. Un muestreador basado en tiempo real necesita una señal del sistema operativo y, por tanto, código en C. Para código que es Lua puro, el sesgo es tolerable y la herramienta funciona; para código que pasa la mitad del tiempo dentro de C, el resultado es engañoso y hay que saberlo.
+
+Sustituyendo `currentline` por una clave de función —usando `linedefined` y `short_src`, o el propio `func` obtenido con `"f"`— se agrega por función en lugar de por línea, y acumulando los niveles del dos hacia arriba dentro del hook se obtienen pilas completas, que es exactamente lo que se necesita para dibujar un gráfico de llamas.
+
+## Un depurador rudimentario
+
+Con el hook de línea y un par de funciones más, para donde le digas y te deja mirar dentro.
+
+```lua
+local puntos = {}                       -- puntos["@init.lua:42"] = true
+
+local function locales(nivel)
+  local t, i = {}, 1
+  while true do
+    local nombre, valor = debug.getlocal(nivel, i)
+    if not nombre then break end
+    if string.sub(nombre, 1, 1) ~= "(" then t[nombre] = valor end
+    i = i + 1
+  end
+  return t
+end
+
+local function al_cambiar_de_linea(_, linea)
+  local info = debug.getinfo(2, "S")
+  if not (info and puntos[info.short_src .. ":" .. linea]) then return end
+
+  local vars = locales(3)               -- 1 hook, 2 getinfo interno, 3 el codigo parado
+  local entorno = setmetatable(vars, { __index = _G })
+  io.write("parado en ", info.short_src, ":", linea, "> ")
+  for texto in io.lines() do
+    if texto == "cont" then break end
+    local f = load("return " .. texto, "=depurador", "t", entorno)
+    if f then print(pcall(f)) else print("expresion invalida") end
+    io.write("> ")
+  end
+end
+
+debug.sethook(al_cambiar_de_linea, "l")
+```
+
+Cada pieza viene de una lección distinta y por eso este ejemplo cierra el nivel. `debug.getlocal` devuelve el nombre y el valor de la local número `i` del marco pedido, y descarta las internas, que Lua nombra entre paréntesis: los estados de un bucle `for`, los temporales del compilador. Un índice negativo accede a los varargs. `debug.setlocal` escribe de vuelta, lo que convierte al inspector en un modificador. Y la evaluación de expresiones es exactamente `load` con un entorno a medida, la lección 20.2 aplicada a una tabla de locales con `__index` apuntando al entorno global para que `print` siga existiendo.
+
+El precio del hook de línea es alto —multiplica por varias veces el tiempo de ejecución, porque se llama a Lua en cada línea— y por eso los depuradores reales lo instalan solo cuando hay puntos activos y lo retiran en cuanto se sale de la zona interesante. Para los upvalues de la función parada se usa `debug.getinfo(2, "f")` para obtener la función y luego `debug.getupvalue` sobre ella, tal como vimos en el nivel 8.
+
+<Callout type="dios" title="La costura por la que Lua deja de ser una caja negra">
+La biblioteca `debug` es la admisión más explícita que hace Lua de una de sus decisiones fundacionales, y merece ser leída como tal. Todo lo que esa biblioteca ofrece —el nombre de tus locales, la línea que estás ejecutando, los upvalues de una closure ajena, el entorno de cualquier función alcanzable, la posibilidad de cambiar cualquiera de esas cosas mientras el programa corre— existía ya dentro de la máquina virtual antes de que hubiera una biblioteca que lo expusiera. Lo único que se decidió fue si abrir la ventana. Y al abrirla, Lua declaró que en este lenguaje la encapsulación es una **convención entre programadores** y no un mecanismo del sistema: las locales de la lección 12.4 son privadas porque nadie mira, no porque nadie pueda; el sandbox de la lección 20.2 aísla porque el invitado no tiene `debug`, no porque el entorno sea una frontera de verdad. Quien viene de un lenguaje donde el modificador de acceso es una garantía del compilador tiende a leer esto como una carencia, y es justo lo contrario: es una elección deliberada entre dos cosas que un lenguaje de doscientos kilobytes no puede permitirse simultáneamente. Un núcleo de seguridad que garantice invariantes frente a código hostil dentro del mismo estado exige verificación de bytecode, tipos comprobados en tiempo de ejecución y una frontera de privilegio en la máquina virtual; un depurador y un profiler completos exigen exactamente lo contrario, que todo estado interno sea legible y escribible desde el propio lenguaje. Lua eligió lo segundo, y delegó lo primero en el anfitrión, que es quien decide qué bibliotecas existen y con qué asignador y con qué hook. Hay todavía un tercer filo. Observar cambia lo observado: el hook de línea multiplica el tiempo, el hook de cuenta mide instrucciones y no segundos, la llamada de cola —que es una optimización— borra precisamente la información que el depurador querría. No existe una introspección gratuita ni completa, y todas las herramientas de esta lección son negociaciones entre resolución y perturbación. Entender qué está midiendo tu profiler, y qué es estructuralmente incapaz de ver, es lo que separa a quien optimiza de quien persigue números.
+</Callout>
+
+<Challenge title="Observa la máquina">
+1. Escribe una función que imprima quién la llamó y desde qué línea usando `debug.getinfo(2, "Sl")`. Llámala después mediante una llamada de cola y explica qué cambia.
+2. Mide el coste de `debug.getinfo(2, "n")` frente a `debug.getinfo(2, "l")` con un millón de invocaciones y anota la proporción.
+3. Instala el profiler por muestreo sobre un programa con un punto caliente conocido y comprueba que lo encuentra. Sube el intervalo a un millón y observa cómo se degrada el resultado.
+4. Añade al profiler la acumulación de la pila completa dentro del hook y genera un recuento por cadena de llamadas.
+5. Ejecuta el profiler sobre código que gasta la mayor parte del tiempo dentro de una función de C y explica por qué el histograma miente.
+6. Instala el depurador, pon un punto de ruptura, inspecciona una local con el REPL y modifícala con `debug.setlocal` antes de continuar.
+</Challenge>

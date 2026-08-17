@@ -1,0 +1,141 @@
+---
+title: "Variantes: rwlock, trylock y el coste bajo contención"
+description: "Reader-writer spinlocks y por qué hoy se prefieren RCU o seqlocks; spin_trylock para no bloquear; y el cache bouncing que hace caro un spinlock disputado, con la respuesta del kernel: el queued spinlock."
+subject: kernel
+level: 15
+order: 4
+position: "15.4"
+duration: "13 min"
+---
+
+<Lead>
+El `spin_lock` básico es un lock exclusivo y ciego: uno entra, el resto gira. El kernel ofrece variantes para casos concretos —lectores concurrentes, intentos sin bloqueo— pero cada una arrastra un coste que hay que entender. Y bajo contención aparece el enemigo silencioso de todo lock: el rebote de la línea de cache entre núcleos. Esta lección es sobre elegir bien y sobre lo que de verdad cuesta girar.
+</Lead>
+
+<Goals>
+
+- Usar `rwlock_t` y entender por qué hoy casi siempre es mala idea.
+- Usar `spin_trylock` para adquirir sin bloquear.
+- Entender el cache bouncing y el coste de un spinlock disputado.
+- Conocer el queued spinlock (`qspinlock`) y qué problema resuelve.
+
+</Goals>
+
+## rwlock_t: varios lectores o un escritor
+
+Un reader-writer spinlock permite muchos lectores a la vez **o** un único escritor en exclusiva. La idea: si un dato se lee mucho más de lo que se escribe, no hace falta serializar a los lectores entre sí.
+
+```c
+#include <linux/rwlock.h>
+
+static DEFINE_RWLOCK(mi_rwlock);
+
+/* lado lector: varios a la vez, ninguno escribe */
+read_lock(&mi_rwlock);
+valor = dato_compartido;
+read_unlock(&mi_rwlock);
+
+/* lado escritor: exclusivo, sin lectores ni otro escritor */
+write_lock(&mi_rwlock);
+dato_compartido = nuevo;
+write_unlock(&mi_rwlock);
+```
+
+Existen las mismas variantes que en el spinlock normal: `read_lock_irqsave`, `write_lock_irqsave`, `read_lock_bh`, etc. La disciplina de contexto (no dormir, IRQs) es idéntica.
+
+## Por qué hoy casi siempre es mala idea
+
+El `rwlock_t` suena bien y envejece mal. Tres problemas:
+
+1. **También rebota la cache.** Un `read_lock` no es gratis: incrementa un contador en la palabra del lock, es decir, *escribe*. Así que los lectores también ensucian la línea de cache y la hacen rebotar entre núcleos (lo verás abajo). El ahorro frente a un spinlock exclusivo es mucho menor de lo que parece.
+2. **Inanición del escritor.** Con lectores entrando sin parar, un escritor puede esperar indefinidamente. El `rwlock_t` clásico no garantiza equidad.
+3. **Casi siempre hay algo mejor.** Si la sección de lectura es minúscula, un `spin_lock` normal es igual de rápido y más simple. Si el dato es de lectura casi pura y necesitas escalar, RCU (nivel 17) da lecturas *sin coste de sincronización*, o un `seqlock` deja leer sin escribir en la línea. El `rwlock_t` queda en una tierra de nadie incómoda; la propia documentación del kernel desaconseja usarlo salvo casos muy concretos.
+
+<Callout type="warn" title="Regla práctica sobre rwlock_t">
+Antes de escribir `rwlock_t`, pregúntate: si mi sección de lectura es corta, ¿por qué no un `spin_lock` normal? Y si es de lectura casi pura y quiero escalar, ¿por qué no RCU o un `seqlock`? Si ambas respuestas te dejan sin excusa, probablemente no querías un `rwlock_t`.
+</Callout>
+
+## spin_trylock: intentar sin bloquear
+
+`spin_trylock` intenta coger el lock y vuelve enseguida: devuelve verdadero si lo consiguió, falso si estaba ocupado. Nunca gira.
+
+```c
+if (spin_trylock(&dev->lock)) {
+	/* lo conseguimos: sección crítica */
+	drenar_cola(dev);
+	spin_unlock(&dev->lock);
+} else {
+	/* estaba ocupado: haz otra cosa, no bloquees */
+	programar_reintento(dev);
+}
+```
+
+Sirve en dos escenarios clave: cuando **no puedes permitirte bloquear** (código que corre en contextos delicados, o rutas donde girar sería inaceptable) y cuando quieres **romper un posible deadlock de orden** —intentar el segundo lock y, si falla, soltar el primero y reintentar en vez de esperar (lo verás en el nivel 15.5)—. Hay variante con máscara de IRQ: `spin_trylock_irqsave`.
+
+## El coste real: cache bouncing
+
+Aquí está la física que ningún API esconde. La palabra del lock vive en una línea de cache. Cada adquisición hace una escritura atómica (un `cmpxchg`) sobre esa línea, y el protocolo de coherencia (MESI) exige tener la línea en estado exclusivo para escribir: eso **invalida** la copia de esa línea en todos los demás núcleos.
+
+Con N núcleos martilleando un mismo lock, cada traspaso arrastra tráfico de coherencia entre caches: la línea *rebota* de un núcleo a otro. El lock deja de ser "unas instrucciones" y pasa a costar cientos de ciclos por handoff. Peor aún en el spinlock de tickets clásico: todos los que esperan giran leyendo la *misma* palabra, así que al soltar, todos se invalidan a la vez —una estampida.
+
+<Mermaid code={`flowchart LR
+  A[CPU0 escribe el lock] --> M[Linea de cache del lock]
+  B[CPU1 escribe el lock] --> M
+  C[CPU2 escribe el lock] --> M
+  M --> D[Invalidaciones MESI constantes]
+  D --> E[Rebote de la linea bajo contencion]
+  class M t-yellow
+  class E t-red`} />
+
+## La respuesta del kernel: qspinlock
+
+Desde hace años, el spinlock de x86 SMP es el **queued spinlock**, basado en el algoritmo MCS. En vez de que todos giren sobre la palabra compartida, cada uno que espera se encola y **gira sobre su propio nodo local por-CPU**. Al soltar, el poseedor solo señala a su sucesor en la cola. Resultado: el tráfico de coherencia por traspaso se vuelve casi constante en vez de crecer con el número de núcleos, y desaparece la estampida.
+
+```c
+/* include/asm-generic/qspinlock_types.h */
+typedef struct qspinlock {
+	union {
+		atomic_t val;
+		struct { u8 locked; u8 pending; };
+		struct { u16 locked_pending; u16 tail; };
+	};
+} arch_spinlock_t;
+```
+
+El `qspinlock` mantiene una vía rápida de un solo `cmpxchg` cuando no hay contención (el caso común, un lock que casi nadie disputa) y solo cae al camino de cola MCS cuando de verdad hay pelea. Todo esto ocurre por debajo de `spin_lock`: tú escribes el mismo código, y el arch layer te da un lock que escala.
+
+## Un vistazo al seqlock
+
+Para el caso de lectura casi pura, el `seqlock_t` evita que los lectores escriban en la línea de cache. El escritor incrementa un contador de secuencia al entrar y al salir; el lector lo lee antes y después y, si cambió (o quedó impar), reintenta:
+
+```c
+#include <linux/seqlock.h>
+
+static DEFINE_SEQLOCK(mi_seqlock);
+
+/* lector: no escribe nada, no bloquea al escritor */
+unsigned int seq;
+do {
+	seq = read_seqbegin(&mi_seqlock);
+	copia = dato_compartido;
+} while (read_seqretry(&mi_seqlock, seq));
+
+/* escritor: exclusivo solo frente a otros escritores */
+write_seqlock(&mi_seqlock);
+dato_compartido = nuevo;
+write_sequnlock(&mi_seqlock);
+```
+
+Es lo que usa el kernel para el reloj monotónico: millones de lecturas baratísimas frente a escrituras raras. La contrapartida: el lector debe tolerar reintentos y no puede tomar punteros a datos que el escritor pueda liberar bajo sus pies. Para ese caso, RCU (nivel 17).
+
+<Callout type="dios" title="La contención no la paga el lock: la paga el bus de coherencia">
+El coste de un spinlock disputado no está donde crees. No es el bucle de espera —girar es casi gratis— sino el susurro constante entre caches: cada intento de coger el lock es una escritura que obliga a invalidar esa línea en todos los demás núcleos, y esa línea cruza el interconnect una y otra vez. Un lock puede tener un tiempo de retención de nanosegundos y aun así hundir el rendimiento de una máquina de 128 núcleos, no por lo que hace dentro, sino por el tráfico que genera fuera. Ahí está la lección profunda de escalar en SMP: el enemigo no es el trabajo serializado, es la *comunicación* que la serialización provoca. El `qspinlock` es genial precisamente porque ataca eso —hace que cada quien gire sobre su propia línea, no sobre la compartida—. Y la moraleja para tu diseño trasciende los locks: en hardware moderno, la escalabilidad se gana reduciendo líneas de cache compartidas y escribibles, no solo secciones críticas. Un lock que nadie disputa es casi gratis; uno disputado te cobra en el sitio más caro de la máquina.
+</Callout>
+
+<Challenge title="Mide y elige la variante correcta">
+1. Convierte un dato de lectura frecuente a `rwlock_t` y luego razona si RCU o un `spin_lock` normal servirían mejor.
+2. Reescribe una ruta que hoy bloquea usando `spin_trylock` con un plan B cuando falla.
+3. Explica, en tus palabras, por qué un `read_lock` también rebota la línea de cache.
+4. Busca `qspinlock` en las fuentes y localiza su vía rápida sin contención.
+5. Diseña un microbenchmark mental: un contador global con 1, 8 y 64 núcleos. ¿Qué crece, el trabajo o el tráfico de cache?
+</Challenge>

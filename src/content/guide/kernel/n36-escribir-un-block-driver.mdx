@@ -1,0 +1,195 @@
+---
+title: "Escribir un block driver con blk-mq: tag set, gendisk y ops"
+description: "La anatomía de un driver de bloques moderno de Linux 7.x construido sobre un ramdisk en memoria estilo brd: el blk_mq_tag_set que describe las colas, el struct blk_mq_ops con queue_rq, la creación del gendisk y su cola en un solo paso con blk_mq_alloc_disk, y el registro con add_disk y su desmontaje ordenado."
+subject: kernel
+level: 36
+order: 3
+position: "36.3"
+duration: "17 min"
+---
+
+<Lead>
+Escribir un dispositivo de bloques es declararle al kernel tres cosas: cómo son mis colas, qué función atiende una petición, y con qué nombre y tamaño aparezco en `/dev`. Todo lo demás —encolar, fusionar, planificar, etiquetar, medir plazos— lo pone blk-mq por debajo, gratis. En este nivel construimos el esqueleto de un disco entero en RAM, un pariente del `brd` real del kernel: no hay hardware, la "transferencia" será un `memcpy`, y precisamente por eso podremos ver desnuda la estructura de todo block driver sin que la ensucie el detalle de un chip concreto.
+</Lead>
+
+<Goals>
+
+- Describir las colas del dispositivo con un `struct blk_mq_tag_set`.
+- Registrar el `struct blk_mq_ops` cuyo `.queue_rq` atiende cada petición.
+- Crear el `gendisk` y su `request_queue` en un paso con `blk_mq_alloc_disk`.
+- Publicar el disco con `add_disk` y desmontarlo en orden inverso sin fugas.
+
+</Goals>
+
+## El estado del dispositivo y su almacén
+
+Nuestro disco en RAM necesita un almacén —un bloque de memoria que hace de platos— y los tres objetos que blk-mq exige. Reservamos el almacén con `vmalloc` porque puede ser grande y no necesita ser físicamente contiguo: nadie va a hacer DMA sobre él.
+
+```c
+#include <linux/module.h>
+#include <linux/blkdev.h>
+#include <linux/blk-mq.h>
+#include <linux/vmalloc.h>
+
+#define SBD_SECTOR_SHIFT   9			/* 512 B por sector */
+#define SBD_NSECTORS       (16 * 1024)		/* 8 MiB de disco */
+#define SBD_SIZE           (SBD_NSECTORS << SBD_SECTOR_SHIFT)
+
+struct sbd_dev {
+	struct blk_mq_tag_set	tag_set;	/* describe las colas */
+	struct gendisk		*disk;		/* el disco publicado */
+	u8			*data;		/* el almacen en RAM */
+};
+
+static int sbd_major;
+static struct sbd_dev *sbd;
+```
+
+## El tag set: describir las colas antes que nada
+
+El `blk_mq_tag_set` es la ficha técnica de las colas del dispositivo: cuántas colas hardware tiene, cuán profunda es cada una, en qué nodo NUMA vive y —lo esencial— qué operaciones lo gobiernan. Un `tag` es un identificador que blk-mq asigna a cada petición en vuelo; el número de tags por cola es la **profundidad**, el máximo de peticiones simultáneas. Nuestro ramdisk tiene una sola cola porque no hay paralelismo físico que explotar.
+
+```c
+static const struct blk_mq_ops sbd_mq_ops = {
+	.queue_rq = sbd_queue_rq,	/* la funcion que atiende una request (nivel 36.4) */
+};
+
+static int sbd_setup_tagset(struct sbd_dev *dev)
+{
+	struct blk_mq_tag_set *set = &dev->tag_set;
+
+	memset(set, 0, sizeof(*set));
+	set->ops		= &sbd_mq_ops;
+	set->nr_hw_queues	= 1;		/* una cola: no hay paralelismo real */
+	set->queue_depth	= 128;		/* hasta 128 peticiones en vuelo */
+	set->numa_node		= NUMA_NO_NODE;
+	set->cmd_size		= 0;		/* sin datos privados por request */
+	set->flags		= 0;		/* sin BLK_MQ_F_BLOCKING: no dormimos en queue_rq */
+
+	return blk_mq_alloc_tag_set(set);	/* reserva las estructuras de las colas */
+}
+```
+
+`blk_mq_alloc_tag_set` reserva de golpe las estructuras internas de todas las colas descritas: los mapas de tags, las colas de software por CPU y las de hardware. A partir de aquí el `tag_set` puede dar vida a uno o varios discos que compartan esas colas.
+
+<Callout type="info" title="Un tag set puede alimentar varios discos">
+Separar el `tag_set` de la creación del disco no es ceremonia: un mismo controlador puede exponer varios discos que compartan el mismo conjunto de colas hardware. Por eso se describe la cola una vez con `blk_mq_alloc_tag_set` y luego se llama a `blk_mq_alloc_disk` tantas veces como discos haya. En nuestro ramdisk hay un solo disco, pero la forma del código es la misma que en un controlador de almacenamiento real.
+</Callout>
+
+## Crear el disco y su cola en un solo paso
+
+Aquí está la modernidad del kernel 7.x. Antaño se creaba la `request_queue` por un lado con `blk_mq_init_queue` y el `gendisk` por otro con `alloc_disk`, y había que atarlos a mano. Hoy `blk_mq_alloc_disk` hace ambas cosas y devuelve un `gendisk` con su cola ya enganchada al `tag_set`. Le pasamos unos límites de cola y el puntero a nuestro estado, que quedará accesible como `q->queuedata`.
+
+```c
+static const struct block_device_operations sbd_fops = {
+	.owner = THIS_MODULE,
+};
+
+static int sbd_create_disk(struct sbd_dev *dev)
+{
+	struct queue_limits lim = {
+		.logical_block_size	= 1 << SBD_SECTOR_SHIFT,
+		.physical_block_size	= 1 << SBD_SECTOR_SHIFT,
+	};
+	struct gendisk *disk;
+
+	/* crea la request_queue y el gendisk, ambos ligados al tag_set */
+	disk = blk_mq_alloc_disk(&dev->tag_set, &lim, dev);
+	if (IS_ERR(disk))
+		return PTR_ERR(disk);
+
+	dev->disk		= disk;
+	disk->major		= sbd_major;
+	disk->first_minor	= 0;
+	disk->minors		= 1;
+	disk->fops		= &sbd_fops;
+	disk->private_data	= dev;
+	snprintf(disk->disk_name, DISK_NAME_LEN, "sbd0");
+	set_capacity(disk, SBD_NSECTORS);	/* tamaño en sectores de 512 B */
+
+	/* publica el disco: a partir de aqui /dev/sbd0 existe y recibe E/S */
+	return add_disk(disk);
+}
+```
+
+Dos gestos merecen atención. `set_capacity` fija el tamaño **en sectores de 512 bytes**, no en bytes: es la unidad universal de la capa de bloques. Y `add_disk` es la línea que **enciende** el dispositivo: en cuanto retorna, el disco es visible en `/sys/block`, `udev` lo procesa y cualquier proceso puede abrir `/dev/sbd0` y enviarle peticiones que llegarán a tu `queue_rq`. Por eso `add_disk` debe ser lo último: nada puede estar a medias cuando la puerta se abre.
+
+## El ensamblaje y el desmontaje en orden inverso
+
+El `module_init` encadena las tres fases —almacén, tag set, disco— y cualquier fallo deshace lo hecho hasta ahí. El `module_exit` recorre el mismo camino al revés: primero retira el disco para que no lleguen más peticiones, luego libera las colas y por último el almacén.
+
+```c
+static int __init sbd_init(void)
+{
+	int err;
+
+	sbd_major = register_blkdev(0, "sbd");	/* major dinamico para /proc/devices */
+	if (sbd_major < 0)
+		return sbd_major;
+
+	sbd = kzalloc(sizeof(*sbd), GFP_KERNEL);
+	if (!sbd) { err = -ENOMEM; goto out_unregister; }
+
+	sbd->data = vzalloc(SBD_SIZE);		/* el almacen, a ceros */
+	if (!sbd->data) { err = -ENOMEM; goto out_free_dev; }
+
+	err = sbd_setup_tagset(sbd);
+	if (err)
+		goto out_free_data;
+
+	err = sbd_create_disk(sbd);		/* llama a add_disk: el ultimo paso */
+	if (err)
+		goto out_free_tagset;
+
+	pr_info("sbd: /dev/sbd0 listo, %u sectores\n", SBD_NSECTORS);
+	return 0;
+
+out_free_tagset:
+	blk_mq_free_tag_set(&sbd->tag_set);
+out_free_data:
+	vfree(sbd->data);
+out_free_dev:
+	kfree(sbd);
+out_unregister:
+	unregister_blkdev(sbd_major, "sbd");
+	return err;
+}
+
+static void __exit sbd_exit(void)
+{
+	del_gendisk(sbd->disk);			/* deja de aceptar E/S y drena la cola */
+	put_disk(sbd->disk);			/* suelta la referencia al gendisk */
+	blk_mq_free_tag_set(&sbd->tag_set);	/* libera las colas */
+	vfree(sbd->data);
+	kfree(sbd);
+	unregister_blkdev(sbd_major, "sbd");
+}
+
+module_init(sbd_init);
+module_exit(sbd_exit);
+MODULE_LICENSE("GPL");
+```
+
+<Mermaid code={`flowchart TD
+  REG[register_blkdev: reserva el major] --> STORE[vzalloc: el almacen en RAM]
+  STORE --> TS[blk_mq_alloc_tag_set: describe las colas]
+  TS --> DISK[blk_mq_alloc_disk: gendisk mas request_queue]
+  DISK --> CAP[set_capacity y nombre]
+  CAP --> ADD[add_disk: enciende /dev/sbd0]
+  ADD --> IO[Llegan peticiones a queue_rq]`} />
+
+<Callout type="warn" title="del_gendisk antes que cualquier otra liberación">
+El orden del desmontaje no es negociable. `del_gendisk` hace lo contrario de `add_disk`: retira el dispositivo de `/dev`, espera a que las peticiones en vuelo terminen y garantiza que no entrará ninguna nueva. Solo **después** de eso puedes liberar el `tag_set` y el almacén, porque hasta que `del_gendisk` retorna, un `queue_rq` podría estar tocando `dev->data` en otra CPU. Liberar el almacén antes de `del_gendisk` es un use-after-free clásico. La regla espeja la del `add_disk`: se enciende lo último y se apaga lo primero.
+</Callout>
+
+<Callout type="dios" title="Tú describes el dispositivo; blk-mq es dueño de la cola">
+Levanta la vista sobre estas tres estructuras, porque juntas encarnan la filosofía entera del kernel moderno de bloques. Mira lo que tu driver realmente hace y lo que no hace. No mantiene una lista de peticiones pendientes, no las ordena, no las fusiona, no asigna identificadores a las operaciones en vuelo, no reparte trabajo entre CPUs, no implementa plazos ni fairness. Todo eso —la parte difícil, la parte con condiciones de carrera y contención de locks— vive en blk-mq y es común a cada block driver que existe. Lo único que tú aportas son tres declaraciones: la forma de mis colas en el `tag_set`, la función que convierte una petición en acción en `queue_rq`, y mi identidad en el `gendisk`. El kernel invirtió la relación clásica entre framework y driver: el driver no llama a la cola, la cola llama al driver. Esta es la misma inversión de control que viste en `probe` y `remove` con el modelo de dispositivos, y no es casualidad: es el patrón que el kernel repite en cada subsistema maduro, porque concentra la complejidad correcta en un solo lugar bien probado y deja al autor del driver únicamente la descripción de su hardware. Cuando internalizas que un block driver es un objeto que **rellena huecos** en una máquina que no controla —el `tag_set` dice qué colas, `queue_rq` dice qué hacer con una petición, el `gendisk` dice quién eres— dejas de ver un dispositivo como un motor que gira y empiezas a verlo como lo que es para el kernel: un conjunto de respuestas a preguntas que blk-mq hará en el momento que decida, no tú.
+</Callout>
+
+<Challenge title="Levanta tu propio disco en RAM">
+1. Compila este esqueleto con un `queue_rq` que de momento solo haga `blk_mq_start_request` y `blk_mq_end_request(rq, BLK_STS_OK)`, cárgalo y comprueba que `/dev/sbd0` aparece en `lsblk`.
+2. Explica por qué `set_capacity` recibe sectores y no bytes, y calcula qué valor pasarías para un disco de 64 MiB.
+3. Introduce a propósito un fallo entre `blk_mq_alloc_tag_set` y `add_disk` y traza qué etiquetas `goto` de limpieza se ejecutan y en qué orden.
+4. Argumenta qué pasaría si `add_disk` no fuera la última operación del `probe` y una petición llegara antes de que el almacén estuviera listo.
+5. Justifica por qué `del_gendisk` debe preceder a `vfree(dev->data)` apelando a un `queue_rq` que corre en otra CPU en ese instante.
+</Challenge>

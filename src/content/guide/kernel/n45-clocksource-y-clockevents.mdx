@@ -1,0 +1,157 @@
+---
+title: "clocksource y clockevents: abstraer el hardware del tiempo"
+description: "Las dos abstracciones que el kernel interpone entre el tiempo y el hardware heterogéneo: clocksource como fuente de tiempo monótono que se lee (TSC, HPET, arch timer) con su conversión mult y shift a nanosegundos, y clock_event_device como generador de interrupciones de temporizador programables en modo periódico o oneshot."
+subject: kernel
+level: 45
+order: 2
+position: "45.2"
+duration: "16 min"
+---
+
+<Lead>
+Debajo de `jiffies` hay hierro, y el hierro es un zoo. Un x86 tiene TSC, HPET, el timer del APIC local y el viejo PIT; un ARM tiene su generic timer; cada SoC embebido trae lo suyo. El kernel no puede escribir su lógica de tiempo contra cada uno, así que interpone dos abstracciones ortogonales: una para *leer* cuánto tiempo ha pasado —la `clocksource`— y otra para *pedir* que llegue una interrupción dentro de un rato —el `clock_event_device`. Todo el subsistema de tiempo, incluido el propio tick, se construye sobre estas dos piezas.
+</Lead>
+
+<Goals>
+
+- Distinguir leer el tiempo (clocksource) de generar interrupciones de tiempo (clockevents).
+- Entender `struct clocksource`, su `read`, su `mask` y la conversión `mult`/`shift` a nanosegundos.
+- Registrar una fuente con `clocksource_register_hz` y comprender el `rating`.
+- Conocer `struct clock_event_device`, sus modos periódico y oneshot, y `set_next_event`.
+
+</Goals>
+
+## Dos preguntas distintas sobre el tiempo
+
+El hardware de tiempo responde a dos preguntas que no hay que confundir. La primera es "¿cuánto tiempo ha pasado?": un contador que crece monótonamente y que puedes leer cuando quieras. La segunda es "avísame dentro de X nanosegundos": un temporizador que dispara una interrupción en un instante futuro. Son capacidades independientes, a veces del mismo chip y a veces de chips distintos, y el kernel las modela por separado:
+
+- **`clocksource`** — el lado de la *lectura*. Un contador monótono con una frecuencia conocida. TSC, HPET, el ACPI PM timer, el arch timer de ARM. Alimenta a `clock_gettime`, a `ktime_get` y al timekeeping.
+- **`clock_event_device`** — el lado de la *escritura*. Un dispositivo al que le programas cuándo debe interrumpir. Alimenta al tick, a los hrtimers y a los timers clásicos.
+
+Esta ortogonalidad es la idea central del nivel: el tiempo que se lee y el tiempo que avisa son subsistemas separados que colaboran.
+
+## clocksource: leer el tiempo monótono
+
+Una `clocksource` es, en esencia, una función que devuelve los ciclos de un contador y los metadatos para convertirlos a nanosegundos. Su estructura vive en `include/linux/clocksource.h`:
+
+```c
+struct clocksource {
+	u64 (*read)(struct clocksource *cs);
+	u64			mask;    /* mascara de bits del contador */
+	u32			mult;    /* multiplicador ciclos -> ns   */
+	u32			shift;   /* desplazamiento de la conversion */
+	u64			max_idle_ns;
+	int			rating;  /* calidad: mayor es mejor */
+	const char		*name;
+	struct list_head	list;
+	unsigned long		flags;
+	/* ... */
+};
+```
+
+El truco fino es la conversión de ciclos a nanosegundos sin coma flotante ni división, ambas prohibidas o carísimas en el camino caliente del kernel. Se precalculan `mult` y `shift` de modo que:
+
+```c
+/* nanosegundos = (ciclos * mult) >> shift */
+static inline u64 clocksource_cyc2ns(u64 cycles, u32 mult, u32 shift)
+{
+	return (cycles * mult) >> shift;
+}
+```
+
+Un desplazamiento a la derecha sustituye a la división. Elegir `mult` y `shift` es delicado: demasiado `shift` desborda el producto de 64 bits, demasiado poco pierde precisión. El ayudante `clocks_calc_mult_shift` los deriva a partir de la frecuencia. El campo `mask` importa porque muchos contadores no son de 64 bits limpios: un HPET puede ser de 32 bits, así que la resta de dos lecturas debe hacerse módulo `mask` para manejar su envoltorio, exactamente el mismo problema que `jiffies` a otra escala.
+
+Registrar una fuente es declarar su función de lectura y su frecuencia; el kernel calcula el resto:
+
+```c
+static struct clocksource mi_cs = {
+	.name   = "mi-contador",
+	.rating = 250,
+	.read   = mi_cs_read,
+	.mask   = CLOCKSOURCE_MASK(32),
+	.flags  = CLOCK_SOURCE_IS_CONTINUOUS,
+};
+
+static int __init mi_cs_init(void)
+{
+	return clocksource_register_hz(&mi_cs, 24000000);  /* 24 MHz */
+}
+```
+
+El `rating` es una nota de calidad de 0 a 499 que ordena a los candidatos: el kernel elige automáticamente la mejor fuente disponible. En x86 el TSC bien portado ronda 300; el HPET, 250; el PIT, apenas 110. Puedes verlo y forzarlo desde userspace:
+
+```bash
+cat /sys/devices/system/clocksource/clocksource0/available_clocksource
+# tsc hpet acpi_pm
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+# tsc
+```
+
+## clockevents: pedir una interrupción futura
+
+El otro lado es el `struct clock_event_device`: un temporizador programable que dispara una interrupción cuando le dices. Su estructura, en `include/linux/clockchips.h`, gira en torno a dos operaciones y una máquina de estados:
+
+```c
+struct clock_event_device {
+	void	(*event_handler)(struct clock_event_device *);
+	int	(*set_next_event)(unsigned long evt, struct clock_event_device *);
+	int	(*set_state_periodic)(struct clock_event_device *);
+	int	(*set_state_oneshot)(struct clock_event_device *);
+	int	(*set_state_shutdown)(struct clock_event_device *);
+	u64		max_delta_ns;
+	u64		min_delta_ns;
+	u32		mult;
+	u32		shift;
+	unsigned int	features;   /* CLOCK_EVT_FEAT_PERIODIC / ONESHOT */
+	int		rating;
+	/* ... */
+};
+```
+
+Hay dos modos que lo cambian todo. En modo **periódico** el dispositivo interrumpe a intervalos fijos —así se generaba el tick clásico, un latido cada `1/HZ`—. En modo **oneshot** interrumpe una sola vez, en el instante exacto que programes con `set_next_event`, y luego calla hasta que lo reprogrames. El modo oneshot es lo que hace posibles tanto los hrtimers como el tickless: si puedes pedir una interrupción en cualquier nanosegundo futuro, ya no necesitas un latido periódico martilleando.
+
+```c
+/* pedir la proxima interrupcion dentro de delta nanosegundos */
+static int programar(struct clock_event_device *dev, u64 delta_ns)
+{
+	u64 ciclos = ((u64)delta_ns * dev->mult) >> dev->shift;
+	return dev->set_next_event(ciclos, dev);
+}
+```
+
+El driver registra el dispositivo con `clockevents_config_and_register`, que calcula `mult`/`shift` y los límites `min_delta_ns`/`max_delta_ns` —el rango de futuros que el hardware sabe programar— a partir de la frecuencia:
+
+```c
+clockevents_config_and_register(&mi_ced, 24000000,   /* frecuencia */
+				0xf,                 /* delta minimo en ciclos */
+				0x7fffffff);         /* delta maximo en ciclos */
+```
+
+## Cómo encajan: el tick nace de ambos
+
+Aquí se cierra el círculo con el nivel anterior. El framework de tick toma un `clock_event_device` y lo pone a generar el latido. En un kernel sin tickless lo configura en modo periódico y su `event_handler` es `tick_handle_periodic`, que llama a `do_timer` y hace avanzar `jiffies`. En un kernel moderno con hrtimers y NO_HZ, el mismo dispositivo se pone en oneshot: el tick deja de ser un latido fijo y pasa a ser *un hrtimer más* que se reprograma tras cada disparo, lo que permite saltárselo cuando no hay nada que hacer.
+
+<Mermaid code={`flowchart TD
+  HW[Hardware de tiempo] --> CS[clocksource: contador monotono]
+  HW --> CE[clock_event_device: interrumpe en el futuro]
+  CS -->|read + mult shift| TK[timekeeping y ktime_get]
+  CE -->|modo periodico| TICK[tick periodico y jiffies]
+  CE -->|modo oneshot| HR[hrtimers y tickless]
+  class CS t-blue
+  class CE t-green`} />
+
+<Callout type="tip" title="Por qué el TSC ganó, y por qué a veces pierde">
+El TSC de x86 es un contador de ciclos por núcleo, rapidísimo de leer con una sola instrucción `RDTSC`, sin acceso a bus. Por eso el kernel lo prefiere como `clocksource` cuando es fiable. El "cuando" es la letra pequeña: en CPUs antiguas el TSC variaba con la frecuencia (SpeedStep) o no estaba sincronizado entre núcleos, y saltar de un núcleo a otro hacía retroceder el tiempo. El flag `CLOCK_SOURCE_IS_CONTINUOUS` y la propiedad *constant/nonstop TSC* del hardware moderno resuelven esto; si el kernel detecta un TSC inestable, lo degrada y cae al HPET. De ahí el `rating`: no es cosmético, es la política de selección que protege la monotonía del tiempo.
+</Callout>
+
+<Callout type="dios" title="La abstracción parte el tiempo en dos verbos: leer y avisar">
+Detente en la disección que acabas de presenciar, porque es una de las más elegantes del kernel. El tiempo físico es uno solo, pero el kernel se niega a tratarlo como una cosa única y lo parte en dos verbos irreductibles: *leer* el tiempo que ha pasado y *pedir* que el tiempo futuro te avise. Parecen la misma capacidad y no lo son. Leer exige un contador monótono, veloz, sin efectos secundarios, que respondas cuando quieras; avisar exige un comparador programable que dispare una interrupción y luego calle. Un chip puede ofrecer una, la otra o ambas, y de esa independencia brota toda la flexibilidad del subsistema. Porque `clocksource` y `clockevents` son ortogonales, el kernel puede leer el tiempo con el TSC rapidísimo mientras programa interrupciones con el arch timer, mezclar y emparejar según la calidad de cada hierro, y —lo más profundo— redefinir qué *es* el tick sin tocar nada más. Cuando entiendas que el tick periódico no es un hecho del hardware sino una *política* construida poniendo un clockevent en modo periódico, comprenderás por qué el kernel pudo un día poner ese mismo dispositivo en oneshot y matar el latido fijo. Los hrtimers y el tickless no son features añadidas por encima: son lo que ocurre cuando dejas de usar el lado "avisar" en su modo tonto y empiezas a usarlo en su modo pleno. La abstracción no describe el hardware; libera al kernel de él.
+</Callout>
+
+<Challenge title="Interroga a las fuentes de tiempo de tu máquina">
+1. Lista las clocksources disponibles y la activa en `/sys/devices/system/clocksource/` y anota sus nombres.
+2. Busca en `dmesg` las líneas de calibración del TSC y del reloj, y localiza el `rating` que el kernel le asignó a cada fuente.
+3. Explica, con la fórmula `(ciclos * mult) >> shift`, por qué el kernel evita coma flotante y división en el camino caliente de leer el tiempo.
+4. Razona por qué una `clocksource` de 32 bits necesita restar sus lecturas módulo `mask`, y qué relación tiene eso con el desbordamiento de `jiffies`.
+5. Argumenta qué gana el kernel al configurar su `clock_event_device` en modo oneshot en vez de periódico, anticipando los niveles 45.4 y 45.5.
+</Challenge>

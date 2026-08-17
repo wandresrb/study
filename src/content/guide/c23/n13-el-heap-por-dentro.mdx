@@ -1,0 +1,160 @@
+---
+title: "El heap por dentro: brk, mmap y la anatomía de un bloque"
+description: "Qué hace realmente malloc antes de devolverte un puntero: la frontera entre el asignador de la biblioteca C y el núcleo, las dos llamadas al sistema que amplían el espacio de direcciones, la cabecera oculta que precede a cada bloque y las razones concretas por las que reservar memoria tiene un coste que conviene medir."
+subject: c23
+level: 13
+order: 2
+position: "13.2"
+duration: "18 min"
+---
+
+<Lead>
+Casi todo el mundo aprende `malloc` como una caja negra que entrega memoria y `free` como el gesto de devolverla. Esa abstracción basta para escribir programas correctos, pero es insuficiente para razonar sobre su rendimiento, para entender por qué un desbordamiento de un byte hace que el programa muera dentro de `free` diez minutos después, o para explicar por qué reservar cien mil bloques pequeños puede costar más que el cálculo que los usa. Debajo de esa caja hay un asignador escrito en espacio de usuario, dos llamadas al sistema con semánticas muy distintas y unos cuantos bytes de contabilidad que viven justo delante de la dirección que te devuelven. Esta lección abre la caja.
+</Lead>
+
+<Goals>
+
+- Situar el asignador en espacio de usuario y distinguirlo del núcleo, que solo entiende de páginas.
+- Contrastar `brk` y `mmap` como mecanismos para ampliar el espacio de direcciones del proceso.
+- Deducir la existencia y el contenido de la cabecera que precede a cada bloque, y calcular su sobrecoste.
+- Descomponer el coste de una reserva en ruta rápida, ruta lenta, fallo de página y sincronización.
+
+</Goals>
+
+## El asignador vive en tu proceso, no en el núcleo
+
+La primera corrección al modelo ingenuo es que `malloc` no es una llamada al sistema. Es una función ordinaria de la biblioteca C, enlazada en tu propio proceso, que ejecuta en modo usuario y que la inmensa mayoría de las veces resuelve la petición sin cruzar la frontera del núcleo. La implementación concreta importa: glibc usa una variante de `ptmalloc` derivada del asignador de Doug Lea, musl estrena `mallocng`, y en producción es habitual sustituirlas por `jemalloc`, `tcmalloc` o `mimalloc` mediante enlazado o precarga dinámica. Las cuatro exponen la misma interfaz y toman decisiones internas radicalmente distintas.
+
+El núcleo, por su parte, no sabe nada de bloques ni de tamaños arbitrarios. Su unidad es la **página**, típicamente de 4 KiB, y su vocabulario se reduce a mapear y desmapear rangos del espacio de direcciones virtual. El asignador es exactamente la capa que traduce entre una demanda irregular y granular por parte de tu programa y una oferta regular y gruesa por parte del sistema.
+
+Las dos vías para ampliar esa oferta son `brk` y `mmap`. La primera desplaza el **fin del segmento de datos**, una frontera lineal heredada de los Unix originales: mover el break hacia arriba añade espacio contiguo al final del montón principal, y solo puede devolverse memoria al sistema si la parte liberada está justo al final. La segunda crea un **mapeo anónimo** independiente en cualquier hueco del espacio virtual, se puede devolver de forma aislada con `munmap`, y no impone contigüidad alguna.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(void) {
+    printf("break inicial     %p\n", sbrk(0));
+    void *pequeno = malloc(64);
+    printf("tras 64 bytes     %p\n", sbrk(0));   // el break ha subido
+    void *grande = malloc(4u << 20);             // 4 MiB
+    printf("tras 4 MiB        %p\n", sbrk(0));   // el break NO se mueve
+    free(pequeno);
+    free(grande);                                // este vuelve al sistema ya
+}
+```
+
+El segundo bloque no mueve el break porque supera el umbral que glibc llama `M_MMAP_THRESHOLD`, 128 KiB por omisión y ajustable de forma dinámica. Por encima de ese tamaño el asignador delega directamente en `mmap`, lo que tiene una consecuencia observable: esos bloques se devuelven al sistema en cuanto los liberas, mientras que los pequeños se quedan en las listas internas esperando a la siguiente petición. La memoria residente de tu proceso, medida desde fuera, no baja al llamar a `free`, y eso no es una fuga.
+
+Esa retención deliberada tiene mando de control. glibc expone `mallopt` con parámetros como `M_TRIM_THRESHOLD`, que fija cuánto espacio libre contiguo debe acumularse al final del montón antes de devolverlo al sistema, y ofrece `malloc_trim` para forzar la devolución en el momento que tú elijas. Ninguna de las dos es portable ni conviene usarlas por costumbre: son instrumentos para procesos residentes que atraviesan picos de consumo y necesitan devolver la memoria entre uno y otro. En un programa normal, dejar que el asignador conserve sus reservas es exactamente lo que quieres, porque cada devolución es una llamada al sistema que habrá que deshacer en la siguiente petición.
+
+<Mermaid code={`flowchart TD
+  A[Tu codigo llama a malloc] --> B[Asignador en espacio de usuario]
+  B --> C[Hay un bloque libre del tamano adecuado]
+  B --> D[No hay memoria disponible en las listas]
+  C --> E[Se corta el bloque y se devuelve sin syscall]
+  D --> F[brk amplia el fin del segmento de datos]
+  D --> G[mmap crea un mapeo anonimo nuevo]
+  F --> H[Nucleo entrega paginas virtuales]
+  G --> H
+  class E t-green
+  class H t-blue`} />
+
+## La cabecera invisible que precede a tu puntero
+
+Si `free` recibe una única dirección y aun así sabe cuántos bytes liberar, esa información tiene que estar guardada en algún sitio. Está delante del puntero que te dieron. Los asignadores de la familia de Doug Lea anteponen a cada bloque una pequeña estructura de contabilidad —el **encabezado**— y te devuelven la dirección que hay justo después de ella.
+
+```c
+// Reconstruccion conceptual del encabezado estilo glibc.
+struct bloque {
+    size_t tam_anterior;   // solo significativo si el bloque previo esta libre
+    size_t tam;            // tamano total, con banderas en los bits bajos
+    // A partir de aqui empieza lo que malloc te devuelve.
+    // Si el bloque esta libre, estos mismos bytes guardan los
+    // enlaces adelante y atras de la lista de libres.
+};
+```
+
+Dos detalles de ingeniería concentran casi toda la elegancia del diseño. El primero es que el tamaño se almacena redondeado al múltiplo de la alineación máxima —16 bytes en x86-64—, de modo que sus bits bajos son siempre cero y quedan libres para alojar banderas: si el bloque anterior está en uso, si este bloque procede de `mmap`, si pertenece a un arena secundaria. El segundo es que un bloque libre reutiliza como enlaces de lista el mismo espacio que ocuparían los datos del usuario, con lo que la contabilidad de los bloques libres es gratuita en memoria.
+
+De ahí se deduce el sobrecoste real, y es mayor de lo que la intuición sugiere. En glibc sobre x86-64 el bloque mínimo son 32 bytes, y una petición de un solo byte consume esos 32. Un millón de nodos de lista enlazada con un `int` y un puntero, que suman 16 bytes útiles, ocupan 32 MiB en vez de 16. Puedes medirlo sin adivinar con la extensión `malloc_usable_size`.
+
+```c
+#include <malloc.h>
+#include <stdio.h>
+
+int main(void) {
+    for (size_t n = 1; n <= 64; n *= 2) {
+        void *p = malloc(n);
+        printf("pedidos %2zu -> utilizables %2zu\n", n, malloc_usable_size(p));
+        free(p);
+    }
+}
+```
+
+El redondeo del encabezado explica además una garantía que casi todo el mundo usa sin nombrarla: la dirección que devuelve `malloc` está alineada de forma adecuada para **cualquier** tipo estándar, porque el asignador ignora para qué vas a usar el bloque y tiene que servir el peor caso. Esa alineación es la de `max_align_t`, declarado en `stddef.h`, y vale 16 en las ABI habituales de 64 bits. Cuando necesitas más —una línea de caché completa, una frontera de página, el requisito de una instrucción vectorial— la vía estándar es `aligned_alloc`, y su bloque se libera con el mismo `free` de siempre.
+
+```c
+#include <stdlib.h>
+#include <stddef.h>
+
+void *p = malloc(48);              // alineado a alignof de max_align_t
+void *q = aligned_alloc(64, 128);  // el tamano debe ser multiplo de 64
+free(p);
+free(q);                           // free normal, no hay funcion especial
+```
+
+El campo `tam_anterior` merece un comentario aparte porque explica una técnica clásica: las **etiquetas de frontera**. Al guardar el tamaño del bloque previo cuando este está libre, el asignador puede navegar hacia atrás en memoria y fusionar bloques adyacentes libres en tiempo constante, sin recorrer lista alguna. La fusión es lo que impide que el montón se pulverice en fragmentos inservibles tras miles de ciclos de reserva y liberación.
+
+<Callout type="warn" title="Escribir un byte antes del puntero corrompe la contabilidad">
+Un desbordamiento por debajo, o un desbordamiento por arriba que invada el encabezado del bloque siguiente, no daña tus datos: daña las estructuras internas del asignador. El programa continúa como si nada hasta que una llamada posterior a `malloc` o a `free` recorre una lista con un tamaño imposible y aborta con un mensaje del estilo de corrupción detectada. El síntoma aparece a una distancia arbitraria de la causa, en otra función y en otro momento, y por eso este tipo de fallo es indepurable sin instrumentación. Los asignadores endurecidos añaden comprobaciones de coherencia y cifran los punteros de las listas precisamente porque esta corrupción fue durante dos décadas la vía de explotación preferida en el montón.
+</Callout>
+
+## Por qué reservar cuesta, y cuánto
+
+Una reserva no tiene un precio único: tiene una distribución con dos modas muy separadas. Conviene descomponerla en cuatro sumandos, porque cada uno se ataca con una técnica distinta.
+
+<Cards>
+  <Card icon="⚡" title="La ruta rápida">
+    Una caché por hilo, la `tcache` de glibc, guarda bloques recién liberados de tamaños comunes. Acertar en ella cuesta unas decenas de ciclos y ninguna llamada al sistema: es un desapilado de lista simple.
+  </Card>
+  <Card icon="🐢" title="La ruta lenta">
+    Si la caché falla hay que buscar en las listas por tamaño, elegir el mejor ajuste, dividir el bloque encontrado y actualizar las etiquetas de frontera. Cientos de ciclos y saltos impredecibles.
+  </Card>
+  <Card icon="📄" title="El fallo de página">
+    El núcleo entrega direcciones virtuales, no memoria física. El primer acceso a cada página provoca un fallo menor que asigna un marco real y lo pone a cero: unos pocos microsegundos por página, no por reserva.
+  </Card>
+  <Card icon="🔒" title="La sincronización">
+    El montón es un recurso compartido. glibc lo protege con un cerrojo por arena y multiplica las arenas para reducir la contención, pero un programa con muchos hilos que reserva sin parar puede pasar más tiempo esperando que calculando.
+  </Card>
+</Cards>
+
+Sobre el fallo de página conviene ser preciso porque desmonta una medición muy común. Cuando reservas un bloque grande, el núcleo se limita a anotar el mapeo; no hay memoria física detrás hasta que la tocas. Por eso `malloc` de un gigabyte devuelve casi instantáneamente y el coste aparece repartido en el primer recorrido del bloque. Ese comportamiento perezoso es también el que permite que `calloc` sea a veces más barato que `malloc` seguido de `memset`: si la memoria viene recién mapeada del núcleo, ya está a cero por obligación de seguridad y `calloc` puede omitir el borrado.
+
+La otra magnitud que no aparece en ningún perfilador de tiempo es la **fragmentación**. La interna es la diferencia entre lo que pediste y lo que ocupa el bloque redondeado. La externa es el espacio libre total que existe pero no sirve porque está partido en trozos demasiado pequeños. Un proceso de larga vida puede tener el noventa por ciento del montón libre y aun así fallar al pedir un bloque mediano, y esa es una de las razones por las que los servidores serios cambian de asignador antes que de algoritmo.
+
+Medir esa magnitud no requiere adivinanzas. glibc expone `malloc_stats`, que vuelca por la salida de error un resumen por arena, y `mallinfo2`, que devuelve una estructura con el total reservado por el sistema, el total en uso y el espacio libre. La cifra que interesa es la diferencia entre lo que el proceso ha pedido al núcleo y lo que tu programa cree tener vivo: si esa brecha crece de forma monótona mientras la carga es estable, tienes fragmentación o retención, no necesariamente una fuga.
+
+```c
+#include <malloc.h>
+#include <stdio.h>
+
+void informe(void) {
+    struct mallinfo2 m = mallinfo2();
+    printf("del sistema %zu, en uso %zu, libre en el monton %zu\n",
+           m.arena, m.uordblks, m.fordblks);
+}
+```
+
+<Callout type="dios" title="El asignador de propósito general es un compromiso, y tú conoces tu caso mejor que él">
+El diseño de `malloc` responde a una petición imposible: servir cualquier tamaño, en cualquier orden, desde cualquier hilo, con latencia baja, sin fragmentar y sin saber nada de tu programa. Cumple ese contrato con una honestidad admirable, y por eso su coste medio es tan bueno; pero cumplirlo le obliga a mantener estructuras de datos, banderas, listas, cachés y cerrojos que tú no necesitarías si pudieras declarar lo que ya sabes. Y casi siempre sabes algo: que todos los objetos de esta fase mueren a la vez, que todos los nodos tienen el mismo tamaño, que este subsistema no comparte memoria con ningún otro hilo. Cada una de esas afirmaciones convierte una estructura general en una trivial. Si todos mueren a la vez, la liberación es mover un puntero hacia atrás y el encabezado sobra. Si todos miden lo mismo, la búsqueda del mejor ajuste desaparece y la fragmentación externa se vuelve imposible por construcción. Si nadie comparte, el cerrojo se evapora. Ese es el salto conceptual del nivel siguiente y la razón de que las arenas y los conjuntos de bloques aparezcan una y otra vez en compiladores, motores de juego y núcleos: no son micro-optimizaciones, son la sustitución de un asignador que no sabe nada por uno que sabe lo único que hacía falta saber. Mide antes de decidir, pero mide sabiendo qué estás midiendo, porque el número que importa rara vez es el tiempo de `malloc` y casi siempre es el de la ausencia de localidad que provocó.
+</Callout>
+
+<Challenge title="Instrumenta el montón">
+1. Escribe un programa que imprima `sbrk(0)` antes y después de reservar 64 bytes, 100 KiB y 4 MiB, y determina experimentalmente el umbral a partir del cual tu implementación cambia a `mmap`.
+2. Ejecuta ese mismo programa bajo `strace -e trace=brk,mmap,munmap` y correlaciona cada llamada al sistema con cada `malloc` de tu código. Cuenta cuántas reservas no generan ninguna llamada.
+3. Tabula `malloc_usable_size` para tamaños de 1 a 128 bytes y deduce el tamaño mínimo de bloque y el escalón de redondeo de tu asignador.
+4. Reserva un bloque de 512 MiB, mide el tiempo de la reserva y después el tiempo del primer recorrido escribiendo un byte por página; compara ambas cifras y explica la diferencia.
+5. Compara el tiempo total de un millón de reservas de 16 bytes con el de una única reserva de 16 MB dividida a mano, y repite el experimento precargando `jemalloc` o `mimalloc` con la variable de entorno `LD_PRELOAD`.
+</Challenge>

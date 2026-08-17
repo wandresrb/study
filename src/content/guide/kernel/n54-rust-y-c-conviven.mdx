@@ -1,0 +1,136 @@
+---
+title: "Cómo conviven Rust y C: bindings, FFI y el crate kernel"
+description: "Rust no reemplaza a C en el kernel: convive con él para escribir código nuevo, sobre todo drivers. Esta lección desmonta el puente que los une — la FFI con la ABI C, los bindings que bindgen genera automáticamente sobre los headers del kernel, los helpers que rescatan las funciones inline, y el crate kernel que reexporta todo. También cómo Kbuild compila Rust sin Cargo y qué significa que el kernel sea no_std."
+subject: kernel
+level: 54
+order: 2
+position: "54.2"
+duration: "17 min"
+---
+
+<Lead>
+La primera idea equivocada sobre Rust en el kernel es imaginar una reescritura. No la hay ni la habrá: los cuarenta millones de líneas de C se quedan donde están, y Rust entra por el lado del código nuevo, donde el coste de un bug de memoria es más alto y el legado más ligero — los drivers. Para que eso funcione, Rust y C tienen que hablarse en el mismo proceso, compartir estructuras y llamarse mutuamente sin una capa de traducción en runtime. El puente que lo permite se apoya en un hecho antiguo: ambos lenguajes saben hablar la ABI de C.
+</Lead>
+
+<Goals>
+
+- Entender por qué Rust se añade para código nuevo y no reemplaza al C existente.
+- Ver cómo la FFI conecta ambos mundos a través de la ABI C compartida.
+- Comprender cómo `bindgen` genera los `bindings` desde los headers del kernel.
+- Situar el crate `kernel`, los `helpers` para funciones inline y el build sin Cargo.
+
+</Goals>
+
+## Rust entra por el código nuevo
+
+La regla que hizo posible aceptar Rust fue una promesa de no agresión: **no se reescribe C que funciona**. Un subsistema maduro y auditado no gana nada con una traducción que solo puede introducir regresiones. Rust se reserva para lo que se escribe desde cero, y ahí los drivers son el terreno natural: son la mayor parte del kernel, la que más gente nueva toca, la que más sufre `use-after-free`, y la que menos depende del núcleo interno. Un driver en Rust se compila a un `.o`, se enlaza en el mismo `vmlinux` y corre en el mismo espacio de direcciones que el C que lo rodea. No hay dos kernels: hay uno solo, con partes en cada lengua.
+
+## La FFI y la ABI C compartida
+
+Que dos lenguajes convivan en un binario exige que acuerden cómo se pasan los argumentos, cómo se disponen las estructuras en memoria y qué nombre tiene cada símbolo. Ese acuerdo es la **ABI**, y el kernel usa la de C. Rust sabe emitir y consumir esa ABI cuando se lo pides con `extern "C"` y con `#[repr(C)]`, la representación que ordena los campos como lo haría un compilador de C en lugar de reordenarlos a su gusto.
+
+```rust
+// Declarar una funcion C para llamarla desde Rust: esto es la FFI.
+extern "C" {
+    fn kfree(objp: *const core::ffi::c_void);
+}
+
+// Una struct compartida con C debe tener el layout de C, no el de Rust.
+#[repr(C)]
+struct Cabecera {
+    longitud: u32,
+    banderas: u32,
+}
+```
+
+Llamar a `kfree` desde Rust es una operación `unsafe`: cruzar la frontera FFI abandona el territorio donde el compilador puede razonar, porque al otro lado hay C, que no ofrece ninguna garantía. Escribir esas declaraciones a mano para las decenas de miles de funciones del kernel sería inviable y frágil. Por eso no se escriben a mano.
+
+## bindgen: los headers C se vuelven Rust
+
+`bindgen` es la herramienta que lee los headers de C y **genera** las declaraciones `extern "C"` y los `#[repr(C)]` equivalentes en Rust. El kernel mantiene un único header de entrada, `rust/bindings/bindings_helper.h`, que incluye los headers cuyas APIs quiere exponer. En cada compilación, `bindgen` lo procesa y produce un fichero Rust con miles de declaraciones.
+
+```c
+// rust/bindings/bindings_helper.h  (fragmento)
+#include <linux/slab.h>
+#include <linux/mutex.h>
+#include <linux/gpio/driver.h>
+```
+
+```rust
+// bindings_generated.rs  (lo produce bindgen, simplificado)
+extern "C" {
+    pub fn mutex_lock(lock: *mut mutex);
+    pub fn mutex_unlock(lock: *mut mutex);
+}
+#[repr(C)]
+pub struct mutex {
+    pub owner: atomic_long_t,
+    /* ...campos generados desde el struct C... */
+}
+```
+
+Estas declaraciones son deliberadamente **crudas e inseguras**: reflejan la API C tal cual, con punteros y sin garantías. No están pensadas para que las use un driver, sino para que las envuelva la capa segura de la lección siguiente. Viven en el crate `bindings` y se reexportan como `kernel::bindings`.
+
+<Callout type="warn" title="Los helpers rescatan lo que bindgen no puede ver">
+Muchas funciones del kernel no son símbolos reales: son macros o `static inline` en un header. `bindgen` no puede generar un `extern` para algo que no existe como función enlazable. La solución es `rust/helpers/helpers.c`, un puente en C que envuelve cada una en una función real con nombre estable.
+
+```c
+// rust/helpers/helpers.c
+void rust_helper_spin_lock(spinlock_t *lock) { spin_lock(lock); }
+```
+
+Así `spin_lock`, que era un `inline`, pasa a existir como `rust_helper_spin_lock`, un símbolo que Rust sí puede llamar por FFI. Es pegamento humilde pero imprescindible.
+</Callout>
+
+## El crate kernel y el build sin Cargo
+
+Sobre los `bindings` crudos se asienta el crate `kernel`: la biblioteca estándar del kernel para Rust. Reexporta los `bindings`, ofrece las abstracciones seguras, define macros como `pr_info!` y `module!`, y expone un `prelude` con lo esencial. Un módulo mínimo no toca casi nada de esto directamente:
+
+```rust
+// SPDX-License-Identifier: GPL-2.0
+use kernel::prelude::*;
+
+module! {
+    type: RustMinimo,
+    name: "rust_minimo",
+    author: "Autoria del driver",
+    description: "Un modulo minimo en Rust",
+    license: "GPL",
+}
+
+struct RustMinimo;
+
+impl kernel::Module for RustMinimo {
+    fn init(_module: &'static ThisModule) -> Result<Self> {
+        pr_info!("Hola desde Rust\n");
+        Ok(RustMinimo)
+    }
+}
+```
+
+Todo el kernel Rust es **`no_std`**: no hay biblioteca estándar, porque `std` presupone un sistema operativo debajo — precisamente lo que aquí estamos construyendo. Se usa `core` (el subconjunto sin asignación) más lo que el crate `kernel` provee. Y no hay **Cargo**: la construcción no la orquesta el gestor de paquetes de Rust sino **Kbuild**, que invoca `rustc` directamente con las mismas banderas de configuración que gobiernan el C.
+
+```makefile title="drivers/mio/Makefile"
+obj-$(CONFIG_RUST_MINIMO) += rust_minimo.o
+```
+
+```bash
+# Habilitar Rust en la configuracion y compilar con la toolchain LLVM
+make LLVM=1 rustavailable      # comprueba que la toolchain Rust esta lista
+make menuconfig                # General setup -> Rust support
+make LLVM=1 -j$(nproc)
+```
+
+Que no haya Cargo sorprende a quien viene de Rust en espacio de usuario, pero es coherente: Cargo descarga dependencias de la red, gestiona versiones y presupone un sistema operativo debajo, y nada de eso tiene sentido en un kernel que debe compilarse de forma reproducible, sin red, con las mismas banderas exactas que gobiernan cada archivo de C. Kbuild ya hacía ese trabajo para C, así que Rust se somete a él: `rustc` se invoca como un compilador más de la cadena, con las opciones que fija `Kconfig`, y el `.o` que produce entra en el mismo enlazado que todo lo demás. El árbol trae además los pocos crates externos que necesita ya integrados —como `pin-init`, que resuelve la inicialización en el lugar de estructuras que no se pueden mover— para no depender de un registro remoto.
+
+<Callout type="dios" title="La convivencia es un puente de ABI, no una capa de traducción">
+Levanta la vista sobre las herramientas concretas, porque la idea que las une es más elegante que cualquiera de ellas. Rust y C no se comunican en el kernel mediante un intérprete, un serializador o una máquina virtual que traduzca de un mundo a otro en tiempo de ejecución; se comunican porque acuerdan, en compilación, hablar exactamente el mismo dialecto binario — la ABI de C — y a partir de ahí una llamada de Rust a C es la misma instrucción `call` que una llamada de C a C, sin un solo ciclo de sobrecoste. Esto es lo que hace la convivencia no solo posible sino invisible en runtime: un `struct` con `#[repr(C)]` tiene byte a byte la disposición que espera el C que lo lee, y un `extern "C"` coloca los argumentos en los mismos registros. Todo el andamiaje —`bindgen` leyendo headers, los `helpers` rescatando inlines, el crate `kernel` reexportando símbolos— existe para automatizar y hacer seguro ese puente, no para reemplazarlo. Y aquí está la lección estratégica que va más allá del kernel: la manera de introducir un lenguaje nuevo en una base de código gigantesca y viva no es la reescritura heroica, que es cara, arriesgada y políticamente imposible, sino la interoperación en la frontera. Rust no conquistó el kernel derribando el C; se coló por la única rendija que la ABI dejaba abierta, se ató a las estructuras existentes con `repr(C)`, y ofreció seguridad allí donde el código era nuevo y el legado ligero. Cuando entiendes que la interoperación por ABI es lo que permite que dos filosofías de lenguaje opuestas compartan un espacio de direcciones sin fricción, dejas de ver la FFI como un detalle técnico y empiezas a verla como la diplomacia que hace posible la transformación más grande del kernel sin una guerra civil.
+</Callout>
+
+<Challenge title="Sigue el puente de C a Rust y de vuelta">
+1. Abre `rust/bindings/bindings_helper.h` en un árbol reciente y enumera cinco headers que exponga; para cada uno, nombra una función que un driver Rust podría necesitar.
+2. Explica por qué llamar a `kfree` a través de la FFI es `unsafe`, y qué garantía del `borrow checker` deja de valer al cruzar la frontera.
+3. Busca en `rust/helpers/helpers.c` una función envuelta y razona por qué `bindgen` no podía generar su binding directamente.
+4. Escribe un `struct` Rust compartido con C y argumenta qué puede romperse si olvidas `#[repr(C)]`.
+5. Ejecuta `make LLVM=1 rustavailable`, describe qué comprueba, y explica por qué el kernel usa Kbuild y `rustc` en lugar de Cargo.
+</Challenge>

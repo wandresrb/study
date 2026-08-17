@@ -1,0 +1,151 @@
+---
+title: "Combinar: la arquitectura de datos en el edge"
+description: "Ninguna aplicación seria elige una sola pieza de almacenamiento; elige una para cada hecho que guarda. Recorremos una plataforma real repartida entre D1 como fuente de verdad, R2 para los bytes, KV para el estrato de lectura global, Durable Objects para lo que exige un árbitro e Hyperdrive para lo que ya existía. Las cinco reglas que impiden que esa composición se corrompa —un dueño por hecho, derivados que se invalidan y nunca se editan, bytes separados de metadatos, coordinación en el grano más fino, caminos de lectura y escritura distintos— y por qué la arquitectura de datos en el edge es, en el fondo, un ejercicio de clasificación por consistencia."
+subject: cloudflare
+level: 27
+order: 5
+position: "27.5"
+duration: "18 min"
+---
+
+<Lead>
+Después de recorrer el árbol, la conclusión más importante del nivel es la que menos se dice en voz alta: la pregunta correcta nunca fue cuál elijo, sino cuál para cada hecho. Ninguna aplicación real vive de una sola pieza de almacenamiento, del mismo modo que ninguna casa se construye con un solo material. Una plataforma de cursos con vídeo, pagos, clases en directo y un panel de administración usa `D1`, `R2`, `KV` y `Durable Objects` a la vez, y quizá también `Hyperdrive` para la contabilidad que ya vivía en un Postgres corporativo. Lo difícil no es usarlas todas: es que la composición no se corrompa con el tiempo.
+</Lead>
+
+<Goals>
+
+- Repartir los hechos de una aplicación real entre las cinco piezas y justificar cada asignación.
+- Aplicar las cinco reglas que mantienen sana una arquitectura compuesta.
+- Separar el camino de lectura del de escritura sin duplicar la fuente de verdad.
+- Ver la arquitectura de datos como una clasificación por exigencia de consistencia.
+
+</Goals>
+
+## Una aplicación real, repartida
+
+Tomemos una plataforma de formación con vídeo, clases en directo y varios inquilinos. Sus hechos no son homogéneos, y por eso su almacenamiento tampoco lo es. Las **entidades relacionadas** —usuarios, cursos, lecciones, inscripciones, pedidos— viven en `D1`, porque sobre ellas se pregunta con criterios que cambian: los alumnos activos de este curso, los pedidos del mes ordenados por importe, las lecciones sin completar. Los **bytes** —los vídeos, las portadas, los certificados en PDF, las copias— viven en `R2`, y de ellos `D1` guarda solo el puntero y los atributos por los que se busca.
+
+El **estrato de lectura global** vive en `KV`: la configuración de la plataforma, las banderas de funcionalidad, el mapa de dominio a inquilino que se consulta en absolutamente cada petición, la portada ya renderizada. Son datos que cambian rara vez, se leen desde todo el mundo y toleran unos segundos de desfase sin que nadie lo note.
+
+| Hecho | Pieza | Tolerancia al desfase |
+| --- | --- | --- |
+| Ficha de un curso | `D1` | segundos, vía derivado en `KV` |
+| Vídeo de una lección | `R2` | irrelevante, el objeto es inmutable |
+| Mapa de dominio a inquilino | `KV` | minutos, cambia casi nunca |
+| Plazas libres de un taller | `Durable Objects` | ninguna, decide una venta |
+| Asiento contable de un pago | `Hyperdrive` | ninguna, y además audita |
+
+Lo que exige un **árbitro** vive en `Durable Objects`: la sala de cada clase en directo con sus asistentes conectados, el contador exacto de plazas de un taller con aforo limitado, el límite de tasa por clave de API, el lock que garantiza que la generación del certificado ocurre una sola vez. Y si la facturación ya estaba en un Postgres corporativo con extensiones y auditorías, `Hyperdrive` la alcanza desde el edge sin migrar nada.
+
+Ese reparto no es una lista de productos contratados: es el resultado de haber recorrido el árbol de decisión una vez por cada tipo de hecho, y por eso se puede justificar entero sin apelar a preferencias. El tipo del entorno acaba siendo, sin proponérselo, el resumen ejecutable de todas esas decisiones.
+
+```ts
+interface Env {
+  DB: D1Database;                 // fuente de verdad relacional
+  MEDIA: R2Bucket;                // bytes opacos
+  CACHE: KVNamespace;             // derivados de lectura global
+  SALA: DurableObjectNamespace;   // coordinacion por entidad
+  CONTABLE: Hyperdrive;           // el Postgres que no se mueve
+}
+```
+
+<Mermaid code={`flowchart TD
+  REQ[peticion] --> W[Worker en el edge]
+  W --> KV[KV mapa de inquilino y flags]
+  W --> D1[D1 entidades y relaciones]
+  W --> DO[Durable Objects sala y aforo]
+  W --> R2[R2 video y certificados]
+  W --> HD[Hyperdrive contabilidad heredada]
+  D1 -.invalida.-> KV
+  D1 -.guarda el puntero de.-> R2
+  class D1 t-green
+  class KV t-teal
+  class DO t-mauve
+  class R2 t-yellow`} />
+
+## Las cinco reglas de composición
+
+Repartir bien es la mitad del trabajo; la otra mitad es impedir que el reparto se degrade. Una arquitectura compuesta no falla el día que se diseña, falla despacio, por acumulación de atajos que en su momento parecieron inocentes. Las cinco reglas que siguen no son consejos de estilo: son las condiciones que, si se rompen, convierten un sistema legible en uno donde nadie sabe ya qué copia dice la verdad.
+
+La primera regla es la que sostiene todas las demás: **un solo dueño por hecho**. Cada dato tiene exactamente un sistema que lo posee y decide su verdad; todo lo demás son copias. Escribir el mismo hecho por dos caminos distintos es la forma más fiable de fabricar una divergencia que nadie sabrá explicar seis meses después, cuando el informe de un panel no cuadre con lo que ve el usuario y ambos tengan razón según su origen.
+
+La segunda se deriva de la primera: **los derivados se invalidan, nunca se editan**. Si `KV` guarda una versión precalculada de algo que vive en `D1`, esa entrada solo puede reconstruirse desde la fuente o borrarse. En cuanto alguien la actualiza directamente porque era más rápido, el derivado se convierte en un segundo origen y la primera regla queda rota sin que nadie lo anuncie.
+
+Hay una consecuencia de esta segunda regla que conviene decir en voz alta porque casi nunca se aplica: los derivados deben poder **borrarse todos a la vez** sin pérdida de información. Ese es el examen que distingue una caché de una base de datos disfrazada. Si vaciar por completo el espacio de nombres de `KV` deja tu sistema lento durante unos minutos, la arquitectura está sana. Si deja tu sistema roto, o si hay algún dato que solo existía allí, entonces ese espacio de nombres dejó de ser un derivado hace tiempo y nadie se enteró.
+
+La tercera es la separación de **bytes y metadatos**, ya vista: el objeto en `R2`, la fila que lo describe en `D1`. La cuarta es que la **coordinación se aísla en el grano más fino** que el dominio permita: un objeto por sala y por taller, nunca uno global, para que la serialización proteja sin embudar. Y la quinta es que **la consistencia se elige por dato**, no por sistema: dentro de la misma aplicación conviven un aforo que exige exactitud instantánea y una portada que puede ir medio minuto por detrás sin consecuencias.
+
+<Callout type="warn" title="Las divergencias no avisan al aparecer">
+Un sistema con dos fuentes de verdad no falla el día que se introduce la segunda: funciona perfectamente durante semanas, porque ambas copias coinciden mientras el tráfico es tranquilo. El fallo llega con una escritura concurrente, un reintento o un despliegue a medias, y para entonces nadie recuerda quién escribía dónde. Escribir explícitamente, en el propio repositorio, qué sistema posee cada hecho es una de las inversiones más rentables de toda la arquitectura.
+</Callout>
+
+## Dos caminos: leer y escribir
+
+Con las reglas en la mano, el diseño concreto de una petición deja de improvisarse y adopta siempre la misma silueta.
+
+La consecuencia práctica de las cinco reglas es que el camino de lectura y el de escritura dejan de ser simétricos, y eso está bien. La escritura va siempre al dueño: la fila a `D1`, el byte a `R2`, el incremento del aforo al `Durable Object`. La lectura, en cambio, puede tomar el atajo más cercano al usuario siempre que el dato lo tolere, y solo cae hacia la fuente cuando el atajo falla.
+
+```ts
+// LECTURA: primero el derivado cercano, luego la fuente de verdad
+const clave = `curso:${cursoId}:ficha`;
+let ficha = await env.CACHE.get(clave, { type: 'json' });
+
+if (!ficha) {
+  const fila = await env.DB
+    .prepare('SELECT id, titulo, resumen, portada_clave FROM cursos WHERE id = ?')
+    .bind(cursoId)
+    .first();
+  ficha = fila;
+  // el derivado caduca solo; ademas se invalida al escribir
+  ctx.waitUntil(env.CACHE.put(clave, JSON.stringify(ficha), { expirationTtl: 300 }));
+}
+
+// ESCRITURA: al dueño, y despues se destruye el derivado. Nunca se edita.
+await env.DB.prepare('UPDATE cursos SET titulo = ? WHERE id = ?').bind(titulo, cursoId).run();
+ctx.waitUntil(env.CACHE.delete(clave));
+```
+
+La asimetría entre ambos caminos tiene un nombre viejo —separar la lectura de la escritura— y en el edge deja de ser una elegancia académica para volverse casi obligatoria, porque la escritura necesita ir a un punto y la lectura quiere estar en todos. Lo importante es que esa separación no duplica la verdad: el camino de lectura no puede decidir nada, solo puede servir más rápido lo que el camino de escritura ya decidió. En cuanto una lectura empieza a corregir, completar o inventar datos que no vienen del dueño, has creado un segundo origen por la puerta de atrás.
+
+Ese pequeño trozo condensa casi todo el nivel. La fuente de verdad es inequívoca. El derivado tiene caducidad propia, para que un fallo de invalidación se cure solo con el tiempo en lugar de envenenar la caché para siempre. La invalidación se hace tras la escritura y no antes, para no dejar una ventana en la que el derivado se reconstruya con el valor viejo. Y el trabajo que el usuario no necesita esperar se aparta del camino crítico.
+
+<Cards>
+  <Card icon="🧭" title="Un dueño por hecho">
+    Escríbelo en algún sitio visible del repositorio. Si no puedes nombrar al dueño de un dato en una frase, todavía no tienes arquitectura.
+  </Card>
+  <Card icon="♻️" title="Derivados desechables">
+    Todo lo que no es fuente de verdad debe poder borrarse entero sin pérdida. Si borrar una caché pierde información, esa caché era una base de datos disfrazada.
+  </Card>
+  <Card icon="🎚️" title="Consistencia por dato">
+    Dentro de la misma aplicación conviven un aforo que no admite desfase y una portada que puede ir medio minuto por detrás. La escala se elige hecho a hecho.
+  </Card>
+</Cards>
+
+Merece la pena señalar que este reparto no nace completo: evoluciona. Un producto joven suele empezar con `D1` y `R2`, que cubren la inmensa mayoría de los hechos de cualquier aplicación, y añade las demás piezas cuando aparece la necesidad concreta que las justifica —el derivado en `KV` cuando una consulta se vuelve la más repetida del sistema, el `Durable Object` cuando el negocio introduce un aforo o una cuota que debe ser exacta—. Esa incorporación tardía es sana siempre que se haga con el árbol delante y no por acumulación; lo que no se puede posponer es la pregunta de la coordinación, porque es la única cuya respuesta tardía deja daños que no se reparan.
+
+<Callout type="info" title="El pegamento también es parte del mapa">
+Entre las piezas de almacenamiento circulan procesos: una `Queue` que absorbe el pico de un pico de subidas, un `Workflow` que orquesta la transcodificación de un vídeo en varios pasos con reintentos, un cron que reconstruye agregados nocturnos. No guardan la verdad, pero deciden cuándo y en qué orden se propaga entre almacenes, y por eso pertenecen al mismo diagrama.
+</Callout>
+
+## La arquitectura como clasificación
+
+Los tres modos de corrupción de una arquitectura compuesta son siempre los mismos, y conviene tenerlos escritos porque todos empiezan como atajos razonables. El primero es el **derivado ascendido**: alguien escribe directamente en la caché porque la fuente iba lenta, y a partir de ese día hay dos verdades. El segundo es el **árbitro esquivado**: alguien lee el aforo desde la fila proyectada en `D1` y decide con ella, saltándose al `Durable Object` que era el único autorizado a decidir; funciona en pruebas y falla el día del pico. El tercero es el **hecho sin dueño**: un dato nuevo que se guarda donde resultaba cómodo en ese momento, sin recorrer el árbol, y que meses después nadie sabe explicar por qué está allí.
+
+Los tres se previenen con la misma disciplina barata: escribir el mapa. Una tabla de tres columnas en el repositorio —qué hecho, qué pieza lo posee, cuánto desfase tolera— es documentación que cabe en una pantalla, se revisa en cada incorporación de un dato nuevo y convierte una discusión de arquitectura en una consulta de treinta segundos. No hace falta nada más ceremonioso; hace falta que exista y que se mire.
+
+<Callout type="warn" title="El diagrama envejece, el mapa de propiedad no debería">
+Los dibujos de cajas y flechas se quedan obsoletos en semanas porque describen la implementación. El mapa de propiedad envejece mucho mejor porque describe el dominio: quién posee el aforo y cuánto puede ir por detrás la portada seguirá siendo verdad aunque cambies de pieza, de proveedor o de lenguaje. Si solo vas a mantener un documento de arquitectura al día, que sea ese.
+</Callout>
+
+<Callout type="dios" title="Una arquitectura de datos no es un conjunto de almacenes, es un mapa de tolerancias">
+Cuando alguien dibuja su arquitectura de datos, casi siempre dibuja cajas: aquí `D1`, aquí `R2`, aquí `KV`, aquí los `Durable Objects`, y flechas entre ellas. Ese dibujo es útil pero engaña, porque sugiere que la decisión importante fue elegir las cajas, cuando la decisión importante fue otra y ocurrió antes: repartir los hechos del dominio según cuánta verdad instantánea exige cada uno. Visto así, las cinco piezas dejan de ser cinco productos y se convierten en cinco puntos de una escala continua de compromisos. En un extremo está el `Durable Object`, que te da un orden total sobre una entidad y te cobra por ello un único hilo y una única ubicación geográfica. En el otro está `KV`, que renuncia a decirte cuándo verás la última escritura y a cambio sirve desde el trozo de red pegado a tu usuario, sin coordinación y casi sin coste. `D1` se sitúa en medio con transacciones y consultas a cambio de un viaje a la primaria, `R2` sale de la escala porque sus bytes son opacos y la pregunta de consistencia apenas se les aplica, e `Hyperdrive` no ocupa un punto sino que traslada la escala entera a un sistema que ya existía. Lo que hace un arquitecto competente no es memorizar esas cinco posiciones, sino recorrer su dominio hecho por hecho y colocar cada uno donde su tolerancia real lo pide, y esa tolerancia siempre viene del producto y nunca de la infraestructura: cuánto puede costar que dos usuarios vean números distintos, qué pasa si se vende una plaza de más, a quién le importa que la portada tarde treinta segundos en actualizarse. Cuando esa clasificación está hecha, la asignación de piezas es casi automática y las discusiones de equipo sobre qué base usar se evaporan, porque ya no hay nada que opinar. Y queda entonces la única disciplina que de verdad hay que sostener con el tiempo, que es impedir que la clasificación se difumine: que ningún derivado se convierta en origen, que ningún hecho tenga dos dueños, que ninguna caché guarde lo único que existe. Un sistema distribuido bien construido no es el que usa las herramientas más avanzadas, sino aquel en el que cualquiera puede señalar un dato y decir sin dudar quién lo posee y cuánto puede ir por detrás. Esa frase, repetida para cada hecho de tu dominio, es la arquitectura de datos en el edge; todo lo demás es implementación.
+</Callout>
+
+<Challenge title="Dibuja el mapa de tu propio dominio">
+1. Lista diez hechos de una aplicación real y asigna a cada uno su pieza, justificando desde el patrón de acceso y no desde la costumbre.
+2. Para cada uno de esos diez, escribe en segundos cuánto desfase tolera y de dónde sale ese número.
+3. Nombra al dueño de cada hecho y busca si alguno tiene dos caminos de escritura. Si lo hay, decide cuál se elimina.
+4. Diseña la invalidación de un derivado en `KV`: en qué instante exacto ocurre, qué caducidad lleva y qué pasa si la invalidación falla.
+5. Encuentra el hecho de tu dominio que exige un árbitro y elige el grano de su identidad; explica qué se rompería con un grano global.
+6. Redacta en tres frases la regla de propiedad de datos de tu proyecto, como si fuera a leerla alguien que entra al equipo mañana.
+</Challenge>

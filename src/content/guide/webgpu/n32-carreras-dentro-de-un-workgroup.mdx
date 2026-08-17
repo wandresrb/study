@@ -1,0 +1,122 @@
+---
+title: "Condiciones de carrera dentro de un workgroup"
+description: "Cómo se produce una carrera en memoria compartida, por qué el lockstep del hardware la esconde, y el método para encontrarla sin depurador."
+subject: webgpu
+level: 32
+order: 3
+position: "32.3"
+duration: "19 min"
+---
+
+<Lead>
+Una carrera en la CPU se manifiesta antes o después: el planificador reordena, el test falla, hay un stack trace. Una carrera en un compute shader puede pasar desapercibida durante meses porque el hardware, por su propia arquitectura, la enmascara. Treinta y dos invocaciones que avanzan en bloqueo de paso nunca se adelantan unas a otras, así que el código incorrecto produce el resultado correcto hasta el día en que alguien lo ejecuta en una GPU con warps de otro tamaño. No hay depurador que ayude: hay que razonarlo.
+</Lead>
+
+<Goals>
+
+- Definir qué constituye una carrera según el modelo de memoria de WGSL.
+- Reconocer los tres patrones de carrera que aparecen en memoria compartida.
+- Explicar por qué un grupo SIMD enmascara carreras y por qué eso es una trampa.
+- Aplicar un protocolo de verificación que expone carreras sin herramientas especiales.
+
+</Goals>
+
+## La definición exacta
+
+Hay carrera cuando dos invocaciones acceden a la misma dirección de memoria, al menos uno de los accesos es una escritura, y no hay una barrera ni una operación atómica que ordene los dos accesos entre sí. En ese caso el modelo de memoria de WGSL no define el contenido de esa dirección.
+
+Merece la pena subrayar lo que eso significa, porque no es lo que la intuición dice. Ante dos escrituras simultáneas de 3 y de 7, la intuición espera un 3 o un 7. El modelo no promete ninguno de los dos: promete **nada**. En una GPU real, con escrituras que atraviesan cachés y colas de fusión, el valor puede ser una mezcla de bits de ambas, o un valor previo, o el valor correcto en una ejecución e incorrecto en la siguiente.
+
+Y una lectura sin ordenar tampoco devuelve necesariamente "el valor anterior o el nuevo". Puede devolver una copia cacheada de hace mucho, porque nada obligó a la unidad de cómputo a mirar la memoria de verdad.
+
+## Los tres patrones
+
+**Uno: leer lo que otro escribe sin barrera entre medias.** El más frecuente y el más fácil de arreglar.
+
+```wgsl
+// MAL
+tile[li] = entrada[gid.x];
+let vecino = tile[li ^ 1u];    // puede leer basura: nadie garantiza que
+                               // la invocacion vecina ya haya escrito
+// BIEN
+tile[li] = entrada[gid.x];
+workgroupBarrier();
+let vecino = tile[li ^ 1u];
+```
+
+**Dos: escribir donde otro todavía está leyendo.** Es el que se cuela en los bucles, porque a la primera iteración le sobra con una barrera y a partir de la segunda no.
+
+```wgsl
+// MAL: en la segunda vuelta, alguien escribe buf[li] mientras
+// otro todavia lee buf[li - offset] de la vuelta anterior.
+for (var offset: u32 = 1u; offset < TAM; offset <<= 1u) {
+  if (li >= offset) { buf[li] += buf[li - offset]; }
+  workgroupBarrier();
+}
+
+// BIEN: separar la lectura de la escritura con su propia barrera.
+for (var offset: u32 = 1u; offset < TAM; offset <<= 1u) {
+  var suma = buf[li];
+  if (li >= offset) { suma += buf[li - offset]; }
+  workgroupBarrier();          // todos han leido
+  buf[li] = suma;
+  workgroupBarrier();          // todos han escrito
+}
+```
+
+Ese segundo bloque es el scan de Hillis-Steele correcto, y las dos barreras no son una precaución sino una necesidad estructural. La versión de una sola barrera funciona en cuanto `TAM` es menor o igual que el ancho SIMD, y falla en cuanto lo supera. Es el bug que sobrevive a los tests.
+
+**Tres: acumular sin atómica.** Varias invocaciones que suman en la misma celda.
+
+```wgsl
+// MAL: lectura, suma y escritura no son indivisibles.
+histograma[bucket] = histograma[bucket] + 1u;
+
+// BIEN
+atomicAdd(&histograma[bucket], 1u);
+```
+
+Este es el único de los tres que no se arregla con barreras. Una barrera ordena en el tiempo, pero aquí el problema es que la operación misma no es indivisible: entre la lectura y la escritura de una invocación cabe la lectura de otra, y una de las dos incrementos se pierde. Hace falta una [operación atómica](/guia/webgpu/n32-operaciones-atomicas/).
+
+## Por qué el hardware esconde el fallo
+
+Las invocaciones de un mismo grupo SIMD comparten contador de programa. Si tu workgroup tiene 32 invocaciones y el hardware ejecuta warps de 32, **todas** las invocaciones del grupo avanzan literalmente a la vez, instrucción a instrucción, y una carrera de tipo uno o dos no puede producirse aunque falte la barrera: nadie puede adelantarse porque no hay nada de lo que adelantarse.
+
+De ahí sale una situación desagradablemente común. Alguien escribe una reducción con `@workgroup_size(32)` en un portátil con NVIDIA, se olvida de una barrera, todo funciona perfectamente durante el desarrollo. Alguien más sube el tamaño a 256 para ganar rendimiento y el resultado empieza a ser erróneo de forma intermitente. Se busca el bug en el cambio de tamaño, que es lo que se ha tocado, y el bug llevaba ahí desde el primer día.
+
+La misma trampa opera al revés entre arquitecturas: un workgroup de 64 es un solo bloque en una AMD con wave64 y dos bloques en una NVIDIA con warps de 32. El mismo código, correcto en apariencia en la primera, falla en la segunda.
+
+Conviene ser tajante con la conclusión: **que un kernel produzca el resultado correcto no es evidencia de que sea correcto**. Solo el razonamiento sobre el grafo de accesos lo es.
+
+## Un protocolo para encontrarlas
+
+No hay un `-fsanitize=thread` para WGSL, pero hay cuatro comprobaciones baratas que capturan la inmensa mayoría de las carreras.
+
+La primera y más efectiva: **ejecutar el mismo kernel con varios tamaños de workgroup**. Con una `override` para el tamaño puedes crear pipelines de 32, 64, 128 y 256 desde el mismo módulo y comparar resultados. Cualquier discrepancia es una carrera, sin más análisis. Cruzar el ancho SIMD es lo que la destapa.
+
+La segunda: **ejecutar dos veces y comparar bit a bit**. Un kernel determinista debe dar exactamente el mismo buffer de salida. Si difiere, hay una carrera o una atómica en coma flotante. Ojo con el matiz: un kernel con `atomicAdd` sobre enteros sí es determinista, pero uno que acumule flotantes en un orden que depende de la planificación no lo es, porque la suma en coma flotante no es asociativa. Esa no determinación es legítima y hay que saber distinguirla.
+
+La tercera: **contrastar contra una implementación de referencia en CPU**, con tolerancia adecuada al tipo. Para enteros, igualdad exacta. Para flotantes, error relativo, y sabiendo que una reducción en árbol de un millón de sumandos suele ser **más** precisa que un bucle secuencial en CPU, no menos, porque los sumandos parciales tienen magnitudes parecidas.
+
+La cuarta: **leer el kernel buscando cada dato compartido y anotando quién lo escribe y quién lo lee en cada fase**. Si entre una escritura y la lectura correspondiente de otra invocación no hay barrera, es una carrera. Es un ejercicio de cinco minutos por kernel y encuentra lo que ninguna prueba encuentra.
+
+```js
+// Comprobacion 1: el mismo modulo, cuatro tamanos, misma entrada.
+const tamanos = [32, 64, 128, 256];
+const salidas = [];
+for (const t of tamanos) {
+  const pipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module, entryPoint: 'main', constants: { TAM: t } },
+  });
+  salidas.push(await ejecutarYLeer(pipeline, entrada, t));
+}
+for (let i = 1; i < salidas.length; i++) {
+  const iguales = salidas[0].every((v, k) => v === salidas[i][k]);
+  console.log(`tam ${tamanos[i]} coincide con 32:`, iguales);
+}
+```
+
+<Callout type="dios" title="Una carrera que da el resultado correcto sigue siendo un fallo de seguridad del propio algoritmo">
+Hay una tentación razonable cuando se descubre una carrera que en la práctica nunca se manifiesta: dejarla, con un comentario. Es mala idea por un motivo que va más allá de la corrección. Los compiladores de shaders son agresivos, y el modelo de memoria es precisamente el contrato que les dice qué transformaciones pueden aplicar. Si el código tiene una carrera, el compilador está autorizado a asumir que no la tiene, y a partir de ahí puede mantener un valor en un registro en vez de releerlo de memoria compartida, puede reordenar la escritura después del bucle entero, puede eliminar una lectura que considera redundante. Nada de eso es un fallo del compilador: es la consecuencia lógica de que tú hayas roto el contrato. Y lo peor es que la decisión la toma cada driver por su cuenta, así que un código con carrera que funciona hoy en Chrome sobre Metal puede dejar de funcionar con la siguiente actualización de macOS sin que nadie haya tocado una línea. La diferencia con una carrera en C es que allí al menos hay herramientas que las detectan; aquí no hay ninguna, el reporte del usuario es "a veces las partículas parpadean", y no hay forma de reproducirlo. Por eso la disciplina en compute no es "arreglar las carreras que dan problemas", es **no escribir ninguna**, y verificar con el protocolo de los cuatro pasos antes de dar un kernel por terminado.
+</Callout>

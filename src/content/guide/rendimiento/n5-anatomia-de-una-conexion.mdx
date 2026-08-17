@@ -1,0 +1,147 @@
+---
+title: "Anatomía de una petición: DNS, TCP y TLS"
+description: "La cadena completa de fases que separa una URL de su primer byte de respuesta, cuántos viajes de ida y vuelta cuesta cada una, y qué se puede eliminar."
+subject: rendimiento
+level: 5
+order: 2
+position: "5.2"
+duration: "18 min"
+---
+
+<Lead>
+Entre escribir una URL y recibir el primer byte hay cuatro protocolos negociando, cada uno con su propio intercambio de mensajes. Ninguno se puede saltar, algunos se pueden solapar y otros se pueden reutilizar. Saber exactamente cuántos viajes de ida y vuelta cuesta cada fase es lo que permite contar el suelo de tu tiempo de carga antes de medirlo.
+</Lead>
+
+<Goals>
+
+- Enumerar las fases de una petición HTTPS en orden y su coste en viajes de ida y vuelta.
+- Distinguir qué fases se pagan por origen y cuáles por petición.
+- Identificar qué se puede eliminar reutilizando conexiones y qué no.
+- Leer las fases en el objeto de tiempos de recurso del navegador.
+
+</Goals>
+
+## La cadena completa
+
+<Mermaid code={`flowchart TB
+  A[El usuario inicia la navegacion] --> B[Resolucion DNS]
+  B --> C[Handshake TCP de tres pasos 1 RTT]
+  C --> D[Handshake TLS 1.3 1 RTT]
+  D --> E[Peticion HTTP enviada]
+  E --> F[Proceso en el servidor]
+  F --> G[Primer byte recibido o TTFB]
+  G --> H[Transferencia del cuerpo]
+  H --> I[Parseo y descubrimiento de subrecursos]
+  I --> J[Descarga de recursos criticos]
+  J --> K[Primer pintado]
+  class B t-yellow
+  class C t-yellow
+  class D t-yellow
+  class F t-mauve
+  class G t-blue
+  class K t-green`} />
+
+Los tres bloques en amarillo son coste puro de establecimiento: no transportan ni un byte de tu contenido y se pagan **una vez por origen**, no una vez por petición. El bloque morado es el único que depende de tu código de servidor. El azul marca el TTFB, y el verde el objetivo.
+
+## Fase por fase
+
+**Resolución de DNS.** Traduce el nombre a una dirección IP. El coste depende de dónde esté la respuesta:
+
+| Situación | Coste |
+|---|---|
+| Caché del navegador | Prácticamente cero |
+| Caché del sistema operativo | Microsegundos |
+| Caché del resolutor del proveedor | 1 RTT hasta el resolutor, típicamente 5-50 ms |
+| Resolución completa desde la raíz | Varios viajes, 100 ms o más |
+
+Hay un factor que agrava esta fase y que se pasa por alto: **los CNAME encadenados**. Si tu dominio apunta a un CNAME que apunta a otro CNAME que apunta al de tu CDN, cada salto puede requerir una consulta adicional. He visto cadenas de cuatro saltos añadiendo cientos de milisegundos a la primera visita.
+
+**Saludo TCP.** El intercambio de tres pasos: el cliente envía la solicitud de sincronización, el servidor responde con su confirmación, el cliente confirma. El cliente puede empezar a enviar datos junto con el tercer mensaje, así que el coste efectivo es de **exactamente 1 RTT** antes de poder enviar datos de aplicación.
+
+**Negociación TLS.** Con **TLS 1.3** es **1 RTT** en una conexión nueva: el cliente envía su saludo con su parte del intercambio de claves ya incluida, el servidor responde con la suya y con su certificado, y a partir de ahí se puede enviar datos de aplicación. Con **TLS 1.2** eran **2 RTT**, porque hacía falta un intercambio adicional. Esta reducción es una de las mejoras de rendimiento más significativas de la última década, y es gratis: basta con tener TLS 1.3 habilitado en el servidor.
+
+**Petición y espera.** Envías la petición y esperas la respuesta: **1 RTT** más el tiempo de proceso del servidor.
+
+Sumando, una primera petición a un origen nuevo sobre TLS 1.3 cuesta como mínimo:
+
+```text
+DNS en cache del resolutor      ~0,3 RTT a 1 RTT
+TCP                              1 RTT
+TLS 1.3                          1 RTT
+Peticion y primer byte           1 RTT + proceso
+                                --------------------
+TTFB minimo                     ~3,3 a 4 RTT + proceso
+```
+
+Con un RTT de 100 milisegundos, eso son **entre 330 y 400 milisegundos de suelo** aunque tu servidor responda instantáneamente y el usuario esté en la misma ciudad que él.
+
+<Callout type="warn" title="Las redirecciones multiplican toda la cadena">
+Una redirección no cuesta un viaje adicional: cuesta **la cadena entera otra vez** si apunta a un origen distinto, porque hay que resolver DNS, abrir TCP y negociar TLS con el nuevo destino. Una entrada por `http://ejemplo.com` que redirige a `https://ejemplo.com` y de ahí a `https://www.ejemplo.com` puede costar dos cadenas completas antes de que empiece la buena. Es el mayor regalo de rendimiento sin escribir código que existe: consolidar las redirecciones de entrada en una sola, o en ninguna.
+</Callout>
+
+### Qué se paga por origen y qué por petición
+
+Esta distinción es la que decide la arquitectura de recursos de un sitio.
+
+**Por origen, una vez:** DNS, TCP y TLS. Una vez abierta la conexión, se reutiliza para todas las peticiones siguientes a ese mismo origen mientras siga viva.
+
+**Por petición:** el viaje de ida y vuelta de la petición y su respuesta, más la transferencia.
+
+La consecuencia es contundente. Añadir un recurso más a un origen que ya tienes abierto cuesta **1 RTT**. Añadir el primer recurso de un origen nuevo cuesta **3 a 4 RTT**. La diferencia es de un factor de tres o cuatro, para un recurso que puede pesar dos kilobytes.
+
+Es la razón por la que la recomendación moderna no es "menos peticiones" sino **"menos orígenes"**. Con HTTP/2 y HTTP/3 multiplexados, veinte peticiones a un origen abierto son baratas; una sola petición a un origen nuevo, no.
+
+Y es también la razón por la que servir tus propias fuentes desde tu propio dominio suele ganar a usar un servicio externo, aunque el servicio externo tenga una red enorme: te ahorras la cadena de establecimiento completa. El caché compartido entre sitios que justificaba los servicios de fuentes públicas dejó de existir cuando los navegadores particionaron la caché HTTP por sitio para evitar el rastreo entre orígenes.
+
+## Leer las fases en el navegador
+
+Todo esto es observable. La API de tiempos de recursos expone las marcas de cada fase:
+
+```js
+// Desglose de la navegacion principal por fases.
+const nav = performance.getEntriesByType('navigation')[0];
+
+const fases = {
+  redireccion: nav.redirectEnd - nav.redirectStart,
+  cache:       nav.domainLookupStart - nav.fetchStart,
+  dns:         nav.domainLookupEnd - nav.domainLookupStart,
+  tcp:         nav.connectEnd - nav.connectStart,
+  tls:         nav.secureConnectionStart > 0
+                 ? nav.connectEnd - nav.secureConnectionStart
+                 : 0,
+  peticion:    nav.responseStart - nav.requestStart,
+  respuesta:   nav.responseEnd - nav.responseStart,
+};
+
+console.table(
+  Object.fromEntries(
+    Object.entries(fases).map(([k, v]) => [k, Math.round(v)]),
+  ),
+);
+```
+
+Dos detalles importantes al leer estos números. El primero: `secureConnectionStart` vale cero si la conexión no es segura, de ahí la comprobación. El segundo: **el tiempo de TLS está contenido dentro del de TCP**, porque `connectEnd` marca el final de todo el establecimiento; por eso se calcula restando desde `secureConnectionStart` y no se suman ambos.
+
+Para recursos de otro origen, estas marcas vienen a cero salvo que el servidor envíe la cabecera `Timing-Allow-Origin`:
+
+```http
+Timing-Allow-Origin: https://tu-sitio.example
+```
+
+Sin esa cabecera solo verás la duración total del recurso, sin desglose. Si controlas el origen de tus imágenes o tu CDN, actívala: convierte un número opaco en un diagnóstico.
+
+## Qué se puede eliminar
+
+Repaso de las palancas, ordenadas por cuánto quitan.
+
+- **Eliminar redirecciones de entrada.** Quita una cadena completa por redirección evitada.
+- **Consolidar orígenes.** Cada origen eliminado quita 3 a 4 RTT.
+- **Servir desde el borde.** Reduce el RTT, y como se multiplica por el número de viajes, el efecto es proporcional a la longitud de la cadena.
+- **TLS 1.3.** Quita 1 RTT frente a TLS 1.2 en cada conexión nueva.
+- **Mantener las conexiones vivas.** Evita repagar el establecimiento; es el comportamiento por defecto, pero se rompe si el servidor tiene un tiempo de espera muy corto.
+- **`preconnect`.** No elimina la cadena, la **adelanta** para que se solape con otro trabajo. Es la única palanca aplicable cuando el origen ajeno es inevitable, y tiene sus propios riesgos.
+- **Aplanar cadenas de CNAME.** Quita consultas de DNS en la primera visita.
+
+<Callout type="dios" title="La conexión que más caro sale es la que se abre a mitad de la carga y nadie ve venir">
+Todo el mundo cuenta los orígenes mirando el HTML. El coste sorpresa está en los orígenes que aparecen **dentro** de otro recurso: una fuente referenciada desde el CSS, una imagen referenciada desde esa fuente de iconos, un script de terceros que carga otro script de un cuarto dominio. Cada uno de esos paga su cadena completa de tres o cuatro viajes, y además la paga **tarde**, cuando el descubrimiento ha ocurrido, con lo que su coste no se solapa con nada y se suma íntegro a la ruta crítica. El caso peor que he medido fue una etiqueta de marketing que cargaba un gestor que cargaba cuatro proveedores, cada uno en su dominio: cinco cadenas de establecimiento encadenadas, iniciadas a los 900 milisegundos, que añadían casi dos segundos al momento en que la página quedaba tranquila. En el HTML solo se veía una etiqueta `<script>`. La forma de encontrarlos es contar dominios únicos en la cascada completa, no en el código fuente, y ordenarlos por el instante en que se abre la conexión: los que se abren tarde son los caros, porque su coste no se solapa con nada.
+</Callout>

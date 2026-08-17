@@ -1,0 +1,150 @@
+---
+title: "Transacciones y escrituras: @Transaction, upsert y lotes"
+description: "Atomicidad con @Transaction, inserciones en conflicto y upsert, escrituras en lote y por qué agrupar mil inserciones en una transacción cambia el orden de magnitud. El modelo de concurrencia real de Room sobre SQLite."
+subject: android
+level: 16
+order: 4
+position: "16.4"
+duration: "19 min"
+---
+
+<Lead>
+Una escritura aislada en SQLite es engañosamente cara: no por el coste de insertar una fila, sino por el `fsync` que garantiza que esa fila sobrevive a un corte de corriente. Mil inserciones sueltas son mil promesas de durabilidad; mil inserciones dentro de una transacción son una sola. Esa asimetría, y no el SQL, es lo que gobierna el rendimiento de escritura en una app Android. A su lado convive un segundo asunto igual de decisivo: qué puede ocurrir en paralelo dentro de Room y qué queda inevitablemente serializado.
+</Lead>
+
+<Goals>
+
+- Usar `@Transaction` para hacer atómicas operaciones compuestas de lectura y escritura.
+- Resolver conflictos de inserción y aplicar `@Upsert` con criterio.
+- Escribir en lote y entender por qué la transacción cambia el orden de magnitud.
+- Describir el modelo de concurrencia de Room: WAL, lectores paralelos, escritor único.
+
+</Goals>
+
+## Atomicidad: `@Transaction` y el todo o nada
+
+Una transacción agrupa varias sentencias en una unidad indivisible: o se aplican todas o no se aplica ninguna. En Room, un método de DAO anotado con `@Transaction` envuelve su cuerpo entero, incluidas las llamadas a otros métodos del mismo DAO.
+
+```kotlin
+@Dao
+interface PedidoDao {
+
+    @Insert
+    suspend fun insertarPedido(pedido: Pedido): Long
+
+    @Insert
+    suspend fun insertarLineas(lineas: List<LineaPedido>)
+
+    @Query("UPDATE stock SET unidades = unidades - :n WHERE producto_id = :id")
+    suspend fun descontar(id: Long, n: Int)
+
+    @Transaction
+    suspend fun registrar(pedido: Pedido, lineas: List<LineaPedido>) {
+        val id = insertarPedido(pedido)
+        insertarLineas(lineas.map { it.copy(pedidoId = id) })
+        lineas.forEach { descontar(it.productoId, it.unidades) }
+    }
+}
+```
+
+Sin `@Transaction`, un fallo al descontar stock dejaría un pedido registrado sin su descuento: la base quedaría en un estado que ninguna regla de negocio contempla. Con ella, cualquier excepción provoca un `rollback` completo y la base vuelve exactamente a donde estaba.
+
+Dos matices que se olvidan a menudo. El primero: **la transacción termina cuando el método retorna**, así que lanzar trabajo asíncrono dentro y no esperarlo lo deja fuera de la garantía. El segundo: `@Transaction` también sirve para **lecturas** compuestas, y de hecho es obligatorio cuando una consulta con `@Relation` ejecuta varias sentencias que deben ver la misma instantánea.
+
+<Callout type="warn" title="Transacciones largas bloquean al resto de escritores">
+Mientras una transacción de escritura está abierta, ningún otro escritor puede progresar. Meter dentro una llamada de red, un cálculo pesado o una espera del usuario convierte una garantía de consistencia en un cuello de botella. La regla es tajante: prepara los datos fuera, entra en la transacción, escribe y sal.
+</Callout>
+
+## Conflictos, upsert y escritura en lote
+
+Insertar una fila cuya clave primaria o índice único ya existe es un conflicto, y hay que decidir qué hacer. `@Insert` acepta una estrategia; `@Upsert` resuelve el caso más común sin obligarte a elegir.
+
+<Cards>
+  <Card icon="💥" title="ABORT">
+    Estrategia por defecto. Lanza excepción y revierte la transacción. Correcta cuando el conflicto indica un bug.
+  </Card>
+  <Card icon="♻️" title="REPLACE">
+    Borra la fila existente e inserta la nueva. Cuidado: el borrado dispara `CASCADE` en las claves foráneas hijas.
+  </Card>
+  <Card icon="🙈" title="IGNORE">
+    Descarta silenciosamente la inserción conflictiva. Útil al sincronizar catálogos donde lo local manda.
+  </Card>
+  <Card icon="🔀" title="@Upsert">
+    Inserta si no existe y actualiza si existe, sin borrar la fila. La opción correcta cuando hay hijos que preservar.
+  </Card>
+</Cards>
+
+```kotlin
+@Dao
+interface ArticuloDao {
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertarSiFalta(articulos: List<Articulo>): List<Long>
+
+    @Upsert
+    suspend fun guardar(articulos: List<Articulo>)
+
+    @Transaction
+    suspend fun sincronizar(remotos: List<Articulo>, vigentes: List<Long>) {
+        guardar(remotos)
+        borrarFuera(vigentes)
+    }
+
+    @Query("DELETE FROM articulos WHERE id NOT IN (:vigentes)")
+    suspend fun borrarFuera(vigentes: List<Long>)
+}
+```
+
+La diferencia entre `REPLACE` y `@Upsert` es la trampa más costosa de este nivel. `REPLACE` ejecuta un borrado seguido de una inserción; si otra tabla referencia esa fila con `onDelete = CASCADE`, sus hijos desaparecen aunque el objetivo fuera solo actualizar dos campos. `@Upsert` hace un `UPDATE` real sobre la fila existente y no dispara ningún borrado.
+
+Sobre el lote: los métodos anotados aceptan colecciones, y esa forma es siempre preferible al bucle. Room ejecuta las inserciones sobre la misma sentencia preparada y, cuando el método es `@Transaction` o forma parte de uno, dentro de una sola transacción.
+
+```kotlin
+// Mal: mil transacciones implícitas, mil promesas de durabilidad.
+articulos.forEach { dao.guardarUno(it) }
+
+// Bien: una transacción, una sentencia preparada reutilizada.
+dao.guardar(articulos)
+```
+
+La diferencia no es marginal. Cada transacción implícita fuerza al menos una sincronización con el almacenamiento; agrupar mil escrituras convierte mil sincronizaciones en una y suele mejorar el tiempo total en uno o dos órdenes de magnitud.
+
+## Concurrencia real: WAL, muchos lectores, un escritor
+
+Room abre la base en modo WAL siempre que la plataforma lo permite, y ese detalle define todo el modelo de concurrencia.
+
+<Mermaid code={`flowchart TD
+  A[Modo WAL activo] --> B[Escrituras van al fichero de log]
+  A --> C[Lecturas ven la ultima version confirmada]
+  B --> D{Cuantos escritores a la vez}
+  D -->|Uno solo| E[El resto espera su turno]
+  C --> F{Cuantos lectores a la vez}
+  F -->|Varios| G[Lectura paralela sin bloquear al escritor]
+  E --> H[Checkpoint mueve el log a la base principal]
+  G --> H
+  class G t-green
+  class E t-yellow`} />
+
+En WAL, las escrituras se anexan a un fichero de registro separado y los lectores siguen viendo la última versión confirmada sin bloquearse. Esto permite **lecturas concurrentes durante una escritura**, algo imposible en el modo por defecto de SQLite. Lo que WAL no cambia es la regla fundamental: **hay un único escritor a la vez**.
+
+Room refleja esa asimetría en su ejecución interna: usa un ejecutor con varios hilos para consultas de lectura y un único hilo para transacciones de escritura. Por eso lanzar diez corrutinas de escritura en paralelo no acelera nada; solo llena una cola. La concurrencia útil está en el lado de la lectura.
+
+<Callout type="info" title="Suspensión y transacciones no se mezclan a la ligera">
+Dentro de un método `@Transaction suspend`, Room garantiza que todas las llamadas se ejecuten en el mismo hilo y conexión mediante un contexto de transacción propio. Por eso llamar a `withContext` con otro dispatcher dentro de la transacción rompe esa afinidad y puede provocar un interbloqueo. La regla es sencilla: dentro de una transacción, no cambies de contexto.
+</Callout>
+
+<Callout type="dios" title="La transacción no es una optimización: es la unidad de significado">
+Es tentador leer este nivel como una lista de trucos de rendimiento —agrupa inserciones, evita transacciones largas— y perderse lo que de verdad está en juego. Una transacción no existe para ir rápido; existe para definir qué estados de tu base son **pensables**. Entre el instante en que insertas el pedido y el instante en que descuentas el stock hay un estado en el que el mundo es incoherente: hay una venta que nadie ha pagado en inventario. Ese estado no es un error de programación, es una consecuencia inevitable de que las operaciones ocurran en el tiempo. Lo que la transacción hace es declarar que ese estado intermedio **no es observable**: existe en el motor, pero ningún lector ni ningún crash puede sorprenderlo. Dicho de otro modo, la transacción no evita la incoherencia, la vuelve privada. De ahí se sigue una forma distinta de decidir sus límites. La pregunta correcta no es cuántas sentencias agrupar para ir rápido, sino cuál es el conjunto mínimo de cambios tras el cual tu modelo de dominio vuelve a ser cierto. Si registrar un pedido significa, en tu negocio, pedido más líneas más stock, entonces esos tres cambios son una sola operación y el hecho de que se expresen en tres sentencias es un accidente del lenguaje SQL, no una propiedad del dominio. Y el rendimiento aparece, casi como una propina, porque los límites transaccionales bien puestos coinciden asombrosamente a menudo con los lotes eficientes: la unidad de significado y la unidad de trabajo suelen ser la misma cosa. Cuando no coinciden, atiende siempre al significado; una app lenta se optimiza, una base incoherente se abandona.
+</Callout>
+
+<Callout type="note" title="Lo esencial del nivel">
+`@Transaction` hace atómico un método compuesto y es obligatorio en lecturas con `@Relation`. Las estrategias de conflicto no son equivalentes: `REPLACE` borra y puede arrastrar hijos por `CASCADE`, mientras que `@Upsert` actualiza en sitio. Escribir en lote dentro de una transacción convierte muchas sincronizaciones a disco en una sola. Y el modelo de concurrencia con WAL es claro: lectores en paralelo, un único escritor, y nada de cambiar de contexto dentro de una transacción.
+</Callout>
+
+<Challenge title="Atomicidad, conflictos y lotes bajo medición">
+1. Escribe un método `@Transaction` que inserte una cabecera y sus líneas, lanza una excepción a mitad y verifica que la base queda intacta.
+2. Compara insertar diez mil filas en un bucle frente a pasarlas como lista dentro de una transacción; anota los tiempos y calcula el factor.
+3. Monta una relación padre-hijo con `CASCADE`, guarda el padre con `REPLACE` y observa qué ocurre con los hijos; repite con `@Upsert`.
+4. Usa `IGNORE` en una sincronización y explica con qué política de resolución de conflictos se corresponde a nivel de dominio.
+5. Lanza varias corrutinas de escritura concurrentes y varias de lectura, y comprueba con trazas cuáles progresan en paralelo y cuáles se serializan.
+</Challenge>

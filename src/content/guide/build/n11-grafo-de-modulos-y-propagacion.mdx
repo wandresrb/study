@@ -1,0 +1,149 @@
+---
+title: "El grafo de módulos y la propagación del cambio"
+description: "Cada archivo es un nodo con importadores e importados. Cuando editas uno, Vite recorre sus importadores hacia arriba buscando quién acepta el cambio: así decide qué reejecutar y hasta dónde sube la actualización antes de encontrar un límite o rendirse."
+subject: build
+level: 11
+order: 2
+position: "11.2"
+duration: "16 min"
+---
+
+<Lead>
+El grafo de módulos es el mapa que el HMR navega. Una edición es una perturbación en un nodo; la pregunta es hasta dónde se propaga la onda. Vite la responde recorriendo los importadores hacia arriba hasta topar con un módulo dispuesto a absorber el cambio. Entender ese recorrido —qué lo termina, qué lo fuerza hasta la raíz— es entender por qué unas ediciones se aplican en caliente y otras recargan la página.
+</Lead>
+
+<Goals>
+
+- Ver cada módulo como un nodo con importadores e importados en un grafo vivo.
+- Entender cómo Vite localiza los módulos afectados por un cambio de archivo.
+- Seguir el algoritmo de propagación hacia arriba por la cadena de importadores.
+- Reconocer qué termina la propagación y qué la fuerza hasta la raíz.
+
+</Goals>
+
+## El grafo: nodos, importadores, importados
+
+Vite mantiene un grafo de módulos donde cada nodo representa un módulo cargado y guarda dos conjuntos de aristas: `importedModules`, a quién importa, e `importers`, quién lo importa. Ese grafo se construye de forma perezosa a medida que el navegador pide módulos, así que refleja la forma **real** de lo que está cargado, no un análisis estático de todo el repositorio. En Vite 8 el grafo es por entorno: accedes a él como `environment.moduleGraph`, y el del cliente, el de SSR y el del edge son grafos distintos.
+
+Que el grafo se construya de forma perezosa tiene una consecuencia práctica: un módulo que el navegador aún no ha pedido no existe todavía como nodo, así que editarlo no dispara nada hasta que algo lo importa por primera vez. El grafo del HMR es un reflejo de lo cargado, no de lo escrito, y esa es justo la propiedad que lo mantiene barato y exacto. Es también el motivo por el que el primer guardado tras arrancar el servidor a veces recarga y los siguientes no: hasta que el navegador no ha poblado el grafo, Vite no tiene el mapa completo sobre el que decidir, y ante la duda elige la operación segura.
+
+La relación clave para el HMR es `importers` —la arista inversa—. Cuando un módulo cambia, su propio código debe reejecutarse, pero alguien tiene que decidir quién más necesita enterarse. Esa decisión se toma subiendo por los importadores.
+
+Ese grafo no es un árbol: un módulo puede tener muchos importadores y muchos importados, los caminos pueden converger y hasta cerrarse en ciclos. Por eso la propagación no es un simple ascenso lineal, sino un recorrido que puede ramificarse hacia varios importadores a la vez y que necesita recordar por dónde ha pasado para no girar en redondo.
+
+```ts
+// forma simplificada de un nodo del grafo por entorno
+interface EnvironmentModuleNode {
+  url: string
+  importers: Set<EnvironmentModuleNode>          // quien me importa
+  importedModules: Set<EnvironmentModuleNode>    // a quien importo
+  isSelfAccepting: boolean                        // llame a accept sin deps
+  acceptedHmrDeps: Set<EnvironmentModuleNode>    // deps aceptadas a mano
+  acceptedHmrExports: Set<string> | null          // exports aceptados
+}
+```
+
+Fíjate en `acceptedHmrExports`: además de aceptar el módulo entero o una dependencia completa, Vite admite aceptar exports concretos, una granularidad que los frameworks usan para tratar cada componente exportado como un límite independiente dentro de un mismo archivo. Es la diferencia entre decir acepto cualquier cambio a este módulo y decir acepto cambios mientras solo toquen estos exports; en cuanto un cambio afecta a otra cosa, el límite se rompe y la onda sigue subiendo.
+
+## Localizar el cambio
+
+Cuando el observador reporta que un archivo cambió, el servidor traduce esa ruta de archivo a uno o varios nodos del grafo —un mismo archivo puede respaldar varios módulos, como un componente de un solo archivo con plantilla y script separados—. Vite invalida esos nodos: descarta su resultado de transformación cacheado y les asigna una nueva marca de tiempo, de modo que la próxima importación traiga la versión fresca. Solo entonces arranca la propagación desde cada nodo cambiado.
+
+La marca de tiempo es la pieza que hace posible el intercambio en el navegador. Un módulo ya importado está cacheado por el motor de módulos del navegador, así que pedir la misma URL devolvería la versión vieja. Vite sortea la caché añadiendo la marca como parámetro de consulta —el runtime importa la ruta con un sufijo de tiempo fresco— y el navegador, al ver una URL distinta, trae y evalúa el código nuevo. Por eso cada actualización lleva su timestamp: no es metadato decorativo, es la llave que fuerza al navegador a soltar la versión rancia.
+
+Invalidar un nodo no basta por sí solo: Vite también invalida en cascada los resultados cacheados que dependían de él, para que ninguna transformación rancia sobreviva al cambio. Es la contraparte silenciosa de la propagación —una limpia el estado del navegador, la otra limpia el estado del servidor— y ambas deben coincidir para que la nueva versión sea la única que quede en pie.
+
+<Mermaid code={`flowchart TD
+  main[main entry] --> app[App]
+  app --> lista[Lista]
+  lista --> card[Card]
+  card --> util[formato util]
+  class util t-yellow`} />
+
+En el diagrama las flechas apuntan en el sentido de la importación: `main` importa `App`, que importa `Lista`, y así hasta `util`. Si editas `util`, la propagación viaja **en contra** de las flechas, del nodo cambiado hacia sus importadores, buscando el primero capaz de detener la onda.
+
+## La propagación hacia arriba
+
+El corazón del HMR es una función que, dado el nodo cambiado, decide si el cambio puede aplicarse localmente o exige recargar. Su lógica, simplificada:
+
+```ts
+function propagar(nodo, limites, cadena) {
+  if (nodo.isSelfAccepting) {
+    limites.add(nodo);          // el nodo es su propio limite
+    return false;               // no hace falta recargar
+  }
+  if (nodo.importers.size === 0) return true;   // sin salida: full reload
+  for (const importador of nodo.importers) {
+    if (importador.acceptedHmrDeps.has(nodo)) {
+      limites.add(importador);  // un importador lo acepta: limite aqui
+      continue;
+    }
+    if (cadena.has(importador)) return true;    // ciclo: full reload
+    if (propagar(importador, limites, cadena.add(importador))) return true;
+  }
+  return false;
+}
+```
+
+Lee el algoritmo como una búsqueda de muros absorbentes. Si el nodo se acepta a sí mismo, es su propio límite y la búsqueda termina ahí. Si no, se mira a cada importador: el que acepta explícitamente esta dependencia se convierte en el límite; el que no, se trata como el nuevo nodo cambiado y se repite. Si la búsqueda llega a un nodo sin importadores —un punto de entrada— que no acepta, no hay a quién subir: `full reload`. Un ciclo en la cadena también fuerza la recarga, porque Vite no puede garantizar un orden de reejecución consistente.
+
+Nota que la búsqueda es en profundidad y acumula los límites en un conjunto, no en una lista: si dos caminos distintos desde la hoja llegan al mismo módulo aceptante, ese módulo aparece una sola vez y se actualiza una sola vez. Esa deduplicación importa en grafos con rombos —donde un cambio abajo alcanza un ancestro por varias rutas— y es lo que evita reejecutar dos veces el mismo límite.
+
+El conjunto de límites recogido es el conjunto mínimo de módulos que de verdad se reejecutarán. Todo lo que hay entre la hoja cambiada y cada límite se descarta y se reimporta fresco; todo lo que hay por encima del límite queda intacto.
+
+<Cards>
+  <Card icon="🧱" title="Encuentra un límite">
+    Un módulo del camino se autoacepta o es aceptado por sus importadores. La búsqueda termina ahí y la actualización es local.
+  </Card>
+  <Card icon="🚪" title="Llega a un entry">
+    Un nodo sin importadores que no acepta. No hay a quién subir: la propagación se rinde y ordena una recarga completa.
+  </Card>
+  <Card icon="♻️" title="Detecta un ciclo">
+    Un importador ya visitado reaparece en la cadena. Sin orden de reejecución garantizado, Vite recarga por seguridad.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="El CSS siempre acepta">
+Los módulos de estilo son autoaceptantes por construcción: el plugin de CSS reemplaza el contenido de la etiqueta de estilo en su sitio, sin reejecutar nada más. Por eso el HMR de CSS parece funcionar siempre, mientras que el de JavaScript depende de que alguien en la cadena acepte. No es que el CSS sea especial por magia: es que su límite ya está puesto de fábrica en el propio módulo.
+</Callout>
+
+## Intervenir la propagación desde un plugin
+
+Los plugins moldean qué módulos se actualizan mediante el hook `hotUpdate` —introducido en Vite 6 y estándar en Vite 8, por entorno, sustituyendo al antiguo `handleHotUpdate`—. Recibe los módulos cambiados y puede filtrarlos, añadir otros, forzar una recarga o enviar eventos propios por el canal. Ahí es donde los plugins de framework inyectan su lógica de refresco.
+
+El cambio de `handleHotUpdate` a `hotUpdate` no es cosmético. El hook antiguo era global y recibía un único grafo mezclado; el nuevo corre una vez por entorno y opera sobre el grafo de ese entorno, lo que permite que un plugin decida de forma independiente qué hacer para el cliente, para SSR y para el edge. En un mundo con múltiples entornos de ejecución, un solo hook global ya no podía expresar esa granularidad.
+
+```ts
+// hook por entorno; sustituye a handleHotUpdate
+export default function miPlugin() {
+  return {
+    name: "mi-plugin",
+    hotUpdate({ modules, timestamp, server }) {
+      // this.environment identifica el entorno actual: client, ssr o edge
+      // devuelve una lista filtrada de modulos, o [] para no actualizar nada
+      return modules;
+    },
+  };
+}
+```
+
+El hook puede hacer más que filtrar. Devolver un array vacío cancela la actualización para ese entorno; añadir módulos amplía el conjunto a reejecutar; y enviar por el canal una señal de recarga fuerza el full reload cuando el plugin sabe que un cambio no es intercambiable en caliente.
+
+```ts
+// forzar una recarga completa desde un plugin cuando el cambio no es intercambiable
+this.environment.hot.send({ type: "full-reload" });
+```
+
+Los plugins de framework viven aquí: interceptan el cambio de un componente, deciden si su transformación permite un refresco local y, si no, degradan a recarga con un mensaje claro. Que toda esta potencia esté detrás de un solo hook por entorno es deliberado: el mismo punto de extensión sirve para un log trivial de depuración y para la lógica de refresco de un framework entero.
+
+<Callout type="dios" title="El grafo es lo que vuelve decidible al HMR">
+La razón por la que el HMR puede ser quirúrgico en vez de un mazazo que recarga todo es que Vite mantiene en todo momento la forma exacta y viva de lo que el navegador ha cargado: no una conjetura estática, sino el grafo real. Y las aristas inversas —los importadores— convierten un hecho difuso, este archivo cambió, en una pregunta bien planteada: quién necesita enterarse. La propagación es literalmente un cálculo de alcanzabilidad sobre esas aristas inversas, acotado por las declaraciones de aceptación, que actúan como paredes que absorben la onda. De aquí se sigue lo más importante: el HMR es una propiedad del grafo, no de ningún archivo aislado. Que una edición se aplique limpia o fuerce una recarga no depende del archivo que tocaste, sino de la topología entre el nodo cambiado y su ancestro aceptante más cercano. Este cambio de perspectiva reencuadra mil comportamientos confusos del HMR en uno solo: la búsqueda o bien encuentra un límite antes de la raíz, o no. Y revela la decisión de diseño profunda de Vite: hacer que el caso común —los frameworks inyectan un accept en cada componente o módulo— quede automáticamente acotado, de modo que la propagación casi siempre termina uno o dos saltos más arriba y las actualizaciones se mantienen locales. El grafo es a la vez el mapa por el que viaja el cambio y la condición que lo detiene; sin él, el HMR no tendría cómo saber qué es seguro reejecutar, y sin las aristas inversas, no tendría cómo formular la pregunta.
+</Callout>
+
+<Challenge title="Recorre el grafo a mano">
+1. Dibuja el grafo de importadores real de una app pequeña, elige una hoja de utilidad y traza a mano el camino que seguiría la propagación al editarla.
+2. Añade `import.meta.hot.accept()` a esa hoja y confirma que la actualización se detiene ahí.
+3. Quítalo y observa cómo la propagación escala; identifica el primer ancestro que acepta y detiene la onda.
+4. Escribe un plugin trivial con un hook `hotUpdate` que registre en consola los módulos cambiados en cada guardado.
+5. Con el modo verboso o `--debug` de Vite, traza una actualización real y contrasta el conjunto de módulos reejecutados con el que predijiste a mano.
+</Challenge>

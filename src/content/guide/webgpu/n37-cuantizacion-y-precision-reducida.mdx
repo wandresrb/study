@@ -1,0 +1,143 @@
+---
+title: "Cuantización y precisión reducida"
+description: "La característica shader-f16, el empaquetado a 8 bits con las funciones de WGSL, y por qué dividir los bytes por cuatro acelera un kernel limitado por memoria."
+subject: webgpu
+level: 37
+order: 4
+position: "37.4"
+duration: "20 min"
+---
+
+<Lead>
+Si un kernel está limitado por memoria, la forma más directa de acelerarlo no es hacer menos operaciones: es que cada dato ocupe menos. Pasar de 32 bits a 16 divide el tráfico por dos, y a 8 bits lo divide por cuatro, y en un régimen limitado por ancho de banda esa división se traduce casi punto por punto en tiempo. Esa es toda la razón de que la inferencia de modelos cuantizados sea el estándar en el navegador, y WebGPU ofrece las tres piezas necesarias: un tipo de media precisión detrás de una característica, funciones de empaquetado en el lenguaje base, y un producto escalar de enteros de 8 bits detrás de una extensión.
+</Lead>
+
+<Goals>
+
+- Activar y usar `f16` comprobando la característica del adaptador.
+- Empaquetar y desempaquetar valores de 8 y 16 bits con las funciones del lenguaje base.
+- Aplicar cuantización afín con escala y punto cero, y estimar su error.
+- Comprobar y usar la extensión de producto escalar de enteros empaquetados.
+
+</Goals>
+
+## Media precisión con f16
+
+WebGPU expone `f16` a través de la característica `'shader-f16'`, que hay que pedir al crear el dispositivo, y de la directiva `enable f16;` al principio del módulo WGSL. Sin las dos cosas el shader no compila.
+
+```js
+const adapter = await navigator.gpu.requestAdapter();
+const tieneF16 = adapter.features.has('shader-f16');
+const device = await adapter.requestDevice({
+  requiredFeatures: tieneF16 ? ['shader-f16'] : [],
+});
+```
+
+```wgsl
+enable f16;
+
+@group(0) @binding(0) var<storage, read>       pesos: array<f16>;
+@group(0) @binding(1) var<storage, read_write> salida: array<f16>;
+
+@compute @workgroup_size(64)
+fn escalar(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= arrayLength(&pesos)) { return; }
+  // f16 se puede mezclar con f32 mediante conversion explicita.
+  salida[i] = pesos[i] * f16(1.5);
+}
+```
+
+El rango de `f16` es lo que hay que vigilar: el mayor valor finito es 65504 y el menor normal es del orden de `6·10⁻⁵`. Los desbordamientos por arriba dan infinito y los de por abajo se van a cero, y las dos cosas ocurren de verdad en una red neuronal si las activaciones no están normalizadas. La práctica estándar es guardar los pesos en `f16` y **acumular en `f32`**, porque una suma de miles de términos en media precisión pierde bits muy rápido.
+
+```wgsl
+var acc: f32 = 0.0;
+for (var k: u32 = 0u; k < K; k = k + 1u) {
+  acc = acc + f32(a[k]) * f32(b[k]);      // acumulador de 32 bits
+}
+```
+
+La ganancia es doble. El tráfico de memoria se divide por dos, que en un kernel limitado por ancho de banda es casi un factor dos de tiempo. Y en muchas GPU la unidad aritmética procesa dos `f16` por ciclo donde procesaba un `f32`, con lo que también se duplica el pico aritmético. En un kernel bien optimizado se notan las dos cosas.
+
+La característica no es universal. Está muy extendida en escritorio y en móviles modernos, y falta en hardware antiguo, así que hace falta un camino alternativo. Ese camino es el empaquetado manual.
+
+## Empaquetar sin la característica
+
+WGSL tiene, en su versión base y sin ninguna extensión, funciones que empaquetan valores en un `u32` y los desempaquetan. Son las que permiten guardar datos comprimidos aunque el dispositivo no soporte `f16`.
+
+| función | empaqueta | rango |
+|---|---|---|
+| `pack2x16float` | dos `f32` en un `u32` | media precisión IEEE |
+| `unpack2x16float` | un `u32` en `vec2f` | |
+| `pack4x8unorm` | cuatro `f32` en un `u32` | 0 a 1 |
+| `unpack4x8unorm` | un `u32` en `vec4f` | 0 a 1 |
+| `pack4x8snorm` | cuatro `f32` en un `u32` | -1 a 1 |
+| `unpack4x8snorm` | un `u32` en `vec4f` | -1 a 1 |
+| `pack2x16unorm` | dos `f32` en un `u32` | 0 a 1 |
+| `pack2x16snorm` | dos `f32` en un `u32` | -1 a 1 |
+
+`pack2x16float` da exactamente el almacenamiento de `f16` sin necesitar la característica: el buffer se declara como `array<u32>`, se guardan dos valores por palabra, y el cálculo se hace en `f32`. Se pierde la ventaja aritmética de `f16` pero se conserva entera la de ancho de banda, que suele ser la que manda.
+
+```wgsl
+// Sin la caracteristica f16: dos valores de media precision por u32.
+@group(0) @binding(0) var<storage, read> comprimido: array<u32>;
+
+fn leer(i: u32) -> f32 {
+  let par = unpack2x16float(comprimido[i / 2u]);
+  return select(par.x, par.y, (i & 1u) == 1u);
+}
+```
+
+Las funciones `unorm` y `snorm` son cuantización de 8 bits con escala fija. Sirven directamente para colores, normales y cualquier magnitud acotada, y son gratis: la conversión la hace una instrucción de hardware.
+
+## Cuantización afín
+
+Para pesos de una red, cuyo rango no es -1 a 1, se usa una cuantización afín: se guarda un entero de 8 bits y dos números en coma flotante por tensor o por canal, la **escala** y el **punto cero**.
+
+```text
+q = round(x / escala) + punto_cero        cuantizar
+x = (q - punto_cero) · escala             descuantizar
+```
+
+Con cuantización simétrica el punto cero es cero y la escala es `max(|x|) / 127`, lo que ahorra una resta en el bucle interno. Con cuantización asimétrica se aprovechan los 256 niveles completos y se gana precisión cuando la distribución no está centrada, cosa habitual después de una función de activación que solo produce valores no negativos.
+
+El error de cuantización de un valor es como mucho medio nivel, o sea `escala/2`, y su varianza es `escala²/12` si se modela como uniforme. Lo importante es que ese error **no crece** al acumular muchos productos si los errores son independientes: la desviación típica del error de una suma de `K` términos crece como la raíz de `K`, mientras que la suma misma crece como `K`. Por eso una capa con miles de entradas tolera bien 8 bits.
+
+Lo que rompe la cuantización no es el error medio, son los **valores atípicos**. Un solo peso mil veces mayor que el resto obliga a una escala mil veces mayor y arruina la resolución de todos los demás. Las dos defensas habituales son cuantizar por canal en lugar de por tensor, lo que aísla el atípico en su canal, y recortar el rango en un percentil alto en vez de en el máximo, aceptando saturar unos pocos valores.
+
+## Producto escalar de enteros empaquetados
+
+Existe una extensión del lenguaje WGSL, `packed_4x8_integer_dot_product`, que añade instrucciones para calcular el producto escalar de cuatro enteros de 8 bits empaquetados en un `u32` con una sola operación. Es exactamente lo que una capa cuantizada necesita.
+
+Se comprueba en `navigator.gpu.wgslLanguageFeatures` y se declara con una directiva `requires` al principio del módulo:
+
+```js
+const hayDP4 = navigator.gpu.wgslLanguageFeatures.has(
+  'packed_4x8_integer_dot_product');
+```
+
+```wgsl
+requires packed_4x8_integer_dot_product;
+
+@group(0) @binding(0) var<storage, read> a: array<u32>;   // 4 int8 por palabra
+@group(0) @binding(1) var<storage, read> b: array<u32>;
+
+// n es el numero de palabras, o sea la longitud del vector dividida por 4.
+fn productoCuantizado(n: u32) -> i32 {
+  var acc: i32 = 0;
+  for (var k: u32 = 0u; k < n; k = k + 1u) {
+    acc = acc + dot4I8Packed(a[k], b[k]);
+  }
+  return acc;
+}
+```
+
+Una llamada a `dot4I8Packed` sustituye a cuatro multiplicaciones y tres sumas, y además evita desempaquetar. El acumulador es `i32`: con 8 bits por operando, el producto cabe en 16 bits y hacen falta unos 16 más para acumular sin desbordar, lo que da margen para vectores de decenas de miles de elementos.
+
+La extensión trae además `pack4xI8`, `pack4xU8`, `pack4xI8Clamp`, `pack4xU8Clamp`, `unpack4xI8` y `unpack4xU8`, que convierten entre un `u32` y un vector de cuatro enteros con signo o sin él. Con ellas se puede escribir el camino alternativo cuando la extensión no está: desempaquetar a mano, multiplicar y sumar. Cuesta más instrucciones y da exactamente el mismo resultado.
+
+La ganancia acumulada es la que hace viable la inferencia en el navegador: el tráfico de memoria se divide por cuatro respecto a `f32`, y cada instrucción hace cuatro multiplicaciones y tres sumas. En una capa densa limitada por memoria, eso es un factor de cuatro; en una limitada por cálculo, un factor de dos a cuatro más.
+
+<Callout type="dios" title="Cuantizar acelera porque reduce bytes, no porque reduzca operaciones, y confundirlo lleva a cuantizar lo que no toca">
+La expectativa habitual al cuantizar un modelo es que vaya cuatro veces más rápido porque los datos son cuatro veces más pequeños. Se cumple en unas capas y no en otras, y el criterio para saber cuáles es la intensidad aritmética. Una capa densa grande, con una matriz de pesos de decenas de megabytes que se lee entera para procesar un solo vector de entrada, tiene intensidad bajísima: está completamente limitada por leer los pesos, y cuantizar a 8 bits la acelera casi exactamente cuatro veces. Es el caso de las capas de un modelo de lenguaje generando token a token, y por eso la cuantización es tan espectacular ahí. Una capa convolucional con muchos canales y tiling bien hecho, en cambio, tiene intensidad alta: los pesos se reutilizan sobre miles de píxeles y el kernel está limitado por cálculo. Cuantizarla acelera solo lo que gane la unidad aritmética, entre nada y el doble según el hardware, y a cambio pierdes precisión. La consecuencia práctica es que **la cuantización no debe aplicarse uniformemente**, y las herramientas serias lo saben: cuantizan los pesos de las capas grandes a 8 o 4 bits, dejan las activaciones en 16, y mantienen en precisión completa las capas pequeñas y sensibles, típicamente la primera, la última y las normalizaciones. Hay un caso todavía más claro y a menudo olvidado: los datos que solo se leen una vez, como un tensor de entrada, no ganan nada al cuantizarse si el coste de descuantizarlos es comparable al de leerlos. La pregunta antes de cuantizar cualquier tensor es siempre cuántas veces se lee ese tensor por cada operación que alimenta; si la respuesta es "muchas", la cuantización es la mejor optimización disponible, y si es "una", probablemente no aporta nada.
+</Callout>

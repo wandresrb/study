@@ -1,0 +1,166 @@
+---
+title: "Empaquetar y usar: el target de macro, el plugin y el consumidor"
+description: "Una macro necesita tres objetivos de compilación y un proceso aparte. Cómo se declara el target `.macro` en SPM, qué es exactamente el plugin del compilador, cómo `#externalMacro` une declaración e implementación, y qué ve y qué paga quien la consume."
+subject: swift
+level: 16
+order: 4
+position: "16.4"
+duration: "18 min"
+---
+
+<Lead>
+La primera macro que alguien escribe rara vez falla por la lógica: falla por la topología. Una macro no es un archivo más de tu módulo, sino un programa **que se ejecuta en tu máquina mientras compilas** y que por tanto tiene que compilarse antes, para la arquitectura de la máquina que compila, con dependencias que jamás deben llegar al binario del usuario. De ahí salen los tres objetivos que todo paquete de macros tiene y que al principio parecen redundantes: el que implementa, el que declara y el que consume. Entender por qué son tres —y no uno con anotaciones— es entender el modelo de ejecución entero, y ahorra las tardes de pelea con errores de enlazado que casi todo el mundo paga como peaje de entrada.
+</Lead>
+
+<Goals>
+
+- Justificar por qué un paquete de macros necesita objetivos separados y cuál es el papel de cada uno.
+- Declarar un target `.macro` en SPM con sus dependencias de `swift-syntax`.
+- Explicar qué es el plugin del compilador y cómo se comunica con él.
+- Describir la experiencia y el coste reales del consumidor, incluido el permiso de confianza.
+
+</Goals>
+
+## La anatomía del paquete
+
+El manifiesto necesita importar `CompilerPluginSupport`, que es lo que habilita el tipo de objetivo nuevo. La estructura mínima publicable tiene tres objetivos y un objetivo más de pruebas.
+
+```swift
+// swift-tools-version: 6.0
+import PackageDescription
+import CompilerPluginSupport
+
+let package = Package(
+    name: "MisMacros",
+    platforms: [.macOS(.v13), .iOS(.v16)],
+    products: [
+        .library(name: "MisMacros", targets: ["MisMacros"])
+    ],
+    dependencies: [
+        .package(url: "https://github.com/swiftlang/swift-syntax.git",
+                 from: "600.0.0")
+    ],
+    targets: [
+        .macro(
+            name: "MisMacrosMacros",
+            dependencies: [
+                .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+                .product(name: "SwiftCompilerPlugin", package: "swift-syntax")
+            ]
+        ),
+        .target(name: "MisMacros", dependencies: ["MisMacrosMacros"]),
+        .testTarget(
+            name: "MisMacrosTests",
+            dependencies: [
+                "MisMacrosMacros",
+                .product(name: "SwiftSyntaxMacrosTestSupport", package: "swift-syntax")
+            ]
+        )
+    ]
+)
+```
+
+El objetivo `.macro` es la pieza nueva y su naturaleza sorprende: **es un ejecutable**, no una biblioteca. SPM lo compila siempre para el host, es decir, para el Mac donde estás trabajando, jamás para el iPhone al que va destinada la aplicación. Ese detalle explica de un plumazo varias cosas: por qué `swift-syntax` no engorda tu app, por qué una macro no puede usar código específico del dispositivo, y por qué compilar la primera vez es tan lento.
+
+El objetivo ordinario `MisMacros` es el que se distribuye. Contiene únicamente las declaraciones `macro` y depende del objetivo de macro para que SPM sepa construir el plugin antes. Es el único que aparece en `products`, y es el que el consumidor importa.
+
+La numeración de `swift-syntax` es la trampa clásica: no sigue versionado semántico de la biblioteca sino la versión del compilador. La serie 509 corresponde a Swift 5.9, la 510 a Swift 5.10, la 600 a Swift 6.0 y así sucesivamente. Elegir mal ata tu paquete a un rango de toolchains más estrecho del que crees, y es la causa habitual de los conflictos de resolución cuando dos dependencias traen macros.
+
+## El plugin del compilador
+
+El ejecutable necesita un punto de entrada que declare qué macros ofrece. Es un tipo con `@main` que conforma a `CompilerPlugin`:
+
+```swift
+import SwiftCompilerPlugin
+import SwiftSyntaxMacros
+
+@main
+struct MisMacrosPlugin: CompilerPlugin {
+    let providingMacros: [any Macro.Type] = [
+        DeteccionDeCasosMacro.self,
+        StringifyMacro.self
+    ]
+}
+```
+
+Ese array es el registro completo: si una implementación no aparece ahí, el compilador dirá que no encuentra la macro por más que el tipo exista. Y aquí está lo que realmente ocurre durante una build. El compilador arranca el ejecutable, y ambos hablan por las tuberías estándar con un protocolo de mensajes serializados: el compilador manda la invocación, el plugin responde con la expansión y con los diagnósticos. El proceso se reutiliza para muchas expansiones y muere al terminar.
+
+Ese aislamiento tiene consecuencias muy concretas y muy útiles. Si tu macro entra en un bucle infinito, el compilador la mata y reporta un fallo del plugin en vez de colgarse. Si escribes en la salida estándar para depurar, **corrompes el canal del protocolo** y la build revienta con un error incomprensible: hay que escribir en la salida de error. Y como el plugin es un programa Swift corriente, puedes ejecutarlo, perfilarlo y depurarlo como cualquier otro.
+
+SPM además lo ejecuta en un entorno restringido en macOS. Una macro no debería leer archivos ni abrir sockets, y en la práctica no puede: la expansión tiene que ser **determinista y pura**, porque el compilador asume que la misma entrada produce siempre la misma salida y sobre esa suposición descansa la caché de compilación entera.
+
+<Mermaid code={`flowchart TB
+  man[Package.swift con CompilerPluginSupport] --> mac[Target punto macro: ejecutable para el host]
+  mac --> plug[Plugin con arroba main y providingMacros]
+  man --> lib[Target normal con las declaraciones macro]
+  lib -->|externalMacro apunta al modulo| plug
+  cons[Paquete consumidor] -->|importa la libreria| lib
+  plug -->|proceso aparte durante la build| comp[Compilador del consumidor]
+  class mac t-mauve
+  class lib t-blue
+  class cons t-green`} />
+
+## El puente entre las dos mitades
+
+La declaración y la implementación viven en objetivos distintos que ni siquiera se compilan para la misma arquitectura, así que hace falta una referencia que no sea un enlace. Eso es `#externalMacro`, que toma el nombre del módulo y el nombre del tipo **como cadenas**:
+
+```swift
+// En el target MisMacros, el que se distribuye
+@attached(member, names: arbitrary)
+public macro DeteccionDeCasos() =
+    #externalMacro(module: "MisMacrosMacros", type: "DeteccionDeCasosMacro")
+```
+
+Que sean cadenas no es descuido: el objetivo que declara no puede importar al que implementa, porque uno se compila para iOS y el otro para tu Mac. La unión se resuelve en tiempo de build, cuando el compilador busca en el plugin un tipo con ese nombre. De ahí que un error de tecleo en cualquiera de las dos cadenas produzca un fallo tardío y poco expresivo, y que renombrar el tipo de implementación sin tocar la declaración compile hasta que alguien usa la macro.
+
+La convención de nombres que genera la plantilla de Xcode —el objetivo de implementación llamado igual que el público con `Macros` pegado detrás— existe justamente para que ese par de cadenas sea difícil de equivocar.
+
+## Del otro lado: el consumidor
+
+Para quien la usa, la macro es casi invisible, y ese es el objetivo. Añade el paquete, importa el módulo y escribe el atributo o la almohadilla. No hay paso de generación, no hay archivos nuevos en el repositorio, y el autocompletado conoce los miembros generados porque la declaración anunció sus nombres.
+
+```swift
+// En el Package.swift del consumidor
+dependencies: [
+    .package(url: "https://github.com/tuusuario/MisMacros.git", from: "1.0.0")
+],
+targets: [
+    .target(name: "App", dependencies: [
+        .product(name: "MisMacros", package: "MisMacros")
+    ])
+]
+```
+
+Hay sin embargo tres cosas que sí paga y conviene anunciarle. La primera es un **diálogo de confianza**: Xcode se niega a ejecutar un plugin de macro no aprobado y pide permiso explícito la primera vez, porque aceptar una dependencia con macros equivale a aceptar que un ejecutable ajeno corra en tu máquina cada vez que compilas. La aprobación queda registrada por paquete, y en integración continua hay que pasar la bandera que la salta.
+
+La segunda es el **tiempo de compilación**. `swift-syntax` es un paquete grande y su primera construcción se nota, sobre todo en máquinas modestas y en CI sin caché. Las versiones recientes de Xcode y de SwiftPM distribuyen binarios preconstruidos de `swift-syntax` precisamente para amortiguar ese golpe, pero cada expansión sigue costando un intercambio con otro proceso.
+
+La tercera es la **superficie de depuración**. Cuando algo va mal dentro de una expansión, el error apunta a código que el usuario no escribió. Una macro bien hecha valida pronto y diagnostica con claridad, porque el usuario no puede corregir lo que no ve.
+
+<Cards>
+  <Card icon="🖥️" title="El plugin es del host">
+    Se compila para tu Mac, no para el dispositivo. Por eso `swift-syntax` nunca entra en el binario que se distribuye.
+  </Card>
+  <Card icon="🔗" title="El puente son cadenas">
+    `#externalMacro` referencia módulo y tipo por nombre porque las dos mitades no comparten arquitectura ni se pueden importar.
+  </Card>
+  <Card icon="🛡️" title="Confianza explícita">
+    Xcode exige aprobar cada plugin. Una dependencia con macros ejecuta código ajeno en tu máquina durante la build.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Aceptar una macro es aceptar un ejecutable">
+El diálogo de confianza de Xcode se despacha con un clic y merece mucho más pensamiento del que recibe, porque marca un cambio real en el modelo de amenazas de una dependencia. Cuando añades una biblioteca corriente, aceptas que su código se ejecute **dentro de tu aplicación**, en el dispositivo del usuario, con los permisos que la app tenga y bajo el aislamiento del sistema operativo. Cuando añades una macro, aceptas además que un programa ajeno se ejecute **en tu máquina de desarrollo y en tus máquinas de integración continua**, con tu usuario, mientras compilas. La restricción de SPM en macOS reduce ese riesgo pero no lo elimina, y en otras plataformas las garantías son más débiles. Es exactamente la misma categoría de riesgo que llevaba años instalada y normalizada en otros ecosistemas —los scripts de instalación de npm, los `build.rs` de Cargo, los complementos de Gradle— y que ha producido incidentes reales y caros; Swift llega tarde a ese problema y por eso pudo llegar con una respuesta: un permiso explícito, por paquete, en vez del silencio por defecto. Hay una lección de diseño más ancha detrás. Cada vez que un ecosistema decide que el build es programable, gana expresividad y pierde una propiedad valiosísima: que compilar sea una operación segura sobre datos inertes. Swift ha intentado quedarse con lo mejor de ambos mundos separando el plugin en un proceso, restringiéndolo, exigiendo determinismo y pidiendo permiso, y esa combinación es probablemente lo más maduro que se ha construido sobre este problema. Pero la responsabilidad no se delega del todo: revisar qué macros entran en tu árbol de dependencias es hoy una tarea de seguridad tan legítima como revisar qué red toca tu aplicación, y conviene incorporarla al criterio con el que eliges paquetes antes de que un incidente te obligue a inventarla con prisa.
+</Callout>
+
+<Callout type="note" title="Lo esencial de esta lección">
+Un paquete de macros tiene un objetivo `.macro` que compila un ejecutable para el host, un objetivo normal que contiene las declaraciones y se distribuye, y un objetivo de pruebas. El plugin se registra con `@main` y `providingMacros`, y el compilador lo lanza como proceso aparte hablando por tuberías. `#externalMacro` une ambas mitades por nombre. El consumidor paga confianza explícita, tiempo de compilación y diagnósticos sobre código que no escribió.
+</Callout>
+
+<Challenge title="Monta el paquete entero">
+1. Crea un paquete de macros desde cero con la plantilla de Xcode y localiza los tres objetivos en el manifiesto.
+2. Cambia a propósito el nombre del tipo en `#externalMacro` y anota en qué momento exacto aparece el error.
+3. Escribe algo en la salida estándar desde la implementación, compila y explica el error resultante.
+4. Mide el tiempo de una build limpia con y sin la dependencia de macros, y reparte el coste entre `swift-syntax` y las expansiones.
+5. Investiga cómo aprobar plugins de macro sin interacción en un servidor de integración continua y qué implica hacerlo.
+</Challenge>

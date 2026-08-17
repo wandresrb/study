@@ -1,0 +1,170 @@
+---
+title: "Flavors de RCU y cuándo no usarla"
+description: "El zoo de sabores de RCU (normal, SRCU que sí puede dormir, RCU-tasks), las señales claras de cuándo RCU es la herramienta equivocada, y un ejemplo completo de caché protegida por RCU de principio a fin."
+subject: kernel
+level: 17
+order: 5
+position: "17.5"
+duration: "16 min"
+---
+
+<Lead>
+RCU no es una sola cosa: es una familia de sabores, cada uno con un compromiso distinto entre coste del lector y qué se le permite hacer. Conocerlos —y saber cuándo RCU es directamente la herramienta equivocada— es lo que separa usarla de dominarla. Cerramos con una caché real, completa, protegida por RCU.
+</Lead>
+
+<Goals>
+
+- Distinguir RCU normal, SRCU y RCU-tasks y sus casos de uso.
+- Saber cuándo se necesita SRCU (dormir en la sección lectora).
+- Reconocer las señales de cuándo NO usar RCU.
+- Leer y escribir una estructura completa protegida por RCU.
+
+</Goals>
+
+## Los sabores de RCU
+
+En Linux 7.x conviven varios sabores. Desde la gran consolidación (que fundió RCU-bh y RCU-sched en la RCU normal), el panorama se simplificó a tres familias principales.
+
+<Cards>
+  <Card icon="⚡" title="RCU normal">
+    El sabor consolidado. `rcu_read_lock`/`rcu_read_unlock`, `synchronize_rcu`, `call_rcu`. Lector baratísimo, pero no puede dormir. El 90% de los usos.
+  </Card>
+  <Card icon="😴" title="SRCU (Sleepable RCU)">
+    El lector SÍ puede dormir. Cada dominio es un `struct srcu_struct` independiente. Un poco más caro (contadores por-CPU), pero permite bloquear dentro de la sección.
+  </Card>
+  <Card icon="🔬" title="RCU-tasks">
+    El grace period espera a que cada tarea ceda la CPU voluntariamente. Nació para tracing, ftrace y BPF: liberar trampolines cuando ninguna tarea los ejecuta.
+  </Card>
+</Cards>
+
+`SRCU` resuelve la limitación más dolorosa de RCU: dormir. Como cada dominio lleva su propia contabilidad por-CPU, un lector puede bloquearse sin comprometer los grace periods de otros dominios. Se usa donde la sección lectora **debe** dormir: fallos de página guiados por el usuario, notifier chains, KVM, algunos tracepoints.
+
+```c
+static DEFINE_SRCU(mi_srcu);
+
+/* Lector que PUEDE dormir */
+int idx = srcu_read_lock(&mi_srcu);
+p = srcu_dereference(gp, &mi_srcu);
+esperar_io_que_duerme(p);           /* permitido bajo SRCU */
+srcu_read_unlock(&mi_srcu, idx);    /* el indice es obligatorio */
+
+/* Escritor */
+rcu_assign_pointer(gp, nuevo);
+synchronize_srcu(&mi_srcu);         /* o call_srcu(&mi_srcu, ...) */
+kfree(viejo);
+```
+
+Fíjate en que `srcu_read_lock` **devuelve un índice** que debes pasar a `srcu_read_unlock`: esa es la contabilidad por-CPU que paga el privilegio de dormir. `RCU-tasks` tiene sus propias variantes (`rcu-tasks`, `rcu-tasks-rude`, `rcu-tasks-trace` para programas BPF que pueden dormir), con `synchronize_rcu_tasks()` y `call_rcu_tasks()`.
+
+<Callout type="note" title="RCU perezosa para ahorrar energía">
+Linux 7.x hereda `CONFIG_RCU_LAZY`: en sistemas donde importa la batería, los callbacks de `call_rcu` no urgentes se agrupan y se procesan en lotes para no despertar CPUs ociosas constantemente. Es invisible para tu código —la semántica no cambia— pero explica por qué un grace period puede tardar más de lo que esperarías en un portátil en idle.
+</Callout>
+
+## Cuándo NO usar RCU
+
+RCU es especializada, no universal. Estas son las señales de que estás forzándola:
+
+- **Escrituras frecuentes.** El coste de RCU está en la escritura: copiar el objeto y esperar un grace period. Si escribes a menudo, el copiado y la latencia del grace period dominan. Un spinlock, un `seqlock` o incluso un `rw_semaphore` pueden ganar. RCU solo brilla cuando las lecturas superan a las escrituras por órdenes de magnitud.
+- **Necesitas bloquear al lector.** RCU nunca bloquea a un lector, por diseño. Si tu semántica exige que un lector **espere** a un escritor (contrapresión, un recurso que debe poseerse en exclusiva), RCU no puede expresarla. Usa un candado.
+- **Necesitas leer siempre el último valor.** RCU admite lecturas rancias: durante la ventana de actualización, un lector ve la versión vieja. Si necesitas linearizabilidad con visibilidad inmediata, RCU sola no basta.
+- **Actualización atómica de muchos objetos.** RCU publica **un** puntero de forma atómica. Coordinar una actualización atómica que abarque varios punteros a la vez es difícil y suele pedir otro mecanismo por encima.
+
+El patrón de rescate cuando necesitas conservar el objeto más allá de la sección es combinar RCU con un refcount: buscas bajo `rcu_read_lock`, tomas una referencia con `kref_get_unless_zero`, y solo entonces sales de la sección. El objeto queda anclado por el contador, no por RCU.
+
+<Mermaid code={`flowchart TD
+  A[Estructura concurrente] --> B[Las lecturas dominan por ordenes de magnitud]
+  B -->|no| L[Usa spinlock, mutex o seqlock]
+  B -->|si| C[El lector necesita dormir dentro de la seccion]
+  C -->|si| S[SRCU]
+  C -->|no| D[Basta con lecturas que pueden ser rancias un instante]
+  D -->|si| R[RCU normal]
+  D -->|no| L
+  class S t-yellow
+  class R t-green
+  class L t-red`} />
+
+## Ejemplo completo: una caché protegida por RCU
+
+Juntemos todo el nivel en una estructura real: una caché de entradas indexada por clave, leída en el camino caliente y actualizada rara vez —el arquetipo de tantas tablas del kernel.
+
+```c
+#include <linux/hashtable.h>
+#include <linux/rculist.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+
+struct entrada {
+	u32 clave;
+	int valor;
+	struct hlist_node nodo;
+	struct rcu_head rcu;
+};
+
+static DEFINE_HASHTABLE(tabla, 8);
+static DEFINE_SPINLOCK(tabla_lock);     /* solo serializa escritores */
+
+/* Lectura: camino caliente, sin bloqueo, escala lineal */
+static int cache_buscar(u32 clave, int *out)
+{
+	struct entrada *e;
+
+	rcu_read_lock();
+	hash_for_each_possible_rcu(tabla, e, nodo, clave) {
+		if (e->clave == clave) {
+			*out = READ_ONCE(e->valor);
+			rcu_read_unlock();
+			return 0;
+		}
+	}
+	rcu_read_unlock();
+	return -ENOENT;
+}
+
+/* Insercion: rara, serializada por spinlock */
+static int cache_insertar(u32 clave, int valor)
+{
+	struct entrada *e = kmalloc(sizeof(*e), GFP_KERNEL);
+
+	if (!e)
+		return -ENOMEM;
+	e->clave = clave;
+	e->valor = valor;
+
+	spin_lock(&tabla_lock);
+	hash_add_rcu(tabla, &e->nodo, clave);
+	spin_unlock(&tabla_lock);
+	return 0;
+}
+
+/* Borrado: desenlaza y difiere la liberacion un grace period */
+static int cache_borrar(u32 clave)
+{
+	struct entrada *e;
+
+	spin_lock(&tabla_lock);
+	hash_for_each_possible(tabla, e, nodo, clave) {
+		if (e->clave == clave) {
+			hash_del_rcu(&e->nodo);
+			spin_unlock(&tabla_lock);
+			kfree_rcu(e, rcu);      /* libera tras el grace period */
+			return 0;
+		}
+	}
+	spin_unlock(&tabla_lock);
+	return -ENOENT;
+}
+```
+
+Léelo con los ojos del nivel entero: el lector no toca el spinlock ni una operación atómica, escala lineal; el escritor se serializa con `tabla_lock`, publica con las primitivas `_rcu` y difiere la liberación con `kfree_rcu`. Es exactamente la forma del `dcache`, la tabla de rutas y mil cachés más del kernel.
+
+<Callout type="dios" title="Has aprendido a leer el corazón del kernel">
+Lo que acabas de escribir no es un ejercicio de juguete: es el patrón estructural sobre el que Linux mueve cada paquete de red, resuelve cada ruta de fichero y consulta cada política de seguridad, a la velocidad del hardware, en máquinas con miles de núcleos. RCU es, probablemente, la contribución más influyente de Linux a la teoría práctica de la concurrencia: la demostración de que, para las cargas read-mostly que dominan un sistema operativo real, se puede tener corrección **y** escalado lineal a la vez, sin elegir. El precio —escritores que copian, publican y esperan un grace period— es exactamente el precio correcto cuando las lecturas superan a las escrituras por órdenes de magnitud. Ahora, cuando abras el árbol de fuentes y veas `rcu_read_lock`, `rcu_dereference`, `list_for_each_entry_rcu` o `call_rcu`, ya no serán conjuros: entenderás la economía que representan, la asimetría que explotan y el grace period que los hace seguros. Sabes leer el mecanismo que mantiene en pie al kernel bajo carga. Ese es un conocimiento de sistemas de primer nivel.
+</Callout>
+
+<Challenge title="Construye y estresa una caché RCU">
+1. Compila la caché completa como módulo y exponla por un `char device` (nivel 13) o `debugfs`.
+2. Lanza muchos hilos lectores con `cache_buscar` y unos pocos escritores con `cache_insertar`/`cache_borrar`.
+3. Con `CONFIG_PROVE_RCU` y KASAN activos, verifica que no hay use-after-free bajo estrés.
+4. Sustituye `kfree_rcu` por `synchronize_rcu()` + `kfree()` y mide la diferencia de throughput del escritor.
+5. Decide con el diagrama: para tu propia estructura, ¿RCU normal, SRCU o un candado? Justifícalo.
+</Challenge>

@@ -1,0 +1,153 @@
+---
+title: "Los retos: builds, CI y versionado"
+description: "Por qué el monorepo no escala gratis: builds que rehacen trabajo intacto, un CI cuyo tiempo crece con el repo y no con el cambio, el problema de versionar y publicar N paquetes, y la primitiva que le falta al package manager y que obliga a un orquestador de tareas dedicado."
+subject: build
+level: 31
+order: 3
+position: "31.3"
+duration: "14 min"
+---
+
+<Lead>
+El monorepo resuelve la coherencia, pero no regala la escala. A medida que crece, aparece una tríada de dolores predecibles: los builds tardan cada vez más porque se rehace trabajo que no cambió, el CI se dilata hasta volverse el cuello de botella del equipo, y versionar y publicar decenas de paquetes se convierte en un problema por derecho propio. Ninguno de los tres lo resuelve el package manager solo. Entender por qué es entender qué primitiva falta —y por qué en 2026 nadie monta un monorepo serio sin una herramienta dedicada encima de pnpm.
+</Lead>
+
+<Goals>
+
+- Ver por qué el coste de un build ingenuo crece con el tamaño del repo, no con el del cambio.
+- Entender el CI como el dolor central: tiempo proporcional al repo si no se filtra por afectados.
+- Enmarcar el versionado y la publicación de N paquetes y el papel de Changesets.
+- Nombrar la primitiva que le falta a pnpm: una caché de tareas direccionada por contenido.
+
+</Goals>
+
+## El coste que crece con el repo, no con el cambio
+
+Imagina un monorepo con cuarenta paquetes. Cambias una línea en `@acme/utils`. Con las herramientas del propio pnpm, `pnpm -r run build` recorre el grafo en orden topológico y reconstruye... los cuarenta paquetes. pnpm garantiza el *orden* correcto, pero no tiene memoria: si nada cambió en treinta y nueve de ellos, los reconstruye igual, porque no sabe que su salida sería idéntica. El trabajo es proporcional al tamaño del repositorio, cuando debería ser proporcional al tamaño del cambio.
+
+```bash
+pnpm -r run build          # 48s: construye los 40 paquetes
+touch packages/utils/src/index.ts
+pnpm -r run build          # 48s otra vez: reconstruye los 40, no solo utils
+```
+
+<Mermaid code={`flowchart TD
+  CH[cambias un archivo en utils] --> SIN[sin cache de tareas rebuild de los 40 paquetes]
+  CH --> CON[con grafo de tareas solo utils y sus consumidores]
+  SIN --> LENTO[minutos de trabajo redundante]
+  CON --> RAPIDO[segundos de trabajo real]
+  class SIN t-maroon
+  class LENTO t-maroon
+  class CON t-green
+  class RAPIDO t-green`} />
+
+Lo correcto sería reconstruir solo `@acme/utils` y sus *dependientes* transitivos —los paquetes que lo consumen y podrían verse afectados—, y reutilizar tal cual la salida de todo lo demás. A ese subconjunto se le llama el conjunto *afectado* —affected—. Calcularlo exige tres ingredientes que la capa de paquetes no reúne por sí sola:
+
+- Un **grafo de tareas**, no solo de paquetes: saber que el `test` de una app depende del `build` de sus librerías, y no solo que un paquete depende de otro.
+- Una **huella de entradas** por tarea: qué archivos, dependencias y variables de entorno influyen en su salida, para decidir si algo cambió de verdad.
+- Un **punto de comparación** —un ref de git— para saber qué se movió desde la última vez que se ejecutó la tarea.
+
+Sin esos tres, cada persona paga en cada build el coste de todo el repo, y ese coste solo sube con cada paquete nuevo que alguien añade.
+
+<Callout type="info" title="Afectado es un cálculo, no una intuición">
+"Solo lo que cambió" suena obvio hasta que intentas computarlo bien. El conjunto afectado se calcula: partes de los archivos que difieren respecto a un ref, subes por el grafo de dependencias hasta cerrar todos los dependientes transitivos, y de ahí derivas qué tareas reejecutar. Hacerlo mal —olvidar una arista, ignorar un cambio de configuración global— produce el peor de los mundos: un verde falso en CI. Por eso el cálculo del afectado es responsabilidad de una herramienta que entiende el grafo, no de un script de git hecho a ojo.
+</Callout>
+
+## El CI: el cuello de botella que escala mal
+
+Lo que en local es una molestia, en CI es el freno del equipo entero. Un pipeline ingenuo ejecuta, en cada pull request, el lint, el typecheck, el test y el build de *todo* el monorepo. Cuando el repo tiene cuarenta paquetes, cambiar un botón en la web dispara la batería completa: minutos —a veces decenas— para validar un cambio que toca un solo paquete. Y ese tiempo crece de forma monótona: cada paquete nuevo que alguien añade ralentiza el CI de *todos* los demás, para siempre.
+
+```bash
+# el pipeline ingenuo: castiga cada PR con el coste del repo entero
+pnpm -r run lint && pnpm -r run typecheck && pnpm -r run test && pnpm -r run build
+```
+
+Con un orquestador, el mismo pipeline se reescribe para actuar solo sobre lo afectado y reutilizar lo cacheado, y su coste pasa a depender del cambio y no del repo:
+
+```bash
+# solo lo afectado desde main, reutilizando cache local y remota
+turbo run lint typecheck test build --filter="...[origin/main]"
+```
+
+El problema tiene un segundo orden más venenoso que el tiempo. Cuando el CI tarda veinte minutos, la gente deja de esperar: abre otra rama, cambia de contexto, mergea sin releer. La latencia del pipeline se convierte en latencia del pensamiento. Y con muchos commits al día contra `main`, aparece el problema de la cola de merge: cada PR se validó contra un `HEAD` que ya cambió cuando le toca entrar, así que hay que revalidar. La solución vuelve a ser la misma que en local —ejecutar solo lo *afectado* y reutilizar lo cacheado, además entre máquinas—, pero exige infraestructura que el package manager no provee.
+
+<Callout type="note" title="El CI que crece castiga dos veces">
+Un pipeline que valida el repo entero no solo tarda más: cobra un impuesto doble. Primero en reloj —minutos por PR que se multiplican por el número de PRs al día—, y luego en dinero, porque esos minutos son minutos de runners que alguien paga. Un monorepo de cierto tamaño sin ejecución por afectados puede gastar más en CI que en hosting de producción, y casi todo ese gasto es recomputar resultados que ya se conocían.
+</Callout>
+
+<Callout type="warn" title="pnpm ordena, pero no memoiza">
+Es la frontera exacta de competencias. `pnpm -r` garantiza el orden topológico correcto y sabe seleccionar por `--filter` los paquetes cambiados desde un ref de git. Lo que no hace —por diseño— es hashear las entradas de cada tarea y reutilizar su salida cuando nada cambió. Esperar de pnpm que "no recompile lo que no cambió" es pedirle el trabajo de Turborepo o Nx. pnpm provee el grafo, el enlace y la selección; la caché va en una capa por encima.
+</Callout>
+
+## Versionado y publicación de N paquetes
+
+El tercer reto es de gobernanza, no de velocidad. Si tu monorepo publica paquetes en un registro —una librería de componentes, un SDK—, ¿cómo los versionas? Hay dos filosofías. La *fija* o en bloque (lockstep): todos los paquetes comparten una versión y suben a la vez, como hace Angular. Simple de razonar, pero infla el changelog con versiones vacías —publicas `2.4.0` de un paquete que no tocaste— y arrastra a los consumidores a upgrades que no necesitan. La *independiente*: cada paquete tiene su propia versión y sube solo cuando cambia. Refleja la realidad, pero exige llevar la cuenta de qué cambió, con qué impacto semver, y qué *otros* paquetes del repo hay que republicar en cascada porque dependían del que cambió.
+
+Ese "en cascada" es el nudo. Si `@acme/ui` depende de `@acme/utils` y publicas una versión mayor de `utils`, hay que republicar `ui` para que apunte a ella, y a los consumidores de `ui` tras ella. Hacerlo a mano en veinte paquetes es la coreografía frágil que el monorepo prometía eliminar.
+
+<Mermaid code={`flowchart TD
+  U[cambias utils version mayor] --> UI[hay que republicar ui que dependia de el]
+  UI --> WEB[y sus consumidores en cascada]
+  CS[changesets calcula la cascada y publica en orden] --> DONE[versiones y changelogs coherentes]
+  class DONE t-green`} />
+
+La respuesta del ecosistema es **Changesets**: cada PR que cambia algo publicable añade un pequeño archivo markdown declarando qué paquetes tocó y con qué nivel semver. Al lanzar, Changesets agrega esos archivos, calcula el efecto en cascada, sube las versiones correctas, genera los changelogs y publica en orden topológico. Y al publicar, reescribe los `workspace:*` internos a la versión concreta que corresponde, de modo que fuera del monorepo los paquetes se consumen con versiones normales.
+
+```bash
+pnpm changeset          # declaras que cambiaste y con que impacto semver
+pnpm changeset version  # aplica los bumps en cascada y escribe changelogs
+pnpm changeset publish   # publica en orden topologico, reescribiendo workspace:
+```
+
+Cada changeset es un archivo diminuto que vive en el PR y declara la intención de versión, no el número final:
+
+```md
+---
+"@acme/ui": minor
+"@acme/utils": patch
+---
+
+Se anade tema oscuro en Button y se corrige un formato de fecha en utils.
+```
+
+<Callout type="note" title="El changeset es una intención, no un efecto">
+Lo elegante de Changesets es que separa *declarar* el cambio de *aplicarlo*. En cada PR añades un archivo que dice "esto es un cambio menor de `@acme/ui`"; el efecto —subir versiones, propagar cascadas, escribir changelogs, publicar— se difiere al momento del release y lo calcula la herramienta. Así la decisión semver se toma con el contexto fresco del PR, pero la mecánica de publicar N paquetes en orden no la hace nadie a mano.
+</Callout>
+
+## Por qué el package manager no basta
+
+Reunidos los tres retos, emerge la primitiva que falta. Los builds lentos y el CI que no escala piden lo mismo: no repetir trabajo cuyo resultado ya se conoce. Eso es una *caché direccionada por contenido* aplicada a tareas. La idea: para cada tarea —el build de un paquete, sus tests— se calcula un hash de todas sus entradas (los archivos fuente, las dependencias, la configuración, las variables de entorno relevantes); si existe una salida cacheada para ese hash, se restaura en milisegundos en lugar de ejecutar; si no, se ejecuta y se guarda bajo ese hash. Súmale un modelo del grafo de tareas —"el test de `ui` depende del build de `utils`"— y ya puedes calcular el conjunto afectado y paralelizar respetando la topología.
+
+```text
+hash(fuentes + deps + config + env)  ->  ¿hay salida cacheada?
+  si  -> restaura en ms, no ejecutes
+  no  -> ejecuta, guarda la salida bajo ese hash
+```
+
+Con esa memoria, la segunda ejecución de una tarea sin cambios no computa nada: restaura salidas y logs desde la caché en milisegundos.
+
+```text
+$ turbo run build
+@acme/utils:build  cache miss, executing 9c3f
+@acme/ui:build     cache hit, replaying logs 1a20
+ Tasks: 2 successful, 2 total
+ Cached: 1 cached, 2 total   Time: 320ms
+```
+
+Ninguna de esas dos piezas —la caché por contenido y el grafo de tareas— es competencia del package manager, y con razón: pnpm resuelve dependencias y enlaza `node_modules`, un dominio ya bastante difícil. Por eso el ecosistema se estratificó. pnpm aporta el grafo de *paquetes*, el enlace y la selección; un orquestador —Turborepo o Nx— aporta el grafo de *tareas*, el hashing y la caché, local y remota. Los retos del monorepo no son accidentes que una herramienta mejor eliminará: son la evidencia de que "instalar dependencias" y "no repetir trabajo" son dos problemas distintos que piden dos capas distintas.
+
+<Callout type="tip" title="Primero el grafo, luego la caché, nunca al revés">
+Un error caro es cachear sobre un grafo de tareas mal declarado. Si tu lista de `outputs` omite un artefacto, o una tarea lee un archivo que no declaraste como entrada, la caché devolverá resultados obsoletos y perseguirás fantasmas. La caché solo es tan buena como la honestidad del grafo que la alimenta: declara con precisión qué produce y de qué depende cada tarea *antes* de encender la memoización.
+</Callout>
+
+<Callout type="dios" title="Los retos del monorepo son un problema de memoria, no de velocidad">
+Es tentador leer los dolores del monorepo como un problema de rapidez —"los builds tardan, hagámoslos más rápidos"— y lanzarse a compiladores en Rust y más núcleos en CI. Pero esa lectura confunde el síntoma con la enfermedad. El build más rápido posible no es el que corre en un compilador veloz: es el que no corre, porque su resultado ya se conoce. Los tres retos —builds lentos, CI que no escala, publicación en cascada— comparten una misma raíz: el sistema *rehace* o *recoordina* trabajo cuyo resultado ya está determinado por sus entradas. La respuesta profunda no es acelerar la ejecución, es dotar al sistema de *memoria*: memoria de qué salida produce cada conjunto de entradas —la caché de tareas— y memoria de qué depende de qué —el grafo de tareas y los changesets—. Con memoria, el trabajo se vuelve proporcional al cambio y no al tamaño del repo, que es la única forma de que un monorepo escale a cientos de paquetes sin que el CI se convierta en el cuello de botella del negocio. Y aquí está la lección de arquitectura: esa memoria no cabe en el package manager, porque instalar dependencias y memoizar tareas son problemas ortogonales. Por eso 2026 no tiene "la herramienta de monorepos" sino un *stack* de capas —pnpm resuelve y enlaza, el orquestador memoiza, Changesets versiona— donde cada una hace una cosa y la hace bien. Los retos no se superan comprando velocidad; se superan diseñando qué recuerda cada capa. Quien entiende eso deja de preguntar "qué build tool es más rápido" y empieza a preguntar "qué es exactamente lo que no debería estar recalculando".
+</Callout>
+
+<Challenge title="Mide el trabajo que sobra">
+1. En un monorepo real, cronometra `pnpm -r run build` en frío. Luego cambia una línea en un solo paquete y vuelve a cronometrarlo: ¿cuánto tiempo se fue en reconstruir lo que no cambió?
+2. Revisa tu pipeline de CI y responde: ¿ejecuta lint, typecheck y test de *todo* el repo en cada PR, o solo de lo afectado?
+3. Cuenta cuántos paquetes de tu repo se publican. Si son varios, ¿cómo llevas hoy sus versiones y las cascadas? ¿A mano, con Changesets, en bloque?
+4. Añade Changesets, crea un changeset de prueba y ejecuta `pnpm changeset version` en una rama para ver los bumps en cascada sin publicar nada.
+5. Escribe, en una frase, qué tarea concreta de tu CI es la que más se repite sin cambiar de resultado. Ese es el primer candidato a cachear.
+</Challenge>

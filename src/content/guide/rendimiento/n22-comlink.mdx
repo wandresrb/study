@@ -1,0 +1,194 @@
+---
+title: "Comlink: hablar con el trabajador sin escribir plomería"
+description: "Cómo Comlink convierte el paso de mensajes en llamadas a métodos con Proxy, qué cuesta esa comodidad en viajes de ida y vuelta, y cómo diseñar una API de trabajador que no se vuelva conversadora."
+subject: rendimiento
+level: 22
+order: 4
+position: "22.4"
+duration: "18 min"
+---
+
+<Lead>
+El patrón de identificador de correlación, la tabla de promesas pendientes y el gran `switch` sobre el tipo de mensaje son plomería: código sin valor propio que hay que escribir en cada proyecto y que se rompe de las mismas maneras. Comlink lo sustituye por un objeto proxy que se comporta como si el módulo del trabajador estuviera en tu mismo hilo. La comodidad es enorme y tiene un precio muy concreto que hay que conocer antes de repartir proxies por toda la aplicación.
+</Lead>
+
+<Goals>
+
+- Explicar cómo Comlink traduce accesos a propiedades en mensajes mediante `Proxy`.
+- Exponer y consumir una API de trabajador con `expose` y `wrap`.
+- Combinar Comlink con transferibles y con devoluciones de llamada.
+- Diseñar la granularidad de la API para minimizar los viajes de ida y vuelta.
+
+</Goals>
+
+## Qué hace exactamente
+
+Comlink es una biblioteca de unos 1,1 KB que la propia documentación describe como diminuta, y lo es porque solo hace una cosa: envolver un extremo de `postMessage` en un `Proxy` de JavaScript.
+
+Cuando accedes a una propiedad de ese proxy, la trampa `get` no devuelve un valor: devuelve **otro proxy** que recuerda la ruta de acceso. Cuando lo invocas, la trampa `apply` envía un mensaje con esa ruta y los argumentos, y devuelve una promesa que se resuelve cuando llega la respuesta. El truco entero cabe en esa frase, y explica al mismo tiempo la comodidad y el coste.
+
+El lado del trabajador expone un objeto:
+
+```js
+// analisis.worker.js
+import * as Comlink from 'comlink';
+
+const api = {
+  ordenar(claves) {
+    const indices = Int32Array.from(claves.keys());
+    indices.sort((a, b) => claves[a] - claves[b]);
+    return Comlink.transfer(indices, [indices.buffer]);
+  },
+
+  async agregar(filas, campo) {
+    const totales = new Map();
+    for (const f of filas) {
+      totales.set(f[campo], (totales.get(f[campo]) ?? 0) + f.importe);
+    }
+    return Object.fromEntries(totales);   // Map tambien se clona, pero un objeto plano es mas barato
+  },
+};
+
+Comlink.expose(api);
+```
+
+Y el hilo principal lo consume como si fuera local, con la única diferencia de que todo devuelve promesas:
+
+```js
+import * as Comlink from 'comlink';
+
+const trabajador = new Worker(new URL('./analisis.worker.js', import.meta.url), { type: 'module' });
+const analisis = Comlink.wrap(trabajador);
+
+const claves = Float64Array.from(filas, (f) => f.importe);
+const orden = await analisis.ordenar(Comlink.transfer(claves, [claves.buffer]));
+const ordenadas = Array.from(orden, (i) => filas[i]);
+```
+
+Compara ese último bloque con el código del identificador de correlación de [la primera lección del nivel](/guia/rendimiento/n22-que-trabajo-se-puede-mover/). No es que sea más corto: es que no hay estado que mantener, no hay fugas posibles en la tabla de pendientes, y el error del trabajador llega como un rechazo de la promesa en lugar de como un mensaje que hay que traducir a mano.
+
+### Las cuatro piezas que necesitas
+
+**`Comlink.expose(objeto, endpoint)`.** Publica un objeto. El segundo argumento es opcional y por defecto es `self`, que es lo correcto dentro de un trabajador dedicado.
+
+**`Comlink.wrap(endpoint)`.** Envuelve el otro extremo. Funciona con cualquier cosa que tenga `postMessage` y `addEventListener`: un `Worker`, un `MessagePort`, un `SharedWorker.port`. Para hablar con un `iframe` o con la ventana padre hay que envolver la ventana en `Comlink.windowEndpoint()`, porque la firma de `postMessage` de una ventana es distinta.
+
+**`Comlink.transfer(valor, [transferibles])`.** Marca un valor de retorno o un argumento para que viaje transferido en lugar de copiado. Sin esta llamada, Comlink clona, y todo lo que sabes sobre [el coste del clonado estructurado](/guia/rendimiento/n22-el-coste-de-postmessage/) se aplica igual. La biblioteca no adivina lo que quieres transferir.
+
+**`Comlink.proxy(funcion)`.** Las funciones no son clonables, así que un callback pasado tal cual lanza `DataCloneError`. Envolverlo en `Comlink.proxy` crea un `MessageChannel` dedicado y manda el puerto, que sí es transferible:
+
+```js
+await analisis.procesarLote(
+  datos,
+  Comlink.proxy((hechos, total) => {
+    barra.value = hechos / total;
+  }),
+);
+```
+
+Dentro del trabajador, `progreso(hechos, total)` se llama con normalidad y el mensaje viaja de vuelta. El detalle importante: **esa devolución también es asíncrona**, devuelve una promesa, y su valor de retorno no está disponible de forma síncrona en el trabajador.
+
+## El coste: cada punto es un viaje
+
+Aquí está el precio de la magia, y es la fuente del noventa por ciento de los problemas con Comlink en producción.
+
+**Cada acceso a una propiedad del proxy es un mensaje.** Con [entre 0,5 y 3 milisegundos por ida y vuelta](/guia/rendimiento/n22-que-trabajo-se-puede-mover/) según el dispositivo, la aritmética se vuelve desagradable muy rápido:
+
+```js
+// Tres viajes de ida y vuelta, no uno
+const tema = await api.configuracion.opciones.tema;
+
+// Un viaje
+const tema = await api.leerConfiguracion('opciones.tema');
+```
+
+El primer caso parece código normal y no lo es. `api.configuracion` es un mensaje, `.opciones` es otro, y el `await` final es el tercero. En un manejador de interacción, eso son entre 1,5 y 9 milisegundos de latencia añadida por una lectura que en memoria local cuesta nanosegundos.
+
+**Un bucle sobre el proxy es un desastre silencioso.** Este código funciona perfectamente y tarda entre medio segundo y tres segundos:
+
+```js
+// MAL: mil viajes de ida y vuelta
+const resultados = [];
+for (const fila of filas) {
+  resultados.push(await api.procesar(fila));   // 1000 mensajes
+}
+
+// BIEN: un viaje
+const resultados = await api.procesarTodas(filas);
+```
+
+La regla que resuelve el problema general: **diseña la API del trabajador con grano grueso**. Un método por operación completa, con la entrada entera y la salida entera. Cada método del objeto expuesto debería justificar su viaje con al menos veinte o treinta milisegundos de trabajo real.
+
+**Los proxies hay que liberarlos.** Cuando el trabajador devuelve un objeto envuelto en `Comlink.proxy`, el `MessageChannel` asociado queda vivo indefinidamente. La liberación es explícita:
+
+```js
+const sesion = await api.abrirSesion(id);
+try {
+  await sesion.escribir(datos);
+} finally {
+  sesion[Comlink.releaseProxy]();     // cierra el canal
+}
+```
+
+Sin ese `releaseProxy`, cada sesión abierta deja un puerto de mensajes y su cierre asociado retenidos en los dos hilos. Es una fuga de memoria que crece con el uso y que no aparece en ningún perfil de carga.
+
+<Callout type="dios" title="El manejador de transferencia personalizado es la característica que casi nadie usa y la que convierte a Comlink en útil de verdad">
+La objeción legítima contra Comlink es que su comodidad te empuja a mandar los datos en la forma en que los tienes, que suele ser la peor para el clonado. Un array de diez mil objetos cruzado en cada llamada anula toda la ganancia del trabajador, y el código se ve tan limpio que nadie sospecha.
+
+La respuesta está en `Comlink.transferHandlers`, un registro de convertidores personalizados que **se aplican automáticamente** a cualquier valor que cruce la frontera. Registras uno en los dos lados y a partir de ahí tus tipos viajan en la representación eficiente sin que ninguna llamada tenga que acordarse.
+
+El caso canónico: convertir un array de objetos a columnas de arrays de tipos al salir y reconstruirlo al llegar.
+
+```js
+// handlers.js — se importa desde el hilo principal Y desde el worker
+import * as Comlink from 'comlink';
+
+Comlink.transferHandlers.set('tabla', {
+  canHandle: (v) => Array.isArray(v) && v.length > 200 && typeof v[0]?.importe === 'number',
+
+  serialize(filas) {
+    const n = filas.length;
+    const id = new Int32Array(n);
+    const importe = new Float64Array(n);
+    const fecha = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      id[i] = filas[i].id;
+      importe[i] = filas[i].importe;
+      fecha[i] = filas[i].fecha;
+    }
+    // [valorSerializado, listaDeTransferibles]
+    return [{ n, id, importe, fecha }, [id.buffer, importe.buffer, fecha.buffer]];
+  },
+
+  deserialize({ n, id, importe, fecha }) {
+    const filas = new Array(n);
+    for (let i = 0; i < n; i++) filas[i] = { id: id[i], importe: importe[i], fecha: fecha[i] };
+    return filas;
+  },
+});
+```
+
+El contrato es exactamente ese: `canHandle` decide, `serialize` devuelve una tupla con el valor y la lista de transferibles, y `deserialize` reconstruye. Comlink recorre los valores que cruzan y aplica el primer manejador cuyo `canHandle` responda que sí.
+
+Tres consecuencias que merecen atención.
+
+**La primera: el registro tiene que ser idéntico en los dos lados.** Si el trabajador no conoce el manejador `tabla`, recibe el objeto de columnas en crudo y falla de una forma confusa. La disciplina es importar el mismo módulo de manejadores en los dos puntos de entrada, antes de `expose` y antes de `wrap`.
+
+**La segunda: el coste de la conversión no desaparece, se mueve.** Construir las columnas es trabajo del hilo emisor. Sigue siendo mucho más barato que clonar diez mil objetos —el bucle de copia a arrays de tipos es aritmética pura sobre memoria contigua, mientras que el clonado estructurado hace una asignación de propiedad con comprobación de tipo por campo— pero no es cero, y hay que medirlo con el banco de la lección del coste de los mensajes.
+
+**La tercera, y es la que decide si merece la pena: si la reconstrucción del otro lado es lo primero que hace tu código, no reconstruyas.** El `deserialize` que devuelve mil objetos vuelve a pagar mil asignaciones. Si el trabajador va a recorrer las columnas de todos modos, expón las columnas y trabaja sobre ellas. El manejador de transferencia es un buen sitio para la conversión, y un sitio pésimo para deshacerla por costumbre.
+
+Y una nota sobre errores, porque es la otra cosa que arreglan los manejadores personalizados: Comlink trae de serie un manejador para `Error`, de modo que una excepción lanzada dentro del trabajador llega al hilo principal como un rechazo con el mensaje y el nombre. Lo que **no** sobrevive es la clase concreta: un `ErrorDeValidacion` tuyo llega como un `Error` genérico y el `instanceof` falla. Si tu manejo de errores discrimina por tipo, necesitas tu propio manejador que serialice el discriminante y lo reconstruya al otro lado.
+</Callout>
+
+## Cuándo usarlo y cuándo no
+
+Comlink gana cuando la interfaz con el trabajador tiene **varias operaciones distintas** y cuando esas operaciones se llaman desde sitios distintos de la aplicación. Ahí el `switch` sobre el tipo de mensaje se convierte en una máquina de estados que nadie quiere mantener, y el proxy elimina esa categoría entera de código.
+
+Comlink sobra cuando el trabajador tiene **una sola función** y se llama desde un solo sitio. Veinte líneas de `postMessage` con un identificador resuelven eso sin dependencias, sin la capa de proxies y sin el riesgo de que alguien escriba un bucle conversador dentro de seis meses.
+
+Y hay un caso donde es directamente contraproducente: **el trabajador que produce un flujo continuo de resultados**. El modelo de Comlink es petición y respuesta; un flujo se modela mucho mejor con `ReadableStream` transferido, que además trae contrapresión de serie. Se pueden combinar —devolver un flujo desde un método de Comlink funciona— pero conviene tenerlo claro antes de forzar el modelo equivocado.
+
+<Challenge>
+Coge un trabajador tuyo escrito con `postMessage` a mano y conviértelo a Comlink. Después instrumenta el número de mensajes que cruzan durante una sesión típica, envolviendo el `postMessage` del extremo con un contador. Si la cifra supera a la de operaciones lógicas que has pedido, tienes una API demasiado fina: agrupa métodos hasta que las dos cifras coincidan y vuelve a medir el retraso de entrada de las interacciones afectadas.
+</Challenge>

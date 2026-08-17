@@ -1,0 +1,184 @@
+---
+title: "Construir uno completo: de la idea al primer usuario"
+description: "Un plugin pequeño pero real de principio a fin: bloc de notas por proyecto en ventana flotante, con punto de entrada mínimo, configuración validada, estado explícito, persistencia en disco, limpieza de recursos, comprobación de salud, documentación y publicación."
+subject: neovim
+level: 21
+order: 5
+position: "21.5"
+duration: "24 min"
+---
+
+<Lead>
+Los cuatro capítulos anteriores son piezas sueltas: una estructura de directorios, un patrón de configuración, un bucle de trabajo y una disciplina de pereza. Ninguna de ellas se aprende de verdad por separado, porque las decisiones difíciles aparecen justo en sus intersecciones —dónde vive el estado cuando la configuración es inmutable, qué hacer con la ventana abierta cuando el usuario sale del editor, cómo limpiar recursos de un módulo que se cargó tarde—. Vamos a construir por eso un plugin completo y deliberadamente pequeño: un bloc de notas asociado al proyecto, que se abre en una ventana flotante, persiste en disco y desaparece sin dejar rastro. Cabe en doscientas líneas, no depende de nada externo y toca todas las obligaciones de un plugin publicable. La ambición aquí no es la funcionalidad sino el acabado: la diferencia entre un fragmento que funciona en tu máquina y un artefacto que otra persona puede instalar sin escribirte.
+</Lead>
+
+<Goals>
+
+- Delimitar el alcance de un plugin en una frase y derivar de ella su superficie pública.
+- Repartir el código entre punto de entrada, configuración, estado y lógica con fronteras nítidas.
+- Gestionar el ciclo de vida completo de los recursos: crear, persistir, cerrar y limpiar.
+- Rematar el artefacto con comprobación de salud, documentación y una versión publicable.
+
+</Goals>
+
+## El diseño: una idea y sus fronteras
+
+Antes de escribir código, la frase. *Un bloc de notas en texto plano, uno por directorio de proyecto, que se abre y se cierra con una tecla sin perturbar la disposición de ventanas.* De ahí se deduce todo lo demás: la identidad de una nota es la ruta del proyecto, el almacenamiento es un fichero por proyecto en el directorio de datos, la interfaz es una ventana flotante y el estado vivo se reduce a qué buffer y qué ventana están abiertos ahora.
+
+Con esa frase quedan fijadas las cuatro respuestas que importan. El **alcance**: una nota por proyecto, texto plano, sin sincronización ni formatos, y todo lo que no quepa ahí es otro plugin. La **superficie**: un comando, una función pública para alternar, una tabla de opciones y un evento propio al guardar; nada más se documenta ni se promete. El **estado**: buffer y ventana actuales más la ruta resuelta, viviendo aparte de la configuración. Y la **salida**: cerrar guarda y libera, salir del editor guarda, y desinstalar no deja autocomandos huérfanos ni ficheros ocultos que sorprendan meses después.
+
+La estructura de ficheros se sigue directamente: `plugin/pico.lua` con el registro mínimo del capítulo anterior, `lua/pico/init.lua` con la API pública, `lua/pico/config.lua` con defectos y validación, `lua/pico/ui.lua` con la ventana, `lua/pico/health.lua` con el diagnóstico y `doc/pico.txt` con la ayuda. Separar la interfaz gráfica del resto no es ceremonia: es lo que permitirá probar la lógica sin abrir ninguna ventana.
+
+## Punto de entrada y configuración
+
+El fichero de entrada es idéntico al patrón ya conocido —guarda de doble carga y un comando de usuario cuyo cuerpo hace el `require`— así que el trabajo interesante empieza en el módulo de configuración, donde se decide qué significa *proyecto* y dónde vive su nota.
+
+```lua
+-- lua/pico/config.lua
+local C = {}
+C.defaults = {
+  dir = vim.fs.joinpath(vim.fn.stdpath("data"), "pico"),
+  ancho = 0.6, alto = 0.6, borde = "rounded",
+  filetype = "markdown", cerrar_con = "q",
+  raiz = { ".git", "package.json", "Cargo.toml" },
+}
+
+function C.resolver(opts)
+  local o = vim.tbl_deep_extend("force", vim.deepcopy(C.defaults), opts or {})
+  vim.validate("dir", o.dir, "string")
+  vim.validate("raiz", o.raiz, "table")
+  vim.validate("ancho", o.ancho, function(v) return type(v) == "number" and v > 0 and v <= 1 end,
+    "fraccion de la pantalla entre 0 y 1")
+  return o
+end
+
+-- Identidad de la nota: la raiz del proyecto, o el directorio actual si no hay marcador
+function C.ruta_nota(o)
+  local marcador = vim.fs.find(o.raiz, { upward = true, path = vim.fn.getcwd() })[1]
+  local raiz = marcador and vim.fs.dirname(marcador) or vim.fn.getcwd()
+  local nombre = raiz:gsub("[/\\:]", "%%") .. ".md"     -- ruta aplanada, nombre unico
+  return vim.fs.joinpath(o.dir, nombre)
+end
+return C
+```
+
+La función que resuelve la ruta concentra la única decisión sutil del plugin: qué significa *proyecto*. Buscar hacia arriba un marcador y caer en el directorio actual cuando no lo hay es el comportamiento que la gente espera, y aplanar la ruta en el nombre del fichero evita crear árboles de directorios que nadie limpiará. Advierte que esta función es pura respecto al editor salvo por el directorio de trabajo: se puede probar sin abrir nada.
+
+## La ventana, el estado y la limpieza
+
+```lua
+-- lua/pico/ui.lua
+local U = { buf = nil, win = nil }
+
+function U.geometria(o)
+  local ancho = math.floor(vim.o.columns * o.ancho)
+  local alto = math.floor(vim.o.lines * o.alto)
+  return { relative = "editor", width = ancho, height = alto,
+    row = math.floor((vim.o.lines - alto) / 2),
+    col = math.floor((vim.o.columns - ancho) / 2),
+    border = o.borde, title = " pico ", title_pos = "center" }
+end
+
+function U.abierto() return U.win ~= nil and vim.api.nvim_win_is_valid(U.win) end
+
+function U.abrir(o, ruta)
+  vim.fn.mkdir(vim.fs.dirname(ruta), "p")
+  if not (U.buf and vim.api.nvim_buf_is_valid(U.buf)) then
+    U.buf = vim.fn.bufadd(ruta)                 -- buffer real ligado al fichero
+    vim.fn.bufload(U.buf)
+    vim.bo[U.buf].filetype = o.filetype
+    vim.bo[U.buf].bufhidden = "hide"            -- sobrevive al cierre de la ventana
+    vim.keymap.set("n", o.cerrar_con, U.cerrar, { buffer = U.buf, desc = "cierra pico" })
+  end
+  U.win = vim.api.nvim_open_win(U.buf, true, U.geometria(o))
+  vim.wo[U.win].winfixbuf = true                -- nadie puede colar otro buffer aqui
+end
+
+function U.cerrar()
+  if U.buf and vim.api.nvim_buf_is_valid(U.buf) and vim.bo[U.buf].modified then
+    vim.api.nvim_buf_call(U.buf, function() vim.cmd("silent write") end)
+    vim.api.nvim_exec_autocmds("User", { pattern = "PicoGuardado" })
+  end
+  if U.abierto() then vim.api.nvim_win_close(U.win, true) end
+  U.win = nil
+end
+return U
+```
+
+Tres decisiones merecen comentario. La primera: el buffer está **ligado al fichero real**, de modo que la escritura es la del editor, con sus copias de seguridad y sus autocomandos, en vez de una serialización propia que tendrías que mantener. La segunda: el buffer sobrevive al cierre de la ventana, lo que conserva el historial de deshacer y la posición del cursor entre aperturas, a cambio de un buffer oculto que hay que recordar liberar. La tercera: el evento de usuario emitido al guardar es una extensión gratuita de la superficie pública, y permite a cualquiera enganchar comportamiento propio sin que tú anticipes su caso.
+
+```lua
+-- lua/pico/init.lua
+local M = { _estado = { ruta = nil } }
+
+function M.setup(opts)
+  M.options = require("pico.config").resolver(opts)
+  local grupo = vim.api.nvim_create_augroup("Pico", { clear = true })
+  vim.api.nvim_create_autocmd("VimLeavePre", { group = grupo, callback = M.cerrar })
+  vim.api.nvim_create_autocmd("VimResized", { group = grupo, callback = function()
+    local ui = require("pico.ui")
+    if ui.abierto() then vim.api.nvim_win_set_config(ui.win, ui.geometria(M.options)) end
+  end })
+  return M
+end
+
+function M.alternar()
+  local ui = require("pico.ui")
+  if ui.abierto() then return ui.cerrar() end
+  local o = M.options or M.setup({}).options    -- tolera que nadie llamase a setup
+  M._estado.ruta = require("pico.config").ruta_nota(o)
+  ui.abrir(o, M._estado.ruta)
+end
+M.cerrar = function() require("pico.ui").cerrar() end
+return M
+```
+
+<Callout type="info" title="La limpieza es la mitad del trabajo">
+Todo recurso que crees debe tener un punto de liberación identificable: la ventana se cierra, el buffer se marca como oculto y se elimina al salir, el grupo de autocomandos se vacía al reconfigurar, los `namespaces` de resaltado se limpian antes de volver a pintarse. Escribe la función de cierre inmediatamente después de la de apertura, nunca *más adelante*, porque el estado huérfano no produce errores visibles: produce comportamientos raros media hora después que nadie relacionará con tu plugin.
+</Callout>
+
+## Rematar: salud, documentación y publicación
+
+```lua
+-- lua/pico/health.lua : lo ejecuta :checkhealth pico
+local H = {}
+function H.check()
+  vim.health.start("pico.nvim")
+  if vim.fn.has("nvim-0.10") == 1 then vim.health.ok("version de Neovim suficiente")
+  else vim.health.error("se requiere Neovim 0.10 o superior") end
+  local o = require("pico").options or require("pico.config").defaults
+  if vim.fn.isdirectory(o.dir) == 1 then vim.health.ok("directorio de notas: " .. o.dir)
+  else vim.health.warn("el directorio se creara al abrir la primera nota") end
+  vim.health.info("nota de este proyecto: " .. require("pico.config").ruta_nota(o))
+end
+return H
+```
+
+```bash
+nvim --headless --clean -u repro.lua -c "checkhealth pico" -c "qa!"   # salud
+nvim --headless -c "helptags doc/" -c q                               # indice de ayuda
+git tag -a v1.0.0 -m "primera version estable" && git push --tags     # version fijable
+```
+
+<Mermaid code={`flowchart TB
+  a[Idea en una frase] --> b[Superficie publica comando opciones evento]
+  b --> c[config con defectos validacion e identidad del proyecto]
+  c --> d[ui con apertura estado y cierre]
+  d --> e[init que coordina y limpia al salir]
+  e --> f[health documentacion y etiqueta de version]
+  style b fill:#cba6f7,color:#11111b
+  style f fill:#a6e3a1,color:#11111b`} />
+
+La comprobación de salud es lo primero que pedirás a quien informe de un problema, así que escribirla es invertir en tu propio tiempo futuro. El fichero de ayuda debe cubrir la frase de alcance, la tabla de opciones con sus valores por defecto, el comando y el evento de usuario. Y la etiqueta de versión no es burocracia: los gestores permiten fijar versiones, y sin etiquetas condenas a tus usuarios a seguir la rama principal con lo que eso implica el día que rompas algo.
+
+<Callout type="dios" title="Terminar es una habilidad distinta de construir, y mucho más rara">
+Vale la pena reparar en la proporción del trabajo que acabas de hacer, porque contradice la intuición de casi todo el mundo que empieza. La funcionalidad real de este plugin —abrir un fichero en una ventana flotante— son unas veinte líneas, y las escribiste en cinco minutos. Las otras ciento ochenta son frontera: validar entrada que quizá nadie pase mal, resolver qué significa proyecto cuando no hay marcador, tolerar que no se llame a la configuración, recolocar la ventana cuando cambia el tamaño del terminal, guardar al salir del editor por una vía que el usuario no anticipó, informar del estado cuando algo va mal, explicar por escrito lo que ya sabes. Esa proporción, entre uno a cinco y uno a diez, no es un defecto de este ejemplo: es la constante que gobierna la distancia entre *funciona* y *está terminado*, y se repite idéntica en una biblioteca, en un servicio o en un producto. La razón por la que sorprende es que la parte interesante del problema, la que motivó empezar, está resuelta al diez por ciento del esfuerzo, y a partir de ahí el trabajo consiste en enumerar sistemáticamente lo que puede salir mal en manos de alguien que no eres tú, con una configuración que no probaste, en un flujo que no imaginaste. Ese trabajo no produce ninguna sensación de progreso, no se demuestra bien y casi nunca se agradece, y por eso el mundo está lleno de fragmentos abandonados al noventa por ciento y escaso de artefactos terminados. Aquí está la única conclusión que importa de este nivel entero: publicar un plugin diminuto y completamente acabado enseña más, y vale más, que empezar tres ambiciosos. Enseña porque la última milla es donde viven las lecciones que ningún tutorial cubre; vale porque un artefacto terminado que resuelve una cosa pequeña de verdad tiene usuarios, y los usuarios son la fuente de todas las mejoras que tú solo nunca habrías imaginado. La invitación, entonces, es literal: elige la molestia más pequeña de tu flujo diario, la que llevas meses tolerando, y conviértela en doscientas líneas terminadas. El siguiente plugin será mejor porque este existió.
+</Callout>
+
+<Challenge title="Tu primer plugin publicado">
+1. Escribe la frase de alcance de tu propio plugin y deriva de ella la lista completa de su superficie pública antes de tocar el código.
+2. Implementa la separación en cuatro módulos y verifica que la lógica de identidad del proyecto se puede probar sin abrir ninguna ventana.
+3. Añade el ciclo de vida completo: apertura, persistencia, cierre con guardado, recolocación al cambiar el tamaño y limpieza al salir del editor.
+4. Escribe la comprobación de salud y el fichero de ayuda, y ejecútalos ambos desde una configuración mínima aislada.
+5. Etiqueta la versión, publícala y pídele a una persona que la instale sin darle más instrucciones que el nombre del repositorio; anota todo lo que te pregunte.
+</Challenge>

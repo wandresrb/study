@@ -1,0 +1,147 @@
+---
+title: "El ciclo de una interrupción: registrar y atender"
+description: "Cómo un dispositivo interrumpe a la CPU, cómo se registra el manejador con request_irq, por qué corre en un contexto atómico donde no puede dormir, qué distingue devolver IRQ_HANDLED de IRQ_NONE y cómo conviven varios dispositivos en una línea compartida con IRQF_SHARED."
+subject: kernel
+level: 34
+order: 1
+position: "34.1"
+duration: "16 min"
+---
+
+<Lead>
+Un teclado que se pulsa, un paquete que llega, un DMA que termina: en todos los casos un dispositivo necesita decirle a la CPU "atiéndeme ahora", y no puede esperar a que un programa lo consulte. Eleva una línea eléctrica, el controlador de interrupciones la enruta y la CPU abandona lo que estaba haciendo para saltar a una función que tú registraste. Ese salto brutal —romper la ejecución normal a mitad de camino— gobierna toda la E/S del sistema, y su primera regla es implacable: el manejador corre en un mundo prestado donde no puede dormir.
+</Lead>
+
+<Goals>
+
+- Registrar un manejador con `request_irq` y liberarlo con `free_irq`.
+- Entender el contexto de interrupción: atómico, sin dormir, sin tocar espacio de usuario.
+- Devolver `IRQ_HANDLED`, `IRQ_NONE` o `IRQ_WAKE_THREAD` según corresponda.
+- Compartir una línea con `IRQF_SHARED` e identificar al emisor real.
+
+</Goals>
+
+## request_irq: enlazar una línea con una función
+
+Registrar un manejador es declararle al núcleo "cuando llegue la interrupción número `irq`, llama a esta función". La firma vive en `linux/interrupt.h`:
+
+```c
+int request_irq(unsigned int irq, irq_handler_t handler,
+                unsigned long flags, const char *name, void *dev);
+```
+
+`irq` es el número de línea virtual, que un driver moderno obtiene del Device Tree, de ACPI o del subsistema MSI, nunca a mano. `handler` es tu función. `flags` combina banderas como `IRQF_SHARED` o `IRQF_TRIGGER_RISING`. `name` aparece en `/proc/interrupts`. Y `dev` es una cookie opaca: se te devuelve en cada llamada al manejador y sirve para identificar este registro concreto al liberarlo. En un driver de plataforma real:
+
+```c
+static irqreturn_t mi_handler(int irq, void *dev_id);
+
+static int mi_probe(struct platform_device *pdev)
+{
+	struct mi_dispositivo *dev;
+	int irq, ret;
+
+	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	irq = platform_get_irq(pdev, 0);       /* la línea, desde el Device Tree */
+	if (irq < 0)
+		return irq;
+
+	ret = devm_request_irq(&pdev->dev, irq, mi_handler,
+			       IRQF_SHARED, "mi-dispositivo", dev);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "no pude pedir la IRQ %d\n", irq);
+
+	platform_set_drvdata(pdev, dev);
+	return 0;
+}
+```
+
+La variante `devm_request_irq` ata la liberación al ciclo de vida del `struct device`: cuando el driver se desvincula, el núcleo llama a `free_irq` por ti. Sin `devm`, tú mismo debes invocar `free_irq(irq, dev)` en la ruta de descarga, pasando la **misma** cookie `dev` con la que registraste.
+
+## El contexto de interrupción: el mundo prestado
+
+Tu manejador no corre dentro de ningún proceso. La CPU fue expropiada a mitad de otra tarea, así que `current` apunta a un hilo cualquiera con el que no tienes nada que ver: no hay a quién dormir. De ahí brota la regla de oro del **contexto de interrupción dura** (`in_hardirq()` es verdadero): es atómico, y todo lo que pueda bloquear está prohibido.
+
+```c
+static irqreturn_t mi_handler(int irq, void *dev_id)
+{
+	struct mi_dispositivo *dev = dev_id;
+
+	/* PROHIBIDO aquí, porque cada línea puede dormir:            */
+	/* mutex_lock(&dev->lock);   -> los mutex duermen si hay pugna */
+	/* kmalloc(n, GFP_KERNEL);   -> puede bloquear haciendo reclaim */
+	/* copy_to_user(u, k, n);    -> puede provocar un fallo de página */
+	/* msleep(1);                -> duerme; "scheduling while atomic" */
+
+	spin_lock(&dev->lock);         /* correcto: el spinlock no duerme */
+	dev->eventos++;
+	spin_unlock(&dev->lock);
+	return IRQ_HANDLED;
+}
+```
+
+Si necesitas memoria, es `GFP_ATOMIC`; si necesitas exclusión, es un spinlock, no un mutex. Y si de verdad hace falta dormir —hablar por I2C, tomar un mutex, copiar a espacio de usuario— eso **no** ocurre aquí: se difiere a un contexto que sí pueda hacerlo, y de eso trata el resto del nivel. Dormir en contexto de interrupción no es un error de estilo: es un `BUG` que cuelga la máquina.
+
+## El valor de retorno: IRQ_HANDLED frente a IRQ_NONE
+
+El manejador devuelve un `irqreturn_t`, un enumerado con tres valores. `IRQ_HANDLED` significa "sí, era mi dispositivo y lo he atendido". `IRQ_NONE` significa "no he sido yo": el núcleo lo usa para detectar interrupciones espurias y, si una línea acumula demasiadas seguidas sin que nadie las reclame, la deshabilita para no colgar el sistema. `IRQ_WAKE_THREAD` despierta al hilo de un manejador dividido (nivel 34.3).
+
+```c
+static irqreturn_t mi_handler(int irq, void *dev_id)
+{
+	struct mi_dispositivo *dev = dev_id;
+	u32 status;
+
+	status = readl(dev->regs + REG_INT_STATUS);
+	if (!(status & INT_MINE))
+		return IRQ_NONE;                 /* no fui yo: comparto la línea */
+
+	writel(status, dev->regs + REG_INT_ACK); /* reconocer y bajar la línea */
+	dev->eventos++;
+	return IRQ_HANDLED;
+}
+```
+
+Reconocer la interrupción en el hardware —el `writel` al registro de ACK— es obligatorio en líneas por nivel: si no bajas la señal, el dispositivo la mantiene alta y entras en una tormenta de interrupciones que reingresa al manejador sin fin.
+
+## IRQ compartidas: varios dueños en un cable
+
+En el PCI clásico varios dispositivos comparten una única línea física INTx. Registras con `IRQF_SHARED` y el núcleo encadena todos los manejadores de esa línea: **los llama a todos** en cada interrupción, y cada uno debe consultar su propio hardware para saber si fue el emisor y, si no, devolver `IRQ_NONE`. Por eso la cookie `dev` debe ser única y no nula en una línea compartida: es lo que distingue tu registro del vecino.
+
+```bash
+# quién está en cada línea, con sus contadores por CPU
+cat /proc/interrupts
+#            CPU0       CPU1
+#  16:        142         0   IO-APIC   16-fasteoi   ehci_hcd, mi-dispositivo
+```
+
+Aquí `ehci_hcd` y `mi-dispositivo` cuelgan de la misma línea 16. Cada uno lee su registro de estado antes de actuar. Esta ceremonia es precisamente lo que MSI y MSI-X eliminan: al dar a cada dispositivo su propio vector, ya no hay línea que compartir ni estado que interrogar, una de las razones por las que el hardware moderno los prefiere.
+
+<Mermaid code={`sequenceDiagram
+  participant HW as Dispositivo
+  participant CPU
+  participant H as Manejador
+  HW->>CPU: eleva la linea IRQ
+  CPU->>CPU: guarda el contexto y enmascara la linea
+  CPU->>H: salta al manejador registrado
+  H->>HW: lee estado y reconoce la interrupcion
+  H->>CPU: devuelve IRQ_HANDLED
+  CPU->>CPU: restaura el contexto y desenmascara`} />
+
+<Callout type="info" title="request_irq es threaded por dentro">
+En los núcleos actuales `request_irq` es un simple `inline` que llama a `request_threaded_irq` con el manejador de hilo a `NULL`. No hay dos caminos distintos: hay uno solo, el dividido, del que `request_irq` es el caso degenerado sin mitad inferior. Lo verás con todas sus letras en el nivel 34.3.
+</Callout>
+
+<Callout type="dios" title="La interrupción es una costura violenta en el tiempo">
+Detente en lo que acaba de pasar, porque reordena la intuición de todo lo que viene. Durante los niveles anteriores el flujo de ejecución era una línea continua: un hilo avanza instrucción tras instrucción y, si se detiene, es porque el planificador decidió apartarlo. La interrupción rompe ese contrato. No la pide nadie del software; la impone el hardware desde fuera, a mitad de cualquier instrucción, sin preguntar qué estaba haciendo la CPU. El resultado es un segundo hilo de ejecución que nace de la nada sobre el mismo procesador, sin proceso propio, sin pila de usuario, sin nadie a quien planificar. Y de esa única carencia —no hay proceso al que dormir— se deduce, con necesidad lógica y no por capricho, toda la prohibición que gobierna el contexto de interrupción: no puedes tomar un mutex porque dormir exige un durmiente, no puedes usar `GFP_KERNEL` porque esperar memoria exige poder ceder la CPU, no puedes copiar a espacio de usuario porque un fallo de página exige un proceso que lo resuelva. El contexto de interrupción no es "código normal con reglas raras": es un lugar ontológicamente distinto, una costura en el tejido temporal del sistema donde el concepto mismo de "esperar" no existe. Todo el resto del nivel —top half y bottom half, hilos de IRQ, softirqs, workqueues— es una sola idea repetida en cinco formas: cómo escapar de esta costura sin proceso hacia un lugar donde volver a tener el derecho de dormir.
+</Callout>
+
+<Challenge title="Registra y observa tu primera interrupción">
+1. Escribe un módulo que pida una IRQ compartida de tu máquina con `request_irq` e `IRQF_SHARED`, y en el manejador incremente un contador y devuelva `IRQ_NONE` si el estado no es suyo.
+2. Comprueba en `/proc/interrupts` que tu nombre aparece junto a los otros dueños de la línea.
+3. Explica, en tres líneas, por qué pasar `dev = NULL` en una línea compartida hace que `request_irq` falle con `-EINVAL`.
+4. Razona qué le pasaría al sistema si tu manejador tomara un `mutex` y otro hilo ya lo tuviera cogido.
+5. Sustituye `request_irq` por `devm_request_irq` y argumenta qué código de la ruta de descarga acabas de poder borrar.
+</Challenge>

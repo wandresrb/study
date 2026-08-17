@@ -1,0 +1,144 @@
+---
+title: "Anotaciones: subclases y clases de lock"
+description: "Cuando anidas legítimamente dos locks del mismo tipo, lockdep grita un falso positivo de recursión. Cómo enseñarle la jerarquía real con spin_lock_nested, mutex_lock_nested, subclases y lockdep_set_class, y por qué mentirle es peligroso."
+subject: kernel
+level: 19
+order: 4
+position: "19.4"
+duration: "14 min"
+---
+
+<Lead>
+lockdep razona por clases, y esa es a la vez su fuerza y su punto ciego. Cuando tomas dos instancias distintas de la misma clase —dos inodos, dos dispositivos hermanos— lockdep ve "misma clase sobre misma clase" y grita recursión. Si el anidamiento es legítimo, la respuesta no es silenciar el aviso: es enseñarle a lockdep la jerarquía real.
+</Lead>
+
+<Goals>
+
+- Entender por qué anidar la misma clase dispara un falso positivo.
+- Usar `spin_lock_nested()` y `mutex_lock_nested()` con subclases.
+- Separar clases con `lockdep_set_class()`.
+- Reconocer cuándo una anotación oculta un bug de verdad.
+
+</Goals>
+
+## El falso positivo del mismo tipo
+
+Recuerda del nivel 19.2 que la misma clase adquirida dos veces parece un *lock recursion deadlock*. Pero hay casos legítimos: estructuras con jerarquía natural donde el kernel toma dos objetos del mismo tipo en un orden fijo y correcto. El ejemplo canónico es el disco entero y una de sus particiones: siempre se bloquea el disco antes que la partición.
+
+```c
+/* dos inodos en un rename: ambos son la clase i_rwsem */
+inode_lock(dir_origen);
+inode_lock(dir_destino);   /* lockdep: possible recursive locking! */
+```
+
+El aviso es un falso positivo: `dir_origen` y `dir_destino` son instancias distintas y el código respeta un orden. Pero lockdep no conoce ese orden porque no es estático: hay que declarárselo.
+
+El mismo patrón aparece por todo el kernel: dos directorios en un `rename`, un dispositivo padre y su hijo en el árbol de dispositivos, dos `sockets` en una conexión, un disco y su partición. Siempre que existe una jerarquía natural entre objetos del mismo tipo hay un anidamiento legítimo que lockdep, por sí solo, no puede distinguir de un bug de recursión. La anotación es el puente entre lo que el programador sabe y lo que el validador puede probar.
+
+## Subclases: enseñar la jerarquía
+
+Las primitivas con sufijo `_nested` aceptan un número de subclase. lockdep trata cada subclase como una clase distinta a efectos de validación, de modo que "clase.0 antes que clase.1" ya no es recursión sino un orden legítimo:
+
+```c
+enum {
+	BD_MUTEX_NORMAL,
+	BD_MUTEX_WHOLE,
+	BD_MUTEX_PARTITION,
+};
+
+/* se sabe que el disco entero ya esta bloqueado en el nivel WHOLE */
+mutex_lock_nested(&part->bd_mutex, BD_MUTEX_PARTITION);
+```
+
+Para la pareja de inodos, el patrón estándar combina un orden estable por dirección con una subclase para el segundo:
+
+```c
+if (inode1 > inode2)
+	swap(inode1, inode2);
+
+inode_lock(inode1);                          /* subclase normal  */
+inode_lock_nested(inode2, I_MUTEX_CHILD);    /* subclase distinta */
+```
+
+Hay como máximo ocho subclases por clase (`MAX_LOCKDEP_SUBCLASSES`). Una variante útil es `spin_lock_nest_lock(&interno, &externo)`, que le dice a lockdep que todos los locks internos de una clase están siempre serializados por un lock externo ya retenido: así se anotan, por ejemplo, los locks de tabla de páginas bajo el `mmap_lock`.
+
+Con la subclase, lockdep deja de ver `inode.0 → inode.0`, que interpretaría como recursión, y pasa a ver `inode.0 → inode.1`, un orden legítimo entre subclases numeradas. El aviso desaparece sin cegar nada importante: un tercer hilo que tomara los mismos dos inodos en orden inverso seguiría disparando el splat, porque violaría de verdad la jerarquía declarada. Esa es la señal de que una anotación bien puesta informa en lugar de silenciar, y la razón por la que insistiremos en que la jerarquía que afirmas sea cierta.
+
+## Clases separadas con lockdep_set_class
+
+El problema inverso: dos locks que **comparten** clase por inicializarse en el mismo sitio, pero que en realidad son jerárquicamente distintos y se toman uno tras otro de forma legítima. Aquí se les asigna una clave de clase propia:
+
+```c
+static struct lock_class_key clave_padre;
+static struct lock_class_key clave_hijo;
+
+spin_lock_init(&padre->lock);
+lockdep_set_class(&padre->lock, &clave_padre);
+spin_lock_init(&hijo->lock);
+lockdep_set_class(&hijo->lock, &clave_hijo);
+```
+
+El kernel lo usa de verdad para dar a cada tipo de sistema de archivos su propia clase de superbloque, evitando ciclos falsos entre subsistemas que nunca interactúan:
+
+```c
+lockdep_set_class(&sb->s_umount, &type->s_umount_key);
+```
+
+Cuidado con el reverso de esta moneda: si un array de miles de `spinlock_t` no se inicializa con `spin_lock_init()` en tiempo de ejecución, todas las instancias quedan mal atribuidas o agotan `MAX_LOCKDEP_KEYS`. La regla práctica es simple: inicializa siempre tus locks explícitamente.
+
+## Otras anotaciones del validador
+
+Las subclases no son la única forma de hablar con lockdep. Hay un vocabulario completo de anotaciones:
+
+- `lockdep_assert_held(&lock)` genera un WARN si el lock no está retenido en ese punto: convierte un comentario de "aquí hay que tener el lock" en un contrato verificado en tiempo de ejecución.
+- `lockdep_pin_lock()` y `lockdep_unpin_lock()` sujetan un lock con un *cookie* y avisan si alguien lo suelta "por accidente" entre medias, un peligro real en código con callbacks que asumen el lock intacto.
+- `lockdep_set_subclass()` reclasifica una instancia ya inicializada a una subclase, y `lockdep_set_class_and_name()` fija clase y nombre a la vez para que el splat sea legible.
+
+```c
+void update_rq_clock(struct rq *rq)
+{
+	lockdep_assert_held(&rq->lock);   /* WARN si el lock no esta tomado */
+	/* ... actualizar el reloj de la runqueue ... */
+}
+```
+
+Para el patrón de dos objetos del mismo tipo sin jerarquía nombrada, `SINGLE_DEPTH_NESTING` es la subclase de conveniencia: dice "este segundo lock está un peldaño por debajo del primero" sin necesidad de inventar un enum.
+
+```c
+/* pin/unpin: cazar que un callback suelte un lock que debia permanecer */
+cookie = lockdep_pin_lock(&rq->lock);
+invocar_callback(rq);             /* si suelta rq->lock, salta el WARN */
+lockdep_unpin_lock(&rq->lock, cookie);
+```
+
+<Cards>
+  <Card icon="🪜" title="_nested / subclase">
+    Mismo tipo con jerarquía real: un peldaño por objeto.
+  </Card>
+  <Card icon="🏷️" title="lockdep_set_class">
+    Mismo sitio de init, locks independientes: clases separadas.
+  </Card>
+  <Card icon="✅" title="lockdep_assert_held">
+    Contrato de "este lock debe estar tomado", verificado en runtime.
+  </Card>
+  <Card icon="📌" title="pin / unpin">
+    Detecta que un callback suelte un lock que debía permanecer.
+  </Card>
+</Cards>
+
+<Callout type="note" title="La anotación es documentación que se ejecuta">
+La documentación de lockdep da un consejo que conviene hacer propio: ante la duda, prefiere una anotación a un comentario. Un comentario que dice "hay que tener este lock" envejece, miente y nadie lo comprueba; un `lockdep_assert_held()` lo verifica en cada ejecución y grita cuando alguien rompe la invariante. Las anotaciones cargan el mismo nivel de detalle que un comentario, pero con dientes.
+</Callout>
+
+## El peligro: mentirle a lockdep
+
+<Callout type="dios" title="Una anotación es una afirmación, no un silenciador">
+Aquí es donde muchos programadores de kernel se pegan un tiro en el pie, así que graba esto. Cuando escribes `mutex_lock_nested(&x, SUBCLASE)` no le estás pidiendo a lockdep que "se calle": le estás **jurando** que existe una jerarquía real y que este lock ocupa ese peldaño. Si la jerarquía que afirmas es falsa, acabas de convertir un deadlock real y detectable en un bug silencioso que lockdep ya no puede ver. Has apagado el detector de humos porque te molestaba el pitido. La documentación del validador lo dice sin rodeos: al pasar código a las primitivas `_nested`, verifica con extremo cuidado que la jerarquía está correctamente mapeada, porque un error te da falsos positivos o, peor, falsos negativos. La disciplina correcta es esta: primero intenta que no haya anidamiento del mismo tipo, o impón un orden global real por dirección o por rol; solo si el anidamiento es genuino y lockdep no puede deducirlo, anótalo, y hazlo con un comentario que explique por qué la jerarquía es cierta. Una anotación sin justificación es deuda de concurrencia esperando a cobrarse con intereses. Trata cada `_nested` como lo que es: una prueba que tú aportas y de la que te haces responsable ante el siguiente que lea el código.
+</Callout>
+
+<Challenge title="Anota una jerarquía sin romperla">
+1. Provoca el "possible recursive locking" tomando dos instancias de la misma clase de `mutex`.
+2. Arréglalo con `mutex_lock_nested()` y una subclase, documentando la jerarquía.
+3. Usa `lockdep_set_class()` para separar dos locks que compartían sitio de init pero son independientes.
+4. Escribe en una frase la jerarquía que estás afirmando en cada anotación: si no puedes, la anotación está mal.
+</Challenge>

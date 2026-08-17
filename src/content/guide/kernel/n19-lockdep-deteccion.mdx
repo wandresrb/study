@@ -1,0 +1,143 @@
+---
+title: "lockdep: probar que no puede haber deadlock"
+description: "Cómo el kernel construye en tiempo de ejecución el grafo de dependencias entre clases de lock, detecta ciclos y usos de IRQ peligrosos, y demuestra la ausencia de familias enteras de deadlock aunque el timing fatal no ocurra nunca. CONFIG_PROVE_LOCKING."
+subject: kernel
+level: 19
+order: 2
+position: "19.2"
+duration: "15 min"
+---
+
+<Lead>
+Los tres deadlocks del nivel anterior comparten un defecto letal para las pruebas: solo se manifiestan con un timing exacto que casi nunca ocurre en el laboratorio. lockdep le da la vuelta al problema. En lugar de esperar al deadlock, aprende las reglas de orden de tus locks sobre la marcha y demuestra que ningún timing podría colgar la máquina.
+</Lead>
+
+<Goals>
+
+- Distinguir una clase de lock de una instancia.
+- Ver cómo se construye el grafo de dependencias y se detectan ciclos.
+- Entender el rastreo del estado de IRQ de cada clase.
+- Activar `CONFIG_PROVE_LOCKING` y conocer su coste.
+
+</Goals>
+
+## La clase de lock, no la instancia
+
+lockdep no razona sobre locks individuales sino sobre **clases**. Una clase agrupa todos los locks que son "el mismo" desde el punto de vista de las reglas de bloqueo, aunque existan miles de instancias. El `i_rwsem` de un `struct inode` es una clase; cada inodo del sistema tiene su propia instancia de esa clase.
+
+La clase se registra la primera vez que una instancia se usa tras el arranque; a partir de ahí, toda instancia que nazca del mismo sitio de inicialización se mapea a esa clase y contribuye a su historial. Por eso la clave de la clase es, esencialmente, el sitio de código donde se llamó a `spin_lock_init()` o `mutex_init()`. La clase sobrevive a la muerte de sus instancias; solo desaparece si se libera su memoria, por ejemplo al descargar un módulo.
+
+Esto es lo que da a lockdep su poder de generalización: basta con que **una** instancia recorra una secuencia de bloqueo para que la regla quede aprendida para **todas** las instancias de esa clase, para siempre.
+
+Un corolario incómodo: si un subsistema crea miles de locks del mismo tipo pero con jerarquías distintas, lockdep los mete a todos en el mismo saco y puede inventar ciclos que no existen. Ese es el precio del razonamiento por clases, y el motivo de las anotaciones del nivel 19.4.
+
+El validador instrumenta todas las primitivas de bloqueo del kernel —spinlocks, rwlocks, mutexes, rwsems, seqlocks— y hasta el `rcu_read_lock()`, cuyo uso vigila para que ningún `lockdep_assert_held()` de una sección RCU se incumpla. Casi cualquier cosa que se tome y se suelte cae bajo su mirada.
+
+## El grafo de dependencias y el ciclo
+
+Cada vez que un hilo adquiere un lock mientras ya retiene otros, lockdep anota una arista dirigida `clase_retenida → clase_nueva`. Con el tiempo se construye un grafo dirigido de "quién se toma antes que quién". Antes de añadir cada arista, la validación hace una pregunta: ¿esta nueva arista cierra un ciclo?
+
+```text
+Hilo 1, alguna vez:   spin_lock(&a);  spin_lock(&b);   =>  arista  a --> b
+Hilo 2, alguna vez:   spin_lock(&b);  spin_lock(&a);   =>  arista  b --> a   (CICLO)
+```
+
+Nota lo crucial: los dos hilos **no** tienen que ejecutarse a la vez. La arista `a → b` pudo aprenderse el martes y la `b → a` el jueves. En cuanto la segunda cierra un ciclo, lockdep dispara el aviso. La condición de carrera nunca tuvo que darse: solo hizo falta recorrer cada arista una vez, en cualquier momento y contexto.
+
+<Mermaid code={`flowchart LR
+  A[clase lock_a] -->|hilo 1 toma a luego b| B[clase lock_b]
+  B -->|hilo 2 toma b luego a| A`} />
+
+Un ejemplo mínimo lo hace tangible. Dos hilos recorren órdenes opuestos, cada uno una sola vez y **sin solaparse jamás**:
+
+```c
+/* linea temporal, sin solape entre hilos:       */
+/* hilo 1:  spin_lock(&a); spin_lock(&b); ...     */   /* lockdep aprende  a -> b */
+/* hilo 2:  spin_lock(&b); spin_lock(&a); ...     */   /* cierra el ciclo  b -> a */
+```
+
+Cuando corre el hilo 1, lockdep registra la arista `a → b`. Más tarde, en cuanto el hilo 2 pide `a` reteniendo `b`, la arista `b → a` cerraría el ciclo, y lockdep dispara el splat en ese preciso instante. Ninguno de los dos hilos llegó a esperar al otro; el deadlock no ocurrió. Lo que lockdep entrega no es el cadáver, sino la prueba anticipada de que el crimen es posible.
+
+Da igual el orden temporal: si el hilo 2 hubiera corrido primero, lockdep habría aprendido `b → a` y habría saltado al ver `a → b`. La detección es simétrica en el tiempo porque opera sobre un grafo acumulado, no sobre una traza de ejecución concreta. Puedes inspeccionar las cadenas ya validadas en `/proc/lockdep_chains`: cada una es una secuencia de clases que el validador dio por buena y cacheó.
+
+## El estado de IRQ: la otra mitad del trabajo
+
+Los ciclos ABBA son solo la mitad. lockdep también rastrea, por cada clase, en qué contextos de IRQ se usa: si alguna vez se tomó en contexto de hardirq o softirq (*irq-safe*), y si alguna vez se tomó con las IRQs habilitadas (*irq-unsafe*). Las reglas de un solo lock son estrictas:
+
+- Una clase *hardirq-safe* nunca debe tomarse *hardirq-unsafe*: sería el deadlock de IRQ del nivel anterior.
+- Toda dependencia `hardirq-safe → hardirq-unsafe` está prohibida, porque una interrupción podría cortar en medio al segundo lock.
+
+Lo notable: lockdep deduce el peligro de IRQ **sin que la interrupción tenga que llegar en el instante fatal**. Le basta con haber visto una vez el lock en un manejador de IRQ y otra vez con IRQs habilitadas. Registra los dos hechos por separado y luego demuestra que su combinación es explosiva.
+
+Bajo el capó, cada clase acumula cuatro hechos de uso por contexto —tomada en el contexto, tomada como readlock en el contexto, tomada con el contexto habilitado, y readlock con el contexto habilitado— y de ellos derivan etiquetas que han de ser mutuamente excluyentes: una clase no puede ser a la vez *hardirq-safe* y *hardirq-unsafe*. Además, ser *softirq-unsafe* implica ser *hardirq-unsafe*, porque un hardirq puede interrumpir a un softirq. Cada vez que una clase estrena un estado, lockdep revisa su pasado en busca de la contradicción. En código, esa es justo la diferencia entre estas dos formas de tomar el mismo lock:
+
+```c
+spin_lock(&x);                 /* deja la clase como irq-unsafe   */
+spin_lock_irqsave(&x, flags);  /* compatible con uso en hardirq   */
+```
+
+## Cadenas, límites y fugas de clases
+
+El validador no revalida cada secuencia una y otra vez: sería insostenible. Mantiene una pila de locks retenidos y, por cada secuencia única —cada *lock chain*—, calcula un hash de 64 bits. La primera vez que ve una cadena la valida y guarda su hash; si reaparece, el hash le dice que ya está probada y la salta. Ese caché es lo que vuelve tolerable una comprobación intrínsecamente cuadrática.
+
+El presupuesto de clases no es infinito. `MAX_LOCKDEP_KEYS` (8191 por defecto; un escritorio típico usa menos de mil) acota cuántas clases pueden existir, y dos errores clásicos lo agotan:
+
+- **Fuga de clases** al cargar y descargar un módulo en bucle: cada carga crea clases nuevas y la descarga no las recupera.
+- **Locks sin inicializar** en arrays grandes: mil `spinlock_t` sin un `spin_lock_init()` explícito no se colapsan en una sola clase como deberían.
+
+```bash
+# cuantas clases hay y cual es el techo
+grep lock-classes /proc/lockdep_stats
+# lock-classes:  748 [max: 8191]
+```
+
+## Activarlo y lo que cuesta
+
+lockdep se enciende con una sola opción, que arrastra al validador y a las variantes de depuración de cada primitiva:
+
+```bash
+# en la configuracion del kernel
+CONFIG_PROVE_LOCKING=y
+# selecciona CONFIG_LOCKDEP, CONFIG_DEBUG_SPINLOCK, CONFIG_DEBUG_MUTEXES...
+
+# estadisticas en tiempo de ejecucion
+cat /proc/lockdep_stats
+cat /proc/lockdep
+```
+
+El coste es real: la comprobación es de complejidad cuadrática sobre los locks retenidos. lockdep lo hace viable cacheando cada "cadena" única de locks con un hash de 64 bits; una cadena ya validada no se vuelve a comprobar. Aun así, es un kernel de depuración: se ejecuta en una VM, no en producción. Un primo cercano, `CONFIG_LOCK_STAT`, no persigue deadlocks sino contención: `/proc/lock_stat` mide cuánto se espera por cada clase de lock, útil cuando el problema no es la corrección sino la escalabilidad. Y al primer fallo, lockdep imprime el informe y se autodesactiva (`debug_locks = 0`): a partir de ahí sus avisos dejan de ser fiables, así que el primero es el que importa.
+
+## Lo que lockdep no ve
+
+lockdep razona sobre el **orden** de los locks, no sobre lo que protegen. No sabe si un dato compartido debería estar bajo un lock y no lo está: eso es un data race, invisible para lockdep y territorio de KCSAN (nivel 19.5). Tampoco juzga si un lock es el adecuado para un dato, ni detecta bloqueos por recursos que no sean locks. Su dominio es preciso y acotado: probar que ninguna combinación de órdenes de adquisición puede cerrarse en un círculo.
+
+Tampoco entiende, en general, dependencias que no pasan por locks: un hilo que espera un `completion` que otro debe señalar queda fuera de su alcance. Algunos casos concretos sí están anotados a mano —flushear una workqueue mientras retienes un lock que uno de sus trabajos necesita se detecta—, pero como regla, lo que no es un lock lockdep no lo ve. Es un teorema estrecho, pero de una solidez enorme; saber exactamente qué demuestra, y qué no, es lo que evita tanto confiar de más como descartar sus avisos a la ligera.
+
+<Callout type="warn" title="El primer splat es el único fiable">
+Cuando lockdep detecta cualquier violación imprime el informe y pone `debug_locks = 0`, apagándose por completo. Es deliberado: una vez que el grafo contiene una anomalía, los avisos posteriores podrían ser ruido derivado del primero. En la práctica, cuando cazas un bug de locking el **primer** splat del `dmesg` es el que hay que analizar; cualquier aviso posterior de esa misma sesión es sospechoso. Reinicia la VM, arregla ese primer problema y vuelve a ejecutar para descubrir el siguiente.
+</Callout>
+
+Con esto, lockdep vigila tres cosas a la vez cada vez que tomas un lock:
+
+<Cards>
+  <Card icon="🔁" title="Recursión">
+    La misma clase adquirida dos veces sin anotación: posible auto-deadlock.
+  </Card>
+  <Card icon="🔄" title="Inversión ABBA">
+    Un ciclo en el grafo de dependencias entre clases: posible deadlock circular.
+  </Card>
+  <Card icon="⚡" title="Inversión de IRQ">
+    Un lock hardirq-safe tomado con IRQs habilitadas: posible deadlock de interrupción.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="El cierre del 100%: una ejecución basta para probar la corrección">
+Esta es la idea más profunda de lockdep, y merece que la saborees. El validador alcanza lo que su documentación llama un "cierre matemático": para toda secuencia de bloqueo simple de un único hilo que haya ocurrido **al menos una vez** en la vida del kernel, demuestra con certeza que ninguna combinación ni timing de esas secuencias puede causar deadlock. Traducido a la práctica: no necesitas reproducir el escenario multi-CPU imposible con tres núcleos, dos IRQs anidadas y un timing de nanosegundos. Te basta con disparar, una vez cada una, las cadenas de bloqueo "componentes" —cosa que el testing normal sí consigue— y lockdep compone por ti todas las interacciones peligrosas. Un deadlock que en la realidad exigiría una constelación irrepetible de tareas y contextos se detecta en un portátil monoprocesador ligeramente cargado. Eso cambia la naturaleza de la QA de concurrencia: de "reza por reproducir la carrera" a "recorre cada camino de código una vez". Es de lo más cerca que está el kernel de una prueba formal de corrección corriendo sobre hardware real, y explica por qué ningún parche de locking serio llega a upstream sin pasar por un kernel con lockdep encendido.
+</Callout>
+
+<Challenge title="Haz que lockdep hable">
+1. Compila un kernel con `CONFIG_PROVE_LOCKING=y` y arráncalo en QEMU.
+2. Escribe un módulo con un ABBA de dos `spinlock` en dos `kthread`; comprueba que lockdep lo detecta **aunque no llegue a colgarse**.
+3. Lee `/proc/lockdep_stats` antes y después: observa cómo crece el número de `lock-classes`.
+4. Explica por qué basta con ejecutar cada hilo una vez, sin solaparlos, para disparar el aviso.
+</Challenge>

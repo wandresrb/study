@@ -1,0 +1,229 @@
+---
+title: "Depurar un NaN que se propaga"
+description: "De dónde nacen los NaN, por qué contaminan un buffer entero, las tres herramientas que los localizan de verdad, y la defensa por construcción que hace que no vuelvan."
+subject: webgpu
+level: 41
+order: 5
+position: "41.5"
+duration: "23 min"
+---
+
+<Lead>
+Un NaN es el único valor de la aritmética que se reproduce. Nace de una operación indefinida en un solo píxel, contamina todo lo que toca porque cualquier operación con un NaN devuelve NaN, y en cuanto pasa por una reducción, un mipmap o un acumulador temporal ha envenenado el buffer entero. El resultado es un artefacto que aparece muy lejos de donde se originó, no se reproduce igual dos veces y sobrevive a todos los parches locales. Se caza con tres herramientas concretas, y después se evita por construcción, que es lo único que de verdad lo arregla.
+</Lead>
+
+<Goals>
+
+- Enumerar las operaciones de WGSL que generan NaN e infinito y reconocerlas en tu código.
+- Detectar valores no finitos con `x != x` y con la comprobación por patrón de bits.
+- Instrumentar un pipeline con un shader de diagnóstico y un contador atómico por fotograma.
+- Escribir las cuatro guardas que impiden que un NaN llegue a nacer.
+
+</Goals>
+
+## De dónde nace y por qué se extiende
+
+NaN significa *not a number* y es el resultado que IEEE 754 devuelve cuando una operación no tiene respuesta definida. Su patrón de bits es el exponente lleno con la mantisa distinta de cero, lo que lo distingue del infinito, que tiene el exponente lleno y la mantisa a cero.
+
+Las fuentes son pocas y conviene sabérselas de memoria, porque en un shader real están todas presentes:
+
+| Operación | Cuándo produce NaN |
+|---|---|
+| `0.0 / 0.0` | Siempre. Con un denominador que puede anularse, es cuestión de tiempo |
+| `sqrt(x)` | Con `x` negativo |
+| `acos(x)`, `asin(x)` | Con el argumento fuera de `[-1, 1]` |
+| `normalize(v)` | Con `v` de longitud cero |
+| `inf - inf`, `inf * 0.0` | Indeterminaciones del infinito |
+| `pow(x, y)` | Con `x` negativo e `y` no entero |
+| `log(x)` | Con `x` negativo |
+
+El caso de `acos` merece atención porque es el más traicionero de la lista. El argumento habitual es un producto escalar de dos vectores normalizados, que matemáticamente vive en `[-1, 1]`. Pero `normalize` divide por una raíz cuadrada calculada con una función trascendente que no está garantizada al ULP, así que el resultado no tiene longitud exactamente uno, y el producto escalar de dos vectores casi paralelos sale `1,0000001`. `acos` de eso es NaN. **No es un caso raro: es el caso de dos vectores paralelos, que ocurre en cada fotograma en cuanto una luz apunta directamente a una superficie.**
+
+La propagación es la propiedad que convierte un problema local en uno global. Cualquier operación aritmética con un NaN devuelve NaN: sumarle cero, multiplicarlo por cero, promediarlo con un millón de valores sanos. Basta un píxel para arruinar cualquier estructura que agregue:
+
+- **Una reducción** en compute —una suma, un máximo, un histograma de luminancia para exposición automática— produce un único valor NaN, y ese valor se aplica a la imagen completa.
+- **Un mipmap**: el nivel uno promedia cuatro téxeles, así que el NaN se duplica en tamaño a cada nivel hasta cubrir toda la textura.
+- **Una acumulación temporal** —un path tracer progresivo, un TAA, un bloom con historial— realimenta su propia salida, así que un NaN entra una vez y ya no sale nunca. El buffer se muere y solo se recupera reinicializándolo.
+
+La propiedad que lo hace detectable es una rareza de IEEE 754: **NaN es el único valor que no es igual a sí mismo**. La comparación `x != x` es verdadera si y solo si `x` es NaN. Esto importa porque **en WGSL no existe `isnan` ni `isinf`**; no los busques y no los inventes. Para el infinito, la comprobación es contra un umbral: `abs(x) > 3.4e38` es cierto solo para infinito, dado que el mayor finito representable es `3,4028235e38`.
+
+## Cómo se ve en pantalla
+
+El aspecto del artefacto depende de en qué punto de la cadena entró el NaN, y saber leerlo acorta la búsqueda a la mitad.
+
+**Triángulos o píxeles negros aislados.** El NaN nació en el fragment shader y llegó al color. Si al escribirse en un formato de ocho bits por canal se satura a cero, verás negro; en un formato flotante puede propagarse al postproceso. Es el caso más benigno porque el daño está contenido en la etapa donde nació.
+
+**Un objeto entero desaparece.** El NaN llegó a `@builtin(position)`, así que la posición de recorte no es un número. Todas las comparaciones del recortador contra los planos del frustum devuelven falso cuando uno de los operandos es NaN, de modo que el triángulo se considera fuera y se descarta. El objeto no se dibuja mal: no se dibuja. La pista es que desaparece por completo, no parcialmente, y que suele reaparecer al cambiar de ángulo si la causa es un caso degenerado dependiente de la orientación.
+
+**El objeto se estira hasta el infinito.** Variante del anterior con un infinito en lugar de un NaN, típicamente de una división por una `w` que se anuló. El recortador sí opera con infinitos y produce triángulos que atraviesan la pantalla entera.
+
+**Una acumulación se pone negra de golpe y no se recupera.** El síntoma inconfundible del NaN realimentado. Lo característico es la irreversibilidad: por muchos fotogramas limpios que vengan después, el historial está envenenado. Si tu acumulador vuelve a la normalidad al mover la cámara, no es un NaN, es otra cosa.
+
+**Sombras o iluminación completamente rotas en una zona.** El NaN entró en un mapa de sombras o en una textura intermedia y sus mipmaps lo extendieron. Aquí el área afectada es mucho mayor que el origen, lo cual despista sobre la magnitud del problema.
+
+## Las tres herramientas
+
+**Uno: el shader de diagnóstico.** Sustituye el fragment shader por uno que pinte de magenta los NaN y de amarillo los infinitos, dejando el resto tal cual. Dos colores que no aparecen en ninguna escena real, y una respuesta inmediata sobre dónde está el problema en pantalla.
+
+```wgsl
+// 0 = finito, 1 = infinito, 2 = NaN. Ordenados para que max() elija lo peor.
+fn claseIeee(x: f32) -> u32 {
+  let bits = bitcast<u32>(x);
+  if ((bits & 0x7f800000u) != 0x7f800000u) { return 0u; }  // exponente no lleno
+  if ((bits & 0x007fffffu) != 0u)          { return 2u; }  // mantisa no nula: NaN
+  return 1u;
+}
+
+fn claseVec3(v: vec3f) -> u32 {
+  return max(max(claseIeee(v.x), claseIeee(v.y)), claseIeee(v.z));
+}
+
+@fragment
+fn fs(entrada: Interpolado) -> @location(0) vec4f {
+  let color = sombrear(entrada);
+  let clase = claseVec3(color);
+  let conInfinitos = select(color, vec3f(1.0, 1.0, 0.0), clase == 1u);
+  let conNan       = select(conInfinitos, vec3f(1.0, 0.0, 1.0), clase == 2u);
+  return vec4f(conNan, 1.0);
+}
+```
+
+La versión por patrón de bits no es un capricho de estilo: es la única que no puede desaparecer bajo optimización, y el motivo está en el callout del final. Recuerda que `select(falso, verdadero, condicion)` toma primero el valor que devuelve cuando la condición es falsa, al revés de lo que sugiere la costumbre de otros lenguajes.
+
+La misma función sirve para inspeccionar valores intermedios: cambia `color` por la normal, por el resultado del BRDF o por la posición de mundo, y sabrás en qué magnitud está el fallo.
+
+**Dos: bisecar el pipeline.** Cuando el NaN aparece al final de una cadena de pasadas, hay que averiguar en cuál nació. La técnica es escribir el valor intermedio a un render target en `rgba32float` y leerlo en la CPU.
+
+```ts
+const sonda = device.createTexture({
+  size: [ancho, alto],
+  format: 'rgba32float',
+  usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+});
+
+async function leerSonda(): Promise<Float32Array> {
+  const bytesPorFila = Math.ceil((ancho * 16) / 256) * 256;   // 16 B por texel, alineado a 256
+  const lectura = device.createBuffer({
+    size: bytesPorFila * alto,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer(
+    { texture: sonda },
+    { buffer: lectura, bytesPerRow: bytesPorFila },
+    { width: ancho, height: alto },
+  );
+  device.queue.submit([enc.finish()]);
+
+  await lectura.mapAsync(GPUMapMode.READ);
+  const copia = lectura.getMappedRange().slice(0);
+  lectura.unmap();
+  lectura.destroy();
+  return new Float32Array(copia);
+}
+
+function informar(datos: Float32Array, bytesPorFila: number) {
+  const floatsPorFila = bytesPorFila / 4;
+  for (let y = 0; y < alto; y++) {
+    for (let x = 0; x < ancho; x++) {
+      const i = y * floatsPorFila + x * 4;
+      for (let c = 0; c < 4; c++) {
+        const v = datos[i + c];
+        if (!Number.isFinite(v)) {
+          console.log(`primer no finito en (${x}, ${y}) canal ${c}: ${v}`);
+          return;
+        }
+      }
+    }
+  }
+  console.log('sonda limpia');
+}
+```
+
+Tres detalles que hacen fallar esto la primera vez. `bytesPerRow` tiene que ser múltiplo de 256, así que casi nunca coincide con `ancho * 16` y hay que saltar el relleno al recorrer. `getMappedRange` devuelve una vista sobre memoria que se invalida al llamar a `unmap`, de ahí el `slice(0)`. Y `rgba32float` es renderizable en el núcleo de WebGPU, pero mezclar sobre él exige la feature `float32-blendable` y filtrarlo al muestrear exige `float32-filterable`; para una sonda de diagnóstico no necesitas ninguna de las dos.
+
+**Tres: la alarma automática.** Leer píxeles a mano no escala. Lo que sí escala es un compute que recorra el buffer sospechoso y cuente los valores no finitos con un atómico, para tener un número por fotograma.
+
+```wgsl
+@group(0) @binding(0) var<storage, read>       datos:  array<f32>;
+@group(0) @binding(1) var<storage, read_write> alarma: array<atomic<u32>, 2>;
+
+@compute @workgroup_size(64)
+fn contarNoFinitos(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x;
+  if (i >= arrayLength(&datos)) { return; }
+
+  let bits = bitcast<u32>(datos[i]);
+  if ((bits & 0x7f800000u) == 0x7f800000u) {
+    if ((bits & 0x007fffffu) != 0u) {
+      atomicAdd(&alarma[0], 1u);   // NaN
+    } else {
+      atomicAdd(&alarma[1], 1u);   // infinito
+    }
+  }
+}
+```
+
+En la CPU, poner el buffer a cero con `writeBuffer` antes de cada despacho, lanzar el compute y leer los dos contadores cada cierto número de fotogramas —no cada uno, porque `mapAsync` sincroniza y hunde el rendimiento—. En cuanto uno de los dos deja de ser cero, tienes el fotograma exacto y el buffer exacto donde nació el problema, que es el noventa por ciento del trabajo de depuración.
+
+```ts
+const ceros = new Uint32Array(2);
+
+function reiniciarAlarma() {
+  device.queue.writeBuffer(bufferAlarma, 0, ceros);
+}
+
+async function comprobarAlarma() {
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(bufferAlarma, 0, bufferLectura, 0, 8);
+  device.queue.submit([enc.finish()]);
+  await bufferLectura.mapAsync(GPUMapMode.READ);
+  const [nan, inf] = new Uint32Array(bufferLectura.getMappedRange().slice(0));
+  bufferLectura.unmap();
+  if (nan || inf) console.warn(`fotograma con ${nan} NaN y ${inf} infinitos`);
+}
+```
+
+Deja esta comprobación permanentemente activa en la compilación de desarrollo, cada sesenta fotogramas. Es lo que convierte un NaN en un aviso con marca de tiempo en lugar de en un informe de usuario que dice «a veces se pone todo negro».
+
+## Defensa por construcción
+
+Las herramientas encuentran el NaN. Lo que impide que vuelva es no dejarlo nacer, y son cuatro guardas.
+
+```wgsl
+/** acos y asin: el argumento se acota SIEMPRE, sin excepciones. */
+fn anguloEntre(a: vec3f, b: vec3f) -> f32 {
+  return acos(clamp(dot(a, b), -1.0, 1.0));
+}
+
+/** normalize: comprueba la longitud AL CUADRADO, que es una sola multiplicacion. */
+fn normalizaSeguro(v: vec3f, porDefecto: vec3f) -> vec3f {
+  let l2 = dot(v, v);
+  return select(porDefecto, v * inverseSqrt(l2), l2 > 1e-16);
+}
+
+/** Division: el denominador nunca puede ser cero. Para denominadores no negativos. */
+fn divideSeguro(numerador: f32, denominador: f32) -> f32 {
+  return numerador / max(denominador, 1e-8);
+}
+
+/** Saturar antes de acumular. 65504 es el mayor finito de f16, el formato
+ *  habitual de un buffer de acumulacion. */
+fn saneaColor(c: vec3f) -> vec3f {
+  let limpio = select(c, vec3f(0.0), c != c);      // c != c da vec3<bool>
+  return clamp(limpio, vec3f(0.0), vec3f(65504.0));
+}
+```
+
+Cuatro comentarios sobre las cuatro. En `anguloEntre`, el `clamp` cuesta dos instrucciones y elimina la fuente de NaN más común de un motor PBR; ponlo aunque estés seguro de que el argumento está en rango, porque el error de `normalize` garantiza que a veces no lo estará. En `normalizaSeguro`, comparar `dot(v, v)` contra `1e-16` en vez de calcular `length(v)` evita una raíz cuadrada y es igual de fiable, ya que `1e-16` corresponde a una longitud de `1e-8`. En `divideSeguro`, la versión con `max` solo vale si el denominador no puede ser negativo —una distancia, una densidad de probabilidad, una suma de pesos—; con denominadores de signo cualquiera hay que ramificar según el signo o replantear la fórmula, porque `max(x, 1e-8)` sobre un negativo cambia el resultado. Y en `saneaColor`, el orden importa: primero se sustituyen los NaN y después se acota, porque el comportamiento de `min` y `clamp` frente a un operando NaN no está definido de forma útil y podría devolverte el NaN de vuelta.
+
+La regla que las unifica y que hay que interiorizar es esta: **comprueba antes de dividir, no después de dividir**. Un `if` sobre el denominador tiene una semántica clara en cualquier hardware. Un `if` sobre el resultado depende de cómo se comporte la comparación con NaN, y esa es una garantía que no tienes.
+
+<Callout type="dios" title="El compilador puede asumir que no hay NaN, así que tu comprobación puede desaparecer">
+Aquí está el detalle que cuesta una semana descubrir por cuenta propia. WGSL no tiene nada parecido a `-ffast-math`: no hay un interruptor que relaje la aritmética. Pero WGSL no es lo que ejecuta la GPU. Tu shader se traduce al lenguaje intermedio de la API nativa —SPIR-V, MSL o DXIL— y de ahí lo compila el compilador del driver, que es un optimizador agresivo escrito por el fabricante y sobre el que no tienes ningún control. Ese compilador puede aplicar transformaciones que dan por hecho que los operandos son finitos, porque en el noventa y nueve coma nueve por ciento del código shader lo son y la ganancia de rendimiento es real.
+
+La consecuencia es concreta y desagradable: una comprobación escrita como `if (x != x) { return respaldo; }` es, para un optimizador que asume ausencia de NaN, una condición idénticamente falsa. Puede eliminar la rama entera y quedarse con `return x`. En una GPU tu red de seguridad funciona; en otra desaparece durante la compilación y no queda rastro en ninguna parte. Ese es el motivo de que un bug de NaN «solo pase en Intel» o «solo en el Mac del diseñador», y de que quien lo sufre acabe convencido de que hay un fallo en el driver. No lo hay: hay dos interpretaciones legítimas de un código que dependía de una garantía que nadie dio.
+
+De ahí las dos consecuencias operativas. La primera es que la comprobación robusta es la de patrón de bits, `(bitcast<u32>(x) & 0x7f800000u) == 0x7f800000u`, porque una operación entera con máscaras no tiene semántica de coma flotante que el optimizador pueda explotar: el `and` y la comparación de enteros se ejecutan tal cual, siempre, en todo el hardware. Cuesta dos instrucciones enteras, que es menos que la comparación en coma flotante que pretende sustituir. La segunda, y más importante, es que **detectar NaN es una estrategia frágil por diseño y evitarlo no lo es**. Un `clamp` antes de `acos` no depende de ninguna garantía sobre el comportamiento del NaN, porque impide que el NaN exista. Invierte el orden de tus prioridades: usa el diagnóstico para localizar el origen una vez, y después arregla el origen con una guarda que no pueda optimizarse porque no comprueba nada, simplemente acota. Cualquier código de producción cuya corrección dependa de que una comparación con NaN se evalúe como tú esperas es código que funciona por casualidad.
+</Callout>

@@ -1,0 +1,151 @@
+---
+title: "KV frente a D1: recuperar no es preguntar"
+description: "Es la comparación que más se confunde del catálogo, porque ambos guardan datos estructurados y ambos se consultan desde un binding. La diferencia no está en la capacidad sino en el verbo: KV recupera un valor cuya clave ya conoces, D1 responde una pregunta que describe un conjunto. De ahí se derivan tres criterios que deciden solos —la forma del acceso, el modelo de consistencia y el perfil de escritura—, tres anti-patrones que nacen de ignorarlos, y el patrón maduro en que dejan de competir: D1 como fuente de verdad y KV como derivado invalidable."
+subject: cloudflare
+level: 27
+order: 2
+position: "27.2"
+duration: "17 min"
+---
+
+<Lead>
+De todas las parejas del catálogo, `KV` y `D1` son las que más discusiones estériles provocan, porque a primera vista compiten: las dos guardan datos estructurados, las dos se alcanzan desde un binding en el entorno, las dos escalan sin que administres nada. La confusión se disuelve en cuanto dejas de mirar qué guardan y empiezas a mirar qué verbo usas contra ellas. Con `KV` recuperas: ya sabes la clave y quieres el valor. Con `D1` preguntas: describes un conjunto que todavía no conoces y el motor lo encuentra. Recuperar y preguntar suenan parecido en lenguaje coloquial y son operaciones de naturaleza distinta en ingeniería.
+</Lead>
+
+<Goals>
+
+- Distinguir recuperar por clave de consultar un conjunto, y ver qué pieza sirve cada verbo.
+- Usar el modelo de consistencia como criterio de elección y no como letra pequeña.
+- Evaluar el perfil de escritura, que suele decidir más que el de lectura.
+- Reconocer el patrón maduro donde `D1` es fuente de verdad y `KV` un derivado.
+
+</Goals>
+
+## Dos verbos, dos motores
+
+`KV` es un almacén clave-valor de lectura global. Su lectura caliente se resuelve desde una caché en el punto de presencia más cercano al usuario, lo que la vuelve extraordinariamente barata y rápida cuando la misma clave se pide una y otra vez desde todo el planeta. A cambio, su repertorio es deliberadamente pobre: recuperar, guardar, borrar y listar claves por prefijo. No hay filtros, ni ordenaciones, ni agregados, ni relaciones. Si tu pregunta no cabe en una clave, `KV` no puede responderla.
+
+`D1` es SQLite gestionado. Su repertorio es el de SQL completo: índices, `JOIN`, subconsultas, agregados, transacciones, restricciones de integridad. Puede responder preguntas que nadie anticipó al diseñar el esquema, porque el lenguaje de consulta es más expresivo que el esquema mismo. A cambio, cada consulta cruza hasta la primaria o hasta una réplica de lectura, se ejecuta en un motor de un solo hilo y se factura por filas leídas.
+
+```ts
+// KV: ya sabes la clave. Recuperas.
+const tema = await env.CONFIG.get('tema-activo', { type: 'json' });
+
+// D1: describes un conjunto. Preguntas.
+const { results } = await env.DB
+  .prepare('SELECT id, titulo FROM pedidos WHERE estado = ? ORDER BY creado DESC LIMIT 20')
+  .bind('pendiente')
+  .all();
+```
+
+Esa diferencia de repertorio explica una asimetría que sorprende a quien llega desde un backend clásico: `D1` puede emular a `KV` sin esfuerzo —una tabla de dos columnas con la clave como clave primaria hace exactamente lo mismo—, mientras que `KV` no puede emular a `D1` de ninguna manera razonable. La emulación en la dirección fácil, sin embargo, sale carísima en el edge, porque cambia una lectura servida desde el punto de presencia por un viaje a la primaria facturado por fila. Que una pieza pueda hacer el trabajo de la otra nunca ha sido argumento suficiente para que deba hacerlo.
+
+La prueba práctica para decidir cabe en una frase: si puedes escribir la clave completa antes de ejecutar el código, `KV` encaja; si la clave depende de un criterio que solo el motor puede evaluar recorriendo datos, necesitas `D1`. Todo lo demás —latencias, precios, límites— es secundario respecto a esta distinción, porque una pieza que no puede responder tu pregunta no compite con la que sí puede, por rápida que sea.
+
+| Rasgo | `KV` | `D1` |
+| --- | --- | --- |
+| Verbo natural | recuperar por clave | preguntar por criterio |
+| API característica | `get` \| `put` \| `delete` \| `list` | `prepare` \| `bind` \| `all` \| `batch` |
+| Consistencia | eventual, hasta unos 60 segundos | fuerte en la primaria, secuencial por sesión en réplicas |
+| Punto de servicio | caché del punto de presencia | primaria o réplica de lectura |
+| Unidad de coste | lecturas, escrituras y almacenamiento | filas leídas y escritas |
+
+<Callout type="tip" title="El truco del prefijo delata el error">
+Cuando alguien intenta usar `KV` como base de datos, aparece siempre el mismo síntoma: claves compuestas del tipo pedido, dos puntos, usuario, dos puntos, fecha, recorridas con `list` por prefijo para simular un índice. Funciona hasta que necesitas ordenar por otro campo, y entonces hay que mantener una segunda familia de claves espejo, y una tercera, sincronizadas a mano y sin transacción. Ese momento es la señal inequívoca de que el problema pedía un índice de verdad, es decir, `D1`.
+</Callout>
+
+## La consistencia como criterio, no como letra pequeña
+
+`KV` es eventualmente consistente. Una escritura tarda en propagarse a todos los puntos de presencia, y durante ese intervalo distintos usuarios pueden ver valores distintos. No es un defecto: es el precio exacto de que la lectura se sirva desde una caché global sin coordinación. Quien pretende usar `KV` como si fuera consistente no está usando mal una herramienta, está negando la propiedad que la hace rápida.
+
+`D1` ofrece consistencia fuerte contra la primaria y consistencia secuencial dentro de una sesión cuando lees de réplicas: nunca verás un dato más viejo del que ya habías visto. Esa garantía es lo que permite el patrón de leer lo que acabas de escribir sin sorpresas, siempre que arrastres el marcador de sesión.
+
+Hay un matiz que casi siempre se pasa por alto y que decide muchos casos dudosos: el desfase de `KV` no es uniforme para todos los lectores. Un punto de presencia que nunca ha pedido esa clave la traerá fresca; otro que la sirvió hace veinte segundos seguirá devolviendo la versión antigua hasta que su copia caduque. Es decir, no solo puedes leer un valor viejo, sino que **dos usuarios simultáneos en continentes distintos pueden ver cosas distintas**. Para una bandera de funcionalidad eso es irrelevante; para un precio que acabas de cambiar en plena campaña, puede ser una incidencia de soporte.
+
+El criterio, entonces, no se aplica al sistema entero sino a cada hecho. Una bandera de funcionalidad tolera perfectamente que tarde medio minuto en propagarse; el saldo de una cuenta que el usuario acaba de modificar, no. Preguntarte cuánto desfase tolera **este dato concreto** es más útil que preguntarte qué consistencia ofrece cada producto, porque la primera pregunta tiene respuesta en tu dominio y la segunda solo en la documentación.
+
+<Mermaid code={`flowchart LR
+  ESC[escritura] --> KVW[KV primaria logica]
+  KVW -.propaga en segundos.-> POP[cache en cada punto de presencia]
+  POP --> U1[lector global muy rapido]
+  ESC2[escritura] --> D1P[D1 primaria]
+  D1P -.replica.-> D1R[replica de lectura]
+  D1R --> U2[lector con sesion consistente]
+  class POP t-teal
+  class D1P t-green`} />
+
+<Callout type="note" title="La caducidad es tu herramienta para gobernar el desfase">
+En `KV` puedes acotar cuánto tiempo vive una entrada antes de reconstruirse, y esa caducidad es la palanca con la que traduces una tolerancia de producto en una configuración concreta. Si el negocio acepta cinco minutos de desfase, ponlos explícitamente en lugar de confiar en que la invalidación siempre llegue: una entrada con caducidad se cura sola cuando algo falla, mientras que una entrada eterna mal invalidada envenena la lectura hasta que alguien la descubre a mano.
+</Callout>
+
+## Las escrituras deciden más que las lecturas
+
+La comparación suele plantearse en términos de lectura, y ahí `KV` gana casi siempre. Por eso conviene invertir la mirada: lo que de verdad descarta una opción es el perfil de escritura. `KV` está pensado para claves que cambian poco. Escribir la misma clave muy a menudo no solo es caro, es contrario a su diseño: la propagación tarda, las escrituras seguidas sobre una misma clave se limitan, y no existe ninguna operación de comparar y sustituir que te permita evitar una actualización perdida cuando dos escritores concurren.
+
+Ese detalle de la operación de comparar y sustituir es más importante de lo que parece, porque es la frontera exacta entre una caché y una base de datos. Un almacén sin forma de decir escribe esto solo si el valor actual sigue siendo aquel no puede sostener ninguna invariante: cualquier lógica de leer, decidir y escribir tiene una ventana en la que otro escritor se cuela. Mientras el dato sea un derivado reconstruible, esa ventana no hace daño, porque el peor resultado es reconstruirlo dos veces. En cuanto el dato es la verdad, la ventana se convierte en pérdida de información.
+
+`D1` sí acepta escrituras transaccionales y con integridad referencial, pero todas viajan a una única primaria de un solo hilo. Su caudal es el inverso de la duración media de la consulta, así que una carga de escritura masiva y sostenida se convierte en cola. Ninguno de los dos es un buen destino para un dato que muchos escritores tocan a la vez y que exige exactitud: ese caso pertenece a `Durable Objects`, y reconocerlo aquí evita forzar la comparación entre dos piezas que ninguna resolvería.
+
+```ts
+// Anti-patron: contar con KV. Dos escritores concurrentes pierden incrementos.
+const actual = Number(await env.CONFIG.get('visitas')) || 0;
+await env.CONFIG.put('visitas', String(actual + 1)); // sin compare and swap
+
+// Correcto en D1 cuando el conteo es agregable y no exige exactitud instantanea
+await env.DB.prepare('UPDATE metricas SET visitas = visitas + 1 WHERE dia = ?')
+  .bind(hoy)
+  .run();
+```
+
+Conviene además mirar la facturación como lo que es: una descripción honesta del modelo, no un detalle administrativo. `KV` cobra por operación y premia la lectura repetida de pocas claves. `D1` cobra por fila leída y escrita, lo que significa que un índice que evita un escaneo completo no solo acelera la consulta, también la abarata. Cuando el precio de una pieza sube de forma desproporcionada al crecer, casi nunca es que la pieza sea cara: es que la estás usando contra su grano.
+
+<Callout type="warn" title="Los dos anti-patrones son simétricos">
+Usar `KV` como base de datos produce índices caseros, listas sincronizadas a mano y actualizaciones perdidas. Usar `D1` como caché global produce lo contrario: millones de lecturas de la misma fila cruzando la red hasta un motor de un solo hilo, facturadas fila a fila, cuando ese valor era idéntico para todo el planeta y podía servirse desde el punto de presencia. Ambos errores nacen del mismo descuido, que es no haber mirado el patrón de acceso antes de elegir.
+</Callout>
+
+## Donde dejan de competir
+
+<Cards>
+  <Card icon="🔑" title="KV brilla">
+    Configuración global, banderas de funcionalidad, mapa de dominios a inquilinos, redirecciones, listas de bloqueo, respuestas ya renderizadas: se leen desde todo el mundo, cambian poco y toleran unos segundos de desfase.
+  </Card>
+  <Card icon="🗃️" title="D1 brilla">
+    Usuarios, pedidos, cursos, inscripciones: entidades relacionadas sobre las que preguntas con criterios cambiantes, necesitas integridad y quieres transacciones.
+  </Card>
+  <Card icon="🪜" title="Los dos, en capas">
+    La consulta cara se resuelve una vez en `D1` y su resultado se recupera muchas desde `KV`, con la clave derivada de los parámetros y una caducidad explícita.
+  </Card>
+</Cards>
+
+Hay además una zona intermedia que conviene nombrar, porque es donde más gente se atasca: los datos que se leen muchísimo **y** se consultan por criterio, como el catálogo de productos de una tienda con filtros. La tentación es elegir uno de los dos y sufrir, cuando la respuesta correcta es que la consulta vive en `D1` y su **resultado** —esa página concreta de resultados, para esos filtros concretos— puede vivir en `KV` con una clave derivada de los parámetros. No estás eligiendo entre recuperar y preguntar: estás preguntando una vez y recuperando muchas.
+
+La madurez llega cuando dejas de verlos como alternativas y los pones en capas. `D1` es la **fuente de verdad**: allí vive el hecho, con su esquema y sus restricciones. `KV` guarda un **derivado** de ese hecho, precalculado para la lectura que más se repite, y se invalida cuando la fuente cambia. La regla que sostiene el patrón es innegociable: el derivado nunca se edita por su cuenta, solo se reconstruye o se borra. Dos caminos de escritura sobre el mismo hecho es exactamente cómo nacen las divergencias que nadie sabe explicar seis meses después.
+
+```ts
+// lectura: primero el derivado cercano; si falta, la fuente de verdad
+const clave = `catalogo:${categoria}:pagina:${pagina}`;
+let pagina_json = await env.CONFIG.get(clave, { type: 'json' });
+
+if (!pagina_json) {
+  const { results } = await env.DB
+    .prepare('SELECT id, nombre, precio FROM productos WHERE categoria = ? LIMIT 20 OFFSET ?')
+    .bind(categoria, pagina * 20)
+    .all();
+  pagina_json = results;
+  ctx.waitUntil(env.CONFIG.put(clave, JSON.stringify(results), { expirationTtl: 120 }));
+}
+```
+
+Fíjate en el orden de las tres decisiones que hay ahí dentro, porque cada una evita un fallo distinto. La clave del derivado se deriva por completo de los parámetros de la consulta, de modo que no hay forma de servir la respuesta de una pregunta como si fuera la de otra. La caducidad existe aunque haya invalidación explícita, para que un fallo puntual se cure con el tiempo. Y la escritura del derivado se aparta del camino crítico, porque el usuario ya tiene su respuesta y no debe esperar a que se guarde una copia que solo beneficia al siguiente.
+
+<Callout type="dios" title="La diferencia no es de capacidad, es de contrato con el tiempo">
+Comparar `KV` y `D1` por lo que pueden guardar es mirar la superficie; la diferencia real es qué contrato firman contigo respecto al tiempo. `KV` te ofrece un trato explícito y honesto: renuncio a decirte cuándo verás mi última escritura, y a cambio te sirvo cualquier lectura desde el trozo de red más cercano a tu usuario, sin coordinación, sin viaje y casi sin coste. `D1` firma el contrato opuesto: te garantizo un orden, una transacción y una verdad única, y a cambio te cobro un viaje hasta el lugar donde esa verdad se decide y un turno en la cola de un único hilo. Ninguno de los dos contratos es superior; lo que ocurre es que cada hecho de tu dominio ya tiene, sin que lo hayas escrito nunca, una tolerancia concreta al desfase, y elegir bien consiste sencillamente en descubrirla y respetarla. Una bandera de funcionalidad puede vivir medio minuto en el pasado sin que nadie sufra; el estado de un pedido que el usuario acaba de confirmar, no. Cuando interiorizas esto, dos cosas cambian a la vez. La primera es que la pregunta deja de ser cuál de los dos elijo para el proyecto y pasa a ser qué tolerancia al desfase tiene este dato, que es una pregunta de producto y no de infraestructura, y que además tiene respuesta antes de escribir una sola línea. La segunda es más profunda: al aceptar que la consistencia se elige por dato, la arquitectura deja de ser un lugar donde los datos se guardan y se vuelve un lugar donde los datos se **clasifican** según cuánta verdad instantánea exigen, con `KV` como el estrato de lo que puede permitirse ir un poco por detrás y `D1` como el estrato de lo que debe estar siempre al día. En ese momento la rivalidad se disuelve por completo, porque una fuente de verdad y una copia rápida de lectura no compiten: cooperan, y la única disciplina que hace falta para que la cooperación no se corrompa es que el derivado jamás se convierta en un segundo origen.
+</Callout>
+
+<Challenge title="Clasifica por verbo y por tiempo">
+1. Toma seis datos de una aplicación real y decide, para cada uno, si el acceso es recuperar por clave o preguntar por criterio.
+2. Asigna a cada uno de esos seis una tolerancia al desfase en segundos y justifica el número desde el producto, no desde la tecnología.
+3. Reescribe un índice casero sobre claves de `KV` como un esquema de `D1` con un índice real y explica qué desaparece.
+4. Explica por qué contar visitas con recuperar y guardar en `KV` pierde incrementos, y qué pieza resolvería el caso si la exactitud fuese obligatoria.
+5. Diseña la capa derivada: qué clave de `KV` cachearía la consulta más repetida de tu `D1`, y en qué momento exacto se invalidaría.
+</Challenge>

@@ -1,0 +1,133 @@
+---
+title: "uevents y udev: del kobject al nodo en /dev"
+description: "Cómo el kernel notifica a userspace cada alta y baja de dispositivo. kobject_uevent construye un entorno KEY=VALUE, lo enriquece el bus y la clase, y lo emite por un socket netlink. devtmpfs crea el nodo básico en /dev al arrancar; udev lo escucha, aplica sus reglas y fija nombres, permisos y enlaces persistentes. Es el reparto mecanismo-política llevado al hardware."
+subject: kernel
+level: 28
+order: 5
+position: "28.5"
+duration: "16 min"
+---
+
+<Lead>
+El kernel sabe cuándo aparece o desaparece un dispositivo, pero no debe decidir cómo se llama su nodo, quién puede abrirlo ni qué programa reacciona a él: eso es política, y la política vive en userspace. El uevent es el mensaje que cruza esa frontera. Cada vez que un `kobject` se añade o se retira, el kernel emite un evento con los datos crudos del hecho; udev lo recibe, consulta sus reglas y materializa el nodo en `/dev` con el nombre y los permisos que el administrador ha decidido.
+</Lead>
+
+<Goals>
+
+- Ver cómo `kobject_uevent` construye un entorno `KEY=VALUE` y lo emite.
+- Entender el transporte por netlink hacia userspace y el papel de `devtmpfs`.
+- Ver cómo udev recibe el evento, aplica reglas y crea el nodo en `/dev`.
+- Comprender el reparto mecanismo-política entre el kernel y udev.
+
+</Goals>
+
+## El kernel avisa: kobject_uevent
+
+Cuando el core publica un dispositivo llama a `kobject_uevent` con la acción correspondiente. La función construye un `kobj_uevent_env`, una bolsa de variables `KEY=VALUE`, y da la oportunidad al bus, a la clase y al tipo de dispositivo de añadir las suyas antes de emitirla.
+
+```c
+/* el core, al publicar o retirar el dispositivo */
+kobject_uevent(&dev->kobj, KOBJ_ADD);      /* alta */
+kobject_uevent(&dev->kobj, KOBJ_REMOVE);   /* baja */
+```
+
+La acción no se limita a alta y baja. El enumerado `kobject_action` define también `KOBJ_CHANGE` —el dispositivo sigue ahí pero algo relevante cambió, y el driver quiere que udev reevalúe sus reglas—, `KOBJ_MOVE` cuando se renombra o reubica en la jerarquía, y `KOBJ_BIND`/`KOBJ_UNBIND` que anuncian el momento exacto del enlace o desenlace con un driver. Un `change` es la vía canónica para que un driver provoque la reevaluación de reglas sin recrear el dispositivo, y es justo lo que hace `udevadm trigger` por debajo.
+
+Las variables las aportan las devoluciones de llamada `uevent` que viste en la tríada. La más importante es `MODALIAS`, la huella que permite a udev autocargar el módulo correcto; para un dispositivo con nodo, el core añade además `MAJOR`, `MINOR` y `DEVNAME`, que son justo lo que hace falta para crear el fichero en `/dev`.
+
+```c
+/* bus->uevent o dev->type->uevent: enriquece el evento antes de emitirlo */
+static int mi_bus_uevent(const struct device *dev, struct kobj_uevent_env *env)
+{
+	/* MODALIAS deja que udev invoque modprobe con el modulo adecuado */
+	return add_uevent_var(env, "MODALIAS=mibus:%s", dev_name(dev));
+}
+
+/* drivers/base/core.c — para un device con nodo, el core añade lo esencial (idea) */
+if (MAJOR(dev->devt)) {
+	add_uevent_var(env, "MAJOR=%u", MAJOR(dev->devt));
+	add_uevent_var(env, "MINOR=%u", MINOR(dev->devt));
+	add_uevent_var(env, "DEVNAME=%s", dev_name(dev));
+}
+```
+
+## El transporte: netlink y devtmpfs
+
+El evento no se entrega por un fichero ni por una señal, sino por un **socket netlink** del grupo `NETLINK_KOBJECT_UEVENT`, un canal multicast que el kernel usa para difundir a userspace. Cualquier proceso suscrito —de forma canónica, `systemd-udevd`— recibe el mensaje con todas sus variables.
+
+En paralelo, **devtmpfs** resuelve el problema del arranque temprano. Es un sistema de ficheros que el kernel monta como `/dev` y en el que crea, él mismo, un nodo básico para cada dispositivo con `dev_t`, usando el `MAJOR` y el `MINOR` del propio dispositivo. Así el sistema tiene un `/dev` funcional desde el primer instante, antes incluso de que udev arranque; udev llega después a refinar ese nodo, no a crearlo desde cero.
+
+```bash
+# ver los eventos en crudo del kernel y ya procesados por udev, con sus variables
+udevadm monitor --kernel --udev --property
+```
+
+Al conectar un adaptador serie USB, ese comando imprime algo así: cada línea es una variable que el kernel puso en el `kobj_uevent_env`, y son exactamente las que udev cruzará contra sus reglas.
+
+```text
+KERNEL[4217.8] add /devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/ttyUSB0 (tty)
+ACTION=add
+DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/ttyUSB0
+SUBSYSTEM=tty
+MAJOR=188
+MINOR=0
+DEVNAME=ttyUSB0
+SEQNUM=4217
+```
+
+El campo `SEQNUM` numera los eventos: udev los procesa respetando ese orden, de modo que un `remove` nunca adelanta al `add` del mismo dispositivo. El `MAJOR:MINOR` es el que devtmpfs ya usó para el nodo; udev no lo inventa, lo lee.
+
+<Mermaid code={`flowchart LR
+  K[kobject_uevent KOBJ_ADD] --> ENV[entorno KEY VALUE con MAJOR MINOR MODALIAS]
+  ENV --> NL[socket netlink multicast]
+  NL --> U[systemd-udevd]
+  U --> R[reglas de udev]
+  R --> NODE[nodo en dev]
+  R --> SYM[symlinks persistentes]
+  K -. devtmpfs ya creo el nodo basico .-> NODE`} />
+
+## udev: reglas y /dev
+
+`systemd-udevd` recibe el uevent y lo procesa contra su base de **reglas**, ficheros en `/usr/lib/udev/rules.d` y `/etc/udev/rules.d` que se evalúan en orden. Cada regla filtra por variables del evento —`SUBSYSTEM`, `ACTION`, atributos de sysfs— y, si casa, aplica acciones: fija el nombre y los permisos del nodo, crea enlaces simbólicos estables, o lanza programas.
+
+```text
+# /etc/udev/rules.d/99-mi-widget.rules
+# al aparecer un dispositivo de mi_bus con cierto atributo, fija permisos y un alias estable
+SUBSYSTEM=="mi_bus", ATTR{milicelsius}=="?*", \
+    GROUP="plugdev", MODE="0660", SYMLINK+="widget0"
+```
+
+La sintaxis distingue dos familias de operadores, y confundirlos es el error clásico. Los de **comparación** —`==` y `!=`— son condiciones que la regla evalúa contra el evento; si alguna falla, la regla se salta. Los de **asignación** —`=` fija un valor, `+=` lo añade a una lista, `:=` lo fija de forma que reglas posteriores no puedan cambiarlo— son las acciones que se aplican cuando todas las condiciones casan. En el ejemplo, `SUBSYSTEM==` y `ATTR{...}==` filtran; `GROUP=`, `MODE=` y `SYMLINK+=` actúan.
+
+El reparto de trabajo es nítido: devtmpfs garantiza que el nodo *existe* con el `MAJOR:MINOR` correcto; udev decide cómo se *llama*, quién lo *posee* y qué *ocurre* cuando aparece. Los enlaces persistentes de `/dev/disk/by-id`, `by-uuid` o `by-path` son precisamente reglas de udev que leen atributos del dispositivo y fabrican nombres estables que no dependen del orden de enumeración.
+
+<Cards>
+  <Card icon="🐧" title="devtmpfs (kernel)">
+    Crea el nodo básico en `/dev` con el `MAJOR:MINOR` correcto en cuanto el dispositivo existe. Es universal y sin política: garantiza un `/dev` usable desde el arranque, antes de que udev exista.
+  </Card>
+  <Card icon="⚙️" title="udev (userspace)">
+    Refina ese nodo: nombre definitivo, dueño, permisos, enlaces simbólicos estables y programas a ejecutar. Todo lo que varía entre sistemas, decidido por reglas que se editan sin recompilar nada.
+  </Card>
+</Cards>
+
+```bash
+# todas las propiedades que udev ve de un nodo, y re-sintetizar altas
+udevadm info --query=all --name=/dev/sda
+udevadm trigger --action=add --subsystem-match=block
+```
+
+<Callout type="note" title="El ayudante /sbin/hotplug es historia">
+En los kernels antiguos el uevent podía lanzar un binario de userspace por cada evento —el `uevent_helper`, típicamente `/sbin/hotplug`—, un modelo que colapsaba durante el arranque al *forkear* miles de procesos. Hoy `CONFIG_UEVENT_HELPER` suele estar desactivado y el único transporte es el netlink, que udev consume con un solo proceso persistente. Si ves referencias a `/sbin/hotplug`, son de otra era.
+</Callout>
+
+<Callout type="dios" title="El uevent es la costura donde el kernel entrega mecanismo y userspace pone política">
+Contempla la frontera que acabas de cruzar, porque materializa uno de los principios rectores de Unix con una nitidez que pocos lugares del sistema alcanzan: la separación entre mecanismo y política. El kernel sabe una cosa con certeza absoluta —que un dispositivo concreto, con este `MAJOR:MINOR` y esta huella `MODALIAS`, acaba de aparecer bajo este punto del árbol— y esa es toda la verdad que posee. Lo que el kernel **no** sabe, y deliberadamente se niega a decidir, es cómo debe llamarse ese dispositivo para el usuario, quién tiene derecho a abrirlo, si debe montarse, si debe cargarse un firmware, si un demonio debe reaccionar. Todo eso es política, y la política cambia entre una estación de trabajo, un servidor y un móvil, cambia entre distribuciones, cambia con las preferencias del administrador. Meter esas decisiones en el kernel lo ataría a un conjunto de convenciones y lo obligaría a recompilarse para cambiar una regla de permisos. El uevent corta ese nudo: el kernel emite el *hecho* desnudo por un canal neutro —netlink— y se desentiende; userspace, en la forma de udev, aplica la *interpretación* mediante un sistema de reglas que se edita sin tocar una sola línea de kernel. Y fíjate en la sofisticación del reparto con devtmpfs: el kernel ni siquiera cede el mecanismo básico —crear el nodo para que el sistema arranque—, porque eso sí es universal y no admite política; lo que cede es todo lo que *sí* varía. Esa línea, trazada exactamente entre lo invariante y lo opinable, es la razón por la que el mismo binario del kernel gobierna desde un reloj hasta un superordenador. Cuando internalices que un uevent no es una notificación cualquiera sino el punto preciso donde el kernel dice "esto es lo que pasó, decide tú qué significa", entenderás que la flexibilidad del ecosistema Linux no está en el kernel a pesar de su rigidez, sino gracias a que sabe exactamente qué no decidir.
+</Callout>
+
+<Challenge title="Sigue un dispositivo desde el kernel hasta /dev">
+1. Ejecuta `udevadm monitor --kernel --udev --property` y conecta o desconecta un USB; identifica en la salida el evento `add`, su `SUBSYSTEM`, su `DEVNAME` y su `MODALIAS`.
+2. Toma un nodo de `/dev` y compáralo con `udevadm info --query=all --name=...`: localiza el `MAJOR:MINOR` y relaciónalo con el `dev_t` del dispositivo en sysfs.
+3. Escribe una regla en `/etc/udev/rules.d` que cree un `SYMLINK` y fije `MODE` y `GROUP` para un dispositivo tuyo; recárgala con `udevadm control --reload` y provócala con `udevadm trigger`.
+4. Explica qué crea devtmpfs y qué crea udev para un mismo nodo, y por qué el sistema puede arrancar aunque udev tarde en levantarse.
+5. Razona por qué `MODALIAS` permite el autocargado de módulos y cómo se conecta con la `MODULE_DEVICE_TABLE` que declaraste en la lección 28.4.
+</Challenge>

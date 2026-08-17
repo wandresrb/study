@@ -1,0 +1,150 @@
+---
+title: "El coste por transacción: mil escrituras de una en una"
+description: "El tiempo de escritura en IndexedDB se factura por transacción y no por registro, y por eso agrupar mil operaciones en un solo commit cambia el resultado en órdenes de magnitud."
+subject: local-first
+level: 8
+order: 2
+position: "8.2"
+duration: "17 min"
+---
+
+<Lead>
+Escribes mil registros, cada uno en su propia transacción, y tardas una eternidad. Escribes los mismos mil registros dentro de una sola transacción y tardas una fracción. Nadie ha cambiado la cantidad de bytes, ni el clonado estructurado, ni el disco: lo único que ha cambiado es cuántas veces se ha ejecutado el ritual de abrir, bloquear, confirmar y sincronizar. Ese ritual tiene un precio fijo, y multiplicarlo por mil es el error de rendimiento más caro y más común de toda la API.
+</Lead>
+
+<Goals>
+
+- Desglosar el coste fijo de una transacción: bloqueo, planificación, cruce de proceso y confirmación.
+- Entender la regla de auto-confirmación y por qué esperar una promesa ajena mata la transacción.
+- Escribir el bucle de lotes correcto: emitir todas las peticiones y esperar solo al final.
+- Elegir el modo de durabilidad y el tamaño de lote con criterio, no por costumbre.
+
+</Goals>
+
+## Anatomía del coste fijo
+
+Una transacción de IndexedDB no es un envoltorio sintáctico: es una unidad de aislamiento con maquinaria propia. Al crearla, el motor calcula su alcance y **adquiere bloqueos** sobre los almacenes implicados; una transacción `readwrite` toma acceso exclusivo sobre todos los almacenes de su alcance durante toda su vida, de modo que cualquier otra que los toque queda encolada. Después, cada petición se planifica y se ejecuta en orden de emisión. Y al final llega la parte cara: la **confirmación**, donde el motor cierra el lote, escribe el registro de recuperación y, según el modo de durabilidad, puede pedir al sistema operativo que vacíe sus búferes al medio físico.
+
+En navegadores basados en Chromium hay además una frontera de proceso: el almacenamiento vive fuera del proceso de renderizado, así que cada petición viaja por un canal de comunicación entre procesos, con su propia copia del valor ya serializado. Ese salto también se amortiza por transacción cuando las peticiones van agrupadas.
+
+Sumado, el ritual completo de una transacción vacía —abrir, bloquear, cruzar el proceso, confirmar y liberar— es un coste que no puedes reducir con ninguna técnica desde JavaScript. Solo puedes pagarlo menos veces. Esa es toda la lección, y de ella se deduce mecánicamente el resto.
+
+<Mermaid code={`flowchart TB
+  subgraph MIL [Mil transacciones]
+    A1[abrir tx] --> A2[bloquear almacen] --> A3[put] --> A4[confirmar y sincronizar] --> A5[liberar bloqueo]
+    A5 -.-> A1
+  end
+  subgraph UNA [Una transaccion]
+    B1[abrir tx] --> B2[bloquear almacen] --> B3[put x mil sin esperar] --> B4[confirmar UNA vez] --> B5[liberar bloqueo]
+  end
+  MIL --> R1[coste fijo pagado mil veces]
+  UNA --> R2[coste fijo pagado una vez]`} />
+
+Lo importante es que el coste fijo no depende del tamaño del registro. Escribir un objeto de veinte bytes en su propia transacción cuesta casi lo mismo que escribir uno de veinte kilobytes: la diferencia entre los dos es el clonado, que es lineal en la forma del dato, mientras que el ritual es constante. Cuando el registro es pequeño, el ritual es prácticamente **todo** el tiempo.
+
+El alcance de la transacción merece atención propia, porque se declara por costumbre y se paga por bloqueo. Pedir tres almacenes en modo `readwrite` cuando solo vas a escribir en uno deja los otros dos inaccesibles para cualquier otra transacción durante todo el recorrido. Y como las transacciones se sirven en el orden en que se crearon, una escritura larga con alcance amplio bloquea lecturas posteriores que no tenían nada que ver con ella. La regla es declarar el alcance mínimo, y separar en transacciones distintas lo que no necesita ser atómico junto.
+
+```js
+// Alcance excesivo: bloquea autores y adjuntos sin necesitarlos.
+db.transaction(["docs", "autores", "adjuntos"], "readwrite");
+
+// Alcance minimo: solo lo que se escribe de verdad.
+db.transaction("docs", "readwrite");
+```
+
+## La regla de auto-confirmación
+
+IndexedDB no tiene un `commit` obligatorio porque confirma sola, y la regla exacta importa: una transacción está *activa* solo durante la tarea que la creó y durante los manejadores de eventos de sus peticiones; en cuanto el control vuelve al bucle de eventos sin peticiones pendientes, se confirma y muere. Emitir una petición nueva sobre una transacción ya inactiva lanza `TransactionInactiveError`.
+
+<Callout type="warn" title="Nunca esperes algo que no sea una petición de IndexedDB">
+Intercalar un `await fetch(...)`, un `setTimeout` o cualquier promesa que se resuelva en una tarea posterior dentro de una transacción abierta la mata: al ceder el control, el motor la da por terminada. El síntoma es un `TransactionInactiveError` intermitente que aparece solo con la red lenta o bajo carga. La regla operativa es simple: reúne **antes** todo lo que necesites de fuera, y abre la transacción solo cuando ya tengas los datos en memoria.
+</Callout>
+
+```js
+// MAL: una transaccion por registro. Mil veces el ritual completo.
+for (const doc of documentos) {
+  const tx = db.transaction("docs", "readwrite");
+  tx.objectStore("docs").put(doc);
+  await esperar(tx);                 // mil confirmaciones
+}
+
+// MAL TAMBIEN: una sola transaccion, pero esperando cada peticion.
+const tx = db.transaction("docs", "readwrite");
+for (const doc of documentos) {
+  await esperar(tx.objectStore("docs").put(doc)); // mil vueltas al bucle de eventos
+}
+
+// BIEN: emite todo en la misma vuelta, espera una sola vez al final.
+const tx = db.transaction("docs", "readwrite");
+const store = tx.objectStore("docs");
+for (const doc of documentos) store.put(doc);     // sin await: se encolan
+await esperar(tx);                                 // una confirmacion
+```
+
+El segundo caso es el más traicionero porque *parece* correcto. Al esperar cada petición, cada `put` obliga a una vuelta completa por el bucle de eventos y por la frontera de proceso antes de emitir el siguiente, serializando lo que el motor podía haber encauzado. La transacción sigue siendo una, pero el paralelismo interno se pierde entero.
+
+No esperar cada petición es seguro porque la especificación garantiza que las peticiones de una misma transacción se procesan **en el orden en que se emitieron**. Si escribes y luego lees la misma clave sin esperar en medio, la lectura verá la escritura. Esa garantía es la que hace legítimo el patrón de disparar todo y esperar al final: no estás renunciando a la coherencia, solo a la confirmación intermedia. Y si necesitas cerrar la transacción antes de que el motor decida hacerlo, existe `tx.commit()`, que la confirma explícitamente sin esperar a que el bucle de eventos se vacíe.
+
+## Durabilidad: qué le pides al disco
+
+El tercer parámetro de `transaction` acepta opciones, y la que importa aquí es `durability`, con tres valores posibles: `strict` exige que los datos estén realmente en el medio físico antes de considerar confirmada la transacción; `relaxed` acepta que el sistema operativo los tenga en sus búferes, con lo que un corte de corriente puede perder las últimas escrituras pero un cierre de pestaña no; `default` deja la decisión al navegador, y los motores actuales tienden a interpretarlo como relajado precisamente porque el estricto es carísimo.
+
+```js
+// Escritura masiva de datos reconstruibles: la sincronizacion al disco sobra.
+const tx = db.transaction("cache", "readwrite", { durability: "relaxed" });
+
+// Escritura de la unica copia de algo que el usuario acaba de crear.
+const tx2 = db.transaction("docs", "readwrite", { durability: "strict" });
+```
+
+Que `relaxed` no sea temerario merece una aclaración, porque el nombre asusta. Lo que se relaja es la garantía frente a un corte de corriente o un fallo del sistema operativo, no frente al cierre de la pestaña ni al cierre del navegador: la transacción se ha confirmado en el motor y el sistema ya tiene los datos en sus búferes. El escenario de pérdida es concreto y poco frecuente, y contra él una aplicación local-first tiene además su propia defensa, que es la réplica en otro dispositivo.
+
+<Callout type="tip" title="El criterio es la reconstruibilidad, no la importancia">
+No preguntes si el dato es importante: pregunta si podrías reconstruirlo. Un caché rellenado desde el servidor, un índice derivado o el resultado de un cálculo admiten `relaxed` sin discusión. La aportación original del usuario que aún no se ha sincronizado con nadie es el caso donde `strict` se justifica. En una aplicación local-first bien diseñada, la inmensa mayoría del volumen escrito cae en la primera categoría y solo un hilo fino cae en la segunda.
+</Callout>
+
+## Cuánto agrupar
+
+Agrupar tiene un límite superior que no es teórico. Una transacción gigante mantiene el bloqueo exclusivo del almacén durante todo su recorrido, así que cualquier lectura que la interfaz necesite mientras tanto se queda esperando; retiene en memoria las estructuras de la escritura pendiente; impide informar del progreso; y si falla al final, revierte entera y has perdido todo el trabajo. La forma sensata es trocear: lotes de unos pocos miles de registros, cada uno con su transacción, cediendo el control entre lotes para que la interfaz respire.
+
+```js
+async function importar(db, registros, tam = 2000) {
+  for (let i = 0; i < registros.length; i += tam) {
+    const lote = registros.slice(i, i + tam);
+    const tx = db.transaction("docs", "readwrite", { durability: "relaxed" });
+    const store = tx.objectStore("docs");
+    for (const r of lote) store.put(r);
+    await esperar(tx);                       // una confirmacion por lote
+    reportar(i + lote.length, registros.length);
+    await new Promise(r => setTimeout(r));   // cede el hilo entre lotes
+  }
+}
+```
+
+El tamaño exacto no se deduce: se mide, y depende del navegador, del dispositivo y de la forma del registro. Lo que sí es universal es la curva —la mejora entre uno y cien es brutal, entre cien y mil ya es modesta, y a partir de cierto punto empeora por presión de memoria y bloqueo—, así que basta con probar tres o cuatro órdenes de magnitud en el dispositivo más lento que soportes.
+
+Trocear tiene además una consecuencia semántica que hay que aceptar a propósito: la importación deja de ser atómica. Si falla el lote número siete, los seis anteriores están escritos y los restantes no. Para una importación esa semántica suele ser preferible —permite reanudar donde se cortó en lugar de repetirlo todo— pero exige registrar el avance en algún sitio duradero y diseñar la operación para que reanudarla sea idempotente. Escribir siempre con `put` en lugar de `add`, y con claves deterministas derivadas del contenido y no autogeneradas, hace que repetir un lote sea inofensivo.
+
+```js
+// Reanudable e idempotente: la clave la fija el dato, no el contador.
+const tx = db.transaction(["docs", "meta"], "readwrite");
+for (const r of lote) tx.objectStore("docs").put(r, /* keyPath: r.id */);
+tx.objectStore("meta").put({ clave: "importado", hasta: i + lote.length });
+await esperar(tx);   // avance y datos, atomicos entre si
+```
+
+La misma lógica gobierna la lectura, aunque con una diferencia importante en el lado del bloqueo: varias transacciones `readonly` sobre el mismo almacén pueden ejecutarse a la vez, porque no toman acceso exclusivo. Eso significa que abrir una transacción de lectura por consulta no tiene el mismo coste catastrófico que abrir una de escritura por registro: sigue habiendo ritual, pero no hay serialización forzada. El pecado grave sigue siendo el otro, el de `readwrite` en bucle.
+
+Dentro de la lectura, recorrer un cursor emitiendo una petición `continue` por registro paga una vuelta al bucle de eventos por elemento; `getAll` con un rango de claves y un límite trae el bloque entero en una sola petición. El cursor solo gana cuando de verdad necesitas abortar a mitad o cuando el conjunto no cabe en memoria.
+
+<Callout type="dios" title="La transacción es la unidad de facturación, y casi nadie la elige a propósito">
+Todo el mundo aprende IndexedDB pensando en el registro como unidad: escribo un documento, leo un documento. Pero el motor no factura por registro, factura por **transacción**, y esa discrepancia entre la unidad mental y la unidad económica es lo que produce aplicaciones que tardan minutos en importar lo que debería tardar segundos. La transacción es exactamente lo que su nombre indica en la teoría de bases de datos: la frontera de atomicidad, de aislamiento y de durabilidad, las tres a la vez. Y las tres tienen un precio que no se prorratea. La atomicidad exige un registro de recuperación que hay que abrir y cerrar. El aislamiento exige bloqueos que hay que tomar y soltar, con toda la coordinación que eso arrastra. La durabilidad exige, en el peor caso, una llamada de sincronización al sistema operativo que en un disco real cuesta milisegundos enteros mientras el resto del sistema se detiene. Por eso el patrón de mil transacciones no es un poco peor: es peor en órdenes de magnitud, y ninguna cantidad de ajuste fino dentro de cada una lo arregla. La disciplina que hay que adquirir es la del ingeniero de bases de datos de siempre —decidir conscientemente dónde empieza y dónde acaba cada transacción, en función de qué conjunto de cambios debe ser atómico y no de cómo está escrito el bucle— porque en cuanto la frontera transaccional la dicta la estructura del código en lugar de la semántica del dominio, el coste se dispara sin que nada en la API te avise.
+</Callout>
+
+<Challenge title="Encuentra tu curva">
+1. Escribe diez mil registros pequeños de tres formas —una transacción por registro, una sola transacción, y lotes— y anota los tres tiempos.
+2. Repite el caso de una sola transacción esperando cada `put` y compáralo con el que no espera. Explica la diferencia sin mirar la lección.
+3. Barre el tamaño de lote entre diez y cincuenta mil y dibuja la curva. Localiza el punto donde deja de mejorar.
+4. Repite el barrido con `strict` y con `relaxed`. Mide cuánto cuesta exactamente la durabilidad en tu dispositivo.
+5. Provoca un `TransactionInactiveError` a propósito metiendo un `await fetch` en mitad de una transacción, y luego arregla el código moviendo la red fuera.
+</Challenge>

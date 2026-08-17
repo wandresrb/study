@@ -1,0 +1,124 @@
+---
+title: "Semántica acquire/release: publicar y consumir datos"
+description: "Las barreras totales son caras y no nombran variables. smp_store_release y smp_load_acquire son barreras de un solo sentido atadas a un acceso concreto: el patrón más limpio para publicar y consumir, y la base de los locks y de RCU."
+subject: kernel
+level: 18
+order: 4
+position: "18.4"
+duration: "16 min"
+---
+
+<Lead>
+`smp_mb` (nivel 18.3) ordena todo en ambos sentidos: es un mazo que no nombra ninguna variable. La semántica acquire/release es un bisturí: barreras de **un solo sentido** atadas a un acceso concreto. `smp_store_release` publica un dato; `smp_load_acquire` lo consume. Es el patrón más limpio de todo el nivel, y resulta que los locks y RCU no son más que este mismo apretón de manos a otra escala.
+</Lead>
+
+<Goals>
+
+- Entender release y acquire como barreras de un solo sentido.
+- Dominar el patrón publicar/consumir con `smp_store_release` y `smp_load_acquire`.
+- Ver por qué un lock es acquire al tomarlo y release al soltarlo.
+- Relacionar el patrón con RCU: `rcu_assign_pointer` y `rcu_dereference`.
+
+</Goals>
+
+## Barreras de un solo sentido
+
+Una barrera total ordena todo hacia ambos lados y no menciona ninguna dirección: cara y ciega. Acquire y release son asimétricas y van pegadas a un acceso específico, lo que las hace más baratas y mucho más claras.
+
+- `smp_store_release(p, v)` es una **escritura que publica**. Garantía: todo acceso previo en orden de programa —cargas y escrituras— se hace visible antes de que esta escritura se vea. Lo de arriba no puede caer por debajo; lo de abajo sí puede subir. Es una valla de un solo sentido, hacia abajo.
+- `smp_load_acquire(p)` es una **carga que se suscribe**. Garantía: todo acceso posterior en orden de programa ocurre después de esta carga. Lo de abajo no puede subir por encima; lo de arriba sí puede bajar. Valla de un solo sentido, hacia arriba.
+
+Su definición genérica (`include/asm-generic/barrier.h`) es esencialmente `READ_ONCE`/`WRITE_ONCE` más una barrera; en arm64 mapean a instrucciones nativas `LDAR` y `STLR`, a menudo más baratas que un `dmb` completo.
+
+## El patrón publicar/consumir
+
+```c
+/* CPU 0: publica */
+data = 42;                        /* rellena el dato */
+smp_store_release(&ready, 1);     /* lo publica: data queda visible antes */
+
+/* CPU 1: consume */
+if (smp_load_acquire(&ready))     /* se suscribe */
+	usar(data);               /* ve data == 42, garantizado */
+```
+
+El contrato es condicional y elegante: **si** la carga acquire lee el valor que escribió la escritura release, **entonces** todo lo anterior al release en CPU 0 es visible para todo lo posterior al acquire en CPU 1. La ordenación queda atada al hecho concreto de haber observado `ready`. Compáralo con el nivel 18.3: `smp_wmb + WRITE_ONCE` y `READ_ONCE + smp_rmb` logran lo mismo, pero release/acquire (a) nombra la variable publicada, (b) es una sola primitiva por lado en vez de dos líneas, (c) mapea a instrucciones nativas en ARMv8, y (d) no se puede emparejar por error con accesos ajenos.
+
+<Callout type="tip" title="Regla mnemotécnica">
+Release = **publicar**: primero rellenas, luego anuncias. Acquire = **suscribirse**: primero compruebas el anuncio, luego lees. La escritura release es siempre la **última** operación del productor; la carga acquire, la **primera** del consumidor. Si te sale al revés, el patrón está mal.
+</Callout>
+
+## Esperar con acquire: smp_cond_load_acquire
+
+Girar sobre una bandera y luego colocar una barrera acquire es tan común que hay una primitiva que lo funde: `smp_cond_load_acquire(ptr, cond)`. Espera hasta que la condición sobre `*ptr` —referida como `VAL`— se cumpla y devuelve el valor con semántica acquire, permitiendo además que el hardware ahorre energía mientras espera:
+
+```c
+/* espera a que ready valga 1 y adquiere; luego data es visible */
+smp_cond_load_acquire(&ready, VAL == 1);
+usar(data);
+```
+
+Es la base de la espera en `qspinlock` y del productor/consumidor eficiente. Sustituye el bucle `while (READ_ONCE(...)) cpu_relax();` más `smp_rmb` por una sola línea con la intención explícita.
+
+## Todo son acquire/release: los locks
+
+Aquí está la unificación. Tomar un lock tiene semántica **acquire**; soltarlo tiene semántica **release**. `spin_lock` y `mutex_lock` son acquire; `spin_unlock` y `mutex_unlock` son release.
+
+```c
+spin_lock(&lock);     /* ACQUIRE: la sección no empieza antes de aquí */
+seccion_critica();
+spin_unlock(&lock);   /* RELEASE: la sección termina antes de aquí */
+```
+
+Por eso la sección crítica es una **caja** de la que nada se escapa: el acquire impide que sus accesos suban por encima del `lock`, y el release impide que bajen por debajo del `unlock`. Ahora bien, es una caja de un solo sentido —el modelo "motel de cucarachas": se entra pero no se sale—: un acceso de fuera *puede* colarse dentro, lo cual es inofensivo. Si necesitas orden total (por ejemplo, Escritura-Carga a través de todo el bloque) usas `smp_mb__after_spinlock`.
+
+## RCU: publicar punteros
+
+El patrón publicar/suscribir de RCU (nivel 17) es exactamente release/acquire sobre punteros, con un matiz que lo hace aún más barato:
+
+```c
+/* Escritor: inicializa el objeto y PUBLICA el puntero */
+p->campo = valor;
+rcu_assign_pointer(gp, p);   /* aprox. smp_store_release(&gp, p) */
+
+/* Lector: SE SUSCRIBE al puntero y lo desreferencia */
+q = rcu_dereference(gp);     /* READ_ONCE + dependencia de dirección */
+usar(q->campo);
+```
+
+`rcu_assign_pointer` es en esencia un `smp_store_release`: garantiza que la inicialización del objeto se ve antes que el puntero. Pero `rcu_dereference` **no** necesita una barrera acquire: le basta la **dependencia de dirección** (nivel 18.3). Como el lector debe cargar el puntero para poder desreferenciarlo, el hardware ya ordena esas dos operaciones gratis. Por eso el lado lector de RCU es casi gratuito: se apoya en dependencias en vez de en fences. Los atómicos siguen la misma familia con sufijos `_acquire`, `_release` y `_relaxed` (`atomic_cmpxchg_release`, `atomic_fetch_add_acquire`) para construir estructuras sin bloqueo.
+
+## Atómicos con orden: construir sin locks
+
+Con esos sufijos se montan estructuras sin bloqueo. Un índice de anillo de un productor y un consumidor publica y consume igual que el flag+datos:
+
+```c
+/* Productor: rellena la ranura y publica el nuevo head */
+buf[head & MASK] = item;
+smp_store_release(&ring->head, head + 1);   /* publica */
+
+/* Consumidor: lee head con acquire y consume si hay algo */
+unsigned int h = smp_load_acquire(&ring->head);
+if (h != ring->tail) {
+	item = buf[ring->tail & MASK];          /* ve el item, garantizado */
+	ring->tail++;
+}
+```
+
+El `smp_store_release` del head garantiza que la escritura de `buf[...]` es visible antes de que el consumidor vea avanzar el head; el `smp_load_acquire` garantiza que la lectura de `buf[...]` no se adelanta a haber visto el head. Es el corazón de las colas sin bloqueo del kernel (`kfifo`, `ptr_ring`), sin un solo lock a la vista.
+
+<Callout type="warn" title="Release seguido de acquire NO es una barrera total">
+Un error sutil: un `smp_store_release` seguido de un `smp_load_acquire` en el **mismo** núcleo no equivale a `smp_mb`. Cada uno es una valla de un solo sentido, así que una carga posterior todavía puede adelantar a una escritura anterior —el reordenamiento Escritura-Carga del store buffer, nivel 18.1—. Si necesitas ese orden concreto, como en la exclusión mutua de Dekker, no queda otra que un `smp_mb` completo. Acquire/release publica y consume; no drena el store buffer.
+</Callout>
+
+<Callout type="dios" title="Publicar y suscribir es el idioma común de toda la concurrencia moderna">
+Acquire/release no es una peculiaridad del kernel: es el mismo vocabulario que `memory_order_acquire`/`release` de C11, que el `volatile` de Java, que las instrucciones `LDAR`/`STLR` de ARMv8. Se impuso como lingua franca porque captura **exactamente** la arista de happens-before que necesitas y ni una restricción más, y eso es tan barato como puede serlo la correción. Pero la revelación de fondo es de unificación: un spinlock, la publicación de un puntero RCU y una bandera hecha a mano son el **mismo** apretón de manos release/acquire a escalas distintas. El lock lo aplica a una sección crítica entera; RCU, a un puntero; tu flag, a una variable. Cuando de verdad ves que release = publicar y acquire = suscribirse, todo el zoológico de primitivas de sincronización —mutex, spinlock, RCU, seqlock, atómicos— colapsa en una sola idea con muchos disfraces. Dejas de aprender primitivas de memoria y empiezas a reconocer el mismo patrón una y otra vez. Esa compresión mental es la marca de quien domina la concurrencia de sistemas.
+</Callout>
+
+<Challenge title="Publica y consume con una sola primitiva por lado">
+1. Reescribe el flag+datos del nivel 18.3 con `smp_store_release`/`smp_load_acquire`: fíjate en que son dos líneas menos y nombran la variable.
+2. Explica por qué la garantía es condicional: solo vale si el acquire lee el valor que publicó el release.
+3. Mapea `spin_lock`/`spin_unlock` a acquire/release y razona la asimetría del "motel de cucarachas".
+4. Lee `rcu_assign_pointer` y `rcu_dereference` en `include/linux/rcupdate.h` y localiza el release y la dependencia.
+5. Encuentra un par atómico `_acquire`/`_release` usado en una estructura sin bloqueo del kernel.
+</Challenge>

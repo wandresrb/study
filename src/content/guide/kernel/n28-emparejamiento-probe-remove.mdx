@@ -1,0 +1,155 @@
+---
+title: "El emparejamiento driver-dispositivo: match, probe y remove"
+description: "Cómo el bus casa un device con un driver y consuma el enlace. Dos disparadores —añadir un dispositivo o registrar un driver— convergen en la misma secuencia: match decide, really_probe apuesta y llama a .probe, driver_bound sella el enlace. El probe diferido con EPROBE_DEFER hace irrelevante el orden de carga, y bind/unbind permiten forzarlo a mano."
+subject: kernel
+level: 28
+order: 4
+position: "28.4"
+duration: "17 min"
+---
+
+<Lead>
+Un dispositivo y su driver aparecen en momentos distintos y por caminos distintos: el firmware enumera el hardware cuando quiere, y los módulos se cargan cuando el sistema lo decide. El emparejamiento es el mecanismo que los hace encontrarse sin importar quién llegó primero. Dos disparadores independientes convergen en la misma secuencia —`match`, `really_probe`, `.probe`— y de ella sale un enlace vivo entre una instancia de hardware y el código que la gobierna.
+</Lead>
+
+<Goals>
+
+- Ver cuándo se dispara el emparejamiento: al añadir un `device` o al registrar un `driver`.
+- Seguir el camino `match` a `really_probe` a `.probe` y qué hace `driver_bound`.
+- Entender `-EPROBE_DEFER` y por qué el orden de carga deja de importar.
+- Ver el enlace y desenlace manual desde `/sys/bus/.../bind` y `unbind`.
+
+</Goals>
+
+## Dos disparadores, un mismo encuentro
+
+El emparejamiento se intenta en dos ocasiones simétricas. Cuando se añade un dispositivo con `device_add`, el core recorre los drivers del bus buscando uno que case. Cuando se registra un driver con `driver_register`, el core recorre los dispositivos del bus buscando cuáles case. Ambos caminos terminan en la misma comprobación: `driver_match_device`.
+
+```c
+/* drivers/base/dd.c — la ultima palabra la tiene el bus */
+static inline int driver_match_device(const struct device_driver *drv,
+				      struct device *dev)
+{
+	/* si el bus no define match, todo device casa con todo driver del bus */
+	return drv->bus->match ? drv->bus->match(dev, drv) : 1;
+}
+```
+
+Da igual el orden en que aparezcan device y driver: el que llega segundo encuentra al primero esperando en la lista del bus. Esa simetría es lo que permite cargar módulos en cualquier orden y conectar hardware en caliente.
+
+## De match a probe
+
+Si `match` devuelve verdadero, el core llama a `really_probe`. Esta función hace una apuesta: fija `dev->driver` provisionalmente, ejecuta el `probe` del driver (o el del bus, si lo interpone) y, según el resultado, sella el enlace o lo deshace por completo.
+
+```c
+/* drivers/base/dd.c — really_probe, esencia */
+static int really_probe(struct device *dev, const struct device_driver *drv)
+{
+	dev->driver = drv;                  /* apuesta: este driver gobernara el device */
+
+	if (dev->bus->probe)
+		ret = dev->bus->probe(dev);     /* algunos buses interponen su probe */
+	else if (drv->probe)
+		ret = drv->probe(dev);          /* el caso habitual: el probe del driver */
+
+	if (ret) {
+		dev->driver = NULL;             /* la apuesta falla: se deshace todo */
+		goto probe_failed;
+	}
+
+	driver_bound(dev);                  /* sella: enlaces en sysfs y notificacion */
+	return 0;
+}
+```
+
+`driver_bound` es el punto donde el enlace se hace oficial: crea el enlace simbólico `driver` en el directorio del dispositivo y el enlace inverso en el del driver, y notifica a quien escuche. A partir de ahí el dispositivo está *bound* y su driver lo gobierna.
+
+<Mermaid code={`flowchart TD
+  A[device_add] --> M{bus match}
+  B[driver_register] --> M
+  M -->|casa| P[really_probe fija dev.driver]
+  M -->|no casa| X[queda sin enlazar]
+  P --> PR[.probe del driver]
+  PR -->|devuelve 0| OK[driver_bound enlace sellado]
+  PR -->|EPROBE_DEFER| D[lista de reintento]
+  PR -->|otro error| X`} />
+
+## Un driver de plataforma real
+
+El patrón anterior rara vez se escribe a mano: los buses ofrecen envoltorios. Un `platform_driver` declara su tabla de compatibilidad, y `module_platform_driver` genera el registro y la baja. El `probe` recibe la instancia ya emparejada y arranca el hardware; los recursos gestionados con `devm_` se liberan solos al desenlazar.
+
+```c
+static const struct of_device_id mi_of_match[] = {
+	{ .compatible = "acme,widget-v2" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, mi_of_match);   /* deja que udev autocargue el modulo */
+
+static int mi_probe(struct platform_device *pdev)
+{
+	struct mi_dev *d;
+
+	d = devm_kzalloc(&pdev->dev, sizeof(*d), GFP_KERNEL);
+	if (!d)
+		return -ENOMEM;
+
+	d->regs = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(d->regs))
+		return PTR_ERR(d->regs);
+
+	platform_set_drvdata(pdev, d);
+	dev_info(&pdev->dev, "enlazado a %pOF\n", pdev->dev.of_node);
+	return 0;
+}
+
+static void mi_remove(struct platform_device *pdev)
+{
+	/* nada que liberar: los recursos devm_ se deshacen automaticamente */
+}
+
+static struct platform_driver mi_driver = {
+	.probe  = mi_probe,
+	.remove = mi_remove,
+	.driver = {
+		.name		= "mi-widget",
+		.of_match_table	= mi_of_match,
+	},
+};
+module_platform_driver(mi_driver);
+```
+
+## Probe diferido y enlace manual
+
+El `probe` no siempre puede triunfar en el primer intento: quizá el reloj o el regulador que necesita todavía no tienen driver. Devolver `-EPROBE_DEFER` le dice al core "aún no, reinténtalo más tarde", y el dispositivo vuelve a una lista que se reintenta cada vez que aparece un driver nuevo. Así, el orden de carga de módulos deja de importar.
+
+```c
+	d->clk = devm_clk_get(&pdev->dev, NULL);
+	if (IS_ERR(d->clk))
+		/* si el proveedor del reloj aun no existe, esto da -EPROBE_DEFER
+		   y el core reintentara el probe cuando el reloj aparezca */
+		return dev_err_probe(&pdev->dev, PTR_ERR(d->clk), "sin reloj todavia\n");
+```
+
+El emparejamiento también puede forzarse desde userspace escribiendo en los ficheros `bind` y `unbind` del driver en sysfs. Es la vía para depurar, para ceder un dispositivo a otro driver, o para reiniciar un enlace sin recargar módulos.
+
+```bash
+# desenlazar un dispositivo de su driver, y volver a enlazarlo a mano
+echo 0000:03:00.0 > /sys/bus/pci/devices/0000:03:00.0/driver/unbind
+echo 0000:03:00.0 > /sys/bus/pci/drivers/nvme/bind
+```
+
+<Callout type="warn" title="El probe diferido no es una excusa para ignorar dependencias">
+`-EPROBE_DEFER` resuelve el orden de aparición, no las dependencias mal declaradas. Si tu `probe` difiere para siempre porque el recurso que espera no existe en absoluto, el dispositivo queda colgado sin enlazar y el síntoma es silencioso. Usa `dev_err_probe`, que registra el motivo solo cuando conviene y silencia el ruido de los reintentos, y revisa `/sys/kernel/debug/devices_deferred` para ver qué sigue esperando y por qué.
+</Callout>
+
+<Callout type="dios" title="Probe es una cita a ciegas orquestada por datos, no por orden de llamada">
+Detente en lo que realmente ocurre en el emparejamiento, porque encierra el principio que hace escalable a todo el kernel de dispositivos. Hay dos flujos completamente asíncronos y mutuamente ignorantes: por un lado, el firmware y los buses **producen dispositivos** —enumeran PCI, sondean USB, parsean el árbol de dispositivos— cada uno a su ritmo y en su momento; por otro, la carga de módulos **produce drivers**, gobernada por el arranque, por udev o por la mano del administrador. Estos dos flujos no se coordinan, no comparten reloj y no se conocen. El emparejamiento es el punto de encuentro, y su genialidad es que **la cita se concierta por datos, no por orden de llamada**: el criterio de compatibilidad vive en una tabla —cadenas *compatible*, IDs de PCI o USB— y `match` es la función que lee esas tablas y decide. Como el enlace se descubre por contenido y no por secuencia, el sistema se vuelve indiferente al tiempo: da igual que el driver llegue antes que el dispositivo o al revés, porque el que llega segundo encuentra al primero aguardando en la lista del bus; y si una dependencia aún no está lista, `-EPROBE_DEFER` congela la cita y la reanuda cuando el mundo cambia. Esta arquitectura dirigida por eventos y datos es exactamente lo que permite el hotplug —enchufar un USB diez horas después de arrancar y que su driver despierte solo—, lo que permite compilar drivers como módulos independientes, y lo que permite que el mismo kernel arranque en un millón de configuraciones de hardware distintas sin una sola línea que ordene "primero esto, luego aquello". Cuando internalices que `probe` no es una llamada en una secuencia de arranque sino la resolución tardía de un emparejamiento diferido en el tiempo, habrás entendido por qué el kernel moderno no tiene un "orden de inicialización de dispositivos": lo reemplazó por un grafo de dependencias que se resuelve solo.
+</Callout>
+
+<Challenge title="Provoca y observa el emparejamiento">
+1. Elige un dispositivo con driver enlazado, escribe su nombre en el `unbind` del driver y comprueba con `dmesg` y sysfs que su `remove` se ejecutó y el enlace desapareció; luego vuelve a enlazarlo con `bind`.
+2. Sigue en el código, desde `driver_register`, la cadena de llamadas hasta `really_probe` y nombra dónde se fija y dónde se anula `dev->driver`.
+3. Explica qué hace `driver_bound` y qué dos enlaces simbólicos cruzados aparecen en sysfs tras un enlace exitoso.
+4. Lee `/sys/kernel/debug/devices_deferred` en tu máquina; si hay entradas, razona qué recurso esperan y por qué el core no da el enlace por perdido.
+5. Argumenta por qué un `probe` que devuelve `-EPROBE_DEFER` es correcto pero uno que devuelve `-ENOMEM` en un caso recuperable no lo es, y qué diferencia hay para el core.
+</Challenge>

@@ -1,0 +1,169 @@
+---
+title: "SLUB por dentro: struct slab, freelist y caché por-CPU"
+description: "El asignador SLUB por debajo: struct kmem_cache, kmem_cache_cpu y kmem_cache_node, el descriptor struct slab que se separó de struct page en 5.17, la freelist enhebrada por los propios objetos libres con hardening XOR, y la ruta rápida sin locks con tid y cmpxchg por-CPU."
+subject: kernel
+level: 21
+order: 3
+position: "21.3"
+duration: "17 min"
+---
+
+<Lead>
+SLUB es el único asignador de objetos de Linux 7.x, y su diseño es una lección de cómo escalar a cientos de núcleos: metadatos mínimos incrustados en los propios objetos libres, un descriptor de slab propio, y una ruta rápida de asignación que no toca ni un solo lock compartido. Vamos a abrir la caja y mirar los engranajes.
+</Lead>
+
+<Goals>
+
+- Describir `struct kmem_cache`, `kmem_cache_cpu` y `kmem_cache_node`.
+- Entender `struct slab` y cómo un objeto libre guarda el puntero al siguiente.
+- Seguir la ruta rápida de asignación sin locks con `tid` y `cmpxchg`.
+- Ver el papel de las slabs parciales por-CPU en la velocidad.
+
+</Goals>
+
+## La anatomía: caché, nodo y CPU
+
+Una caché SLUB se despliega en tres niveles: una estructura global por tipo, una estructura por nodo NUMA y una estructura por CPU. La por-CPU es donde vive el camino caliente.
+
+```c
+/* mm/slub.c y include/linux/slub_def.h, campos esenciales */
+struct kmem_cache {
+	struct kmem_cache_cpu __percpu *cpu_slab;  /* estado por-CPU */
+	slab_flags_t   flags;
+	unsigned int   size;          /* tamano del objeto con metadatos */
+	unsigned int   object_size;   /* tamano util que pidio el usuario */
+	unsigned int   offset;        /* donde vive el freepointer */
+	unsigned int   cpu_partial;   /* cuantos objetos cachear por-CPU */
+	unsigned long  random;        /* semilla del hardening de freelist */
+	struct kmem_cache_node *node[MAX_NUMNODES];
+	const char    *name;
+	/* ... */
+};
+
+struct kmem_cache_cpu {
+	void          **freelist;   /* siguiente objeto libre de la slab activa */
+	unsigned long   tid;        /* id de transaccion: mata el ABA */
+	struct slab    *slab;       /* slab activa de esta CPU */
+	struct slab    *partial;    /* slabs parciales cacheadas por esta CPU */
+};
+```
+
+La `kmem_cache_node` guarda la lista de slabs parciales del nodo (`partial`) bajo un spinlock `list_lock`, y el conteo de slabs. Es el depósito compartido al que se recurre solo cuando la CPU se queda sin objetos locales.
+
+## struct slab: el descriptor que se separó de struct page
+
+Durante años SLUB robó campos a `struct page` para describir sus slabs, un abuso de la unión de la página que confundía a medio kernel. En **5.17** (2022) se saneó: nació un `struct slab` propio, que sigue solapando el marco de página física pero con nombres honestos.
+
+```c
+/* mm/slab.h */
+struct slab {
+	unsigned long __page_flags;
+	struct kmem_cache *slab_cache;
+	union {
+		struct {
+			union {
+				struct list_head slab_list;  /* lista parcial del nodo */
+				struct {                     /* lista parcial por-CPU */
+					struct slab *next;
+					int          slabs;
+				};
+			};
+			void *freelist;      /* primer objeto libre de ESTA slab */
+			union {
+				unsigned long counters;
+				struct {
+					unsigned inuse:16;   /* objetos en uso */
+					unsigned objects:15; /* objetos totales */
+					unsigned frozen:1;   /* congelada: la posee una CPU */
+				};
+			};
+		};
+		struct rcu_head rcu_head;    /* para SLAB_TYPESAFE_BY_RCU */
+	};
+};
+```
+
+El bit `frozen` es clave: una slab *congelada* pertenece en exclusiva a una CPU y esta puede manipular su freelist sin tomar el `list_lock` del nodo. Ahí está el secreto de la velocidad de SLUB: la mayor parte del tiempo, la slab activa de tu CPU está congelada y solo tú la tocas.
+
+## El objeto libre lleva el puntero al siguiente
+
+SLUB no gasta memoria en un array de punteros a huecos. En su lugar, **cada objeto libre almacena dentro de sí** la dirección del siguiente libre, en el desplazamiento `s->offset`. La freelist es, literalmente, una lista simplemente enlazada enhebrada a través de los propios objetos vacíos: cero metadatos externos.
+
+<Mermaid code={`flowchart LR
+  CPU[kmem_cache_cpu freelist] --> A[objeto libre]
+  A -->|freepointer en offset s| B[objeto libre]
+  B -->|freepointer| C[objeto libre]
+  C -->|freepointer| N[NULL fin de la slab]
+  class CPU t-blue
+  class N t-yellow`} />
+
+Ese puntero incrustado es un blanco de oro para un exploit: si un desbordamiento sobrescribe el freepointer de un objeto libre, la siguiente asignación devolverá una dirección elegida por el atacante. Por eso `CONFIG_SLAB_FREELIST_HARDENED` lo **ofusca**: no guarda el puntero en claro, sino cifrado con un XOR triple contra una semilla por-caché y la propia dirección donde se almacena.
+
+```c
+/* mm/slub.c, forma simplificada del hardening */
+static inline void *freelist_ptr_decode(const struct kmem_cache *s,
+					freeptr_t ptr, unsigned long ptr_addr)
+{
+#ifdef CONFIG_SLAB_FREELIST_HARDENED
+	return (void *)((unsigned long)ptr.v ^ s->random ^
+			swab((unsigned long)ptr_addr));
+#else
+	return (void *)ptr.v;   /* sin hardening: puntero en claro */
+#endif
+}
+```
+
+Como el cifrado mezcla la dirección de almacenamiento, un mismo valor de puntero se codifica distinto según dónde viva, y una sobrescritura ciega produce un puntero basura que hace saltar la comprobación en vez de redirigir la asignación. Su primo `CONFIG_SLAB_FREELIST_RANDOM` va más allá y **baraja el orden** de la freelist al crear cada slab, para que el orden de asignación no sea predecible.
+
+## La ruta rápida sin locks
+
+Aquí está la joya. En el caso común, asignar un objeto **no toma ningún lock**: lee el estado por-CPU y lo actualiza con un intercambio atómico local.
+
+```c
+/* corazon de slab_alloc_node, muy simplificado */
+redo:
+	c    = raw_cpu_ptr(s->cpu_slab);
+	tid  = READ_ONCE(c->tid);          /* fotografia de la transaccion */
+	object = c->freelist;
+	slab   = c->slab;
+
+	if (unlikely(!object || !node_match(slab, node))) {
+		/* freelist vacia: cae a la ruta lenta */
+		object = __slab_alloc(s, gfpflags, node, addr, c);
+	} else {
+		void *next = get_freepointer_safe(s, object);
+		/* publica freelist=next y tid+1 de forma atomica en ESTA CPU */
+		if (unlikely(!__update_cpu_freelist_fast(s, object, next, tid)))
+			goto redo;                 /* nos interrumpieron: reintenta */
+	}
+```
+
+La actualización usa `this_cpu_cmpxchg128` (un compare-and-swap de 128 bits sobre el par freelist más tid) cuando el hardware lo permite. El **`tid`** es un contador de transacción que se incrementa en cada operación: si una interrupción o una migración se cuela entre la lectura y el intercambio, el `tid` habrá cambiado, el `cmpxchg` fallará y se reintenta. Es la defensa contra el problema ABA sin pagar el precio de un spinlock. Todo el tráfico de memoria del camino caliente cae sobre una única línea de caché **propia** de la CPU: ni rebote entre núcleos ni contención.
+
+Solo cuando la freelist por-CPU se agota se entra en `__slab_alloc`, la ruta lenta, que busca en este orden:
+
+<Cards>
+  <Card icon="⚡" title="Slab parcial por-CPU">
+    Si `c->partial` tiene slabs, promueve una a activa sin tocar el nodo. Rápido y sin `list_lock`.
+  </Card>
+  <Card icon="🗄️" title="Slab parcial del nodo">
+    Toma `node->list_lock`, saca una slab parcial de la lista del nodo NUMA y la congela para esta CPU.
+  </Card>
+  <Card icon="🌱" title="Slab nueva del buddy">
+    Sin parciales en ningún sitio, pide páginas al buddy, las talla en objetos y enhebra la freelist.
+  </Card>
+</Cards>
+
+La liberación es la imagen especular: si liberas a la slab activa de tu CPU, empujas el objeto a la cabeza de `c->freelist` con el mismo `cmpxchg` sin locks; si es a otra slab, la ruta lenta la reintegra a las parciales por-CPU o del nodo. Las slabs parciales por-CPU (`CONFIG_SLUB_CPU_PARTIAL`) son un depósito intermedio que absorbe ráfagas de alloc y free sin bajar al `list_lock` del nodo en cada transición.
+
+<Callout type="dios" title="Escalar es no compartir: la freelist por-CPU sin candados">
+SLUB es la aplicación literal de la lección del nivel 18: la sincronización más rápida es la que no ocurre. Fíjate en lo que consigue el camino caliente: asigna y libera un objeto tocando exclusivamente la línea de caché de la CPU actual, sin un solo spinlock, sin una sola escritura a memoria compartida entre núcleos, con un `cmpxchg` local cuyo `tid` neutraliza cualquier carrera con interrupciones. Cien CPUs pueden asignar a la vez de la misma caché lógica sin estorbarse, porque cada una trabaja sobre su propia slab congelada y su propia freelist. La contención solo aparece en la ruta fría —rellenar desde el nodo bajo `list_lock`, pedir una slab al buddy—, que se visita rara vez y cuyo coste se amortiza sobre cientos de objetos. A esto se suma que los metadatos viven *dentro* de los objetos libres, de modo que la caché no gasta memoria administrativa aparte. El resultado es un asignador que en 2007 desbancó al SLAB clásico y que hoy, único superviviente, sostiene sin despeinarse las rutas más calientes del kernel en máquinas de cientos de núcleos. Diseñar para que el caso común no comparta nada: esa es la idea que separa un asignador que escala de uno que se ahoga.
+</Callout>
+
+<Challenge title="Sigue el objeto por dentro">
+1. Dibuja los tres niveles —`kmem_cache`, `kmem_cache_node`, `kmem_cache_cpu`— y di qué protege cada lock.
+2. Explica qué significa el bit `frozen` de una `struct slab` y por qué permite prescindir del `list_lock`.
+3. Describe cómo se enhebra la freelist a través de los objetos libres y qué guarda el hardening en `s->random`.
+4. Razona por qué el `tid` es imprescindible para que el `cmpxchg` por-CPU sea correcto frente a interrupciones.
+5. Ordena los tres orígenes de la ruta lenta de más barato a más caro y di cuándo se llega a cada uno.
+</Challenge>

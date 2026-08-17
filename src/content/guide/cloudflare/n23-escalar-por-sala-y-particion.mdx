@@ -1,0 +1,159 @@
+---
+title: "Escalar: un objeto por sala y partición por identidad"
+description: "Un Durable Object escala hacia los lados, no hacia arriba: la unidad de escala es el nombre, y crecer significa tener mas objetos con menos carga cada uno. Vemos por que el objeto unico es el antipatron que arruina cualquier diseno de tiempo real, como se calcula el coste real de una sala a partir del abanico cuadratico de la difusion, que hacer cuando una sala crece tanto que ya no cabe en un solo hilo —difusion en arbol con fragmentos y coordinador—, y como se elige la clave de particion para que cada objeto lleve poca carga. Cerramos con la coubicacion mediante locationHint y el presupuesto por objeto."
+subject: cloudflare
+level: 23
+order: 5
+position: "23.5"
+duration: "22 min"
+---
+
+<Lead>
+Todo lo que hace poderoso a un Durable Object en tiempo real —ser único, tener un solo hilo, sostener el orden— es también, mirado del revés, su límite. Un objeto no se hace más grande porque llegue más gente: sigue siendo un hilo en una máquina, con su memoria y su presupuesto de cómputo. Por eso escalar aquí nunca significa engordar el objeto, sino multiplicarlo. La pregunta de diseño deja de ser cuántos servidores necesito y pasa a ser una mucho más interesante: cómo parto mi dominio en entidades con nombre para que ninguna cargue demasiado. Elegir bien esa partición es, casi siempre, la única decisión de escalado que tendrás que tomar.
+</Lead>
+
+<Goals>
+
+- Justificar por qué la unidad de escala es el nombre del objeto y reconocer el antipatrón del objeto único.
+- Calcular el coste de una sala a partir del abanico de la difusión y del número de mensajes por segundo.
+- Partir una sala demasiado grande en fragmentos coordinados y difundir en árbol.
+- Elegir la clave de partición y afinar la coubicación con `locationHint` y el presupuesto por objeto.
+
+</Goals>
+
+## La unidad de escala es el nombre
+
+En un backend clásico, escalar tiempo real es un problema de infraestructura: más instancias del servidor de sockets, un bus de mensajes por medio para que las instancias se hablen entre sí, y una tabla que diga quién está conectado a cuál. Aquí no hay nada de eso, porque la propia identidad del objeto hace de repartidor. Cada sala, cada documento, cada partida es un nombre, y cada nombre es un objeto distinto con su hilo, su memoria y su almacén. Diez mil salas simultáneas no son diez mil conexiones apretadas en un proceso: son diez mil procesos diminutos, aislados entre sí, repartidos por la red.
+
+```ts
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const sala = new URL(request.url).searchParams.get("sala") ?? "general";
+    // el nombre de la entidad es la unidad de escala
+    const id = env.SALA.idFromName(`sala:${sala}`);
+    return env.SALA.get(id).fetch(request);
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+La palabra clave es aislamiento. Como dos salas no comparten memoria, ni hilo, ni almacén, tampoco comparten destino: una sala que recibe una avalancha ralentiza a sus propios miembros y a nadie más, y un fallo en el código que solo se dispara con cierto contenido tumba una entidad en vez de un servidor entero. Ese reparto del radio de impacto es una propiedad de escalado tan valiosa como el rendimiento, y se obtiene sin escribir una línea: viene de haber puesto un nombre a cada porción del mundo.
+
+De ahí se sigue el antipatrón que hay que aprender a oler desde lejos: el objeto único. Es tentador crear una sola instancia que lo sepa todo —el registro global de usuarios en línea, el contador de todo el sistema, el enrutador central de mensajes— porque simplifica el código. Pero un objeto es un hilo, y un hilo es un cuello de botella con nombre propio: todo el tráfico del sistema se serializa en él, la latencia crece con la carga y no hay manera de repartirlo después sin rehacer el modelo. Si un objeto recibe tráfico proporcional al tamaño total de tu aplicación, está mal partido. La carga de cada objeto debe depender del tamaño de su entidad, no del de tu producto.
+
+## El abanico: por qué una sala grande duele
+
+El coste de una sala no lo marca el número de conexiones, sino el producto de dos números. Si hay `n` participantes y cada uno envía `m` mensajes por segundo, el objeto procesa `n` por `m` mensajes entrantes, pero emite `n` por `m` por `n` salientes, porque cada mensaje se difunde a todos. El abanico es cuadrático en el número de participantes, y esa es la curva que decide si tu diseño aguanta.
+
+Los números concretos aclaran la intuición. Cincuenta personas escribiendo un mensaje cada diez segundos son cinco entrantes y doscientos cincuenta salientes por segundo: trivial. Mil espectadores en un directo con cien comentarios por segundo son cien mil envíos por segundo desde un solo hilo: ya es un problema serio. Y una sala con decenas de miles de conexiones choca además con el techo de conexiones simultáneas que admite un objeto, del orden de decenas de miles. Antes de partir nada, calcula el abanico: es una multiplicación, y te dice si estás cerca del muro.
+
+Cuando el abanico aprieta pero la sala todavía cabe, hay dos remedios previos a la partición, ambos baratos. El primero es agrupar: en vez de difundir cada mensaje al instante, acumula lo que llega durante un intervalo corto y emite un lote con una alarma, con lo que el abanico se calcula sobre lotes por segundo y no sobre mensajes por segundo. El segundo es adelgazar lo que viaja: difundir deltas en lugar de estados completos, y para datos de alta frecuencia —cursores, posiciones— quedarse con el último valor de cada emisor y descartar los intermedios, que nadie llegará a ver.
+
+```ts
+async webSocketMessage(ws: WebSocket, crudo: string): Promise<void> {
+  this.pendientes.push(JSON.parse(crudo));
+  // un solo abanico cada cien ms, sin importar cuantos mensajes lleguen
+  if ((await this.ctx.storage.getAlarm()) === null) {
+    await this.ctx.storage.setAlarm(Date.now() + 100);
+  }
+}
+
+async alarm(): Promise<void> {
+  if (this.pendientes.length === 0) return;
+  this.difundir({ tipo: "lote", eventos: this.pendientes });
+  this.pendientes = [];
+}
+```
+
+Con esa sola alarma, mil mensajes por segundo en una sala de mil personas dejan de ser un millón de envíos y pasan a ser diez mil: dos órdenes de magnitud a cambio de cien milisegundos de retardo que nadie percibe en un chat. Antes de fragmentar nada, gasta siempre este cartucho.
+
+## Salas demasiado grandes: difundir en árbol
+
+Si tras agrupar y adelgazar la sala sigue sin caber, hay que partirla, y la forma canónica es un árbol. La sala deja de ser un objeto y pasa a ser un coordinador con varios fragmentos: los clientes se reparten entre los fragmentos por un hash de su identidad, cada fragmento sostiene su porción de conexiones, y el coordinador solo habla con los fragmentos, nunca con los clientes.
+
+```ts
+const FRAGMENTOS = 16;
+
+function fragmentoDe(usuario: string, sala: string): string {
+  const h = [...usuario].reduce((a, c) => a * 31 + c.charCodeAt(0), 7);
+  return `sala:${sala}:frag:${Math.abs(h) % FRAGMENTOS}`;
+}
+
+// en el coordinador: un envio por fragmento, no uno por cliente
+async difundirEnArbol(mensaje: unknown, sala: string): Promise<void> {
+  const trabajos = [];
+  for (let i = 0; i < FRAGMENTOS; i++) {
+    const id = this.env.FRAGMENTO.idFromName(`sala:${sala}:frag:${i}`);
+    trabajos.push(this.env.FRAGMENTO.get(id).difundirLocal(mensaje));
+  }
+  await Promise.all(trabajos);
+}
+```
+
+Hay una variante que conviene conocer porque cubre el caso más extremo, el de la retransmisión con cientos de miles de espectadores. Cuando los fragmentos pasan de unas pocas decenas, el coordinador vuelve a ser un cuello de botella —está haciendo un envío por fragmento— y la solución es añadir un nivel intermedio: el coordinador habla con un puñado de repetidores y cada repetidor con sus fragmentos. El árbol crece en profundidad en lugar de en anchura, y el número de envíos que hace cualquier nodo se mantiene pequeño mientras el total crece de forma exponencial con la altura.
+
+El cambio de forma es el de siempre: un hilo que hacía `n` envíos pasa a hacer dieciséis, y cada fragmento hace `n` partido por dieciséis en paralelo, en dieciséis hilos distintos. El coste que pagas es real y conviene tenerlo presente: el orden global se relaja, porque dos fragmentos pueden entregar en instantes ligeramente distintos, y aparece un salto de red entre coordinador y fragmento. Por eso la partición se hace cuando hace falta y no antes: para un chat es aceptable, para un editor colaborativo donde el orden es el producto, casi nunca lo es.
+
+<Mermaid code={`flowchart TB
+  C[coordinador de la sala] --> F1[fragmento uno]
+  C --> F2[fragmento dos]
+  C --> F3[fragmento tres]
+  F1 --> A[clientes del fragmento uno]
+  F2 --> B[clientes del fragmento dos]
+  F3 --> D[clientes del fragmento tres]
+  class C t-green`} />
+
+## Elegir la clave y el lugar
+
+La decisión de fondo sigue siendo la clave de partición, y hay una prueba sencilla para validarla. Escribe cuánta carga tendrá el objeto más ocupado de tu sistema en el peor día que puedas imaginar; si esa cifra no depende del tamaño total de tu producto sino del de una sola entidad, la clave es buena. El documento, la sala, la partida y la persona suelen pasar la prueba. La organización entera, la región o el sistema global casi nunca la pasan, porque su carga crece con tu éxito.
+
+Cuando una entidad natural resulta demasiado gruesa, refínala en vez de rendirte: un canal por tema dentro de un espacio de trabajo, un objeto por hoja en vez de por libro, un objeto por región del mapa en vez de por mundo. Y cuando resulta demasiado fina —millones de objetos con una conexión cada uno— agrupa hacia arriba, porque cada objeto tiene un pequeño coste fijo de despertar.
+
+Vigila también el desequilibrio, que es el modo de fallo más común de una partición por lo demás razonable. Casi todos los dominios tienen entidades desproporcionadas: el canal general donde está la empresa entera, el documento que alguien compartió en público, la partida del torneo que ve todo el mundo. Una clave correcta en promedio puede seguir teniendo un objeto mil veces más cargado que la mediana, y ese objeto marcará tu peor latencia. Por eso el diseño se valida siempre contra la entidad mayor, no contra la típica.
+
+```ts
+// la primera peticion decide donde vive el objeto: acercalo a su gente
+const id = env.SALA.idFromName(`sala:${sala}`);
+const stub = env.SALA.get(id, { locationHint: "weur" });
+```
+
+Queda el lugar físico. Un objeto se crea cerca de quien lo invoca por primera vez y allí se queda, lo cual es óptimo cuando la primera petición viene de la misma región que el resto, y desafortunado cuando la crea un administrador desde otro continente. Con `locationHint` empujas esa decisión hacia la región que de verdad usará la sala. Recuerda que la pista solo cuenta en la creación, y que si tus participantes están repartidos por el mundo no hay ubicación perfecta: habrá una latencia base para los más lejanos, y lo que se optimiza entonces no es la distancia sino el número de viajes.
+
+Con todo eso en la mano, el ejercicio final es escribir el presupuesto de un objeto: cuánto puede cargar antes de doler, y qué síntoma delata cada techo. No hay que memorizar cifras, sino saber cuál de estas cuatro dimensiones te limita primero, porque cada una pide un remedio distinto.
+
+| Dimensión | Techo práctico | Síntoma cuando se acerca | Remedio |
+| --- | --- | --- | --- |
+| Conexiones | Decenas de miles por objeto | Rechazos al aceptar el `upgrade` | Fragmentar la sala |
+| Cómputo | Un hilo por objeto | Latencia creciente en la difusión | Agrupar y adelgazar mensajes |
+| Memoria | Instancia pequeña y volátil | Presión al reconstruir tras dormir | Bajar el estado al almacén |
+| Estado durable | Almacén por objeto | Consultas lentas o `list` \| `sql` costosos | Podar con instantáneas |
+
+<Callout type="info" title="Mide antes de fragmentar">
+Partir una sala tiene un coste permanente en complejidad y en garantías de orden, así que no lo hagas por intuición. Registra mensajes entrantes por segundo, envíos salientes y tiempo de proceso por mensaje en tus salas mayores, y decide con esos tres números. La mayoría de los sistemas que se fragmentan por miedo descubren después que agrupar la difusión en lotes de cien milisegundos les habría bastado durante años.
+</Callout>
+
+<Cards>
+  <Card icon="🔑" title="El nombre es la partición">
+    Escalas creando más objetos, no objetos más grandes. La clave de partición es la decisión de escalado.
+  </Card>
+  <Card icon="🚫" title="Nada de objeto único">
+    Si la carga de un objeto crece con el tamaño de tu producto y no con el de su entidad, has creado un cuello de botella con nombre.
+  </Card>
+  <Card icon="🌳" title="Difusión en árbol">
+    Coordinador y fragmentos cuando una sola sala no cabe. Ganas paralelismo y pagas con un salto más y un orden global relajado.
+  </Card>
+  <Card icon="📐" title="Calcula el abanico">
+    Participantes por mensajes por participantes. Es una multiplicación, y te dice si vas a chocar antes de escribir el código.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="La escala como acto de modelado, no de aprovisionamiento">
+Hay una asimetría que conviene ver con claridad al cerrar este nivel. En la arquitectura tradicional, la escala es un problema de aprovisionamiento: mides carga, añades máquinas, repartes con un balanceador, y cuando el estado compartido estorba metes un bus de mensajes para que las instancias se cuenten entre ellas lo que ha pasado. Ese trabajo es continuo, caro y ajeno al dominio; nadie que use tu producto sabrá jamás que existió. Aquí la escala se ha convertido en otra cosa: es una consecuencia de cómo nombras el mundo. Cuando decides que la entidad es el documento y no el espacio de trabajo, o que es la partida y no el servidor de juego, ya has decidido tu curva de escalado, y lo has hecho en el lenguaje del dominio y no en el de las máquinas. Las decisiones de infraestructura que antes ocupaban a un equipo entero se han disuelto dentro de una decisión de modelado que un buen diseñador toma en una pizarra, en diez minutos, sin saber cuántos servidores existen. Eso tiene un efecto secundario magnífico y otro incómodo, y hay que decir los dos. El magnífico es que la escala se vuelve gratuita cuando el modelo es bueno: un millón de salas pequeñas no requiere ninguna arquitectura especial, porque nunca hubo un recurso compartido que saturar. El incómodo es que la escala se vuelve imposible cuando el modelo es malo, y no hay chequera que lo arregle: si has metido todo el tráfico en un objeto único, ninguna cantidad de dinero comprará un segundo hilo para él. Lo que en el mundo anterior era una emergencia operativa —un pico de tráfico, un servidor que arde— aquí es una revisión del dominio, y se paga en refactorización, no en facturas. Por eso el consejo final de este nivel no es técnico sino de método: antes de escribir la primera línea de un sistema en tiempo real, escribe los nombres. Qué entidades hay, quién debe ver lo mismo que quién, y cuánta gente cabe razonablemente dentro de cada una. Si esos nombres están bien elegidos, el sistema escalará solo. Si están mal elegidos, ninguna otra decisión posterior podrá salvarlo.
+</Callout>
+
+<Challenge title="Parte tu dominio antes de que el tráfico lo parta">
+1. Enumera las entidades de un sistema tuyo en tiempo real y elige la clave de partición. Justifica que la carga del objeto más ocupado depende de su entidad y no del tamaño total del producto.
+2. Calcula el abanico de tu sala mayor en el peor caso y di cuántos envíos por segundo saldrían de un solo hilo.
+3. Reduce ese abanico sin partir nada: agrupa la difusión en lotes con una alarma y quédate solo con el último valor de cada emisor para los datos de alta frecuencia.
+4. Implementa la difusión en árbol con dieciséis fragmentos y un coordinador, y mide la diferencia frente a la sala monolítica.
+5. Diseña a propósito el antipatrón del objeto único para tu caso, describe en qué punto exacto se rompe y qué cambio de nombres lo habría evitado desde el principio.
+</Challenge>

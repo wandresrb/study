@@ -1,0 +1,98 @@
+---
+title: "Workflows: procesos durables que sobreviven al fallo"
+description: "Una invocación de Worker es efímera: si un proceso de varios pasos muere a mitad, se pierde todo. Los Workflows introducen la ejecución durable: escribes código asíncrono lineal y la plataforma persiste el progreso tras cada paso, de modo que un fallo, un reinicio o un despliegue reanudan desde el último paso completado, no desde cero. Vemos el problema de la ejecución efímera, qué persiste exactamente y el modelo mental de un código que recuerda dónde iba."
+subject: cloudflare
+level: 16
+order: 3
+position: "16.3"
+duration: "16 min"
+---
+
+<Lead>
+Un `fetch` es una chispa: se enciende, atiende una petición, responde y se apaga. Es perfecto para request/response, pero desastroso para un proceso largo. Piensa en un pedido: cobrar la tarjeta, aprovisionar el servicio, enviar la confirmación, esperar tres días, hacer seguimiento. Si el isolate se recicla o el paso tres falla, todo el estado en memoria se evapora, y no querrás volver a cobrar la tarjeta al reintentar. Los Workflows resuelven esto con una idea profunda —la ejecución durable—: escribes código lineal y corriente, y la plataforma guarda tu progreso después de cada paso, de manera que el proceso puede morir entre dos pasos y renacer justo donde estaba.
+</Lead>
+
+<Goals>
+
+- Reconocer por qué la ejecución efímera de un Worker no basta para procesos largos de varios pasos.
+- Entender qué es la ejecución durable y qué se persiste exactamente entre pasos.
+- Escribir la forma de un Workflow: `WorkflowEntrypoint` y el método `run(event, step)`.
+- Interiorizar el modelo mental: código lineal cuyo progreso sobrevive a fallos, reinicios y despliegues.
+
+</Goals>
+
+## El problema: la ejecución efímera
+
+Un manejador de peticiones vive lo que dura una respuesta. Esa brevedad es una virtud cuando el trabajo empieza y acaba en la misma invocación, pero se vuelve una trampa cuando el proceso se extiende en pasos y en tiempo. Un pedido que cobra, aprovisiona, notifica y espera días no cabe en una sola chispa: en algún punto el isolate se recicla, se despliega una versión nueva o un paso lanza una excepción, y el estado en memoria desaparece con él.
+
+Para hacer ese proceso fiable a mano tienes que construir siempre la misma fontanería. Externalizar cada estado intermedio a una base de datos. Hacer idempotente cada paso, para que un reintento no cobre dos veces. Levantar una máquina de estados que sepa por dónde iba el proceso. Y un planificador que lo despierte y lo reanude. Es mucho código, es el mismo código una y otra vez, y es sutilmente difícil: justo en la ventana entre "ejecuté el efecto" y "anoté que lo ejecuté" es donde anidan los peores errores.
+
+## Qué es la ejecución durable
+
+Un Workflow es un motor de ejecución durable. Extiendes `WorkflowEntrypoint` e implementas el método `run`, que recibe el evento que lo disparó y un objeto `step`. La magia está en el `step`: cuando un paso termina, su resultado se persiste de forma duradera. Si el proceso muere entre pasos, el motor lo reinicia y lo reproduce, pero en vez de volver a ejecutar los pasos ya completados, lee sus resultados guardados y salta directo a donde se quedó.
+
+```ts
+import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent } from "cloudflare:workers";
+
+type Params = { pedidoId: string };
+
+export class ProcesarPedido extends WorkflowEntrypoint<Env, Params> {
+  async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
+    const pago = await step.do("cobrar tarjeta", async () => {
+      return await cobrar(event.payload.pedidoId);
+    });
+
+    await step.do("aprovisionar", async () => {
+      await aprovisionar(pago.id);
+    });
+
+    await step.do("enviar confirmacion", async () => {
+      await email(event.payload.pedidoId, pago.id);
+    });
+  }
+}
+```
+
+El Workflow se declara con un binding en `wrangler.jsonc` y se dispara desde un Worker, que devuelve un identificador de instancia con el que consultar su estado más tarde:
+
+```ts
+// wrangler.jsonc -> "workflows": [{ "name": "procesar-pedido",
+//   "binding": "PROCESAR_PEDIDO", "class_name": "ProcesarPedido" }]
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const instancia = await env.PROCESAR_PEDIDO.create({
+      params: { pedidoId: "A-1001" },
+    });
+    return Response.json({ id: instancia.id });
+  },
+};
+```
+
+La consecuencia es que el estado de ejecución de tu propia función se vuelve duradero. No es que el código no falle nunca; es que su progreso sobrevive al fallo. Una instancia puede durar minutos, horas o semanas, y cada una tiene su identidad propia.
+
+## Código que recuerda dónde iba
+
+<Mermaid code={`flowchart LR
+  S1[step cobrar] --> P1[estado persistido]
+  P1 --> S2[step aprovisionar] --> P2[estado persistido]
+  P2 --> X[fallo o reinicio]
+  X -.reanuda.-> S3[step enviar confirmacion]
+  S3 --> DONE[completado]
+  class P1 t-green
+  class P2 t-green
+  class X t-red`} />
+
+El salto mental es este: escribes código lineal y ordinario —sin máquina de estados explícita, sin anotar checkpoints a mano— y las fronteras entre pasos se convierten en checkpoints automáticos. Leyendo `run` de arriba abajo ves el proceso entero de un vistazo; pero en tiempo de ejecución esa misma función puede correr muchas veces, y en cada una avanza rápido sobre los pasos ya hechos reutilizando su resultado almacenado. Por eso el código parece simple y secuencial mientras es a prueba de caídas por debajo. Comparado con la versión artesanal, obtienes la misma fiabilidad con una décima parte del código, y la carga de la corrección se traslada de ti a la plataforma.
+
+<Callout type="dios" title="La ejecución durable disuelve la falsa elección entre funcion sin estado y servidor con estado">
+Durante décadas, el pensamiento de backend se organizó en torno a una dicotomía que parecía insalvable. En un lado, la función sin estado: fácil de escalar y de razonar, pero amnésica, incapaz de recordar nada entre invocaciones. En el otro, el servidor con estado: recuerda, pero es frágil, difícil de escalar y muere llevándose consigo lo que sabía. Toda una generación de arquitecturas nació de elegir un cuerno de ese dilema y pagar su precio. La ejecución durable no elige: disuelve la dicotomía. Un Workflow es a la vez las dos cosas y ninguna —un código que se lee como una única función lineal y sin estado, pero cuyo progreso se persiste como el registro de transacciones de una base de datos—. La misma idea late bajo Temporal, DBOS, las Step Functions y, en el fondo, bajo el event sourcing y los write-ahead logs: no intentes construir sistemas que nunca fallen, construye sistemas cuyo progreso sobreviva al fallo. Ahí está el giro que hay que interiorizar: la fiabilidad no es la ausencia de caídas, es la supervivencia del avance. Una vez que ves el mundo así, toda una familia de orquestaciones frágiles —cron que consulta una tabla, banderas de estado a medias, reintentos que a veces duplican efectos— se revela como lo que siempre fue: una reimplementación artesanal, y casi siempre defectuosa, de aquello que un motor de ejecución durable te regala de fábrica. El ingeniero que lo entiende deja de preguntarse "¿cómo guardo el estado entre pasos?" y empieza a preguntarse "¿dónde están las fronteras de mis pasos?", porque sabe que trazar bien esas fronteras es todo el trabajo.
+</Callout>
+
+<Challenge title="Reconoce un proceso que pide durabilidad">
+1. Describe un proceso real de tu dominio con al menos tres pasos y una espera larga. Marca qué paso no debe repetirse jamás y por qué.
+2. Enumera la fontanería que necesitarías para hacerlo fiable a mano: base de datos de estado, idempotencia, máquina de estados, planificador. Estima cuánto código es.
+3. Reescríbelo como un `WorkflowEntrypoint` con un `run` que use tres `step.do`. Comprueba que se lee de forma lineal.
+4. Explica qué significa que el motor "reproduce" el Workflow tras un fallo y por qué no vuelve a ejecutar los pasos ya completados.
+5. Argumenta la frase "la fiabilidad no es la ausencia de caídas, es la supervivencia del progreso" con un ejemplo concreto de tu proceso.
+</Challenge>

@@ -1,0 +1,164 @@
+---
+title: "spin_lock_irqsave y spin_lock_bh: compartir con interrupciones"
+description: "Cuando el mismo dato lo toca un manejador de interrupción o un softirq, hay que deshabilitar las IRQs locales al coger el lock. El deadlock de auto-interrupción y por qué basta con desactivarlas en el núcleo local."
+subject: kernel
+level: 15
+order: 3
+position: "15.3"
+duration: "13 min"
+---
+
+<Lead>
+Hasta ahora protegías datos que solo tocaban hilos en contexto de proceso. Pero muchos datos del kernel los comparte también un manejador de interrupción o un softirq, y ahí `spin_lock` a secas te tiende una trampa mortal: un deadlock contra ti mismo en un único núcleo. La salida son las variantes que desactivan las interrupciones locales al coger el lock: `spin_lock_irqsave` y `spin_lock_bh`.
+</Lead>
+
+<Goals>
+
+- Entender el deadlock de auto-interrupción en un solo núcleo.
+- Usar `spin_lock_irqsave`/`spin_unlock_irqrestore` y saber por qué guardar el estado.
+- Usar `spin_lock_bh` cuando el otro lado es un softirq o tasklet.
+- Ver por qué basta con desactivar las IRQs del núcleo local.
+
+</Goals>
+
+## El deadlock de la auto-interrupción
+
+Imagina un dato compartido entre tu código en contexto de proceso y el manejador de la IRQ del dispositivo. Ambos cogen el mismo lock. Con `spin_lock` normal:
+
+```c
+/* contexto de proceso */
+spin_lock(&dev->lock);
+/* ... justo aquí, en este mismo núcleo, LLEGA la interrupción ... */
+dev->registros++;
+spin_unlock(&dev->lock);
+```
+
+```c
+/* manejador de la interrupción, en el MISMO núcleo */
+static irqreturn_t mi_handler(int irq, void *data)
+{
+	struct mi_dispositivo *dev = data;
+	spin_lock(&dev->lock);   /* gira esperando... a un lock que TÚ tienes */
+	dev->pendientes++;
+	spin_unlock(&dev->lock);
+	return IRQ_HANDLED;
+}
+```
+
+La interrupción expropia al hilo de proceso *en el mismo núcleo*, justo cuando este tiene el lock. El manejador intenta coger el lock y gira. Pero el hilo de proceso, que es el único que puede soltarlo, no volverá a ejecutar hasta que el manejador termine —y el manejador no termina porque gira—. Cuelgue total, y encima en un solo núcleo, sin necesidad de SMP.
+
+<Mermaid code={`flowchart TD
+  A[CPU0 proceso: spin_lock ok] --> B[Dentro de la seccion critica]
+  B --> C[Llega la IRQ en CPU0]
+  C --> D[Manejador: spin_lock gira]
+  D --> E[Espera a que se libere el lock]
+  E --> F[El proceso no corre para soltarlo]
+  F --> D
+  class D t-yellow
+  class F t-red`} />
+
+## spin_lock_irqsave / spin_unlock_irqrestore
+
+La solución: al coger el lock en contexto de proceso, **desactiva las interrupciones del núcleo local**. Así ninguna IRQ podrá expropiarte para intentar el mismo lock.
+
+```c
+unsigned long flags;
+
+spin_lock_irqsave(&dev->lock, flags);   /* guarda el estado IRQ y las desactiva */
+dev->registros++;
+spin_unlock_irqrestore(&dev->lock, flags); /* restaura el estado previo */
+```
+
+`flags` es un `unsigned long` opaco. `spin_lock_irqsave` guarda ahí si las interrupciones estaban activas o no *antes* y luego las desactiva; `spin_unlock_irqrestore` las devuelve a como estaban. ¿Por qué guardar y restaurar en vez de simplemente activar al salir? Porque existe `spin_lock_irq`, que reactiva incondicionalmente al soltar:
+
+```c
+spin_lock_irq(&dev->lock);      /* desactiva sin guardar */
+dev->registros++;
+spin_unlock_irq(&dev->lock);    /* REACTIVA siempre: solo seguro si sabes
+                                   que las IRQ estaban activas al entrar */
+```
+
+Solo puedes usar `spin_lock_irq` si tienes la certeza de que las interrupciones estaban activas al entrar; si te llaman desde un sitio que ya las había desactivado, las reactivarías antes de tiempo y romperías al que te llamó. Ante la duda, `irqsave`.
+
+Del lado del manejador basta `spin_lock` normal, porque en contexto de interrupción dura las IRQs locales ya están desactivadas por el hardware:
+
+```c
+static irqreturn_t mi_handler(int irq, void *data)
+{
+	struct mi_dispositivo *dev = data;
+	spin_lock(&dev->lock);    /* aquí las IRQ locales ya están off */
+	dev->pendientes++;
+	spin_unlock(&dev->lock);
+	return IRQ_HANDLED;
+}
+```
+
+## spin_lock_bh: cuando el otro lado es un softirq
+
+Si el dato no lo comparte una IRQ dura sino un **softirq**, un **tasklet** o el hilo de red (bottom halves, nivel 23), desactivar interrupciones de hardware es excesivo. Basta con desactivar el procesamiento de bottom halves en el núcleo local:
+
+```c
+spin_lock_bh(&dev->lock);      /* desactiva softirqs/tasklets en este núcleo */
+dev->cola_rx++;                /* dato compartido con, p. ej., el softirq NET_RX */
+spin_unlock_bh(&dev->lock);
+```
+
+`spin_lock_bh` es más barato que `irqsave` porque no toca la máscara de interrupciones de hardware: solo impide que corra un bottom half que quisiera el mismo lock. Elige la variante según con quién compartes: IRQ dura → `irqsave`; softirq/tasklet → `bh`; solo contexto de proceso → `spin_lock` pelado.
+
+## Por qué basta con el núcleo local
+
+`irqsave` desactiva las interrupciones **solo en el núcleo actual**, no en toda la máquina. ¿No es un agujero? En SMP, otro núcleo puede recibir su interrupción y su manejador girar sobre el mismo lock. Y está bien: ese giro es brevísimo, porque el que tiene el lock (en otro núcleo) no está interrumpido —sus IRQs están off— y lo soltará enseguida. Desactivar las interrupciones de *todos* los núcleos para cada lock sería un desastre de escalabilidad. El principio: solo hace falta cerrarle la puerta al reentrante *local*, el único que puede expropiarte a ti.
+
+## Un ejemplo completo: buffer compartido con la IRQ
+
+Junta las piezas. Un driver con una cola circular que llenan las interrupciones y vacía el proceso:
+
+```c
+struct mi_dispositivo {
+	spinlock_t   lock;
+	u32          cola[64];
+	unsigned int cabeza, rabo;
+};
+
+/* proceso: saca un evento de la cola */
+static int sacar_evento(struct mi_dispositivo *dev, u32 *out)
+{
+	unsigned long flags;
+	int ret = -EAGAIN;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	if (dev->cabeza != dev->rabo) {
+		*out = dev->cola[dev->cabeza % 64];
+		dev->cabeza++;
+		ret = 0;
+	}
+	spin_unlock_irqrestore(&dev->lock, flags);
+	return ret;
+}
+
+/* IRQ: mete un evento; las IRQ locales ya están off, basta spin_lock */
+static irqreturn_t mi_handler(int irq, void *data)
+{
+	struct mi_dispositivo *dev = data;
+
+	spin_lock(&dev->lock);
+	dev->cola[dev->rabo % 64] = leer_hw(dev);
+	dev->rabo++;
+	spin_unlock(&dev->lock);
+	return IRQ_HANDLED;
+}
+```
+
+El lado de proceso usa `irqsave` porque puede ser interrumpido a mitad; el manejador usa `spin_lock` pelado porque ya corre con las IRQ locales desactivadas. Mismo lock, dos disciplinas de entrada según el contexto de cada cual.
+
+<Callout type="dios" title="El enemigo no es el otro núcleo: eres tú mismo un instante después">
+El deadlock de IRQ es hermoso porque rompe la intuición de que la concurrencia viene siempre de *otro*. Aquí el segundo actor eres tú: el mismo núcleo, expropiado por una interrupción a mitad de la sección crítica, convertido de golpe en un segundo hilo que reclama el lock que tu primer yo aún sostiene. No hay otro procesador; hay dos líneas de ejecución solapadas en el tiempo sobre el mismo silicio. Por eso la cura no es un lock más listo, sino cerrar la única vía por la que ese segundo yo puede nacer: la interrupción local. Y fíjate en la economía de la solución: no apagas las interrupciones del mundo, solo las tuyas, y solo durante la apnea del lock. Cuando entiendas que "atómico" en el kernel significa exactamente "ni otro núcleo ni una interrupción local pueden colarse aquí", habrás unido en una sola idea la exclusión mutua y el enmascaramiento de interrupciones —las dos mitades del contrato del spinlock—.
+</Callout>
+
+<Challenge title="Protege un dato contra su manejador de IRQ">
+1. Declara un contador en tu driver compartido entre `write` (proceso) y un manejador de interrupción.
+2. Protégelo con `spin_lock_irqsave`/`spin_unlock_irqrestore` en el lado de proceso.
+3. En el manejador, usa `spin_lock`/`spin_unlock` a secas y explica en un comentario por qué basta.
+4. Razona qué pasaría con `spin_lock` normal en ambos lados en un solo núcleo.
+5. Cambia el escenario a un tasklet y sustituye por `spin_lock_bh`; justifica por qué es suficiente.
+</Challenge>

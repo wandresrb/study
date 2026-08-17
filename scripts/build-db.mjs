@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, readdirSync, renameSync, rmSync, existsSync, mkdirSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
-const GUIDE = 'src/content/guia';
+const GUIDE = 'src/content/guide';
 const SCHEMA = 'db/schema.sql';
 const SEEDS = 'db/seeds';
 const OUT = 'db/catalog.db';
@@ -69,7 +69,7 @@ for (const file of files) {
   const path = relative(GUIDE, file).replace(/\.mdx$/, '');
   const d = frontmatter(file);
 
-  for (const field of ['title', 'description', 'subject', 'level', 'order', 'posicion']) {
+  for (const field of ['title', 'description', 'subject', 'level', 'order', 'position']) {
     if (!d[field]) problems.push(`${path}: missing "${field}"`);
   }
   if (problems.length) continue;
@@ -80,13 +80,13 @@ for (const file of files) {
     continue;
   }
 
-  const minutes = Number(/(\d+)/.exec(d.duracion ?? '')?.[1] ?? 0);
+  const minutes = Number(/(\d+)/.exec(d.duration ?? '')?.[1] ?? 0);
   insert.run(
     path,
     d.subject,
     level,
     Number(d.order),
-    d.posicion,
+    d.position,
     d.title,
     d.description,
     minutes,

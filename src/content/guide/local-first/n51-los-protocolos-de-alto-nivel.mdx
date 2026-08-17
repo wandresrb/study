@@ -1,0 +1,121 @@
+---
+title: "Los protocolos de alto nivel: blobs, difusión por temas y documentos"
+description: "Transferencia reanudable verificada, difusión por temas y sincronización clave-valor vienen ya construidas sobre la misma pila, y entender qué te ahorran es la única forma de decidir cuándo merece la pena montarlo tú."
+subject: local-first
+level: 51
+order: 5
+position: "51.5"
+duration: "24 min"
+---
+
+<Lead>
+Una pila de red te da conexiones; una aplicación necesita conversaciones. Entre lo uno y lo otro hay un tramo de trabajo que todo el mundo subestima la primera vez: reanudar una descarga interrumpida sin volver a empezar y sin confiar ciegamente en el emisor, repartir un mensaje entre pares que entran y salen sin avisar, hacer converger dos copias de un mismo conjunto de datos sin enviarlas enteras. Cada uno de esos tres problemas tiene décadas de literatura detrás y ninguno se resuelve bien en una tarde. La propuesta de iroh es entregarlos ya resueltos como protocolos componibles que se registran sobre un mismo extremo: `iroh-blobs` para transferencias, `iroh-gossip` para difusión por temas y `iroh-docs` para sincronización clave-valor con estructuras convergentes. Esta lección explica qué hace cada uno por dentro, porque la decisión de usarlos o de escribir el tuyo depende por completo de si el modelo que imponen coincide con el de tu dominio.
+</Lead>
+
+<Goals>
+
+- Explicar cómo el árbol de hashes de BLAKE3 habilita verificación incremental, rangos y reanudación.
+- Situar la difusión epidémica por temas y las garantías que ofrece y que no ofrece.
+- Entender la reconciliación de conjuntos por rangos y por qué dos pares sincronizados apenas hablan.
+- Decidir con criterio cuándo estos protocolos encajan y cuándo conviene escribir uno propio.
+
+</Goals>
+
+## Blobs: el árbol de hashes lo hace casi todo
+
+El protocolo de blobs trabaja con secuencias opacas de bytes y es **direccionado por contenido**: cada blob se referencia siempre por el hash criptográfico de su contenido. Ese hash es de BLAKE3, y aquí está el detalle del que se deriva todo lo demás. BLAKE3 es un algoritmo de hash *en árbol*: parte la entrada en trozos uniformes, los coloca como hojas de un árbol binario y produce hashes intermedios que se acumulan hasta un hash raíz. Iroh usa esos 32 bytes de raíz como identificador inmutable del blob.
+
+Tener el árbol y no solo la raíz cambia lo que se puede hacer durante una transferencia. Permite **verificación incremental**: la integridad de cada trozo se comprueba tanto en el emisor como en el receptor mientras los bytes viajan, siguiendo el mecanismo de transmisión verificada descrito en la especificación de BLAKE3. Iroh guarda todos los hashes de trozos como metadatos externos, dejando el blob de entrada intacto como fuente canónica de bytes. Y permite **peticiones de rango**: recuperar una subsecuencia contigua verificable transmitiendo solo las porciones del árbol binario necesarias para verificarla.
+
+<Callout type="info" title="El tamaño de trozo es una palanca real y su valor por defecto tiene un precio medible">
+El tamaño de trozo de BLAKE3 es una constante ajustable cuyo valor por defecto es un kibibyte, y la documentación cuantifica su coste sin rodeos: supone un seis por ciento de sobrecarga sobre el tamaño del blob de entrada. Aumentarlo reduce esa sobrecarga a cambio de exigir más datos transferidos antes de alcanzar el siguiente punto de verificación incremental. Lo notable es que la constante se puede modificar y recalcular **sin alterar el hash raíz**, de modo que el identificador del contenido no depende de esa decisión de ingeniería. Es un ejemplo poco común de parámetro de rendimiento que no contamina el modelo de datos, y merece la pena tenerlo presente si transfieres muchos ficheros pequeños o muy pocos enormes.
+</Callout>
+
+De ahí salen las dos propiedades que uno quiere de una transferencia seria y que rara vez vienen juntas. La **reanudación** es directa: si la descarga se corta, se conoce exactamente qué rangos ya están verificados y se pide el resto. Y la **desconfianza en el emisor** es gratuita: no hay que esperar al final para comprobar un hash global, porque cada trozo se valida contra el árbol según llega, y un emisor que envíe basura es detectado en el primer trozo y no después de gastar el ancho de banda entero.
+
+```rust
+// Importar un fichero devuelve una etiqueta con el hash raiz
+let tag = store.blobs().add_path(ruta_absoluta).await?;
+
+// Un billete empaqueta el hash y la identidad del extremo en una cadena
+let ticket = BlobTicket::new(endpoint.id().into(), tag.hash, tag.format);
+
+// Al otro lado, la descarga se pide por hash y se puede reanudar
+let downloader = store.downloader(&endpoint);
+downloader.download(ticket.hash(), Some(ticket.endpoint_addr().id)).await?;
+```
+
+La relación entre blobs se expresa mediante **colecciones**: una secuencia ordenada de hashes que apuntan a otros blobs, serializada como la simple concatenación de hashes de 32 bytes sin separador alguno. Una colección solo es válida si su longitud es múltiplo de 32, lo que hace trivial indexar en ella multiplicando el índice por 32; por convención, el primer elemento es un blob de metadatos cuyo contenido define la aplicación. Conviene retener la limitación que la documentación declara sin disimulo: las colecciones son el **único** medio de relacionar blobs, y no se pueden consultar de forma anidada como grafos.
+
+## Difusión por temas: epidemia con árboles
+
+El segundo protocolo resuelve un problema distinto: que un mensaje llegue a todos los interesados en un tema sin que exista un intermediario que sepa quiénes son. `iroh-gossip` se basa en **árboles de difusión epidémica**, con una implementación que sigue dos artículos clásicos sobre vistas parciales y sobre construcción de árboles de difusión sobre esas vistas. La idea de fondo es que cada nodo conoce solo un puñado de vecinos, acepta esa visión parcial y reenvía de forma probabilística, de modo que los mensajes acaban alcanzando a la mayoría o a todos los suscriptores.
+
+Un tema se identifica por 32 bytes. La documentación recomienda no inventarlos a mano sino derivarlos de una cadena con significado mediante una función de hash estable, algo del estilo de un identificador con espacio de nombres invertido, para evitar colisiones con otras aplicaciones. Para entrar en un enjambre hacen falta **pares semilla** que ya estén dentro, y la biblioteca ofrece esperar explícitamente a que al menos uno se haya unido antes de emitir nada, porque un nodo sin vecinos difunde al vacío.
+
+```rust
+// El tema es un identificador de 32 bytes y hace falta al menos un par semilla
+let (sender, mut receiver) = gossip
+    .subscribe(topic_id, pares_semilla)
+    .await?
+    .split();
+
+receiver.joined().await?; // sin vecinos, difundir no sirve de nada
+sender.broadcast(mensaje.into()).await?;
+```
+
+Las garantías merecen leerse con frialdad. La documentación es explícita en que los pares pueden entrar, salir, cambiar de dirección o descartar mensajes en cualquier momento, y en que la redundancia de caminos mejora la resistencia a fallos **a costa de aumentar el tráfico**. Frente a los intermediarios centralizados de mensajería, que mantienen una pertenencia autoritativa al tema y ofrecen garantías de entrega más fuertes, la difusión epidémica cambia esas garantías por descentralización, simplicidad y resistencia en entornos muy cambiantes. En cuanto a escala, un único tema para todos los pares sirve hasta unos pocos miles; más allá, se separan temas por grupo, espacio o documento.
+
+## Documentos: reconciliar conjuntos por rangos
+
+El tercer protocolo es el más ambicioso y, no por casualidad, el que está construido sobre los otros dos. `iroh-docs` es un almacén clave-valor multidimensional edificado sobre estructuras convergentes, con un protocolo de sincronización eficiente. Su vocabulario es corto y conviene memorizarlo: un **documento** es un almacén clave-valor compartido con nombre, cuya identidad es la clave pública de un par de claves que controla el acceso de escritura; una **entrada** es una fila identificada por la terna de espacio de nombres, autor y clave; un **autor** es un par de claves que firma entradas, y una aplicación puede crear tantos como quiera.
+
+El detalle que ordena toda la arquitectura es qué guarda una entrada como valor: **el hash BLAKE3 de su contenido**, junto con un tamaño y una marca de tiempo. Los bytes de verdad viven en el almacén de blobs. Por eso la documentación describe `iroh-docs` como un metaprotocolo: los documentos guardan metadatos de entradas y ejecutan la reconciliación, los blobs guardan el contenido al que apuntan esos hashes, y la difusión por temas transporta las notificaciones en vivo para que los pares se enteren de las entradas nuevas según aparecen y no solo al reconectar.
+
+<Mermaid code={`flowchart TD
+  DOCS[documentos guardan metadatos de entradas y reconcilian por rangos] --> BLOBS[blobs guardan los bytes referidos por cada hash]
+  DOCS --> GOSSIP[difusion por temas lleva los avisos de cambio en vivo]
+  BLOBS --> END[un unico extremo con enrutado por identificador de protocolo]
+  GOSSIP --> END
+  DOCS --> END
+  END --> QUIC[QUIC con TLS 1.3 sobre la ruta directa o el relevo]
+  class DOCS t-mauve
+  class BLOBS t-blue
+  class GOSSIP t-green
+  class QUIC t-yellow`} />
+
+La sincronización usa **reconciliación de conjuntos por rangos**: los pares parten recursivamente sus conjuntos de entradas y comparan huellas de las particiones para localizar dónde discrepan. La propiedad que hace valioso el algoritmo está enunciada en una sola línea de la documentación y vale la pena subrayarla: dos pares que ya están completamente sincronizados solo necesitan **intercambiar una huella** para confirmarlo. El caso común —no ha cambiado nada— cuesta un mensaje, no un recorrido del conjunto. Para persistencia, el almacén guarda todas las réplicas en un único fichero mediante un motor clave-valor empotrado.
+
+## Cuándo prefieres montarlo tú
+
+Lo que estos tres protocolos te ahorran es fácil de enumerar y difícil de sobreestimar: verificación incremental correcta, reanudación por rangos, un algoritmo de difusión con literatura revisada detrás y una reconciliación que no degrada cuando no hay cambios. Escribir cualquiera de las tres cosas bien es trabajo de meses y, sobre todo, es trabajo cuyo fallo se manifiesta tarde y mal, en forma de corrupción silenciosa o de tráfico que crece con el tamaño del conjunto.
+
+Dicho eso, hay tres señales claras de que te conviene escribir el tuyo. La primera es un **modelo de datos que no encaje**: si tu unidad no es una clave con un valor opaco, o si necesitas consultar relaciones como un grafo, chocarás pronto con la limitación declarada de que las colecciones no se consultan anidadas. La segunda es una **autorización distinta**: el control de escritura de un documento se apoya en un par de claves por espacio de nombres, y los esquemas de permisos por campo o por rol hay que construirlos encima. La tercera es una **garantía de entrega que la difusión epidémica no da**: si necesitas orden total o confirmación de recepción, ese protocolo no es el que buscas.
+
+<Cards>
+  <Card icon="🌳" title="Árbol antes que hash">
+    Verificación incremental, rangos verificables y reanudación salen del árbol de BLAKE3, no del hash final. La raíz de 32 bytes es el identificador.
+  </Card>
+  <Card icon="📣" title="Epidemia con vista parcial">
+    Cada nodo conoce pocos vecinos y reenvía con redundancia. Más resistencia y más tráfico, sin pertenencia autoritativa al tema.
+  </Card>
+  <Card icon="🧾" title="Entrada igual a hash">
+    El documento guarda hash, tamaño y marca de tiempo; los bytes viven en blobs. Por eso documentos, blobs y difusión van juntos.
+  </Card>
+  <Card icon="🪶" title="Sincronizado cuesta un mensaje">
+    La reconciliación por rangos hace que dos pares idénticos confirmen su acuerdo con una sola huella intercambiada.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Los tres protocolos son la misma idea aplicada tres veces: hacer que el caso frecuente no cueste nada">
+Presentados en fila, blobs, difusión por temas y documentos parecen tres piezas independientes que comparten transporte por conveniencia de empaquetado. Hay, sin embargo, un principio único debajo de los tres, y reconocerlo convierte esta lección de catálogo en criterio de diseño. El principio es este: **cada uno identifica cuál es su caso frecuente y organiza su estructura de datos para que ese caso cueste lo mínimo posible, aceptando pagar más en los casos raros**. En blobs, el caso frecuente no es descargar un fichero entero desde cero, es *ya tengo casi todo esto* —la descarga que se cortó, el rango que falta, el fichero que otro par ya me pasó a medias—, y el árbol de hashes existe para que reanudar cueste proporcional a lo que falta y no a lo que hay. En documentos, el caso frecuente no es la fusión de dos historias divergentes, es *no ha cambiado nada desde la última vez*, y la reconciliación por rangos está construida para que ese caso se resuelva con una sola huella intercambiada mientras la partición recursiva solo se despliega allí donde de verdad hay discrepancia. En difusión, el caso frecuente no es la entrega garantizada a una lista conocida, es *un grupo cambiante donde nadie sabe quién está*, y la vista parcial con reenvío redundante está diseñada para que ese caso no requiera consenso sobre la pertenencia, pagando con tráfico duplicado lo que se ahorra en coordinación. Fíjate en lo que tienen en común esas tres decisiones: **ninguna optimiza el peor caso, todas optimizan el caso que de verdad ocurre**, y todas lo hacen eligiendo una estructura de datos —árbol de hashes, partición por huellas, vista parcial— en lugar de una heurística en tiempo de ejecución. Esa es exactamente la lección que el track lleva repitiendo desde los niveles de estructuras convergentes: decidir en tiempo de diseño sale gratis por conflicto y escala sin límite, decidir en tiempo de ejecución no. Y de ahí sale el criterio práctico para responder a la pregunta con la que termina el nivel, que es cuándo escribir tu propio protocolo. No lo escribas porque estos te resulten grandes o porque prefieras entenderlo todo; escríbelo cuando puedas nombrar con precisión **cuál es tu caso frecuente y por qué ninguno de los tres lo tiene como caso frecuente suyo**. Si sabes responder a eso, tu protocolo tendrá una estructura que lo justifique y un identificador propio en el enrutador junto a los demás. Si no sabes responder, lo que vas a escribir no es un protocolo nuevo: es una reimplementación peor de uno de estos tres, con los mismos costes y sin los años de pruebas de interoperabilidad.
+</Callout>
+
+<Challenge title="Elige protocolo por caso frecuente, no por afinidad">
+1. Escribe en una línea cuál es el caso frecuente de tu aplicación y qué operación tendría que ser casi gratuita para que funcione bien.
+2. Transfiere un fichero grande con blobs, córtalo a la mitad y verifica que la reanudación solo pide los rangos que faltaban.
+3. Mide la sobrecarga real de los metadatos del árbol sobre un fichero tuyo y contrástala con el seis por ciento documentado.
+4. Levanta un enjambre de difusión con tres nodos, derriba uno y observa cuánto tarda la vista de los otros en reflejarlo.
+5. Sincroniza dos réplicas de un documento sin cambios y cuenta los mensajes intercambiados en la confirmación.
+6. Justifica por escrito si tu caso pide uno de estos tres protocolos, una combinación, o uno propio con su propio identificador.
+</Challenge>

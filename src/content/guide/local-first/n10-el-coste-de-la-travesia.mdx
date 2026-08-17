@@ -1,0 +1,160 @@
+---
+title: "El coste de la travesía: cada consulta cruza un hilo"
+description: "Qué se paga de verdad en cada salto entre el hilo principal y el Worker de datos, cómo se amortiza con lotes, consultas gruesas y cachés de lectura, y qué patrones convierten esa frontera en el cuello de botella."
+subject: local-first
+level: 10
+order: 5
+position: "10.5"
+duration: "17 min"
+---
+
+<Lead>
+La base de datos está en el disco del usuario, a cuatro milímetros del código que la consulta, y una consulta trivial puede tardar más que la propia consulta multiplicada por cincuenta. No es culpa del motor, que resuelve un `SELECT` por clave primaria en decenas de microsegundos: es el peaje de la frontera entre hilos que la restricción de OPFS te obligó a levantar. Esta última lección del nivel pone número a ese peaje, enseña a amortizarlo y cataloga los patrones que lo convierten en el cuello de botella de toda la aplicación.
+</Lead>
+
+<Goals>
+
+- Descomponer el coste real de un viaje de ida y vuelta al Worker de datos.
+- Entender que se paga por cruce y por byte, nunca por fila de trabajo útil.
+- Aplicar las cuatro palancas de amortización: consultas gruesas, lotes, transferencias y caché de lectura.
+- Reconocer y erradicar los antipatrones que multiplican los cruces.
+
+</Goals>
+
+## Qué se paga en cada cruce
+
+Un viaje de ida y vuelta tiene tres componentes, y solo uno de ellos es proporcional a lo que pediste.
+
+<Cards>
+  <Card icon="📦" title="Clonado estructurado">
+    El argumento y el resultado se copian byte a byte al otro contexto. Es proporcional al tamaño y a la forma: un vector de objetos con doce claves copia esas doce claves por fila, y eso se paga en tiempo y en basura para el recolector.
+  </Card>
+  <Card icon="⏳" title="Encolado en el destino">
+    El mensaje no interrumpe a nadie: entra en la cola de tareas del hilo destino y espera su turno. Si el hilo principal está pintando un fotograma, tu respuesta espera detrás; el suelo de latencia lo marca lo ocupado que esté el otro lado.
+  </Card>
+  <Card icon="⚡" title="Resolución de la promesa">
+    Buscar el identificador en el mapa de pendientes y resolver es un microtask barato. Es el único de los tres que puedes ignorar en tu presupuesto.
+  </Card>
+  <Card icon="🎯" title="El suelo fijo">
+    Sumado todo, un cruce de ida y vuelta con carga pequeña cuesta del orden de una fracción de milisegundo, y bastante más si el otro lado está ocupado. Una consulta indexada dentro del motor cuesta decenas de microsegundos.
+  </Card>
+</Cards>
+
+De ahí sale la única regla que hay que interiorizar: **el peaje se cobra por cruce, no por trabajo realizado**. Traer una fila y traer quinientas cuesta casi lo mismo en encolado, y la diferencia solo aparece en el clonado. Por tanto, una consulta que hace mucho es barata y cincuenta consultas que hacen poco son caras, exactamente al revés de la intuición que traes de trabajar contra una biblioteca local.
+
+<Mermaid code={`flowchart LR
+  A[Cincuenta consultas finas] --> B[Cincuenta cruces y cincuenta clones]
+  B --> C[Decenas de milisegundos de peaje]
+  D[Una consulta gruesa] --> E[Un cruce y un clon]
+  E --> F[Menos de un milisegundo de peaje]
+  class C t-red
+  class F t-green`} />
+
+## Cómo se amortiza
+
+**Consultas gruesas.** Diseña la interfaz del worker como si fuera una API pública: una operación por pantalla, no una por tabla. Si una vista necesita el usuario, sus últimos veinte pedidos y el total gastado, eso es una llamada que devuelve las tres cosas, con las uniones y agregados resueltos en SQL, donde cuestan microsegundos, y no tres llamadas orquestadas desde la interfaz.
+
+**Lotes.** Cuando de verdad necesites varias sentencias, mándalas juntas. Un mensaje, una transacción, una respuesta.
+
+```js
+// Mal: tres cruces y tres transacciones
+await db.ejecutar('INSERT INTO notas VALUES (?, ?)', [id, texto]);
+await db.ejecutar('UPDATE contadores SET n = n + 1 WHERE k = ?', ['notas']);
+await db.ejecutar('INSERT INTO diario VALUES (?, ?)', [id, Date.now()]);
+
+// Bien: un cruce, una transaccion, atomicidad de regalo
+await db.lote([
+  ['INSERT INTO notas VALUES (?, ?)', [id, texto]],
+  ['UPDATE contadores SET n = n + 1 WHERE k = ?', ['notas']],
+  ['INSERT INTO diario VALUES (?, ?)', [id, Date.now()]],
+]);
+```
+
+**Transferencias en lugar de copias.** Un resultado grande devuelto como vector de objetos es el peor caso posible del clonado. Devuélvelo en formato columnar dentro de un `ArrayBuffer` y pásalo en la lista de transferencia: el búfer cambia de dueño sin copiarse, y el coste deja de depender del tamaño.
+
+```js
+// En el worker: mover en vez de copiar
+const buf = empaquetarColumnas(filas);          // un ArrayBuffer
+self.postMessage({ id, buf }, [buf]);           // transferencia, coste cero
+
+// Aviso: tras transferirlo, 'buf' queda inutilizable en el worker
+```
+
+**Caché de lectura y notificación.** El cambio de modelo más rentable es dejar de preguntar. El hilo principal mantiene un almacén materializado con lo que la interfaz necesita; el worker anuncia qué ha cambiado tras cada escritura y solo entonces se refresca lo afectado. Las lecturas de render pasan a ser síncronas contra esa copia local, los cruces caen a los estrictamente necesarios y de paso recuperas la ergonomía que la frontera te había quitado. Es la idea que el nivel 15 desarrolla como consultas reactivas.
+
+<Callout type="tip" title="Fusiona las peticiones idénticas en vuelo">
+Tres componentes que montan a la vez y piden el mismo dato generan tres cruces por un solo resultado. Guarda las promesas en curso en un mapa por clave de consulta y devuelve la misma a quien repita la petición mientras siga viva. Son diez líneas, no cambia ninguna llamada existente y en una interfaz con componentes independientes suele recortar un tercio de los mensajes del arranque.
+</Callout>
+
+## Los patrones que lo empeoran
+
+<Mermaid code={`flowchart TB
+  A[Bucle que espera por cada fila] --> Z[Mil cruces]
+  B[Consulta por pulsacion de tecla] --> Z
+  C[Traer todo y filtrar en la interfaz] --> Y[Clonado enorme]
+  D[Relaciones perezosas del ORM] --> Z
+  Z --> X[La frontera es el cuello de botella]
+  Y --> X
+  class X t-red`} />
+
+- **El N más 1 de toda la vida, con peaje.** Un bucle que pide la lista y luego espera por cada elemento convierte una consulta en mil. Contra un servidor esto ya era un error clásico; aquí es idéntico, con la única diferencia de que el viaje es más corto y por eso pasa desapercibido hasta que la lista crece.
+
+```js
+// Mal: 1 mas N cruces
+const pedidos = await db.consultar('SELECT * FROM pedidos LIMIT 200');
+for (const p of pedidos) {
+  p.cliente = await db.consultar('SELECT * FROM clientes WHERE id = ?', [p.cliente_id]);
+}
+
+// Bien: un cruce, la union donde debe estar
+const pedidos = await db.consultar(
+  'SELECT p.*, c.nombre FROM pedidos p JOIN clientes c ON c.id = p.cliente_id LIMIT 200'
+);
+```
+
+- **Una consulta por pulsación de tecla.** Un buscador que consulta en cada `input` genera decenas de cruces por segundo y llena la cola del worker de trabajo que ya nadie quiere. Agrupa por tiempo, cancela lo obsoleto y descarta las respuestas que llegan tarde comparando el identificador de la última petición emitida.
+- **Traerlo todo para mostrar veinte filas.** Paginar y ordenar en SQL cuesta microsegundos; traer cincuenta mil filas para quedarte con veinte cuesta un clonado gigante, memoria en ambos lados y una pausa del recolector.
+- **Relaciones perezosas.** Un ORM que dispara una consulta al leer una propiedad es catastrófico sobre esta arquitectura: cada acceso a un campo se convierte en un mensaje. La carga tiene que ser explícita y anticipada.
+- **Ceder el control dentro del manejador del worker.** Un `await` innecesario en mitad de la atención de un mensaje deja que entre otro y rompe el orden que la frontera te regalaba. Dentro del worker, el trabajo con el motor es síncrono: mantenlo síncrono.
+- **Medir con la base caliente y vacía.** Cien filas de prueba en un portátil rápido no muestran ningún problema. El presupuesto se valida con el volumen del percentil noventa y cinco de tus usuarios reales y con el hilo principal ocupado.
+
+## El presupuesto: cuenta cruces, no consultas
+
+Cambia la unidad con la que razonas. La pregunta útil al revisar una pantalla no es "cuántas consultas hace" sino **"cuántas veces cruza la frontera antes de poder pintar algo"**. Un objetivo sensato para una vista es uno, dos si hay una parte diferida que puede llegar después. Todo lo que pase de ahí necesita justificación explícita.
+
+Instrumentarlo es barato: cuenta los mensajes emitidos por interacción y registra el tiempo entre el envío y la resolución. Con dos contadores en el cliente de RPC tienes ya el noventa por ciento del diagnóstico, y los antipatrones de la sección anterior aparecen solos en cuanto miras la cifra de cruces por pantalla en lugar de la de milisegundos por consulta.
+
+```js
+// Instrumentacion minima dentro del cliente de RPC
+let cruces = 0;
+const historia = [];
+
+function medir(id) {
+  cruces++;
+  const t0 = performance.now();
+  return () => historia.push({ id, ms: performance.now() - t0 });
+}
+
+// Y una marca por interaccion para leerlo en el perfilador
+performance.mark('pantalla-inicio');
+// ... tras el primer pintado con datos
+performance.measure('pantalla', 'pantalla-inicio');
+console.log('cruces hasta pintar:', cruces);
+```
+
+Conviene separar en esa medición dos cosas que se confunden: el tiempo que la petición pasa esperando turno y el que pasa trabajando. Si el tiempo de ida y vuelta crece cuando la interfaz está ocupada pero la consulta tarda lo mismo dentro del worker, tu problema no es la base de datos sino la cola del hilo principal, y la solución no está en el SQL sino en repartir mejor el trabajo del render. Medir solo el total te llevará a optimizar índices que ya estaban bien.
+
+Para casos extremos existe una vía más agresiva: un búfer circular sobre `SharedArrayBuffer` con `Atomics` para señalizar, que elimina el clonado y buena parte del encolado. Tiene dos precios. El primero es que exige aislamiento entre orígenes, con las cabeceras correspondientes, y eso condiciona qué recursos de terceros puede cargar tu página. El segundo es que estás escribiendo un protocolo de memoria compartida a mano, con todo lo que implica. Es la herramienta correcta para muy pocos problemas, y conviene haber agotado antes las cuatro palancas normales.
+
+<Callout type="dios" title="Has reinventado la latencia de red, tres órdenes de magnitud más pequeña">
+Aquí se cierra el círculo de este nivel de la forma más irónica posible. Local-first nació para eliminar el viaje de ida y vuelta al servidor: esa era la promesa, esa era la rueda de carga que íbamos a desterrar. Y al final del camino, para conseguir un motor de base de datos de verdad en el cliente, la restricción de OPFS te ha obligado a construir una frontera entre hilos que se comporta —a otra escala, pero con la misma naturaleza— exactamente igual que la red que querías eliminar: hay un canal, hay serialización, hay un coste fijo por mensaje que domina sobre el trabajo útil, hay que agrupar y hay que cachear. Un milisegundo en lugar de doscientos, sí, pero la disciplina de diseño es idéntica, y no es casualidad: es que el problema es el mismo problema. Siempre que dos ámbitos de ejecución no comparten memoria y solo se hablan por mensajes, la latencia y la serialización mandan sobre el cómputo, y todo lo que la industria aprendió a base de golpes con las APIs charlatanas —que las interfaces remotas se diseñan gruesas, que el N más 1 mata, que el estado hay que materializarlo cerca de quien lo lee— vuelve a aplicarse palabra por palabra. La conclusión práctica es que la capa de datos de tu aplicación local-first no se diseña como una biblioteca sino como un servicio: pocas operaciones, gruesas, pensadas para una pantalla concreta, con las escrituras en lote y las lecturas contra una proyección local que se invalida por notificación. Y la conclusión de fondo, la que te llevas del nivel entero, es que una única línea de una especificación —que el manejador síncrono solo vive en un Worker— no te ha dado una molestia de implementación: te ha dado una arquitectura, con su modelo de concurrencia, su protocolo, su elección de líder entre pestañas y su presupuesto de latencia. Aceptarlo desde la primera línea de código es lo que separa una aplicación local-first que escala a gigabytes de una que se atasca a los diez mil registros sin que nadie entienda por qué.
+</Callout>
+
+<Challenge title="Pon número a tu frontera">
+1. Instrumenta tu cliente de RPC para contar mensajes y medir el tiempo de ida y vuelta. Anota cuántos cruces necesita tu pantalla más cargada antes del primer pintado.
+2. Mide un viaje con carga vacía y otro devolviendo diez mil filas como objetos. Reparte el tiempo entre encolado y clonado a partir de ambas cifras.
+3. Repite la medición de diez mil filas devolviendo un `ArrayBuffer` columnar transferido. Calcula el factor de mejora.
+4. Busca un N más 1 real en tu código, conviértelo en una sola consulta con unión y compara los cruces antes y después.
+5. Implementa la fusión de peticiones idénticas en vuelo y mide cuántos mensajes ahorra durante el arranque en frío de la aplicación.
+6. Fija un presupuesto explícito de cruces por pantalla, escríbelo en tu documentación técnica y añade una comprobación que falle cuando se supere.
+</Challenge>

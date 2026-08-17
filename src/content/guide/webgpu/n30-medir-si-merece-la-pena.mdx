@@ -1,0 +1,106 @@
+---
+title: "Medir si un bundle merece la pena en lugar de suponerlo"
+description: "Cómo cronometrar la grabación de comandos, cómo saber si el cuello está en la CPU o en la GPU sin instrumentar nada, y qué números mirar para decidir con datos."
+subject: webgpu
+level: 30
+order: 5
+position: "30.5"
+duration: "18 min"
+---
+
+<Lead>
+Los render bundles son la última pieza del bloque de renderizado y también el mejor ejemplo de una optimización que hay que justificar con una medición previa. Su ganancia depende de una fracción del tiempo de CPU que casi nadie ha medido nunca, y las herramientas habituales del navegador no la muestran directamente. La buena noticia es que las tres mediciones que hacen falta son cortas, no requieren extensiones ni permisos, y una de ellas ni siquiera necesita escribir código.
+</Lead>
+
+<Goals>
+
+- Cronometrar el tiempo de grabación de comandos de forma aislada.
+- Determinar si el cuello está en CPU o en GPU con dos experimentos sin instrumentación.
+- Usar consultas de marca temporal con la conciencia de sus límites.
+- Interpretar una distribución de tiempos en lugar de una media.
+
+</Goals>
+
+## Cronometrar la grabación
+
+La grabación de comandos es código JavaScript síncrono, así que se mide con el reloj de siempre. Lo importante es rodear **solo** la grabación, sin incluir la actualización de la escena ni el `submit`:
+
+```js
+let acumulado = 0, muestras = 0;
+const historial = [];
+
+function fotograma() {
+  actualizarEscena();                 // fuera de la medicion
+
+  const t0 = performance.now();
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass(descriptorRender);
+  grabarDibujados(pass);              // esto es lo que optimizan los bundles
+  pass.end();
+  const buffer = encoder.finish();
+  const t1 = performance.now();
+
+  device.queue.submit([buffer]);      // fuera: es asincrono y no mide nada util
+
+  historial.push(t1 - t0);
+  if (historial.length === 240) {
+    historial.sort((a, b) => a - b);
+    console.log('mediana', historial[120].toFixed(3), 'ms',
+                'p95', historial[228].toFixed(3), 'ms');
+    historial.length = 0;
+  }
+}
+```
+
+Dos precisiones sobre ese fragmento. `queue.submit()` **queda fuera** a propósito: devuelve inmediatamente y no espera a la GPU, así que incluirlo no aporta información y añade ruido. Y se registran la mediana y el percentil 95, no la media: la fluidez percibida la decide el peor fotograma de cada segundo, y una media esconde exactamente eso.
+
+Si esa cifra es de 0,1 ms, ya tienes tu respuesta y puedes cerrar este nivel: no hay nada que ganar. Si es de 2 ms sobre un presupuesto de 16, hay un 12% del fotograma en juego.
+
+## Los dos experimentos que no necesitan código
+
+Antes de instrumentar nada, hay dos cambios de una línea que identifican el cuello de botella con una fiabilidad sorprendente.
+
+**Baja la resolución a la mitad.** Si el tiempo de fotograma mejora sustancialmente, estás limitado por el trabajo de fragmento de la GPU y ninguna optimización de CPU te va a servir. Si no cambia nada, la GPU no es el cuello.
+
+**Dibuja la mitad de los objetos.** Si el tiempo de fotograma mejora, el coste crece con el número de comandos y los bundles tienen algo que ofrecer. Si no cambia, el coste está en otra parte —actualización de la escena, física, lógica de aplicación— y los bundles no lo tocarán.
+
+Los dos experimentos juntos dan cuatro resultados y los cuatro son accionables: si solo mejora el primero, optimiza fragmento; si solo el segundo, optimiza comandos y considera bundles; si mejoran los dos, estás cerca del equilibrio y conviene atacar el mayor; y si no mejora ninguno, el tiempo se va en algo que no es el renderizado y hay que ir a buscarlo al perfilador.
+
+## Consultas de marca temporal, con sus asteriscos
+
+Para el tiempo de GPU por pass, WebGPU ofrece la feature `timestamp-query`. Hay que pedirla al crear el dispositivo, crear un conjunto de consultas de tipo `'timestamp'`, y declarar en el descriptor del pass dónde escribir la marca de entrada y la de salida:
+
+```js
+const consultas = device.createQuerySet({ type: 'timestamp', count: 2 });
+
+const pass = encoder.beginRenderPass({
+  colorAttachments: [/* ... */],
+  timestampWrites: {
+    querySet: consultas,
+    beginningOfPassWriteIndex: 0,
+    endOfPassWriteIndex: 1,
+  },
+});
+```
+
+Después se resuelven las consultas a un búfer con `resolveQuerySet` y se copian a uno legible. Los valores están en nanosegundos.
+
+Los asteriscos importan. La feature **no está en todos los adaptadores**, así que el código tiene que funcionar sin ella. La especificación dice explícitamente que **cómo se determina el valor depende de la implementación**, y varios navegadores reducen deliberadamente su resolución por motivos de seguridad, porque un reloj de alta precisión es un vector de ataques de canal lateral. Y las marcas miden el intervalo en el que la GPU trabajó en ese pass, que no es lo mismo que el coste del pass si la GPU estaba ejecutando otra cosa a la vez.
+
+La conclusión operativa: sirven perfectamente para **comparar** dos versiones del mismo pass en la misma máquina, que es exactamente lo que necesitas aquí, y no sirven como cronómetro absoluto ni para comparar entre dispositivos.
+
+<Callout type="dios" title="La mejora máxima que puedes obtener está acotada por una fracción que probablemente no has medido, y medirla cuesta menos que la optimización">
+Hay una asimetría muy poco razonable en cómo se decide optimizar: dedicamos días a implementar una técnica y minutos a comprobar si el problema que ataca es el nuestro. Con los bundles el desequilibrio es especialmente evidente porque su ganancia máxima está acotada por una fracción trivial de medir. Escríbelo como una desigualdad y tenlo delante: **la mejora del tiempo de fotograma no puede superar el tiempo de grabación de comandos dividido por el tiempo de fotograma**. Si grabas en 1,2 ms y tu fotograma dura 16, el techo absoluto es un 7%, y lo real será la mitad porque el bundle también cuesta algo. ¿Merece una tarde? Puede que sí, si estás justo en la frontera de los sesenta fotogramas; seguro que no, si vas a treinta y cinco. Lo que hace especialmente rentable esta comprobación es que la misma medición te dice **cuál es la siguiente optimización**, porque el tiempo que no está en la grabación está en algún otro sitio identificable: en actualizar matrices, en recorrer el grafo de escena, en el recolector de basura, en subir búferes o en la GPU. Un renderizador con cuatro cronómetros bien puestos —actualización, grabación, envío y GPU— te da un desglose que decide todas las optimizaciones del próximo mes, no solo esta, y cuesta veinte líneas y una tarde de ponerlo. Y hay una trampa final que conviene conocer porque invalida muchas mediciones caseras: **si tu aplicación va sincronizada al refresco de la pantalla y le sobra tiempo, el tiempo de fotograma será constante hagas lo que hagas**. Verás 16,67 ms antes y 16,67 ms después de cualquier optimización, y concluirás que no sirvió de nada cuando en realidad has pasado de usar el 60% del presupuesto a usar el 40%. La forma de ver el margen es medir el trabajo, no el intervalo: los cronómetros internos siguen bajando aunque el fotograma no se mueva. Y si necesitas comprobarlo de golpe, carga la escena hasta que caiga por debajo del refresco y compara ahí, donde el tiempo de fotograma vuelve a ser una medida de trabajo y no de espera.
+</Callout>
+
+## Qué esperar
+
+Si has verificado que estás limitado por la grabación de comandos, con una lista estable de varios cientos de dibujados y una repartición por frecuencia de cambio razonable, lo que suele verse es que la parte de grabación cae a una fracción pequeña de lo que era, porque cientos de comandos se convierten en uno.
+
+Lo que no debes esperar es una mejora del tiempo de GPU, que no cambia en absoluto: el mismo trabajo, los mismos estados, los mismos dibujados. Ni una mejora de la calidad de imagen, evidentemente. Ni que el efecto sea el mismo en todos los navegadores, porque el coste que se elimina vive en la implementación y no en el hardware.
+
+Y el criterio para dejar de optimizar por aquí es el mismo que sirve en todas partes: cuando la grabación de comandos deje de aparecer entre los tres primeros consumidores de tu presupuesto de CPU, el trabajo está hecho y el siguiente milisegundo está en otro sitio.
+
+<Challenge>
+Instrumenta tu renderizador con cuatro cronómetros —actualización de la escena, grabación de comandos, envío y, si tienes la feature, GPU por pass— y saca por consola la mediana y el percentil 95 de cada uno cada cuatro segundos. Después ejecuta los dos experimentos de la resolución y del número de objetos y anota los cuatro números en cada caso. Con esa tabla de doce cifras tienes un diagnóstico completo de dónde se va tu fotograma, y descubrirás que la decisión sobre los bundles se toma sola, en cualquiera de las dos direcciones.
+</Challenge>

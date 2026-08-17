@@ -1,0 +1,141 @@
+---
+title: "Consistencia y single-threaded: por qué las transacciones son fáciles"
+description: "Un Durable Object es un punto único de serialización: existe una sola instancia por identidad, corre en un solo hilo y atiende sus eventos de uno en uno. De esa topología, y no de un protocolo defensivo, nace su consistencia. Vemos por qué desaparecen las carreras y los bloqueos, cómo la plataforma protege incluso el código asíncrono con input y output gating, y cuál es el precio honesto de este modelo: el rendimiento acotado por objeto."
+subject: cloudflare
+level: 22
+order: 4
+position: "22.4"
+duration: "19 min"
+---
+
+<Lead>
+Todo lo que has visto —el almacén que lee tus propias escrituras, las escrituras atómicas, la base de datos sin bloqueos— descansa sobre una sola propiedad, y conviene mirarla de frente. Un Durable Object es un punto único de serialización: hay exactamente una instancia por identidad en toda la red, corre en un único hilo y atiende sus eventos de uno en uno. Su consistencia no viene de un protocolo ingenioso que defiende los datos de accesos concurrentes; viene de que, sencillamente, no hay accesos concurrentes. Cuando solo un hilo toca el estado, las transacciones dejan de ser un problema difícil y pasan a ser el orden natural de las cosas.
+</Lead>
+
+<Goals>
+
+- Explicar por qué un Durable Object es el punto único de serialización de su identidad.
+- Entender que un solo hilo atiende los eventos de un objeto y qué elimina eso: carreras y bloqueos.
+- Distinguir el `input gating` y el `output gating` que hacen seguro incluso el código con `await`.
+- Reconocer el precio del modelo: el rendimiento por objeto está acotado, y se escala repartiendo entidades.
+
+</Goals>
+
+## Un unico punto de serializacion
+
+En un backend clásico sin estado, muchas instancias del mismo servicio golpean una base de datos compartida a la vez. Dos peticiones que quieren incrementar el mismo contador se pisan: leen el mismo valor, suman, y una escritura borra a la otra. Es la condición de carrera arquetípica, y para sobrevivir a ella inventamos toda una disciplina defensiva —transacciones, niveles de aislamiento, bloqueos, actualizaciones optimistas con reintento— cuyo único fin es imponer un orden donde la arquitectura no lo daba.
+
+Esa disciplina funciona, pero cobra un peaje que rara vez contabilizamos entero: código más enrevesado, errores que solo asoman bajo carga, reintentos que a veces duplican efectos, y un modelo mental en el que siempre debes preguntarte quién más podría estar tocando estos datos ahora mismo. La pregunta del nivel es si ese peaje es inevitable o si nace de una decisión que podríamos tomar de otra manera.
+
+El Durable Object elimina el problema en la raíz en lugar de defenderse de él. Como todas las peticiones dirigidas a una identidad se enrutan a la única instancia que la encarna, y esa instancia corre en un solo hilo, no hay dos ejecuciones simultáneas que puedan pisarse. El objeto es el lugar por donde todo pasa en fila.
+
+La serialización que antes fabricabas con candados aquí es un hecho de la topología: hay uno, y solo uno, tocando el estado. No es que la plataforma detecte los conflictos y los resuelva rápido; es que los conflictos no llegan a existir, porque nunca hay dos manos sobre la misma pieza de estado al mismo tiempo. Esa diferencia —evitar el problema en vez de gestionarlo— es la que hace que el código de un objeto se parezca al de un programa de un solo usuario.
+
+```ts
+export class Contador {
+  constructor(private state: DurableObjectState, private env: Env) {}
+
+  async incrementar(): Promise<number> {
+    // sin candados, sin transaccion explicita, sin reintentos:
+    // ninguna otra ejecucion toca este objeto a la vez
+    const n = (await this.state.storage.get<number>("n")) ?? 0;
+    const siguiente = n + 1;
+    await this.state.storage.put("n", siguiente);
+    return siguiente;
+  }
+}
+```
+
+Ese `incrementar` sería una carrera de manual en un servicio replicado. Aquí es correcto tal cual, sin una sola línea de defensa, porque no existe la simultaneidad de la que defenderse. El mismo cuerpo de código que en un backend distribuido exigiría una transacción con nivel de aislamiento serializable, o un `UPDATE ... SET n = n + 1` cuidadosamente atómico, o un reintento optimista, aquí es tres líneas sin ceremonia.
+
+Merece la pena detenerse en de dónde sale esa garantía. No la da el lenguaje ni el almacén por sí solos: la da el enrutamiento. La plataforma promete que un identificador de objeto resuelve siempre a la misma instancia, viva donde viva en la red, y que esa instancia es única en todo el planeta. Esa unicidad global es la pieza que convierte a un simple hilo de JavaScript en un serializador fiable para un sistema distribuido entero.
+
+Es la inversión clave respecto al backend clásico. Allí la base de datos era el único punto compartido y todos los servidores sin estado competían por ella; aquí cada objeto es su propio punto compartido, y solo compiten por él las peticiones de esa misma identidad. El cuello de botella no desaparece: se pulveriza en millones de cuellos diminutos, uno por entidad, que casi nunca se saturan porque cada uno solo recibe el tráfico de su porción del mundo.
+
+## Input y output gating
+
+Queda una duda legítima: JavaScript es de un solo hilo, sí, pero es asíncrono. Entre el `get` y el `put` hay un `await`. ¿No podría colarse otro evento en esa pausa y ver un estado a medias? Es la pregunta correcta, porque un solo hilo evita el paralelismo pero no, por sí mismo, el entrelazado de tareas asíncronas. La plataforma cierra esa rendija con dos compuertas automáticas que no tienes que invocar.
+
+<Cards>
+  <Card icon="🚪" title="Input gating">
+    Mientras una escritura en el almacén está en vuelo, la plataforma retiene la entrega de nuevos eventos. Así ninguna ejecución observa un estado a medio confirmar durante un `await`.
+  </Card>
+  <Card icon="📤" title="Output gating">
+    La salida de red —la respuesta al cliente— se retiene hasta que las escrituras que la preceden son durables. Nadie fuera del objeto ve un resultado que aún no está a salvo en disco.
+  </Card>
+  <Card icon="🧱" title="blockConcurrencyWhile">
+    Para la inicialización delicada, `state.blockConcurrencyWhile` bloquea toda otra actividad del objeto hasta que tu bloque termina. Útil para cargar estado antes de atender nada.
+  </Card>
+</Cards>
+
+Que estas compuertas sean automáticas es lo que te deja escribir sin pensar en ellas. No hay una API de transacción que invocar en cada método ni un modo estricto que activar: el comportamiento seguro es el comportamiento por defecto, y el gating actúa por debajo cada vez que hay una escritura en vuelo, sin que tu código lo mencione.
+
+<Mermaid code={`flowchart TB
+  R1[peticion 1] --> Q[cola del objeto]
+  R2[peticion 2] --> Q
+  R3[peticion 3] --> Q
+  Q --> T[un unico hilo, uno a uno]
+  T --> S[estado siempre consistente]
+  class T t-green`} />
+
+El efecto conjunto es que el código simple y secuencial que escribes es también el código correcto. No hay una versión defensiva más complicada esperándote cuando el sistema crezca: leer, decidir y escribir dentro de un objeto es seguro por construcción, y las compuertas garantizan que ni siquiera un `await` intermedio rompe la ilusión de que todo ocurre en un instante indivisible.
+
+La única costura que sí debes cuidar es el arranque. Si tu objeto necesita cargar estado antes de atender la primera petición, envuelve esa carga en `state.blockConcurrencyWhile`: bloquea toda otra actividad hasta que el bloque termina, de modo que ninguna petición ve el objeto a medio inicializar.
+
+```ts
+constructor(private state: DurableObjectState, private env: Env) {
+  // ninguna peticion se atiende hasta que el estado esta cargado
+  this.state.blockConcurrencyWhile(async () => {
+    this.saldo = (await this.state.storage.get<number>("saldo")) ?? 0;
+  });
+}
+```
+
+## El objeto como coordinador
+
+Que el objeto sea el único punto de serialización de su identidad tiene un corolario práctico enorme: es el lugar perfecto para coordinar cualquier cosa que no deba ocurrir dos veces. Reservar un asiento, repartir un número de secuencia monótono, elegir un líder, imponer un límite de tasa. Todo eso, que en un sistema distribuido exige un candado compartido con su liturgia de adquirir, renovar y liberar, dentro de un objeto es trivial, porque el candado ya lo puso la topología.
+
+```ts
+async reservarAsiento(asiento: string, usuario: string): Promise<boolean> {
+  const dueno = await this.state.storage.get<string>(`asiento:${asiento}`);
+  if (dueno) return false;          // ya estaba tomado
+  await this.state.storage.put(`asiento:${asiento}`, usuario);
+  return true;                      // aqui no cabe ninguna carrera
+}
+```
+
+Ese "comprueba y luego escribe" sería la carrera de manual en un servicio replicado: dos peticiones leen el asiento vacío y ambas creen habérselo quedado. En el objeto es correcto tal cual, porque las dos peticiones se atienden en fila y la segunda ya ve el resultado de la primera. El Durable Object es, así, un candado distribuido que no necesita ser distribuido: la exclusión mutua brota de que solo hay un dueño, no de un protocolo que la imponga sobre muchos.
+
+Este es, quizá, el uso más subestimado de un objeto: no guardar datos, sino arbitrar. Cualquier recurso escaso que muchos quieran a la vez —un asiento, un número de pedido correlativo, el turno de escritura sobre un documento compartido— encuentra en un objeto su árbitro natural. Al fin y al cabo, arbitrar no es más que serializar y decidir al final quién gana, y serializar es justo lo que un objeto hace sin que se lo pidas.
+
+<Callout type="note" title="La serializacion protege el estado del objeto, no el mundo de fuera">
+Un solo hilo garantiza que nadie mas toca el estado del objeto mientras tu metodo corre, pero no vuelve transaccional lo que ese metodo hace afuera. Si dentro de un metodo llamas a una API externa y despues escribes en el almacen, un fallo entre ambos pasos deja el efecto externo hecho y la escritura pendiente. La consistencia interna del objeto es gratis; la consistencia con sistemas de fuera te sigue pidiendo idempotencia y cuidado, igual que en cualquier arquitectura.
+</Callout>
+
+## El precio honesto del modelo
+
+Sería deshonesto vender la serialización como gratis. Tiene un coste, y es exactamente su virtud vista del revés: si un objeto atiende sus eventos de uno en uno, su rendimiento está acotado. Todo lo que se dirige a una misma identidad hace cola; no puedes ganar velocidad para ese objeto añadiendo réplicas, porque la réplica única es el punto entero. Un Durable Object es un cuello de botella deliberado, y la ingeniería está en elegir qué encierras dentro de él.
+
+Ese techo por objeto rara vez muerde si eliges bien la identidad, pero conviene tenerlo presente como límite real, no como detalle teórico. Un objeto que reúne demasiada responsabilidad —el que quiere ser dueño del catálogo entero, no de un producto— convierte su fila en el cuello de botella de todo el sistema. La salud del diseño se mide por cuánto tráfico converge de verdad en una sola identidad y con qué frecuencia.
+
+La salida no es agrandar el objeto, sino multiplicar objetos. Repartes el dominio en muchas identidades independientes —un objeto por sala, por usuario, por documento— y cada una corre en su propio hilo, en su propia ubicación, sin coordinarse con las demás. La concurrencia del sistema entero es enorme; lo que es estrictamente secuencial es solo lo que ocurre dentro de cada entidad, que es justo donde querías el orden.
+
+Hay aquí un eco de la ley de Amdahl, pero al revés y a tu favor. En vez de sufrir una fracción serial que limita el sistema entero, tú decides dónde poner el orden estricto: lo confinas a la frontera de cada entidad y dejas que todo lo demás corra en paralelo. El arte, entonces, es trazar bien esas fronteras. Un objeto demasiado grande —el que quiere ser dueño de medio dominio— convierte su fila en el cuello de botella de todo; uno bien dimensionado serializa solo lo que de verdad compite por el mismo estado y nada más.
+
+<Callout type="tip" title="El tamano del objeto es una decision de rendimiento">
+Elige la identidad del objeto pensando en el punto de contencion. Un unico objeto global para todo el sistema serializa todo el trafico en una fila y se satura enseguida. Un objeto por entidad natural —una sala, un usuario, un pedido— reparte la carga en tantas filas como entidades tengas, y cada una solo serializa lo suyo. La granularidad del objeto es, en la practica, la granularidad de tu concurrencia.
+</Callout>
+
+No es un compromiso extraño ni nuevo: es el mismo trato que aceptas cuando fragmentas una base de datos por clave de partición. Cada partición serializa lo suyo y el conjunto escala en horizontal. La diferencia es que aquí la partición no es una fila en una tabla sino un objeto vivo con su propio hilo y su propia memoria, y que la unidad de consistencia y la unidad de cómputo coinciden en la misma pieza. Elegir la identidad del objeto es, a la vez, elegir la clave de fragmentación de tu sistema.
+
+<Callout type="dios" title="La consistencia como propiedad estructural, no como disciplina defensiva">
+Hay dos maneras de conseguir que un sistema con estado sea correcto bajo concurrencia, y la historia del backend es en gran parte el relato de la primera. La primera es defensiva: admites que muchos actores tocan los mismos datos a la vez y levantas un aparato para protegerte —bloqueos, niveles de aislamiento, control optimista, protocolos de commit en dos fases, relojes vectoriales para resolver conflictos entre réplicas—. Es correcto, pero es difícil, es sutil, y es el hogar de los peores errores que existen: los que solo aparecen bajo carga, en la ventana de microsegundos entre dos operaciones que creías indivisibles. La segunda manera es estructural: en lugar de defender los datos de la concurrencia, eliminas la concurrencia sobre cada dato. Le das a cada pieza de estado un único dueño, un único hilo, un único punto por el que todo pasa en fila. Eso es exactamente un Durable Object, y es también, sin más ropaje, el modelo de actores que Hewitt describió en los años setenta y que Erlang llevó a la práctica: estado encapsulado tras un hilo que procesa mensajes de uno en uno. Lo que la plataforma añade es hacer ese actor durable y global —una sola instancia por identidad en todo el planeta, con su estado persistido a su lado—. El giro que hay que interiorizar es que la consistencia deja de ser algo que impones con protocolo y pasa a ser algo que obtienes de la forma del sistema. No hay carrera que ganar cuando no hay dos corredores; no hay bloqueo que tomar cuando solo hay un hilo; no hay conflicto de réplicas que reconciliar cuando solo hay una copia. El precio, el rendimiento acotado por objeto, no es un defecto que ocultar sino la otra cara exacta de la garantía: pagas en throughput por entidad lo que cobras en simplicidad de razonamiento, y escalas repartiendo el mundo en más dueños, no rompiendo la regla de un solo dueño. Quien entiende esto deja de preguntarse cómo protejo estos datos de los accesos concurrentes y empieza a preguntarse quién debe ser el único dueño de estos datos.
+</Callout>
+
+<Challenge title="Convéncete de que no hay carrera">
+1. Escribe el método `incrementar` de arriba y lánzale mil peticiones concurrentes al mismo objeto. Comprueba que el resultado final es exactamente mil, sin pérdidas.
+2. Razona qué le pasaría a ese mismo código en un servicio con varias réplicas y una base de datos compartida, y qué disciplina necesitarías para arreglarlo.
+3. Explica con tus palabras qué protege el `input gating` y qué protege el `output gating`, y por qué juntos hacen seguro un método con un `await` entre la lectura y la escritura.
+4. Diseña deliberadamente un cuello de botella: mete todo el tráfico en un solo objeto global y observa cómo se satura. Luego repártelo por entidad y compara.
+5. Argumenta la frase "la consistencia es una propiedad estructural, no una disciplina defensiva" relacionándola con el modelo de actores.
+</Challenge>

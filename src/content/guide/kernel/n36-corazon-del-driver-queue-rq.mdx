@@ -1,0 +1,162 @@
+---
+title: "El corazón del driver: queue_rq, recorrer el bio y completar"
+description: "La función que blk-mq invoca por cada petición: blk_mq_start_request para arrancar el reloj de timeout, rq_for_each_segment para recorrer todos los bio_vec de la request mapeándolos con bvec_kmap_local, blk_mq_end_request para completarla, y por qué el valor de retorno de queue_rq no es el estado de la E/S sino el del despacho."
+subject: kernel
+level: 36
+order: 4
+position: "36.4"
+duration: "17 min"
+---
+
+<Lead>
+Toda la estructura del nivel anterior existe para que blk-mq pueda llamar a una sola función tuya: `.queue_rq`, "aquí tienes una petición, hazla". Dentro de ella vive el trabajo real del driver, y es más sutil de lo que parece. Una `request` no es un `bio`: es un racimo de `bio` que el planificador fusionó, y cada `bio` es a su vez un vector de segmentos que apuntan a páginas dispersas. Atender la petición es recorrer esa jerarquía, mover los bytes, y llamar a la función exacta que le dice al kernel "terminado". Y hay una trampa conceptual en el valor que devuelves: no informa de si la E/S salió bien, sino de si aceptaste despacharla.
+</Lead>
+
+<Goals>
+
+- Implementar `.queue_rq` y arrancar la petición con `blk_mq_start_request`.
+- Recorrer todos los segmentos de la `request` con `rq_for_each_segment` y `bvec_kmap_local`.
+- Completar con `blk_mq_end_request` y distinguirlo de `blk_mq_complete_request`.
+- Entender por qué el retorno de `queue_rq` reporta el despacho, no el resultado de la E/S.
+
+</Goals>
+
+## La firma y el arranque
+
+`blk_mq_ops.queue_rq` recibe un contexto de cola hardware y un pequeño descriptor con la petición a atender. Lo primero, casi un ritual, es `blk_mq_start_request`: marca la petición como en curso y **arranca su reloj de timeout**, para que si el driver se cuelga y nunca la completa, blk-mq pueda detectarlo y disparar la recuperación.
+
+```c
+static blk_status_t sbd_queue_rq(struct blk_mq_hw_ctx *hctx,
+				 const struct blk_mq_queue_data *bd)
+{
+	struct request *rq = bd->rq;
+	struct sbd_dev *dev = rq->q->queuedata;	/* el estado que pasamos a alloc_disk */
+	blk_status_t status = BLK_STS_OK;
+
+	blk_mq_start_request(rq);		/* en curso: arranca el timeout */
+
+	/* ... procesar la peticion ... */
+
+	blk_mq_end_request(rq, status);		/* completa: bio_endio y libera el tag */
+	return BLK_STS_OK;			/* despacho aceptado (ver ultima seccion) */
+}
+```
+
+El `struct blk_mq_queue_data` trae también `bd->last`, un aviso de si esta es la última petición de un lote: un driver de hardware real lo usa para tocar el timbre del dispositivo una sola vez tras encolar varias, en lugar de una por petición. Nuestro ramdisk, que completa al instante, lo ignora.
+
+## De la request a los bytes: recorrer los segmentos
+
+Aquí está el concepto central. Una `request` agrupa uno o más `bio`, y cada `bio` contiene un array de `bio_vec`, cada uno una tripleta `pagina, offset, longitud`. Recorrer todo eso a mano sería tedioso y frágil; el kernel ofrece `rq_for_each_segment`, que **aplana** la jerarquía entera y te entrega, uno a uno, cada `bio_vec` de cada `bio` de la petición, en orden de sector.
+
+Para tocar los bytes de un segmento hay que mapear su página a una dirección virtual del kernel. `bvec_kmap_local` hace ese mapeo temporal —barato, por CPU, sin dormir— y se deshace con `kunmap_local`. Cada segmento corresponde a un tramo contiguo del disco, así que avanzamos un cursor de bytes en paralelo.
+
+```c
+static blk_status_t sbd_queue_rq(struct blk_mq_hw_ctx *hctx,
+				 const struct blk_mq_queue_data *bd)
+{
+	struct request *rq = bd->rq;
+	struct sbd_dev *dev = rq->q->queuedata;
+	loff_t pos = blk_rq_pos(rq) << SBD_SECTOR_SHIFT;   /* sector inicial a bytes */
+	struct req_iterator iter;
+	struct bio_vec bvec;
+	blk_status_t status = BLK_STS_OK;
+
+	blk_mq_start_request(rq);
+
+	/* rechazar lo que se salga del almacen: E/S fuera de rango */
+	if (pos + blk_rq_bytes(rq) > SBD_SIZE) {
+		status = BLK_STS_IOERR;
+		goto done;
+	}
+
+	/* recorrer TODOS los segmentos de TODOS los bio de la request */
+	rq_for_each_segment(bvec, rq, iter) {
+		void *kaddr = bvec_kmap_local(&bvec);	/* mapea la pagina del segmento */
+
+		if (rq_data_dir(rq) == WRITE)
+			memcpy(dev->data + pos, kaddr, bvec.bv_len);   /* usuario -> disco */
+		else
+			memcpy(kaddr, dev->data + pos, bvec.bv_len);   /* disco -> usuario */
+
+		kunmap_local(kaddr);
+		pos += bvec.bv_len;			/* avanzar el cursor del disco */
+	}
+
+done:
+	blk_mq_end_request(rq, status);
+	return BLK_STS_OK;
+}
+```
+
+Tres funciones de acceso condensan toda la información de la petición: `blk_rq_pos` da el sector inicial, `blk_rq_bytes` el tamaño total, y `rq_data_dir` la dirección —`READ` o `WRITE`—. Con ellas, un ramdisk se reduce a un `memcpy` en la dirección correcta. En un driver de hardware, ese `memcpy` sería en cambio programar un descriptor de DMA y tocar un registro; la forma del bucle es idéntica.
+
+## Completar: end_request frente a complete_request
+
+`blk_mq_end_request(rq, status)` es el final del viaje: llama a `bio_endio` en cada `bio` de la petición —despertando al proceso que esperaba—, devuelve el `tag` al conjunto para que otra petición pueda usarlo, y contabiliza la E/S en las estadísticas. El `status` es un `blk_status_t`: `BLK_STS_OK` si todo fue bien, `BLK_STS_IOERR` ante un error, `BLK_STS_MEDIUM` para un fallo del medio.
+
+Nuestro ramdisk completa **síncronamente** dentro de `queue_rq` porque el `memcpy` termina de inmediato. Un dispositivo real no puede: lanza el comando al hardware y **vuelve** sin que la E/S haya terminado. Más tarde, una interrupción de fin avisa, y en ese contexto de IRQ el driver llama a `blk_mq_complete_request`, que no completa allí mismo —sería trabajo pesado en contexto atómico— sino que programa el softirq de bloque para rematar la faena en un lugar donde sí se puede.
+
+```c
+/* En hardware real la completion es asincrona y ocurre en dos tiempos: */
+
+/* 1) en queue_rq: lanzar y volver, SIN completar todavia */
+static blk_status_t real_queue_rq(struct blk_mq_hw_ctx *hctx,
+				  const struct blk_mq_queue_data *bd)
+{
+	blk_mq_start_request(bd->rq);
+	programar_dma_y_tocar_timbre(bd->rq);	/* la E/S sigue en vuelo */
+	return BLK_STS_OK;			/* despachada, no terminada */
+}
+
+/* 2) en la IRQ de fin: avisar a blk-mq, que difiere el remate al softirq */
+static irqreturn_t real_isr(int irq, void *data)
+{
+	struct request *rq = averiguar_request_completada(data);
+
+	blk_mq_complete_request(rq);		/* -> softirq -> .complete -> end_request */
+	return IRQ_HANDLED;
+}
+```
+
+<Mermaid code={`sequenceDiagram
+  participant P as Proceso
+  participant BL as blk-mq
+  participant D as queue_rq
+  participant HW as Dispositivo
+  P->>BL: submit_bio read sector N
+  BL->>BL: fusiona y planifica, asigna un tag
+  BL->>D: queue_rq con la request
+  D->>D: blk_mq_start_request arranca el timeout
+  D->>HW: recorre los bio_vec y transfiere
+  D->>BL: blk_mq_end_request status OK
+  BL->>P: bio_endio despierta al proceso`} />
+
+## El retorno de queue_rq no es el estado de la E/S
+
+Esta es la trampa que confunde a todo el que llega. El `blk_status_t` que **devuelve** `queue_rq` no informa de si la lectura o escritura tuvo éxito: informa de si aceptaste **despacharla**. Son dos cosas distintas. El resultado de la E/S se comunica por el `status` que pasas a `blk_mq_end_request`; el retorno de `queue_rq` solo le dice a blk-mq qué hacer con la petición a continuación.
+
+Por eso en el código de arriba, aun cuando la E/S falla y completamos con `BLK_STS_IOERR`, `queue_rq` **devuelve `BLK_STS_OK`**: sí, la acepté y la resolví —resultó en error, pero eso ya lo reporté por el otro canal—. El único caso en que `queue_rq` devuelve algo distinto es cuando **no puede** aceptar la petición ahora: si te faltan recursos, devuelves `BLK_STS_RESOURCE` o `BLK_STS_DEV_RESOURCE`, no llamas a `blk_mq_end_request`, y blk-mq **reencola** la petición para reintentarla luego.
+
+```c
+/* el unico retorno distinto de OK: rechazar el despacho para reintento */
+if (!hay_hueco_en_el_hardware(dev)) {
+	blk_mq_stop_hw_queue(hctx);	/* pausa la cola hasta que haya sitio */
+	return BLK_STS_RESOURCE;	/* NO llames a end_request: blk-mq reencola */
+}
+```
+
+<Callout type="warn" title="Si devuelves RESOURCE, no has arrancado la petición para nada">
+El error más sutil de un block driver es mezclar los dos canales. Si vas a devolver `BLK_STS_RESOURCE` para que blk-mq reintente, no debes haber consumido nada irreversible ni haber llamado a `blk_mq_end_request`, porque la misma petición volverá a entrar a `queue_rq`. Y al revés: si completaste con `blk_mq_end_request`, la petición **ya no es tuya**, y devolver algo distinto de `BLK_STS_OK` haría que blk-mq la tratara como no despachada y la manejara dos veces. Cada petición se completa exactamente una vez por uno solo de los dos canales: o `end_request`, o retorno de reintento. Nunca ambos.
+</Callout>
+
+<Callout type="dios" title="Despachar y completar son dos verdades separadas por el tiempo">
+Detente en la distinción entre el retorno de `queue_rq` y el `status` de `blk_mq_end_request`, porque no es un detalle de API: es la huella, en el código, de la naturaleza asíncrona de toda E/S real. En un mundo síncrono —el ramdisk— las dos verdades coinciden en el mismo instante: aceptas la petición y la terminas en la misma línea, y la distinción parece pedante. Pero el ramdisk miente sobre la realidad. En un disco real, entre "acepto despachar esto" y "esto ha terminado" transcurre una eternidad de microsegundos durante la cual el hardware trabaja solo y tu CPU se marcha a hacer otra cosa. Esos dos momentos están **separados en el tiempo**, ocurren en **contextos distintos** —uno en el hilo que envió, otro en la interrupción de fin— y por eso necesitan **canales distintos**: el retorno inmediato dice "sí, me hago cargo, sigue tú", y la completion tardía, disparada por el hardware, dice "ya está, con este resultado". Confundirlos es confundir la promesa con su cumplimiento. Toda la arquitectura de blk-mq —los tags que identifican peticiones en vuelo, el reloj de timeout que `start_request` arranca, el softirq al que `complete_request` difiere el remate— existe para gestionar precisamente ese hueco temporal entre el despacho y la finalización. Cuando interiorices que una petición de E/S no es una llamada a función que devuelve un valor, sino una promesa que se hace en un contexto y se cumple en otro, entenderás por qué el kernel entero de almacenamiento está construido alrededor de identificar, cronometrar y completar operaciones que sobreviven a la función que las lanzó. Y verás que io_uring, dos niveles más adelante, no es más que esta misma verdad llevada hasta la frontera con el espacio de usuario.
+</Callout>
+
+<Challenge title="Disecciona una petición real">
+1. Añade un `pr_info` dentro del bucle que imprima `blk_rq_pos`, `blk_rq_bytes` y `rq_data_dir` de cada petición, y observa con `dd bs=1M` cómo varían el sector y el tamaño.
+2. Explica por qué `rq_for_each_segment` puede iterar varias veces para una sola petición y qué relación tiene eso con la fusión del nivel 36.1.
+3. Provoca una E/S fuera de rango y comprueba que completas con `BLK_STS_IOERR` mientras `queue_rq` sigue devolviendo `BLK_STS_OK`; justifica por qué es correcto.
+4. Describe, para un driver de hardware, qué línea de `queue_rq` desaparecería y en qué función de interrupción reaparecería `blk_mq_complete_request`.
+5. Razona qué desastre ocurre si llamas a `blk_mq_end_request` y además devuelves `BLK_STS_RESOURCE` para la misma petición.
+</Challenge>

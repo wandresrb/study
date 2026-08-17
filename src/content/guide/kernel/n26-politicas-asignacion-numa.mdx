@@ -1,0 +1,136 @@
+---
+title: "Políticas de asignación NUMA: local, bind e interleave"
+description: "Cómo el kernel decide en qué nodo nace cada página: la política por defecto (local first-touch), MPOL_BIND, MPOL_INTERLEAVE y las políticas ponderadas para memoria por niveles. numa_node_id, alloc_pages_node, kmalloc_node y el balanceo automático (AutoNUMA) que migra páginas hacia quien las usa."
+subject: kernel
+level: 26
+order: 2
+position: "26.2"
+duration: "16 min"
+---
+
+<Lead>
+Saber que la memoria remota es lenta (26.1) no sirve de nada si el kernel asigna páginas al azar. La estrategia por defecto es sencilla y potente: dar a cada quien memoria de su propio nodo. Pero no siempre es lo óptimo —una tabla enorme leída por todos los núcleos rinde mejor **repartida**— así que Linux ofrece un menú de **políticas de asignación NUMA**, y además un motor que corrige errores en caliente migrando páginas hacia el nodo que de verdad las toca.
+</Lead>
+
+<Goals>
+
+- Dominar las políticas: `MPOL_DEFAULT` (local), `MPOL_BIND` y `MPOL_INTERLEAVE`.
+- Asignar consciente del nodo con `alloc_pages_node`, `kmalloc_node` y `numa_node_id`.
+- Entender first-touch y por qué "quién toca primero" decide el nodo.
+- Conocer AutoNUMA y las políticas ponderadas para memoria por niveles (CXL).
+</Goals>
+
+## El menú de políticas
+
+Una **política de memoria** (`struct mempolicy`, en `mm/mempolicy.c`) responde a una pregunta: cuando haga falta una página, ¿de qué nodo la saco? Linux define varias, aplicables por proceso, por hilo o por rango de direcciones:
+
+- `MPOL_DEFAULT`: asigna en el **nodo local** del núcleo que ejecuta la falta de página. Es la política por defecto y casi siempre la correcta.
+- `MPOL_BIND`: **restringe** la asignación a un conjunto de nodos concreto; si no hay memoria allí, se recupera o falla, pero no se sale del conjunto.
+- `MPOL_INTERLEAVE`: **reparte** las páginas en round-robin entre un conjunto de nodos, página a página. Sacrifica localidad por **ancho de banda agregado** y latencia predecible.
+- `MPOL_PREFERRED`: **prefiere** un nodo pero cae a otros si hace falta (una preferencia blanda, no una restricción).
+- `MPOL_PREFERRED_MANY`: prefiere un **conjunto** de nodos con caída elegante al resto.
+- `MPOL_WEIGHTED_INTERLEAVE`: interleave **ponderado**, reparte más páginas a los nodos con más ancho de banda. Clave para memoria por niveles.
+
+Desde el espacio de usuario se fijan con las syscalls `set_mempolicy`, `mbind` (por rango) y `get_mempolicy`, o cómodamente con `numactl` y `libnuma`:
+
+```bash
+# Repartir la memoria de un proceso entre todos los nodos
+numactl --interleave=all ./mi_servidor
+
+# Anclar CPU y memoria al nodo 1: maxima localidad
+numactl --cpunodebind=1 --membind=1 ./trabajo_hpc
+```
+
+```c
+/* Equivalente con libnuma dentro de un programa */
+#include <numa.h>
+#include <numaif.h>
+
+struct bitmask *nodos = numa_allocate_nodemask();
+numa_bitmask_setall(nodos);                    /* todos los nodos */
+set_mempolicy(MPOL_INTERLEAVE, nodos->maskp, nodos->size + 1);
+```
+
+<Cards>
+  <Card icon="🏠" title="Local, la de por defecto">
+    Cada página en el nodo de quien la toca. La mejor latencia por acceso. El acierto por defecto para datos que un núcleo usa en privado.
+  </Card>
+  <Card icon="⛓️" title="Bind, restricción dura">
+    Confina la asignación a un conjunto de nodos y no sale de ahí. Para aislar cargas y garantizar que la memoria vive donde corre el cómputo.
+  </Card>
+  <Card icon="🔀" title="Interleave, ancho de banda">
+    Reparte página a página entre nodos. Sacrifica localidad por ancho de banda agregado: ideal para una tabla enorme que todos escanean.
+  </Card>
+</Cards>
+
+<Callout type="note" title="Las cpusets acotan lo que la política puede pedir">
+Una política NUMA no opera en el vacío: el cgroup `cpuset` del proceso define el conjunto de nodos permitidos, y la política solo elige **dentro** de él. Si un contenedor está confinado al nodo 1 por su `cpuset.mems`, un `MPOL_INTERLEAVE` sobre todos los nodos se reduce, en la práctica, a interleave sobre el único nodo permitido. La colocación real en producción nace de la intersección entre la política del proceso y el `cpuset` que lo contiene.
+</Callout>
+
+## Asignar consciente del nodo desde el kernel
+
+Dentro del kernel, el asignador de páginas consulta la política de la tarea de forma transparente: `alloc_pages(gfp, order)` mira `current` y sirve del nodo que la política indique. Cuando quieres control explícito, pides un nodo concreto:
+
+```c
+#include <linux/gfp.h>
+#include <linux/slab.h>
+
+/* Asigna en el nodo del nucleo actual: el patron local por defecto */
+struct page *p = alloc_pages_node(numa_node_id(), GFP_KERNEL, 0);
+
+/* Estructura pegada al hardware que la usara: cerca del dispositivo */
+struct ctx *c = kmalloc_node(sizeof(*c), GFP_KERNEL, dev_to_node(dev));
+
+/* Una slab-cache sirviendo del nodo pedido */
+void *obj = kmem_cache_alloc_node(cache, GFP_KERNEL, cpu_to_node(cpu));
+```
+
+La familia `*_node` (`alloc_pages_node`, `kmalloc_node`, `vmalloc_node`, `kmem_cache_alloc_node`) es la manera del kernel de decir "quiero esta memoria **aquí**". Un driver la usa para colocar sus estructuras en el nodo del dispositivo PCIe; el planificador, para poner la pila de un hilo en su nodo. El flag `__GFP_THISNODE` endurece la petición: exige ese nodo **sin** caer a la zonelist de respaldo, fallando antes que asignar remoto.
+
+<Callout type="warn" title="First-touch: la política se aplica al tocar, no al reservar">
+Una trampa clásica: `malloc` o `mmap` no asignan memoria física, solo reservan espacio virtual. La página real nace en la **primera escritura** (la falta de página), y es *ese* núcleo, en *ese* momento, quien decide el nodo según la política vigente. En un programa paralelo, si un hilo inicializa todo el buffer y luego lo reparte entre núcleos, toda la memoria acaba en **un solo nodo** y los demás pagan accesos remotos eternos. La regla de oro del HPC es first-touch: **que cada hilo toque primero la porción que después usará**.
+</Callout>
+
+<Mermaid code={`flowchart TD
+  A[Falta de pagina] --> B{Politica vigente de la tarea}
+  B -->|local| L[Asigna en el nodo del nucleo actual]
+  B -->|bind| K[Restringe al conjunto de nodos fijado]
+  B -->|interleave| R[Reparte pagina a pagina entre nodos]
+  B -->|preferred| P[Prefiere un nodo y cae a vecinos]
+  class L t-green
+  class R t-blue`} />
+
+## AutoNUMA: corregir la colocación en caliente
+
+Las políticas estáticas fallan cuando el patrón de acceso cambia o cuando el planificador migra un hilo a otro nodo, dejando sus datos lejos. Para eso existe el **balanceo automático de NUMA** (AutoNUMA), gobernado por `CONFIG_NUMA_BALANCING`:
+
+```bash
+# 1 = activo. El kernel muestrea, detecta accesos remotos y migra
+sysctl kernel.numa_balancing
+cat /proc/sys/kernel/numa_balancing_scan_period_min_ms
+```
+
+El mecanismo es astuto: periódicamente el kernel desmapea páginas del proceso marcándolas como `PROT_NONE` (un "hint fault"). Cuando el hilo las vuelve a tocar, la falta de página revela **qué núcleo, en qué nodo**, accede a cada página. Con esa telemetría, `task_numa_fault` decide dos cosas: **migrar la página** hacia el nodo del hilo, o **migrar el hilo** hacia el nodo de sus páginas, buscando que datos y cómputo converjan. Es un lazo de realimentación que persigue la localidad sin que el programador anote nada.
+
+## Memoria por niveles: el interleave ponderado
+
+En 2026 la topología ya no es solo "sockets con DRAM". Con CXL, una máquina tiene **niveles** de memoria: DRAM rápida cerca de la CPU y memoria CXL más lenta pero abundante, cada nivel como un nodo NUMA. El kernel modela esto en `mm/memory-tiers.c` y aplica **promoción** (subir páginas calientes a DRAM) y **democión** (bajar frías a CXL). Ahí brilla `MPOL_WEIGHTED_INTERLEAVE`: repartir proporcional al ancho de banda de cada nivel, no a partes iguales.
+
+```bash
+# Pesos de interleave por nodo, para memoria por niveles
+cat /sys/kernel/mm/mempolicy/weighted_interleave/node0
+echo 3 > /sys/kernel/mm/mempolicy/weighted_interleave/node0
+echo 1 > /sys/kernel/mm/mempolicy/weighted_interleave/node1
+```
+
+<Callout type="dios" title="La política es una apuesta entre localidad y ancho de banda">
+Todas las políticas NUMA son variaciones sobre una única tensión, y verla te da el criterio para elegir siempre bien. En un extremo está la **localidad**: mete cada dato en el nodo que lo usa y minimiza la latencia de cada acceso individual. En el otro está el **ancho de banda agregado**: reparte los datos entre todos los controladores de memoria para que muchos núcleos tiren en paralelo sin saturar un solo enlace. `MPOL_BIND` y el first-touch apuestan por lo primero; `MPOL_INTERLEAVE` por lo segundo. No hay respuesta universal: depende del patrón de acceso. Una estructura que cada núcleo usa privadamente quiere localidad. Una tabla inmensa e inmutable que todos escanean —un índice, un modelo, un grafo— quiere interleave, porque si vive en un solo nodo ese controlador se convierte en el cuello de botella de toda la máquina. El ingeniero que domina NUMA no memoriza qué política usar: **mide el patrón de acceso** y deduce de él si su cuello de botella será la latencia o el ancho de banda, y solo entonces elige. Esa capacidad de razonar desde el patrón hacia la política es lo que separa afinar un servidor grande de rezar para que rinda.
+</Callout>
+
+<Challenge title="Elige y mide tu política">
+1. Lanza una carga con `numactl --membind=0` y luego con `--interleave=all`; compara con `numastat` cuál genera accesos remotos.
+2. Escribe un módulo que asigne una estructura con `kmalloc_node(..., dev_to_node(dev))` y explica por qué la pones en el nodo del dispositivo.
+3. Explica el problema del first-touch con un ejemplo de un buffer inicializado por un solo hilo.
+4. Activa `kernel.numa_balancing` y describe, paso a paso, cómo un hint fault acaba migrando una página.
+5. Razona cuándo `MPOL_WEIGHTED_INTERLEAVE` supera al interleave clásico en una máquina con CXL.
+</Challenge>

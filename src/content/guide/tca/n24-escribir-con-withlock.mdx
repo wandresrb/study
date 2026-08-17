@@ -1,0 +1,155 @@
+---
+title: "Escribir en estado compartido: withLock y la propagación del cambio"
+description: "Leer un dato compartido es trivial; escribirlo es donde se concentra todo el diseño. Esta lección explica por qué TCA no permite asignar directamente sobre un campo `@Shared` y exige en su lugar `withLock`, qué garantiza esa sección crítica en un mundo Swift 6 donde la caja no está aislada a ningún actor, y qué reglas de higiene se aplican dentro del bloque. Después sigue el viaje del cambio hasta el otro extremo del árbol: qué se invalida, qué se redibuja y —el punto más importante y el más olvidado— qué no ocurre, porque escribir en estado compartido no envía ninguna acción a las features que lo observan, y de esa asimetría se derivan casi todos los errores de razonamiento con esta herramienta."
+subject: tca
+level: 24
+order: 3
+position: "24.3"
+duration: "19 min"
+---
+
+<Lead>
+La primera vez que intentas escribir en un campo compartido, el compilador te para. La reacción natural es buscar el atajo que devuelva la asignación de toda la vida, y esa reacción es la que conviene resistir, porque la fricción está puesta a propósito y en el sitio exacto donde hace falta. Una caja compartida por varias features es, en Swift 6, memoria alcanzable desde más de un contexto de concurrencia; y una escritura sobre memoria compartida que no declare su sección crítica es, por definición, una carrera esperando a manifestarse. Pero la razón técnica es solo la mitad. La otra mitad es arquitectónica: `withLock` convierte la mutación de un dato global en un acto sintácticamente visible, imposible de confundir con la asignación inocente de un campo local, y esa visibilidad es la que permite revisar un diff y saber en qué líneas exactas el sistema toca algo que otros están mirando.
+</Lead>
+
+<Goals>
+
+- Escribir en estado compartido con `withLock` y justificar por qué la asignación directa no está disponible.
+- Aplicar las reglas de higiene de la sección crítica: corta, síncrona, sin efectos y sin envío de acciones.
+- Predecir con exactitud qué features se invalidan y cuáles no reciben ninguna acción cuando alguien escribe.
+- Afirmar mutaciones de estado compartido en un `TestStore` y detectar el cambio propagado desde otra feature.
+
+</Goals>
+
+## Por qué no se puede asignar
+
+La escritura se hace siempre sobre el valor proyectado, pasando por una función que recibe el contenido como parámetro inout y lo devuelve mutado.
+
+```swift
+case .nombreCambiado(let nuevo):
+  state.$usuario.withLock { $0.nombre = nuevo }
+  return .none
+
+case .planMejorado:
+  state.$usuario.withLock { usuario in
+    usuario.plan = .profesional
+    usuario.creditos += 100          // dos campos, una sola sección crítica
+  }
+  return .none
+```
+
+Tres razones sostienen esta forma y ninguna es cosmética. La primera es la exclusión mutua: la caja es alcanzable desde cualquier hilo, así que un incremento escrito como leer, sumar y guardar puede intercalarse con otro y perder una de las dos sumas; el bloque garantiza que ese ciclo completo ocurre sin interrupciones. La segunda es la atomicidad de la transacción: cuando una operación de dominio toca dos campos que deben cambiar juntos —el plan y los créditos del ejemplo— hacerlo dentro de un mismo bloque impide que alguien observe el estado intermedio, mientras que dos asignaciones sueltas lo exponen. La tercera es la legibilidad del cambio: `state.editando = true` y `state.$usuario.withLock` se distinguen de un vistazo, y esa distinción tipográfica es lo que permite auditar un módulo entero buscando dónde se escribe algo que no es propio.
+
+El bloque devuelve lo que devuelva su cuerpo, lo que permite leer y escribir en la misma operación sin abrir dos ventanas donde podría colarse otro escritor.
+
+```swift
+let creditosRestantes = state.$usuario.withLock { usuario -> Int in
+  usuario.creditos -= coste
+  return usuario.creditos
+}
+```
+
+Y de ahí salen las reglas de higiene, que son las de cualquier sección crítica de cualquier lenguaje. El bloque debe ser corto, porque mientras dure nadie más escribe. Debe ser síncrono: no se hace trabajo asíncrono dentro, ni se llama a una dependencia que pueda bloquear, ni se espera nada. No se envía una acción desde dentro, porque eso reentraría en el sistema con el candado tomado. Y no se toca otra caja compartida dentro del bloque de la primera, porque dos secciones críticas anidadas en orden distinto en dos sitios distintos son un abrazo mortal escrito a mano.
+
+## Cómo viaja el cambio, y cómo no
+
+Escribir en la caja hace una sola cosa: cambia el contenido de la caja. Todo lo demás se sigue de que hay features apuntando a ella, y conviene separar con cuidado lo que sí ocurre de lo que no.
+
+Lo que sí ocurre es la invalidación de la interfaz. Cualquier vista que hubiera leído esa propiedad durante su última evaluación está registrada como dependiente, de modo que la escritura la marca como sucia y SwiftUI la reevalúa en el siguiente ciclo. Da igual dónde esté esa vista en el árbol, si pertenece a otra pestaña o si su feature ni siquiera es pariente de la que escribió: la observación va por lectura, no por parentesco. Es exactamente la propiedad que se buscaba en la primera lección, y funciona sin escribir una línea de propagación.
+
+Lo que no ocurre es cualquier otra cosa. Ninguna acción se envía. Ningún reducer de ninguna otra feature se ejecuta. Nadie recibe una notificación que le permita reaccionar, validar, cancelar un efecto o disparar uno nuevo. Si `Ajustes` necesitara recalcular algo cuando el plan del usuario cambia, no hay nada en el mecanismo de `@Shared` que se lo diga: su reducer sigue esperando acciones propias que nadie va a enviar. Esta asimetría es la fuente de la inmensa mayoría de los errores de razonamiento con estado compartido, y merece formularse como regla: **el estado compartido propaga datos, no eventos**.
+
+De la regla se sigue la práctica. Si lo que la otra feature necesita es el dato, comparte y no hagas nada más: leerá el valor nuevo la próxima vez que lo lea, que en una vista es inmediatamente. Si lo que necesita es enterarse de que ocurrió algo —para lanzar una petición, cancelar un temporizador o registrar un evento— eso es un hecho del dominio y su vehículo sigue siendo una acción `delegate` que sube al ancestro común. Usar la caja compartida como canal de notificación entre hermanos, escribiendo un contador o un booleano que el otro *espera ver cambiar*, es reinventar la comunicación por variable global con todos sus defectos: sin orden garantizado, sin registro en el log y sin nada que afirmar en un test.
+
+Queda un corolario incómodo: si el estado compartido puede cambiar sin que la feature procese acción alguna, el estado que un reducer ve al empezar puede no ser el que vio al terminar la acción anterior. En la práctica esto rara vez muerde, porque las escrituras ocurren en reducers y los reducers de un mismo store no corren a la vez; pero deja de ser cierto en cuanto alguien escribe desde dentro de un efecto, en otro hilo. De ahí la disciplina que cierra esta lección: **se escribe desde el reducer, con el valor que traiga la acción; el efecto envía una acción con el resultado y es el reducer quien la escribe**.
+
+En código, la disciplina es un patrón de dos tiempos que ya conoces del nivel diez y que aquí gana una razón más para respetarse:
+
+```swift
+case .recargarPerfilPulsado:
+  return .run { [id = state.usuario.id] send in
+    await send(.perfilLlego(Result { try await self.api.perfil(id) }))
+  }
+
+case let .perfilLlego(.success(perfil)):
+  state.$usuario.withLock { $0.aplicar(perfil) }   // el reducer escribe
+  return .none
+
+case .perfilLlego(.failure):
+  state.error = .noSePudoRecargar
+  return .none
+```
+
+El efecto no toca la caja: transporta un valor y termina. La escritura ocurre en el único sitio donde está ordenada respecto a todas las demás acciones del store, aparece en el registro asociada a la acción que la causó y se afirma en el test con la aserción de `receive`. Capturar `$usuario` dentro del `run` y escribir allí ahorraría cuatro líneas y perdería las tres propiedades a la vez.
+
+Conviene además señalar dónde se escribe cuando lo que cambia es una parte. Si una feature solo posee la caja de una propiedad —recibió `$usuario.plan` en lugar de `$usuario`— escribe sobre esa caja derivada y el efecto sobre el objeto completo es el esperado: `state.$plan.withLock` modifica el mismo `Usuario` que los demás observan, pero esa feature nunca tuvo acceso al resto de campos. Rebanar la caja al entregarla es, por tanto, la forma más barata de limitar el alcance de una escritura sin escribir ni una comprobación.
+
+## Afirmar la escritura
+
+El `TestStore` trata la mutación compartida con la misma exigencia que cualquier otra, y la sintaxis de la aserción es idéntica a la de la escritura real.
+
+```swift
+await store.send(.planMejorado) {
+  $0.$usuario.withLock {
+    $0.plan = .profesional
+    $0.creditos += 100
+  }
+}
+```
+
+Lo interesante es el segundo caso, el de la feature que no escribió. Un test de `Ajustes` puede afirmar el efecto de una escritura ajena inyectándola directamente sobre la caja, lo que permite probar la reacción a un cambio externo sin montar la feature que lo produce ni la jerarquía que las une:
+
+```swift
+let usuario = Shared(value: Usuario(nombre: "Ada", plan: .gratuito))
+let store = TestStore(initialState: Ajustes.State(usuario: usuario)) {
+  Ajustes()
+}
+
+usuario.withLock { $0.plan = .profesional }        // escribe otro, desde fuera
+await store.send(.aparecio) {
+  $0.seccionesVisibles = .todas                     // la reacción propia sí se afirma
+}
+```
+
+Es el reflejo exacto del contrato `delegate` del nivel catorce, ahora en clave de datos: cada lado se prueba solo, contra la frontera y no contra el otro. Y la asimetría del ejemplo es instructiva —la escritura ajena se ejecuta sin aserción porque no la produjo esta feature, mientras que todo lo que sí produce el reducer bajo prueba sigue exigiendo su declaración—, porque es la traducción literal a testing de la regla que gobierna la lección: cada feature responde de lo que escribe, y solo de eso.
+
+<Cards>
+  <Card icon="🔐" title="Sección crítica visible">
+    `withLock` distingue de un vistazo tocar lo propio de tocar lo de todos. Esa diferencia tipográfica es lo que hace auditable un módulo.
+  </Card>
+  <Card icon="⚛️" title="Una transacción, un bloque">
+    Dos campos que deben cambiar juntos cambian dentro del mismo bloque. Dos bloques exponen un estado intermedio que nadie modeló.
+  </Card>
+  <Card icon="📡" title="Datos, no eventos">
+    Escribir invalida vistas y no ejecuta reducers ajenos. Lo que otro deba hacer al enterarse viaja como acción `delegate`.
+  </Card>
+  <Card icon="🎯" title="El reducer escribe">
+    El efecto trae el valor en una acción y el reducer lo guarda. Escribir desde dentro del efecto borra el orden y el registro.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="La escritura desde un efecto es legal y casi siempre es un error">
+Nada impide capturar `$usuario` en el cierre de un `run` y escribir allí cuando llegue la respuesta de la red. Compila, funciona y destruye tres cosas a la vez: el cambio deja de aparecer en el registro de acciones, deja de ser afirmable con la aserción de `send` en el `TestStore`, y pasa a ocurrir en un instante que ninguna acción marca, lo que reintroduce por completo la indeterminación temporal que el nivel diez se dedicó a eliminar. La forma correcta es la de siempre: el efecto envía una acción con el resultado y el reducer, síncrono y ordenado, hace el `withLock`.
+</Callout>
+
+<Mermaid code={`flowchart TD
+  R[Reducer de Perfil] -->|withLock| C[Caja compartida]
+  C -->|invalidacion por lectura| V1[Vista de Perfil]
+  C -->|invalidacion por lectura| V2[Vista de Ajustes]
+  C -->|invalidacion por lectura| V3[Vista de Cabecera]
+  C -.->|no envia accion| RA[Reducer de Ajustes]
+  D[Hecho del dominio] -->|accion delegate| RA
+  class C t-green
+  class RA t-yellow`} />
+
+<Callout type="dios" title="El candado no protege la memoria: protege la frontera entre lo propio y lo común">
+Es tentador leer `withLock` como una molestia impuesta por el modelo de concurrencia, una etiqueta que Swift 6 obliga a poner para que el compilador se calle, y quedarse ahí. Esa lectura pierde lo esencial, que se ve mejor preguntando qué habría pasado si el diseño hubiera elegido lo contrario. Con asignación directa, `state.usuario.nombre = nuevo` y `state.editando = true` serían dos líneas de la misma forma, con el mismo aspecto en un diff, con la misma sensación al escribirlas, y sin embargo estarían haciendo cosas categóricamente distintas: la segunda modifica una celda que solo esta feature posee y de la que responde en solitario; la primera modifica una celda que cinco features están mirando ahora mismo y sobre cuyo contenido tres de ellas tienen suposiciones que tú no conoces. Una arquitectura que borra esa distinción en la sintaxis obliga a reconstruirla mentalmente en cada revisión de código, y lo que hay que reconstruir en cada revisión termina por no reconstruirse nunca. Lo que hace la sección crítica explícita, más allá de la exclusión mutua que efectivamente garantiza, es mantener visible en el texto del programa una frontera que es semántica y no técnica: la frontera entre lo que es tuyo y lo que es de todos. Por eso la regla de que el bloque sea corto no es solo higiene de concurrencia sino higiene de dominio —una sección crítica larga suele delatar que estás haciendo dentro del candado razonamiento que pertenece al reducer—, y por eso la prohibición de enviar acciones desde dentro no es solo evitar la reentrada sino recordar que el estado compartido transporta datos y las acciones transportan eventos, dos capas que se ensucian mutuamente en cuanto se mezclan. Al final la disciplina completa cabe en una frase que vale la pena memorizar antes de seguir: se lee en cualquier parte, se escribe en un solo sitio, y ese sitio se ve.
+</Callout>
+
+<Challenge title="Cruza dos escritores y observa la diferencia entre dato y evento">
+1. Añade a tu app una tercera feature que solo lea el usuario compartido y lo pinte en una cabecera. Escribe desde el perfil y comprueba que la cabecera se redibuja sin que exista ninguna línea de propagación.
+2. Haz que la feature de ajustes necesite lanzar una petición cuando el plan cambia. Intenta resolverlo mirando el campo compartido y anota exactamente por qué no funciona; después resuélvelo con una acción `delegate` que suba al ancestro.
+3. Escribe dos campos relacionados en dos `withLock` separados y añade un retardo artificial entre ambos. Observa el estado intermedio en la interfaz y después únelos en un solo bloque para comprobar que desaparece.
+4. Mueve una escritura al interior de un `run` y ejecuta el test que la afirmaba. Lee el fallo, revierte el cambio y escribe en dos frases qué garantía se rompió.
+5. Prueba la reacción de la cabecera sin montar el perfil: en su test, muta la caja compartida directamente y afirma el estado resultante. Comprueba que ninguna de las dos pruebas necesita a la otra feature.
+</Challenge>

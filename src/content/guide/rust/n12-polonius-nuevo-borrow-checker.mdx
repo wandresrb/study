@@ -1,0 +1,161 @@
+---
+title: "Polonius: el borrow checker de nueva generación"
+description: "Polonius reformula el análisis de préstamos razonando sobre orígenes que fluyen por el grafo, no sobre vidas que se estiran. Qué patrón sano rechazaba NLL y Polonius acepta —el retorno condicional de una referencia—, cómo lo razona, y en qué estado está su despliegue en 2026."
+subject: rust
+level: 12
+order: 3
+position: "12.3"
+duration: "18 min"
+---
+
+<Lead>
+NLL enseñó al compilador a medir la vida real de cada préstamo, pero se quedó con un punto ciego: cuando una función devuelve una referencia solo en algunos caminos, NLL la considera viva en **todos**, y rechaza código perfectamente seguro. **Polonius** es la reformulación de nueva generación del borrow checker que cierra ese hueco. En vez de preguntar "¿hasta dónde vive esta referencia?", pregunta "¿qué préstamos podrían estar en uso en este punto exacto del flujo?", y esa inversión le permite aceptar programas sanos que NLL, por conservador, nunca pudo.
+</Lead>
+
+<Goals>
+
+- Entender en qué se diferencia Polonius de NLL: de vidas que se estiran a orígenes que fluyen.
+- Reconocer el caso canónico que NLL rechaza y Polonius acepta: el retorno condicional de una referencia.
+- Leer un préstamo como un conjunto de orígenes vivos en cada punto del programa.
+- Situar el estado real de Polonius en 2026 y cómo probarlo hoy.
+
+</Goals>
+
+## Qué le faltaba a NLL
+
+Recupera el patrón que cerró la lección anterior: una función que devuelve un préstamo en una rama y muta el contenedor en otra. Es idiomático, es seguro, y NLL lo rechaza.
+
+```rust
+fn ultimo_o_insertar(v: &mut Vec<i32>) -> &i32 {
+    if let Some(x) = v.last() {   // préstamo de `v` para obtener `x`
+        return x;                  // ...que solo se usa en ESTE camino
+    }
+    v.push(0);                     // ERROR bajo NLL: cree que el préstamo sigue vivo
+    v.last().unwrap()
+}
+```
+
+El problema de NLL es de *granularidad*. NLL modela el préstamo con una vida —una región del grafo— y, para que el `return x` sea válido, esa región debe extenderse hasta la salida de la función. Pero una vez extendida, NLL la ve viva también en el camino del `else`, donde en realidad no devolvimos nada y el préstamo ya no importa. NLL no sabe decir "vivo en este camino, muerto en aquel"; solo maneja una región única que, o cubre el `return`, o no. Al cubrirlo, envenena el otro camino y el `push` choca contra un fantasma.
+
+La raíz es que la vida de un préstamo, como región, tiene que ser *convexa* sobre el grafo: un solo trozo continuo que abarca todos sus usos. Cuando los usos viven en ramas distintas que se reúnen más adelante, esa región convexa engorda hasta cubrir puntos donde el préstamo, camino a camino, ya estaba muerto. Es una imprecisión inherente al modelo, no un fallo de implementación, y ninguna cantidad de afinado de NLL la elimina: hace falta cambiar de teoría.
+
+<Callout type="warn" title="Es un falso positivo, no un peligro real">
+Que NLL rechace `ultimo_o_insertar` no significa que el código sea inseguro: significa que el análisis es demasiado grueso para *demostrar* que es seguro. Esa es precisamente la brecha que todo verificador estático arrastra —rechazar algún programa correcto por no poder probar su corrección— y la que Polonius viene a estrechar. No estás engañando a nadie al querer que compile; estás pidiendo un análisis más fino.
+</Callout>
+
+<Callout type="info" title="Por qué se llama Polonius">
+El nombre es una broma culta del equipo de Rust. En *Hamlet*, el consejero Polonio aconseja a su hijo: "neither a borrower nor a lender be" —ni prestatario ni prestamista seas—. El análisis que gobierna préstamos (*borrows*) y a quien los concede no podía llamarse de otra forma. Tras el guiño hay ingeniería seria: Polonius nació como una biblioteca independiente que reexpresa el borrow checking en reglas al estilo Datalog, precisamente para razonar con una precisión que el motor de regiones no alcanzaba.
+</Callout>
+
+## Cómo razona Polonius: orígenes que fluyen por el grafo
+
+Polonius invierte la pregunta. NLL parte de cada referencia y calcula *hasta dónde vive* su préstamo. Polonius parte de cada punto del programa y calcula *qué préstamos podrían usarse a partir de aquí* —lo que su teoría llama los **orígenes** (*origins*) vivos en ese punto—. La diferencia suena sutil, pero lo cambia todo: al razonar punto por punto sobre el grafo de flujo, Polonius distingue naturalmente el camino del `return` del camino del `else`.
+
+En términos operativos, Polonius reformula el borrow checking como un problema de análisis de flujo al estilo Datalog: un conjunto de hechos —"aquí nace el préstamo `L`", "aquí se accede a través de él", "este punto sucede tras aquel"— y reglas que propagan qué orígenes siguen vivos en cada arista. Un préstamo mutable en un punto es un error solo si, en **ese punto concreto**, algún origen incompatible sigue vivo. En `ultimo_o_insertar`, cuando el flujo llega al `push`, el único origen que lo alcanzaría es el del camino que ya hizo `return`: en el camino del `else` ese origen está muerto, así que no hay conflicto y el `push` se acepta.
+
+Puedes visualizar esos hechos casi como una base de datos que se consulta punto a punto. Anotando la misma función con los orígenes y los puntos de interés, se ve dónde vive y dónde muere cada préstamo:
+
+```rust
+fn ultimo_o_insertar(v: &mut Vec<i32>) -> &i32 {
+    if let Some(x) = v.last() {   // nace el origen L0: préstamo compartido de `v`
+        return x;                  // punto A: L0 vivo, se devuelve por este camino
+    }                              // punto B: por aquí L0 ya está MUERTO
+    v.push(0);                     // punto C: se pide &mut v; ningún origen vivo -> OK
+    v.last().unwrap()
+}
+```
+
+Una única regla —un préstamo mutable en un punto es un error si allí vive algún origen incompatible— recorre el grafo y solo dispara cuando de verdad hay solapamiento. La consulta se resuelve como cualquier deducción lógica: propagando hechos hasta el punto fijo. Ese cambio de maquinaria —de estirar regiones convexas a deducir hechos por punto— es exactamente lo que compra la precisión que a NLL le faltaba.
+
+<Callout type="info" title="Location-sensitive: la variante que de verdad importa">
+No todas las formulaciones de Polonius son iguales. La versión *location-insensitive* razona sobre qué orígenes existen pero no sobre *dónde* en el grafo, y apenas mejora a NLL. La que desbloquea el retorno condicional es la *location-sensitive*: la que ata cada hecho a un punto concreto del flujo de control. Cuando se habla de "Polonius" como el futuro del borrow checker, es a esta segunda a la que se refiere, y es también la más costosa de implementar con eficiencia, de ahí que su llegada a *stable* se haya hecho esperar tanto.
+</Callout>
+
+Que sea cara no la hace opcional: es la diferencia entre un borrow checker que solo mejora en los márgenes y uno que por fin acepta el patrón condicional que la comunidad lleva una década pidiendo.
+
+<Cards>
+  <Card icon="📏" title="NLL · vidas que se estiran">
+    Modela cada préstamo como una región del grafo y la estira hasta cubrir todos sus usos. Un solo uso lejano contamina todos los caminos intermedios.
+  </Card>
+  <Card icon="🌊" title="Polonius · orígenes que fluyen">
+    Modela, en cada punto, qué préstamos podrían usarse desde ahí. Distingue camino por camino: un préstamo puede estar vivo en una rama y muerto en la de al lado.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TB
+  start[Entrada de la funcion] --> cond[Comprueba v.last]
+  cond -->|Some x| ret[return x usa el prestamo]
+  cond -->|None| push[v.push cero]
+  push --> tail[v.last unwrap]
+  ret --> salida[Salida]
+  tail --> salida
+  push --> nota[En este camino el prestamo del return ya esta muerto]`} />
+
+## El patrón que ahora compila
+
+Con el análisis de Polonius, `ultimo_o_insertar` se acepta tal cual, sin reestructurar. La familia de patrones que desbloquea comparte una firma: **devolver una referencia obtenida en una comprobación previa y, si la comprobación falla, mutar el contenedor para producirla**. Es el corazón de las APIs tipo *get-or-insert*, omnipresentes en cachés, mapas y arenas:
+
+```rust
+use std::collections::HashMap;
+
+fn obtener_o_crear<'m>(mapa: &'m mut HashMap<u32, String>, clave: u32) -> &'m String {
+    if let Some(valor) = mapa.get(&clave) {
+        return valor;                       // camino A: devolvemos el préstamo compartido
+    }
+    mapa.insert(clave, String::from("nuevo")); // camino B: el préstamo de `get` ya murió
+    &mapa[&clave]
+}
+```
+
+Bajo NLL, el préstamo compartido de `mapa.get` se considera vivo hasta la salida por el `return`, y colisiona con el `&mut` que exige `mapa.insert`. Bajo Polonius, el flujo que llega al `insert` es exactamente el que *no* devolvió nada: allí el origen del `get` está muerto y no hay conflicto. El mismo razonamiento vale para `Vec`, `BTreeMap`, arenas de nodos y cualquier estructura donde consultas primero y construyes después.
+
+No es un caso de laboratorio: es uno de los patrones más pedidos de la historia del lenguaje, con años de discusión a sus espaldas y un apodo propio entre los desarrolladores del compilador —"el problema del caso condicional"—. Que sobreviva tanto tiempo como falso positivo mide lo difícil que es afinar un borrow checker sin comprometer jamás la seguridad: es más fácil rechazar de más que arriesgarse a aceptar un solo programa peligroso.
+
+<Callout type="tip" title="Mientras tanto, la cura práctica sigue siendo reestructurar">
+Hasta que Polonius sea el motor por defecto, si chocas con este patrón en *stable* tienes salidas idiomáticas: usar `HashMap::entry` con `or_insert_with`, que expresa el get-or-insert en una sola operación sin dos préstamos separados; o reordenar para consultar la existencia con un booleano antes de tomar la referencia final. Entender Polonius no te exime de reestructurar hoy, pero te dice que reestructuras por una limitación temporal del análisis, no por un defecto de tu diseño.
+</Callout>
+
+La misma forma reaparece en cualquier estructura que memoiza sobre un mapa o una arena. Piensa en un intérprete que cachea el resultado de subexpresiones: consulta si ya calculó una clave y, si no, la calcula, la inserta y devuelve la referencia recién creada. Es `obtener_o_crear` con otro disfraz.
+
+```rust
+use std::collections::HashMap;
+
+fn evaluar<'c>(cache: &'c mut HashMap<u32, u64>, clave: u32) -> &'c u64 {
+    if cache.contains_key(&clave) {
+        return &cache[&clave];        // camino A: ya estaba, devolvemos la referencia
+    }
+    let calculado = (clave as u64) * (clave as u64);
+    cache.insert(clave, calculado);   // camino B: el préstamo previo ya murió
+    &cache[&clave]
+}
+```
+
+Bajo NLL, incluso esta variante que separa la consulta (`contains_key`) de la toma final de la referencia choca en el camino del `insert`; Polonius la acepta porque razona que, cuando el flujo llega a insertar, no queda vivo ningún préstamo de la rama que ya retornó.
+
+## Estado en 2026: qué es real y qué está en camino
+
+Conviene ser preciso para no crearte expectativas falsas. Polonius es un proyecto de años, y en 2026 conviven varias piezas:
+
+- El **modelo teórico** está definido y validado: se sabe qué programas debería aceptar y por qué son seguros.
+- Una variante *location-sensitive* —la que de verdad distingue caminos— avanza en el compilador y se puede activar en *nightly* con las banderas de `-Zpolonius`, todavía como trabajo en curso, no apto para producción.
+- El verificador **por defecto en estable sigue siendo NLL**. La edición 2024 no cambia por sí sola el motor de borrow checking, pero marca el rumbo: es el vehículo con el que estas mejoras llegarán sin romper código existente, porque Polonius solo *añade* programas aceptados, nunca quita.
+
+La lección práctica: si hoy chocas con el retorno condicional de un préstamo en *stable*, aún debes reestructurar (lo verás en la próxima lección). Pero entender Polonius te dice **por qué** ese código era seguro desde el principio, y te ahorra la frustración de creer que tu diseño estaba mal cuando lo único insuficiente era el análisis.
+
+Que la migración sea *aditiva* tiene una consecuencia tranquilizadora: ningún programa que compila hoy dejará de compilar cuando Polonius aterrice. Solo pasará que un puñado de funciones que hoy exigen un rodeo empezarán a aceptarse escritas de la forma directa. Por eso puedes escribir tu código pensando en la semántica correcta —la que Polonius reconoce— y, donde el *stable* de hoy aún no llegue, aplicar el rodeo con la conciencia tranquila de que es andamiaje temporal, no una cicatriz permanente en el diseño.
+
+<Callout type="dios" title="El borrow checker persigue una asíntota: aceptar exactamente lo que es seguro">
+Contempla la trayectoria completa: préstamos léxicos, luego NLL, ahora Polonius. No es una sucesión de parches, sino una convergencia dirigida hacia un ideal preciso. Todo verificador estático de memoria vive atrapado entre dos fracasos posibles: aceptar un programa peligroso —inadmisible, rompe la promesa entera del lenguaje— o rechazar un programa seguro —admisible, pero irritante y, en exceso, incapacitante—. Rust jamás cederá en el primero: la seguridad no es negociable. Así que toda la evolución del borrow checker ocurre en el segundo eje, estrechando sin descanso el conjunto de programas "seguros pero rechazados" hacia el vacío. Los préstamos léxicos rechazaban multitudes de programas sanos por accidentes de sintaxis; NLL eliminó casi todos midiendo el flujo; Polonius persigue los últimos reductos, como el retorno condicional, con un análisis punto a punto. La asíntota de este proceso es un compilador que acepta **exactamente** los programas seguros y ni uno menos: el momento en que "el borrow checker me rechaza" implicaría, sin excepción, "mi programa tiene un problema real". Cada generación se acerca más a esa línea. Y esto reescribe cómo debes leer un rechazo: cuanto más maduro es el checker, menos probable es que estés ante un falso positivo y más probable que el compilador haya visto un peligro que tú no. Programar en Rust es apostar, cada vez con más razón, a que el compilador tiene razón.
+</Callout>
+
+<Callout type="note" title="Lo esencial de Polonius">
+Polonius reformula el borrow checking: en vez de estirar la vida de cada préstamo, calcula en cada punto del grafo qué orígenes de préstamo podrían usarse desde ahí. Esa granularidad punto a punto le permite distinguir caminos y aceptar el patrón que NLL rechaza por conservador: devolver una referencia en una rama y mutar el contenedor en otra —el corazón de las APIs *get-or-insert*—. En 2026 el motor por defecto en *stable* sigue siendo NLL; Polonius avanza en *nightly* y llegará de forma aditiva, sin romper código. Entenderlo te dice por qué cierto código seguro aún no compila: el límite es del análisis, no de tu diseño.
+</Callout>
+
+<Challenge title="Piensa punto por punto">
+1. Reproduce `obtener_o_crear` sobre un `HashMap` en *stable* y confirma el conflicto que NLL cree ver entre `get` e `insert`.
+2. Explica, señalando el camino del `else`, por qué el préstamo de `get` está muerto cuando el flujo llega al `insert`.
+3. Formula en una frase la diferencia entre "hasta dónde vive un préstamo" (NLL) y "qué orígenes viven en este punto" (Polonius).
+4. Reescribe `ultimo_o_insertar` con `entry().or_insert_with(...)` de forma que compile hoy en *stable* y compara el esfuerzo con dejar que Polonius lo acepte tal cual.
+5. Argumenta por qué Polonius solo puede *añadir* programas aceptados y nunca quitar, y qué implica eso para la compatibilidad de la edición 2024.
+</Challenge>

@@ -1,0 +1,139 @@
+---
+title: "Zonas y watermarks: dónde vive la RAM y cuándo se reclama"
+description: "La RAM no es homogénea: el kernel la divide en zonas (ZONE_DMA, ZONE_DMA32, ZONE_NORMAL, ZONE_MOVABLE) según sus restricciones, y en cada zona instala tres marcas de agua (min, low, high) que gobiernan cuándo despierta kswapd y cuándo el que asigna se pone a reclamar."
+subject: kernel
+level: 20
+order: 5
+position: "20.5"
+duration: "16 min"
+---
+
+<Lead>
+No toda la memoria física es igual: unos dispositivos solo pueden hacer DMA a direcciones bajas, unas páginas se pueden mover y otras no. El kernel captura esa heterogeneidad dividiendo cada nodo en **zonas**, y sobre cada zona instala un termostato de tres marcas de agua que decide, sin intervención humana, cuándo hay que empezar a liberar memoria. Es la última pieza del asignador de páginas.
+</Lead>
+
+<Goals>
+
+- Distinguir `ZONE_DMA`, `ZONE_DMA32`, `ZONE_NORMAL` y `ZONE_MOVABLE`.
+- Entender por qué existen las zonas y cómo un `gfp_t` elige entre ellas.
+- Leer las marcas de agua `min`, `low` y `high` de una zona.
+- Relacionar las marcas con el despertar de `kswapd` y el reclaim directo.
+
+</Goals>
+
+## La RAM no es homogénea: las zonas
+
+```c
+/* include/linux/mmzone.h */
+enum zone_type {
+	ZONE_DMA,	/* direcciones bajas para DMA heredado (ISA) */
+	ZONE_DMA32,	/* por debajo de 4 GiB, para DMA de 32 bits */
+	ZONE_NORMAL,	/* memoria de trabajo, mapeada directamente */
+	ZONE_MOVABLE,	/* solo asignaciones movibles o reclamables */
+	ZONE_DEVICE,	/* memoria de dispositivo o persistente (pmem) */
+	__MAX_NR_ZONES
+};
+```
+
+Una zona es un tramo de marcos con las mismas restricciones de uso. En una máquina x86-64 típica el reparto es: `ZONE_DMA` cubre los primeros 16 MiB (dispositivos ISA heredados), `ZONE_DMA32` va de 16 MiB a 4 GiB (para tarjetas que solo direccionan 32 bits), y `ZONE_NORMAL` abarca todo lo que hay por encima de 4 GiB. La antigua `ZONE_HIGHMEM` era un parche de la era de 32 bits y no existe en 64 bits: aquí toda la RAM está en el mapa directo.
+
+`ZONE_MOVABLE` es distinta: no es un rango físico fijo, sino una reserva lógica donde solo caen asignaciones movibles (páginas de usuario, page cache). Como todo su contenido se puede migrar, esa zona se puede vaciar entera —clave para el hot-unplug de memoria y para formar páginas enormes sin fragmentación. La máscara `gfp_t` elige la zona objetivo: `__GFP_DMA`, `__GFP_DMA32` y `__GFP_MOVABLE` fijan el techo permitido, y un `GFP_KERNEL` pelado apunta a `ZONE_NORMAL` y va cayendo hacia zonas más bajas por la lista de respaldo (zonelist). El campo `lowmem_reserve` de cada zona protege a las bajas y escasas de ser vaciadas por peticiones que podrían haberse servido más arriba.
+
+<Cards>
+  <Card icon="🔌" title="ZONE_DMA y DMA32">
+    Direcciones bajas para dispositivos con DMA limitado: los primeros 16 MiB heredados y el tramo por debajo de 4 GiB de las tarjetas de 32 bits. Memoria escasa y preciosa que el kernel no malgasta.
+  </Card>
+  <Card icon="🧱" title="ZONE_NORMAL">
+    La memoria de trabajo, mapeada directamente. En x86-64 es casi toda la RAM: de aquí salen las pilas de kernel, los slabs y las tablas de páginas.
+  </Card>
+  <Card icon="🔀" title="ZONE_MOVABLE">
+    Solo asignaciones migrables. Como todo su contenido se puede reubicar, se vacía entera: habilita el hot-unplug de memoria y las páginas enormes sin fragmentación.
+  </Card>
+</Cards>
+
+Las zonas no flotan sueltas: viven dentro de un **nodo** NUMA, descrito por `pg_data_t` (alias `struct pglist_data`). En una máquina con varios sockets hay un nodo por banco de memoria, cada uno con su propio juego de zonas y su propio `kswapd`. La lista de respaldo `node_zonelists` ordena todas las zonas de todos los nodos por cercanía, de modo que una asignación que no cabe en la zona preferida cae, en orden, a la siguiente mejor:
+
+```c
+/* include/linux/mmzone.h (muy simplificado) */
+typedef struct pglist_data {
+	struct zone		node_zones[MAX_NR_ZONES];
+	struct zonelist		node_zonelists[MAX_ZONELISTS];
+	int			nr_zones;
+	struct task_struct	*kswapd;	/* un reclamador de fondo por nodo */
+} pg_data_t;
+```
+
+## El termostato: las tres marcas de agua
+
+```c
+/* include/linux/mmzone.h */
+enum zone_watermarks {
+	WMARK_MIN,
+	WMARK_LOW,
+	WMARK_HIGH,
+	WMARK_PROMO,
+	NR_WMARK
+};
+
+struct zone {
+	unsigned long		_watermark[NR_WMARK];
+	unsigned long		watermark_boost;
+	/* ... */
+	struct free_area	free_area[NR_PAGE_ORDERS];
+	/* ... */
+} ____cacheline_internodealigned_in_smp;
+
+#define min_wmark_pages(z)  (z->_watermark[WMARK_MIN]  + z->watermark_boost)
+#define low_wmark_pages(z)  (z->_watermark[WMARK_LOW]  + z->watermark_boost)
+#define high_wmark_pages(z) (z->_watermark[WMARK_HIGH] + z->watermark_boost)
+```
+
+Cada zona vigila su número de páginas libres contra tres umbrales, y de su posición respecto a ellos depende toda la política de reclaim:
+
+- **Por encima de `high`:** la zona está holgada. El camino rápido de asignación sirve sin despertar a nadie.
+- **Por debajo de `low`:** el sistema despierta a `kswapd`, el reclamador de fondo por nodo, que libera páginas hasta volver a superar `high` y entonces se duerme. Todo ocurre en segundo plano, sin bloquear a quien asigna.
+- **Por debajo de `min`:** el camino rápido ya no puede servir. El propio hilo que asigna entra en **reclaim directo** y se bloquea liberando memoria él mismo (solo si su `gfp_t` lo permite). Por debajo de `min` quedan las reservas de emergencia, alcanzables únicamente con `__GFP_HIGH` o con el flag de tarea `PF_MEMALLOC`.
+
+Los valores salen de `min_free_kbytes` (ajustable por sysctl) y de `watermark_scale_factor`, que separa `low` y `high` de `min`. El asignador consulta estas marcas con `zone_watermark_ok()` en cada intento.
+
+## Cómo las marcas disparan el reclaim
+
+Aquí se cierra el círculo con los flags de la lección anterior. El camino rápido pide contra la marca `low`: si `zone_watermark_ok()` da verde, entrega la página sin más. Si falla, arranca el camino lento —despertar `kswapd`, quizá compactar, quizá hacer reclaim directo— y reintenta. Los bits de reclaim de la máscara deciden qué está permitido en ese camino lento: `__GFP_DIRECT_RECLAIM` autoriza a bloquearse reclamando, y por eso `GFP_KERNEL` puede esperar mientras `GFP_ATOMIC` no. `__GFP_HIGH` baja el listón hasta las reservas de `min`, dando a las asignaciones urgentes un margen que las normales no tienen. Y las tareas del propio reclaim, marcadas con `PF_MEMALLOC`, ignoran las marcas por completo: si tuvieran que respetarlas, se bloquearían a sí mismas intentando conseguir la memoria que necesitan para liberar memoria.
+
+El esqueleto del camino rápido es, por cada zona candidata, una comprobación de marca antes de tocar el buddy:
+
+```c
+/* mm/page_alloc.c — esqueleto del camino rapido (simplificado) */
+for_next_zone_zonelist(zone, z, zonelist, high_zoneidx) {
+	unsigned long mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
+
+	if (!zone_watermark_fast(zone, order, mark, high_zoneidx, alloc_flags)) {
+		/* por debajo de la marca: probamos la siguiente zona o
+		 * caemos al camino lento (kswapd, reclaim, compactacion) */
+		continue;
+	}
+	return rmqueue(zone, order, gfp_mask, alloc_flags);  /* servir del buddy */
+}
+```
+
+<Mermaid code={`flowchart TD
+  A[Libre por encima de high] -->|todo bien| A2[camino rapido sin reclaim]
+  A -.baja hasta low.-> B[Libre entre low y min]
+  B -->|accion| B2[despierta kswapd en segundo plano]
+  B -.baja hasta min.-> C[Libre por debajo de min]
+  C -->|accion| C2[reclaim directo, el asignador se bloquea]
+  C -.reservas.-> D[solo __GFP_HIGH o PF_MEMALLOC pasan]`} />
+
+Puedes leer las marcas reales de tu máquina en `/proc/zoneinfo`, que lista por zona sus valores `min`, `low`, `high` y el número de páginas libres en cada instante.
+
+<Callout type="dios" title="El asignador de páginas es el suelo sobre el que respira Linux">
+Recoge ahora todo el nivel en una sola imagen y verás una jerarquía perfecta. La RAM se trocea en marcos, cada marco tiene su `struct page`; los marcos libres se organizan en el buddy por bloques de 2^n; los bloques se agrupan en zonas según sus restricciones físicas; y cada zona lleva un termostato de tres marcas que dispara el reclaim sin que nadie lo ordene. Sobre ese suelo —y solo sobre él— se levantan el slab que sirve tus `kmalloc`, el `vmalloc` que finge contigüidad, el page cache que acelera tu disco y la memoria de usuario de cada proceso. La belleza está en que el sistema se autorregula: las marcas de agua convierten la gestión de memoria en un lazo de control con histéresis —`kswapd` limpia hasta `high`, se calla hasta `low`— que mantiene siempre un colchón de páginas libres sin desperdiciar RAM en reposo. Cuando una máquina va como la seda con años de uptime bajo cargas que cambian cada segundo, no es magia: es este lazo, afinado durante tres décadas, haciendo su trabajo en silencio. Has recorrido el asignador de páginas de arriba abajo; ya no es una caja negra bajo tu `kmalloc`, sino un mecanismo que entiendes pieza a pieza. Ese es el suelo firme desde el que se estudia todo lo demás del kernel.
+</Callout>
+
+<Challenge title="Ausculta las zonas y sus marcas">
+1. Lee `/proc/zoneinfo` y localiza `min`, `low`, `high` y las páginas libres de la zona Normal.
+2. Sube `min_free_kbytes` con `sysctl` y observa cómo cambian las tres marcas y cuándo entra `kswapd` (mira `pgscan_kswapd` en `/proc/vmstat`).
+3. Lanza un proceso que devore RAM hasta cruzar `low` y sigue la actividad de `kswapd`.
+4. Con `/proc/zoneinfo` o `numactl --hardware`, identifica qué zonas existen en tu máquina y sus tamaños.
+5. Razona por qué `GFP_KERNEL` no se sirve de `ZONE_DMA` salvo por respaldo, y qué protege exactamente el `lowmem_reserve`.
+</Challenge>

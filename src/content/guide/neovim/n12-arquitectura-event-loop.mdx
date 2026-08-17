@@ -1,0 +1,195 @@
+---
+title: "La arquitectura de Neovim: un hilo, un bucle, cero congelaciones"
+description: "Neovim ejecuta todo tu Lua en un único hilo y aun así habla con servidores LSP, lanza procesos y vigila ficheros sin quedarse tieso. La pieza es libuv y su bucle de eventos: las fases de una vuelta, el pool de hilos que absorbe lo bloqueante, uv.now frente a uv.hrtime, la UI como cliente RPC, y la ley que gobierna el nivel entero: bloquear el bucle es congelar el editor."
+subject: neovim
+level: 12
+order: 1
+position: "12.1"
+duration: "18 min"
+---
+
+<Lead>
+Neovim ejecuta tu código Lua en un único hilo. Esa frase, que suena a limitación, es el cimiento de todo lo demás: como solo hay un hilo tocando el estado del editor —buffers, ventanas, opciones, registros—, no existen carreras de datos, ni candados, ni estructuras que proteger. El precio de esa simplicidad es brutalmente concreto: ese hilo no puede detenerse jamás, y quien lo detiene congela el editor entero. La pieza que reconcilia ambas cosas —trabajo asíncrono real sin concurrencia sobre el estado— se llama `libuv`, y es la misma biblioteca que sostiene Node.js.
+</Lead>
+
+<Goals>
+
+- Describir el bucle de eventos de `libuv` y las fases fijas de cada una de sus vueltas.
+- Distinguir el hilo principal del pool de hilos que atiende las operaciones bloqueantes.
+- Explicar por qué una función Lua lenta congela la interfaz por completo, y medirlo con `uv.hrtime()`.
+- Entender por qué `uv.now()` no avanza dentro de un callback y qué te dice eso del bucle.
+- Situar la UI como un cliente RPC que solo dibuja lo que el bucle le envía.
+
+</Goals>
+
+## El hilo principal y su bucle
+
+Cuando arrancas Neovim, el proceso entra en un bucle infinito que no es tuyo: es el bucle de `libuv`. Su trabajo consiste en preguntarle al sistema operativo, una y otra vez, «¿ha pasado algo?». Ese algo puede ser una tecla pulsada, un byte llegando por un socket de un servidor LSP, un timer que ha vencido, un proceso hijo que ha terminado o un fichero que ha cambiado en disco. Por cada suceso, el bucle localiza el callback registrado para él y lo ejecuta **en el hilo principal**, uno detrás de otro, sin solaparse nunca.
+
+Esa última cláusula es la que define toda la arquitectura. Dos callbacks jamás corren a la vez. No hay un instante en el que dos porciones de código Lua estén a medias de modificar el mismo buffer. La asincronía de Neovim es **concurrencia sin paralelismo**: muchas cosas están en marcha, pero solo una se está ejecutando.
+
+De ahí se sigue una consecuencia que conviene enunciar ya, porque explica el resto del nivel: en Neovim la unidad de trabajo no es la tarea, es el callback. Cada callback que registras es una promesa de devolver el control rápidamente, y el bucle es un contrato de cooperación entre todos los que la firman. Nadie te puede interrumpir —eso es lo cómodo—, y por eso nadie puede rescatarte si te alargas —eso es lo peligroso—.
+
+<Pipeline
+  title="una vuelta del bucle de libuv"
+  result="callbacks despachados de uno en uno, siempre en el hilo principal"
+  groups={[
+    { title: 'las fases, en orden fijo', tone: 'mauve', sequence: true, steps: [
+      { t: 'timers', d: 'Dispara los callbacks de los timers cuyo plazo ya venció. Un plazo es un suelo, nunca una cita exacta.' },
+      { t: 'pending', d: 'Callbacks de entrada/salida que quedaron aplazados de la vuelta anterior.' },
+      { t: 'poll', d: 'La espera en el núcleo del sistema: epoll, kqueue o IOCP. Aquí duerme Neovim cuando no hay nada que hacer.' },
+      { t: 'check', d: 'Trabajo que debe correr justo después del poll.' },
+      { t: 'close', d: 'Callbacks de cierre de los handles que pediste destruir. Lo verás en la 12.2.' },
+    ]},
+    { title: 'quién alimenta la cola', tone: 'blue', sequence: false, steps: [
+      { t: 'El sistema operativo', d: 'Teclas, sockets, procesos hijos, cambios en disco: todo despierta al poll.' },
+      { t: 'El pool de hilos', d: 'Termina un trabajo bloqueante y deposita el resultado en la cola del bucle. El callback corre en el hilo principal.' },
+      { t: 'La UI, por RPC', d: 'La terminal es un cliente aparte: envía teclas y pinta las celdas que el núcleo le manda.' },
+      { t: 'vim.schedule', d: 'Tu propia cola de trabajo diferido, que Neovim vacía cuando el editor está en reposo. Es el tema de la 12.3.' },
+    ]},
+  ]}
+/>
+
+## Las fases y el pool de hilos
+
+La fase `poll` es donde el proceso duerme cuando no hay nada que hacer: por eso un Neovim inactivo consume prácticamente cero CPU. No está girando en vacío, está bloqueado en una llamada del núcleo —`epoll` en Linux, `kqueue` en macOS y BSD, `IOCP` en Windows— esperando a que algo ocurra. Ese bloqueo es el único legítimo de toda la arquitectura, porque el sistema operativo puede despertarlo en el instante exacto en que llega el primer byte.
+
+El orden de las fases explica también los plazos. Un timer programado a 10 milisegundos no dispara a los 10 milisegundos exactos, sino en la primera vuelta cuya fase `timers` ocurra después de ese plazo. `libuv` garantiza que **no dispara antes**, nunca que dispare puntualmente; si el callback anterior tardó 300 milisegundos, tu timer de 10 llegará con 290 de retraso y no habrá nada roto. Todos los plazos de este nivel son suelos, no citas.
+
+Hay además una cola que no aparece en la tabla de `libuv` y que a ti te importa especialmente: la de `vim.schedule`, el trabajo diferido que Neovim vacía cuando el editor está en reposo, entre operación y operación. Ese es el punto en el que el estado del editor es consistente, y por tanto el único momento en el que la API puede tocarse con seguridad. Toda la lección 12.3 se sostiene sobre ese hueco.
+
+Pero hay operaciones que el sistema operativo no sabe hacer de forma asíncrona —leer un fichero normal, resolver un nombre de dominio—. Para esas, `libuv` mantiene un **pool de hilos** aparte. El hilo principal encarga la tarea, sigue con su bucle, y cuando el hilo del pool termina, deposita el resultado en la cola del bucle para que el callback se ejecute, de nuevo, en el hilo principal. El trabajo pesado sí ocurre en paralelo; la **respuesta** a ese trabajo, nunca.
+
+<Callout type="info" title="Los hilos del pool no tienen intérprete Lua">
+Un hilo del pool de `libuv` es un hilo de C puro: no ve tu estado Lua, no puede llamar a `vim.api` y no comparte el `lua_State` del hilo principal. Solo mueve bytes. Esta separación es exactamente lo que hace segura toda la arquitectura, y es la raíz técnica de la regla de oro que estudiarás en la 12.3.
+</Callout>
+
+## Los dos relojes: uv.now y uv.hrtime
+
+`vim.uv` expone dos relojes, y la diferencia entre ambos es una lección de arquitectura en miniatura.
+
+`uv.now()` devuelve milisegundos monótonos —desde un origen arbitrario: no lo compares con la hora del día—, pero con una trampa deliberada: el valor se **cachea al principio de cada vuelta del bucle**. Todos los callbacks de una misma vuelta ven el mismo `now()`, aunque entre uno y otro pasen milisegundos reales. Es una optimización —una sola llamada al sistema por vuelta en lugar de una por consulta— y también un chivato: si `uv.now()` no avanza entre dos puntos de tu código, es que el bucle no ha girado entre ellos.
+
+`uv.hrtime()` devuelve **nanosegundos** monótonos leídos del reloj real en el momento de la llamada, sin caché. Es el reloj para medir.
+
+```lua
+local t0 = vim.uv.hrtime()
+-- ... trabajo que quieres auditar ...
+print(("tardó %.2f ms"):format((vim.uv.hrtime() - t0) / 1e6))
+```
+
+<Predict question="local a = vim.uv.now(); vim.fn.system({ 'sleep', '2' }); print(vim.uv.now() - a). ¿Qué imprime, aproximadamente?"
+  options={[
+    { t: '0: uv.now() se cachea al principio de la vuelta y el bucle no ha girado', ok: true, x: 'Todo el comando :lua corre dentro de un mismo turno del hilo principal. vim.fn.system bloquea dos segundos SIN devolver el control al bucle, así que no empieza ninguna vuelta nueva y el valor cacheado de now() no se actualiza. Para medir de verdad: uv.hrtime(), o uv.update_time() antes de la segunda lectura.' },
+    { t: '2000: han pasado dos segundos y el reloj lo refleja', x: 'Habrían pasado si uv.now() leyera el reloj del sistema en cada llamada, pero no lo hace: devuelve el valor cacheado al comenzar la vuelta actual del bucle, y esa vuelta no ha terminado. Justo por eso este experimento demuestra que el bucle estuvo parado.' },
+    { t: 'Un error: no se puede llamar a vim.fn.system desde Lua', x: 'vim.fn.system es perfectamente llamable desde Lua; su problema no es de legalidad sino de coste: bloquea el hilo principal hasta que el proceso termina. Ese bloqueo es precisamente lo que congela el editor durante los dos segundos.' },
+  ]}
+/>
+
+Ese experimento es más profundo de lo que parece: acabas de usar un reloj para **demostrar** que el bucle no giró mientras tu código corría. Guárdalo, porque es la herramienta de diagnóstico más barata del nivel.
+
+## Bloquear el bucle es congelar el editor
+
+Ahora la consecuencia práctica. Mientras tu callback de Lua está corriendo, el bucle **no avanza**: no hay fase `poll`, no se leen teclas, no se procesa la entrada del LSP, no se redibuja nada. El editor no está roto ni colgado; está esperando cortésmente a que devuelvas el control.
+
+```lua
+-- Bloqueante: el hilo principal se detiene hasta que el proceso acaba
+local salida = vim.fn.system({ "sleep", "3" })
+-- Durante esos 3 segundos Neovim no dibuja, no lee teclas, no responde
+vim.notify(salida)
+```
+
+La versión correcta encarga el trabajo a `libuv` y devuelve el control de inmediato. El callback se ejecutará mucho después, cuando el bucle vuelva a pasar por la fase que corresponda.
+
+```lua
+-- No bloqueante: libuv arranca el proceso y el bucle sigue girando
+vim.system({ "sleep", "3" }, { text = true }, function(obj)
+  vim.schedule(function()
+    vim.notify("código de salida: " .. obj.code)
+  end)
+end)
+```
+
+La diferencia entre ambos fragmentos no es de estilo ni de elegancia: es la diferencia entre un editor que responde y uno que no. Todo plugin que se sienta rápido lo es porque su autor entendió esta distinción; todo plugin que produce microcongelaciones al escribir la ha ignorado en algún punto. El `vim.system` de arriba lo estudiarás a fondo en la 13.1, y el `vim.schedule` que lleva dentro, en la 12.3; de momento basta con leer la forma: encargar, volver, y que te avisen.
+
+<Predict question="Lanzas :lua vim.fn.system({ 'sleep', '3' }) y durante la espera tecleas jjj. ¿Qué pasa con esas teclas?"
+  options={[
+    { t: 'Se encolan y se aplican de golpe cuando el bucle recupera el control', ok: true, x: 'La terminal y el sistema operativo siguen acumulando tu entrada aunque Neovim no la lea: el bucle simplemente no ha llegado a la fase poll. Al terminar el bloqueo, Neovim procesa la cola entera de golpe y el cursor baja tres líneas de repente. Por eso un editor bloqueado parece que “escupe” lo tecleado al descongelarse.' },
+    { t: 'Se pierden: el editor no estaba escuchando', x: 'No se pierden. Neovim no las lee durante el bloqueo, pero el sistema operativo las guarda en el buffer de entrada de la terminal. En cuanto el bucle vuelve a girar, las procesa todas. Si se perdieran, un bloqueo sería aún más destructivo de lo que ya es.' },
+    { t: 'Se procesan al momento: la entrada corre en otro hilo', x: 'No hay otro hilo leyendo teclas para el editor: la entrada se procesa en el hilo principal, en la fase poll del bucle, y ese hilo está ocupado ejecutando tu system(). Justo esa ausencia de un segundo hilo con acceso al estado es el diseño entero de Neovim.' },
+  ]}
+/>
+
+<Callout type="tip" title="Mide antes de sospechar">
+`vim.uv.hrtime()` es la forma barata de auditar un callback: guarda el instante al entrar, réstalo al salir y avisa si el resultado supera tu presupuesto. Para cazar al culpable de una sesión lenta, `:profile start perfil.log` seguido de `:profile func *` y `:profile dump` te dice qué función se está comiendo el hilo, sin necesidad de adivinar.
+</Callout>
+
+Conviene fijar el orden de magnitud. El ojo percibe una pausa a partir de unos 100 milisegundos, y la escritura fluida se rompe mucho antes, cerca de los 16 milisegundos que dura un fotograma. Un callback que tarde 50 milisegundos y se dispare en cada pulsación no produce un cuelgue visible, produce algo peor de diagnosticar: una sensación difusa de que el editor «va pastoso» y que nadie sabe atribuir a un plugin concreto. Contra esa avalancha de eventos por pulsación lucharás en la 12.4 con `debounce` y `throttle`.
+
+La interfaz, por su parte, ni siquiera vive dentro de ese razonamiento. La TUI de Neovim es un **proceso cliente** que habla con el núcleo por RPC sobre `msgpack`: envía las teclas que recibe y pinta las celdas que el núcleo le manda. Si el bucle se detiene, la UI no se cuelga —sigue viva, mostrando lo último que sabía—, simplemente deja de recibir instrucciones. Esa es la razón de que un Neovim bloqueado se vea congelado en lugar de desaparecer, y de que una GUI externa pueda conectarse al mismo núcleo sin que este se entere de con quién habla.
+
+## Quién habita el bucle en un Neovim real
+
+En una sesión cualquiera hay decenas de handles registrados que jamás creaste tú. Reconocerlos ayuda a entender que la asincronía no es una técnica avanzada reservada a los plugins exóticos, sino el modo normal de funcionar de todo el editor.
+
+<Cards>
+  <Card icon="🔌" title="Clientes LSP">
+    Cada servidor de lenguaje es un proceso hijo con tuberías. Neovim escribe peticiones y lee respuestas en la fase de `poll` sin detenerse nunca a esperarlas. El protocolo entero lo verás en el Nivel 19.
+  </Card>
+  <Card icon="🌳" title="Treesitter">
+    El análisis incremental se reparte en trozos que ceden el control al bucle entre uno y otro, para que un fichero enorme no bloquee la escritura.
+  </Card>
+  <Card icon="⚙️" title="Procesos y trabajos">
+    Formateadores, linters y comandos de compilación viven como handles de proceso con callbacks de salida y de cierre. Es el material del Nivel 13.
+  </Card>
+  <Card icon="⏲️" title="Timers de plugins">
+    Refrescos de la barra de estado, `debounce` de diagnósticos y reintentos de conexión son todos timers conviviendo en la misma cola.
+  </Card>
+</Cards>
+
+Puedes asomarte a esa población desde dentro del propio editor. `libuv` sabe enumerar todos los handles que tiene registrados con `uv.walk`, y verlo con tus ojos convierte la explicación en un hecho comprobable.
+
+```lua
+-- Cuenta los handles vivos del bucle, agrupados por tipo
+local cuenta = {}
+vim.uv.walk(function(handle)
+  local tipo = handle:get_type()
+  cuenta[tipo] = (cuenta[tipo] or 0) + 1
+end)
+print(vim.inspect(cuenta))   -- timer, process, pipe, tcp, async, signal...
+```
+
+La lista es también un mapa de responsabilidades. Cuando el editor se atasca, el culpable está casi siempre en una de esas cuatro casillas, y la pregunta útil no es «¿qué plugin es lento?» sino «¿qué callback está tardando demasiado en devolver el control?». Son preguntas distintas: un plugin puede hacer un trabajo enorme y no molestar a nadie si lo trocea, y otro puede hacer un trabajo trivial y arruinar la escritura si lo repite en cada tecla.
+
+Ninguno de estos actores se pisa con los demás, porque ninguno se ejecuta a la vez que otro. Comparten el hilo por turnos, y ese reparto es tan barato que un Neovim con quince plugins activos y tres servidores LSP conectados sigue consumiendo casi nada mientras no tocas el teclado. La eficiencia no viene de hacer más cosas en paralelo, sino de no hacer nada mientras no hay nada que hacer.
+
+<Callout type="dios" title="La ausencia de candados no es un descuido: es el diseño entero">
+Compara esta arquitectura con la alternativa obvia. Un editor multihilo con acceso concurrente al estado tendría que proteger cada buffer, cada tabla de marcas, cada lista de ventanas con algún candado; cada plugin de terceros —escrito por alguien que jamás leyó el código del núcleo— tendría que respetar esa disciplina o corromper el editor de formas irreproducibles. La superficie de error sería inmensa y estaría distribuida entre miles de autores. Neovim escoge lo contrario: un único hilo posee todo el estado, y por tanto **ninguna** sincronización es necesaria en el código de usuario. El coste se paga en un solo punto, y es un coste que puede enunciarse en una frase que cabe en la cabeza: no bloquees el hilo. A cambio, un plugin de mil líneas escrito por un desconocido no puede provocar una carrera de datos ni un `deadlock`, porque no existe nada con lo que competir. Es la misma apuesta que hizo Node.js una década antes y por las mismas razones, y explica por qué `libuv` —una biblioteca nacida para un runtime de JavaScript— acabó siendo el corazón de un editor de texto. Fíjate además en el orden causal: `libuv` no está en Neovim para hacerlo asíncrono, sino para hacerlo asíncrono **sin dejar de ser de un solo hilo**. Cualquier biblioteca de hilos habría dado lo primero; solo un bucle de eventos da las dos. Todo lo que estudiarás en este nivel —timers, handles, `vim.schedule`, `debounce`, corrutinas— son consecuencias de esta única decisión arquitectónica, no técnicas independientes que casualmente conviven.
+</Callout>
+
+## Drills
+
+<Exercise challenge="Siente la congelación en tus propios dedos." keys=':lua vim.fn.system({ "sleep", "3" })'>
+Durante tres segundos, nada: ni cursor, ni teclas, ni redibujado. Teclea algo mientras esperas y observa cómo se aplica de golpe al terminar. El editor no estaba roto: estaba ejecutando tu callback y el bucle no podía girar.
+</Exercise>
+
+<Exercise challenge="Censa los handles que ya viven en tu sesión." keys=':lua local c = {} vim.uv.walk(function(h) local t = h:get_type() c[t] = (c[t] or 0) + 1 end) print(vim.inspect(c))'>
+Timers, procesos, tuberías, señales... y no has creado ninguno tú. Ábrelo con y sin un servidor LSP conectado y compara el censo: cada cliente añade un `process` y varias `pipe`.
+</Exercise>
+
+<Exercise challenge="Demuestra con un reloj que el bucle estuvo parado." keys=':lua local a = vim.uv.now() vim.fn.system({ "sleep", "1" }) print(vim.uv.now() - a)'>
+Imprime 0 o un valor ridículo: `uv.now()` se cachea al principio de cada vuelta y la vuelta no terminó. Repite la medición con `vim.uv.hrtime()` en nanosegundos y verás el segundo entero. Dos relojes, dos propósitos.
+</Exercise>
+
+<Exercise challenge="Ponle un cronómetro de verdad a un trozo de código." keys=':lua local t0 = vim.uv.hrtime() vim.fn.getcwd() print((vim.uv.hrtime() - t0) / 1e6 .. " ms")'>
+El patrón de auditoría mínimo: `hrtime` al entrar, `hrtime` al salir, dividir entre un millón. Cuando sospeches de un callback, esta es la primera prueba, no la última.
+</Exercise>
+
+<Challenge title="Mide la congelación">
+1. Ejecuta `:lua vim.fn.system({ "sleep", "3" })` e intenta pulsar teclas durante la espera; describe qué ocurre con lo que escribiste al recuperar el control.
+2. Repite el experimento con `vim.system({ "sleep", "3" }, {}, function() end)` y comprueba que el editor sigue respondiendo mientras el proceso vive.
+3. Demuestra que el bucle no giró durante el bloqueo: compara `vim.uv.now()` antes y después de un `vim.fn.system` lento, y repite la medida con `vim.uv.hrtime()`. Explica por qué los dos relojes discrepan.
+4. Censa los handles con `vim.uv.walk` en un Neovim recién abierto y en tu sesión de trabajo con LSP; atribuye cada diferencia a un actor concreto.
+5. Explica por qué un callback de Lua que tarda 50 milisegundos y se dispara en cada pulsación produce una escritura perceptiblemente pastosa, aunque nunca haya un «cuelgue».
+6. Argumenta qué garantía perderías si Neovim ejecutase los callbacks de `libuv` en hilos del pool en lugar de en el hilo principal.
+</Challenge>

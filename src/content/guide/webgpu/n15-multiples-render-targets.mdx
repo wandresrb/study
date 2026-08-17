@@ -1,0 +1,135 @@
+---
+title: "Múltiples render targets: escribir a varios attachments a la vez"
+description: "Cómo se declaran varias salidas de fragmento, qué tiene que casar con el render pass, el coste en ancho de banda de un G-buffer, y qué pasa cuando no hay etapa de fragmentos."
+subject: webgpu
+level: 15
+order: 3
+position: "15.3"
+duration: "17 min"
+---
+
+<Lead>
+Un fragment shader puede escribir a varios attachments en la misma pasada, y esa capacidad es la que hace posible el renderizado diferido, los buffers de movimiento, los canales de identificación de objetos y cualquier técnica que necesite guardar varias magnitudes por píxel. También es la forma más rápida de saturar el ancho de banda de una GPU, y el cálculo de cuánto cuesta cabe en tres líneas.
+</Lead>
+
+<Goals>
+
+- Declarar varias salidas de fragmento y hacerlas casar con el descriptor y el render pass.
+- Aplicar `writeMask` y estados de mezcla distintos por target.
+- Calcular el ancho de banda que consume un G-buffer a una resolución dada.
+- Configurar un pipeline sin etapa de fragmentos y saber cuándo interesa.
+
+</Goals>
+
+## Declarar varias salidas
+
+La salida del fragment shader pasa a ser una struct con una `@location` por attachment:
+
+```wgsl
+struct SalidaGBuffer {
+  @location(0) albedo    : vec4f,
+  @location(1) normal    : vec4f,
+  @location(2) material  : vec4f,
+  @location(3) velocidad : vec2f,
+};
+
+@fragment
+fn fs(entrada : EntradaFS) -> SalidaGBuffer {
+  var s : SalidaGBuffer;
+  s.albedo    = vec4f(colorBase, 1.0);
+  s.normal    = vec4f(normalize(entrada.normal) * 0.5 + 0.5, 0.0);
+  s.material  = vec4f(rugosidad, metalico, oclusion, 0.0);
+  s.velocidad = entrada.pantallaActual - entrada.pantallaAnterior;
+  return s;
+}
+```
+
+Los números de `@location` son los índices dentro de `fragment.targets` en el pipeline y dentro de `colorAttachments` en el render pass, y los tres tienen que estar alineados:
+
+```js
+fragment: {
+  module, entryPoint: 'fs',
+  targets: [
+    { format: 'rgba8unorm' },     // location 0
+    { format: 'rgba16float' },    // location 1
+    { format: 'rgba8unorm' },     // location 2
+    { format: 'rg16float' },      // location 3
+  ],
+},
+```
+
+```js
+const pase = encoder.beginRenderPass({
+  colorAttachments: [
+    { view: vistaAlbedo,    loadOp: 'clear', storeOp: 'store', clearValue: [0,0,0,1] },
+    { view: vistaNormal,    loadOp: 'clear', storeOp: 'store', clearValue: [0,0,0,0] },
+    { view: vistaMaterial,  loadOp: 'clear', storeOp: 'store', clearValue: [0,0,0,0] },
+    { view: vistaVelocidad, loadOp: 'clear', storeOp: 'store', clearValue: [0,0,0,0] },
+  ],
+  depthStencilAttachment: { /* ... */ },
+});
+```
+
+Las reglas que hay que cumplir:
+
+- El número de targets está acotado por `maxColorAttachments`, con mínimo garantizado de 8.
+- Todos los attachments de color de un pase tienen que tener **las mismas dimensiones y el mismo número de muestras**.
+- El tipo de la salida tiene que ser compatible con el formato: `vec4f` para formatos flotantes y normalizados, `vec4u` para `uint`, `vec4i` para `sint`.
+- Escribir menos componentes de los que el formato tiene es legal.
+- Hay además un límite sobre el tamaño total de los formatos combinados, `maxColorAttachmentBytesPerSample`, con mínimo garantizado de 32 bytes.
+
+Ese último límite es el que corta antes en la práctica. El G-buffer de arriba suma 4 más 8 más 4 más 4, o sea 20 bytes por muestra, y cabe. Cuatro targets de `rgba16float` suman 32 y caben justo. Cuatro de `rgba32float` suman 64 y no caben en un dispositivo que solo garantice el mínimo.
+
+## writeMask y mezcla por target
+
+Cada target tiene su propio estado, y no tienen por qué coincidir:
+
+```js
+targets: [
+  { format: 'rgba16float',
+    blend: {
+      color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+      alpha: { srcFactor: 'one',       dstFactor: 'one-minus-src-alpha', operation: 'add' },
+    } },
+  { format: 'rgba8unorm', writeMask: GPUColorWrite.ALL },
+  { format: 'rg16float',  writeMask: GPUColorWrite.RED | GPUColorWrite.GREEN },
+],
+```
+
+`writeMask` permite escribir solo algunos canales de un target, y su uso real es acumular en un canal sin tocar los otros, o desactivar por completo la escritura a un attachment en una pasada concreta poniéndolo a cero.
+
+Un elemento de `targets` puede ser `null`, lo que significa que el pipeline no escribe a ese attachment aunque el pase lo tenga. Es la forma de reutilizar un mismo render pass de cuatro attachments con pipelines que solo escriben a algunos.
+
+## Sin etapa de fragmentos
+
+La etapa `fragment` del descriptor es **opcional**. Un pipeline sin ella dibuja geometría que solo afecta al buffer de profundidad y al stencil:
+
+```js
+const pipelineProfundidad = device.createRenderPipeline({
+  layout: disposicion,
+  vertex: { module, entryPoint: 'vsSoloPosicion', buffers: [layoutPosiciones] },
+  depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+  primitive: { topology: 'triangle-list', cullMode: 'back' },
+  // sin fragment
+});
+```
+
+Es lo que se usa para un depth prepass, para rellenar un mapa de sombras y para pases de oclusión. La ganancia es doble: no hay coste de fragment shader y no hay escritura de color, así que el pase va limitado solo por geometría y por la tasa de relleno de profundidad, que en las GPUs modernas es varias veces mayor que la de color.
+
+<Callout type="tip" title="El pase de profundidad quiere su propio vertex shader">
+Reutilizar el vertex shader del pase de color en el pase de profundidad funciona, y desaprovecha la mitad de la ganancia: ese shader calcula y devuelve normales, tangentes y UVs que nadie va a leer. Un vertex shader que solo devuelve `@builtin(position)` mueve mucho menos entre etapas y suele ser dos o tres veces más barato. Y si vas a usar `depthCompare: 'equal'` después, márcalo con `@invariant` en los dos shaders.
+</Callout>
+
+<Callout type="dios" title="El G-buffer no cuesta instrucciones: cuesta megabytes por fotograma, y en móvil ni siquiera cabe">
+La razón por la que el renderizado diferido triunfó en escritorio y fracasó en móvil está entera en una cuenta que se hace en treinta segundos y que casi nadie hace antes de decidir la arquitectura.
+
+Coge el G-buffer de esta lección: 20 bytes por píxel de color, más 4 de profundidad, 24 en total. A 2560 por 1440 son 3,7 millones de píxeles, o sea **88 MiB escritos** en la pasada de geometría. La pasada de iluminación los lee otra vez: otros 88 MiB. A 60 fotogramas por segundo, eso son **más de 10 GiB por segundo** solo en mover el G-buffer, sin contar texturas, geometría ni el resto de pasadas.
+
+Una GPU de escritorio moderna tiene entre 300 y 1000 GiB por segundo de ancho de banda, así que 10 son un porcentaje asumible. Una GPU integrada de portátil tiene entre 50 y 100, compartidos con la CPU: ahí los mismos 10 GiB son entre el diez y el veinte por ciento de todo el presupuesto, y se nota.
+
+Y en una GPU móvil de arquitectura por tiles el problema es de otra naturaleza y es peor. Esas GPUs no escriben a memoria durante la pasada: trabajan sobre una **memoria de tile** dentro del chip, de unas pocas decenas de kilobytes, y vuelcan el resultado al final. Si tus attachments caben en el tile, el G-buffer entero es prácticamente gratis porque nunca sale del chip. Si no caben, la GPU tiene que reducir el tamaño del tile o volcar y recargar, y el rendimiento se cae por un precipicio. Ese es el motivo de que `maxColorAttachmentBytesPerSample` exista y de que su mínimo garantizado sea 32 bytes: es aproximadamente lo que cabe en un tile modesto.
+
+De ahí salen las tres decisiones que de verdad importan al diseñar un G-buffer, en orden. **Reducir el número de bytes por píxel** empaquetando: normales octaédricas en 32 bits, materiales en `rgba8unorm`, profundidad lineal reconstruida desde el depth buffer en vez de guardada aparte. **Reducir el número de attachments**, fusionando canales aunque quede menos legible. Y **cuestionar el diferido entero**: forward con agrupación de luces por teselas o por clústeres no escribe ningún G-buffer, y en hardware con poco ancho de banda gana casi siempre.
+
+La cuenta de arriba, hecha antes de escribir el primer shader, es lo que decide esa arquitectura. Hacerla después, cuando ya hay veinte materiales escritos contra un G-buffer de cuatro targets, sale carísimo.
+</Callout>

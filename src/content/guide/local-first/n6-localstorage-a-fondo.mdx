@@ -1,0 +1,157 @@
+---
+title: "localStorage a fondo: la API que bloquea el hilo"
+description: "Por qué una API síncrona de clave y valor detiene el hilo principal en cada acceso, y por qué los cinco megabytes de cadenas UTF-16 rinden mucho menos de lo que su cifra sugiere."
+subject: local-first
+level: 6
+order: 2
+position: "6.2"
+duration: "17 min"
+---
+
+<Lead>
+`localStorage` es la API de almacenamiento más usada de la web y también la peor entendida, porque su superficie —cuatro métodos, cadenas a cadenas— esconde dos decisiones de diseño de 2009 que hoy son limitaciones estructurales: es **síncrona** en un entorno de un solo hilo, de modo que cada acceso detiene la interfaz, y su cuota se contabiliza sobre **cadenas UTF-16**, de modo que los cinco megabytes anunciados rinden bastante menos de lo que su cifra promete. Ninguna de las dos se puede sortear con una biblioteca; ambas son propiedades del contrato, y conocerlas con precisión es lo que separa el uso legítimo del abuso que degrada una aplicación entera.
+</Lead>
+
+<Goals>
+
+- Explicar por qué toda llamada a `localStorage` bloquea el hilo principal y qué cuesta eso de verdad.
+- Calcular la capacidad real de los 5 MB cuando el contenido son cadenas UTF-16.
+- Manejar `QuotaExceededError` sabiendo que llega sin aviso previo y sin atomicidad.
+- Delimitar los pocos casos en los que la sincronía de esta API es una ventaja y no un defecto.
+
+</Goals>
+
+## Una API síncrona en un entorno de un solo hilo
+
+La firma lo dice todo: `localStorage.getItem(clave)` **devuelve** el valor. No una promesa, no un callback: el valor. Para cumplir ese contrato, el navegador tiene que completar toda la operación —consultar el almacén del origen, leer del disco si aún no está en memoria, entregar la cadena— antes de que la siguiente instrucción de tu programa pueda ejecutarse. Y como el hilo principal es también el que ejecuta el layout, la pintura y los manejadores de eventos, ese intervalo es tiempo en el que la interfaz sencillamente no existe.
+
+El coste no se distribuye de forma uniforme. El **primer** acceso de una página suele ser el caro: obliga a materializar el área de almacenamiento del origen, que vive fuera del proceso de renderizado, lo que implica comunicación entre procesos y, potencialmente, lectura de disco. Los accesos siguientes suelen resolverse contra una copia en memoria y son mucho más baratos. Esa asimetría explica por qué el mismo bucle se comporta de forma radicalmente distinta según dónde se ejecute en el arranque, y por qué las mediciones ingenuas dan resultados contradictorios.
+
+<Mermaid code={`flowchart TD
+  A[getItem en el hilo principal] --> B{el area del origen ya esta en memoria}
+  B -->|no| C[materializar el area y leer del disco]
+  B -->|si| D[copia en memoria]
+  C --> E[el hilo principal esta detenido]
+  D --> E
+  E --> F[la interfaz vuelve a responder]
+  class E t-red
+  class F t-green`} />
+
+Hay una segunda fuente de coste que la firma tampoco revela: la **coherencia entre contextos**. Varias pestañas, ventanas e `iframe` del mismo origen comparten una única área de almacenamiento, y la especificación exige que las operaciones se comporten como si fueran atómicas respecto a ellos. Garantizar eso obliga al navegador a coordinar los procesos que comparten el origen, y esa coordinación es precisamente lo que impide que la lectura se resuelva siempre con una simple consulta a memoria local.
+
+Hay además una consecuencia arquitectónica que suele pasarse por alto: `localStorage` **no existe dentro de un Worker**. Está definida sobre `Window`, no sobre `WorkerGlobalScope`, y por eso no puedes desplazar su coste a otro hilo. Lo que en IndexedDB u OPFS se resuelve moviendo el trabajo fuera del hilo principal, aquí no tiene salida: la única mitigación posible es acceder menos.
+
+<Callout type="warn" title="El presupuesto de fotograma no perdona">
+A 60 Hz, un fotograma completo dura unos 16,7 milisegundos, y en ese tiempo caben tus manejadores, el estilo, el layout y la pintura. Cualquier operación síncrona que consuma una fracción apreciable de ese presupuesto se traduce en un fotograma perdido; si la operación ocurre dentro de un manejador de entrada, se traduce directamente en latencia de interacción percibida. Un `JSON.parse` de varios cientos de kilobytes leídos de `localStorage` durante el arranque es, en dispositivos modestos, exactamente el tipo de tarea larga que arruina las métricas de respuesta.
+</Callout>
+
+## Cinco megabytes que son menos de lo que parecen
+
+El límite habitual es de **5 MB de datos en cadenas UTF-16 por origen**, y las tres palabras que importan son las tres últimas. En UTF-16 cada unidad de código ocupa **dos bytes**, incluidos los caracteres ASCII, que en UTF-8 habrían ocupado uno. Si tu intuición sobre el tamaño de un JSON viene de mirar archivos en disco —donde casi todo es UTF-8— tu estimación estará equivocada por un factor de dos en el caso más común, el del texto latino sin acentos.
+
+A esa duplicación se suman tres impuestos que casi nadie contabiliza:
+
+<Cards>
+  <Card icon="🔑" title="Las claves también cuentan">
+    El nombre de cada entrada ocupa cuota igual que su valor. Cientos de claves con prefijos verbosos consumen un porcentaje nada despreciable del presupuesto.
+  </Card>
+  <Card icon="📎" title="El envoltorio de JSON">
+    Comillas, llaves, corchetes y comas son caracteres reales. Serializar objetos con nombres de campo largos multiplica el tamaño del contenido útil.
+  </Card>
+  <Card icon="🧱" title="Binario en base64">
+    `localStorage` solo guarda cadenas. Codificar bytes en base64 los infla aproximadamente un tercio antes de que se aplique el coste de UTF-16.
+  </Card>
+  <Card icon="🌍" title="El texto no latino no es más caro">
+    Un ideograma y una letra latina ocupan lo mismo, dos bytes. Lo llamativo no es que el CJK sea caro: es que el ASCII paga el doble de lo que pagaría en UTF-8.
+  </Card>
+</Cards>
+
+```js
+// Medir lo que ocupa de verdad una entrada, en unidades de codigo UTF-16
+function costeUtf16(clave, valor) {
+  return (clave.length + valor.length) * 2; // dos bytes por unidad de codigo
+}
+
+// El impuesto acumulado de un objeto tipico
+const perfil = { identificador: "a7f3", nombreCompleto: "Ada Lovelace" };
+const serializado = JSON.stringify(perfil);
+serializado.length;              // el envoltorio de JSON ya esta dentro
+costeUtf16("perfil", serializado); // y todo se paga a dos bytes por unidad
+```
+
+El resultado práctico es que la capacidad útil de `localStorage` para datos de aplicación reales queda muy por debajo de lo que sugiere el número redondo. No es un almacén de datos: es un cajón de preferencias con una etiqueta engañosamente generosa.
+
+Hay un matiz de contabilidad que conviene tener presente: cómo se cuentan exactamente esos 5 MB —en bytes o en unidades de código— no está uniformemente especificado, y por tanto la capacidad exacta puede variar entre implementaciones. La conclusión de ingeniería no cambia y de hecho se refuerza: **nunca diseñes rozando el techo**. Si tu cálculo dice que cabe justo, no cabe, porque el margen depende de un detalle de conteo que no controlas y que puede diferir entre el navegador donde lo probaste y el del usuario.
+
+Una auditoría honesta del consumo cabe en cinco líneas, y suele deparar sorpresas: claves olvidadas de versiones antiguas, entradas duplicadas por bibliotecas de terceros, y objetos que crecieron sin que nadie lo notase.
+
+```js
+// Auditoria completa del consumo del origen, ordenada de mayor a menor
+const entradas = Object.keys(localStorage)
+  .map((k) => [k, (k.length + localStorage.getItem(k).length) * 2])
+  .sort((a, b) => b[1] - a[1]);
+
+const total = entradas.reduce((acc, [, bytes]) => acc + bytes, 0);
+console.table(entradas); // los tres primeros suelen explicar casi todo
+```
+
+## El error que llega tarde, sin aviso y sin atomicidad
+
+No existe ninguna API para preguntar cuánta cuota queda en Web Storage. El único mecanismo de descubrimiento es el fracaso: `setItem` lanza una `DOMException` de tipo `QuotaExceededError`, **de forma síncrona**, en el momento en que la escritura no cabe. Esto tiene dos implicaciones incómodas.
+
+La primera es que cualquier escritura sin `try`/`catch` es una excepción no capturada esperando su turno, y ocurrirá en el dispositivo del usuario que más ha usado tu aplicación —el que más datos ha acumulado—, es decir, precisamente en tu usuario más valioso. La segunda es que **no hay atomicidad**: si tu operación lógica escribe tres claves y la tercera falla, las dos primeras ya están grabadas. `localStorage` no tiene transacciones, así que un fallo de cuota puede dejar el estado del origen en una combinación inconsistente que ninguna de tus invariantes contemplaba.
+
+Hay una tercera implicación, más sutil y peor documentada: el modo de navegación privada y las políticas restrictivas de algunos navegadores pueden hacer que `localStorage` **exista pero no persista**, o incluso que lanzar una excepción sea el comportamiento normal al escribir. Un código que asume que la escritura siempre funciona y que lo escrito siempre se recupera falla de formas confusas en esos entornos, y esos entornos no son minoritarios.
+
+```js
+try {
+  localStorage.setItem("borrador", texto);
+} catch (e) {
+  if (e instanceof DOMException && e.name === "QuotaExceededError") {
+    // aqui no hay recuperacion elegante: o podas datos viejos o degradas
+  }
+  throw e;
+}
+```
+
+<Callout type="tip" title="El evento storage no te avisa a ti">
+El evento `storage` se dispara en los **demás** documentos del mismo origen, nunca en el que hizo la escritura. Es un canal de notificación entre pestañas legítimo y muy barato, pero grueso: no distingue el origen lógico del cambio, se dispara con la clave y los valores antiguo y nuevo, y no ofrece garantía de orden frente a otras escrituras. Para coordinación seria entre pestañas existen `BroadcastChannel` y la API de Web Locks, que veremos más adelante en el track.
+</Callout>
+
+## Dónde sigue siendo la respuesta correcta
+
+Sería un error concluir que `localStorage` no debe usarse nunca. Hay un caso en el que su defecto principal es exactamente la propiedad que necesitas: **cuando debes decidir algo antes de pintar el primer fotograma**. El tema claro u oscuro, el idioma, una bandera de funcionalidad que altera el primer render: si esos valores se leyeran de forma asíncrona, la página se pintaría primero con el valor equivocado y luego saltaría. La sincronía, aquí, es la solución y no el problema.
+
+El patrón habitual para aprovechar esa propiedad sin pagar de más consiste en leer una única clave, muy pequeña, en un script que se ejecuta antes de que se pinte nada, y no volver a tocar la API durante el resto de la vida de la página. Todo lo demás —incluida la escritura de la preferencia cuando el usuario la cambia— puede diferirse a un momento en el que congelar unos milisegundos no le cuesta nada a nadie.
+
+```js
+// Lo unico que justifica un acceso sincrono: decidir antes de pintar
+const tema = localStorage.getItem("tema") ?? "claro";
+document.documentElement.dataset.tema = tema; // sin salto visual
+
+// La escritura no tiene esa urgencia: difierela fuera del camino critico
+function guardarTema(valor) {
+  requestIdleCallback(() => localStorage.setItem("tema", valor));
+}
+```
+
+El criterio que se sostiene bien en la práctica tiene tres condiciones que deben cumplirse **a la vez**: el dato es pequeño y de tamaño acotado por diseño; se lee muy pocas veces, idealmente una vez en el arranque; y perderlo es un inconveniente menor, no una pérdida de trabajo del usuario. En cuanto una de las tres se rompe —el dato crece sin techo, se lee en un bucle, o su pérdida destruye algo que el usuario escribió— el mecanismo correcto es otro.
+
+| Uso | Veredicto | Motivo |
+| --- | --- | --- |
+| Tema, idioma, banderas de arranque | Correcto | Se necesita antes del primer fotograma |
+| Token de sesión de corta vida | Discutible | Accesible desde cualquier script del origen |
+| Borradores de texto del usuario | Incorrecto | Sin transacciones ni aviso previo de cuota |
+| Caché de respuestas de red | Incorrecto | Cache API guarda `Request` \| `Response` nativo |
+| Base de datos de la aplicación | Incorrecto | Cuota diminuta y bloqueo del hilo principal |
+
+<Callout type="dios" title="La sincronía no es una comodidad: es una deuda que paga el usuario más comprometido">
+Conviene mirar de frente la única razón por la que `localStorage` sigue siendo tan popular: es cómoda para el programador, y esa comodidad tiene un precio que el programador no paga. Escribir `const t = localStorage.getItem("tema")` es más agradable que orquestar una promesa, y en la máquina de desarrollo —con el disco rápido, el almacén caliente y cuatro claves diminutas— el coste es literalmente inobservable, lo cual es la trampa perfecta: el defecto es invisible exactamente allí donde se toman las decisiones. La degradación se manifiesta en el otro extremo de la distribución, en el teléfono modesto, con el almacenamiento frío, después de dieciocho meses de uso y con un origen que ha acumulado claves que nadie recuerda haber creado. Y ahí aparece la asimetría que hace de esto un problema ético además de técnico: cuanto más ha usado alguien tu aplicación, más datos ha acumulado, más caro le sale cada acceso y más cerca está de la excepción de cuota. La API castiga con precisión inversa a la lealtad. A esto se suma que el bloqueo del hilo principal no es un coste local sino sistémico: no ralentiza tu función, congela la aplicación entera, incluidas las animaciones, el desplazamiento y los gestos que el usuario está haciendo en ese instante, y por eso una tarea larga en el arranque contamina la percepción de todo lo que viene después. La lección que hay que extraer no es *nunca uses localStorage*, sino algo más exigente y más portátil: **toda API síncrona sobre almacenamiento persistente es una deuda diferida cuyos intereses los paga otro**, y la única forma de usarla con honestidad es acotar por diseño el tamaño de lo que guardas y el número de veces que lo lees, no confiar en que en la práctica no crecerá. Cuando ese acotamiento deja de ser sostenible —y en toda aplicación con éxito llega ese día—, el movimiento correcto no es optimizar el acceso, es cambiar de estrato: pasar a un almacén asíncrono, estructurado y transaccional, que es justamente lo que IndexedDB y OPFS existen para ser.
+</Callout>
+
+<Challenge title="Mide el coste real de tu almacenamiento">
+1. Recorre todas las claves de `localStorage` de una aplicación que uses y calcula el coste total en UTF-16, sumando claves y valores. Compáralo con el tamaño que tendría ese mismo contenido en UTF-8.
+2. Instrumenta el arranque de una página y mide el tiempo del **primer** acceso frente al de los siguientes cien. Explica la diferencia.
+3. Provoca deliberadamente un `QuotaExceededError` escribiendo en un bucle y comprueba qué queda escrito cuando la excepción salta a mitad de una operación de varias claves.
+4. Toma un dato que hoy guardes en `localStorage` y aplica las tres condiciones de la sección final. Si falla alguna, escribe qué mecanismo lo sustituiría y por qué.
+</Challenge>

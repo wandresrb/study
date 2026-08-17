@@ -1,0 +1,140 @@
+---
+title: "Depth bias y el búfer de estarcido"
+description: "Los tres parámetros del sesgo de profundidad y qué calcula cada uno, y el estarcido completo: referencia, máscaras, las ocho operaciones y el orden real de las dos pruebas."
+subject: webgpu
+level: 25
+order: 5
+position: "25.5"
+duration: "21 min"
+---
+
+<Lead>
+Quedan dos bloques del descriptor de profundidad y estarcido que casi nadie toca hasta que los necesita: el sesgo, que empuja la profundidad de un primitivo para resolver empates, y el estarcido, un búfer de ocho bits por píxel que no guarda distancias sino etiquetas. El primero tiene tres parámetros y solo uno es evidente. El segundo es la herramienta con la que se han hecho durante treinta años los contornos, los portales, los reflejos planos y las sombras volumétricas, y su modelo mental encaja en un párrafo si se cuenta en el orden correcto.
+</Lead>
+
+<Goals>
+
+- Calcular el sesgo resultante a partir de `depthBias`, `depthBiasSlopeScale` y `depthBiasClamp`.
+- Decidir entre sesgo, desplazamiento geométrico y estarcido para superficies coplanares.
+- Describir el orden real de la prueba de estarcido respecto a la de profundidad.
+- Configurar un pase de contorno y una máscara con las operaciones y máscaras correctas.
+
+</Goals>
+
+## Los tres parámetros del sesgo
+
+El sesgo de profundidad existe para un problema muy concreto: dos superficies que ocupan el mismo plano. Un cartel pegado a una pared, una marca de neumático sobre el asfalto, la superficie sombreada frente al mapa de sombras que la representa. En todos ellos, la profundidad calculada coincide o casi coincide, y el resultado es el patrón moteado del z-fighting o el rayado de la *shadow acne*.
+
+WebGPU lo resuelve con un desplazamiento aplicado por la función fija, después de la interpolación y antes de la comparación. Se calcula así:
+
+```
+sesgo = depthBias * r + depthBiasSlopeScale * m
+sesgo_final = clamp(sesgo, depthBiasClamp)
+```
+
+**`depthBias` es un entero, no un float, y multiplica a `r`.** Ese `r` es la mínima diferencia de profundidad resoluble en el formato del attachment. En un formato normalizado como `depth16unorm` es una constante, `2^-16`. En un formato de coma flotante **no es constante**: se calcula por primitivo a partir del exponente máximo de las profundidades de sus vértices, de modo que el mismo `depthBias` de valor uno desplaza mucho más cerca del plano lejano que junto a la cámara. Es una fuente clásica de sorpresas al pasar de `depth24plus` a `depth32float`.
+
+**`depthBiasSlopeScale` multiplica a la pendiente máxima del primitivo**, es decir, al mayor de los módulos de la derivada de la profundidad respecto a `x` y a `y` en espacio de pantalla. Un triángulo perpendicular a la cámara tiene pendiente casi cero y no necesita sesgo; un triángulo muy inclinado cubre un rango enorme de profundidad en pocos píxeles y necesita mucho. Este término es el que hace que el sesgo funcione en geometría real, y en shadow mapping es el importante: sin él, o rayas las superficies frontales o despegas las sombras de los objetos.
+
+**`depthBiasClamp` acota el resultado.** Con pendientes casi verticales, el término de pendiente se dispara y el objeto se despega de su base —el artefacto llamado *peter-panning*—. El límite recorta ese caso extremo. Se acota por arriba si es positivo y por abajo si es negativo.
+
+Los tres valen cero por defecto, y hay una regla de validación que conviene tener presente: **si la topología es `line-list`, `line-strip` o `point-list`, los tres tienen que valer cero**. El sesgo por pendiente no está definido para primitivos sin área, y la validación de WebGPU lo rechaza en la creación del pipeline. Si dibujas alambres sobre una malla y esperabas resolver el z-fighting con sesgo, la respuesta es otra: desplazar los vértices en el vertex shader hacia la cámara.
+
+```js
+// Pipeline de un mapa de sombras. Los valores son un punto de partida
+// razonable; el ajuste fino depende de la resolucion del mapa y de la escena.
+const pipelineSombras = device.createRenderPipeline({
+  label: 'shadow map',
+  layout: layoutSombras,
+  vertex: { module, entryPoint: 'vs_solo_posicion' },
+  primitive: { topology: 'triangle-list', cullMode: 'back' },
+  depthStencil: {
+    format: 'depth32float',
+    depthWriteEnabled: true,
+    depthCompare: 'less',
+    depthBias: 2,
+    depthBiasSlopeScale: 2.0,
+    depthBiasClamp: 0.01,
+  },
+});
+```
+
+Y una advertencia con nombre y apellidos: **con reversed-z el signo del sesgo se invierte**. Alejar de la cámara significa aumentar la profundidad en la convención normal y disminuirla en la invertida. Un `depthBias` positivo que funcionaba deja de funcionar y empeora el artefacto en vez de arreglarlo. Es el segundo bug clásico al adoptar el [reversed-z](/guia/webgpu/n25-reversed-z-y-la-precision/), justo detrás de olvidar invertir también el mapa de sombras.
+
+## Cuándo el sesgo no es la herramienta
+
+El sesgo tiene un defecto estructural: es un desplazamiento en el espacio de la profundidad, y por tanto **depende de la cámara**. La misma configuración que resuelve el problema a dos metros lo deja resuelto de sobra a veinte y sin resolver a doscientos. Cuando la geometría coplanar es parte permanente de la escena, hay dos alternativas mejores.
+
+La primera es **desplazar la geometría en el mundo**, unos milímetros a lo largo de la normal. Es exacto, es estable con la cámara y no cuesta nada en tiempo de ejecución. El inconveniente es que el objeto desplazado despega visiblemente si se mira desde un ángulo rasante, así que sirve para calcomanías pequeñas y no para superficies grandes.
+
+La segunda es **el estarcido**, y es la respuesta correcta para las calcomanías proyectadas y para cualquier caso donde la superficie de destino no sea plana. En vez de competir en profundidad, se marca la región en un búfer de etiquetas y se dibuja restringido a ella. Que es exactamente el tema de la mitad que queda.
+
+## El estarcido: referencia, máscaras y el orden de las pruebas
+
+El búfer de estarcido guarda un entero de ocho bits por píxel. No tiene ningún significado predefinido: es memoria de propósito general indexada por píxel, y su valor lo decides tú.
+
+El mecanismo tiene cuatro piezas y una de ellas no está en el pipeline sino en el pass.
+
+**La referencia** es un valor de treinta y dos bits que se fija con `pass.setStencilReference(valor)` y que vale cero al empezar cada render pass. Es el operando izquierdo de la comparación y también el valor que escribe la operación `replace`. Que viva en el pass y no en el pipeline es deliberado: permite dibujar cincuenta objetos con etiquetas distintas usando un único pipeline, cambiando solo la referencia entre llamadas. Y tiene una consecuencia que reaparecerá al hablar de bundles: `setStencilReference` no se puede grabar en un render bundle.
+
+**`stencilReadMask`** se aplica con un Y lógico tanto a la referencia como al valor almacenado **antes** de comparar. Sirve para dividir los ocho bits en campos independientes: los cuatro bajos para una cosa y los cuatro altos para otra, sin que se estorben.
+
+**`stencilWriteMask`** decide qué bits se modifican al escribir. Es el complemento del anterior y hace posible que una pasada actualice su campo sin tocar los demás.
+
+**Las operaciones**, tres por cada cara, en `stencilFront` y `stencilBack`. Y aquí está la parte que hay que memorizar bien, porque los nombres no dicen el orden:
+
+| Campo | Se aplica cuando |
+|---|---|
+| `failOp` | la prueba de estarcido **falla** |
+| `depthFailOp` | el estarcido pasa pero **falla la profundidad** |
+| `passOp` | pasan las dos |
+
+Es decir: **la prueba de estarcido ocurre antes que la de profundidad**. Un fragmento rechazado por el estarcido no llega siquiera a compararse en profundidad, y por eso el estarcido puede usarse para recortar trabajo. Los tres campos valen `keep` por defecto y las ocho operaciones posibles son:
+
+`keep` deja el valor, `zero` lo pone a cero, `replace` escribe la referencia, `invert` invierte sus bits, `increment-clamp` y `decrement-clamp` suman o restan uno saturando en los extremos, e `increment-wrap` y `decrement-wrap` hacen lo mismo dando la vuelta. Las dos últimas existen específicamente para las sombras volumétricas, donde el contador puede pasar de doscientos cincuenta y cinco y necesita envolver.
+
+La comparación usa el mismo enum `GPUCompareFunction` de la profundidad, con `always` por defecto. Y una regla de validación útil: si tocas cualquier campo de `stencilFront` o `stencilBack`, el formato del attachment tiene que tener aspecto de estarcido, o el pipeline se rechaza.
+
+```js
+// Paso 1: marcar la silueta del objeto con el valor 1.
+const marcar = device.createRenderPipeline({
+  layout, vertex: { module, entryPoint: 'vs' },
+  // Sin fragment: solo queremos la marca, no el color.
+  primitive: { topology: 'triangle-list', cullMode: 'back' },
+  depthStencil: {
+    format: 'depth24plus-stencil8',
+    depthWriteEnabled: true,
+    depthCompare: 'less',
+    stencilFront: { compare: 'always', passOp: 'replace' },
+    stencilBack:  { compare: 'always', passOp: 'replace' },
+    stencilWriteMask: 0xFF,
+  },
+});
+
+// Paso 2: dibujar el objeto engordado donde la marca NO esta.
+const contorno = device.createRenderPipeline({
+  layout, vertex: { module, entryPoint: 'vs_engordado' },
+  fragment: { module, entryPoint: 'fs_color_plano', targets: [{ format }] },
+  primitive: { topology: 'triangle-list', cullMode: 'back' },
+  depthStencil: {
+    format: 'depth24plus-stencil8',
+    depthWriteEnabled: false,
+    depthCompare: 'always',
+    stencilFront: { compare: 'not-equal', passOp: 'keep' },
+    stencilBack:  { compare: 'not-equal', passOp: 'keep' },
+    stencilReadMask: 0xFF,
+    stencilWriteMask: 0x00, // esta pasada lee pero no escribe
+  },
+});
+
+// En el pass:
+pass.setStencilReference(1);
+pass.setPipeline(marcar);   pass.draw(n);
+pass.setPipeline(contorno); pass.draw(n);
+```
+
+El attachment necesita su parte: `stencilClearValue`, `stencilLoadOp` y `stencilStoreOp` son campos independientes de los de profundidad, y con un formato combinado hay que dar los seis. Olvidar `stencilLoadOp` en un `depth24plus-stencil8` es un error de validación, no un valor por defecto.
+
+<Callout type="dios" title="El estarcido no es memoria barata: es el único búfer que sobrevive entre pasadas sin coste de ancho de banda">
+Se presenta siempre como una herramienta de máscaras, y por eso mucha gente lo descarta pensando que un canal alfa o un render target extra harían lo mismo. La diferencia está en dónde vive. En el hardware de renderizado por tiles, que es todo lo móvil y buena parte de lo de escritorio, el búfer de profundidad y estarcido reside en la memoria interna del tile durante todo el pass y **nunca sale a memoria principal si le dices que lo descarte al terminar**. Marcar una región con estarcido y consultarla después, dentro del mismo pass, cuesta cero bytes de ancho de banda. Hacer lo mismo con un render target adicional cuesta una escritura y una lectura de una textura de pantalla completa, que en un móvil a 1080p son varios megabytes por fotograma y una fracción medible del presupuesto térmico. Ese es el motivo real por el que técnicas que parecen anticuadas —el recorte por estarcido de los volúmenes de luz en un diferido, la máscara de cielo, la restricción de un efecto a una región— siguen siendo la mejor opción en móvil y no en escritorio. Y el corolario operativo: si usas estarcido, **haz que su marcado y su consumo ocurran en el mismo render pass**. Un `stencilStoreOp: 'store'` seguido de un `stencilLoadOp: 'load'` en el siguiente pass tira por tierra toda la ventaja y convierte la técnica en el render target que querías evitar.
+</Callout>

@@ -1,0 +1,146 @@
+---
+title: "El procesador moderno"
+description: "Segmentación, ejecución fuera de orden y especulación: qué hace de verdad la CPU con tu bucle, cuánto cuesta un fallo de predicción de salto, y cómo escribir ramas que el predictor acierte o eliminarlas del todo."
+subject: c23
+level: 28
+order: 3
+position: "28.3"
+duration: "17 min"
+---
+
+<Lead>
+La máquina abstracta de C ejecuta una sentencia, termina, y ejecuta la siguiente. El silicio que hay debajo lleva treinta años sin hacer nada parecido: descodifica cuatro o seis instrucciones por ciclo, las renombra para romper falsas dependencias, las lanza en el orden en que sus operandos van estando listos, mantiene varios cientos en vuelo simultáneo y **adivina el futuro** cada vez que encuentra una bifurcación. Toda esa maquinaria existe para sostener una ilusión secuencial que tú das por supuesta, y entender dónde se rompe la ilusión es lo que separa un bucle rápido de uno lento.
+</Lead>
+
+<Goals>
+
+- Reconstruir el camino de una instrucción por el cauce y entender qué significa ser superescalar y fuera de orden.
+- Explicar por qué la especulación es obligatoria y qué se descarta exactamente cuando falla.
+- Cuantificar el coste de un fallo de predicción y medirlo con contadores de hardware.
+- Decidir con criterio entre hacer la rama predecible, eliminarla, o dejarla en paz.
+
+</Goals>
+
+## El cauce y la ilusión secuencial
+
+Un procesador de servidor actual tiene entre quince y veinte etapas entre leer una instrucción y retirarla. La razón es la frecuencia: si el trabajo de una instrucción se reparte en veinte pasos cortos, cada paso cabe en un ciclo más breve y el reloj puede subir. El precio es que hay veinte instrucciones a medio hacer en todo momento, y ninguna es todavía definitiva.
+
+<Mermaid code={`flowchart LR
+  A[Fetch: leer bytes guiado por el predictor] --> B[Decode: convertir a micro operaciones]
+  B --> C[Rename: eliminar falsas dependencias]
+  C --> D[Scheduler: esperar operandos listos]
+  D --> E[Execute: puertos de ejecucion en paralelo]
+  E --> F[Retire: confirmar en orden de programa]
+  F -.->|si el salto fallo| G[Descartar todo y refetch]
+  G -.-> A
+  class E t-green
+  class F t-blue
+  class G t-red`} />
+
+Tres propiedades del diagrama merecen atención. Primero, es **superescalar**: las etapas procesan varias instrucciones por ciclo, así que el techo teórico de una máquina moderna está entre cuatro y seis instrucciones retiradas por ciclo, y un `IPC` de uno significa que estás usando la cuarta parte de la máquina. Segundo, es **fuera de orden**: el planificador lanza cada micro operación en cuanto sus operandos existen, sin respetar el orden del programa, de modo que una carga que falla en caché no bloquea las cincuenta instrucciones independientes que vienen detrás. Tercero, y esto es lo que salva la abstracción, el **retiro es en orden**: los resultados se hacen arquitectónicamente visibles en el orden exacto del programa. Por eso puedes seguir razonando secuencialmente sobre tu código aunque el silicio no lo ejecute así.
+
+La ventana en la que la máquina busca trabajo independiente es enorme y conviene tener el número en la cabeza: el búfer de reordenación de un núcleo grande actual guarda entre cuatrocientas y seiscientas micro operaciones en vuelo. Eso significa que la CPU puede tener doce o más fallos de caché resueltos en paralelo mientras sigue trabajando, siempre que las direcciones de esos fallos sean **independientes entre sí**. Es el mecanismo que hace que un recorrido secuencial sobre un array enorme cueste una fracción de lo que costaría si cada fallo se pagara por separado.
+
+La consecuencia práctica es que el cuello de botella de un bucle rara vez es el número de instrucciones. Suele ser una de estas tres cosas: la **latencia de la cadena de dependencias** más larga, la **saturación de un puerto** de ejecución concreto, o un **fallo de predicción**. Las tres se miden; ninguna se adivina.
+
+La primera es la más contraintuitiva porque no depende de cuánto trabajo hay, sino de cómo está encadenado:
+
+```c
+/* Cadena unica: cada suma espera a la anterior. El bucle avanza a la
+   velocidad de la LATENCIA del sumador, no de su rendimiento. */
+double s = 0;
+for (size_t i = 0; i < n; i++) s += v[i];
+
+/* Cuatro cadenas independientes: el planificador las solapa y el bucle
+   avanza a la velocidad del RENDIMIENTO del sumador. */
+double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+for (size_t i = 0; i + 4 <= n; i += 4) {
+    s0 += v[i]; s1 += v[i + 1]; s2 += v[i + 2]; s3 += v[i + 3];
+}
+double s = (s0 + s2) + (s1 + s3);
+```
+
+Ambos bucles ejecutan el mismo número de sumas. El segundo puede ser hasta cuatro veces más rápido, porque una unidad de suma en coma flotante con latencia de cuatro ciclos y rendimiento de una operación por ciclo está ociosa tres cuartas partes del tiempo si solo le das una cadena. La diferencia entre **latencia** y **rendimiento** de una instrucción es la distinción más rentable que puedes aprender de la documentación de tu microarquitectura.
+
+## Especular es obligatorio
+
+Considera qué debe hacer la etapa de lectura al encontrar un salto condicional. La condición depende de una comparación que quizá tarde veinte ciclos en resolverse porque espera una carga de memoria. Si la máquina se detuviera hasta saberla, el cauce se vaciaría en cada rama, y en código real hay una rama cada cinco o seis instrucciones. Un procesador que no especulara tendría un `IPC` ridículo.
+
+Así que no espera: **apuesta**. Un predictor consulta la historia reciente de esa rama y de las que la precedieron, elige un camino y sigue leyendo, descodificando y ejecutando por él. Los predictores contemporáneos, de la familia `TAGE`, combinan varias tablas indexadas por historias globales de longitudes distintas y aciertan por encima del noventa y cinco por ciento en código típico; en bucles regulares rozan la perfección. También hay un `BTB` que predice **la dirección destino**, no solo la dirección tomada, y un predictor específico para los retornos de función.
+
+Cuando la apuesta falla, todo lo especulado se descarta: se limpian las etapas frontales, se restaura el estado del renombrado y se vuelve a leer desde la dirección correcta. El coste es la profundidad del cauce, entre quince y veinte ciclos en x86-64 moderno. Nada catastrófico en sí, pero multiplicado por un bucle de diez millones de iteraciones con la rama al cincuenta por ciento se convierte en el factor dominante del tiempo de ejecución.
+
+El experimento clásico lo demuestra sin ambigüedad:
+
+```c
+#include <stdint.h>
+#include <stddef.h>
+
+uint64_t suma_condicional(const int *v, size_t n) {
+    uint64_t s = 0;
+    for (size_t i = 0; i < n; i++)
+        if (v[i] >= 128)     /* rama impredecible si v esta desordenado */
+            s += v[i];
+    return s;
+}
+```
+
+Sobre un array de enteros aleatorios en el rango de cero a doscientos cincuenta y cinco, la rama es una moneda al aire y el predictor acierta la mitad de las veces. Ordena el mismo array antes de llamar a la función y la rama se vuelve trivial —falsa durante la primera mitad, cierta durante la segunda—, con dos fallos en todo el recorrido. **El mismo código, sobre los mismos datos, con la misma aritmética, puede correr entre tres y seis veces más rápido.** Y el coste de ordenar se amortiza con creces si vas a recorrer el array varias veces.
+
+Conviene precisar qué significa "impredecible", porque el predictor es mucho mejor de lo que sugiere la intuición. No necesita que la rama sea constante: reconoce patrones periódicos de longitud considerable, correlaciones con ramas anteriores y comportamientos que dependen de la iteración del bucle. Una rama que alterna cierto y falso en cada iteración se predice perfectamente; una que sigue el patrón de tres ciertos y un falso, también. Lo único que derrota al predictor es la **entropía real**: condiciones cuyo valor depende de datos sin estructura. Por eso el diagnóstico no puede hacerse leyendo el código, y por eso el contador `branch-misses` no tiene sustituto.
+
+<Callout type="dios" title="La especulación es una decisión de diseño con factura moral">
+Merece la pena detenerse en lo que significa que un procesador ejecute instrucciones cuyo resultado quizá haya que tirar. Es una apuesta económica: la energía gastada en trabajo descartado se cambia por rendimiento medio, y la industria lleva treinta años concluyendo que la apuesta compensa. Pero durante casi todo ese tiempo se asumió una premisa que resultó ser falsa: que descartar los resultados arquitectónicos bastaba para que la especulación fuese invisible. En dos mil dieciocho, Spectre y Meltdown demostraron que no. El trabajo especulado deja huellas en el **estado microarquitectónico** —qué líneas quedaron en caché, qué entradas de `TLB` se rellenaron— y ese estado sobrevive al descarte y es medible desde fuera. Toda una clase de vulnerabilidades nació de la brecha entre la semántica arquitectónica, que dice que nada ocurrió, y la realidad física, que recuerda que sí. La respuesta de la industria costó rendimiento real y permanente: barreras de especulación, aislamiento de tablas de páginas, mitigaciones en compilador. La lección que debes llevarte trasciende la seguridad: **las abstracciones de rendimiento tienen fugas por definición**, porque su implementación deja rastros observables que el contrato no menciona. Un procesador que promete comportarse como si ejecutara en orden no promete tardar lo mismo, y el tiempo es un canal. Cada vez que una capa te oculta un mecanismo para simplificarte la vida, esa capa filtra por el lado del tiempo, la energía o la memoria; el trabajo del ingeniero de rendimiento es precisamente saber por dónde.
+</Callout>
+
+## Ramas predecibles, ramas eliminadas
+
+Ante una rama cara tienes tres respuestas, y elegir mal es tan costoso como no hacer nada.
+
+<Cards>
+  <Card icon="⚡" title="Hazla predecible">
+    Ordena o particiona los datos para que la rama siga un patrón. Es la intervención más rentable cuando puedes pagar el orden una vez y recorrer muchas.
+  </Card>
+  <Card icon="🔀" title="Elimínala">
+    Sustitúyela por aritmética, máscaras o un movimiento condicional. Conviertes un coste probabilístico enorme en uno fijo y pequeño.
+  </Card>
+  <Card icon="🧭" title="Déjala en paz">
+    Si el predictor ya acierta el noventa y nueve por ciento, quitarla solo añade latencia. Mide `branch-misses` antes de tocar nada.
+  </Card>
+</Cards>
+
+La eliminación se apoya en que la comparación entera produce cero o uno, y ese valor se puede usar como aritmética en lugar de como control:
+
+```c
+/* Con rama: coste probabilistico, entre 0 y 20 ciclos por iteracion. */
+if (v[i] >= 128) s += v[i];
+
+/* Sin rama, con mascara: coste fijo, 3 o 4 ciclos, sin especulacion. */
+int64_t m = -(int64_t)(v[i] >= 128);   /* 0 o -1, es decir todo bits a uno */
+s += v[i] & m;
+
+/* Sin rama, dejando que el compilador emita cmov. */
+s += (v[i] >= 128) ? v[i] : 0;
+```
+
+Ninguna de las tres formas es universalmente mejor, y ese es el punto. La versión sin ramas paga siempre; la versión con rama paga solo cuando falla. El umbral de rentabilidad está alrededor de un diez por ciento de fallos, aunque depende de la profundidad del cauce y del trabajo que la rama se ahorra cuando acierta. Peor aún: el compilador decide por su cuenta si emite `cmov` o un salto, y con frecuencia acierta más que tú. La única forma honesta de saberlo es escribir ambas versiones, medirlas con `perf stat -e branch-misses,cycles` y quedarse con los números.
+
+Queda un frente que la mayoría de los programadores no considera nunca: el **extremo frontal**. Todo lo anterior asume que las instrucciones llegan al descodificador, pero el código también vive en memoria y también compite por caché. Un binario grande con funciones calientes dispersas por todo el segmento de texto sufre fallos de caché de instrucciones y de `TLB` de instrucciones, y esos fallos son especialmente caros porque vacían el cauce por hambre en lugar de por error. Es la razón de que la optimización guiada por perfiles exista y de que dé mejoras de entre un diez y un quince por ciento en cargas grandes sin cambiar una línea de fuente: reordena los bloques básicos para que el camino frecuente sea contiguo, agrupa las funciones calientes y expulsa el código de manejo de errores lejos.
+
+```bash
+# Optimizacion guiada por perfiles: dos compilaciones y una ejecucion
+gcc -O2 -fprofile-generate prog.c -o prog && ./prog carga_representativa
+gcc -O2 -fprofile-use -fprofile-correction prog.c -o prog
+```
+
+La condición crítica es que la carga de entrenamiento sea representativa. Un perfil recogido sobre datos que no se parecen a los de producción coloca en línea recta el camino equivocado y puede empeorar el rendimiento, que es la forma más elegante de perder el tiempo dos veces.
+
+Dos herramientas complementarias. Los atributos `[[likely]]` y `[[unlikely]]` de C23, y el veterano `__builtin_expect`, no enseñan nada al predictor dinámico —ese aprende solo— pero sí guían al compilador para colocar el camino frecuente en línea recta y expulsar el raro fuera de la ruta caliente, lo que mejora la densidad de la caché de instrucciones. Y en el otro extremo, las llamadas indirectas a través de punteros a función y los `switch` compilados como tabla de saltos dependen del `BTB`: un despachador virtual con muchos destinos distintos falla igual que una rama al azar, y es la razón de que los intérpretes rápidos repliquen el despachador al final de cada operación en lugar de centralizarlo en un bucle único.
+
+<Challenge title="Cuantifica la especulación">
+1. Implementa `suma_condicional`, ejecútala sobre un array aleatorio y sobre el mismo array ordenado, y mide ambas con `perf stat -e cycles,instructions,branches,branch-misses`. Comprueba que las instrucciones son idénticas y que los ciclos no.
+2. A partir de esos contadores, despeja el coste medio de un fallo de predicción en tu máquina. Compáralo con la profundidad de cauce documentada de tu microarquitectura.
+3. Escribe las tres variantes de la sección final —rama, máscara y operador ternario— y compara el ensamblador con `objdump -d`. Averigua en cuáles emitió el compilador un `cmov` sin que se lo pidieras.
+4. Barre la probabilidad de la condición de cero a uno en pasos de cinco centésimas y grafica el tiempo de la versión con rama frente a la versión sin ramas. Localiza el punto de cruce empírico.
+5. Escribe un intérprete mínimo de máquina de pila con un `switch` en un bucle, mide sus `branch-misses`, conviértelo a despacho replicado con `goto` calculado y vuelve a medir.
+</Challenge>

@@ -1,0 +1,142 @@
+---
+title: "Writeback: páginas sucias, dirty_ratio y durabilidad"
+description: "Una escritura bufferizada solo ensucia un folio en RAM; bajarlo al disco es trabajo del writeback. Las páginas sucias, los umbrales `dirty_ratio`, los hilos flusher per-bdi que sustituyeron a pdflush, y por qué solo `fsync` garantiza durabilidad."
+subject: kernel
+level: 24
+order: 4
+position: "24.4"
+duration: "17 min"
+---
+
+<Lead>
+Cuando `write()` regresa, tu dato es un folio sucio en RAM: visible para cualquiera que lea el archivo, pero perdido si se corta la luz. Convertir esa promesa en un dato durable es el trabajo del **writeback**. Hay un delicado equilibrio detrás: escribir demasiado pronto desperdicia E/S, demasiado tarde arriesga los datos y satura la RAM. El kernel lo gobierna con umbrales, hilos de flush dedicados y una barrera final —`fsync`— que es la única forma de exigir durabilidad de verdad.
+</Lead>
+
+<Goals>
+
+- Seguir el ciclo de vida de un folio de sucio a en-writeback a limpio.
+- Entender `dirty_background_ratio`, `dirty_ratio` y el freno `balance_dirty_pages`.
+- Conocer los hilos flusher per-bdi que reemplazaron a pdflush y bdflush.
+- Distinguir visibilidad de durabilidad y el papel de `fsync` y `errseq_t`.
+
+</Goals>
+
+## De sucia a limpia
+
+Marcar un folio sucio pone el flag `PG_dirty` y activa `PAGECACHE_TAG_DIRTY` en la XArray del archivo. A partir de ahí el folio recorre tres estados hasta volver a ser reclamable:
+
+```c
+/* mm/page-writeback.c: transiciones del folio */
+filemap_dirty_folio(mapping, folio);   /* 1. sucio: PG_dirty, tag DIRTY */
+folio_start_writeback(folio);          /* 2. en vuelo: PG_writeback, tag WRITEBACK */
+folio_end_writeback(folio);            /* 3. limpio: quita ambos, el dato ya esta en disco */
+```
+
+Durante el paso 2 el folio está simultáneamente en la lista de writeback y visible para lectores; solo cuando el dispositivo confirma la escritura se llama a `folio_end_writeback` y el folio queda limpio, apto para ser reclamado sin pérdida. Las marcas de la XArray son lo que permite al motor de writeback recorrer **solo** los folios sucios de un archivo de gigabytes sin inspeccionar los limpios.
+
+<Mermaid code={`flowchart LR
+  W[write llena el folio] --> D[folio marcado dirty]
+  D -->|supera dirty_background_ratio| B[hilo flusher per-bdi]
+  D -->|supera dirty_ratio| T[balance_dirty_pages frena al escritor]
+  B --> WB[folio en writeback]
+  T --> WB
+  WB --> C[folio limpio en disco]
+  F[fsync] --> WB`} />
+
+## dirty_ratio y el freno al escritor
+
+¿Cuánta memoria sucia tolera el kernel antes de forzar la bajada? Lo deciden dos umbrales, expresados como porcentaje de la RAM disponible:
+
+```bash
+$ sysctl vm.dirty_background_ratio vm.dirty_ratio
+vm.dirty_background_ratio = 10   # a partir de aqui, los flusher empiezan en segundo plano
+vm.dirty_ratio = 20              # a partir de aqui, se frena al proceso que escribe
+```
+
+El **umbral de fondo** (`dirty_background_ratio`, 10% por defecto) es suave: al superarlo, los hilos flusher arrancan en segundo plano sin molestar a nadie. El **umbral duro** (`dirty_ratio`, 20%) es un tope: si la memoria sucia lo alcanza, `balance_dirty_pages` **bloquea al propio proceso escritor** dentro de su `write()`, obligándolo a esperar a que baje suficiente dato. Es un mecanismo de contrapresión: nadie puede ensuciar RAM más rápido de lo que el disco la absorbe.
+
+```c
+/* llamado desde el camino de escritura tras cada folio (nivel 24.3) */
+void balance_dirty_pages_ratelimited(struct address_space *mapping);
+/* si se supera dirty_ratio, duerme al escritor hasta drenar lo suficiente */
+```
+
+Para cargas donde el porcentaje es demasiado grosero (un 20% de 512 GiB son 100 GiB de datos en riesgo), existen las variantes en bytes absolutos, y dos temporizadores que fuerzan la bajada aunque no se alcancen los umbrales:
+
+```bash
+vm.dirty_bytes = 0             # alternativa absoluta a dirty_ratio (0 = usar el %)
+vm.dirty_expire_centisecs = 3000   # un folio sucio mas de 30 s debe bajarse
+vm.dirty_writeback_centisecs = 500 # el flusher despierta cada 5 s a revisar
+```
+
+<Callout type="warn" title="Un dirty_ratio alto es un búfer de datos en riesgo">
+Subir `dirty_ratio` acelera ráfagas de escritura porque permite acumular más en RAM antes del freno, pero cada byte sucio es un byte que se pierde en un corte de luz y que además habrá que escribir de golpe, causando picos de latencia. En servidores con mucha RAM, la práctica habitual es usar `dirty_bytes`/`dirty_background_bytes` en valores absolutos (por ejemplo unos cientos de MiB) en vez de porcentajes, para acotar tanto el riesgo como el tamaño de las ráfagas de E/S.
+</Callout>
+
+## Los hilos de flush: de pdflush a per-bdi
+
+Quién hace materialmente la bajada ha evolucionado mucho. En los kernels 2.4 eran `bdflush` (páginas) y `kupdated` (temporizador). Los 2.6 tempranos los unificaron en `pdflush`, un pool global de hilos. Pero un pool global tenía un defecto fatal: un dispositivo lento (un pincho USB) podía acaparar todos los hilos y matar de hambre a un NVMe rápido. La solución, vigente en 7.x, es **un hilo flusher por dispositivo de respaldo** (`bdi`, *backing device info*):
+
+```c
+/* include/linux/backing-dev-defs.h: el escritor por dispositivo */
+struct bdi_writeback {
+	struct backing_dev_info *bdi;
+	unsigned long           state;
+	struct delayed_work     dwork;   /* la funcion wb_workfn corre aqui */
+	struct list_head        b_dirty; /* inodos sucios de este dispositivo */
+	/* ... */
+};
+```
+
+Cada `bdi` tiene su propio `bdi_writeback`, y su trabajo se ejecuta como *delayed work* (`wb_workfn`) sobre la workqueue `bdi_wq`. Los verás en `ps` como hilos de kworker asociados a la workqueue de writeback. Así cada dispositivo drena a su propio ritmo: el USB lento no frena al NVMe. En sistemas con cgroups, el writeback está además *cgroup-aware*, atribuyendo la E/S sucia al cgroup que la generó para un control de recursos justo.
+
+## fsync y la durabilidad
+
+Ninguno de los mecanismos anteriores promete *cuándo* llegará tu dato al disco: solo que llegará. Cuando necesitas la garantía —una base de datos confirmando una transacción, un editor guardando— usas `fsync`, que fuerza la bajada de todos los folios sucios del archivo y espera a que el dispositivo confirme:
+
+```c
+/* fuerza writeback del rango y espera; datasync omite metadatos no esenciales */
+int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync);
+```
+
+`fsync` hace dos cosas que el writeback en segundo plano no garantiza: espera a la confirmación **síncronamente**, y emite una **orden de vaciado de caché al dispositivo** (`REQ_PREFLUSH` y, opcionalmente, `REQ_FUA`) para que el dato salga del propio caché volátil del disco a la superficie persistente. `fdatasync` es la variante que omite metadatos no esenciales (como el `mtime`), más rápida cuando solo importa el contenido. La detección de errores es sutil: un fallo de writeback debe reportarse en el `fsync` de **cada** descriptor abierto, aunque el error ocurriera una sola vez. Ese es el papel de `errseq_t`:
+
+```c
+struct address_space {
+	/* ... */
+	errseq_t wb_err;   /* secuencia de errores de writeback del archivo */
+};
+/* cada open recuerda el punto que ya vio; fsync devuelve el error una vez por fd */
+int err = file_check_and_advance_wb_err(file);
+```
+
+Este diseño arregló un bug histórico en el que un error de escritura consumido por un proceso quedaba invisible para otro que hacía `fsync` del mismo archivo, dando por buenos datos perdidos.
+
+El kernel ofrece un abanico de primitivas de durabilidad, de la más quirúrgica a la más contundente; elegir la correcta es cuestión de cuánto quieres forzar y con qué coste:
+
+<Cards>
+  <Card icon="🧷" title="fsync">
+    Baja datos y metadatos del archivo y espera confirmación, con vaciado del caché volátil del dispositivo. La garantía completa.
+  </Card>
+  <Card icon="⚡" title="fdatasync">
+    Como `fsync` pero omite metadatos no esenciales como el `mtime`. Más rápido cuando solo importa el contenido.
+  </Card>
+  <Card icon="🌍" title="sync y syncfs">
+    Fuerzan el writeback de todo el sistema o de un sistema de archivos entero, no de un solo archivo.
+  </Card>
+  <Card icon="🔒" title="O_SYNC">
+    Abre el archivo de modo que cada `write` sea ya durable, sin `fsync` explícito. Cómodo, pero lento por operación.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="write() da visibilidad, fsync() da durabilidad: confundirlas cuesta datos">
+La lección que separa a quien entiende almacenamiento de quien no es esta: `write()` y `fsync()` responden preguntas distintas, y tratarlas como si fueran la misma es la raíz de casi toda pérdida de datos. `write()` te da **visibilidad**: tras ella, cualquier lector del archivo verá el dato nuevo, porque está en el folio compartido del page cache. Pero visibilidad no es persistencia: ese folio vive en RAM volátil, y hasta que el writeback lo baje y el dispositivo lo confirme, un corte de luz lo borra sin dejar rastro. `fsync()` te da **durabilidad**: bloquea hasta que el dato está físicamente en el medio persistente, atravesando incluso el caché volátil del propio disco con una orden de flush. El page cache es, en este sentido, una mentira útil —te deja creer que escribiste en disco cuando escribiste en memoria— y `fsync` es cómo obligas periódicamente a esa mentira a volverse verdad. Toda la teoría de durabilidad de bases de datos vive en esta grieta: el *write-ahead log*, el *group commit*, las barreras de escritura, el debate sobre si `fsync` que falla debe reintentarse o es irrecuperable. Y hay una trampa final que hunde a los ingenuos: `fsync` de un archivo recién creado no garantiza que el **directorio** que lo contiene sea durable; hace falta `fsync` también del directorio, o el archivo puede existir sin que nadie sepa encontrarlo tras el reinicio. Interioriza que durabilidad es una operación explícita, nunca un efecto secundario, y habrás evitado la categoría de bug más silenciosa y cruel que existe.
+</Callout>
+
+<Challenge title="Fuerza la verdad al disco">
+1. Escribe un archivo grande y observa en `/proc/meminfo` cómo sube `Dirty` y luego baja sola tras `vm.dirty_expire_centisecs`.
+2. Baja `vm.dirty_background_bytes` a unos pocos MiB y comprueba con `iostat 1` que el writeback arranca casi de inmediato.
+3. Compara `time` de un bucle que hace `write` sin `fsync`, con `fsync` por iteración, y con `fdatasync`; explica el orden de magnitud de diferencia.
+4. Investiga con `ftrace` o `bpftrace` cuándo se llama a `folio_start_writeback` durante una copia grande.
+5. Explica por qué `errseq_t` es necesario para que dos descriptores del mismo archivo no se pierdan un error de escritura.
+</Challenge>

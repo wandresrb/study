@@ -1,0 +1,156 @@
+---
+title: "Introspección: leer, escribir y fusionar upvalues"
+description: "La biblioteca debug abre en canal el mecanismo de captura: enumerar y modificar upvalues desde fuera del closure, comprobar con upvalueid si dos funciones comparten la misma celda, y redirigir una captura con upvaluejoin. Qué revela cada primitiva sobre la implementación, para qué se usa de verdad y por qué es lo primero que se retira de un sandbox."
+subject: lua
+level: 8
+order: 5
+position: "8.5"
+duration: "17 min"
+---
+
+<Lead>
+Todo lo que has construido en este nivel descansa sobre una promesa de opacidad: los upvalues no están en ninguna tabla, no los alcanza `pairs`, no los ve el serializador y por eso sirven como estado privado de verdad. La biblioteca `debug` rompe esa promesa a conciencia, y lo hace con una precisión que la convierte en la mejor documentación viva de la implementación. Con cuatro funciones puedes enumerar los upvalues de cualquier closure, leerlos, escribirlos, preguntar si dos closures comparten la misma celda y hasta redirigir una captura para que apunte a otra. Nada de esto es un agujero accidental: es una consecuencia deliberada de que los upvalues sean objetos de primera clase con identidad propia, y estudiarlo cierra el nivel porque convierte en observable todo lo que hasta ahora era un modelo mental. También impone una lección de seguridad que conviene aprender aquí y no en producción.
+</Lead>
+
+<Goals>
+
+- Enumerar y modificar upvalues desde fuera con `debug.getupvalue` y `debug.setupvalue`.
+- Comprobar la compartición de celdas con `debug.upvalueid`.
+- Entender qué hace `debug.upvaluejoin` y para qué se usó históricamente.
+- Razonar el coste y el riesgo de la introspección, y por qué se retira del sandbox.
+
+</Goals>
+
+## Leer y escribir la caja negra
+
+Las dos primitivas básicas indexan los upvalues de un closure por posición, en el orden en que el compilador los asignó:
+
+```lua
+local function fabrica()
+  local secreto = 42
+  local paso = 1
+  return function() secreto = secreto + paso; return secreto end
+end
+
+local f = fabrica()
+
+local i = 1
+while true do
+  local nombre, valor = debug.getupvalue(f, i)
+  if not nombre then break end
+  print(i, nombre, valor)
+  i = i + 1
+end
+--> 1  secreto  42
+--> 2  paso     1
+
+debug.setupvalue(f, 1, 1000)
+print(f())   --> 1001
+```
+
+Tres observaciones que valen más que el ejemplo. La primera es que los nombres están ahí porque el prototipo conserva la tabla de descripción de upvalues que el compilador generó, y esa tabla se compila siempre, no solo en modo de depuración. La segunda es que la escritura desde fuera es real: no modificas una copia, escribes en la misma celda que ve el closure, con lo que acabas de saltarte por completo el encapsulamiento de la lección 3. La tercera es que un closure C tiene también upvalues accesibles por esta vía, pero sin nombre, porque en el lado C no hay declaraciones léxicas que nombrar; obtienes la cadena vacía como nombre y el valor correcto.
+
+Un caso especial merece atención propia. Si la función usa alguna variable global, tendrá un upvalue llamado `_ENV`, casi siempre el primero. Leerlo te devuelve la tabla de entorno de esa función; escribirlo la sustituye. Eso es exactamente el mecanismo que reemplazó a la vieja función de cambiar entornos que existía hasta Lua 5.1: cambiar el entorno de una función ya compilada es, hoy, escribir un upvalue.
+
+```lua
+local function usa_globales()
+  return saludo_global
+end
+
+print(debug.getupvalue(usa_globales, 1))   --> 1  _ENV  table: 0x...
+
+local jaula = { saludo_global = "hola desde la jaula" }
+debug.setupvalue(usa_globales, 1, jaula)
+
+print(usa_globales())                      --> hola desde la jaula
+```
+
+Sin recompilar nada y sin tocar el cuerpo de la función, has cambiado el universo de globales que esa función ve. Repara en la simetría con la lección 1: si `_ENV` es una variable léxica normal, entonces el sandbox no es un subsistema aparte, es una aplicación más del mismo mecanismo de captura. Y comprueba también el caso complementario: una función que no use ninguna global no tendrá ese upvalue, y la enumeración lo confirmará devolviendo nada en la primera posición.
+
+<Callout type="info" title="El orden de los upvalues no es un contrato">
+Los índices dependen de cómo el compilador ordenó las capturas en ese prototipo concreto, y esa ordenación puede cambiar entre versiones de Lua o entre reescrituras del código fuente. Escribir un parche que fija el upvalue número dos y confía en que siga siendo el mismo dentro de un año es una receta de fallo silencioso. Cuando necesites tocar uno, recórrelos y localízalo por nombre.
+</Callout>
+
+## La identidad de la celda
+
+La primitiva más reveladora del conjunto no lee ni escribe nada: solo responde a la pregunta de si dos capturas son la misma. `debug.upvalueid` devuelve un valor opaco que identifica de forma única el objeto upvalue, de modo que comparándolos puedes verificar empíricamente lo que en las lecciones anteriores era teoría.
+
+```lua
+local function par()
+  local n = 0
+  return function() return n end, function() n = n + 1 end
+end
+
+local leer, subir = par()
+local otro_leer = (par())
+
+print(debug.upvalueid(leer, 1) == debug.upvalueid(subir, 1))       --> true
+print(debug.upvalueid(leer, 1) == debug.upvalueid(otro_leer, 1))   --> false
+```
+
+La primera comparación confirma la tesis central de la lección 3: dos closures creados en el mismo ámbito no tienen dos copias de `n`, tienen dos punteros al mismo objeto. La segunda confirma que cada invocación de la fábrica produce celdas nuevas. Es el mismo experimento que allí hacías por observación del comportamiento —modifico con uno y leo con el otro— pero ahora respondido directamente por el runtime, sin inferencia.
+
+<Mermaid code={`flowchart LR
+  G[getupvalue] --> R[Lee nombre y valor de la celda]
+  S[setupvalue] --> W[Escribe en la celda que ve el closure]
+  I[upvalueid] --> D[Revela identidad de la celda]
+  J[upvaluejoin] --> M[Redirige una captura hacia otra celda]
+  D --> X[Permite comprobar comparticion]
+  M --> Y[Crea comparticion que el lexico no daba]`} />
+
+## Fusionar capturas
+
+La cuarta primitiva es la más agresiva y la que mejor explica la arquitectura. `debug.upvaluejoin` toma dos closures y dos índices, y hace que la captura indicada del primero pase a referirse a la misma celda que la captura indicada del segundo. No copia valores: reescribe el puntero del vector de upvalues.
+
+Esto es genuinamente notable, porque produce una situación que el lenguaje por sí solo no puede expresar. En Lua puro, dos funciones comparten una celda si y solo si se crearon en un ámbito donde la variable era la misma; la compartición es una propiedad del texto del programa. Con esta función puedes hacer que compartan celda dos closures nacidos en fábricas distintas, en ficheros distintos, en momentos distintos. La topología de captura deja de estar determinada por el léxico.
+
+```lua
+local function contador()
+  local n = 0
+  return function() n = n + 1; return n end
+end
+
+local a, b = contador(), contador()
+a(); a()
+print(a(), b())                     --> 3   1, independientes
+
+debug.upvaluejoin(b, 1, a, 1)       -- b pasa a usar la celda de a
+print(b(), a())                     --> 4   5, ahora comparten
+```
+
+Antes de la fusión, `a` y `b` eran dos instancias sin relación alguna, cada una con su celda cerrada en el montón. Después, la primera captura de `b` apunta al mismo objeto que la de `a`, y el valor previo de `b` queda huérfano y a merced del recolector. Ninguna reescritura del programa en Lua puro habría producido ese estado, porque ambas celdas nacieron en invocaciones distintas de la misma fábrica.
+
+Su uso histórico más importante fue emular la vieja semántica de cambio de entorno sobre el modelo de `_ENV`: dado un conjunto de funciones que debían compartir el mismo entorno, se unían sus upvalues de entorno para que un cambio en una se viera en todas. Hoy sigue apareciendo en bibliotecas de parcheo en caliente, en herramientas de recarga de módulos sin reiniciar el proceso y en marcos de pruebas que sustituyen una dependencia capturada por un doble sin tener que reconstruir el objeto que la capturó.
+
+<Cards>
+  <Card icon="🔍" title="Diagnóstico">
+    Volcar los upvalues de un closure sospechoso es a veces la única manera de entender por qué un callback ve un estado que no esperabas. La alternativa es reproducir el bug, que en código diferido casi nunca se deja.
+  </Card>
+  <Card icon="🧪" title="Pruebas">
+    Sustituir por un doble una dependencia capturada permite probar funciones que no reciben sus colaboradores por parámetro. Úsalo como último recurso: si necesitas esto a menudo, el problema es el diseño.
+  </Card>
+  <Card icon="♻️" title="Recarga en caliente">
+    Recompilar un módulo genera closures nuevos con celdas nuevas; unir sus upvalues a los antiguos conserva el estado vivo a través de la recarga. Es la técnica base de los entornos que se actualizan sin reiniciar.
+  </Card>
+  <Card icon="🚨" title="Riesgo">
+    Todo lo anterior escribe en celdas que el código propietario cree suyas. Un valor de tipo inesperado colocado en un upvalue produce un fallo lejos del punto de escritura y sin rastro que lo relacione.
+  </Card>
+</Cards>
+
+## Lo que revela y lo que cuesta
+
+Puestas en fila, las cuatro primitivas cuentan una historia coherente sobre la implementación. Que existan nombres demuestra que el prototipo conserva la descripción estática de sus capturas. Que existan índices estables durante la vida del closure demuestra que el vector de upvalues es un array de tamaño fijo decidido al compilar. Que exista una identidad consultable demuestra que la celda es un objeto con existencia propia y no un campo del closure. Y que se pueda redirigir el puntero demuestra que la relación entre closure y celda es una referencia mutable, no una parte estructural del objeto. Toda la lección 2 se puede reconstruir desde esta API sin mirar una línea de C.
+
+El coste tiene dos caras. La obvia es de rendimiento: son funciones de la biblioteca de depuración, no están pensadas para el camino caliente y algunas implementaciones alternativas las soportan de forma parcial o penalizan a la función inspeccionada. La menos obvia es de seguridad, y es la decisiva. Toda la privacidad que construiste en la lección 3 depende de que el código ajeno no tenga acceso a `debug`. Si lo tiene, no hay secreto: puede enumerar las capturas de cualquier función que le pases, leerlas, reescribirlas y, a través del upvalue `_ENV`, alcanzar el entorno global desde el que creías haberlo aislado. Por eso el primer paso de cualquier sandbox serio no es filtrar la biblioteca de ficheros, es retirar `debug` entera.
+
+<Callout type="dios" title="Toda abstracción tiene una puerta, y saber dónde está es parte de dominarla">
+Hay una tentación comprensible al descubrir esta biblioteca, que es leerla como una traición: si la privacidad por closure se rompe con tres llamadas, entonces no era privacidad y todo lo anterior era un cuento. Esa lectura confunde dos planos que conviene mantener separados de por vida. Dentro del lenguaje, el estado capturado en un upvalue es rigurosamente inalcanzable: no hay ninguna expresión de Lua, ninguna metatabla, ninguna iteración, ninguna serialización que lo nombre, y esa garantía es real y es la que sostiene el diseño de la lección 3. Lo que `debug` ofrece no es una expresión del lenguaje sino una capacidad concedida desde fuera, una ventana que el implementador abrió a propósito en el runtime porque un lenguaje sin forma de mirarse por dentro es un lenguaje indepurable. Y como toda capacidad, se posee o no se posee: es un valor concreto colocado en una tabla concreta, y quitarlo del entorno del código no confiable lo deja sin ella. Ese es exactamente el modelo de seguridad de Lua y explica por qué el sandbox se construye entregando entornos en lugar de comprobando permisos. La generalización trasciende a Lua y vale la pena grabarla, porque el patrón se repite en todas partes: los campos privados de la clase se leen por reflexión, la memoria del proceso se lee con el depurador conectado, el contenedor aislado se abre desde el anfitrión, el cifrado en reposo se descifra por quien tenga la llave. En todos los casos la abstracción es sólida frente a quien juega dentro de las reglas y transparente frente a quien tiene una capacidad de nivel superior. La madurez técnica no consiste en fingir que esas puertas no existen ni en concluir que la abstracción no sirve, sino en saber exactamente cuántas hay, quién tiene las llaves y qué hay que retirar del entorno para que el adversario no las tenga. Un ingeniero que sabe que `debug` existe protege mejor su estado privado que uno que cree que el closure es una caja fuerte, porque el primero retira la biblioteca y el segundo la deja puesta.
+</Callout>
+
+<Challenge title="Abre la caja y vuelve a cerrarla">
+1. Escribe una función que reciba cualquier closure y devuelva una tabla con los nombres y valores de todos sus upvalues. Pruébala con las fábricas de las lecciones anteriores.
+2. Toma el objeto `cuenta` de la lección 3 y modifica su saldo desde fuera con `debug.setupvalue`. Comprueba que ninguna validación se ha ejecutado.
+3. Verifica con `debug.upvalueid` tus tres predicciones del reto de la lección 2 sobre qué closures comparten celda.
+4. Crea dos contadores independientes y únelos con `debug.upvaluejoin` para que compartan el contador. Observa el resultado y explica por qué el léxico del programa no permitiría escribirlo.
+5. Construye un entorno reducido para código no confiable en el que `debug` no exista, y comprueba que desde dentro ya no hay manera de inspeccionar un closure que le entregues.
+</Challenge>

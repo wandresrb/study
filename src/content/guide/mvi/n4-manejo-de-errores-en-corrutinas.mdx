@@ -1,0 +1,148 @@
+---
+title: "Manejo de errores: try, handler y supervisorScope"
+description: "El manejo de excepciones en corrutinas desconcierta porque parece igual al de siempre y no lo es: un try alrededor de un launch no captura nada, porque el fallo no vuelve por la pila de llamadas sino que asciende por el árbol de Jobs. Esta lección ordena el asunto en cuatro pasos. Primero, el try dentro del cuerpo, que sigue funcionando exactamente como esperas y es la herramienta correcta el noventa por ciento de las veces. Segundo, la propagación estructural y por qué launch y async difieren. Tercero, el CoroutineExceptionHandler como red de seguridad de última instancia y sus condiciones exactas de uso. Y cuarto, supervisorScope y el SupervisorJob, que rompen la ley de ascenso para que un hijo pueda fracasar sin arrastrar a sus hermanos. Cierra aplicándolo a Orbit: el error como estado, no como caída."
+subject: mvi
+level: 4
+order: 5
+position: "4.5"
+duration: "20 min"
+---
+
+<Lead>
+Ninguna parte de las corrutinas confunde tanto como esta, y la razón es que se parece demasiado a lo que ya sabías. El `try` y el `catch` siguen ahí, con la misma sintaxis, y por eso el primer instinto es envolver un `launch` con ellos y esperar que funcione. No funciona, y el motivo es exactamente lo que este nivel lleva construyendo: en código secuencial una excepción vuelve por la pila de llamadas hacia quien te invocó, pero una corrutina no le devuelve nada a quien la lanzó, porque su relación con él no es de llamada sino de parentesco. El fallo no retrocede por la pila; asciende por el árbol de `Job`. Esta lección cierra el nivel poniendo orden en esa diferencia y dando la única regla que de verdad importa en una arquitectura MVI: en una app bien hecha, casi todos los errores deberían acabar siendo estado.
+</Lead>
+
+<Goals>
+
+- Usar `try` y `catch` dentro del cuerpo de la corrutina y saber por qué envolver un `launch` no captura nada.
+- Seguir la propagación estructural del fallo y distinguir el comportamiento de `launch` del de `async`.
+- Instalar un `CoroutineExceptionHandler` sabiendo dónde surte efecto y dónde se ignora.
+- Aplicar `supervisorScope` y `SupervisorJob` para que un hijo pueda fallar sin arrastrar a sus hermanos.
+
+</Goals>
+
+## El try que sí funciona está dentro
+
+Empecemos por la buena noticia, que además cubre la inmensa mayoría de los casos reales: dentro del cuerpo de una corrutina, el manejo de excepciones es idéntico al de cualquier código secuencial. Como el compilador reescribe la función pero conserva su estructura de control, un `try` que envuelve una llamada suspendible captura lo que esa llamada lance, aunque entre el intento y el fallo hayan pasado dos segundos y un cambio de hilo.
+
+```kotlin
+// Correcto: el try esta DENTRO, envolviendo el trabajo suspendible
+fun cargarPerfil(id: String) = intent {
+    reduce { state.copy(cargando = true) }
+    try {
+        val perfil = repo.perfil(id)
+        reduce { state.copy(perfil = perfil, cargando = false, error = null) }
+    } catch (e: IOException) {
+        reduce { state.copy(cargando = false, error = "Sin conexion") }
+    }
+}
+
+// Inutil: el try esta FUERA. launch retorna de inmediato y no lanza nada aqui
+try {
+    scope.launch { repo.perfil(id) }   // el fallo ocurre despues, en otra rama
+} catch (e: Exception) {
+    // este bloque no se ejecutara jamas
+}
+```
+
+La asimetría se explica sola en cuanto la miras con las reglas de la lección segunda. `launch` no ejecuta el bloque y devuelve su resultado: registra una corrutina hija y retorna un `Job` casi al instante. Cuando el fallo ocurre, la línea del `try` externo hace rato que terminó y su marco de pila ya no existe. No hay nada que capturar porque no hay nadie esperando ahí. El `catch` externo no es que falle: es que pregunta en el sitio equivocado.
+
+<Callout type="warn" title="Cuidado con capturar Exception a secas">
+Un `catch` de `Exception` también atrapa la `CancellationException` que viste en la lección anterior, y si no la relanzas dejas viva a una corrutina que el sistema ya dio por cancelada: seguirá ejecutando el resto del bloque, quizá tocando el estado de una pantalla que ya no existe. Las dos formas correctas son capturar tipos concretos —`IOException`, `HttpException`, los errores de tu dominio— o, cuando de verdad necesites un `catch` amplio, llamar a `ensureActive` como primera línea del bloque, que relanza si la corrutina estaba cancelada y no hace nada en caso contrario.
+</Callout>
+
+## Cómo asciende el fallo
+
+Cuando una excepción escapa del cuerpo de una corrutina sin ser capturada, entra en juego la segunda ley del árbol: el fallo asciende. La corrutina se marca como fallida, notifica a su padre, el padre cancela al resto de sus hijos y sigue propagando hacia arriba hasta la raíz. Si nadie lo detiene, el `Job` raíz queda cancelado y el error se considera no capturado.
+
+`launch` y `async` difieren en un punto que conviene tener muy claro. `launch` propaga de inmediato: en cuanto falla, el árbol se entera. `async` **guarda** la excepción dentro del `Deferred` y la relanza cuando alguien llama a `await`, lo que permite capturarla con un `try` alrededor de ese `await`. Pero cuidado con la conclusión fácil: si el `async` cuelga de un ámbito ordinario, el fallo sigue cancelando al padre por la vía estructural, capture alguien el `await` o no. Solo cuando el `async` cuelga de un ámbito supervisor su fracaso queda confinado al `Deferred`.
+
+<Mermaid code={`flowchart TD
+  H1[Hijo 1 falla con IOException] -->|asciende| P[Job padre del scope]
+  P -->|cancela a los hermanos| H2[Hijo 2 cancelado]
+  P -->|cancela a los hermanos| H3[Hijo 3 cancelado]
+  P -->|sigue ascendiendo| R[Job raiz]
+  R --> HD[CoroutineExceptionHandler si lo hay]
+  HD --> L[Registro y aviso final]
+  class H1 t-red
+  class R t-mauve
+  class HD t-yellow`} />
+
+Hay además un detalle de la propagación que sorprende la primera vez que se ve en una traza. Cuando un fallo cancela a sus hermanos, esos hermanos terminan con `CancellationException` y no con el error original, así que el informe que llegue arriba contendrá una sola causa real y varias cancelaciones derivadas. Si a la vez que se propaga el primer fallo ocurre un segundo error genuino en otra rama, la biblioteca conserva el primero como causa principal y adjunta el resto como excepciones suprimidas. Saber esto ahorra tiempo al depurar: la primera excepción de la lista suele ser la que hay que investigar, y las demás son consecuencia.
+
+Hay una consecuencia de diseño que merece decirse en voz alta. Que el fallo cancele a los hermanos es correcto cuando las tres cargas eran partes de un mismo resultado: si el perfil no llegó, seguir descargando sus publicaciones es gastar batería para nada. Pero es un desastre cuando los hijos son independientes —tres secciones de una portada, tres sincronizaciones de módulos distintos—, porque un fallo aislado deja la pantalla entera vacía. Distinguir esos dos casos es exactamente la decisión que resuelve `supervisorScope`, y por eso se estudia al final y no al principio.
+
+## El manejador como última red
+
+Un `CoroutineExceptionHandler` es un elemento del contexto que se invoca cuando una excepción llega a la raíz sin que nadie la haya capturado. No es un `catch` distribuido ni sirve para recuperarse: para cuando se ejecuta, la corrutina ya murió y su subárbol ya fue cancelado. Su papel legítimo es el de registro y aviso: escribir en la traza, mandar el fallo al sistema de informes, mostrar un mensaje genérico.
+
+```kotlin
+val manejador = CoroutineExceptionHandler { contexto, error ->
+    registro.reportar(error, contexto[CoroutineName]?.name)
+}
+
+// Surte efecto: esta en el contexto de la corrutina RAIZ del scope
+val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + manejador)
+scope.launch { puedeFallar() }
+
+// No surte efecto: en un hijo, el contexto se ignora para este proposito
+scope.launch {
+    launch(manejador) { puedeFallar() }   // el fallo lo gestiona el padre
+}
+```
+
+La regla de instalación es estricta y produce muchos desconciertos: el manejador solo se consulta en la corrutina **raíz** de un ámbito, porque un hijo no gestiona sus propios errores, los delega en su padre. Ponerlo en un `launch` anidado no hace nada. Hay además una segunda condición que sorprende: un `async` raíz tampoco lo usa, porque su excepción es responsabilidad de quien llame a `await`; si nadie lo llama, el error se pierde en silencio, que es una de las pocas fugas de información que el sistema permite.
+
+<Cards>
+  <Card icon="🎯" title="try dentro del cuerpo">
+    La herramienta principal. Captura donde ocurre, permite reintentar y convertir el fallo en estado. Cubre casi todos los casos reales.
+  </Card>
+  <Card icon="🧯" title="CoroutineExceptionHandler">
+    Red de última instancia en la raíz, solo para registrar y avisar. Nunca para recuperarse, porque el subárbol ya está cancelado.
+  </Card>
+  <Card icon="🛡️" title="supervisorScope">
+    Rompe el ascenso: un hijo puede fallar sin cancelar a sus hermanos. Para trabajo genuinamente independiente.
+  </Card>
+  <Card icon="🌀" title="catch de Flow">
+    El operador `catch` intercepta fallos aguas arriba dentro de un flujo, y combinado con `retry` da reintentos declarativos sin ensuciar el cuerpo.
+  </Card>
+</Cards>
+
+Un apunte de plataforma que cierra el apartado: en Android, si un fallo llega sin manejador hasta la raíz de un ámbito que no lo tiene, la excepción acaba en el gestor global de la máquina virtual, que en la práctica significa cerrar la aplicación. Por eso `viewModelScope` no es una red de seguridad: cancela bien, pero no perdona errores. La red la pones tú, y ponerla donde toca —dentro del `intent`, junto al trabajo que puede fallar— es lo que separa una app que informa de una que desaparece.
+
+## supervisorScope: hijos que fallan solos
+
+`supervisorScope` crea un ámbito con las mismas garantías estructurales que `coroutineScope` —espera a todos sus hijos, propaga la cancelación hacia abajo— pero con la ley de ascenso desactivada: el fallo de un hijo no cancela ni al padre ni a sus hermanos. Cada rama responde de sí misma. Su equivalente duradero es el `SupervisorJob`, que se coloca en el contexto de un ámbito de larga vida y es, por cierto, lo que `viewModelScope` usa por dentro.
+
+```kotlin
+fun cargarPortada() = intent {
+    supervisorScope {
+        launch { runCatching { repo.destacados() }
+            .onSuccess { d -> reduce { state.copy(destacados = d) } }
+            .onFailure { reduce { state.copy(fallo = state.fallo + "destacados") } } }
+        launch { runCatching { repo.recientes() }
+            .onSuccess { r -> reduce { state.copy(recientes = r) } }
+            .onFailure { reduce { state.copy(fallo = state.fallo + "recientes") } } }
+    }
+}
+```
+
+Conviene precisar el alcance exacto de la excepción, porque se confunde con facilidad. `supervisorScope` desactiva el ascenso solo para sus **hijos directos**; dentro de cada uno de ellos, el árbol vuelve a comportarse como siempre. Si el primer `launch` del ejemplo abriera a su vez tres nietos con un `coroutineScope` ordinario, el fallo de uno de esos nietos cancelaría a sus dos hermanos y haría fracasar a su padre, aunque ese fracaso ya no salpicara a la otra sección. Es justo lo que quieres: cada sección es una unidad indivisible hacia dentro e independiente hacia fuera.
+
+Fíjate en la forma que toma el resultado. Cada sección se resuelve por su cuenta y publica lo que consiguió; si una falla, la pantalla muestra las otras dos y marca la caída de la tercera. Sin el supervisor, un solo fallo de red habría cancelado el ámbito entero y el usuario vería una portada vacía por culpa de una sección secundaria. La elección entre `coroutineScope` y `supervisorScope` se reduce a una pregunta sobre el significado de los datos: si el resultado solo tiene sentido completo, quieres el ordinario; si cada parte vale por sí sola, quieres el supervisor.
+
+<Callout type="tip" title="En MVI el error casi siempre es un campo del estado">
+Todo lo anterior desemboca en una consecuencia arquitectónica que cierra el círculo con lo que aprendiste en los niveles anteriores. Una excepción que asciende hasta el manejador es un error que ya no puedes contar bien: la corrutina murió y lo único que queda es registrar. En una app con MVI eso debería ser excepcional, porque casi todo fallo previsible —sin conexión, credenciales inválidas, tiempo agotado, respuesta malformada— no es una caída sino una **situación** que la interfaz tiene que representar. Su sitio natural es el mismo que el resto de la verdad de la pantalla: un campo del estado, capturado con un `try` dentro del `intent` y publicado con un `reduce`. Deja los side effects para lo verdaderamente efímero —un aviso de una sola vez, una navegación forzada— y reserva el manejador global para lo que de verdad no esperabas.
+</Callout>
+
+<Callout type="dios" title="Un fallo tiene alcance, y elegirlo es una decision de producto disfrazada de tecnica">
+Lo que hace difícil este tema no es la sintaxis sino que obliga a responder una pregunta que el código secuencial nunca te planteaba: cuando algo falla, **qué más deja de tener sentido**. En un programa de una sola línea de ejecución esa pregunta no existe porque la respuesta es siempre la misma, todo lo que venía después; la pila de llamadas es una jerarquía impuesta por el orden temporal, y una excepción simplemente deshace el camino andado hasta que alguien la recoge. En cuanto hay concurrencia, la pila deja de ser el mapa. Tres corrutinas hermanas no están una después de otra, están una al lado de otra, y ninguna regla del lenguaje puede saber si el fracaso de la primera invalida a las otras dos. Solo tú lo sabes, porque depende de qué significan esos datos juntos. Ahí está la clave de todo el diseño: Kotlin no eligió por ti, te dio dos formas de árbol y te obligó a decidir cuál dibujas. El `Job` ordinario declara *estas ramas son partes de un mismo resultado*, y por eso el fallo de una cancela a las demás, que es lo correcto cuando el usuario espera una respuesta única y completa. El `SupervisorJob` declara *estas ramas son resultados independientes que comparten ciclo de vida*, y por eso el fallo se confina, que es lo correcto cuando la pantalla es un mosaico y cada pieza vale por sí sola. Repara en que la diferencia no es técnica sino semántica: dos programas con el mismo código de red y el mismo manejo de excepciones se comportarán de forma opuesta ante un mismo corte de conexión según qué ámbito eligieras, y ninguna de las dos conductas es un bug. El bug es no haber decidido. De ahí se sigue el criterio que conviene llevarse de este nivel entero y aplicar mucho más allá de Kotlin: el manejo de errores maduro no consiste en atrapar excepciones, sino en delimitar su radio de daño antes de que ocurran. Atrapar es la parte fácil y la que todo el mundo hace; delimitar exige mirar tu pantalla y contestar, sección por sección, qué queda en pie si esta pieza no llega. Cuando esa respuesta está escrita en la estructura del árbol y no en la memoria del programador, ocurre lo mismo que ya viste con la inmutabilidad del estado, con los dos flujos del `container` y con la concurrencia estructurada: una clase entera de comportamientos incorrectos deja de ser posible. Y cuando además el resultado de esa delimitación se publica como un campo del estado en vez de como una caída, el error deja de ser algo que le pasa a tu programa y pasa a ser algo que tu programa sabe contar. Esa frase resume el nivel y, con él, casi todo lo que MVI defiende.
+</Callout>
+
+<Challenge title="Delimita el radio de tus fallos">
+1. Envuelve un `launch` con un `try` externo y comprueba que no captura nada. Explica, con el vocabulario del árbol, dónde estabas preguntando y dónde ocurría el fallo.
+2. Escribe un `catch` de `Exception` dentro de una corrutina, cancélala y demuestra que sigue ejecutando código después. Arréglalo con `ensureActive` y explica por qué basta.
+3. Lanza tres cargas hermanas con `coroutineScope` y haz fallar a una. Anota qué pasa con las otras dos. Repite con `supervisorScope` y contrasta ambos resultados.
+4. Instala un `CoroutineExceptionHandler` en un hijo y comprueba que se ignora; muévelo a la raíz y comprueba que actúa. Explica la regla en términos de quién gestiona el error de quién.
+5. Toma una pantalla real tuya, enumera sus secciones y decide para cada una si su fallo debe invalidar el resto. Traduce esa decisión al ámbito correspondiente y a los campos de error de tu `data class` de estado.
+</Challenge>

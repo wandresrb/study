@@ -1,0 +1,206 @@
+---
+title: "Frustum culling en un compute shader"
+description: "Extraer los seis planos del frustum de la matriz con Gribb-Hartmann, el test esfera-plano y el del vértice positivo, y el kernel WGSL que descarta cien mil objetos en paralelo."
+subject: webgpu
+level: 40
+order: 2
+position: "40.2"
+duration: "23 min"
+---
+
+<Lead>
+El test de frustum es la operación de culling más rentable que existe: seis productos escalares por objeto para evitar procesar una malla entera. Hacerlo en un bucle de JavaScript sobre cien mil objetos cuesta entre diez y treinta milisegundos; hacerlo en un compute shader cuesta decenas de microsegundos. La parte que casi nadie escribe bien es la extracción de los planos, porque la fórmula que circula por internet es la de OpenGL y el volumen de recorte de WebGPU no es el de OpenGL.
+</Lead>
+
+<Goals>
+
+- Derivar los seis planos del frustum a partir de la matriz de proyección-vista con el método de Gribb-Hartmann.
+- Adaptar la extracción al volumen de recorte de WebGPU, con la profundidad de cero a uno.
+- Implementar el test esfera-plano y el test de caja con la técnica del vértice positivo.
+- Escribir el kernel de compute completo y dimensionar el dispatch respetando los límites del dispositivo.
+
+</Goals>
+
+## Los seis planos ya están dentro de la matriz
+
+Un punto es visible si, después de multiplicarlo por la matriz de proyección-vista, sus coordenadas de recorte cumplen tres desigualdades dobles. En WebGPU son:
+
+```text
+-w ≤ x ≤ w
+-w ≤ y ≤ w
+ 0 ≤ z ≤ w
+```
+
+Esa última línea es la diferencia que se paga cara. OpenGL exige `-w ≤ z ≤ w`, con el plano cercano en menos uno. Direct3D, Metal, Vulkan y WebGPU usan cero a uno. Copiar la fórmula clásica de Gribb-Hartmann sin tocarla te deja un plano cercano colocado detrás de la cámara que no descarta absolutamente nada, y el bug es silencioso: todo se ve bien, simplemente no estás culleando por delante.
+
+Ahora la observación central del método: **cada una de esas seis desigualdades ya es un test de plano**. Llama `f0`, `f1`, `f2` y `f3` a las cuatro filas de la matriz de proyección-vista `M`, y toma un punto `v` en coordenadas homogéneas de mundo. Con la convención de vector columna que usan WGSL y todas las librerías de matrices habituales, las coordenadas de recorte son productos escalares de las filas por el punto:
+
+```text
+x = f0 · v      y = f1 · v      z = f2 · v      w = f3 · v
+```
+
+Sustituye en la primera desigualdad. `x ≥ -w` equivale a `f0 · v ≥ -(f3 · v)`, es decir `(f3 + f0) · v ≥ 0`. Y `(f3 + f0)` es un `vec4` cuyas tres primeras componentes son una normal y la cuarta una distancia al origen: exactamente la ecuación implícita de un plano. Repite el mismo despeje seis veces:
+
+| plano | desigualdad | fila resultante |
+|---|---|---|
+| izquierda | `x ≥ -w` | `f3 + f0` |
+| derecha | `x ≤ w` | `f3 - f0` |
+| abajo | `y ≥ -w` | `f3 + f1` |
+| arriba | `y ≤ w` | `f3 - f1` |
+| cerca | `z ≥ 0` | `f2` |
+| lejos | `z ≤ w` | `f3 - f2` |
+
+El plano cercano es la fila dos sola, sin sumarle nada. Esa es la única diferencia respecto a la versión de OpenGL, y es toda la diferencia.
+
+Con esta construcción, el interior del frustum es el conjunto de puntos con `dot(n, p) + d ≥ 0` para los seis planos, es decir, las normales apuntan hacia dentro. No hace falta invertir nada.
+
+Falta un detalle que sí importa: **normalizar**. Tal como salen, el módulo de la parte vectorial de cada plano es arbitrario, así que `dot(n, p) + d` es proporcional a la distancia real pero no es la distancia. Para el test de signo daría igual; para comparar contra un radio en unidades de mundo, no. Dividir el `vec4` entero por `length(n)` deja la ecuación en forma normal y `dot(n, p) + d` pasa a ser la distancia con signo en metros.
+
+Lo lógico es extraer los planos **una vez por fotograma en la CPU** y subirlos como 96 bytes de uniformes:
+
+```js
+// Una mat4 de WebGPU se almacena por columnas: el elemento de fila j
+// y columna i esta en m[i * 4 + j].
+function filas(m) {
+  return [0, 1, 2, 3].map((j) => [m[j], m[4 + j], m[8 + j], m[12 + j]]);
+}
+
+function normalizar(p) {
+  const k = 1 / Math.hypot(p[0], p[1], p[2]);
+  return [p[0] * k, p[1] * k, p[2] * k, p[3] * k];
+}
+
+const suma  = (a, b) => a.map((v, i) => v + b[i]);
+const resta = (a, b) => a.map((v, i) => v - b[i]);
+
+// Devuelve los seis planos normalizados, con las normales hacia dentro.
+export function planosFrustum(viewProj) {
+  const [f0, f1, f2, f3] = filas(viewProj);
+  return [
+    normalizar(suma(f3, f0)),    // izquierda
+    normalizar(resta(f3, f0)),   // derecha
+    normalizar(suma(f3, f1)),    // abajo
+    normalizar(resta(f3, f1)),   // arriba
+    normalizar(f2),              // cerca, con z de 0 a 1
+    normalizar(resta(f3, f2)),   // lejos
+  ];
+}
+
+const datos = new Float32Array(planosFrustum(viewProj).flat()); // 24 floats
+device.queue.writeBuffer(bufferPlanos, 0, datos);
+```
+
+Comprobación de cordura que cuesta treinta segundos y ahorra una tarde: coge el punto que está justo delante de la cámara a la distancia del plano cercano más un centímetro y verifica que los seis productos escalares dan positivos. Después mueve ese punto un metro detrás de la cámara y verifica que el plano cercano da negativo. Si el plano cercano nunca da negativo, has copiado la fórmula de OpenGL.
+
+## Esfera primero, caja solo si hace falta
+
+El volumen envolvente correcto para empezar es la **esfera**, y las razones son tres.
+
+Es el test más barato que existe: un producto escalar y una comparación por plano. Es **invariante a la rotación**, así que la esfera en espacio de mundo se obtiene transformando el centro y multiplicando el radio por el mayor factor de escala de la matriz, sin recalcular nada más; una caja alineada a los ejes, en cambio, hay que reconstruirla entera cada vez que el objeto gira, y encima crece al hacerlo. Y es **conservadora** en el sentido correcto: la esfera envuelve al objeto, así que si la esfera está fuera, el objeto está fuera con certeza matemática.
+
+El test es una línea. Un objeto está completamente fuera si su centro está a más de un radio por detrás de **algún** plano:
+
+```wgsl
+// Devuelve true si la esfera esta enteramente en el lado exterior del plano.
+fn esfera_fuera(plano : vec4<f32>, centro : vec3<f32>, radio : f32) -> bool {
+  return dot(plano.xyz, centro) + plano.w < -radio;
+}
+```
+
+Basta con que un solo plano lo cumpla para descartar. Si ninguno lo cumple, se conserva.
+
+La caja alineada a los ejes ajusta mejor a geometría alargada —un pasillo, una viga, un terreno en losas— y ahí sí compensa. El test correcto se llama **del vértice positivo** y consiste en no probar los ocho vértices sino solo el que está más lejos en la dirección de la normal, porque si *ese* está en el lado exterior, los otros siete también. Para un plano de normal `n`, ese vértice es `centro + sign(n) * extent`, y sustituyendo en la ecuación del plano sale la forma sin ramas:
+
+```wgsl
+// La caja se guarda como centro y semiextensiones, no como min y max:
+// asi el test sale sin ramas y la estructura se alinea sola a 16 bytes.
+fn caja_fuera(plano : vec4<f32>, centro : vec3<f32>, extent : vec3<f32>) -> bool {
+  // Radio efectivo de la caja proyectado sobre la normal del plano.
+  // dot(n, centro + sign(n) * extent) = dot(n, centro) + dot(abs(n), extent)
+  let r = dot(abs(plano.xyz), extent);
+  return dot(plano.xyz, centro) + plano.w < -r;
+}
+```
+
+Dos multiplicaciones más que la esfera, y sin un solo `if`. Esta es la razón por la que se guardan centro y semiextensiones en vez de mínimo y máximo: la identidad `dot(abs(n), extent)` solo funciona en esa forma.
+
+<Callout type="warn" title="El test es conservador por diseño y produce falsos positivos">
+Probar contra los seis planos por separado acepta objetos que están **fuera** del frustum pero dentro de la intersección de los seis semiespacios ampliados. Ocurre con volúmenes envolventes grandes cerca de las esquinas del frustum: la esfera cruza la región exterior de dos planos a la vez sin quedar entera fuera de ninguno. No hay ningún error en el código; es una propiedad del test.
+
+Y no importa. El coste de un falso positivo es un objeto que se dibuja y no aporta píxeles, es decir, unos microsegundos de GPU. El coste de un falso *negativo* sería un objeto visible que desaparece, que es un bug de imagen. Un test conservador nunca produce falsos negativos, y por eso es el correcto. Cualquier refinamiento —probar contra las esquinas del frustum, usar cajas orientadas— cuesta más de lo que ahorra en la inmensa mayoría de las escenas.
+</Callout>
+
+## El kernel completo
+
+Una invocación por instancia. Lee el volumen envolvente de un storage buffer, escribe un flag en otro.
+
+```wgsl
+struct Esfera {
+  centro : vec3<f32>,   // alineacion 16, tamano 12
+  radio  : f32,         // encaja en el hueco: la estructura mide 16 bytes justos
+};
+
+@group(0) @binding(0) var<uniform>              planos  : array<vec4<f32>, 6>;
+@group(0) @binding(1) var<storage, read>        bounds  : array<Esfera>;
+@group(0) @binding(2) var<storage, read_write>  visible : array<u32>;
+
+@compute @workgroup_size(64)
+fn cull(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  // Guardia obligatoria: el dispatch redondea hacia arriba y sobran invocaciones.
+  if (i >= arrayLength(&bounds)) {
+    return;
+  }
+
+  let e = bounds[i];
+  var dentro : u32 = 1u;
+
+  for (var k = 0u; k < 6u; k = k + 1u) {
+    if (dot(planos[k].xyz, e.centro) + planos[k].w < -e.radio) {
+      dentro = 0u;
+      break;
+    }
+  }
+
+  visible[i] = dentro;
+}
+```
+
+Tres detalles del código que no son cosméticos.
+
+La estructura `Esfera` mide exactamente 16 bytes porque `vec3<f32>` tiene alineación 16 y tamaño 12, y el `f32` del radio ocupa el hueco de relleno que habría quedado. Si en vez de eso pusieras dos `vec3<f32>` seguidos, cada uno se alinearía a 16 y la estructura mediría 32 bytes con 8 desperdiciados: el doble de ancho de banda para leer lo mismo. En un kernel que solo hace lecturas y unos pocos productos escalares, el ancho de banda **es** el tiempo de ejecución.
+
+El `break` no ahorra tanto como parece. Las invocaciones de un mismo grupo SIMD avanzan en bloqueo de paso, así que el grupo entero sigue iterando hasta que la última de sus invocaciones termina; solo se ahorra cuando las 32 o 64 vecinas coinciden en salir pronto. Como los objetos contiguos en el buffer suelen estar cerca en el espacio, esa coherencia existe de verdad y el `break` sí paga. Si tus instancias están en orden aleatorio, ordénalas por localidad espacial una vez al cargar la escena y este kernel se acelera solo.
+
+Y el guardia. El dispatch se dimensiona con techo, así que casi siempre hay invocaciones sobrantes en el último workgroup. Sin el `if` escribirían fuera del array: en WebGPU eso no es corrupción de memoria porque los accesos a storage buffers están acotados por la implementación, pero sí es trabajo tirado y un flag que nunca se lee.
+
+```js
+const GRUPO = 64;
+const pase = encoder.beginComputePass({ label: 'frustum culling' });
+pase.setPipeline(pipelineCull);
+pase.setBindGroup(0, grupoCull);
+pase.dispatchWorkgroups(Math.ceil(numInstancias / GRUPO));
+pase.end();
+```
+
+Con `maxComputeWorkgroupsPerDimension` igual a 65535 por defecto, un dispatch de una dimensión con grupos de 64 cubre 4.190.400 instancias. Por encima de esa cifra hay que repartir en dos dimensiones y reconstruir el índice lineal dentro del shader; por debajo, que es donde vive el 99,9 % de los casos, una dimensión basta.
+
+## Por qué la GPU gana este problema
+
+El trabajo total es idéntico en las dos máquinas: seis productos escalares por objeto. Lo que cambia es cuántos se hacen a la vez.
+
+Con 100.000 instancias, el kernel lanza 1.563 workgroups de 64 invocaciones. Una GPU de gama media tiene entre 16 y 40 unidades de cómputo, cada una capaz de tener varios workgroups residentes a la vez para tapar la latencia de memoria. En la práctica hay miles de invocaciones en vuelo simultáneamente. El kernel es puro ancho de banda: lee 16 bytes por instancia y escribe 4, así que mueve 2 MB en total. A 200 GB/s eso son **10 microsegundos**, y ese es el suelo real; el cálculo aritmético queda enteramente escondido detrás de las lecturas.
+
+El bucle equivalente en JavaScript recorre 100.000 objetos con acceso disperso a memoria, sin vectorizar, en un único hilo. Entre 10 y 30 ms según cómo estén dispuestos los datos. Son **tres órdenes de magnitud**, y el margen es tan grande que ni siquiera hace falta afinar el kernel para ganar.
+
+Hay un corolario que cuesta aceptar: el resultado del culling se queda en la GPU. La tentación de leer los flags de vuelta para saber cuántos objetos han pasado es la manera más rápida de tirar todo el beneficio, porque `mapAsync` obliga a esperar a que la GPU termine y añade al menos un fotograma completo de latencia. Los flags se consumen sin salir del dispositivo: primero para [el test de oclusión](/guia/webgpu/n40-oclusion-con-la-jerarquia-de-profundidad/), después para [compactarlos en una lista densa](/guia/webgpu/n40-compactar-visibles-con-un-scan/).
+
+<Callout type="dios" title="No calcules los planos dentro del shader, aunque parezca mas limpio">
+Es tentador pasar la matriz de proyección-vista al compute shader y extraer los planos dentro, en una función auxiliar, para tenerlo todo en un sitio. He visto ese código en producción muchas veces y cuesta caro por dos razones que no son evidentes hasta que miras el ensamblador.
+
+La primera es que los planos son **uniformes**: valen lo mismo para las 100.000 invocaciones. Calcularlos dentro significa hacer 100.000 veces seis normalizaciones, es decir, seis raíces cuadradas y seis divisiones por invocación. Una raíz cuadrada no es cara, pero seiscientas mil no son gratis, y sobre todo compiten por la misma unidad de función especial que tiene mucho menos rendimiento que la ALU normal.
+
+La segunda es peor y es la que de verdad muerde: para recorrer los planos en un bucle necesitas un `array<vec4<f32>, 6>` indexado con una variable, y un array de función indexado dinámicamente **no cabe en registros**. El compilador tiene dos salidas: desenrollar el bucle por completo, lo que dispara la presión de registros y baja la ocupación, o volcar el array a memoria de scratch, que es memoria global disfrazada y cuesta cientos de ciclos por acceso. Cualquiera de las dos convierte un kernel limitado por ancho de banda en uno limitado por latencia, y el tiempo se multiplica por tres o por cuatro.
+
+La forma correcta es la del código de arriba: los planos salen de la CPU en un uniform buffer de 96 bytes. Un uniform buffer se lee a través de la caché de constantes, que en todas las arquitecturas modernas tiene un camino de difusión optimizado precisamente para el caso en que todas las invocaciones leen la misma dirección, y el acceso indexado a un `array<vec4<f32>, 6>` uniforme no fuerza ningún volcado porque el dato no está en el espacio de función. Es un ejemplo de la regla general del cómputo en GPU: **todo lo que sea igual para todas las invocaciones se calcula fuera, aunque el cálculo parezca ridículamente barato**. Lo que se multiplica por cien mil deja de ser barato por definición.
+</Callout>

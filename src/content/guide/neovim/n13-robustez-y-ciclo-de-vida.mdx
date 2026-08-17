@@ -1,0 +1,225 @@
+---
+title: "Robustez y ciclo de vida: procesos que mueren cuando deben"
+description: "Los tres finales de un proceso hijo y cómo distinguirlos con executable, pcall, code y signal; cancelar la ejecución en vuelo con kill antes de relanzar; descartar resultados obsoletos con un contador de generación o con changedtick; y la limpieza en BufWipeout, ExitPre y VimLeavePre para no dejar huérfanos."
+subject: neovim
+level: 13
+order: 5
+position: "13.5"
+duration: "22 min"
+---
+
+<Lead>
+Todo lo anterior funciona el día que la herramienta existe, responde rápido y termina bien. El código que separa un experimento de un plugin es el que se escribe para los otros días: el binario que no está instalado, el comando que se cuelga esperando algo que nunca llega, el resultado que aterriza cuando ya nadie lo quiere, el proceso que sigue vivo diez minutos después de que cerraras su buffer. Esta lección cierra el nivel con esos días, y con una idea que los ordena todos: cada proceso que lanzas es un recurso con dueño, y el dueño eres tú.
+</Lead>
+
+<Goals>
+
+- Distinguir los tres finales de un proceso y manejar cada uno por separado: `executable`, `pcall`, `code` y `signal`.
+- Cancelar la ejecución en vuelo con la manija guardada: un proceso por recurso, `kill` al anterior.
+- Descartar resultados obsoletos con un contador de generación, y saber cuándo basta `changedtick`.
+- Atar la vida del hijo a la del buffer con autocomandos, y a la del editor con `ExitPre` y `VimLeavePre`.
+- Evitar huérfanos y zombis entendiendo qué sobrevive a qué.
+
+</Goals>
+
+## Los tres finales
+
+Un proceso hijo no falla de una sola manera. Falla de tres, y confundirlas produce mensajes de error inútiles.
+
+<Cards>
+  <Card icon="🚫" title="No arrancó">
+    El binario no existe, no es ejecutable o el `cwd` no es un directorio. `vim.system` **lanza un error de Lua** —la documentación lo dice en su primera línea: *runs a system command or throws an error if cmd cannot be run*— y tu callback no llega a existir.
+  </Card>
+  <Card icon="⚠️" title="Arrancó y falló">
+    El proceso vivió y devolvió un `code` distinto de cero. Es un fallo *de la herramienta*, su explicación está en `stderr`, y para `vim.system` es un resultado tan normal como el éxito.
+  </Card>
+  <Card icon="🔪" title="Lo mataron">
+    Murió por señal, con `signal` distinto de cero. Su `code` no cuenta la historia real y su salida está probablemente truncada. A veces el asesino eres tú: tu propio `timeout` o tu `kill`.
+  </Card>
+</Cards>
+
+El primer final es el único que no pasa por el callback, y por eso es el que más se olvida: el error salta en la propia llamada, con un `ENOENT` críptico que revienta lo que hubiera alrededor. La defensa tiene dos capas, y la primera convierte el error en un mensaje accionable antes de que ocurra:
+
+```lua
+local function ejecutar(cmd, opts, cb)
+  if vim.fn.executable(cmd[1]) ~= 1 then
+    vim.notify(('no encuentro %s en el PATH'):format(cmd[1]), vim.log.levels.WARN)
+    return nil
+  end
+  local ok, obj = pcall(vim.system, cmd, opts, cb)
+  if not ok then
+    vim.notify(tostring(obj), vim.log.levels.ERROR)
+    return nil
+  end
+  return obj
+end
+```
+
+`vim.fn.executable` devuelve `1` si el binario está en el `PATH`, y es barata. ¿Por qué el `pcall` además? Porque la comprobación no cubre todo el primer final: un `cwd` que dejó de existir o un binario borrado entre la comprobación y el lanzamiento siguen lanzando. `executable` es el diagnóstico amable; `pcall` es el cinturón.
+
+<Predict question="Ejecutas vim.system({'noexiste'}, {}, cb) con un binario que no está instalado. ¿Qué ocurre?" options={[
+  { t: 'La llamada lanza un error de Lua en el acto y cb no se invoca jamás', ok: true, x: 'Es el contrato documentado: si el comando no puede ni arrancar, vim.system lanza (ENOENT). No hay proceso, no hay resultado, no hay callback. Por eso este final se maneja con executable y pcall ALREDEDOR de la llamada, no dentro del callback.' },
+  { t: 'cb recibe un objeto con code distinto de cero y el error en stderr', x: 'Ese es el segundo final: un proceso que arrancó y falló. Para tener code y stderr hace falta que exista un proceso, y aquí no llegó a existir ninguno. Confundir los dos finales es escribir el manejo de errores en el sitio equivocado.' },
+  { t: 'Devuelve nil y el editor sigue como si nada', x: 'vim.system nunca devuelve nil: devuelve una manija o lanza. Un fallo silencioso sería peor contrato, porque seguirías el flujo normal con una manija fantasma.' },
+]} />
+
+Los otros dos finales se distinguen **dentro** del callback, y merecen ramas distintas: un `code` de `124` con `signal` a `15` es tu propio `timeout` disparándose (13.1), y decirle al usuario que la herramienta falló sería mentira; tardó demasiado, y el mensaje correcto es ese.
+
+<Callout type="warn" title="Un código distinto de cero no siempre es un error">
+`grep` devuelve `1` cuando no encuentra nada. `diff` devuelve `1` cuando hay diferencias. `git diff --quiet` devuelve `1` cuando hay cambios, que es justo lo que preguntabas. Antes de tratar el `code` como fallo, lee el manual de la herramienta concreta y codifica **su** convención, no la tuya: la Predict del `grep` en la 13.1 era exactamente esta advertencia.
+</Callout>
+
+## Un proceso por recurso
+
+En cuanto enganchas un proceso a un evento frecuente —guardar, teclear— dejas de tener una ejecución y pasas a tener ejecuciones solapadas. Si no haces nada, todas terminarán y todas publicarán, y el resultado visible será el de la **última en acabar**, que no tiene por qué ser la más reciente: la carrera con la que cerró la lección 13.4.
+
+La disciplina que la resuelve cabe en una frase: **un hueco por recurso, y quien llega mata a quien estaba**. El recurso aquí es el buffer; la manija que la 13.1 te enseñó a no tirar es lo que hace posible el desalojo:
+
+```lua
+local en_curso = {}
+
+local function relanzar(bufnr, cmd, cb)
+  local previo = en_curso[bufnr]
+  if previo and not previo:is_closing() then
+    previo:kill('sigterm')
+  end
+  en_curso[bufnr] = vim.system(cmd, { text = true, timeout = 10000 }, function(obj)
+    en_curso[bufnr] = nil
+    if obj.signal ~= 0 then return end   -- lo matamos nosotros: no publiques
+    cb(obj)
+  end)
+end
+```
+
+El descarte por `signal` es la mitad de la lógica, y la mitad que todo el mundo omite. Un proceso que matas deliberadamente **también** invoca su callback —con salida truncada y un código sin sentido—, y publicar eso produce diagnósticos que parpadean y listas a medias. La regla: si yo lo maté, su resultado no me interesa. Y delante de todo esto va el *debounce* de la 12.4, porque matar procesos también cuesta: el temporizador que colapsa la ráfaga de eventos en un disparo hace que `relanzar` corra una vez por pausa, no una por tecla.
+
+<Predict question="Sin cancelación ni descarte, guardas dos veces seguidas: el análisis A tarda 4 segundos y el B, lanzado después, tarda 1. ¿Qué diagnósticos ves pasados 5 segundos?" options={[
+  { t: 'Los de A, la versión vieja: fue el último en terminar y pisó a B', ok: true, x: 'B publicó en el segundo 1 y A lo sobrescribió en el 4, porque diagnostic.set reemplaza el namespace entero. El orden que importa no es el de lanzamiento sino el de llegada, y sin cancelación ni generación nada garantiza que coincidan. Es la carrera clásica: resultados correctos, orden incorrecto.' },
+  { t: 'Los de B: se lanzó más tarde, así que gana', x: 'Eso sería cierto si las llegadas respetaran el orden de salida, y nada lo garantiza: cada proceso corre a su ritmo. La intuición de que lo más reciente gana es precisamente el bug.' },
+  { t: 'Los dos mezclados: cada uno añade los suyos al namespace', x: 'vim.diagnostic.set reemplaza, no acumula: cada publicación pisa la anterior en ese namespace y buffer (13.4). Por eso la carrera no produce mezcla sino sustitución, y por eso el último en llegar dicta la pantalla.' },
+]} />
+
+## Resultados obsoletos: la generación
+
+Matar al anterior reduce la ventana de la carrera, pero no la cierra: `kill` es una petición asíncrona, el proceso puede morir con su callback ya en vuelo, y hay casos donde no puedes o no quieres matar —una petición cara que quizá aún sirva—. La solución completa no está en el proceso sino en el resultado: **etiquetar cada lanzamiento y descartar todo lo que llegue con etiqueta vieja**.
+
+```lua
+local generacion = {}
+
+local function lintar(bufnr)
+  generacion[bufnr] = (generacion[bufnr] or 0) + 1
+  local mia = generacion[bufnr]                  -- capturada en el closure (7.3)
+
+  ejecutar({ 'ruff', 'check', vim.api.nvim_buf_get_name(bufnr) }, { text = true },
+    function(obj)
+      vim.schedule(function()
+        if generacion[bufnr] ~= mia then return end   -- llegó tarde: a la basura
+        if not vim.api.nvim_buf_is_valid(bufnr) then return end
+        publicar(bufnr, obj)
+      end)
+    end)
+end
+```
+
+El mecanismo es un contador por buffer que solo sube. Cada lanzamiento guarda su valor en un *upvalue* —el mecanismo de la 7.3— y el callback compara: si el contador global avanzó, alguien lanzó después que yo, y mi resultado describe un mundo que ya no existe. No importa el orden de llegada, no importa si el proceso murió o triunfó: la generación impone un orden lógico donde el kernel no ofrece ninguno.
+
+Neovim trae una variante nativa de esta idea para el caso particular más común: `changedtick`, el contador de cambios del buffer que el formateador de la 13.4 ya usaba. Las dos herramientas responden preguntas distintas y conviene no confundirlas. `changedtick` pregunta *¿cambió el texto desde que pregunté?* —perfecto para un formateador, cuyo resultado solo es válido sobre el texto exacto que envió—. La generación pregunta *¿alguien lanzó una consulta más nueva que la mía?* —lo que importa a un linter, porque el texto puede estar intacto y aun así haber una ejecución más reciente cuyo resultado merece ganar—. Cinturón y tirantes: `kill` ahorra CPU, la generación garantiza corrección, y ninguno sustituye al otro.
+
+<Pipeline
+  title="el relanzamiento que no compite"
+  result="en pantalla, siempre el resultado de la última generación"
+  groups={[
+    { title: 'al disparar el evento', tone: 'peach', sequence: true, steps: [
+      { t: 'debounce', d: 'La ráfaga de eventos colapsa en un disparo (12.4).' },
+      { t: 'kill al anterior', d: 'Si la manija del buffer sigue viva: sigterm y a otra cosa.' },
+      { t: 'generación += 1', d: 'El lanzamiento captura su número en el closure.' },
+      { t: 'lanzar y guardar la manija', d: 'Un hueco por buffer: en_curso[bufnr] = la nueva.' },
+    ]},
+    { title: 'al volver el callback', tone: 'blue', sequence: true, steps: [
+      { t: '¿signal ≠ 0?', d: 'Lo mataron —quizá tú—: resultado truncado, descartar.' },
+      { t: '¿generación vieja?', d: 'Hay un lanzamiento más nuevo: descartar sin mirar.' },
+      { t: '¿buffer válido?', d: 'Pudo cerrarse mientras el proceso corría: descartar.' },
+      { t: 'vim.schedule y publicar', d: 'Solo el superviviente de los tres filtros toca el editor (12.3).' },
+    ]},
+  ]}
+/>
+
+## Atar la vida del proceso
+
+Un proceso lanzado desde un buffer no tiene ninguna relación con ese buffer: si el usuario lo cierra, el proceso sigue. Establecer la relación es trabajo tuyo, y su forma canónica en Neovim son los autocomandos, porque cada camino de salida del editor tiene su evento:
+
+```lua
+vim.api.nvim_create_autocmd({ 'BufWipeout', 'BufDelete' }, {
+  callback = function(ev)
+    local h = en_curso[ev.buf]
+    if h and not h:is_closing() then h:kill('sigterm') end
+    en_curso[ev.buf] = nil
+  end,
+})
+
+vim.api.nvim_create_autocmd('VimLeavePre', {
+  callback = function()
+    for _, h in pairs(en_curso) do
+      if not h:is_closing() then h:kill('sigterm') end
+    end
+  end,
+})
+```
+
+Los dos eventos de buffer cubren el cierre normal. Para la salida global hay dos candidatos que conviene distinguir: `ExitPre` dispara cuando un `:quit` o `:qall` va a cerrar el editor, pero la salida **aún puede cancelarse** —un buffer modificado sin guardar la aborta—, así que es el sitio para avisar o pedir confirmación, no para destruir. `VimLeavePre` es el punto sin retorno: de ahí no se vuelve, y ahí van los `kill`.
+
+¿Y si no haces nada? Neovim mata al salir los trabajos que no lanzaste con `detach` —la propia documentación de esa opción lo dice del revés: un proceso desligado «no será matado cuando Nvim salga», y los demás sí—. Hacerlo tú antes conserva dos ventajas: eliges la señal, y le das al proceso la oportunidad de recoger sus archivos temporales en vez de morir de golpe.
+
+<Callout type="tip" title="SIGTERM primero, SIGKILL después">
+`SIGTERM` es una petición: el proceso puede atenderla, cerrar sus archivos y salir con dignidad. `SIGKILL` es una ejecución sumaria que no puede interceptar y que deja tras de sí lo que tuviera abierto. La escalada correcta es la de cualquier gestor de servicios: `kill('sigterm')`, un temporizador corto, y solo si `is_closing()` sigue diciendo que no, `kill('sigkill')`. Ya conoces un sitio donde Neovim escala por ti sin preguntar: `wait(timeout)` de la 13.1, que al vencer ejecuta directamente con `SIGKILL`, a diferencia del `SIGTERM` educado de la opción `timeout`.
+</Callout>
+
+## Huérfanos, zombis y grupos
+
+Aquí es donde la intuición falla, porque hay dos patologías distintas que la gente llama con el mismo nombre.
+
+Un **zombi** es un proceso que ya murió pero cuya entrada en la tabla del kernel sigue ahí porque su padre no ha recogido el código de salida. En Neovim prácticamente no te ocurrirá: libuv, la biblioteca de eventos de la 12.1, recoge a sus hijos automáticamente al completarse el ciclo del callback; basta con no interferir y dejar que el callback se ejecute.
+
+Un **huérfano** es el problema real y el inverso: un proceso que sigue **vivo** después de que muriera quien debía vigilarlo. Casi siempre nace de una composición: lanzas un comando que a su vez lanza otros —un script que invoca al compilador, un `npm run` que abre un servidor— y matas al primero. El muerto era el padre; los nietos quedan sueltos, adoptados por el proceso raíz del sistema, consumiendo CPU sin que nada los reclame.
+
+| Situación | Qué sobrevive | Cómo evitarlo |
+|---|---|---|
+| Matar un script envoltorio | Los procesos que él lanzó | Evitar el intermediario, o matar el grupo entero |
+| Lanzar con `detach` | Todo, incluso al salir de Neovim | Reservarlo para demonios de verdad (13.1) |
+| `stdin = true` sin `write(nil)` | El hijo, esperando un EOF que no llega | Cerrar el canal es tu responsabilidad (13.1) |
+| Comando que se cuelga | El proceso, indefinidamente | `timeout` en todo, incluso en lo «instantáneo» |
+
+La defensa práctica tiene tres capas. Primero, **evita el shell**: la lista de argumentos de `vim.system` ya elimina un intermediario de la cadena, y con él la fuente más común de nietos; si el intermediario es inevitable y estás en Unix, lanzarlo con `detach` lo convierte en líder de su propio grupo y una señal a su `pid` en negativo con `vim.uv.kill` alcanza al grupo entero, a cambio de que matarlo pase a ser siempre deber tuyo. Segundo, **pon `timeout` a todo**, porque el comando que se cuelga es siempre el que no previste. Y tercero, cuida el único caso en que `stdin` cuelga a un hijo: por defecto no hay tubería de entrada y quien intente leer recibe su EOF al instante, pero si pediste `stdin = true`, el `write(nil)` que cierra el canal es una promesa que hiciste en la 13.1 y que aquí se cobra.
+
+<Callout type="dios" title="La robustez es una propiedad del ciclo de vida, no del manejo de errores">
+Hay una manera muy extendida y muy pobre de entender la robustez: consiste en imaginarla como una capa de comprobaciones que se añade encima del código que ya funciona —un `pcall` aquí, un `if code ~= 0` allá— y en creer que la calidad se mide por la densidad de esas comprobaciones. Esa concepción falla porque trata el error como un **valor** que se inspecciona, cuando en el trabajo con procesos el error es un **estado del sistema** que persiste después de que tu función haya retornado. Un proceso huérfano no es un valor que se te olvidó comprobar: es una entidad viva en el kernel, con su descriptor de tuberías, su memoria y su parte del planificador, que tu programa creó y de la que sigue siendo moralmente responsable aunque haya perdido toda referencia a ella. La pregunta correcta, por tanto, no es qué hago si esto falla, sino **para cada proceso que puedo crear, cuál es el conjunto completo de caminos por los que mi programa puede llegar a olvidarse de él**. Enumerados sobre el papel, esos caminos son sorprendentemente pocos: el usuario cierra el buffer, sale del editor, lanza otra ejecución encima, el proceso decide no terminar nunca, o su resultado llega a un mundo que ya cambió. Cinco caminos, y cada uno tiene en esta lección su contramedida con nombre: los autocomandos de buffer, `VimLeavePre`, el `kill` al anterior, el `timeout`, la generación. Esa enumeración es la definición operativa de la robustez aquí, y explica por qué su forma canónica en Neovim son los autocomandos: un autocomando es literalmente la materialización de un camino de salida, y registrar uno por camino convierte un problema de vigilancia continua en una lista finita que puedes revisar. La consecuencia de diseño cierra el nivel entero. Cada proceso que lanzas es un **recurso con dueño**, y la disciplina de propiedad que un lenguaje de sistemas aplica a la memoria es exactamente la que debes aplicar aquí: alguien lo posee, ese alguien tiene un final conocido, y en ese final el recurso se libera. Escribe la limpieza antes que la funcionalidad y no tendrás que salir a cazar huérfanos con el monitor del sistema.
+</Callout>
+
+<Callout type="info" title="Lo esencial">
+Tres finales, tres manejos: `executable` y `pcall` para el que no arranca, `code` y `stderr` para el que falla, `signal` para el que muere matado —y si `signal` es `15` con `code` `124`, fuiste tú—. Un hueco por buffer: `kill('sigterm')` al anterior antes de relanzar, descarta por `signal` y por generación, y usa `changedtick` cuando la pregunta sea si el texto cambió. Limpia en `BufWipeout` y `BufDelete`, mata en `VimLeavePre` —no en `ExitPre`, que aún puede cancelarse— y escala de `SIGTERM` a `SIGKILL` solo si hace falta.
+</Callout>
+
+<Exercise challenge="Provoca el primer final con tus propios ojos: un binario que no existe." keys=":lua print(pcall(vim.system, {'binario_que_no_existe'}))">
+Imprime `false` y el mensaje con su `ENOENT`: la llamada lanzó, no hubo proceso ni callback. Antepón `vim.fn.executable('binario_que_no_existe')` y verás el `0` que te habría permitido avisar con un mensaje humano en vez de capturar un error críptico.
+</Exercise>
+
+<Exercise challenge="Fabrica un resultado obsoleto y descártalo con el contador de generación. Ejecuta esto dos veces seguidas, rápido." keys=":lua G=(G or 0)+1 local g=G vim.system({'sleep','2'},{},function() vim.schedule(function() print(g, g==G and 'vigente' or 'obsoleto') end) end)">
+A los dos segundos llegan las dos: la primera imprime `1 obsoleto` y la segunda `2 vigente`. Cada lanzamiento capturó su número en el closure y solo el último coincide con el contador. Acabas de ver el patrón entero en dos líneas.
+</Exercise>
+
+<Exercise challenge="Usa changedtick como centinela: comprueba dentro de tres segundos si el buffer cambió mientras esperabas." keys=":lua local t=vim.b.changedtick vim.defer_fn(function() print(t==vim.b.changedtick and 'buffer intacto' or 'buffer cambiado') end, 3000)">
+Lánzalo y teclea algo antes de que venza: `buffer cambiado`. Repite sin tocar nada: `intacto`. Es la comprobación exacta del formateador de la 13.4, aislada: la respuesta solo vale si la pregunta sigue siendo la misma.
+</Exercise>
+
+<Exercise challenge="Comprueba la escalada: mata un proceso con sigterm y verifica el cierre con is_closing." keys=":lua P=vim.system({'sleep','30'}) P:kill('sigterm') vim.defer_fn(function() print('cerrado:', P:is_closing()) end, 200)">
+Para un `sleep`, `SIGTERM` basta y `is_closing()` responde `true` enseguida. La escalada a `kill('sigkill')` se reserva para el que ignora la petición: compruébalo antes de disparar, no por sistema.
+</Exercise>
+
+<Challenge title="Un envoltorio que no deja rastro">
+1. Escribe `ejecutar` con `executable` y `pcall`, y provoca los tres finales: un binario inexistente, el comando `false`, y un `sleep` largo con `timeout` corto. Comprueba que cada uno produce su mensaje distinto.
+2. Implementa el hueco por buffer con `kill` al anterior y descarte por `signal`. Guarda diez veces seguidas y verifica con el monitor del sistema que no se acumulan procesos.
+3. Añade el contador de generación y demuestra que hace falta: comenta el `kill`, lanza un análisis lento seguido de uno rápido, y comprueba que sin generación gana el viejo y con ella el nuevo.
+4. Registra la limpieza en `BufWipeout`, `BufDelete` y `VimLeavePre`. Cierra un buffer con un proceso en vuelo y luego Neovim entero: nada debe quedar vivo.
+5. Lanza un script que a su vez lance un `sleep 60`, mata solo al script y observa con el monitor del sistema que el nieto sobrevive. Explica por qué, y qué papel jugarían el grupo de procesos y `detach` en evitarlo.
+6. Junta todo en un `lintar` final —debounce, kill, generación, limpieza— y úsalo con el linter de la 13.4. Es tu primer envoltorio con ciclo de vida completo: el nivel entero cabe en esa función.
+</Challenge>

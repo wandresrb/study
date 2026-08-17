@@ -1,0 +1,158 @@
+---
+title: "Reducers reutilizables: extraer una ley y parametrizarla"
+description: "Cuando la misma lógica aparece en tres features, la respuesta en TCA no es una superclase ni un protocolo con implementación por defecto, sino un reducer propio parametrizado que se compone como cualquier otro. Esta lección distingue las dos formas de reutilización —la hoja genérica sobre su dominio, incrustada con `Scope`, y el envoltorio genérico sobre otro reducer, aplicado como modificador—, muestra cómo conformar a `Reducer` a mano y cómo aceptar un hijo mediante `@ReducerBuilder` igual que hace la propia biblioteca, y fija los criterios para no abstraer antes de tiempo."
+subject: tca
+level: 9
+order: 4
+position: "9.4"
+duration: "19 min"
+---
+
+<Lead>
+Llega un momento en toda app madura en el que tres features hacen lo mismo con nombres distintos: buscar con retardo y descartar respuestas obsoletas, paginar una lista, validar un formulario, registrar cada acción para analítica. En una arquitectura orientada a objetos esa repetición se ataca con una clase base, un protocolo con extensión o un servicio compartido, y las tres opciones tienen el mismo vicio: obligan al que reutiliza a conocer al que provee. En TCA la respuesta es de otra naturaleza, porque el reducer ya es un valor: extraes la ley común a un tipo propio, la parametrizas por lo que varía, y la enchufas donde haga falta con los mismos operadores que ya usas. Nada hereda de nada, y la pieza extraída sigue siendo un reducer corriente.
+</Lead>
+
+<Goals>
+
+- Distinguir la reutilización por hoja genérica —incrustada con `Scope`— de la reutilización por envoltorio genérico aplicado como modificador.
+- Escribir una feature genérica sobre su dominio y componerla en varios padres sin duplicar lógica.
+- Conformar a `Reducer` a mano y aceptar un reducer hijo mediante `@ReducerBuilder`, como hacen `Scope` e `ifLet`.
+- Aplicar criterios explícitos para decidir cuándo extraer una abstracción y cuándo tolerar la repetición.
+
+</Goals>
+
+## Dos formas de reutilizar
+
+La distinción es limpia y conviene fijarla antes de escribir una línea. Un **reducer hoja genérico** encapsula un dominio completo —su propio `State`, su propia `Action`— parametrizado por el tipo de dato con el que trabaja; se reutiliza incrustándolo en padres distintos con `Scope`, `ifLet` o `forEach`, y cada padre le presta una rebanada de su estado. Un **reducer envoltorio genérico** no tiene dominio propio: es genérico sobre *otro reducer*, al que envuelve para añadirle una preocupación transversal; se reutiliza como modificador encadenado con punto, exactamente como `_printChanges` o `signpost`.
+
+La pregunta que las separa es una sola: ¿lo que se repite es un trozo de dominio o un trozo de comportamiento? Si lo repetido tiene estado propio que el padre no debería mirar, es una hoja. Si lo repetido es algo que le ocurre a cualquier estado —registrarlo, medirlo, restringirlo— es un envoltorio.
+
+<Mermaid code={`flowchart TD
+  R[repeticion detectada] --> Q{tiene estado propio}
+  Q -->|si| H[hoja generica sobre el dominio]
+  Q -->|no| W[envoltorio generico sobre otro reducer]
+  H --> S[se compone con Scope ifLet o forEach]
+  W --> M[se aplica como modificador encadenado]`} />
+
+## La hoja genérica: una feature parametrizada por su dominio
+
+Un buscador con retardo es el ejemplo canónico: la mecánica —escribir, esperar, cancelar la petición anterior, recibir— es idéntica para productos, para usuarios y para etiquetas; lo único que cambia es el tipo del resultado y la función que consulta. Eso se expresa con genéricos y con una closure inyectada en el inicializador.
+
+```swift
+@Reducer
+struct Buscador<Elemento: Equatable & Identifiable & Sendable> {
+  @ObservableState
+  struct State: Equatable {
+    var consulta = ""
+    var resultados: IdentifiedArrayOf<Elemento> = []
+    var cargando = false
+  }
+
+  enum Action: Equatable {
+    case consultaCambiada(String)
+    case respuesta([Elemento])
+  }
+
+  let buscar: @Sendable (String) async throws -> [Elemento]
+
+  var body: some ReducerOf<Self> {
+    Reduce { state, action in
+      switch action {
+      case let .consultaCambiada(texto):
+        state.consulta = texto
+        state.cargando = true
+        return .run { envia in
+          try await envia(.respuesta(try await buscar(texto)))
+        }
+        .debounce(id: CancelID.busqueda, for: .milliseconds(300), scheduler: DispatchQueue.main)
+      case let .respuesta(items):
+        state.cargando = false
+        state.resultados = IdentifiedArray(uniqueElements: items)
+        return .none
+      }
+    }
+  }
+
+  private enum CancelID { case busqueda }
+}
+```
+
+En el padre, la instancia concreta se elige al componer, y dos buscadores de tipos distintos conviven sin rozarse:
+
+```swift
+var body: some ReducerOf<Self> {
+  Scope(state: \.productos, action: \.productos) {
+    Buscador<Producto>(buscar: { try await catalogo.buscar($0) })
+  }
+  Scope(state: \.usuarios, action: \.usuarios) {
+    Buscador<Usuario>(buscar: { try await directorio.buscar($0) })
+  }
+  Reduce { state, action in ... }
+}
+```
+
+Dos detalles no negociables. El primero es que la hoja no conoce a su padre: recibe la función de búsqueda por el inicializador —o la resuelve con `@Dependency`, que suele ser preferible— y si necesita avisar hacia arriba lo hace con un caso `delegate` en su `Action` que el padre escucha. El segundo es que el estado que le presta el padre debe ser suyo en exclusiva; en cuanto dos reducers compiten por escribir el mismo campo, la reutilización se convierte en acoplamiento.
+
+## El envoltorio genérico: conformar a `Reducer` a mano
+
+Cuando lo repetido es comportamiento y no dominio, escribes un `struct` genérico sobre `Base: Reducer` que guarda al envuelto y conforma a `Reducer` implementando `reduce` directamente. Como implementas el método y no la propiedad, el tipo asociado `Body` se resuelve como `Never` y no hay `body` que escribir.
+
+```swift
+struct Auditada<Base: Reducer>: Reducer {
+  let base: Base
+  let registrar: @Sendable (Base.Action) -> Void
+
+  init(
+    registrar: @escaping @Sendable (Base.Action) -> Void,
+    @ReducerBuilder<Base.State, Base.Action> base: () -> Base
+  ) {
+    self.registrar = registrar
+    self.base = base()
+  }
+
+  func reduce(into state: inout Base.State, action: Base.Action) -> Effect<Base.Action> {
+    registrar(action)
+    return base.reduce(into: &state, action: action)
+  }
+}
+
+extension Reducer {
+  func auditada(_ registrar: @escaping @Sendable (Action) -> Void) -> Auditada<Self> {
+    Auditada(registrar: registrar) { self }
+  }
+}
+```
+
+La pieza que hay que mirar dos veces es la anotación `@ReducerBuilder<Base.State, Base.Action>` sobre el parámetro del inicializador: es lo que permite que quien use tu tipo escriba varios reducers dentro de las llaves sin comas, igual que dentro de un `Scope`. Es literalmente el mismo mecanismo que emplea la biblioteca, disponible para ti sin ninguna API privada. Y la extensión de `Reducer` con un método que devuelve `Auditada<Self>` es lo que convierte tu tipo en un modificador encadenable, de modo que compone con los oficiales sin coordinación previa.
+
+<Callout type="tip" title="La tercera forma: genérico sobre un protocolo de estado">
+Existe una variante intermedia que conviene conocer y usar con moderación: declarar un protocolo pequeño —`protocol ConCarga { var cargando: Bool { get set } }`— y escribir un envoltorio genérico restringido con `where Base.State: ConCarga`, capaz de manipular ese campo en cualquier feature que lo declare. Es potente y es también la puerta de entrada a jerarquías de protocolos que reproducen los males de la herencia. Regla prudente: un protocolo de estado con una o dos propiedades, nunca con lógica dentro, y jamás como base común de todas tus features.
+</Callout>
+
+## Cuándo no extraer
+
+Toda abstracción cobra un peaje: un tipo genérico más que leer, parámetros que nombrar, mensajes de compilador más largos y una indirección que el siguiente lector tendrá que deshacer mentalmente. Extraer demasiado pronto produce el peor resultado posible, un reducer «reutilizable» con seis parámetros que solo se usa dos veces y que nadie se atreve a tocar.
+
+<Cards>
+  <Card icon="3️⃣" title="Tres apariciones, no dos">
+    Con dos repeticiones aún no sabes qué es esencial y qué accidental. La tercera te enseña qué varía de verdad, y solo eso merece convertirse en parámetro.
+  </Card>
+  <Card icon="⚖️" title="Una ley, no un parecido">
+    Extrae cuando las repeticiones comparten una regla que cambiaría a la vez. Si podrían evolucionar por separado, el parecido es casual y unirlas creará acoplamiento.
+  </Card>
+  <Card icon="🧪" title="Testeable en soledad">
+    Si la pieza extraída no se puede probar con su propio `TestStore`, sin montar un padre, es que sigue dependiendo del contexto y todavía no es reutilizable.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Reutilizar sin heredar, o el reducer como álgebra abierta">
+Merece la pena detenerse en lo que esta lección hace posible y por qué en otras arquitecturas no lo es. Al haber convertido el reducer en un valor y la composición en operaciones cerradas sobre ese valor, TCA no reserva para sí el conjunto de combinadores: cualquiera puede añadir uno nuevo, y el nuevo compone con los antiguos sin que nadie haya tenido que preverlo. Eso es lo que en teoría de lenguajes se llama una abstracción *abierta*, y es exactamente lo contrario de lo que ofrece una jerarquía de clases, donde extender significa insertarse en un punto que el diseñador original decidió por adelantado. Aquí no hay punto de extensión porque todo lo es: un `struct` genérico que guarda otro reducer dentro y una extensión de protocolo de tres líneas bastan para que tu combinador sea ciudadano de primera clase junto a `Scope` y `ifLet`. La consecuencia cultural importa tanto como la técnica. En un equipo que ha entendido esto, la respuesta a «necesitamos que todas las features registren sus acciones» deja de ser una reunión de arquitectura y pasa a ser un fichero de veinte líneas que nadie tiene que aprobar, porque no toca a nadie: es aditivo por construcción. Y la respuesta a «esta lógica se repite en tres pantallas» deja de ser un refactor arriesgado y pasa a ser una extracción mecánica, guiada por el compilador, cuyo resultado se prueba aislado antes de enchufarse. La reutilización deja de ser una promesa de diseño y se convierte en una operación rutinaria; y cuando algo se vuelve rutinario, por fin se hace.
+</Callout>
+
+<Challenge title="Extrae un combinador y demuéstralo aislado">
+1. Localiza en tu código dos features que hagan lo mismo con datos distintos. Escribe qué varía exactamente entre ellas y decide si es dominio o comportamiento.
+2. Si es dominio, extrae una hoja genérica con su `State` y su `Action` propios, y componla en ambos padres con `Scope`. Comprueba que ninguno de los dos padres tuvo que cambiar su vista.
+3. Si es comportamiento, escribe un `struct` genérico sobre `Base: Reducer` con un inicializador anotado con `@ReducerBuilder` y una extensión de `Reducer` que lo exponga como modificador encadenable.
+4. Escribe un `TestStore` que pruebe la pieza extraída **sola**, sin ningún padre. Si no puedes, aún no está desacoplada.
+5. Encadena tu modificador con `_printChanges()` en los dos órdenes posibles y comprueba que ambos compilan y componen. Esa propiedad es la prueba de que tu combinador es de primera clase.
+</Challenge>

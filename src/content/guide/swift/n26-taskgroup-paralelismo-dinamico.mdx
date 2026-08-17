@@ -1,0 +1,167 @@
+---
+title: "TaskGroup: paralelismo dinámico con resultados y errores"
+description: "El grupo de tareas como ámbito explícito para un número de trabajos conocido solo en ejecución: cómo se añaden hijas, por qué el grupo es una `AsyncSequence` de resultados, cómo se propagan y se contienen los errores, y la técnica de ventana deslizante para limitar la concurrencia."
+subject: swift
+level: 26
+order: 3
+position: "26.3"
+duration: "20 min"
+---
+
+<Lead>
+Cuando el número de trabajos deja de estar escrito en el código y pasa a depender de una colección, de una respuesta del servidor o de una decisión del usuario, la aridad estática de `async let` se queda corta y hace falta una estructura que lleve la cuenta en ejecución sin renunciar a ninguna garantía. Eso es un grupo de tareas: un ámbito con nombre, creado con `withTaskGroup` o su variante que lanza, al que se le añaden hijas dinámicamente y que no puede cerrarse mientras alguna siga viva. La diferencia con una lista de trabajos pendientes escrita a mano es que el grupo no es un contenedor pasivo: es a la vez el dueño de las hijas, la secuencia asíncrona por la que llegan sus resultados y el mecanismo que las cancela a todas cuando algo va mal.
+</Lead>
+
+<Goals>
+
+- Construir grupos con `withTaskGroup` y `withThrowingTaskGroup` y justificar cuál corresponde en cada caso.
+- Recolectar resultados por `for await` entendiendo que el orden de llegada no es el de creación.
+- Analizar la propagación de errores en un grupo y contener fallos parciales con un resultado tipado.
+- Implementar una ventana deslizante para acotar la concurrencia máxima y explicar por qué hace falta.
+
+</Goals>
+
+## El ámbito con nombre
+
+El grupo se abre con una función que recibe una clausura; dentro de ella, la variable del grupo permite añadir hijas. Al cerrarse la clausura, ninguna hija sigue viva.
+
+```swift
+func miniaturas(de urls: [URL]) async -> [Miniatura] {
+    await withTaskGroup(of: Miniatura?.self) { grupo in
+        for url in urls {
+            grupo.addTask { await generarMiniatura(url) }   // hija por elemento
+        }
+
+        var salida: [Miniatura] = []
+        for await resultado in grupo {                      // llegan segun terminan
+            if let m = resultado { salida.append(m) }
+        }
+        return salida
+    }
+}
+```
+
+Tres detalles cargan con casi toda la semántica. El primero es `of:`, que fija el **tipo común** de resultado de todas las hijas; si los trabajos devuelven cosas distintas hay que unificarlos en un enum o en una tupla, y esa fricción es una señal útil de que quizá lo que querías era `async let`. El segundo es que las hijas empiezan en cuanto se añaden, no al iterar. El tercero es que el grupo se comporta como una `AsyncSequence`: iterar sobre él consume resultados **en orden de finalización**, no de creación.
+
+Si el orden importa, la solución idiomática es devolver el índice junto al valor y reordenar al final, no intentar forzar la llegada.
+
+```swift
+await withTaskGroup(of: (Int, Miniatura?).self) { grupo in
+    for (i, url) in urls.enumerated() {
+        grupo.addTask { (i, await generarMiniatura(url)) }
+    }
+    var buffer = [Miniatura?](repeating: nil, count: urls.count)
+    for await (i, m) in grupo { buffer[i] = m }
+    return buffer.compactMap { $0 }
+}
+```
+
+<Callout type="warn" title="Un grupo sin consumir sigue siendo un grupo esperado">
+Si sales de la clausura sin iterar, el grupo espera igualmente a todas las hijas antes de cerrarse, y sus resultados se descartan. No hay fuga, pero tampoco hay ahorro: si no vas a usar los valores, cancela explícitamente con `cancelAll` en lugar de dejar que el ámbito espere en silencio.
+</Callout>
+
+## Errores: propagar o contener
+
+Con `withThrowingTaskGroup`, una hija que lanza no derriba el grupo por sí sola: el error se materializa cuando alguien lo consume, es decir, en el `for try await` o en un `next` explícito. En ese momento se cancela el resto de hijas, se espera a que terminen y el error sale del grupo.
+
+```swift
+try await withThrowingTaskGroup(of: Documento.self) { grupo in
+    for id in ids { grupo.addTask { try await descargar(id) } }
+    var docs: [Documento] = []
+    for try await d in grupo { docs.append(d) }   // el primer fallo aborta todo
+    return docs
+}
+```
+
+Esa es la política de «todo o nada», adecuada cuando un resultado parcial no tiene sentido. La política opuesta —seguir adelante y reportar los fallos— no se consigue con `try` sino haciendo que el fallo forme parte del tipo de resultado.
+
+```swift
+await withTaskGroup(of: Result<Documento, Error>.self) { grupo in
+    for id in ids {
+        grupo.addTask {
+            do    { return .success(try await descargar(id)) }
+            catch { return .failure(error) }
+        }
+    }
+    var ok: [Documento] = []
+    var fallos: [Error] = []
+    for await r in grupo {
+        switch r {
+        case .success(let d): ok.append(d)
+        case .failure(let e): fallos.append(e)
+        }
+    }
+    return Informe(exitos: ok, errores: fallos)
+}
+```
+
+La elección entre ambas no es estilística. «Todo o nada» convierte cualquier fallo en el fallo de la operación completa; la contención por `Result` mantiene vivo el trabajo restante y traslada la decisión a quien llama. Sincronizar veinte ficheros pide lo segundo; construir un objeto que necesita sus cinco partes pide lo primero.
+
+<Mermaid code={`flowchart TB
+  G[withThrowingTaskGroup abre el ambito] --> A1[addTask 1]
+  G --> A2[addTask 2]
+  G --> A3[addTask 3]
+  A1 --> C[for try await consume resultados]
+  A2 --> C
+  A3 --> C
+  C -->|una hija lanza| K[Se cancela el resto del grupo]
+  K --> W[Se espera a todas las hijas]
+  W --> E[El error sale del ambito]
+  C -->|todas terminan bien| R[Resultado agregado]
+  class C t-blue
+  class E t-red`} />
+
+## Limitar la concurrencia
+
+Añadir diez mil hijas de golpe compila y funciona, pero suele ser un error de ingeniería: cada una reserva memoria, y diez mil conexiones simultáneas saturan la red, el disco o el servidor remoto mucho antes de mejorar el rendimiento. El patrón correcto es una **ventana deslizante**: llenar el grupo hasta un máximo y, por cada resultado consumido, añadir el siguiente trabajo.
+
+```swift
+func procesar(_ items: [Item], maximo: Int = 6) async -> [Salida] {
+    await withTaskGroup(of: Salida.self) { grupo in
+        var indice = 0
+        var salidas: [Salida] = []
+
+        while indice < min(maximo, items.count) {        // llenar la ventana
+            let item = items[indice]
+            grupo.addTask { await trabajar(item) }
+            indice += 1
+        }
+
+        for await s in grupo {                            // uno sale, uno entra
+            salidas.append(s)
+            if indice < items.count {
+                let item = items[indice]
+                grupo.addTask { await trabajar(item) }
+                indice += 1
+            }
+        }
+        return salidas
+    }
+}
+```
+
+El máximo adecuado no se adivina: depende del recurso que satura primero. Para trabajo ligado a CPU, el número de núcleos activos es un punto de partida razonable; para red, lo marca el servidor y la latencia; para disco, el dispositivo. Medir dos o tres valores es más barato que discutirlo.
+
+<Cards>
+  <Card icon="🎯" title="Un tipo, muchos trabajos">
+    El grupo homogeneiza. Si te cuesta encontrar el tipo común, revisa si el problema pedía en realidad aridad fija.
+  </Card>
+  <Card icon="🚪" title="El consumo es donde ocurre todo">
+    Resultados, errores y el fin del grupo se observan al iterar. Sin consumo, el grupo funciona pero se vuelve opaco.
+  </Card>
+  <Card icon="🪟" title="La ventana antes que el diluvio">
+    Limitar la concurrencia casi siempre mejora la latencia total y siempre mejora la estabilidad bajo carga.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="El grupo como reificación del ámbito, y el precio de hacerlo explícito">
+Un grupo de tareas es lo que ocurre cuando una idea que vivía en el compilador se convierte en un objeto que vive en la memoria. En `async let` el ámbito es puramente léxico: no existe ninguna entidad en ejecución llamada «el conjunto de mis hijas», porque el compilador conoce su tamaño y puede compilar las esperas directamente en cada salida. El grupo **reifica** ese ámbito: lo vuelve un valor con estado propio, con una lista viva de hijas, con un canal por el que salen sus resultados y con un método para cancelarlas todas. Ese paso de lo estático a lo reificado es uno de los movimientos recurrentes del diseño de lenguajes —lo mismo ocurre al pasar de la recursión al `stack` explícito, de los tipos a la metaprogramación o del bloque `try` a un valor que representa el fallo— y siempre tiene el mismo perfil de coste y beneficio: se gana expresividad ilimitada y se paga con verificación reducida y con contabilidad en ejecución. Aquí el precio se ve con claridad en las restricciones que Swift impone al valor del grupo, que no puede escapar de la clausura ni guardarse en ninguna parte: si pudiera, la garantía de que el ámbito posee a sus hijas se rompería, y el grupo pasaría de ser una estructura a ser exactamente aquello que la concurrencia estructurada vino a sustituir, una lista global de trabajos que alguien tiene que recordar vaciar. Hay una segunda lección, más práctica y más profunda de lo que parece: al hacer explícito el ámbito, el grupo hace también explícita una decisión que el modelo sin estructura permitía no tomar nunca, la de **cuánto paralelismo es el correcto**. Escribir un bucle que añade una hija por elemento se siente como declarar intención, pero en realidad delega en el planificador una decisión de capacidad que el planificador no puede tomar, porque desconoce cuál es el recurso escaso de tu sistema. La ventana deslizante no es una optimización tardía sino la forma de admitir en el código que existe un cuello de botella real y de nombrarlo; y una vez nombrado, el mismo número que limita la concurrencia se convierte en la palanca que permite razonar sobre latencia, sobre consumo y sobre el comportamiento del sistema el día que la lista de entrada crezca cien veces.
+</Callout>
+
+<Challenge title="Un grupo que aguante la carga">
+1. Convierte un bucle secuencial sobre cien elementos en un grupo y compara tiempo total, uso de memoria y estabilidad.
+2. Devuelve pares de índice y valor para reconstruir el orden original y verifica que el orden de llegada difiere del de creación.
+3. Implementa las dos políticas de error sobre el mismo trabajo y escribe una prueba que distinga sus comportamientos ante un fallo intermedio.
+4. Añade una ventana deslizante configurable y mide latencia con máximos de 1, 4, 16 y sin límite hasta encontrar el codo de la curva.
+5. Cancela el grupo desde fuera a mitad de proceso y comprueba que ninguna hija sobrevive al cierre del ámbito.
+</Challenge>

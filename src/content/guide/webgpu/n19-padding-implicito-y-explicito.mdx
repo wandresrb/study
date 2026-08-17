@@ -1,0 +1,158 @@
+---
+title: "El padding implícito, el explícito y las reglas extra del espacio uniform"
+description: "Los atributos @align y @size, por qué el espacio de direcciones uniform impone un stride de 16 en los arrays, y las tres reordenaciones que eliminan el padding de una struct."
+subject: webgpu
+level: 19
+order: 3
+position: "19.3"
+duration: "21 min"
+---
+
+<Lead>
+Las reglas de alineación producen huecos que nadie escribió. WGSL ofrece dos atributos para tomar el control de esos huecos, y además impone al espacio de direcciones `uniform` unas restricciones adicionales que no se aplican a `storage` y que explican el bug más caro del ecosistema: un `array<f32, 64>` que en un uniform buffer ocupa 1024 bytes en vez de 256.
+</Lead>
+
+<Goals>
+
+- Usar `@align(n)` y `@size(n)` para forzar el layout de un miembro de struct.
+- Enunciar las dos restricciones extra del espacio `uniform` y calcular su efecto.
+- Reordenar los miembros de una struct para eliminar el padding sin cambiar su contenido.
+- Escribir un miembro de relleno explícito y saber cuándo es preferible al atributo.
+
+</Goals>
+
+## Los dos atributos
+
+WGSL permite anotar cualquier miembro de una struct con `@align(n)` y `@size(n)`.
+
+`@align(n)` fuerza la alineación de ese miembro a `n`, que tiene que ser una potencia de dos positiva y **no menor** que la alineación natural del tipo. Sirve para empujar un miembro a un límite concreto:
+
+```wgsl
+struct Bloque {
+  a : f32,             // offset 0
+  @align(16) b : f32,  // offset 16 en vez de 4
+};                     // AlignOf = 16, SizeOf = 32
+```
+
+`@size(n)` fuerza el tamaño que ese miembro **ocupa dentro de la struct**, que tiene que ser mayor o igual al tamaño natural. No cambia el tipo ni lo que el shader lee: solo estira el hueco que separa a este miembro del siguiente.
+
+```wgsl
+struct Bloque {
+  @size(16) v : vec3<f32>,   // ocupa 16 aunque vec3 mida 12
+  f : f32,                    // offset 16, no 12
+};                            // SizeOf = 32
+```
+
+La diferencia entre los dos es la dirección en que actúan: `@align` mueve el **inicio** de este miembro, `@size` mueve el **inicio del siguiente**. Para el mismo objetivo suele haber una versión con cada uno, y la elección es de legibilidad.
+
+Ambos atributos afectan también a `AlignOf` y `SizeOf` de la struct que los contiene, con las mismas reglas de siempre: la alineación de la struct es el máximo de las alineaciones efectivas de sus miembros, y su tamaño se redondea a esa alineación.
+
+<Callout type="tip" title="@size para documentar, no solo para forzar">
+Escribir `@size(16)` sobre un `vec3<f32>` cuyo siguiente miembro ya iba a caer en 16 no cambia nada del layout, y a cambio deja escrito en el shader que ese hueco es deliberado. Cuando alguien inserte un `f32` en medio seis meses después, el atributo lo obliga a decidir conscientemente si quiere el hueco o no, en vez de descubrir el desplazamiento en la pantalla.
+</Callout>
+
+## Las restricciones extra del espacio uniform
+
+Aquí está la regla que cuesta dinero. Además de las cuatro reglas generales, WGSL impone al espacio de direcciones `uniform` dos restricciones que no se aplican a `storage`:
+
+**El stride de un array tiene que ser múltiplo de 16.** Un `array<f32, 4>` en un storage buffer tiene stride 4 y ocupa 16 bytes. El mismo array en un uniform buffer tiene stride 16 y ocupa **64 bytes**. Cada `f32` viaja solo en su bloque de 16, con doce bytes de relleno detrás.
+
+**Un miembro de tipo struct o array se alinea a 16.** Formalmente, la alineación requerida en el espacio uniform de una struct o de un array es `roundUp(16, AlignOf(T))`. Además, cuando un miembro es una struct, el miembro siguiente empieza al menos en `offset + roundUp(16, SizeOf(struct))`.
+
+La consecuencia práctica es brutal y aparece en cuanto alguien quiere pasar una tabla de números:
+
+```wgsl
+struct Pesos {
+  valores : array<f32, 64>,   // en uniform: 64 × 16 = 1024 bytes
+};
+@group(0) @binding(0) var<uniform> pesos : Pesos;
+```
+
+Mil veinticuatro bytes para 256 bytes de datos útiles, y el 75 % del ancho de banda desperdiciado en leer relleno. Además, el shader que hace `pesos.valores[i]` está leyendo cada dato en un bloque distinto, lo que arruina la localidad.
+
+La solución idiomática es empaquetar en `vec4`:
+
+```wgsl
+struct Pesos {
+  valores : array<vec4<f32>, 16>,   // 16 × 16 = 256 bytes, sin relleno
+};
+```
+
+Y en el shader, el acceso al elemento `i` se descompone en índice de bloque y componente:
+
+```wgsl
+fn peso(i : u32) -> f32 {
+  return pesos.valores[i / 4u][i % 4u];
+}
+```
+
+La división y el módulo por 4 son un desplazamiento y una máscara para el compilador, así que el coste es despreciable frente al ancho de banda que ahorras.
+
+<Callout type="danger" title="El mismo shader, dos layouts distintos según el espacio">
+La struct `Pesos` declarada arriba tiene tamaño 1024 en `uniform` y 256 en `storage`. Si la mueves de un espacio a otro sin cambiar el código de JavaScript que la rellena, todo se rompe en silencio. Y como el cambio de espacio suele hacerse por un motivo ajeno —el array creció, hace falta escritura—, la relación causa-efecto no es obvia. Cuando cambies el espacio de direcciones de una struct, recalcula el layout entero desde cero.
+</Callout>
+
+## Reordenar para eliminar el padding
+
+El padding implícito casi siempre se puede eliminar reordenando los miembros. Hay tres reglas prácticas.
+
+**Agrupa los miembros por alineación decreciente.** Matrices y `vec4` primero, `vec3` y `vec2` después, escalares al final. Cada grupo empieza en un límite que respeta al anterior sin necesidad de relleno.
+
+**Emparéjate los `vec3` con un escalar detrás.** Es el patrón que hace que `Luz` mida 32 bytes exactos. Un `vec3<f32>` seguido de un `f32` llena un bloque de 16 sin desperdiciar nada, y hay casi siempre un escalar disponible que emparejar.
+
+**Junta los escalares en grupos de cuatro.** Cuatro `f32` o `u32` consecutivos llenan un bloque; tres dejan cuatro bytes de cola que se pierden en el redondeo final.
+
+Aplicado a un caso real, la diferencia es esta:
+
+```wgsl
+// 96 bytes: tres huecos de padding.
+struct MaterialMal {
+  rugosidad  : f32,          // 0
+  colorBase  : vec4<f32>,    // 16  (12 bytes perdidos)
+  metalico   : f32,          // 32
+  emision    : vec3<f32>,    // 48  (12 bytes perdidos)
+  oclusion   : f32,          // 60
+  normalMul  : f32,          // 64
+};                           // roundUp(16, 68) = 80
+
+// 48 bytes: sin ningún hueco.
+struct MaterialBien {
+  colorBase  : vec4<f32>,    // 0
+  emision    : vec3<f32>,    // 16
+  rugosidad  : f32,          // 28
+  metalico   : f32,          // 32
+  oclusion   : f32,          // 36
+  normalMul  : f32,          // 40
+  _reserva   : f32,          // 44
+};                           // 48
+```
+
+De 80 a 48 bytes, un 40 % menos, sin quitar ni un dato. En una escena con quinientos materiales eso son 16 KiB menos de tráfico y, sobre todo, cada material cabe en tres líneas de caché en vez de cinco.
+
+El `_reserva` del final es padding **explícito**. Podría omitirse y dejar que la regla 3 hiciera el redondeo, pero escribirlo tiene dos ventajas: deja claro que los 48 bytes son deliberados, y le da nombre a un hueco que mañana puede ser un dato útil.
+
+## Padding explícito frente a atributo
+
+Hay dos formas de escribir un hueco: un miembro de relleno con nombre, o un `@size` sobre el miembro anterior. Ambas producen exactamente el mismo layout.
+
+```wgsl
+// A: miembro de relleno.
+struct A {
+  v  : vec3<f32>,
+  _p : f32,
+  w  : vec3<f32>,
+  _q : f32,
+};
+
+// B: atributo de tamaño.
+struct B {
+  @size(16) v : vec3<f32>,
+  @size(16) w : vec3<f32>,
+};
+```
+
+La versión A tiene una ventaja concreta: el código de JavaScript que rellena el buffer puede escribir en los huecos sin ceremonia, porque son campos con posición conocida. La versión B es más compacta y más difícil de estropear al reordenar. Para structs que se generan desde una herramienta, B; para structs que se escriben a mano desde JavaScript, A suele leerse mejor porque el conteo de floats coincide con el conteo de miembros.
+
+<Callout type="dios" title="El padding no es memoria desperdiciada: es memoria que la GPU lee igual">
+Cuesta convencer a alguien de que reordenar campos importa cuando el ahorro son 32 bytes por material. La cuenta que convence no es la de memoria sino la de **líneas de caché**. Una GPU lee memoria en bloques de 64 o 128 bytes; un material de 48 bytes puede caber entero en una línea, uno de 80 nunca. Cuando el fragment shader lee `material.rugosidad`, o el dato ya está en caché porque vino con `colorBase`, o cuesta un viaje a memoria que la GPU tapa ejecutando otras invocaciones si tiene ocupación suficiente y no tapa si no la tiene. En un shader con muchos registros y poca ocupación —los shaders PBR completos lo son—, ese viaje extra es visible en el frame time. El padding no gasta memoria: gasta ancho de banda, que es el recurso escaso de verdad en una GPU moderna. Reordenar cuatro campos es la optimización con mejor relación esfuerzo-resultado de todo el pipeline gráfico.
+</Callout>

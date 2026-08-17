@@ -1,0 +1,147 @@
+---
+title: "Namespaces: aislar la vista del sistema"
+description: "Un proceso cree estar solo en el mundo porque el kernel le miente de forma coherente sobre qué parte del sistema puede ver. Los ocho tipos de namespace, qué recurso global particiona cada uno, y las tres llamadas que los crean y unen: clone, unshare y setns, con la identidad de cada namespace materializada como un inodo bajo proc."
+subject: kernel
+level: 52
+order: 1
+position: "52.1"
+duration: "16 min"
+---
+
+<Lead>
+Cuando ejecutas `ps aux` dentro de un contenedor y solo ves tres procesos, no es que el sistema tenga tres procesos: es que el kernel te muestra una lista recortada y te la presenta como si fuera la única. Esa mentira coherente y sostenida tiene un nombre, `namespace`, y es el ladrillo con el que se construye todo aislamiento en Linux. Un namespace particiona un recurso que hasta ahora era global y único —la tabla de PIDs, la pila de red, el árbol de montajes— y da a un grupo de procesos su propia instancia privada, invisible para el resto. No hay máquina virtual, no hay hipervisor: hay un kernel compartido que sabe fingir, para cada proceso, un universo distinto.
+</Lead>
+
+<Goals>
+
+- Entender un namespace como una partición privada de un recurso global del kernel.
+- Conocer los ocho tipos: `pid`, `net`, `mnt`, `uts`, `ipc`, `user`, `cgroup` y `time`.
+- Crear y unir namespaces con `clone`, `unshare` y `setns`.
+- Reconocer la identidad de un namespace en el inodo bajo `/proc/PID/ns`.
+
+</Goals>
+
+## Un recurso global partido en instancias
+
+Antes de los namespaces, ciertos recursos del kernel eran singletons: había *una* tabla de procesos, *una* pila TCP/IP, *un* hostname. Un namespace rompe esa unicidad. Cada proceso apunta, a través de su `task_struct`, a un `struct nsproxy` que reúne las instancias de namespace que ese proceso habita:
+
+```c
+/* include/linux/nsproxy.h (kernel 6.x/7.x) */
+struct nsproxy {
+	refcount_t		     count;
+	struct uts_namespace	    *uts_ns;
+	struct ipc_namespace	    *ipc_ns;
+	struct mnt_namespace	    *mnt_ns;
+	struct pid_namespace	    *pid_ns_for_children;
+	struct net		    *net_ns;
+	struct time_namespace	    *time_ns;
+	struct time_namespace	    *time_ns_for_children;
+	struct cgroup_namespace	    *cgroup_ns;
+};
+```
+
+Fíjate en dos ausencias reveladoras. El `user` namespace no está aquí: vive en las credenciales, `task->cred->user_ns`, porque gobierna quién eres, no qué ves. Y el `pid` namespace propio del proceso tampoco: se deduce de su `struct pid`, mientras `nsproxy` solo guarda `pid_ns_for_children`, el que heredarán los hijos que cree. Compartir un namespace es que dos `task_struct` apunten al mismo objeto; aislarlos es darles objetos distintos. Todo el aislamiento de Linux es, literalmente, esta indirección de punteros.
+
+## Los ocho recursos aislables
+
+Cada tipo de namespace corresponde a un flag de `clone` y particiona exactamente un recurso:
+
+```c
+/* include/uapi/linux/sched.h */
+#define CLONE_NEWTIME	0x00000080	/* relojes monotonic y boottime */
+#define CLONE_NEWNS	0x00020000	/* montajes (el "NS" historico: mount) */
+#define CLONE_NEWCGROUP	0x02000000	/* raiz de la jerarquia de cgroups */
+#define CLONE_NEWUTS	0x04000000	/* hostname y domainname */
+#define CLONE_NEWIPC	0x08000000	/* colas de mensajes, semaforos, shm */
+#define CLONE_NEWUSER	0x10000000	/* mapeo de UIDs y GIDs, capabilities */
+#define CLONE_NEWPID	0x20000000	/* numeracion de PIDs */
+#define CLONE_NEWNET	0x40000000	/* interfaces, rutas, puertos, firewall */
+```
+
+El `pid` namespace es el más vistoso: el primer proceso que lo crea se convierte en `PID 1` dentro de él, hereda la responsabilidad de recoger huérfanos y no puede ver a sus ancestros; un mismo proceso tiene un PID distinto en cada nivel de la jerarquía. El `net` namespace da una pila de red entera y vacía —solo `loopback` apagado— sobre la que luego se conecta un `veth`. El `mnt` namespace, cuyo flag conserva el nombre histórico `CLONE_NEWNS` de cuando era el único, aísla el árbol de montajes. El `user` namespace es el más profundo y el que habilita a los demás sin privilegios: dentro puedes ser `root` (UID 0) mientras fuera eres un usuario común, porque mapea rangos de identidades. El `time` namespace, incorporado en 5.6, virtualiza los relojes `CLOCK_MONOTONIC` y `CLOCK_BOOTTIME` para que un contenedor migrado conserve su noción de tiempo de arranque.
+
+<Mermaid code={`flowchart TD
+  T[task_struct del proceso] --> N[nsproxy]
+  T --> CR[cred user_ns]
+  T --> PID[struct pid namespace activo]
+  N --> U[uts_ns hostname]
+  N --> I[ipc_ns colas y semaforos]
+  N --> M[mnt_ns arbol de montajes]
+  N --> PC[pid_ns_for_children]
+  N --> NE[net_ns pila de red]
+  N --> C[cgroup_ns raiz de cgroups]
+  N --> TI[time_ns relojes]`} />
+
+## Tres llamadas: crear, desprender, unir
+
+Solo hay tres formas de manipular la membresía de un proceso en un namespace. `clone` crea un proceso nuevo ya dentro de namespaces frescos; `unshare` desprende al proceso actual de los que comparte, dándole instancias propias sin crear un hijo; y `setns` mete al proceso en un namespace ya existente al que apunta un descriptor de fichero.
+
+```c
+#define _GNU_SOURCE
+#include <sched.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+static char pila[65536];
+
+static int hijo(void *arg)
+{
+	sethostname("aislado", 7);        /* no afecta al host: uts propio */
+	execlp("/bin/sh", "sh", NULL);
+	return 1;
+}
+
+int main(void)
+{
+	/* un hijo con PID, red y hostname propios */
+	int flags = CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWUTS | SIGCHLD;
+	pid_t p = clone(hijo, pila + sizeof(pila), flags, NULL);
+	waitpid(p, NULL, 0);
+	return 0;
+}
+```
+
+Desde la línea de comandos, `unshare` hace lo mismo sin escribir C, y es la herramienta con la que exploraremos contenedores a mano en la lección siguiente:
+
+```bash
+# desprende mount y uts para este shell; el host no se entera
+unshare --mount --uts /bin/bash
+hostname prueba          # cambia solo aqui
+```
+
+`setns` es la operación inversa y la que usa `nsenter` o un runtime para *entrar* en el mundo de otro proceso, típicamente para inyectar un depurador dentro de un contenedor:
+
+```c
+int fd = open("/proc/1234/ns/net", O_RDONLY);
+setns(fd, CLONE_NEWNET);   /* adoptar la red del proceso 1234 */
+```
+
+## La identidad vive en un inodo
+
+¿Cómo sabe el kernel si dos procesos comparten un namespace? Cada instancia tiene un inodo único dentro del sistema de ficheros virtual `nsfs`, y ese número *es* su identidad. `/proc/PID/ns` expone un enlace simbólico mágico por cada tipo:
+
+```bash
+$ ls -l /proc/self/ns/
+lrwxrwxrwx net  -> 'net:[4026531840]'
+lrwxrwxrwx pid  -> 'pid:[4026531836]'
+lrwxrwxrwx mnt  -> 'mnt:[4026531841]'
+lrwxrwxrwx user -> 'user:[4026531837]'
+```
+
+Dos procesos están en el mismo `net` namespace si y solo si el número entre corchetes coincide. Ese enlace no es texto decorativo: si lo abres con `open`, obtienes un descriptor que mantiene vivo el namespace aunque muera el último proceso que lo habitaba —así se crean namespaces persistentes con `ip netns add`— y es exactamente el `fd` que `setns` espera. La identidad de un universo entero cabe en un número de inodo.
+
+<Callout type="warn" title="El user namespace es la llave maestra">
+Crear un `pid`, `net` o `mnt` namespace exige `CAP_SYS_ADMIN`. Pero crear un `user` namespace no requiere privilegios, y dentro de él obtienes las capabilities completas sobre los recursos que ese namespace posee. Por eso los contenedores *rootless* anidan primero un `user` namespace y desde él crean el resto: es la palanca que convierte a un usuario común en administrador de su propio universo aislado, sin tocar el del host.
+</Callout>
+
+<Callout type="dios" title="El aislamiento no es una barrera, es una perspectiva">
+Detente en la naturaleza exacta de lo que acabas de ver, porque contradice la intuición con la que llegaste. Uno imagina el aislamiento como un muro: algo que se interpone, que bloquea, que separa dos regiones del sistema con una frontera física. Los namespaces no son eso. No hay muro, no hay copia, no hay duplicación del recurso: hay un único kernel, una única tabla de procesos en la memoria de la máquina, una única pila de red real. Lo que cambia no es el sistema, sino el punto de vista desde el que cada proceso lo interroga. Un namespace es una lente, no una pared. Cuando el proceso dentro del contenedor pregunta por la lista de PIDs, el kernel no le oculta los otros procesos tras una barrera: sencillamente traduce la pregunta al marco de referencia de ese namespace y le devuelve la única respuesta que tiene sentido en él. El proceso no está encerrado; está mirando el mismo mundo a través de un cristal que reescribe las coordenadas. Y de esta idea —que el aislamiento es relatividad de perspectiva y no separación física— se deduce toda la potencia y todo el peligro del modelo. La potencia: aislar cuesta casi nada, porque no copias nada, solo rediriges un puntero de `nsproxy`. El peligro: como el kernel es uno solo, cualquier grieta en él es una grieta en todos los universos a la vez, y un fallo en el código que traduce perspectivas colapsa la ilusión entera. El contenedor no es una fortaleza amurallada frente al host: es el mismo edificio visto desde una habitación cuyas ventanas el kernel repintó. Entender esto es entender por qué un contenedor comprometido que alcanza el kernel lo compromete todo, y por qué el resto de este nivel —seccomp, capabilities, LSM— existe para reforzar la única superficie que de verdad separa los mundos.
+</Callout>
+
+<Challenge title="Cartografía tus propios universos">
+1. Ejecuta `unshare --user --map-root-user --pid --fork --mount-proc /bin/bash` y comprueba con `echo $$` y `ps aux` que eres `PID 1` en un mundo con casi ningún proceso.
+2. Desde otra terminal, compara `readlink /proc/self/ns/pid` con el mismo enlace dentro del shell aislado: los números de inodo deben diferir.
+3. Explica en tres líneas por qué `nsproxy` guarda `pid_ns_for_children` y no el `pid` namespace propio del proceso.
+4. Crea un `net` namespace persistente con `ip netns add lab` y razona qué mantiene vivo ese namespace cuando no hay ningún proceso dentro.
+5. Argumenta por qué crear un `user` namespace no necesita privilegios pero crear un `net` namespace directamente sí, y cómo se relacionan ambos hechos en un contenedor rootless.
+</Challenge>

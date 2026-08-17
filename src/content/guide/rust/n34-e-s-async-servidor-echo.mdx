@@ -1,0 +1,167 @@
+---
+title: "E/S async con Tokio: un servidor echo concurrente"
+description: "Aquí la teoría se vuelve un servidor que funciona. TcpListener acepta conexiones sin bloquear, TcpStream se lee y escribe con los traits AsyncReadExt y AsyncWriteExt, y el patrón acepta-y-lanza-tarea entrega una tarea por conexión al scheduler. El resultado es un echo concurrente que atiende a miles de clientes sobre un puñado de hilos, la culminación de todo lo anterior en unas veinte líneas."
+subject: rust
+level: 34
+order: 4
+position: "34.4"
+duration: "20 min"
+---
+
+<Lead>
+Todo lo anterior converge aquí, en algo que se conecta y responde. La E/S de red es el hábitat natural de async, porque es pura espera: un socket pasa la mayor parte de su vida aguardando bytes que aún no llegaron. Tokio ofrece los espejos asíncronos de la biblioteca estándar —`tokio::net::TcpListener` y `TcpStream`— cuyas operaciones, en vez de bloquear el hilo, **ceden** la tarea cuando no pueden progresar. Leer y escribir se hace a través de dos traits de extensión, `AsyncReadExt` y `AsyncWriteExt`, que dan los `.await`-ables `read` y `write_all`. Y el patrón que lo ata todo —aceptar en bucle y lanzar una tarea por conexión— produce un servidor echo que atiende a miles de clientes a la vez sobre los pocos hilos del runtime. Veinte líneas que resumen el nivel entero.
+</Lead>
+
+<Goals>
+
+- Aceptar conexiones sin bloquear con `TcpListener::bind` y el bucle de `accept`.
+- Leer y escribir sobre un `TcpStream` con `read` y `write_all` de `AsyncReadExt`/`AsyncWriteExt`.
+- Detectar el fin de conexión (`Ok(0)` como EOF) y manejar errores de E/S con `?`.
+- Ensamblar un servidor echo concurrente con el patrón acepta-y-lanza-una-tarea.
+
+</Goals>
+
+## TcpListener y el bucle de accept
+
+Un servidor empieza escuchando en una dirección. `TcpListener::bind` es asíncrono —reserva el socket y devuelve un future— y `accept` espera la siguiente conexión entrante **sin bloquear**: mientras no llegue ningún cliente, la tarea del bucle cede y el hilo trabajador atiende a otras.
+
+```rust
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:8080").await?;
+    println!("escuchando en 127.0.0.1:8080");
+
+    loop {
+        // accept cede la tarea hasta que un cliente se conecta
+        let (socket, addr) = listener.accept().await?;
+        println!("conexion de {addr}");
+        // ... aqui atenderemos el socket
+        let _ = socket;
+    }
+}
+```
+
+`accept` devuelve un par: el `TcpStream` de la conexión y la `SocketAddr` del cliente. Fíjate en que `main` devuelve `std::io::Result<()>`, de modo que el operador `?` del nivel 23 propaga cualquier fallo de red hasta el runtime. Este bucle, tal cual, ya acepta conexiones; lo que le falta es atenderlas *sin* dejar de aceptar las siguientes.
+
+## Leer y escribir async
+
+Un `TcpStream` no trae los métodos `read` y `write` como inherentes: llegan a través de dos traits de extensión que debes importar, `AsyncReadExt` y `AsyncWriteExt`. Importarlos "enciende" los métodos asíncronos sobre el stream, igual que un trait del nivel 13 añade capacidades a un tipo:
+
+```rust
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+async fn saludar(mut socket: TcpStream) -> std::io::Result<()> {
+    let mut buf = [0u8; 1024];
+
+    // read llena el buffer y devuelve cuantos bytes leyo
+    let n = socket.read(&mut buf).await?;
+    if n == 0 {
+        return Ok(()); // el otro extremo cerro: EOF
+    }
+
+    // write_all insiste hasta escribir todos los bytes
+    socket.write_all(&buf[..n]).await?;
+    socket.flush().await?;
+    Ok(())
+}
+```
+
+Dos convenios cruciales heredados de la E/S de Unix. `read` devuelve el número de bytes leídos, y un `Ok(0)` significa **fin de flujo**: el otro extremo cerró la conexión, no que "no había datos" —eso habría cedido la tarea, no retornado—. Y `write_all` es el envoltorio que repite la escritura hasta colocar *todos* los bytes, porque un `write` a secas podría escribir solo una parte. Trabaja con `write_all` salvo que tengas una razón para gestionar las escrituras parciales tú mismo.
+
+## Un servidor echo concurrente
+
+Ahora el ensamblaje. La clave está en **no** atender la conexión en el mismo bucle que acepta —eso serializaría a los clientes, uno esperando a que el anterior termine—. En su lugar, por cada conexión aceptada lanzamos una **tarea** con `tokio::spawn` y volvemos de inmediato a `accept`:
+
+```rust
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:8080").await?;
+
+    loop {
+        let (mut socket, addr) = listener.accept().await?;
+
+        // una tarea por conexion: el bucle sigue aceptando enseguida
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = match socket.read(&mut buf).await {
+                    Ok(0) => break,            // el cliente cerro
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("error leyendo de {addr}: {e}");
+                        break;
+                    }
+                };
+                if let Err(e) = socket.write_all(&buf[..n]).await {
+                    eprintln!("error escribiendo a {addr}: {e}");
+                    break;
+                }
+            }
+        });
+    }
+}
+```
+
+Cada tarea corre su propio bucle "lee un trozo, devuélvelo" hasta que el cliente cierra (`Ok(0)`) o falla la E/S. Como las tareas se lanzan con `spawn`, el runtime las reparte entre sus hilos con robo de trabajo, y el bucle de `accept` nunca se detiene a atender a nadie. Pruébalo con `nc 127.0.0.1 8080` en varias terminales a la vez: todas reciben eco simultáneo.
+
+<Callout type="warn" title="El move captura el socket, y por eso la tarea vive por su cuenta">
+El `async move` **traslada** el `socket` a la tarea: deja de existir en el bucle. Esto es lo que satisface el `'static` que exige `spawn` —la tarea no toma prestado nada del `main`, es dueña de su socket— y lo que permite que la conexión sobreviva a la iteración del bucle que la aceptó. Sin `move`, el future intentaría tomar prestado el `socket` local y el borrow checker lo rechazaría: una tarea desligada no puede sostener un préstamo de un ámbito que va a seguir corriendo.
+</Callout>
+
+<Mermaid code={`flowchart TD
+  B[bind y escucha en el puerto] --> A[accept cede hasta que llega un cliente]
+  A --> S[spawn lanza una tarea para el socket]
+  S --> A
+  S --> L[Bucle de la tarea lee un trozo del socket]
+  L --> C[read devuelve n bytes]
+  C -->|n mayor que cero| E[write_all devuelve los mismos bytes]
+  E --> L
+  C -->|n igual a cero es EOF| F[La tarea termina y suelta el socket]
+  class B t-mauve
+  class A t-blue
+  class S t-peach
+  class E t-green
+  class F t-red`} />
+
+## Una tarea por conexión, no un hilo
+
+Este patrón parece idéntico al viejo modelo "un hilo por conexión" de los servidores clásicos, y esa semejanza es justamente la victoria. Escribes el mismo código secuencial y legible —lee, procesa, responde, repite— pero cada unidad concurrente es una **tarea** de cientos de bytes, no un hilo de megabytes. Donde el modelo de hilos se ahogaba a los pocos miles de conexiones por agotar memoria y saturar al planificador del núcleo con cambios de contexto, el modelo de tareas sostiene decenas o cientos de miles sobre el puñado de hilos del runtime.
+
+Y la razón por la que funciona es todo lo del nivel: cada `.await` sobre `read`, `write_all` o `accept` que no puede progresar **cede** el hilo en lugar de bloquearlo (nivel 34.1), el driver de E/S registra el descriptor en `epoll` y despierta la tarea cuando hay datos, y el scheduler reparte las tareas listas entre sus trabajadores. El servidor echo es minúsculo, pero es la plantilla exacta de la que crecen `hyper` y `axum`: aceptar, lanzar una tarea, y dejar que el runtime haga lo suyo.
+
+<Cards>
+  <Card icon="👂" title="TcpListener">
+    `bind` reserva el socket y `accept` cede la tarea hasta que llega un cliente, devolviendo un `TcpStream` y la dirección del par.
+  </Card>
+  <Card icon="📥" title="AsyncReadExt">
+    Aporta `read` sobre el stream. Devuelve los bytes leídos; `Ok(0)` es fin de conexión, no ausencia momentánea de datos.
+  </Card>
+  <Card icon="📤" title="AsyncWriteExt">
+    Aporta `write_all`, que insiste hasta colocar todos los bytes, y `flush`. El envoltorio que evita gestionar escrituras parciales a mano.
+  </Card>
+  <Card icon="🧵" title="spawn por conexión">
+    El patrón que hace concurrente al servidor: aceptar y lanzar una tarea con `async move`, para no serializar a los clientes.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="El mismo código secuencial, un coste de concurrencia distinto">
+Detente en la extraña familiaridad de este servidor, porque en ella está la tesis entera de async. El cuerpo de la tarea —un bucle que lee, comprueba el fin de flujo, escribe y repite— es *exactamente* el que habrías escrito para un servidor bloqueante de un hilo por conexión hace treinta años. No hay callbacks anidados, ni promesas encadenadas, ni una inversión del control que te obligue a partir la lógica en fragmentos inconexos. La forma del código es secuencial porque el problema es secuencial: para un cliente dado, lees *y luego* respondes *y luego* vuelves a leer. Lo que async cambia no es la **forma** de la lógica, sino su **coste de concurrencia**. En el modelo bloqueante, sostener esa lógica secuencial para diez mil clientes a la vez costaba diez mil hilos, porque la única manera de que un `read` bloqueante no congelara a los demás era darle a cada uno su propio hilo con su propia pila de megabytes y su propio turno en el planificador del núcleo. Async rompe esa ecuación al reemplazar el bloqueo por la cesión: cuando el `read` de un cliente no tiene datos, su tarea no congela un hilo esperando, sino que se aparta y devuelve el hilo al scheduler, que lo dedica a otra de las diez mil tareas que sí tienen algo que hacer. El compilador hizo posible esta cesión transformando tu bucle secuencial en la máquina de estados del nivel 32.4, cuyos estados son precisamente los puntos `.await` donde la tarea puede suspenderse y reanudarse; el runtime la conduce; el reactor la despierta. Y el resultado es que la misma lógica que antes exigía un hilo por conexión ahora exige una tarea por conexión, y una tarea es tres órdenes de magnitud más barata. Aquí se cierra el arco que empezó en el nivel 29 con "un hilo por tarea no escala": la respuesta nunca fue escribir código más retorcido, sino conservar el código secuencial que los humanos sabemos leer y cambiar, por debajo, lo que cuesta ejecutarlo mil veces a la vez. Cuando `nc` te devuelve el eco desde tres terminales simultáneas y compruebas que las tres corren sobre los mismos cuatro hilos, estás viendo la promesa cumplida: la ergonomía de un hilo por conexión con el coste de una tarea por conexión.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+`TcpListener::bind` y `accept` aceptan conexiones cediendo la tarea, no bloqueando. Sobre un `TcpStream`, importa `AsyncReadExt` y `AsyncWriteExt` para tener `read` y `write_all`; `read` devuelve los bytes leídos y `Ok(0)` es EOF, `write_all` insiste hasta escribirlo todo. El patrón concurrente es aceptar en bucle y, por cada conexión, `tokio::spawn(async move { ... })`: el `move` traslada el socket a la tarea, satisface el `'static` y deja el bucle libre para seguir aceptando. Es la misma lógica secuencial que un servidor de hilo por conexión, pero con el coste de una tarea por conexión.
+</Callout>
+
+<Challenge title="Levanta y estira el servidor echo">
+1. Arranca el servidor echo y conéctate con `nc 127.0.0.1 8080` desde tres terminales; confirma que las tres reciben eco a la vez y explica cuántos hilos las atienden.
+2. Elimina el `tokio::spawn` y atiende cada conexión en el propio bucle de `accept`; observa que un cliente bloquea a los demás y explica por qué se serializaron.
+3. Quita el `move` del `async move` y lee el error del compilador; relaciónalo con el `'static` que exige `spawn`.
+4. Haz que el servidor devuelva el texto en mayúsculas en vez de un eco literal; identifica el único punto del bucle que cambia.
+5. Añade un `tokio::time::timeout` alrededor del `read` para cerrar conexiones inactivas tras cinco segundos, y explica qué tarea se despierta cuando vence el plazo.
+</Challenge>

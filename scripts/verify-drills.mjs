@@ -1,32 +1,32 @@
-// El oráculo: cada drill interactivo se ejecuta contra un Neovim REAL.
+// The oracle: every interactive exercise runs against a REAL Neovim.
 //
 //   node scripts/verify-drills.mjs [track]
 //
-// Extrae de los MDX los <Drill> con doc/solucion/objetivo, reproduce la
-// solución en `nvim --clean --headless` con feedkeys, y compara el buffer
-// resultante con el objetivo. Si divergen, o la solución está mal o la
-// emulación del navegador no cubre ese comando: en ambos casos el drill no
-// debe publicarse como interactivo. Correr en CI con neovim instalado.
+// Pulls the <Exercise> blocks that carry doc/solution/goal out of the MDX,
+// replays the solution in `nvim --clean --headless` through feedkeys, and
+// compares the resulting buffer with the goal. If they diverge, either the
+// solution is wrong or the browser emulation does not cover that command: in
+// both cases the exercise must not ship as interactive. Run it in CI.
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const GUIA = 'src/content/guia';
+const GUIDE = 'src/content/guide';
 const track = process.argv[2] ?? 'neovim';
 
-// El oráculo preferido es nvim; si no está, un Vim ≥8 con --clean se comporta
-// igual para todo lo que estos drills ejercitan (ORACULO_BIN lo fuerza).
-let bin = process.env.ORACULO_BIN ?? 'nvim';
-let esNvim = true;
+// nvim is the preferred oracle; failing that, a Vim >=8 with --clean behaves
+// the same for everything these exercises exercise (ORACLE_BIN forces it).
+let bin = process.env.ORACLE_BIN ?? 'nvim';
+let isNvim = true;
 try {
   execFileSync(bin, ['--version'], { stdio: 'pipe' });
-  esNvim = !/^VIM - Vi IMproved/m.test(String(execFileSync(bin, ['--version'], { stdio: 'pipe' })));
+  isNvim = !/^VIM - Vi IMproved/m.test(String(execFileSync(bin, ['--version'], { stdio: 'pipe' })));
 } catch {
   try {
     bin = 'vim';
     execFileSync(bin, ['--version'], { stdio: 'pipe' });
-    esNvim = false;
+    isNvim = false;
     console.warn('⚠ sin nvim: usando vim clásico como oráculo (equivalente para estos drills)');
   } catch {
     console.error('✗ ni `nvim` ni `vim` en el PATH.');
@@ -34,33 +34,33 @@ try {
   }
 }
 
-/** Extrae los atributos de cada <Drill …> multilínea con doc y solucion. */
-function extraerDrills(texto, fichero) {
-  const drills = [];
+/** Pulls the attributes out of each multiline <Exercise …> with doc + solution. */
+function extractExercises(text, file) {
+  const found = [];
   const re = /<Exercise\b/g;
   let m;
-  while ((m = re.exec(texto))) {
-    // la ventana del tag: hasta el ">" solo en su línea (drills interactivos),
-    // el "/>" de un autocierre, el cierre </Drill> de un accordion, o el
-    // siguiente <Drill — lo primero que llegue, para no mezclar drills
-    const resto = texto.slice(m.index);
-    const limites = [/\n>\s*\n/, /\/>/, /<\/Exercise>/, /(?!^)<Exercise\b/m]
-      .map((r) => resto.slice(1).search(r) + 1)
+  while ((m = re.exec(text))) {
+    // the tag window: up to a ">" alone on its line (interactive form), the
+    // "/>" of a self-close, the </Exercise> of an accordion, or the next
+    // <Exercise — whichever comes first, so two never blend into one
+    const rest = text.slice(m.index);
+    const bounds = [/\n>\s*\n/, /\/>/, /<\/Exercise>/, /(?!^)<Exercise\b/m]
+      .map((r) => rest.slice(1).search(r) + 1)
       .filter((i) => i > 0);
-    if (limites.length === 0) continue;
-    const tag = resto.slice(0, Math.min(...limites));
-    const attr = (nombre) => {
-      const r = new RegExp(`${nombre}=\\{(('(?:\\\\.|[^'\\\\])*')|("(?:\\\\.|[^"\\\\])*")|(\\[[^\\]]*\\])|(\\d+))\\}`);
+    if (bounds.length === 0) continue;
+    const tag = rest.slice(0, Math.min(...bounds));
+    const attr = (name) => {
+      const r = new RegExp(`${name}=\\{(('(?:\\\\.|[^'\\\\])*')|("(?:\\\\.|[^"\\\\])*")|(\\[[^\\]]*\\])|(\\d+))\\}`);
       const hit = r.exec(tag);
       if (!hit) return undefined;
-      // es una expresión JS de nuestro propio contenido: evaluarla es seguro
+      // a JS expression from our own content: evaluating it is safe
       return new Function(`return (${hit[1]})`)();
     };
     const doc = attr('doc');
     const solution = attr('solution');
     if (doc === undefined || solution === undefined) continue;
-    drills.push({
-      file: fichero,
+    found.push({
+      file,
       challenge: /challenge="([^"]*)"/.exec(tag)?.[1] ?? '(sin enunciado)',
       doc,
       cursor: attr('cursor') ?? [1, 0],
@@ -70,70 +70,70 @@ function extraerDrills(texto, fichero) {
       solution,
     });
   }
-  return drills;
+  return found;
 }
 
-/** "ci\"adiós<Esc>" → cadena para feedkeys() entre comillas dobles de vimscript */
-function aFeedkeys(teclas) {
-  return teclas
+/** "ci\"adiós<Esc>" -> a string for feedkeys() inside vimscript double quotes */
+function toFeedkeys(keys) {
+  return keys
     .replaceAll('\\', '\\\\')
     .replaceAll('"', '\\"')
-    // <Esc>, <CR>, <C-v>… pasan a notación \<...> que vimscript expande
+    // <Esc>, <CR>, <C-v>… become the \<...> notation vimscript expands
     .replace(/<([^<>]+)>/g, '\\<$1>')
-    // y los saltos de línea reales, al FINAL: si fuera antes, la regla de
-    // arriba re-escaparía el <CR> recién creado y llegaría como texto
+    // real newlines LAST: any earlier and the rule above would re-escape the
+    // <CR> it just created, and it would arrive as literal text
     .replaceAll('\n', '\\<CR>');
 }
 
 const dir = mkdtempSync(join(tmpdir(), 'drills-'));
 let total = 0;
-let mal = 0;
+let bad = 0;
 
-for (const f of readdirSync(join(GUIA, track)).filter((f) => f.endsWith('.mdx'))) {
-  const drills = extraerDrills(readFileSync(join(GUIA, track, f), 'utf8'), f);
-  for (const d of drills) {
+for (const f of readdirSync(join(GUIDE, track)).filter((f) => f.endsWith('.mdx'))) {
+  const exercises = extractExercises(readFileSync(join(GUIDE, track, f), 'utf8'), f);
+  for (const d of exercises) {
     total += 1;
-    const entrada = join(dir, 'in.txt');
-    const salida = join(dir, 'out.txt');
-    const posicion = join(dir, 'pos.txt');
-    writeFileSync(entrada, d.doc.endsWith('\n') || d.doc === '' ? d.doc : d.doc + '\n');
-    const teclas = aFeedkeys((d.setup ?? '') + d.solution);
-    const [lin, col] = d.cursor;
+    const input = join(dir, 'in.txt');
+    const output = join(dir, 'out.txt');
+    const posFile = join(dir, 'pos.txt');
+    writeFileSync(input, d.doc.endsWith('\n') || d.doc === '' ? d.doc : d.doc + '\n');
+    const keys = toFeedkeys((d.setup ?? '') + d.solution);
+    const [line, col] = d.cursor;
     try {
       execFileSync(
         bin,
         [
-          '--clean', ...(esNvim ? ['--headless'] : ['--not-a-term', '-X']), '-n', entrada,
-          '-c', `call cursor(${lin},${col + 1})`,
-          // 'tx': la t hace que las teclas cuenten como TECLEADAS — sin ella,
-          // una grabación de macro (q…q) captura un registro vacío
-          '-c', `call feedkeys("${teclas}", 'tx')`,
-          '-c', `call writefile([line('.') . ',' . (col('.') - 1)], '${posicion}')`,
-          '-c', `silent! write! ${salida}`,
+          '--clean', ...(isNvim ? ['--headless'] : ['--not-a-term', '-X']), '-n', input,
+          '-c', `call cursor(${line},${col + 1})`,
+          // 'tx': the t makes the keys count as TYPED — without it, recording
+          // a macro (q…q) captures an empty register
+          '-c', `call feedkeys("${keys}", 'tx')`,
+          '-c', `call writefile([line('.') . ',' . (col('.') - 1)], '${posFile}')`,
+          '-c', `silent! write! ${output}`,
           '-c', 'qa!',
         ],
         { stdio: 'pipe', timeout: 10_000 },
       );
-      const res = readFileSync(salida, 'utf8').replace(/\n$/, '');
-      const esperado = (d.goal ?? d.doc).replace(/\n$/, '');
-      const [rl, rc] = readFileSync(posicion, 'utf8').trim().split(',').map(Number);
-      const docOk = res === esperado;
+      const got = readFileSync(output, 'utf8').replace(/\n$/, '');
+      const want = (d.goal ?? d.doc).replace(/\n$/, '');
+      const [rl, rc] = readFileSync(posFile, 'utf8').trim().split(',').map(Number);
+      const docOk = got === want;
       const curOk = !d.goalCursor || (rl === d.goalCursor[0] && rc === d.goalCursor[1]);
       if (docOk && curOk) {
         console.log(`✓ ${f} · ${d.challenge.slice(0, 60)}`);
       } else {
-        mal += 1;
-        console.error(`✗ ${f} · ${d.reto.slice(0, 60)}`);
-        if (!docOk) console.error(`    buffer real:    ${JSON.stringify(res)}\n    buffer esperado: ${JSON.stringify(esperado)}`);
+        bad += 1;
+        console.error(`✗ ${f} · ${d.challenge.slice(0, 60)}`);
+        if (!docOk) console.error(`    buffer real:    ${JSON.stringify(got)}\n    buffer esperado: ${JSON.stringify(want)}`);
         if (!curOk) console.error(`    cursor real: [${rl},${rc}] · esperado: [${d.goalCursor}]`);
       }
     } catch (e) {
-      mal += 1;
-      console.error(`✗ ${f} · ${d.reto.slice(0, 60)} — nvim falló: ${e.message?.split('\n')[0]}`);
+      bad += 1;
+      console.error(`✗ ${f} · ${d.challenge.slice(0, 60)} — nvim falló: ${e.message?.split('\n')[0]}`);
     }
   }
 }
 
 rmSync(dir, { recursive: true, force: true });
-console.log(`\n${total} drills contra nvim real · ${mal} divergencias`);
-process.exit(mal ? 1 : 0);
+console.log(`\n${total} drills contra nvim real · ${bad} divergencias`);
+process.exit(bad ? 1 : 0);

@@ -1,0 +1,105 @@
+---
+title: "Por qué Rust en el embebido: seguridad sin red debajo"
+description: "En un microcontrolador no hay sistema operativo que te rescate, a menudo no hay MMU que convierta un puntero salvaje en un fallo limpio, y casi nunca cabe ni se tolera un recolector de basura. Las dos salidas clásicas del dilema entre control y seguridad desaparecen, y solo queda la tercera puerta de Rust: la prueba en compilación con coste cero. Además, el ownership modela el acceso exclusivo al hardware y el typestate codifica su configuración en el propio tipo."
+subject: rust
+level: 42
+order: 1
+position: "42.1"
+duration: "17 min"
+---
+
+<Lead>
+En un servidor, un puntero salvaje tiene dos redes debajo: la unidad de gestión de memoria (MMU), que lo convierte en un fallo de página y mata el proceso limpiamente, y el recolector de basura, que impide que llegues a tenerlo. En un microcontrolador las dos desaparecen. No hay sistema operativo que aísle procesos, a menudo no hay MMU —un Cortex-M carece de ella—, y casi nunca sobra la RAM ni la tolerancia a pausas que un GC exige. El espacio de direcciones es plano: la flash, la RAM y cada periférico conviven en un único mapa, de modo que una escritura descarriada no revienta con una traza de pila, sino que reconfigura en silencio el registro que gobierna un motor. Aquí la seguridad de memoria no es una comodidad: es la línea que separa un bug que atrapas de un bug que mueve un actuador físico. Por eso la tercera puerta de Rust —garantía en compilación, coste cero en ejecución— no es una opción más en el embebido: es la única que cabe.
+</Lead>
+
+<Goals>
+
+- Entender por qué el embebido carece de red de seguridad: sin SO y, a veces, sin MMU.
+- Ver por qué un fallo de memoria en un MCU es más grave y más silencioso que en un PC.
+- Comprender cómo el ownership modela el acceso exclusivo a periféricos mapeados en memoria.
+- Reconocer el typestate que codifica la configuración del hardware en el tipo.
+
+</Goals>
+
+## Lo que desaparece bajo tus pies
+
+Recuerda el dilema fundacional: control frente a seguridad, con C y C++ en un bando y los lenguajes con GC en el otro. En un PC, ese dilema tiene dos analgésicos. La **MMU** traduce direcciones virtuales y dispara un fallo de página cuando tocas memoria que no es tuya; el sistema operativo lo convierte en un `SIGSEGV` que mata solo tu proceso y deja el resto del sistema intacto. Y si prefieres no jugar con fuego, un **recolector de basura** te quita el volante entero.
+
+En un Cortex-M, ninguna de las dos existe. No hay MMU —como mucho una MPU opcional, mucho más burda—, así que las direcciones que manejas son físicas y desnudas. La flash arranca en `0x0800_0000`, la RAM en `0x2000_0000`, y los periféricos en `0x4000_0000`: todos en el mismo mapa plano. Una escritura fuera de rango no provoca un fallo de página, porque no hay quien lo levante; simplemente aterriza donde apunte. Si el puntero descarriado cae sobre `0x4002_0000`, no has corrompido un dato: has reconfigurado un puerto GPIO, un temporizador o un canal de DMA. El programa no se cae —sigue corriendo—, pero el motor gira cuando no debía.
+
+<Mermaid code={`flowchart TD
+  BUG[Escritura por un puntero salvaje] --> Q[Hay MMU y SO]
+  Q -->|Si, en un PC| PC[Fallo de pagina y SIGSEGV]
+  PC --> LIMPIO[El proceso muere limpio y aislado]
+  Q -->|No, en un MCU| MCU[Aterriza en el mapa plano]
+  MCU --> REG[Reconfigura un registro de periferico]
+  REG --> FISICO[El actuador fisico obedece al error]
+  class LIMPIO t-green
+  class FISICO t-red`} />
+
+El recolector de basura es, además, doblemente imposible aquí. Muchos MCU tienen entre 8 y 256 KB de RAM: no hay espacio para un heap gestionado que suele pedir de dos a cinco veces la memoria del dato vivo. Y un bucle de control de motor a 20 kHz no tolera una pausa de recolección de un milisegundo. A menudo ni siquiera hay heap: el binario reserva toda su memoria de forma estática. Las dos escapatorias tradicionales del dilema —"que la MMU lo mate" y "que el GC lo evite"— quedan amputadas. La garantía tiene que estar demostrada antes de arrancar.
+
+<Callout type="warn" title="El fallo silencioso es peor que el crash">
+Un `SIGSEGV` es, paradójicamente, una buena noticia: el fallo se manifiesta, se localiza y se corrige. En un MCU sin MMU el mismo error de memoria no se manifiesta; se disuelve en un comportamiento anómalo del hardware —un pin que conmuta solo, un contador que se desborda antes de tiempo— que puedes tardar semanas en rastrear con un osciloscopio. Rust convierte esa clase entera de errores en algo que ni compila, y por eso su valor *crece* al bajar al metal, no disminuye.
+</Callout>
+
+## El hardware como recurso con dueño
+
+Un periférico es, físicamente, un puñado de registros en direcciones fijas. En C se exponen como macros globales: cualquier función, desde cualquier módulo, puede escribir en `GPIOA->ODR`. No hay noción de propiedad, así que dos rutinas que configuren el mismo puerto compiten sin que nada lo impida: una carrera de datos, pero sobre silicio.
+
+Rust aplica su modelo de propiedad al hardware. El PAC —la capa de acceso a registros que verás en la lección siguiente— expone el conjunto de periféricos como un **singleton**: una función `take()` que devuelve `Some` la primera vez y `None` en cada llamada posterior. Poseer ese valor es poseer el hardware; para repartirlo, mueves subperiféricos fuera de él. El borrow checker garantiza entonces algo que en C no tiene ni nombre: que no existan dos partes del programa con un handle mutable al mismo periférico a la vez.
+
+```rust
+use stm32f4xx_hal::pac;
+
+let dp = pac::Peripherals::take().unwrap(); // Some la 1a vez
+// let otro = pac::Peripherals::take();     // devolveria None: ya no eres el unico
+let gpioa = dp.GPIOA; // mueves el puerto fuera: ahora su dueno es esta variable
+```
+
+Es el mismo `Send`, el mismo `Sync`, el mismo ownership que ya dominas, aplicados a un recurso que no es memoria del heap sino un bloque de registros. La exclusividad deja de ser una convención que el equipo promete respetar y pasa a ser un invariante que el compilador impone.
+
+## El tipo que recuerda cómo está configurado el pin
+
+El segundo regalo del sistema de tipos es el **typestate**, la misma técnica con que blindaste tu núcleo `unsafe` haciendo irrepresentables los estados ilegales, ahora aplicada al estado de un pin. Un GPIO puede estar como entrada, como salida o en función alternativa. En C es un entero, y nada te impide leer un pin configurado como salida o poner alto uno que es entrada: registros incoherentes que el hardware obedece sin rechistar.
+
+En un HAL de Rust, la configuración vive en el tipo. Configurar el pin lo **consume** y devuelve otro tipo distinto:
+
+```rust
+let gpioc = dp.GPIOC.split();
+let mut led = gpioc.pc13.into_push_pull_output(); // tipo: Output push-pull
+led.set_high(); // existe para una salida
+
+// let x = led.is_high();  // NO COMPILA: is_high no existe para un pin de salida
+```
+
+Un pin de entrada tiene tipo `Input` y un pin de salida `Output` (con parámetros como `PushPull` u `OpenDrain`); `set_high` solo existe para el segundo. Llamar a la operación equivocada no es un error en ejecución que descubres con el osciloscopio: es un método que sencillamente no está. Y todo ello a coste cero: el parámetro de tipo es un marcador fantasma, borrado en compilación, de modo que el código máquina generado es idéntico a la escritura cruda del registro que habrías tecleado en C. Pagas la seguridad en el compilador y no un ciclo en el chip.
+
+<Callout type="tip" title="El typestate no cuesta bytes ni ciclos">
+Un tipo como `Output` no ocupa memoria en el binario: es un *zero-sized type*. El HAL lo usa solo para decidir, en compilación, qué métodos ofrece cada pin. Tras la monomorfización desaparece por completo. Obtienes un pin que "recuerda" su modo sin gastar un solo bit de RAM en recordarlo: la memoria del tipo vive en el compilador, no en el dispositivo.
+</Callout>
+
+<Cards>
+  <Card icon="🔒" title="El periférico, con dueño">
+    `Peripherals::take()` entrega el hardware una sola vez. El ownership impide que dos partes del programa configuren el mismo periférico a la vez: acceso exclusivo demostrado, no prometido por convención.
+  </Card>
+  <Card icon="🏷️" title="El pin, con su modo en el tipo">
+    Configurar el pin lo consume y cambia su tipo. `set_high` solo existe para una salida; llamar a la operación equivocada no compila. Typestate a coste cero, borrado en la compilación.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="En el metal, la seguridad de tipos deja de ser lujo y se vuelve el modelo del hardware">
+Es tentador pensar que el embebido, por ser pequeño y cercano al silicio, es el terreno donde las garantías de un lenguaje de alto nivel estorban y conviene volver al puntero desnudo. La verdad es la contraria, y entenderla reordena tu idea de para qué sirve Rust. En un servidor, las abstracciones de seguridad compiten con una MMU y un GC que ya hacen parte del trabajo; su aportación es real pero acolchada por esas redes. En un MCU no hay redes: el mismo error que en un PC te da un crash localizable, aquí mueve una válvula, sobrecalienta una resistencia o hace que un marcapasos pierda un latido, y lo hace sin traza, sin excepción, sin nada que puedas capturar después. Justo donde el coste de equivocarse es máximo y las herramientas de rescate son mínimas, la única defensa posible es la que actúa *antes* de ejecutar. Y ahí Rust hace algo más profundo que impedir punteros colgantes: convierte el sistema de tipos en un modelo ejecutable del hardware. La propiedad de un periférico codifica su acceso exclusivo; el typestate de un pin codifica su modo eléctrico; una función alternativa mal enchufada no compila porque el tipo no encaja en el conector. El compilador deja de razonar solo sobre valores en memoria y empieza a razonar sobre la máquina física —qué está conectado a qué, en qué estado, quién lo controla—, rechazando las configuraciones imposibles igual que rechazaba los use-after-free. No has traído un lenguaje seguro a un dominio hostil: has descubierto el dominio donde su seguridad importa más, porque es el único donde no hay nadie más vigilando.
+</Callout>
+
+<Callout type="note" title="Lo esencial de por qué Rust en el embebido">
+El embebido elimina las dos redes que amortiguan los fallos de memoria en un PC: sin SO y a menudo sin MMU, un puntero salvaje no provoca un `SIGSEGV` limpio, sino que corrompe en silencio un registro de periférico en un mapa de direcciones plano. El GC es inviable por espacio y por latencia. Solo sirve la garantía en compilación con coste cero. Rust añade dos usos del sistema de tipos únicos del dominio: el ownership modela el acceso exclusivo al hardware (el singleton `Peripherals::take()`), y el typestate codifica la configuración de cada pin en su tipo, haciendo que las operaciones inválidas ni existan. Ambos, a coste cero en ejecución.
+</Callout>
+
+<Challenge title="Siente la ausencia de red">
+1. Busca el mapa de memoria de un MCU concreto (por ejemplo, un STM32F4) y localiza las tres regiones: flash, RAM y periféricos. Razona qué le pasa a una escritura en la base de los periféricos por error.
+2. Explica en dos frases por qué un recolector de basura es inviable en un dispositivo con 32 KB de RAM y un lazo de control a 20 kHz.
+3. Escribe el patrón singleton: llama a `Peripherals::take()` dos veces y observa que la segunda devuelve `None`. Explica qué invariante de propiedad protege eso.
+4. Configura un pin como salida con `into_push_pull_output()` e intenta llamar a un método de entrada. Lee el error del compilador y explica por qué el typestate lo hace imposible.
+5. Argumenta por qué la seguridad de memoria de Rust aporta *más* en un MCU sin MMU que en un servidor con MMU y GC, en vez de menos.
+</Challenge>

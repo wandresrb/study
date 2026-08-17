@@ -1,0 +1,134 @@
+---
+title: "Page faults: handle_mm_fault, demand paging y copy-on-write"
+description: "El mmap del nivel anterior no asignó memoria: la magia ocurre en el primer acceso, cuando la CPU lanza un fallo de página y el kernel materializa la página justo a tiempo. Recorremos handle_mm_fault, la paginación bajo demanda, el copy-on-write que hace barato a fork, y la ruta rápida de fallos con locks por-VMA."
+subject: kernel
+level: 23
+order: 3
+position: "23.3"
+duration: "17 min"
+---
+
+<Lead>
+El `mmap` del nivel 23.2 no reservó ni un byte de memoria física: solo prometió una región. La promesa se cobra en el primer acceso. Cuando el proceso toca una dirección que aún no tiene traducción, la MMU lanza una excepción —el fallo de página— y el kernel materializa la página justo a tiempo. Esa pereza tiene dos caras gemelas: la paginación bajo demanda, que no asigna hasta el primer toque, y el copy-on-write, que no copia hasta la primera escritura.
+</Lead>
+
+<Goals>
+
+- Seguir un fallo de página desde la trampa de la CPU hasta `handle_mm_fault`.
+- Entender demand paging: la memoria se asigna en el primer acceso, no en `mmap`.
+- Explicar copy-on-write en `fork` y su resolución en `do_wp_page`.
+- Conocer la ruta rápida de fallos con locks por-VMA.
+
+</Goals>
+
+## De la trampa al manejador
+
+Cuando la MMU no encuentra una traducción válida para una dirección, o la encuentra pero con permisos insuficientes, dispara una excepción de hardware. En x86 es el vector `#PF`: el registro `CR2` guarda la dirección que falló y un código de error indica si fue lectura o escritura, en usuario o en kernel, por permisos o por ausencia. El manejador de arquitectura (`do_user_addr_fault`) localiza la VMA con `find_vma` y delega en el corazón portable del subsistema:
+
+```c
+vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+                           unsigned int flags, struct pt_regs *regs);
+```
+
+Los `flags` describen el fallo: `FAULT_FLAG_WRITE` si fue una escritura, `FAULT_FLAG_USER` si vino de userspace, `FAULT_FLAG_INSTRUCTION` si fue al captar código. El valor de retorno es un mapa de bits `VM_FAULT_*`: `0` si se resolvió, `VM_FAULT_OOM`, `VM_FAULT_SIGBUS`, `VM_FAULT_SIGSEGV` para los fallos irrecuperables. Si no hay VMA que cubra la dirección, no hay promesa que cumplir: es un `SIGSEGV`.
+
+## Demand paging: nada hasta el primer toque
+
+`handle_mm_fault` desciende por `__handle_mm_fault`, que **construye la tabla de páginas** nivel a nivel —`p4d`, `pud`, `pmd`— asignando las tablas intermedias que falten, hasta llegar a `handle_pte_fault`, donde se decide qué página instalar. Si la PTE está vacía (`pte_none`, jamás tocada), el respaldo de la VMA elige la ruta:
+
+```c
+static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+{
+	if (!vmf->pte) {                       /* PTE nunca materializada */
+		if (vma_is_anonymous(vmf->vma))
+			return do_anonymous_page(vmf); /* anonimo: pagina a ceros */
+		else
+			return do_fault(vmf);          /* fichero: -> vm_ops->fault */
+	}
+	/* ...la PTE existe: quiza es swap, o una escritura sobre pagina protegida... */
+	if (vmf->flags & FAULT_FLAG_WRITE && !pte_write(vmf->orig_pte))
+		return do_wp_page(vmf);            /* copy-on-write */
+	return 0;
+}
+```
+
+Hay una optimización preciosa en `do_anonymous_page`: si el primer acceso a una página anónima es de **lectura**, el kernel no asigna memoria; mapea la **página cero** global (`zero_page`), una única página de ceros compartida por todo el sistema, en modo solo lectura. Solo cuando llega la primera **escritura** se asigna una página real. Un `calloc` gigante que apenas se lee cuesta, así, casi nada.
+
+No todos los fallos cuestan lo mismo, y la distinción gobierna el rendimiento. Un fallo **menor** (minor) solo necesita tender un mapeo a una página que ya está en RAM: la página cero, un folio del page cache ya residente, una página compartida por COW. Un fallo **mayor** (major) tiene que ir al almacenamiento y bloquea al proceso en E/S. Cuando la PTE no está vacía sino que guarda una **entrada de swap**, el fallo entra en `do_swap_page`, que trae la página de vuelta del disco y la reinstala: es el caso mayor por excelencia. El kernel los cuenta por separado en `/proc/PID/stat` (`minflt`, `majflt`), visibles con `ps -o min_flt,maj_flt`.
+
+<Callout type="tip" title="Minor frente a major: mide donde duele">
+Un proceso con muchos fallos **mayores** paga E/S en cada acceso: memoria fría, page cache expulsado o thrashing de swap, y su latencia salta de microsegundos a milisegundos. Uno con solo fallos **menores** materializa memoria que ya estaba en RAM, casi gratis. Cuando diagnostiques latencia de memoria, mira `majflt` antes que nada: es la señal de que tu working set no cabe y el disco se ha vuelto tu RAM.
+</Callout>
+
+## Copy-on-write: fork sin copiar
+
+`fork` debería duplicar todo el espacio de direcciones del padre. Copiarlo entero sería carísimo y casi siempre inútil, porque lo habitual es que el hijo haga `exec` de inmediato y lo tire todo. La solución es el **copy-on-write**: `copy_page_range` no copia páginas, copia **PTEs**, y marca las de ambos —padre e hijo— como solo lectura, incrementando el contador de referencias de cada folio. Los dos procesos comparten físicamente las mismas páginas mientras solo las lean.
+
+La ilusión se mantiene hasta que uno escribe. Esa escritura sobre una PTE protegida provoca un fallo que cae en `do_wp_page`:
+
+```c
+static vm_fault_t do_wp_page(struct vm_fault *vmf)
+{
+	struct folio *folio = ...;             /* la pagina compartida */
+
+	/* Si somos el unico dueno, reutilizamos en el sitio: cero copias */
+	if (folio && folio_ref_count(folio) == 1) {
+		wp_page_reuse(vmf);                /* solo re-habilita escritura */
+		return VM_FAULT_WRITE;
+	}
+	/* Si hay otros duenos, copiamos a una pagina privada nueva */
+	return wp_page_copy(vmf);              /* asigna, copia, instala escribible */
+}
+```
+
+<Mermaid code={`flowchart TB
+  F[fork: copy_page_range] --> S[padre e hijo comparten paginas solo-lectura]
+  S --> W{alguien escribe}
+  W -->|refcount 1: unico dueno| R[wp_page_reuse: rehabilita escritura sin copiar]
+  W -->|refcount mayor que 1| C[wp_page_copy: pagina nueva privada]
+  class S t-yellow
+  class R t-green
+  class C t-blue`} />
+
+La astucia del `refcount == 1`: si el otro proceso ya escribió su copia y se desligó, el folio queda con un solo dueño, y entonces `do_wp_page` reutiliza la página **sin copiar**, solo rehabilitando el bit de escritura. Para saber qué procesos comparten una página anónima, el kernel usa el **mapeo inverso** (`anon_vma`, el campo de la VMA que vimos en el nivel 23.1): la estructura que, dada una página física, encuentra todas las VMAs que la mapean.
+
+## La ruta rápida: locks por-VMA
+
+Durante años, cada fallo de página tomaba el `mmap_lock` en lectura. En cargas con miles de hilos que fallan a la vez, ese cerrojo global se convertía en el cuello de botella. Desde Linux 6.4, el camino rápido evita el `mmap_lock` por completo usando un **lock por-VMA**: se localiza y bloquea en lectura únicamente la VMA que falló, bajo RCU, y se resuelve el fallo sin tocar el cerrojo global.
+
+```c
+/* Camino rapido de do_user_addr_fault */
+vma = lock_vma_under_rcu(mm, address);       /* toma solo el lock de ESTA vma */
+if (vma) {
+	fault = handle_mm_fault(vma, address,
+	                        flags | FAULT_FLAG_VMA_LOCK, regs);
+	vma_end_read(vma);
+	if (!(fault & VM_FAULT_RETRY))
+		return;                          /* resuelto sin mmap_lock */
+}
+/* Complicacion (hay que asignar tablas, fusionar...): cae al camino lento */
+mmap_read_lock(mm);
+/* ...find_vma + handle_mm_fault clasicos... */
+```
+
+Si el fallo se complica —hace falta asignar tablas de páginas, o la operación tocaría varias VMAs— el manejador retrocede con `VM_FAULT_RETRY` y reintenta por el camino lento con el `mmap_lock`. El caso común, un fallo anónimo o de fichero sobre una VMA estable, se resuelve en paralelo con otros hilos sin contención. Esta escalabilidad es la cosecha directa del maple tree del nivel 23.1, cuya lectura segura bajo RCU hizo posibles los locks por-VMA.
+
+<Callout type="note" title="El fallo que suelta el cerrojo y se deja matar">
+Un fallo mayor puede esperar milisegundos por el disco, y sería intolerable sostener el `mmap_lock` todo ese tiempo. Por eso existe `FAULT_FLAG_ALLOW_RETRY`: al bloquearse en E/S, el manejador **suelta** el cerrojo, espera la página de forma interrumpible y reintenta con `VM_FAULT_RETRY`. Combinado con `FAULT_FLAG_KILLABLE`, esto hace que un proceso atascado en un fallo de disco siga siendo matable con una señal, en lugar de quedar clavado en estado D ininterrumpible.
+</Callout>
+
+<Callout type="warn" title="Overcommit: la promesa puede exceder la RAM">
+Como `mmap` promete sin entregar, el kernel puede prometer **más** memoria de la que existe: es el overcommit, gobernado por `/proc/sys/vm/overcommit_memory`. Casi siempre funciona, porque casi nadie toca todo lo que pidió. Pero si demasiados procesos cobran sus promesas a la vez y la RAM más el swap se agotan, el kernel no puede cumplir: entra el OOM killer y mata un proceso para recuperar páginas. La paginación bajo demanda es una apuesta estadística, y el OOM killer es lo que ocurre cuando la casa pierde.
+</Callout>
+
+<Callout type="dios" title="La pereza no es un truco de optimización: es la arquitectura">
+Mira lo que acabas de recorrer y verás un solo principio repetido a cuatro escalas. `mmap` promete pero no entrega. El primer acceso de lectura a memoria anónima da la página cero compartida, no una propia. `fork` comparte en vez de copiar. `do_wp_page` copia solo si de verdad hay otro dueño, y ni siquiera entonces si el refcount cayó a uno. En cada nivel, el kernel se niega a hacer trabajo hasta tener la **prueba irrefutable** de que ese trabajo es necesario, y esa prueba es siempre la misma: un fallo de página, la señal de hardware de que el programa acaba de tocar algo que necesitaba de verdad. Esto no es una colección de optimizaciones sueltas; es una filosofía de diseño que convierte a la MMU en el detector de necesidad del sistema. El hardware que parecía existir solo para traducir direcciones resulta ser, además, el mecanismo que le permite al kernel distinguir la memoria que el programa *dice* querer de la que *demuestra* usar. Por eso arrancar un proceso de un gigabyte es instantáneo, por eso `fork` seguido de `exec` no copia casi nada, por eso millones de procesos pueden compartir una libc. La memoria virtual no es rápida a pesar de ser perezosa: es rápida **porque** es perezosa, y el fallo de página es el latido que sincroniza pereza con necesidad.
+</Callout>
+
+<Challenge title="Provoca y observa la pereza">
+1. Reserva 1 GiB anónimo con `mmap`, mide el RSS antes y después con `/proc/self/status`, y explica por qué apenas sube hasta que escribes.
+2. Distingue en `handle_pte_fault` las rutas `do_anonymous_page`, `do_fault` y `do_wp_page`, y qué condición dispara cada una.
+3. Explica por qué la primera lectura de memoria anónima mapea la `zero_page` y qué cambia en la primera escritura.
+4. Razona cómo `do_wp_page` decide entre reutilizar (`refcount == 1`) y copiar, y qué papel juega `anon_vma`.
+5. Compara el camino rápido con `lock_vma_under_rcu` frente al lento con `mmap_read_lock`, y di qué complicación fuerza el retroceso a `VM_FAULT_RETRY`.
+</Challenge>

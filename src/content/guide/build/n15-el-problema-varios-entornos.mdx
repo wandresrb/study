@@ -1,0 +1,150 @@
+---
+title: "El problema: una app moderna vive en varios entornos"
+description: "Por qué el modelo de dos grafos de Vite 5 —un grafo de cliente y un único grafo de SSR cableado para Node— se quedó corto. Las apps modernas apuntan también al edge (workerd, Deno, Bun), a varios workers y a los React Server Components, que exigen tres grafos distintos. El diagnóstico que motivó la Environment API."
+subject: build
+level: 15
+order: 1
+position: "15.1"
+duration: "16 min"
+---
+
+<Lead>
+Tu aplicación no se ejecuta en un solo lugar. El mismo código fuente termina corriendo en el navegador, en un servidor Node que genera el HTML inicial y, cada vez más, en un runtime del edge —`workerd`, Deno, Bun— que imita las Web APIs del navegador pero no es Node. Cada destino es un runtime distinto: otros globales, otras condiciones de resolución, otras restricciones. Durante años, Vite modeló ese mundo plural como un binario: un grafo de cliente y un único grafo de SSR. Todo lo demás fue un parche. Este nivel diagnostica por qué ese binario tenía que romperse.
+</Lead>
+
+<Goals>
+
+- Enumerar los runtimes a los que apunta una app moderna: navegador, servidor Node y edge.
+- Entender el modelo de dos grafos cableados de Vite 5 y su `ssrLoadModule`.
+- Ver por qué "un grafo de SSR extra" no basta para el edge, los múltiples workers ni los RSC.
+- Reconocer los parches que construyeron los frameworks y el coste de parear dev con producción.
+
+</Goals>
+
+## Un mismo código, muchos destinos
+
+Una aplicación web moderna no es un programa, sino varios recortados del mismo fuente. Los mismos componentes se renderizan en el navegador —con `document`, `window` y el `fetch` del DOM—, en un servidor Node que produce el HTML inicial mediante SSR y, con frecuencia creciente, en un runtime del edge: Cloudflare `workerd`, Deno o Bun, que exponen las Web APIs estándar pero no son Node y no traen sus módulos `node:` de serie.
+
+Cada destino es un runtime con su propia física. Cambian los globales disponibles, cambian las condiciones de resolución que deciden qué archivo de un paquete se importa —`browser`, `node`, `worker`, `edge`— y cambian las restricciones: en el edge no hay sistema de archivos ni hilos, y un `import` de `node:fs` que en el servidor es trivial allí sencillamente no existe. La herramienta de build tiene que producir y servir código para todos esos destinos desde una sola base de código y, esto es lo decisivo, hacerlo idéntico en desarrollo y en producción.
+
+La palabra clave es *paridad*. No basta con que el código funcione en cada destino por separado; hace falta que la representación que pruebas en tu máquina sea la misma que se despliega. Cuando el runtime de desarrollo difiere del de producción, cada diferencia —un global ausente, una condición que resuelve a otro fichero, una API con semántica distinta— se vuelve un bug latente que solo aflora tras el despliegue, en el peor momento y con el peor coste de diagnóstico.
+
+Conviene contar los destinos con los dedos, porque el número exacto importa: no es "cliente y servidor", es cliente, uno o varios servidores Node, uno o varios Workers de edge y, cuando entran los RSC, grafos de servidor que coexisten. La pregunta deja de ser binaria —¿cliente o servidor?— y se vuelve cardinal: ¿cuántos entornos distintos, con qué runtime cada uno? Una herramienta que solo sabe contar hasta dos no puede responder esa pregunta, y todo el nivel trata de cómo Vite aprendió a contar más allá.
+
+<Cards>
+  <Card icon="🌐" title="Navegador">
+    ESM nativo cargado por el cliente. Globales del DOM, condición de resolución `browser`, salida a assets estáticos servidos desde un CDN.
+  </Card>
+  <Card icon="🖥️" title="Servidor Node">
+    El SSR clásico. Acceso a `node:` completo, condición `node`, evaluado en un proceso de larga vida que emite el HTML inicial.
+  </Card>
+  <Card icon="🛰️" title="Edge">
+    `workerd`, Deno o Bun. Web APIs sin Node, sin sistema de archivos, condición `workerd` o `worker`, arranque en frío de milisegundos cerca del usuario.
+  </Card>
+</Cards>
+
+## Vite 5: dos grafos cableados
+
+Vite creció con un modelo de dos mundos. Por dentro mantenía exactamente dos grafos de módulos, cableados en el código: el grafo `client` —lo que el navegador carga por ESM nativo— y un único grafo `ssr` —lo que Node evalúa para generar HTML—. La superficie pública reflejaba ese binario sin disimulo.
+
+```ts
+// Vite 5: el mundo era binario, y estaba cableado en el objeto server
+server.moduleGraph                                  // EL grafo del cliente
+await server.transformRequest(url)                  // transform de cliente
+await server.transformRequest(url, { ssr: true })   // transform de SSR
+await server.ssrLoadModule('/src/entry-server.ts')  // evaluado SIEMPRE en Node
+```
+
+No existía un tercer hueco. "SSR" no era un concepto general de "un entorno de servidor cualquiera": era ese grafo concreto, cableado para Node, incrustado en el objeto `server`. `ssrLoadModule` evaluaba el módulo con el sistema de módulos de Node y sus globales; daba por sentado el runtime. La palabra `environment` ni siquiera figuraba en la API: había cliente, y había SSR, y SSR quería decir Node. Cuando tu destino no era Node, la abstracción no te ofrecía nada y tenías que salirte de ella.
+
+Merece detenerse en la palabra "cableado", porque no es casual. Los dos grafos no eran configuración que pudieras extender: eran estructuras fijas del objeto `server`, con nombres propios en la API pública. Añadir un tercero no era pasar una opción, sino modificar el núcleo de Vite. Esa rigidez —dos y solo dos, por construcción— es la que forzó a todo el ecosistema a trabajar *alrededor* de Vite en vez de *a través* de él en cuanto el destino no era ni el navegador ni Node.
+
+## Por qué dos no bastan
+
+Tres fuerzas quebraron el binario a la vez, y conviene verlas juntas porque comparten una misma raíz: el número de entornos reales dejó de ser dos.
+
+<Mermaid code={`flowchart TB
+  src[Codigo fuente unico] --> cl[Grafo client navegador]
+  src --> sr[Grafo ssr Node]
+  sr -. no encaja .-> ed[Edge workerd]
+  sr -. no encaja .-> rc[RSC server]
+  sr -. no encaja .-> wq[Worker de cola]
+  class cl t-blue
+  class sr t-yellow
+  class ed t-red
+  class rc t-red
+  class wq t-red`} />
+
+- **El edge no es Node.** `ssrLoadModule` evalúa en Node, con sus globales y su resolución. Para correr ese mismo código de servidor dentro de `workerd` durante el desarrollo, los frameworks no podían reutilizarlo: dev corría en Node y producción en el edge, una brecha de paridad que escondía bugs hasta el despliegue.
+- **Una app puede tener varios servidores.** Un proyecto real combina a veces un worker de SSR con un worker de cola, o varios Workers coordinados. Dos grafos no pueden representar N contextos de servidor distintos, cada uno con su propia resolución y sus propios plugins.
+- **Los RSC exigen tres grafos.** React Server Components necesita como mínimo tres: el grafo de servidor que ejecuta los componentes de servidor, el de SSR que los hidrata a HTML y el de cliente, cada uno con su transform y sus condiciones. Un único hueco `ssr` no puede albergar dos grafos de servidor diferentes a la vez.
+
+El coste de segundo orden se pagaba a diario, y era el HMR. Cuando empaquetabas el servidor y lo reimportabas para ejecutarlo, perdías la actualización en caliente y volvías al ciclo de reinicio completo; cuando levantabas un servidor de Vite aparte, tenías que reinventar el puente que propaga los cambios de un grafo al runtime. El desarrollo del lado servidor iba siempre un peldaño por detrás del confort que Vite había normalizado para el cliente.
+
+Hay un matiz que agrava el cuadro: estos tres frentes no son alternativos, sino acumulativos. Una app real de 2026 puede ser, a la vez, cliente en el navegador, SSR en Node para el HTML inicial, RSC en un grafo de servidor y una función en `workerd` para una ruta de API. No es que elijas uno de los casos difíciles; es que te tocan varios a la vez, y el modelo de dos casillas se queda sin sitio ya en el segundo destino que no encaja en ellas.
+
+<Callout type="warn" title="El síntoma que lo delataba: dev en Node, producción en el edge">
+El bug clásico de esta era no estaba en tu código, sino en la brecha de runtime. Desarrollabas un Worker sobre un simulacro de Node, todo funcionaba, desplegabas a `workerd` y entonces reventaba: un global ausente, un `node:` que no existe, una API con semántica distinta. La causa no era un descuido tuyo, sino que la herramienta no sabía modelar tu destino real y te obligaba a probar sobre un runtime que no era el de producción. Ese fallo estructural —no accidental— es exactamente lo que la Environment API vino a eliminar.
+</Callout>
+
+## El coste de vivir sin entornos
+
+Vale la pena catalogar los parches, porque cada uno reaparecerá, ya resuelto, cuando lleguemos a la Environment API. Todos compartían una misma forma: reimplementar, fuera de Vite, una porción del trabajo que Vite hacía para el cliente pero se negaba a generalizar al resto de destinos.
+
+```ts
+// El rodeo tipico: un segundo servidor de Vite solo para el codigo de servidor
+const clientServer = await createServer(clientConfig)
+const ssrServer = await createServer(ssrConfig)   // otra instancia, otro proceso mental
+const { render } = await ssrServer.ssrLoadModule('/src/entry-server.ts')
+```
+
+<Cards>
+  <Card icon="🧱" title="Servidores separados">
+    Una instancia de Vite por destino. Duplicas config, memoria y estado, y coordinas a mano dos procesos que deberían ser uno.
+  </Card>
+  <Card icon="🔩" title="vite-node">
+    Un runner improvisado para evaluar módulos fuera del navegador. Cada framework mantenía el suyo, ninguno compatible con el vecino.
+  </Card>
+  <Card icon="🩹" title="Polyfills de Node">
+    Fingir en dev los globales que faltarán en el edge. Funciona hasta que la semántica difiere y el bug aparece solo en producción.
+  </Card>
+  <Card icon="📦" title="Empaquetar y reimportar">
+    Bundlear el servidor y volver a cargarlo para ejecutarlo. Barato de montar, caro de usar: adiós al HMR del servidor.
+  </Card>
+</Cards>
+
+Ninguno de estos rodeos era ilegítimo; todos eran respuestas razonables a una herramienta que no modelaba el problema. Pero su suma era un ecosistema fragmentado: cada framework mantenía su propia máquina, incompatible con la del vecino, y un plugin escrito para uno no servía para otro. La energía que debería haber ido a mejorar la plataforma se disipaba en reconstruir, una y otra vez, el mismo andamiaje.
+
+<Mermaid code={`flowchart TB
+  prob[El mismo problema ejecutar codigo de servidor] --> a[Framework A con su runner]
+  prob --> b[Framework B con su runner]
+  prob --> c[Framework C con su runner]
+  a --> dup[trabajo duplicado e incompatible]
+  b --> dup
+  c --> dup
+  class prob t-yellow
+  class dup t-red`} />
+
+El dibujo delata el desperdicio: varios frameworks resolviendo, cada uno por su cuenta, el mismo problema de ejecutar código de servidor, y produciendo soluciones que no se hablan entre sí. No es solo trabajo duplicado; es trabajo *divergente*, porque cada runner improvisado tomaba decisiones ligeramente distintas sobre resolución, globales o HMR, y esas diferencias se filtraban a los usuarios como incompatibilidades sutiles y difíciles de rastrear.
+
+<Callout type="tip" title="La fragmentación es el impuesto de una abstracción que falta">
+Cuando ves a varios proyectos serios reimplementar, cada uno peor, la misma pieza, no estás ante incompetencia colectiva sino ante una abstracción ausente en la capa de abajo. La fragmentación es el síntoma; la cura no es que un framework lo haga mejor que los demás, sino que la plataforma absorba el problema. La Environment API es exactamente ese movimiento: subir el concepto de entorno a Vite para que nadie tenga que reinventarlo aguas abajo, ni pagar el impuesto de mantenerlo.
+</Callout>
+
+El diagnóstico que cristalizó en la comunidad fue quirúrgico: el problema no era ninguno de los parches en particular, sino la suposición que los hacía necesarios —que "no cliente" equivale a "un único SSR de Node"—. Mientras esa suposición viviera cableada en el `server`, cada nuevo destino exigiría un nuevo rodeo. La única cura de fondo era mover el concepto de entorno de "constante del núcleo" a "abstracción de primera clase, pluralizable y configurable".
+
+<Callout type="note" title="El HMR del servidor era el canario en la mina">
+Si buscas una sola señal de que el modelo estaba mal, es la pérdida del HMR en el servidor. Vite había hecho del recargado en caliente algo tan natural que se daba por sentado en el cliente; que el lado servidor lo perdiera en cuanto salías del camino feliz no era un detalle menor, era el síntoma de que estabas ejecutando tu código *fuera* de Vite y no *dentro* de él. Cuando una comodidad central de una herramienta desaparece justo en los casos que la herramienta no modela, ese hueco de confort te está señalando con precisión dónde falta una abstracción.
+</Callout>
+
+<Callout type="dios" title="SSR nunca fue una cosa: era un agujero con forma de Node">
+El diagnóstico profundo de este nivel es que la dicotomía cliente/servidor de Vite 5 no describía la realidad, sino una simplificación cómoda de 2020. "SSR" parecía un concepto de primera clase, pero al mirarlo de cerca no era más que un segundo grafo cableado para un runtime concreto, Node, con su nombre metido a martillazos en el objeto `server`. Mientras el mundo tuvo dos destinos, la abstracción aguantó. Pero el frontend se volvió plural: el mismo código apunta hoy al navegador, a un proceso Node, a uno o varios Workers en el edge y, con los RSC, a grafos de servidor que conviven en la misma app con resoluciones incompatibles. Cada uno de esos destinos es un runtime distinto —otros globales, otras condiciones, otras restricciones— y la herramienta solo tenía dos casillas. El resultado fue una década de parches que reimplementaban, mal y por separado, el trabajo que la build tool debería hacer una sola vez y bien. La lección de ingeniería es general y vale más allá de Vite: cuando un booleano como `ssr: true` empieza a querer decir "cualquier cosa que no sea el cliente", ese booleano ya no es un flag, es un tipo suma disfrazado, y el diseño te está pidiendo a gritos convertirlo en un objeto de primera clase con nombre, configuración y ciclo de vida propios. Reconocer ese momento —cuando un atributo binario se ha quedado pequeño para el dominio que modela— es la habilidad que separa a quien parchea de quien rediseña. La Environment API es la respuesta de Vite a ese grito.
+</Callout>
+
+<Challenge title="Diagnostica el binario">
+1. Lista los runtimes a los que apunta un proyecto tuyo real: ¿solo navegador, o también Node, o también edge?
+2. Abre la documentación de `ssrLoadModule` en Vite 5 y explica por qué asume Node y qué pasa si tu servidor no lo es.
+3. Dibuja los grafos de módulos que necesitaría una app con RSC y razona por qué un único hueco `ssr` se queda corto.
+4. Busca en un framework que uses (Astro, SolidStart, Remix) cómo ejecutaba código de servidor en dev antes de la Environment API.
+5. Explica en dos frases por qué un flag `ssr: true` es en realidad un tipo suma disfrazado en cuanto aparece un tercer destino.
+</Challenge>

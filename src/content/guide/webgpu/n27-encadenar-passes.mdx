@@ -1,0 +1,113 @@
+---
+title: "Encadenar passes: la salida de uno como entrada del siguiente"
+description: "Cómo garantiza WebGPU que un pass ve lo que escribió el anterior sin barreras explícitas, la regla que prohíbe leer y escribir el mismo subrecurso a la vez, y el patrón de ping-pong."
+subject: webgpu
+level: 27
+order: 5
+position: "27.5"
+duration: "18 min"
+---
+
+<Lead>
+Un fotograma de un renderizador moderno es una tubería: la escena entra en un target HDR, de ahí sale un extracto de brillos, ese extracto se reduce y se desenfoca en varias etapas, y el resultado se compone sobre el original antes de mapear el rango y presentar. Cada eslabón es un render pass que lee lo que escribió el anterior. En Vulkan eso exige barreras de memoria escritas a mano y es donde se pierden las tardes; en WebGPU la sincronización es automática, y a cambio hay una regla estricta sobre qué puede hacer un pass con un recurso que ya está usando.
+</Lead>
+
+<Goals>
+
+- Explicar qué garantiza WebGPU sobre el orden y la visibilidad entre passes de un mismo submit.
+- Aplicar la regla que impide usar un subrecurso como attachment y como binding a la vez.
+- Montar una cadena de post-proceso con targets intermedios y un ping-pong.
+- Etiquetar los passes de forma que un error de validación diga dónde ocurrió.
+
+</Goals>
+
+## El orden está garantizado y las barreras no son tuyas
+
+Los comandos de un command buffer se ejecutan en el orden en que se grabaron, y los command buffers de un `submit` en el orden del array. Eso incluye los passes: si el pass A escribe una textura y el pass B, grabado después, la lee, **B ve lo que escribió A**. No hay que hacer nada.
+
+Lo que ocurre por debajo es que la implementación conoce el uso que cada pass hace de cada recurso —lo sabe porque el API la obliga a declararlo en los bind groups y en los attachments— y emite ella las transiciones de disposición y las barreras de memoria que la API nativa necesita. Es una de las diferencias más grandes con Vulkan y una de las razones por las que WebGPU es escribible por una persona en una tarde.
+
+Tiene un coste que conviene conocer: la implementación es **conservadora**. No puede saber que solo escribiste en una esquina de la textura, así que sincroniza el recurso entero. En la práctica eso no importa casi nunca, porque las cadenas de post-proceso leen la textura completa de todas formas.
+
+```js
+const encoder = device.createCommandEncoder({ label: 'fotograma' });
+
+// 1. Escena a un target HDR.
+const escena = encoder.beginRenderPass(descEscena);
+dibujarEscena(escena);
+escena.end();
+
+// 2. Extraer brillos: lee el HDR, escribe a media resolucion.
+const brillos = encoder.beginRenderPass(descBrillos);
+brillos.setPipeline(pipeBrillos);
+brillos.setBindGroup(0, grupoLeeEscena);
+brillos.draw(3);
+brillos.end();
+
+// 3. Componer y mapear rango: lee las dos, escribe al canvas.
+const salida = encoder.beginRenderPass(descSalida);
+salida.setPipeline(pipeComponer);
+salida.setBindGroup(0, grupoLeeEscenaYBrillos);
+salida.draw(3);
+salida.end();
+
+device.queue.submit([encoder.finish()]);   // un solo submit por fotograma
+```
+
+Ese `draw(3)` sin buffer de vértices es el triángulo que cubre la pantalla generado desde `vertex_index`, el patrón estándar para pasadas de pantalla completa; la versión completa del shader está en [las funciones de comparación](/guia/webgpu/n25-las-funciones-de-comparacion/). Un triángulo grande recortado es preferible a dos triángulos que formen un cuadrilátero, porque evita la costura diagonal donde los cuadrantes de sombreado se procesan dos veces.
+
+## La regla del mismo subrecurso
+
+Dentro de **un mismo pass**, un subrecurso de textura no puede estar a la vez como attachment y como recurso vinculado. La razón es de hardware: el orden en que se escriben los fragmentos no está definido, así que leer desde un shader lo que ese mismo pass está escribiendo sería una carrera. WebGPU lo prohíbe en la validación en lugar de dejar que produzca resultados distintos en cada GPU.
+
+Hay exactamente una excepción, y es la que hace posibles las partículas suavizadas y la niebla: **el aspecto de profundidad marcado como solo lectura**. Con `depthReadOnly: true` en el attachment, la misma textura de profundidad puede estar vinculada como recurso muestreado en ese pass, porque nadie la va a escribir. El mecanismo está detallado en [el depth buffer y sus formatos](/guia/webgpu/n25-el-depth-buffer-y-sus-formatos/).
+
+Para el color no hay excepción. Si un efecto necesita leer el color que está escribiendo —una distorsión que refracte el fondo, por ejemplo— hay que cerrar el pass, copiar o simplemente usar la textura como entrada de un pass nuevo. Es exactamente el caso que en las APIs nativas resuelven los subpasses y que aquí cuesta un viaje a memoria.
+
+## Ping-pong
+
+Cuando un efecto es iterativo —desenfoque separable, difusión, simulación de fluidos en pantalla, propagación de luz— el resultado de cada iteración es la entrada de la siguiente, y como no se puede leer y escribir la misma textura, se usan dos y se alternan.
+
+```js
+// Dos targets identicos y dos bind groups cruzados, creados una sola vez.
+const ping = crearTarget(), pong = crearTarget();
+const grupoLeePing = crearGrupo(ping), grupoLeePong = crearGrupo(pong);
+
+let leeDe = grupoLeePing, escribeEn = pong;
+
+for (let i = 0; i < iteraciones; i++) {
+  const p = encoder.beginRenderPass({
+    label: `desenfoque ${i}`,
+    colorAttachments: [{
+      view: escribeEn.createView(),
+      loadOp: 'clear',            // vamos a escribir cada pixel: no cargues
+      storeOp: 'store',
+      clearValue: { r: 0, g: 0, b: 0, a: 0 },
+    }],
+  });
+  p.setPipeline(pipeDesenfoque);
+  p.setBindGroup(0, leeDe);
+  p.draw(3);
+  p.end();
+
+  // Intercambio: lo que acabamos de escribir se convierte en la entrada.
+  [leeDe, escribeEn] = [escribeEn === pong ? grupoLeePong : grupoLeePing,
+                        escribeEn === pong ? ping : pong];
+}
+```
+
+Dos observaciones sobre ese bucle. Los bind groups se crean **una vez**, fuera del bucle y fuera del fotograma: crearlos por iteración es uno de los desperdicios de CPU más comunes en código de post-proceso. Y el `loadOp` es `'clear'` y no `'load'` porque la pasada escribe cada píxel del destino; poner `'load'` ahí es el error que la lección de [las operaciones de carga y guardado](/guia/webgpu/n27-loadop-storeop-y-el-hardware-de-tiles/) cuantifica en megabytes por fotograma, multiplicado además por el número de iteraciones.
+
+<Callout type="dios" title="La cadena de post-proceso es donde se va el ancho de banda, y la mitad de sus etapas se pueden fusionar sin perder nada">
+Cuando se perfila un renderizador que va justo, la atención se dirige a la escena: menos triángulos, menos luces, mejor culling. Y muy a menudo el problema está entero en la tubería de después, por una razón aritmética simple: **cada etapa de post-proceso lee y escribe la pantalla completa**, así que una cadena de siete etapas mueve catorce pantallas de datos por fotograma haga lo que haga cada una. A 1080p con targets de 16 bits en coma flotante eso son 232 MB por fotograma, casi 14 GB por segundo a 60 Hz, y la mayoría de esas etapas hacen una operación aritmética trivial sobre el píxel que acaban de leer. Están limitadas por memoria de principio a fin, y su coste es casi independiente de lo que calculen. De ahí sale la optimización que más devuelve y que menos se hace: **fusionar etapas en un solo shader**. La corrección de color, el mapeo de rango dinámico, el viñeteado, la aberración cromática, el grano y el ajuste de exposición son seis pasadas en la mayoría de los códigos y son **una** función de cincuenta líneas que lee un píxel y devuelve otro. Fusionarlas divide entre seis el tráfico de esa parte sin cambiar ni un resultado. La regla para saber qué se puede fusionar es exacta y se comprueba en un segundo: dos etapas consecutivas se fusionan si la segunda **solo necesita el píxel que la primera escribió en esa misma posición**. Todo lo puntual se fusiona. Lo que no se fusiona es lo que necesita vecinos —desenfoques, reducciones, difusiones—, porque ahí sí hace falta que la etapa anterior haya terminado en todos los píxeles. Y hay un corolario que sorprende: como la mayoría de los efectos con vecindario son de baja frecuencia, se pueden hacer a resolución reducida, con lo que las dos optimizaciones se refuerzan. Una cadena bien montada tiene dos o tres pasadas reales a resolución completa y todo lo demás sucede en una pirámide pequeña.
+</Callout>
+
+## Etiquetar, porque los errores no traen mapa
+
+Un error de validación en el pass número cinco de un fotograma con nueve passes no dice cuál es el cinco a menos que se lo digas. Todos los descriptores de WebGPU aceptan `label`, y las implementaciones lo incluyen en los mensajes de error.
+
+```js
+const pass = encoder.beginRenderPass({ label: 'bloom - reduccion nivel 3', /* ... */ });
+```
+
+Etiqueta los passes, los pipelines, los buffers y las texturas desde el primer día. Cuesta un campo por descriptor y convierte un mensaje ilegible sobre un objeto anónimo en una frase que señala la línea. Es la mejora de productividad más barata que ofrece esta API, y aún así casi nadie la aplica hasta la primera noche perdida.

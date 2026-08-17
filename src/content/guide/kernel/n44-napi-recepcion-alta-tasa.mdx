@@ -1,0 +1,134 @@
+---
+title: "NAPI: sobrevivir a un millón de paquetes por segundo"
+description: "Por qué una interrupción por paquete hunde a la CPU en receive livelock a alta tasa, y cómo NAPI —el híbrido de interrupción y sondeo— apaga las IRQs de recepción tras el primer aviso y drena el anillo de RX con una función poll acotada por un budget, todo dentro del softirq NET_RX_SOFTIRQ y con GRO por debajo."
+subject: kernel
+level: 44
+order: 1
+position: "44.1"
+duration: "17 min"
+---
+
+<Lead>
+Una tarjeta de red de 2026 puede entregar más de cuarenta millones de paquetes por segundo. Si cada uno levantara su propia interrupción, la CPU no haría otra cosa que atender el prólogo de un manejador que nunca llega a procesar nada: entra, guarda el contexto, ensucia la caché, y otra interrupción ya está esperando en la puerta. A ese colapso —cuanta más carga, menos trabajo útil— se le llama receive livelock, y NAPI es la respuesta que el kernel dio hace veinte años y sigue afinando hoy: interrumpir una sola vez, apagar la interrupción, y bajar a sondear el anillo hasta vaciarlo.
+</Lead>
+
+<Goals>
+
+- Entender por qué una interrupción por paquete degenera en `receive livelock` bajo carga.
+- Ver cómo NAPI combina interrupción y sondeo: apaga las IRQs de RX y drena el anillo.
+- Dominar `napi_schedule`, la función `poll` del driver y `napi_complete_done` con su `budget`.
+- Situar el sondeo en el softirq `NET_RX_SOFTIRQ` y su gobierno por `netdev_budget`.
+
+</Goals>
+
+## Una interrupción por paquete: el livelock
+
+El modelo ingenuo entrega cada paquete desde su propio manejador de interrupción. A baja tasa es correcto y hasta elegante: llega un paquete, la CPU salta, lo procesa, vuelve. Pero el coste fijo de entrar y salir del manejador —guardar el contexto, vaciar la tubería, contaminar L1— no depende del tamaño del paquete, y a alta tasa ese coste fijo devora el ciclo entero.
+
+```c
+/* modelo ingenuo: una interrupcion por paquete (NO hacer esto a alta tasa) */
+static irqreturn_t rx_irq_ingenuo(int irq, void *data)
+{
+	struct mi_priv *priv = data;
+	struct sk_buff *skb;
+
+	while ((skb = mi_leer_un_paquete(priv)))  /* un skb por vuelta */
+		netif_rx(skb);                    /* lo entrega a la pila */
+	return IRQ_HANDLED;
+}
+```
+
+Y hay algo peor que el desperdicio. La interrupción tiene prioridad **sobre** el hilo o el softirq que consume los paquetes, así que bajo una avalancha la CPU se pasa el cien por cien del tiempo reconociendo interrupciones y el cero por ciento vaciando colas: el rendimiento útil cae a medida que sube la carga. Esa inversión patológica —descrita por Mogul y Ramakrishnan en 1996— es el `livelock`, y no es un `deadlock`: nadie está bloqueado, todos corren, pero el sistema no avanza.
+
+## NAPI: interrumpir una vez, sondear después
+
+La idea de NAPI es romper el acoplamiento uno-a-uno. Al llegar el primer paquete la IRQ se dispara, pero el manejador **no procesa nada**: enmascara las interrupciones de recepción en el hardware y programa un sondeo. A partir de ahí el kernel drena el anillo en contexto de softirq, muchos paquetes por vuelta y sin una sola interrupción más. Cuando el anillo se seca, NAPI reactiva las IRQs y deja de sondear.
+
+```c
+/* el manejador ya no procesa: enmascara y programa el sondeo */
+static irqreturn_t rx_irq(int irq, void *data)
+{
+	struct mi_priv *priv = data;
+
+	mi_deshabilitar_rx_irq(priv);   /* apaga las IRQs de RX en el hardware */
+	napi_schedule(&priv->napi);     /* encola este NAPI y lanza el softirq */
+	return IRQ_HANDLED;
+}
+
+static int mi_abrir(struct net_device *dev)
+{
+	struct mi_priv *priv = netdev_priv(dev);
+
+	netif_napi_add(dev, &priv->napi, mi_poll);  /* registra el contexto NAPI */
+	napi_enable(&priv->napi);
+	return request_irq(priv->irq, rx_irq, 0, dev->name, priv);
+}
+```
+
+`napi_schedule` es barato e idempotente: por debajo, `napi_schedule_prep` toma el bit `NAPI_STATE_SCHED` para que dos IRQs no encolen dos veces el mismo NAPI, `__napi_schedule` lo añade a la lista `poll_list` del `softnet_data` de esta CPU y eleva `NET_RX_SOFTIRQ`. Bajo carga sostenida te quedas sondeando —barato, por lotes—; bajo carga ligera pagas una IRQ por ráfaga —baja latencia—. El régimen se elige solo, sin oráculo.
+
+## La función poll: drenar el anillo hasta el budget
+
+Aquí late el corazón de NAPI. La función `poll` recibe un `budget` —típicamente 64— y saca hasta esa cantidad de paquetes del anillo, alimentando cada uno a la pila con `napi_gro_receive`, que además coalesce segmentos contiguos (GRO). Devuelve cuántos procesó. Si procesó **menos** que el `budget`, el anillo se vació: cierra con `napi_complete_done` y reactiva las IRQs. Si agotó el `budget`, puede quedar más: devuelve `budget` sin completar, y el softirq lo volverá a sondear.
+
+```c
+static int mi_poll(struct napi_struct *napi, int budget)
+{
+	struct mi_priv *priv = container_of(napi, struct mi_priv, napi);
+	int work_done = 0;
+
+	while (work_done < budget) {
+		struct sk_buff *skb = mi_rx_uno(priv);  /* saca uno del anillo */
+		if (!skb)
+			break;                          /* anillo vacio */
+		napi_gro_receive(napi, skb);            /* a la pila, con GRO */
+		work_done++;
+	}
+
+	if (work_done < budget) {                       /* vaciamos: volver a IRQs */
+		napi_complete_done(napi, work_done);
+		mi_habilitar_rx_irq(priv);
+	}
+	return work_done;                               /* == budget: se re-sondea */
+}
+```
+
+El invariante es delicado: reactiva las IRQs **solo** dentro de la rama `work_done < budget`, y **después** de `napi_complete_done`. Invertir el orden abre una carrera: un paquete que llegue entre el vaciado y la reactivación quedaría sin aviso hasta la próxima IRQ ajena, porque ya le dijiste al hardware que volviera a interrumpir mientras el NAPI seguía programado. `napi_complete_done` cierra esa ventana comprobando si acaba de entrar trabajo nuevo.
+
+## net_rx_action: el softirq que gobierna el sondeo
+
+`net_rx_action` es el manejador de `NET_RX_SOFTIRQ`. Recorre la `poll_list` de la CPU llamando a cada `poll`, pero bajo dos límites globales para que una interfaz voraz no ahogue al resto: `netdev_budget` (300 paquetes por defecto, sumando todos los NAPI) y `netdev_budget_usecs` (2000 µs de reloj). Al agotar cualquiera, deja los NAPI restantes en la lista y reprograma el softirq o despierta a `ksoftirqd`.
+
+```bash
+# sintomas de saturacion: cuota de softirq agotada
+cat /proc/net/softnet_stat        # col 1: procesados, col 3: time_squeeze
+sysctl net.core.netdev_budget     # net.core.netdev_budget = 300
+```
+
+La columna `time_squeeze` que crece delata que `net_rx_action` se quedó sin cuota con trabajo aún pendiente: la señal para subir `netdev_budget`. Y una extensión moderna cambia el contexto de ejecución sin tocar tu `poll`: activar `/sys/class/net/ethX/threaded` mueve el sondeo del softirq a un hilo de kernel dedicado por NAPI, que el planificador puede fijar y priorizar —mejor aislamiento y latencia de cola en máquinas de muchos núcleos—.
+
+<Mermaid code={`sequenceDiagram
+  participant NIC as Tarjeta
+  participant IRQ as Manejador
+  participant SIRQ as NET_RX_SOFTIRQ
+  participant Poll as mi_poll
+  NIC->>IRQ: primer paquete eleva la IRQ
+  IRQ->>NIC: enmascara las IRQs de RX
+  IRQ->>SIRQ: napi_schedule encola el NAPI
+  loop hasta vaciar o agotar el budget
+    SIRQ->>Poll: poll napi budget
+    Poll->>NIC: drena paquetes del anillo
+  end
+  Poll->>NIC: napi_complete_done reactiva las IRQs`} />
+
+<Callout type="dios" title="NAPI mide su propia carga con el mismo gesto con que la atiende">
+Detente en la inversión, porque contradice una intuición que arrastras desde el primer curso de sistemas. Te enseñaron que el sondeo es el enemigo de la eficiencia —una espera activa que quema CPU preguntando por algo que aún no llega— y que la interrupción es la amiga —dormir hasta que ocurra el evento—. NAPI demuestra que a escala los papeles se invierten. Cuando el evento es continuo, "espera al evento" degenera en "que te interrumpan sin parar", y lo eficiente pasa a ser dejar de que te avisen e ir a mirar tú. Pero lo verdaderamente hondo no es que NAPI elija sondear: es que elige el régimen correcto en cada instante a partir de la propia tasa de llegada, sin necesidad de conocerla de antemano. El anillo que se drena por debajo del `budget` **es** la señal de que la carga bajó; la siguiente IRQ **es** la señal de que subió. El sistema no tiene un termómetro aparte que mida su presión y un actuador que reaccione: el mismo mecanismo que responde a la carga es el que la mide. La profundidad del anillo es el tacómetro. Interioriza esto y reconocerás el patrón en cada ruta de alto rendimiento del kernel —desde el batching de E/S en bloque hasta la amortización de interrupciones de DMA (nivel 27)—: el trabajo pendiente deja de ser un problema a resolver y se convierte en el sensor que autorregula el ritmo con que se resuelve. Un buen subsistema no consulta su carga; la carga es la que le dice, por construcción, en qué modo debe estar.
+</Callout>
+
+<Challenge title="Del livelock al sondeo">
+1. Abre un driver real de `drivers/net/ethernet/` y localiza `netif_napi_add` y su función `poll`; confirma que la reactivación de IRQs ocurre solo en la rama `work_done < budget` y tras `napi_complete_done`.
+2. Genera tráfico con `iperf3` o `pktgen` y observa `/proc/net/softnet_stat`; explica qué significa que la columna `time_squeeze` crezca y qué botón girar.
+3. Argumenta, en tres líneas, por qué reactivar las IRQs antes de `napi_complete_done` puede perder un despertar y dejar paquetes sin atender.
+4. Activa NAPI con hilos en una interfaz y razona qué cambia en la planificación y en la latencia de cola frente al softirq.
+5. Estima: a 40 Mpps y `budget` de 64, cuántas llamadas a `poll` por segundo hacen falta, frente a cuántas interrupciones levantaría el modelo ingenuo.
+</Challenge>

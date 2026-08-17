@@ -1,0 +1,135 @@
+---
+title: "Escribir un driver USB: usb_driver, probe y disconnect"
+description: "El contrato mínimo con usbcore: una struct usb_driver con una tabla usb_device_id construida con USB_DEVICE(...), y dos callbacks .probe y .disconnect. Reclamar la interfaz, localizar endpoints, guardar estado con usb_set_intfdata y sobrevivir a la desconexión en caliente con el conteo de referencias correcto."
+subject: kernel
+level: 31
+order: 3
+position: "31.3"
+duration: "16 min"
+---
+
+<Lead>
+Escribir un driver USB no es programar el bus: es firmar un contrato con `usbcore`. Declaras una tabla que dice qué dispositivos reclamas y dos funciones, una para cuando aparece uno y otra para cuando se va. El núcleo hace por ti la enumeración, el arbitraje y el DMA; a ti te entrega una interfaz ya enlazada y esperas que la vuelvas útil. Todo el peso del driver se concentra en esos dos callbacks, y en una disciplina que no perdona: la desconexión puede llegar en cualquier instante.
+</Lead>
+
+<Goals>
+
+- Declarar la `usb_device_id` table con `USB_DEVICE(...)` y publicarla con `MODULE_DEVICE_TABLE`.
+- Rellenar `struct usb_driver` y registrarla con `module_usb_driver`.
+- Implementar `.probe`: reclamar la interfaz, localizar endpoints y guardar estado con `usb_set_intfdata`.
+- Implementar `.disconnect` con la simetría y el conteo de referencias correctos.
+
+</Goals>
+
+## La id_table: a quién reclamo
+
+El primer trozo de todo driver USB es la tabla que declara qué dispositivos captura. Cada entrada usa una macro que rellena los campos de `struct usb_device_id` y las banderas de coincidencia (`match_flags`) por ti: `USB_DEVICE` empareja por fabricante y producto, mientras que `USB_INTERFACE_INFO` captura toda una clase de dispositivos con independencia de quién los fabrique. La tabla **termina siempre** en una entrada vacía, el centinela que marca el final.
+
+```c
+#include <linux/usb.h>
+
+static const struct usb_device_id skel_ids[] = {
+	{ USB_DEVICE(0x0525, 0xa4a5) },               /* por vendor y product */
+	{ USB_INTERFACE_INFO(USB_CLASS_HID, 0, 0) },  /* o por clase de interfaz */
+	{ }                                           /* centinela terminador */
+};
+MODULE_DEVICE_TABLE(usb, skel_ids);
+```
+
+`MODULE_DEVICE_TABLE` no es decorativa: exporta la tabla a los metadatos del módulo (`modalias`), y gracias a ella `udev` en espacio de usuario sabe **cargar tu módulo automáticamente** cuando se conecta un dispositivo que encaja. Sin esa línea tendrías que hacer `modprobe` a mano cada vez.
+
+## struct usb_driver y el registro
+
+El driver propiamente dicho es una `struct usb_driver` que enlaza la tabla con los callbacks. Se registra con la macro `module_usb_driver`, que genera por ti el `module_init` y el `module_exit` llamando a `usb_register` y `usb_deregister` (el mismo patrón `module_*_driver` que viste en char devices, nivel 13).
+
+```c
+static struct usb_driver skel_driver = {
+	.name       = "usb-skel",
+	.id_table   = skel_ids,
+	.probe      = skel_probe,
+	.disconnect = skel_disconnect,
+	.suspend    = skel_suspend,     /* opcional: gestion de energia */
+	.resume     = skel_resume,
+	.supports_autosuspend = 1,
+};
+module_usb_driver(skel_driver);
+```
+
+Recuerda la lección de arquitectura: `usbcore` enlaza drivers **a interfaces, no a dispositivos**. Por eso `.probe` recibe una `struct usb_interface` y no una `usb_device`, y por eso una webcam puede tener tres drivers distintos activos a la vez sobre el mismo aparato físico.
+
+## probe: reclamar y preparar
+
+`.probe` se ejecuta una vez que el dispositivo ya está enumerado y configurado. Su misión: decidir si reclamas la interfaz (devolviendo `0`) o la rechazas (devolviendo un `-errno`), y si la reclamas, reservar tu estado privado, localizar los endpoints y **anclar ese estado a la interfaz** con `usb_set_intfdata`.
+
+```c
+static int skel_probe(struct usb_interface *intf,
+		      const struct usb_device_id *id)
+{
+	struct usb_device *udev = interface_to_usbdev(intf);
+	struct usb_endpoint_descriptor *bulk_in, *bulk_out;
+	struct usb_skel *dev;
+	int ret;
+
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	kref_init(&dev->kref);                 /* conteo propio, ver disconnect */
+	dev->udev = usb_get_dev(udev);         /* +1 referencia al dispositivo */
+	dev->intf = intf;
+
+	ret = usb_find_common_endpoints(intf->cur_altsetting,
+					&bulk_in, &bulk_out, NULL, NULL);
+	if (ret) {
+		dev_err(&intf->dev, "faltan los endpoints bulk esperados\n");
+		goto error;
+	}
+	dev->bulk_in_addr  = bulk_in->bEndpointAddress;
+	dev->bulk_out_addr = bulk_out->bEndpointAddress;
+
+	usb_set_intfdata(intf, dev);           /* estado privado por interfaz */
+	dev_info(&intf->dev, "usb-skel enlazado\n");
+	return 0;
+
+error:
+	usb_put_dev(dev->udev);
+	kfree(dev);
+	return ret;                            /* rechaza la interfaz */
+}
+```
+
+Si tu dispositivo debe aparecer en `/dev`, aquí añadirías `usb_register_dev` con una `struct usb_class_driver` para que el núcleo te reserve un minor y cree el nodo, tal como hace `drivers/usb/usb-skeleton.c`. La `usb_get_dev` incrementa el refcount del dispositivo para que la estructura no se libere mientras la usas.
+
+## disconnect: la simetría bajo fuego
+
+`.disconnect` es la contraparte de `.probe`, pero se ejecuta en la circunstancia más hostil del kernel: el usuario **ya ha arrancado el cable**. El hardware puede haber desaparecido físicamente mientras tú tenías transferencias en vuelo. Tu deber es cortar toda E/S pendiente, soltar tus referencias y no volver a tocar el dispositivo jamás.
+
+```c
+static void skel_disconnect(struct usb_interface *intf)
+{
+	struct usb_skel *dev = usb_get_intfdata(intf);
+
+	usb_set_intfdata(intf, NULL);
+	usb_kill_urb(dev->bulk_urb);        /* aborta E/S en vuelo (nivel 31.4) */
+	usb_put_dev(dev->udev);             /* suelta la referencia de probe */
+	kref_put(&dev->kref, skel_delete);  /* libera cuando el ultimo fd cierre */
+	dev_info(&intf->dev, "usb-skel desenlazado\n");
+}
+```
+
+El detalle fino es el conteo de referencias. Si expones un nodo en `/dev`, un programa puede tener el archivo **abierto** en el momento de la desconexión. No puedes liberar tu estado bajo sus pies: por eso se usa un `kref` que `probe` inicializa, cada `open` incrementa y cada `release` decrementa; la memoria se libera solo cuando cae la última referencia. Es el patrón `kref` del nivel 14 aplicado a la vida y muerte de un dispositivo físico.
+
+<Callout type="warn" title="La desconexión es asíncrona y sin aviso">
+`.disconnect` no espera a que termines lo que estabas haciendo. Puede solaparse con un `read` que un proceso tenga bloqueado en tu driver. Toda estructura compartida entre los callbacks y las rutas de E/S necesita su propio lock (niveles 15 y 16), y tras la desconexión toda llamada al hardware debe fallar limpiamente con `-ENODEV` en lugar de tocar registros de un dispositivo que ya no está.
+</Callout>
+
+<Callout type="dios" title="El driver es un contrato, no un programa que toca el bus">
+Compara mentalmente lo que acabas de escribir con lo que un ingeniero de los años ochenta habría necesitado para el mismo periférico: sondear puertos de E/S, arbitrar interrupciones fijadas por puentes, gestionar temporización a mano. Tú no has escrito nada de eso. Has rellenado una tabla y dos funciones, y a cambio has heredado la pila USB entera: la enumeración, el arbitraje del bus, el DMA del host controller, la gestión de energía. Ese es el corazón del modelo de dispositivos del kernel (nivel 28) llevado a su forma más pura: un driver moderno no es código que manipula hardware, es la **declaración de un contrato** que `usbcore` cumple por ti. Tú dices "reclamo los dispositivos que encajen en esta tabla, y aquí está lo que hago cuando aparecen y desaparecen"; el núcleo hace el resto. Y hay una asimetría reveladora en ese contrato: `.probe` ocurre en calma, con el dispositivo presente y cooperativo, pero `.disconnect` ocurre bajo fuego, con el hardware quizá ya arrancado. Un driver que solo funciona cuando todo va bien es un juguete; la marca del driver serio es que sobrevive a la desconexión en caliente sin corromper memoria ni tocar un dispositivo fantasma. Esa disciplina —soltar referencias en orden, matar URBs en vuelo, dejar que el último `fd` decida cuándo morir— no es burocracia: es lo que separa un driver que puedes cargar en producción de uno que provoca un oops la primera vez que alguien tira del cable.
+</Callout>
+
+<Challenge title="Tu primer driver USB de verdad">
+1. Escribe un módulo con una `usb_device_id` table que capture un dispositivo concreto por su `USB_DEVICE(vid, pid)` y publícala con `MODULE_DEVICE_TABLE`.
+2. Rellena `struct usb_driver`, regístrala con `module_usb_driver` e implementa un `.probe` que reserve estado, localice los endpoints con `usb_find_common_endpoints` y llame a `usb_set_intfdata`.
+3. Implementa `.disconnect` simétrico: recupera el estado, suéltalo y decrementa las referencias en el orden correcto.
+4. Carga el módulo, conecta el dispositivo y confirma en `dmesg` que `.probe` corre; arranca el cable y confirma `.disconnect`. Comprueba con `udev` que el módulo se autocarga gracias a `MODULE_DEVICE_TABLE`.
+</Challenge>

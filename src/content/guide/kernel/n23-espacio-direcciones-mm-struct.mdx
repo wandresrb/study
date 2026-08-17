@@ -1,0 +1,135 @@
+---
+title: "El espacio de direcciones: mm_struct, VMAs y el maple tree"
+description: "Cada proceso vive en la ilusión de una memoria privada y contigua. El kernel modela esa ilusión con mm_struct y una colección de regiones vm_area_struct. Cómo se estructura el descriptor, qué es una VMA, y por qué en Linux 7.x las VMAs viven en un maple tree y no en el viejo rbtree con lista enlazada."
+subject: kernel
+level: 23
+order: 1
+position: "23.1"
+duration: "16 min"
+---
+
+<Lead>
+Todo proceso cree poseer la máquina entera: un espacio de direcciones plano, privado, que arranca cerca de cero y llega hasta el techo del hardware. Es la gran mentira del kernel, y `mm_struct` es el libro de contabilidad donde la sostiene. Dentro viven las VMAs: los tramos reales y homogéneos que el proceso sí tiene mapeados. Entender esta estructura es entender de qué está hecha, literalmente, la memoria de un proceso.
+</Lead>
+
+<Goals>
+
+- Leer `mm_struct` como el descriptor del espacio de direcciones de un proceso.
+- Describir una VMA (`vm_area_struct`): límites, `vm_flags`, `vm_ops` y respaldo.
+- Entender por qué se abandonó el rbtree con lista enlazada por el maple tree.
+- Recorrer las VMAs con `VMA_ITERATOR` bajo el `mmap_lock`.
+
+</Goals>
+
+## mm_struct: el descriptor del espacio
+
+Cada proceso tiene un `struct mm_struct` (definido en `include/linux/mm_types.h`) que describe **todo** su espacio de direcciones. `task_struct->mm` apunta a él. Los hilos de un mismo proceso comparten el mismo `mm_struct` —eso es exactamente lo que significa `CLONE_VM` en `clone`—, mientras que un proceso independiente tiene el suyo.
+
+```c
+struct mm_struct {
+	struct {
+		struct maple_tree mm_mt;       /* arbol de VMAs: antes mm_rb + lista */
+		pgd_t *pgd;                    /* raiz de la tabla de paginas */
+		atomic_t mm_users;             /* hilos que usan este espacio */
+		atomic_t mm_count;             /* referencias al propio mm_struct */
+		int map_count;                 /* numero de VMAs */
+		struct rw_semaphore mmap_lock; /* protege el arbol de VMAs */
+		unsigned long mmap_base;       /* base donde crece mmap */
+		unsigned long task_size;       /* limite del espacio de usuario */
+		unsigned long start_code, end_code, start_data, end_data;
+		unsigned long start_brk, brk;  /* el heap: brk lo mueve sbrk/brk */
+		unsigned long start_stack;
+		/* ...decenas de campos mas: rss, exe_file, context... */
+	} __randomize_layout;
+};
+```
+
+Dos detalles cruciales. `pgd` es la raíz de la tabla de páginas: al cambiar de proceso, el planificador carga su dirección física en `CR3` (x86) o `TTBR0` (arm64), y con eso la MMU ve otro espacio. Y hay **dos** contadores de referencia: `mm_users` cuenta los hilos que ejecutan en este espacio; `mm_count` cuenta las referencias a la estructura en sí. Cuando `mm_users` llega a cero se desmontan las VMAs; cuando `mm_count` llega a cero se libera el `mm_struct`. Un `mm_count` extra lo toma, por ejemplo, un kthread que usa `mmget_not_zero` para pisar temporalmente un espacio ajeno.
+
+## La VMA: una región homogénea
+
+El espacio de direcciones no es un bloque único: es un conjunto de **regiones**, cada una con permisos y respaldo uniformes. Una `vm_area_struct` describe un intervalo semiabierto de direcciones virtuales, `vm_start` incluido y `vm_end` excluido, con las mismas propiedades en toda su extensión.
+
+```c
+struct vm_area_struct {
+	unsigned long vm_start;        /* primera direccion, inclusive */
+	unsigned long vm_end;          /* primera fuera, exclusive */
+	struct mm_struct *vm_mm;       /* el espacio al que pertenece */
+	pgprot_t vm_page_prot;         /* permisos de hardware para las PTE */
+	vm_flags_t vm_flags;           /* VM_READ, VM_WRITE, VM_EXEC, VM_SHARED... */
+	struct anon_vma *anon_vma;     /* mapeo inverso para paginas anonimas */
+	const struct vm_operations_struct *vm_ops; /* callbacks: fault, open... */
+	unsigned long vm_pgoff;        /* desplazamiento en vm_file, en paginas */
+	struct file *vm_file;          /* fichero mapeado, o NULL si es anonimo */
+	void *vm_private_data;
+};
+```
+
+Cada línea de `/proc/PID/maps` es una VMA. Los límites, los permisos `rwxp` y el fichero de respaldo salen directos de estos campos:
+
+```bash
+cat /proc/self/maps
+# 5623a1c00000-5623a1c01000 r-xp 00000000 08:02 1310795 /usr/bin/cat  <- una VMA
+# 7f3b2a4c0000-7f3b2a4e2000 r--p 00000000 08:02 2097550 .../libc.so.6 <- otra VMA
+# 7ffde3a00000-7ffde3a21000 rw-p 00000000 00:00 0       [stack]        <- otra VMA
+```
+
+La `p` final significa privado (respaldo copy-on-write); una `s` sería `MAP_SHARED`. La distinción entre respaldo por fichero y anónimo la marca `vm_file`, y la trataremos a fondo en el nivel 23.5.
+
+## Del rbtree con lista al maple tree
+
+Durante casi veinte años, cada `mm_struct` mantenía **dos** estructuras redundantes: una lista doblemente enlazada (`vma->vm_next`, `vma->vm_prev`) para recorrer las VMAs en orden, y un árbol rojo-negro (`mm->mm_rb`) para buscar por dirección en tiempo logarítmico. Dos estructuras que había que mantener sincronizadas en cada inserción y borrado: fuente perpetua de bugs sutiles y de contención.
+
+Linux 6.1 (2022) las sustituyó por una sola: el **maple tree** (`mm->mm_mt`). Es un árbol tipo B optimizado para almacenar **rangos** no solapados, con nodos anchos que aprovechan la línea de caché y, sobre todo, con lectura segura bajo RCU. Las VMAs perdieron sus punteros `vm_next`/`vm_prev`: ya no hay lista.
+
+<Mermaid code={`flowchart TB
+  MM[mm_struct] --> MT[maple_tree mm_mt]
+  MT --> N0[nodo raiz: rangos ordenados]
+  N0 --> V1[VMA 0x5623 codigo r-x]
+  N0 --> V2[VMA 0x7f3b libc r--]
+  N0 --> V3[VMA 0x7ffd pila rw-]
+  class MT t-blue
+  class N0 t-yellow`} />
+
+La ganancia no es solo elegancia: una sola estructura significa una sola invalidación de caché por operación, búsqueda por rango nativa, y lectores que consultan sin bloquear al escritor. Es la infraestructura sobre la que se construyeron después los **locks por-VMA** que veremos en el nivel 23.3.
+
+## Recorrer las VMAs
+
+Con el maple tree, el idioma para iterar es el `VMA_ITERATOR` y la macro `for_each_vma`. Para localizar la VMA que cubre una dirección concreta —lo primero que hace un page fault— está `find_vma`, que devuelve la primera VMA con `vm_end > addr`.
+
+```c
+struct vm_area_struct *vma;
+VMA_ITERATOR(vmi, mm, 0);              /* iterador desde la direccion 0 */
+
+mmap_read_lock(mm);                    /* toma el mmap_lock en lectura */
+for_each_vma(vmi, vma)
+	pr_info("%lx-%lx flags=%lx\n", vma->vm_start, vma->vm_end, vma->vm_flags);
+mmap_read_unlock(mm);
+
+/* Buscar la VMA de una direccion concreta: */
+vma = find_vma(mm, address);
+if (vma && address >= vma->vm_start)
+	; /* la direccion cae dentro de esta VMA */
+```
+
+Toda travesía o modificación del árbol exige el `mmap_lock` (un `rw_semaphore`, renombrado en su día desde `mmap_sem`): en lectura para consultar, en escritura para `mmap`, `munmap` o `mprotect`. Sostener este cerrojo global en cada fallo de página fue durante años un cuello de botella para cargas con muchos hilos; el nivel 23.3 mostrará cómo los locks por-VMA lo esquivan en el camino rápido.
+
+<Callout type="tip" title="find_vma no comprueba que estes dentro">
+Cuidado con una sutileza clásica: `find_vma` devuelve la primera VMA con `vm_end > addr`, que puede ser la VMA **siguiente** si `addr` cae en un hueco sin mapear. Por eso el idioma correcto es comprobar siempre `addr >= vma->vm_start` después: si falla, la dirección está en un agujero y el acceso será un `SIGSEGV`. Olvidar esa comprobación es una fuente recurrente de bugs en código que camina el espacio de direcciones.
+</Callout>
+
+<Callout type="note" title="La VMA no es la página">
+Cuidado con no confundir dos niveles. La VMA es **metadatos**: describe qué intervalo virtual está mapeado y con qué permisos, pero no implica que haya ni un solo byte de memoria física detrás. Las páginas reales y sus traducciones viven en la **tabla de páginas** (`pgd` y sus niveles inferiores), y se rellenan perezosamente en el primer acceso. Una VMA de un gigabyte recién creada por `mmap` no consume memoria física: solo tres punteros y un rango en el maple tree.
+</Callout>
+
+<Callout type="dios" title="El espacio de direcciones es una promesa, no una posesión">
+Detente en la asimetría, porque es la idea que gobierna todo el subsistema de memoria. La VMA no dice "tengo esta memoria"; dice "el proceso tiene *derecho* a esta memoria si la toca". Es una declaración de intención, no un inventario de posesiones. El kernel lleva dos libros de contabilidad de naturaleza distinta: el maple tree de VMAs registra la **geografía prometida** del espacio virtual —qué rangos son legítimos, con qué permisos, respaldados por qué—, y la tabla de páginas registra la **materia entregada** —qué páginas físicas existen de verdad ahora mismo—. El primero es barato y se puede prometer a manos llenas: un `malloc` de un terabyte crea una VMA y devuelve al instante. El segundo es caro y se paga página a página, solo cuando el programa demuestra que de verdad necesita cada una tocándola. Toda la economía de la memoria virtual vive en esa brecha entre lo prometido y lo entregado: el overcommit, la paginación bajo demanda, el copy-on-write, el swap. Cuando interiorizas que `mm_struct` describe un contrato y no un almacén, dejas de preguntarte "¿cuánta memoria usa este proceso?" —pregunta mal formulada— y empiezas a preguntar las dos que sí tienen respuesta: cuánta ha prometido el kernel, y cuánta ha entregado. Ese es el salto conceptual del nivel entero.
+</Callout>
+
+<Challenge title="Cartografía tu propio espacio de direcciones">
+1. Ejecuta `cat /proc/self/maps` e identifica las VMAs de código, datos, heap, pila y librerías compartidas por sus permisos.
+2. Explica la diferencia entre `mm_users` y `mm_count` y da un caso en que uno suba sin el otro.
+3. Justifica por qué mantener una lista enlazada y un rbtree en paralelo era propenso a errores, y qué gana el maple tree al unificarlos.
+4. Escribe un módulo que tome `current->mm`, recorra sus VMAs con `for_each_vma` bajo `mmap_read_lock` y las imprima; compara la salida con `/proc/self/maps`.
+5. Razona por qué una VMA recién creada de 1 GiB no consume memoria física y dónde se registraría esa memoria si la hubiera.
+</Challenge>

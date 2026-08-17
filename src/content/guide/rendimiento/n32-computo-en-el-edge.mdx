@@ -1,0 +1,158 @@
+---
+title: "El cómputo en el borde: qué gana, qué pierde y dónde está el límite"
+description: "Cómo funciona un aislado de borde, la aritmética que explica por qué mover cómputo lejos de los datos empeora la latencia, los límites reales de estos entornos, y la lista corta de trabajos que sí pertenecen al borde."
+subject: rendimiento
+level: 32
+order: 5
+position: "32.5"
+duration: "20 min"
+---
+
+<Lead>
+Ejecutar código en trescientos sitios a la vez suena a la conclusión natural de todo lo anterior: si acercar los bytes funciona, acercar el cómputo funcionará más. La aritmética dice otra cosa. El cómputo no vive solo: consulta datos, y los datos siguen estando en un sitio concreto. Mover la función sin mover el dato no reduce la distancia, la multiplica por el número de consultas. Esta lección es la que evita esa factura.
+</Lead>
+
+<Goals>
+
+- Explicar qué es un aislado de borde y por qué arranca en milisegundos en lugar de en cientos.
+- Calcular cuándo mover cómputo al borde mejora la latencia y cuándo la empeora.
+- Enumerar los límites reales de estos entornos antes de comprometer una arquitectura.
+- Instrumentar el reparto de tiempo entre borde y origen con `Server-Timing`.
+
+</Goals>
+
+## Qué es un aislado y por qué importa
+
+La ejecución de código en el borde no es "un servidor pequeño en cada ciudad". Ese modelo existió y era caro: mantener un contenedor por cliente en trescientas ubicaciones multiplica el coste de memoria en reposo por trescientos, y el arranque en frío de un contenedor cuesta del orden de cientos de milisegundos, que es exactamente lo que habías venido a ahorrar.
+
+El modelo que funciona es distinto. Un **aislado** es un contexto de ejecución de JavaScript dentro de un proceso compartido: el motor está ya arrancado y en memoria, y crear un contexto nuevo cuesta unidades de milisegundos y unos pocos megabytes. Miles de aislados de clientes distintos conviven en el mismo proceso, con la separación garantizada por el propio motor. La variante con WebAssembly va todavía más rápido en el arranque, porque instanciar un módulo compilado previamente es del orden de decenas de microsegundos.
+
+Esa diferencia de tres órdenes de magnitud en el arranque es lo que hace viable el modelo económico, y de ella salen todas las restricciones que verás más abajo. No hay proceso propio, así que no hay sistema de ficheros ni sockets arbitrarios. No hay contenedor persistente, así que el estado en memoria puede desaparecer entre dos peticiones sin aviso. No hay módulos nativos, porque no hay nada que enlazar. Las limitaciones no son mezquindad del proveedor: son la contrapartida directa del arranque instantáneo.
+
+## La aritmética que casi nadie hace
+
+Aquí está el error que cuesta dinero. Tienes un origen en Fráncfort con la base de datos al lado y un usuario en São Paulo. La situación de partida:
+
+```text
+Sin borde:
+  usuario -> Frankfurt          ida y vuelta 220 ms
+  servidor -> base de datos     5 consultas x 1 ms = 5 ms
+  total aproximado              225 ms
+```
+
+Ahora mueves la función al nodo de São Paulo, a diez milisegundos del usuario, sin tocar la base de datos:
+
+```text
+Con computo en el borde y datos en Frankfurt:
+  usuario -> nodo de Sao Paulo   ida y vuelta 10 ms
+  nodo -> base de datos          5 consultas x 220 ms = 1.100 ms
+  total aproximado               1.110 ms
+```
+
+Has multiplicado la latencia por cinco. La razón es evidente en cuanto se escribe: **antes cruzabas el Atlántico una vez; ahora lo cruzas una vez por consulta**. El servidor de origen estaba pegado a los datos y las cinco consultas eran gratis; el nodo de borde está pegado al usuario y las cinco consultas cuestan el trayecto completo cada una.
+
+La regla general se deduce sola. Llama `L_u` a la latencia entre usuario y borde, `L_o` a la latencia entre usuario y origen, `L_d` a la latencia entre borde y datos, y `N` al número de idas y vueltas secuenciales que la función hace contra los datos. Mover el cómputo al borde gana cuando:
+
+```text
+L_u + N x L_d  <  L_o + N x (latencia origen-datos)
+```
+
+Con la base de datos junto al origen, el término de la derecha es prácticamente `L_o`. Así que la condición se reduce a `L_u + N x L_d < L_o`, y como `L_d` suele ser del mismo orden que `L_o`, **la desigualdad solo se cumple con `N` igual a cero**. Ese es el resultado importante: el cómputo en el borde gana cuando no consulta nada remoto, o cuando los datos también están replicados cerca.
+
+Y hay una trampa dentro de la trampa: `N` es el número de idas y vueltas **secuenciales**, no de consultas. Cinco consultas en paralelo cuestan una ida y vuelta, no cinco. Antes de mover nada al borde, mira si tus consultas son secuenciales por necesidad o por costumbre; paralelizarlas suele dar más que cualquier reubicación.
+
+Las tres salidas cuando `N` no es cero:
+
+**Replicar los datos.** Almacenes de clave y valor distribuidos globalmente, réplicas de lectura regionales, bases de datos embebidas replicadas. Funciona bien para datos que se leen mucho y se escriben poco: catálogos, configuración, banderas de funcionalidad, traducciones, tablas de rutas. Funciona mal para lo que necesita consistencia fuerte, porque replicar escrituras a trescientos sitios con garantías no es barato ni rápido.
+
+**Colocar la función junto a los datos en vez de junto al usuario.** Suena a renuncia y no lo es: si la función va a hacer cinco consultas, ejecutarla al lado de la base de datos y aceptar una sola ida y vuelta larga con el usuario es exactamente la configuración óptima. Varios proveedores lo ofrecen como opción automática, detectando que la función pasa más tiempo esperando al origen que trabajando y reubicándola. Es la misma arquitectura de siempre, y sigue siendo la correcta para todo lo que consulte datos.
+
+**Cachear el resultado en el borde.** Que es de lo que iba el resto del nivel, y sigue siendo la respuesta con mejor relación entre esfuerzo y beneficio.
+
+## Los límites reales
+
+Antes de comprometer una arquitectura conviene tener la lista delante. Las cifras concretas varían por proveedor y por plan, y cambian; el orden de magnitud y la naturaleza de la restricción no.
+
+| Límite | Orden de magnitud habitual | Qué rompe |
+|---|---|---|
+| Tiempo de CPU por petición | decenas de milisegundos en planes básicos | Cualquier bucle sobre miles de elementos, criptografía pesada, generación de imágenes |
+| Memoria por aislado | unos 128 MB | Cargar un documento grande entero en memoria |
+| Tamaño del paquete desplegado | de 1 a 10 MB comprimido | Meter un motor de plantillas grande, un cliente de base de datos pesado o una fuente incrustada |
+| Subpeticiones por invocación | de decenas a un millar | Un agregador que llame a treinta servicios por página |
+| Estado en memoria | no persiste de forma garantizada | Cualquier caché en variable de módulo tratada como fiable |
+| APIs de plataforma | subconjunto del entorno de servidor habitual | Módulos nativos, acceso al sistema de ficheros, sockets arbitrarios |
+
+Dos matices que se pagan caros por descubrirlos tarde. El primero: **el tiempo de CPU no es el tiempo total**. Esperar a un `fetch` no consume CPU, así que una función que espera dos segundos a tu origen puede estar dentro del límite sin problema; lo que lo revienta es un `JSON.parse` de un documento de diez megabytes. El segundo: **el estado en memoria funciona hasta que no funciona**. Una caché en una variable de módulo acierta a menudo, porque el aislado se reutiliza entre peticiones cercanas, y falla sin aviso cuando el aislado se recicla. Como caché oportunista es excelente; como fuente de verdad es un fallo intermitente imposible de reproducir.
+
+## Qué sí pertenece al borde
+
+La lista corta, y el criterio común: **todo lo que decide algo con la información que ya viene en la petición, sin consultar nada remoto.** `N` igual a cero.
+
+- **Encaminamiento y redirecciones.** Reescrituras de URL, redirecciones de dominios antiguos, retirada de barras finales. Cero datos, cero latencia añadida.
+- **Reparto en pruebas A/B.** Asignar la variante a partir de una cookie o de un hash del identificador, y añadirla a la clave de caché. Elimina el parpadeo de las pruebas hechas en el cliente, que es un problema de CLS además de uno de negocio.
+- **Validación de credenciales firmadas.** Verificar la firma de un testigo es CPU pura, sin consultas. Rechazar en el borde lo que no está autorizado ahorra el viaje al origen entero.
+- **Cabeceras y normalización de la clave de caché.** Justo lo de [la clave de caché](/guia/rendimiento/n32-la-clave-de-cache/): agrupar el país en cubetas, quitar parámetros de campaña, fijar la clase de dispositivo.
+- **Reescritura de HTML cacheado en streaming.** Personalizar sin ir al origen, como en [qué se puede cachear en el borde](/guia/rendimiento/n32-que-se-puede-cachear-en-el-borde/).
+- **Transformación de imágenes.** Servir el formato y el tamaño adecuados según la petición, cacheando el resultado.
+- **Filtrado y limitación de tasa.** Parar el tráfico abusivo lo más lejos posible del origen.
+
+Y la lista de lo que casi nunca pertenece: renderizar una página que necesita seis consultas, agregar respuestas de varios servicios internos, cualquier cosa que escriba en una base de datos transaccional, y el procesamiento pesado de datos.
+
+Para saber en cuál de los dos lados estás, mide en vez de opinar. La cabecera estándar `Server-Timing` te deja exponer el reparto de tiempo y leerlo desde el cliente:
+
+```js
+// En la funcion de borde.
+export default {
+  async fetch(peticion) {
+    const t0 = Date.now();
+    const cacheada = await caches.default.match(peticion);
+    const tCache = Date.now() - t0;
+
+    const t1 = Date.now();
+    const respuesta = cacheada || (await fetch(peticion));
+    const tOrigen = Date.now() - t1;
+
+    const salida = new Response(respuesta.body, respuesta);
+    salida.headers.set(
+      'Server-Timing',
+      `cache;dur=${tCache};desc="${cacheada ? 'HIT' : 'MISS'}", ` +
+      `origen;dur=${tOrigen}, ` +
+      `borde;dur=${Date.now() - t0}`
+    );
+    // Sin esto, otro origen no puede leer los tiempos.
+    salida.headers.set('Timing-Allow-Origin', '*');
+    return salida;
+  },
+};
+```
+
+```js
+// En el cliente: leer el desglose que ha enviado el borde.
+new PerformanceObserver((lista) => {
+  for (const entrada of lista.getEntries()) {
+    if (!entrada.serverTiming?.length) continue;
+    const tramos = Object.fromEntries(
+      entrada.serverTiming.map((t) => [t.name, t.duration])
+    );
+    const red = entrada.responseStart - entrada.requestStart;
+    console.log(new URL(entrada.name).pathname, {
+      ...tramos,
+      redSinServidor: Math.round(red - (tramos.borde || 0)),
+    });
+  }
+}).observe({ type: 'resource', buffered: true });
+```
+
+Ese último número —el tiempo de espera menos lo que el servidor declara haber tardado— es el que te dice cuánto de tu tiempo hasta el primer byte es física y cuánto es tuyo. Si es grande, mover cómputo no te va a salvar: lo que tienes es un problema de distancia y se resuelve cacheando. Si es pequeño y el tiempo declarado por el origen es grande, entonces sí tienes un problema de cómputo, y merece la pena preguntarse dónde ejecutarlo.
+
+<Callout type="dios" title="El borde no acerca el cómputo al usuario: lo aleja de los datos, y esa es la única frase que hay que recordar del nivel">
+El eslogan de la computación en el borde es "ejecuta tu código cerca del usuario", y como todos los buenos eslóganes es cierto y engañoso a la vez. Es cierto en la mitad que enuncia y engañoso en la mitad que calla, porque una función no es una entidad autónoma que produce respuestas por generación espontánea: es un intermediario entre el usuario y un estado que vive en algún sitio. Tiene dos vecinos, no uno, y solo puedes estar cerca de uno de ellos. Acercarte al usuario es, necesariamente y sin excepción, alejarte de los datos. La pregunta correcta, por tanto, nunca es "¿dónde está mi usuario?" sino **"¿cuántas veces tiene que hablar esta función con el estado antes de poder responder?"**, y esa pregunta tiene una respuesta numérica que puedes contar leyendo el código. Si la respuesta es cero, el borde es la ubicación óptima y la mejora es real e inmediata. Si es uno, es discutible y depende de la geografía concreta. Si es cinco, el borde es la peor ubicación posible de todas las disponibles, peor que el origen, peor que el propio cliente, y ninguna optimización posterior lo va a arreglar porque el problema es aritmético. Fíjate en que esto no es una limitación de una tecnología concreta que vaya a desaparecer con la siguiente versión: es una consecuencia de que la información no viaja más rápido que la luz y de que el estado consistente tiene que estar en algún lugar. La única forma de escapar de la desigualdad es replicar el estado, y replicar estado tiene su propio precio, que se paga en consistencia. Ahí está el verdadero contenido intelectual de esta decisión: **elegir dónde ejecutar es elegir qué garantía de consistencia estás dispuesto a soltar**, y quien te vende cómputo en el borde sin mencionar esa palabra te está vendiendo la mitad del asunto. La versión operativa de todo esto cabe en una regla: antes de mover una función al borde, cuenta sus idas y vueltas secuenciales contra el estado. Si no es cero, el trabajo que tienes por delante no es de despliegue, es de arquitectura de datos, y es mucho más grande de lo que parecía.
+</Callout>
+
+<Challenge title="Cuenta tus idas y vueltas">
+1. Coge la ruta dinámica más lenta de tu sitio y cuenta cuántas idas y vueltas **secuenciales** hace contra la base de datos y contra servicios internos. Anota el número.
+2. Comprueba cuántas de esas son secuenciales por necesidad real. Paraleliza las que no lo sean y vuelve a medir antes de tocar la ubicación.
+3. Añade `Server-Timing` a tus respuestas con al menos tres tramos y `Timing-Allow-Origin`. Léelo desde el cliente con el observador de arriba.
+4. Calcula el tiempo de espera menos el tiempo declarado por el servidor para usuarios de tres continentes. Ese número es tu latitud de mejora por cercanía.
+5. Busca en tu código toda caché guardada en una variable de módulo dentro de una función de borde y comprueba qué pasa si esa caché está vacía. Si algo se rompe, es un fallo latente.
+</Challenge>

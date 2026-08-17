@@ -1,0 +1,121 @@
+---
+title: "Contiguo en RAM o contiguo a la vista: kmalloc frente a vmalloc"
+description: "La diferencia entre memoria físicamente contigua y virtualmente contigua, por qué kmalloc pide páginas de orden alto al buddy allocator, cómo la fragmentación externa hace fallar reservas grandes aunque sobre RAM, y kvmalloc como síntesis moderna."
+subject: kernel
+level: 22
+order: 1
+position: "22.1"
+duration: "14 min"
+---
+
+<Lead>
+`kmalloc` te entrega memoria contigua en la RAM física; `vmalloc` te la entrega contigua solo a la vista de la CPU. La distinción parece un tecnicismo hasta que una reserva de 128 KB con `kmalloc` devuelve `NULL` en una máquina con gigabytes libres. La culpa es la fragmentación externa del asignador de páginas, y entenderla es lo que decide qué asignador usar.
+</Lead>
+
+<Goals>
+
+- Distinguir contigüidad física de contigüidad virtual y saber quién necesita cada una.
+- Entender por qué `kmalloc` acaba pidiendo páginas de orden alto al buddy allocator.
+- Ver cómo la fragmentación externa hace fallar reservas grandes aunque sobre RAM.
+- Conocer `kvmalloc` como el idioma moderno que combina lo mejor de ambos mundos.
+
+</Goals>
+
+## Dos maneras distintas de ser contiguo
+
+Todo lo que devuelve `kmalloc` procede de páginas que viven en el *direct map* (nivel 22.3): la región donde el kernel tiene mapeada, con un simple desplazamiento, toda la RAM. Dos consecuencias caen de ahí. Primera: la memoria es **físicamente contigua**, byte virtual adyacente equivale a byte físico adyacente. Segunda: su traducción es trivial, `virt_to_phys` funciona porque solo hay que restar `PAGE_OFFSET`.
+
+`vmalloc`, en cambio, toma páginas **sueltas** de orden cero por todo el sistema y las cose en un rango **virtualmente contiguo** dentro de la zona vmalloc, construyendo tablas de páginas a mano. El puntero que devuelve recorre direcciones virtuales seguidas, pero detrás hay marcos físicos dispersos y sin ningún orden.
+
+<Cards>
+  <Card icon="🧱" title="kmalloc — contiguo en RAM">
+    Físicamente contiguo, del slab sobre el buddy. Apto para DMA sin scatter-gather y para hardware que recorre un búfer linealmente. `virt_to_phys` es válido.
+  </Card>
+  <Card icon="🗺️" title="vmalloc — contiguo a la vista">
+    Virtualmente contiguo, páginas dispersas unidas por tablas de páginas. Nunca lo pases a un dispositivo que haga DMA por dirección física plana.
+  </Card>
+</Cards>
+
+## Por qué kmalloc termina pidiendo orden alto
+
+El buddy allocator solo sabe repartir bloques de `2^n` páginas **físicamente seguidas y alineadas**: eso es una reserva de *orden n*. `kmalloc` atiende los tamaños pequeños desde sus caches de slab (`kmalloc-64`, `kmalloc-128`…), pero en cuanto pides más de `KMALLOC_MAX_CACHE_SIZE` —8 KB, dos páginas— deja de haber cache y la petición baja directa al asignador de páginas con una orden calculada del tamaño:
+
+```c
+#include <linux/slab.h>
+
+/* 128 KB = 32 paginas de 4 KB => orden 5: un unico bloque de 32 marcos seguidos */
+void *p = kmalloc(128 * 1024, GFP_KERNEL);
+if (!p)
+	return -ENOMEM;   /* falla mucho antes de lo que crees */
+```
+
+El techo absoluto es `KMALLOC_MAX_SIZE`, que en la configuración típica de x86-64 (`MAX_PAGE_ORDER` igual a 10, páginas de 4 KB) son 4 MB. Pero ese número engaña: el problema no es el límite duro, sino que a partir de cierta orden el asignador **prefiere fallar** antes que esforzarse.
+
+## La fragmentación externa: RAM de sobra, ningún hueco
+
+Tras horas de actividad, la memoria libre queda salpicada: miles de marcos disponibles, pero repartidos en islas de una o dos páginas entre marcos ocupados. El buddy allocator puede tener megabytes libres y aun así no encontrar **32 marcos consecutivos y alineados** para tu orden 5. Eso es la fragmentación externa, y la ves cruda en las listas libres por orden:
+
+```bash
+cat /proc/buddyinfo
+# Node 0, zone   Normal  1919  1358  883  440  200  87  34  11  2  1  0
+#                        ord0  ord1 ...                          ord9 ord10
+```
+
+Los ceros y unos de la derecha son la sentencia: apenas quedan bloques de orden alto. Peor aún, `kmalloc` con `GFP_KERNEL` produce memoria **inmóvil** (el kernel no puede reubicarla), así que la compactación —que migra páginas *movibles* para fabricar huecos grandes— casi no puede ayudar. La reserva grande de kernel es justo la que la compactación no rescata.
+
+<Mermaid code={`flowchart LR
+  subgraph FIS [RAM fisica fragmentada]
+    direction LR
+    A[libre] --- B[usada] --- C[libre] --- D[usada] --- E[libre] --- F[usada]
+  end
+  K[kmalloc orden 5: necesita 32 marcos seguidos] -. no hay hueco .-> FIS
+  V[vmalloc: toma marcos sueltos y los mapea] -. siempre cabe .-> FIS`} />
+
+<Callout type="warn" title="PAGE_ALLOC_COSTLY_ORDER: el kernel se rinde a propósito">
+Las reservas de orden mayor que 3 (más de 32 KB, `PAGE_ALLOC_COSTLY_ORDER`) están marcadas como *costosas*. Para ellas el asignador **no** invoca al OOM killer ni reintenta sin fin: prueba una ronda de reclaim y compactación y, si no hay bloque, devuelve `NULL`. Es una decisión deliberada. Por eso una reserva grande con `kmalloc` puede fallar bajo carga aunque `free` muestre gigabytes: el kernel prefiere un fallo limpio a desestabilizar el sistema persiguiendo un bloque contiguo que quizá no exista.
+</Callout>
+
+## kvmalloc: pide contiguo, acepta disperso
+
+La mayoría del código no necesita contigüidad **física**; la pedía por costumbre. El idioma moderno lo hace explícito: intenta `kmalloc` y, si la reserva grande falla por fragmentación, cae a `vmalloc` de forma transparente.
+
+```c
+#include <linux/slab.h>
+
+/* intenta kmalloc (rapido, contiguo); si falla, __vmalloc por debajo */
+void *buf = kvmalloc(nmemb * size, GFP_KERNEL);
+if (!buf)
+	return -ENOMEM;
+/* ... uso ... */
+kvfree(buf);   /* libera tanto si vino de kmalloc como de vmalloc */
+```
+
+`kvmalloc` añade internamente `__GFP_NORETRY` y `__GFP_NOWARN` al primer intento con `kmalloc`, para que el camino rápido se rinda enseguida y sin ruido en `dmesg` antes de recurrir a `vmalloc`. Solo admite banderas compatibles con `GFP_KERNEL`: como la vía `vmalloc` puede dormir, `kvmalloc` es inutilizable en contexto atómico. Cuando dudes entre `kmalloc` y `vmalloc` para un búfer grande cuya geometría física no le importa a nadie, la respuesta casi siempre es `kvmalloc`.
+
+La decisión completa se reduce a dos preguntas encadenadas. Primera: ¿el búfer va a alimentar un DMA plano o a un hardware que recorra memoria físicamente contigua? Si es así, **necesitas** contigüidad física, y `kmalloc` —o `dma_alloc_coherent` (nivel 27)— es obligatorio, con el tamaño acotado a lo que el buddy allocator pueda entregar. Segunda, cuando la contigüidad física da igual: ¿es una reserva pequeña de un camino caliente? Entonces `kmalloc` gana por el slab; si es grande y esporádica, `kvmalloc` es la respuesta por defecto.
+
+```c
+/* pequeno y caliente, sin exigencia fisica -> kmalloc, del cache de slab */
+struct nodo *n = kmalloc(sizeof(*n), GFP_KERNEL);
+
+/* grande, esporadico, sin DMA plano -> kvmalloc (intenta kmalloc, cae a vmalloc) */
+void *tabla = kvmalloc_array(n_entradas, sizeof(struct entrada), GFP_KERNEL);
+```
+
+El antipatrón a erradicar es reservar con `kmalloc` un búfer grande «por si lo contiguo ayuda», sin que ningún dispositivo lo exija: cargas al sistema con una petición de orden alto y frágil a cambio de nada. Si el único observador de tu búfer es la CPU a través de la MMU, la contigüidad física no aporta ninguna ventaja y solo te expone a la fragmentación.
+
+<Callout type="note" title="Movible frente a inmóvil: la otra cara de la fragmentación">
+El buddy allocator segrega las páginas por *migratetype* (`MIGRATE_MOVABLE`, `MIGRATE_UNMOVABLE`, `MIGRATE_RECLAIMABLE`) precisamente para acotar el daño. La memoria de usuario es movible: la compactación puede desplazarla y fabricar bloques de orden alto. La memoria de kernel de `kmalloc` es inmóvil y contamina esos bloques de forma permanente. Mezclar ambos tipos en el mismo pageblock es lo que envenena la capacidad futura de servir reservas grandes.
+</Callout>
+
+<Callout type="dios" title="La MMU convierte un problema combinatorio en uno trivial">
+Aquí está la lección que reordena todo el nivel. La contigüidad física es un recurso **escaso y frágil**: se fragmenta con el tiempo y encontrar `2^n` marcos seguidos es un problema combinatorio que puede no tener solución aunque sobre memoria total. La contigüidad virtual, en cambio, es **abundante y barata**: el espacio de direcciones del kernel es enorme y encontrar un rango virtual libre es trivial. La unidad de gestión de memoria es el gran ecualizador: interpone una capa de indirección —las tablas de páginas— que transforma «hallar un bloque físico contiguo», difícil, en «hallar páginas sueltas más un rango virtual libre», fácil. `vmalloc` no crea contigüidad de la nada; la **simula** pagando en tablas de páginas y presión de TLB lo que ahorra en suerte. Todo el nivel 22 gira sobre esta única idea: separar la dirección que la CPU ve de la dirección donde el byte realmente vive, y elegir conscientemente cuánta de esa indirección te conviene pagar.
+</Callout>
+
+<Challenge title="Provoca el fallo y sortéalo">
+1. Escribe un módulo que reserve tamaños crecientes con `kmalloc(size, GFP_KERNEL | __GFP_NOWARN)` y registre a partir de qué tamaño empieza a devolver `NULL` tras cargar y descargar el módulo en bucle.
+2. Inspecciona `/proc/buddyinfo` antes y después: correlaciona los ceros de orden alto con el tamaño en que `kmalloc` empieza a fallar.
+3. Sustituye la reserva por `kvmalloc` y comprueba que ya no falla; averigua con `/proc/vmallocinfo` cuáles cayeron a la vía `vmalloc`.
+4. Explica por qué la compactación no puede rescatar una reserva `GFP_KERNEL` de orden 5 pero sí una de páginas de usuario.
+5. Justifica por qué `PAGE_ALLOC_COSTLY_ORDER` vale 3 y no, por ejemplo, 6.
+</Challenge>

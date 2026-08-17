@@ -1,0 +1,158 @@
+---
+title: "scheduler.yield(): qué hace, qué navegadores lo tienen y qué usar donde no"
+description: "La API que cede el hilo sin perder el turno, por qué es mejor que cualquier alternativa anterior, el estado real de su soporte a mediados de 2026, y la degradación que hay que escribir sí o sí."
+subject: rendimiento
+level: 20
+order: 1
+position: "20.1"
+duration: "18 min"
+---
+
+<Lead>
+Ceder el hilo principal siempre ha sido posible y siempre ha sido malo. Las alternativas clásicas devuelven el control al navegador y a cambio ponen tu continuación al final de la cola, detrás de cualquier otro trabajo que se haya acumulado, incluidos temporizadores de terceros. `scheduler.yield()` resuelve exactamente ese problema: cede, y la continuación vuelve **por delante** de las tareas normales. Es la primitiva correcta, es reciente, y **no está en Safari**, así que la degradación no es opcional.
+</Lead>
+
+<Goals>
+
+- Explicar qué garantiza `scheduler.yield()` que las alternativas no garantizan.
+- Enunciar el estado exacto de soporte a mediados de 2026.
+- Escribir una función de cesión que funcione en los tres motores.
+- Decidir cuándo el coste de ceder supera el beneficio.
+
+</Goals>
+
+## Qué hace y por qué es distinto
+
+`scheduler.yield()` devuelve una promesa. Al esperarla, la tarea actual **termina** —el navegador recupera el hilo, puede procesar eventos de entrada y pintar— y la continuación de tu función se programa como una tarea nueva.
+
+```js
+async function procesarTodo(items) {
+  for (const item of items) {
+    procesar(item);
+    await scheduler.yield();   // cede el hilo y vuelve pronto
+  }
+}
+```
+
+Lo que la distingue de todo lo anterior es la **prioridad de la continuación**. Con `setTimeout(fn, 0)`, tu continuación entra al final de la cola de tareas normales; si mientras tanto una biblioteca de terceros ha programado quince temporizadores, tú vas el dieciséis. Con `scheduler.yield()`, la continuación se programa en una cola de prioridad más alta que las tareas normales, y **hereda la prioridad de la tarea en la que se llamó**. En la práctica eso significa que vuelves antes que el trabajo especulativo de otros y después que la entrada del usuario, que es exactamente el orden que quieres.
+
+La segunda diferencia importa en bucles: **el orden se preserva**. Varias continuaciones cedidas vuelven en el orden en que cedieron. Con temporizadores encadenados eso también se cumple en la práctica, pero sin garantía y con la interferencia de cualquier otro temporizador.
+
+La tercera es que **no hay retardo mínimo**. `setTimeout(fn, 0)` sufre el sujetado a cuatro milisegundos tras varios niveles de anidamiento, del que hablaremos en [su propia lección](/guia/rendimiento/n20-settimeout-cero-y-por-que-es-peor/). La cesión no tiene retardo: vuelve en cuanto el navegador ha hecho lo que tenía que hacer.
+
+## El soporte real, sin adornos
+
+Esto es lo verificado a mediados de 2026, y conviene decirlo sin ambigüedad porque hay mucha documentación entusiasta que lo omite:
+
+| Motor | `scheduler.yield()` | `scheduler.postTask()` |
+|---|---|---|
+| Chrome y Edge | Sí, desde la versión 129 (septiembre de 2024) | Sí, desde la 94 (2021) |
+| Firefox | Sí, desde la versión 142 (agosto de 2025) | Sí, desde la 142 |
+| Safari | **No** | **No** |
+
+Con Safari fuera, **la API no es Baseline** y no se puede usar sin comprobación. Y Safari no es un caso marginal: en muchos mercados es el navegador mayoritario en móvil, que es precisamente el dispositivo donde el bloqueo del hilo duele más.
+
+La comprobación correcta es de característica, no de navegador:
+
+```js
+const tieneYield = typeof globalThis.scheduler?.yield === 'function';
+```
+
+El encadenamiento opcional sobre `scheduler` es necesario porque el objeto entero puede no existir.
+
+## La función de cesión que funciona en todas partes
+
+Esta es la implementación que conviene tener en un módulo de utilidades y usar en todo el proyecto. Tres niveles de degradación, del mejor al peor:
+
+```js
+/**
+ * Cede el hilo principal. Devuelve una promesa que se resuelve
+ * cuando el navegador ha tenido ocasion de atender al usuario.
+ */
+export const ceder = (() => {
+  // 1. La API correcta, donde existe
+  if (typeof globalThis.scheduler?.yield === 'function') {
+    return () => globalThis.scheduler.yield();
+  }
+  // 2. postTask con prioridad de usuario visible: sin sujetado, con prioridad
+  if (typeof globalThis.scheduler?.postTask === 'function') {
+    return () => globalThis.scheduler.postTask(() => {}, { priority: 'user-visible' });
+  }
+  // 3. MessageChannel: sin sujetado de 4 ms, a diferencia de setTimeout
+  const canal = new MessageChannel();
+  const cola = [];
+  canal.port1.onmessage = () => cola.shift()?.();
+  return () => new Promise((resolver) => {
+    cola.push(resolver);
+    canal.port2.postMessage(null);
+  });
+})();
+```
+
+El tercer nivel merece explicación porque es la parte que la mayoría de las implementaciones hacen mal. `MessageChannel` programa una tarea nueva —cede de verdad, el navegador puede pintar y atender entrada— y **no sufre el sujetado a cuatro milisegundos** de los temporizadores anidados. Es la técnica que usan internamente varios planificadores de marcos, precisamente por eso. Es peor que `scheduler.yield()` porque la continuación entra en la cola de tareas normales sin prioridad, pero es notablemente mejor que `setTimeout(fn, 0)`.
+
+El uso es idéntico en los tres casos:
+
+```js
+import { ceder } from './planificacion.js';
+
+async function importarFilas(filas) {
+  let ultimaCesion = performance.now();
+  for (const fila of filas) {
+    insertarFila(fila);
+    if (performance.now() - ultimaCesion > 40) {
+      await ceder();
+      ultimaCesion = performance.now();
+    }
+  }
+}
+```
+
+Fíjate en que no se cede en cada iteración sino cuando se han acumulado 40 milisegundos de trabajo. Ceder tiene coste, y cederlo todo es peor que no ceder nada. El criterio de troceado está en [trocear trabajo largo](/guia/rendimiento/n20-trocear-trabajo-largo/).
+
+<Callout type="dios" title="Ceder no es gratis, y en Safari la degradación puede empeorar lo que intentabas arreglar">
+La conversación sobre cesión suele presentarla como una mejora sin coste, y no lo es. Los números concretos.
+
+**Cada cesión cuesta entre 0,1 y 1 milisegundo** en el propio mecanismo: terminar la tarea, volver al bucle de eventos, programar la continuación, reanudarla. Es poco. Pero además, y esto es lo que la gente no cuenta, **cada cesión da al navegador la oportunidad de hacer trabajo de renderizado**, y si tu trabajo modifica el DOM en cada trozo, cada cesión puede provocar un ciclo completo de estilo, layout, pintura y composición. Insertar mil filas cediendo cada una puede ser **cinco o diez veces más lento en tiempo total** que insertarlas de golpe, porque has forzado mil renderizados en vez de uno.
+
+De ahí la regla que importa: **cede entre lotes, no entre elementos, y no modifiques el DOM en cada lote si puedes evitarlo**. Construye en un fragmento de documento y confirma una vez por lote grande.
+
+Y ahora el punto que hace esta lección incómoda de escribir con honestidad: **en Safari, donde no hay `scheduler.yield()`, la degradación tiene peor perfil**. El respaldo con `MessageChannel` cede correctamente, pero la continuación entra en la cola de tareas normales, sin prioridad. Si la página tiene trabajo de terceros programado —analítica, publicidad, seguimiento— tus trozos compiten con él en igualdad de condiciones, y el tiempo total de tu operación puede alargarse mucho más de lo que se alarga en Chromium.
+
+La consecuencia práctica es que **el troceado hay que medirlo en Safari por separado**, y que el número de trozos debe ser conservador: menos cesiones y más largas. Un bucle que en Chromium funciona bien cediendo cada 25 milisegundos puede necesitar ceder cada 50 en Safari para no dilatarse.
+
+Hay un tercer coste que aparece en aplicaciones con estado y es de corrección, no de rendimiento: **entre una cesión y la siguiente, el mundo puede cambiar**. El usuario puede haber navegado a otra vista, haber filtrado la lista o haber cerrado el componente. Un bucle troceado que sigue trabajando sobre datos obsoletos es un fallo real, y la protección es una señal de cancelación:
+
+```js
+async function importarFilas(filas, senal) {
+  for (const lote of enLotes(filas, 200)) {
+    if (senal.aborted) return;          // el mundo cambio: abandona
+    insertarLote(lote);
+    await ceder();
+  }
+}
+
+const control = new AbortController();
+importarFilas(datos, control.signal);
+// Al desmontar el componente o navegar:
+control.abort();
+```
+
+Sin esa comprobación, el troceado convierte un bloqueo visible en una fuga de trabajo invisible, y eso es cambiar un problema por otro peor.
+</Callout>
+
+## Cuándo no ceder
+
+Tres casos donde ceder es la decisión equivocada.
+
+**Cuando el trabajo total es corto.** Por debajo de 50 milisegundos, no hay tarea larga que partir. Trocear añade complejidad y coste sin beneficio.
+
+**Cuando el trabajo tiene que ser atómico.** Una transacción que deja el estado inconsistente a mitad no se puede partir sin diseñar la consistencia intermedia. Es un problema de arquitectura, no de planificación.
+
+**Cuando el trabajo puede salir del hilo principal.** Si es cálculo puro sobre datos, sin DOM, un trabajador es mejor que trocear: el hilo principal queda libre del todo, no a ratos. Lo verás en el nivel de trabajadores.
+
+Y una regla que evita el uso cargo-cult de la API: **cede solo donde hayas medido una tarea larga**. Sembrar `await ceder()` por toda la base de código porque parece buena práctica alarga todas las operaciones y no arregla ninguna métrica.
+
+<Challenge>
+Escribe el módulo `planificacion.js` con la función `ceder` de tres niveles. Después coge la tarea más larga de tu aplicación, trocéala con cesión cada 40 milisegundos, y mide en tres navegadores: la duración total de la operación y la tarea más larga resultante. Comprueba que la relación entre las dos cifras es distinta en Safari y explica por qué con lo que has leído.
+</Challenge>

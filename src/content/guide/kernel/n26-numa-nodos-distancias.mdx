@@ -1,0 +1,137 @@
+---
+title: "NUMA: nodos, distancias y el descriptor por nodo"
+description: "En máquinas de varios sockets la memoria no es uniforme: la RAM local a un núcleo es más rápida que la remota. Nodos NUMA, la matriz de distancias de la tabla SLIT, y struct pglist_data, el descriptor que el kernel mantiene por cada nodo con sus zonas, sus zonelists de respaldo y su propio kswapd."
+subject: kernel
+level: 26
+order: 1
+position: "26.1"
+duration: "16 min"
+---
+
+<Lead>
+En un portátil toda la RAM está a la misma distancia de la única CPU: memoria **uniforme**. En un servidor de dos, cuatro u ocho sockets cada procesador tiene su propia RAM soldada al lado, y para tocar la del vecino debe cruzar un interconnect —UPI en Intel, Infinity Fabric en AMD—. Ese cruce cuesta latencia y ancho de banda. La memoria deja de ser uniforme: es **NUMA**, Non-Uniform Memory Access. El kernel no puede ignorarlo, y toda la gestión de memoria física se organiza alrededor del concepto de **nodo**.
+</Lead>
+
+<Goals>
+
+- Distinguir UMA de NUMA y por qué todo servidor grande es NUMA.
+- Leer la topología: nodos, `cpu_to_node`, y la matriz de distancias de la SLIT.
+- Conocer `struct pglist_data` (`pg_data_t`), el descriptor que el kernel guarda por nodo.
+- Entender las zonas dentro del nodo y las zonelists que definen el orden de respaldo.
+
+</Goals>
+
+## De la memoria uniforme a la no uniforme
+
+En una máquina UMA todos los núcleos comparten un único controlador de memoria: cualquier acceso cuesta lo mismo venga de donde venga. NUMA rompe esa simetría. Cada socket integra su propio controlador y su banco de DRAM; el conjunto de un socket con su memoria es un **nodo**. Acceder a la memoria del nodo propio —**local**— tarda quizá 90 ns; alcanzar la de otro nodo —**remota**— exige atravesar el interconnect y puede costar 1.5x o 2x más, además de saturar un enlace compartido bajo carga.
+
+La herramienta de partida para ver la topología es `numactl`:
+
+```bash
+numactl --hardware
+```
+
+```text
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 4 5 6 7
+node 0 size: 128000 MB
+node 1 cpus: 8 9 10 11 12 13 14 15
+node 1 size: 128000 MB
+node distances:
+node   0   1
+  0:  10  21
+  1:  21  10
+```
+
+La diagonal vale 10 (acceso local) y el resto 21 (remoto): esa matriz de **distancias relativas** es la brújula de todas las decisiones NUMA del kernel. No son nanosegundos, son ratios normalizados donde 10 significa "lo más cerca posible".
+
+<Callout type="info" title="Nodos sin memoria y nodos sin CPU">
+La topología puede ser rara. Hay nodos **sin CPU** (bancos de memoria persistente o CXL sin cómputo propio) y nodos **sin memoria** (`memoryless`, todas sus CPUs asignan en el nodo vecino más cercano). Por eso el kernel separa `numa_node_id()` —el nodo de cómputo del núcleo actual— de `numa_mem_id()` —el nodo del que este núcleo debe **asignar** memoria—. En hardware normal coinciden; en topologías exóticas no.
+</Callout>
+
+## La topología: nodos y distancias
+
+El kernel expone la topología con un puñado de primitivas de `include/linux/topology.h` y `include/linux/nodemask.h`:
+
+```c
+#include <linux/topology.h>
+#include <linux/nodemask.h>
+
+int nid;
+
+/* recorre solo los nodos que tienen memoria en linea */
+for_each_online_node(nid) {
+	const struct cpumask *cpus = cpumask_of_node(nid);
+	pr_info("nodo %d: %d CPUs, distancia a si mismo = %d\n",
+		nid, cpumask_weight(cpus), node_distance(nid, nid));
+}
+
+/* de un nucleo a su nodo, y de un nodo a la distancia con otro */
+int mi_nodo = numa_node_id();          /* nodo del nucleo actual  */
+int nodo_de_cpu3 = cpu_to_node(3);     /* nodo de un nucleo dado  */
+int d = node_distance(0, 1);           /* 10 local, mayor si remoto */
+```
+
+`node_distance(a, b)` deriva de la tabla ACPI **SLIT** (System Locality Information Table), que el firmware publica y el kernel copia en la matriz `numa_distance`. Las constantes canónicas viven en `include/linux/topology.h`: `LOCAL_DISTANCE` es 10, `REMOTE_DISTANCE` es 20, y `RECLAIM_DISTANCE` (por defecto 30) marca el umbral a partir del cual el kernel prefiere **reclamar** memoria local antes que asignar en un nodo tan lejano. Todo esto se refleja también en sysfs, bajo `/sys/devices/system/node/nodeN/`, con `cpumap`, `distance` y `meminfo` por nodo.
+
+## `struct pglist_data`: un descriptor por nodo
+
+El corazón de la representación NUMA es `pg_data_t`, definido en `include/linux/mmzone.h`. El kernel mantiene **uno por nodo**, alcanzable con `NODE_DATA(nid)`:
+
+```c
+/* include/linux/mmzone.h (campos esenciales, resumido) */
+typedef struct pglist_data {
+	struct zone node_zones[MAX_NR_ZONES];      /* DMA32, NORMAL, MOVABLE... */
+	struct zonelist node_zonelists[MAX_ZONELISTS]; /* orden de respaldo NUMA */
+	int nr_zones;
+
+	unsigned long node_start_pfn;      /* primer PFN que abarca el nodo   */
+	unsigned long node_present_pages;  /* paginas fisicas reales          */
+	unsigned long node_spanned_pages;  /* rango total, huecos incluidos   */
+	int node_id;
+
+	struct task_struct *kswapd;        /* hilo de reclamo propio del nodo */
+	wait_queue_head_t kswapd_wait;
+	struct lruvec __lruvec;            /* listas LRU por nodo (reclamo)   */
+	struct per_cpu_nodestat __percpu *per_cpu_nodestats;
+} pg_data_t;
+```
+
+Cada nodo es, en la práctica, un subsistema de memoria casi autónomo: sus zonas, su hilo `kswapd` para recuperar páginas cuando escasea, sus listas LRU y sus estadísticas por CPU. Recorrer sus zonas es directo:
+
+```c
+pg_data_t *pgdat = NODE_DATA(numa_node_id());
+struct zone *z;
+
+for (z = pgdat->node_zones; z < pgdat->node_zones + MAX_NR_ZONES; z++) {
+	if (!populated_zone(z))
+		continue;
+	pr_info("nodo %d zona %s: %lu paginas gestionadas\n",
+		pgdat->node_id, z->name, zone_managed_pages(z));
+}
+```
+
+## Zonas dentro del nodo y zonelists de respaldo
+
+Dentro de cada nodo la memoria se divide en **zonas** (`ZONE_DMA32`, `ZONE_NORMAL`, `ZONE_MOVABLE`...), que existen por restricciones de hardware y de reclamo, no por NUMA. Lo genuinamente NUMA es la **zonelist**: la lista ordenada de zonas que el asignador de páginas recorre cuando el nodo local no puede satisfacer la petición. `build_zonelists` la construye ordenando primero las zonas del nodo local y luego las de los demás nodos por distancia creciente. Así, si el nodo 0 se queda sin páginas, el buddy allocator cae al nodo más cercano, no a uno cualquiera.
+
+<Mermaid code={`flowchart TD
+  P[Peticion de pagina en el nodo 0] --> L{Hay pagina libre local}
+  L -->|Si| OK[Asigna en el nodo 0 rapido]
+  L -->|No| Z[Recorre la zonelist por distancia]
+  Z --> R[Cae al nodo vecino mas cercano]
+  R --> OK2[Asigna remoto mas lento pero disponible]
+  class OK t-green
+  class OK2 t-yellow`} />
+
+<Callout type="dios" title="El nodo es la unidad de razonamiento de toda la memoria física">
+Fíjate en lo que acaba de pasar: la latencia del hardware ha reescrito la estructura de datos del kernel. Porque la memoria remota es más lenta, el kernel no gestiona "la RAM" como un pozo único; la parte en nodos, y cada `pg_data_t` es un reino con sus zonas, su reclamador y sus estadísticas. Cada decisión posterior —qué política de asignación usar (26.2), dónde poner un contador per-CPU (26.3), cómo medir un cuello de botella (26.5)— se toma con el nodo como coordenada implícita. Esta es la lección profunda de todo el nivel y de la programación de sistemas moderna: por encima de cierta escala **la topología física del hardware se filtra hacia arriba y moldea el software**. No puedes escribir un asignador, un planificador ni una base de datos que escale a cientos de núcleos fingiendo que toda la memoria está a la misma distancia. El buen ingeniero de sistemas deja de ver "memoria" y empieza a ver "memoria de *este* nodo", igual que dejó de ver "un dato" para ver "un dato en *esta* línea de caché". Interiorizar la coordenada de nodo es el primer paso para pensar como piensa el kernel a gran escala.
+</Callout>
+
+<Challenge title="Cartografía tu máquina NUMA">
+1. Ejecuta `numactl --hardware` (o léelo en QEMU con `-numa node`) y dibuja la matriz de distancias de tu sistema.
+2. Explica la diferencia entre `numa_node_id()` y `numa_mem_id()` y cuándo divergen.
+3. Enumera los campos de `pg_data_t` y clasifícalos: cuáles describen el rango físico, cuáles el reclamo y cuáles las estadísticas.
+4. Razona por qué las zonelists ordenan los nodos por distancia y qué pasaría si cayeran a un nodo remoto al azar.
+5. Explora `/sys/devices/system/node/node0/` y localiza `distance`, `cpumap` y `meminfo`.
+</Challenge>

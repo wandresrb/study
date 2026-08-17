@@ -1,0 +1,156 @@
+---
+title: "Semáforos: el abuelo que aún sabe contar"
+description: "struct semaphore, down y up, la historia del lock durmiente original de Linux, por qué los mutex lo jubilaron casi en todo, y el único nicho donde sigue siendo insustituible: el semáforo contador de verdad."
+subject: kernel
+level: 16
+order: 3
+position: "16.3"
+duration: "12 min"
+---
+
+<Lead>
+Antes del mutex, el kernel dormía con semáforos. Son la primitiva de sincronización más antigua de la informática —Dijkstra, 1965— y durante décadas fueron el lock durmiente por defecto de Linux. Hoy están casi jubilados, pero entender por qué, y dónde siguen siendo irremplazables, ilumina toda la evolución de la concurrencia del kernel.
+</Lead>
+
+<Goals>
+
+- Entender la mecánica de `down` y `up` y la ausencia de propiedad.
+- Conocer su historia como lock durmiente original de Linux.
+- Saber por qué los mutex los reemplazaron casi por completo.
+- Usar un semáforo contador real para limitar el acceso a N recursos.
+
+</Goals>
+
+## P y V: bajar y subir
+
+Un semáforo es un contador con dos operaciones atómicas. Dijkstra las llamó **P** (proberen, "probar": bajar) y **V** (verhogen, "incrementar": subir). En Linux son `down` y `up`, sobre `#include <linux/semaphore.h>`:
+
+```c
+struct semaphore {
+	raw_spinlock_t		lock;
+	unsigned int		count;		/* permisos disponibles */
+	struct list_head	wait_list;	/* los que duermen esperando */
+};
+```
+
+`down` intenta consumir un permiso: si `count` es mayor que cero lo decrementa y sigue; si es cero, la tarea se duerme en `wait_list`. `up` devuelve un permiso: incrementa `count` y despierta a un durmiente. Con `count` inicial a 1 tienes un semáforo binario (un lock); con `count` a N, un contador de verdad.
+
+```c
+#include <linux/semaphore.h>
+
+/* desde Linux 6.5, DEFINE_SEMAPHORE lleva el contador explícito */
+static DEFINE_SEMAPHORE(sem, 1);	/* binario: actúa como un lock */
+
+static int seccion(void)
+{
+	if (down_interruptible(&sem))	/* baja; duerme si no hay permiso */
+		return -ERESTARTSYS;
+
+	...sección crítica (puede dormir)...
+
+	up(&sem);			/* sube; despierta a un durmiente */
+	return 0;
+}
+```
+
+Tienes las variantes esperables: `down_interruptible` (cede ante señales), `down_killable`, `down_trylock` (no duerme, devuelve inmediatamente) y `down_timeout` (espera acotada).
+
+## Sin dueño: bendición y maldición
+
+Fíjate en algo que el mutex no permite: **cualquier tarea puede llamar a `up`**, no solo la que hizo `down`. El semáforo no recuerda quién lo bajó; solo cuenta permisos. Esa ausencia de propiedad es una espada de doble filo:
+
+<Cards>
+  <Card icon="🔓" title="La bendición">
+    Una tarea baja y otra sube. Perfecto para señalizar entre contextos o para repartir N permisos entre productores y consumidores.
+  </Card>
+  <Card icon="⚠️" title="La maldición">
+    Sin dueño no hay optimistic spinning, ni depuración de propiedad, ni herencia de prioridad. Como lock, es más lento y más ciego a los bugs que un mutex.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart LR
+  A[down] --> B{count mayor que cero}
+  B -->|Si| C[decrementa count y sigue]
+  B -->|No| D[se duerme en wait_list]
+  E[up desde cualquier tarea] --> F[incrementa count]
+  F --> G[despierta a un durmiente]
+  class C t-green
+  class D t-blue`} />
+
+## Por qué los mutex ganaron
+
+Cuando en 2006 llegó `struct mutex`, el semáforo binario usado como lock quedó obsoleto casi de un día para otro. El mutex era más rápido (spinning), más estricto (un dueño, sin recursión), mejor instrumentado (lockdep, `CONFIG_DEBUG_MUTEXES`) y su semántica encajaba con el 99% de los usos. Una campaña de conversión sistemática cambió miles de semáforos binarios por mutex en todo el árbol. Hoy, ver `down`/`up` usados como un simple lock es un olor a código heredado: casi siempre debería ser un mutex.
+
+## El nicho que sobrevive: contar recursos
+
+Hay una cosa que un mutex no puede hacer y un semáforo sí: contar hasta más de uno. Cuando necesitas limitar el acceso concurrente a **N** recursos idénticos —N canales DMA, N buffers de un pool, N conexiones simultáneas—, el semáforo contador es la herramienta exacta:
+
+```c
+#include <linux/semaphore.h>
+
+#define N_CANALES 4
+static DEFINE_SEMAPHORE(canales, N_CANALES);	/* 4 permisos simultáneos */
+
+static int transmitir(const void *datos, size_t n)
+{
+	/* como mucho 4 tareas aquí a la vez; la quinta duerme hasta que
+	 * otra suba su permiso. El acceso puede dormir sin problema. */
+	if (down_interruptible(&canales))
+		return -ERESTARTSYS;
+
+	...usar uno de los 4 canales...
+
+	up(&canales);		/* devuelve el permiso; puede hacerlo otra tarea */
+	return 0;
+}
+```
+
+Aquí `count` a 4 expresa algo que ningún mutex podría: "hasta cuatro a la vez". Ese es el semáforo en su forma pura, la que Dijkstra imaginó, y sigue viva en el kernel para exactamente este caso.
+
+## Variantes y señalización sin bloqueo
+
+Como no tiene dueño, el semáforo sirve para señalizar entre contextos que no comparten una tarea: uno baja y otro sube. De hecho `up` solo coge un spinlock interno, así que **se puede llamar desde contexto atómico** —una mitad inferior o incluso una ISR puede hacer `up` para despertar a un hilo que hizo `down` en contexto de proceso—. Es el mismo puente entre mundos que veremos, más pulido, en las completions (nivel 16.5).
+
+Para caminos que no pueden bloquear, `down_trylock` consulta un permiso sin arriesgarse a dormir:
+
+```c
+/* intenta coger un permiso sin dormir jamás */
+if (down_trylock(&canales)) {
+	/* no había permiso libre: sigue otra estrategia en vez de esperar */
+	return -EAGAIN;
+}
+...usar el canal...
+up(&canales);
+```
+
+Cuidado con la convención: `down_trylock` devuelve 0 si consiguió el permiso y distinto de cero si no —lo contrario de lo que sugiere el nombre, y una fuente clásica de bugs—. Para una espera acotada existe `down_timeout`, que se rinde tras un número de jiffies.
+
+<Callout type="info" title="La firma cambió: cuidado al portar código">
+Hasta Linux 6.5, `DEFINE_SEMAPHORE(nombre)` asumía un contador de 1. Desde entonces exige el valor explícito: `DEFINE_SEMAPHORE(nombre, n)`. Es un cambio pensado para que nadie confunda un semáforo binario (que debería ser un mutex) con un contador de verdad: ahora el número está siempre a la vista.
+</Callout>
+
+## down a secas: la trampa del estado D
+
+Prefiere siempre `down_interruptible` o `down_killable` sobre `down` a secas. Un `down` no interrumpible deja a la tarea en estado **D** (uninterruptible sleep) si el permiso nunca llega: invisible a las señales, imposible de matar —ni `kill -9` la toca— y sumando a la carga media del sistema. Es una de las causas clásicas de procesos "zombis de facto" que solo un reinicio quita.
+
+```c
+/* casi siempre así: cedemos ante señales y evitamos tareas inmatables */
+if (down_interruptible(&sem))
+	return -ERESTARTSYS;
+
+/* down() a secas: solo si es literalmente imposible que no se libere */
+```
+
+La misma disciplina vale para toda la familia durmiente: `mutex_lock_interruptible`, `wait_for_completion_killable`, `down_read_interruptible`. Si vas a dormir esperando algo que podría no llegar, deja siempre una puerta abierta a las señales.
+
+<Callout type="dios" title="Especializa tus herramientas y el tipo cazará tus bugs">
+La historia del semáforo al mutex es una parábola de ingeniería. El semáforo es la herramienta general: cuenta, señaliza, bloquea, todo con la misma API. El mutex es la herramienta especializada: solo hace una cosa —exclusión mutua con un dueño— pero la hace mejor porque su tipo codifica un invariante que el compilador y el depurador pueden vigilar. El kernel no se hizo más potente añadiendo flexibilidad; se hizo más seguro **quitándola**, partiendo un uso genérico en tipos específicos que capturan la intención. Cuando diseñes tus propias abstracciones —un lock, una cola, un asignador—, resiste la tentación de la navaja suiza. Una API estrecha que solo permite el uso correcto convierte clases enteras de errores en errores de compilación o en warnings de lockdep. El semáforo no desapareció: se replegó a su nicho verdadero, contar recursos, y dejó el trono a una herramienta que hace menos y por eso protege más.
+</Callout>
+
+<Challenge title="Un pool de recursos con semáforo contador">
+1. Declara un `DEFINE_SEMAPHORE(pool, 3)` que modele tres recursos idénticos.
+2. Lanza cinco hilos de kernel (`kthread_run`) que hagan `down_interruptible`, duerman con `msleep(200)` y luego hagan `up`.
+3. Con `pr_info` y marcas de tiempo, comprueba que nunca hay más de tres dentro a la vez.
+4. Cambia el contador a 1 y observa cómo el comportamiento degenera al de un lock binario.
+5. Investiga: ¿por qué este patrón no se puede expresar con un `struct mutex`?
+</Challenge>

@@ -1,0 +1,169 @@
+---
+title: "El modelo de compilación: LLVM en lugar de una máquina virtual"
+description: "Kotlin/Native no es Kotlin con otro empaquetado: es el mismo lenguaje atravesando un backend distinto que termina en LLVM y produce código máquina sin intérprete debajo. Esta lección reconstruye el camino completo desde el frontend K2 hasta el binario enlazado, explica qué es realmente un klib y por qué no contiene código máquina, cataloga los artefactos que el compilador sabe emitir, justifica por qué el tiempo de compilación es el impuesto estructural de este modelo, y contrasta punto por punto una compilación anticipada con la carga perezosa, la especulación y la desoptimización de la JVM."
+subject: kotlin
+level: 34
+order: 1
+position: "34.1"
+duration: "22 min"
+---
+
+<Lead>
+La primera vez que compilas un proyecto de Kotlin/Native y esperas cuatro minutos por un binario que en la JVM habría tardado ocho segundos, la reacción natural es sospechar que algo está mal configurado. No lo está. Ese tiempo es la consecuencia directa de una decisión de arquitectura: en la JVM el compilador solo tiene que producir bytecode y delegar en una máquina virtual que decidirá en tiempo de ejecución qué merece optimizarse; en Native no hay nadie a quien delegar, así que todas esas decisiones hay que tomarlas antes, sobre el programa entero, y escribirlas en piedra. Entender ese reparto de responsabilidades explica a la vez la lentitud del compilador, la velocidad del arranque, la ausencia de reflexión y casi todas las demás peculiaridades del target.
+</Lead>
+
+<Goals>
+
+- Reconstruir la tubería completa desde el fuente hasta el binario y situar dónde termina Kotlin y empieza LLVM.
+- Distinguir qué es un `klib`, qué contiene y por qué no es un artefacto ejecutable.
+- Elegir entre ejecutable, framework, biblioteca dinámica y biblioteca estática según el consumidor.
+- Explicar el tiempo de compilación como consecuencia del modelo anticipado y mitigarlo con cachés.
+
+</Goals>
+
+## De K2 a LLVM: donde el camino se bifurca
+
+El frontend es el mismo para todos los targets. K2 analiza, resuelve, comprueba tipos y produce una representación intermedia propia de Kotlin, el IR, que todavía no sabe nada de arquitecturas ni de registros. Hasta aquí un proyecto de JVM y uno de Native son indistinguibles: los mismos errores, los mismos avisos, las mismas inferencias. La bifurcación llega después, cuando cada backend baja ese IR a su destino. El de JVM emite bytecode. El de Native aplica una larga secuencia de transformaciones —desazucarado de corrutinas, materialización de genéricos, inserción de las llamadas al gestor de memoria— y finalmente traduce a IR de LLVM, que es donde el compilador de Kotlin deja de ser el protagonista.
+
+A partir de ese punto trabaja LLVM con sus propios pases de optimización, y el resultado son ficheros objeto para un *target triple* concreto: arquitectura, sistema y ABI. El enlazador del sistema los une con el runtime de Kotlin/Native —que no es una máquina virtual sino una biblioteca estática con el gestor de memoria, el recolector, el soporte de excepciones y las tablas de tipos— y produce el binario final.
+
+<Mermaid code={`flowchart TD
+  A[Fuentes Kotlin] --> B[Frontend K2]
+  B --> C[Kotlin IR]
+  C --> D[klib con IR serializado]
+  C --> E[Backend nativo]
+  E --> F[LLVM IR]
+  F --> G[Pases de LLVM]
+  G --> H[Ficheros objeto]
+  D --> E
+  H --> I[Enlazador del sistema]
+  J[Runtime de Kotlin Native] --> I
+  I --> K[Binario o framework]`} />
+
+El nodo que suele malinterpretarse es el `klib`. Una biblioteca de Kotlin/Native no contiene código máquina: contiene IR serializado más los metadatos de declaraciones. Es deliberado, porque el mismo `klib` de una biblioteca multiplataforma debe poder terminar en arquitecturas distintas, y porque el backend necesita ver el cuerpo de las funciones ajenas para poder insertarlas y especializarlas. La consecuencia práctica es que enlazar no es pegar objetos precompilados: cada binario final recompila, en la práctica, todo lo que consume, incluida la biblioteca estándar.
+
+Conviene además interiorizar que el *target* no es una etiqueta cosmética sino el triple completo que LLVM necesita: arquitectura, sistema operativo y convención binaria. Declarar tres targets en un mismo módulo no produce un binario portable con tres modos, produce tres binarios independientes que comparten fuentes y nada más, cada uno con su propio conjunto de dependencias resueltas, su propia biblioteca del sistema y su propio enlazado.
+
+```kotlin
+kotlin {
+    macosArm64()          // arm64-apple-macos
+    linuxX64()            // x86_64-unknown-linux-gnu
+    mingwX64()            // x86_64-pc-windows-gnu
+
+    targets.withType<org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget> {
+        compilations.configureEach {
+            compilerOptions.configure {
+                // util para ver donde se va el tiempo del backend
+                freeCompilerArgs.add("-Xverbose-phases=Codegen")
+            }
+        }
+    }
+}
+```
+
+<Callout type="info" title="La compilación cruzada tiene fronteras políticas, no técnicas">
+Puedes compilar para Linux desde macOS, pero no puedes compilar para iOS o macOS desde Linux ni desde Windows: el enlazado contra los SDK de Apple exige las herramientas de Apple, que solo se distribuyen para macOS. Es una restricción de licencia disfrazada de restricción de toolchain, y condiciona la topología de cualquier granja de integración continua que publique para plataformas Apple.
+</Callout>
+
+## Lo que sale por el otro extremo
+
+El compilador sabe emitir cuatro clases de artefacto y la elección depende enteramente de quién va a consumirlo. Un ejecutable es un binario autónomo con punto de entrada. Un *framework* es el empaquetado que entienden Xcode y el enlazador de Apple, con cabeceras Objective-C generadas y, opcionalmente, la interfaz de Swift. Una biblioteca dinámica expone símbolos con una cabecera C para que la cargue cualquier proceso. Una estática se incorpora al binario del consumidor y desaparece como entidad separada.
+
+```kotlin
+kotlin {
+    iosArm64 {
+        binaries {
+            framework {
+                baseName = "Motor"
+                isStatic = true          // se funde con la app, sin dylib que firmar
+            }
+        }
+    }
+    linuxX64 {
+        binaries {
+            executable { entryPoint = "com.ejemplo.main" }
+            sharedLib { baseName = "motor" }
+        }
+    }
+}
+```
+
+Los dos últimos casos generan además una cabecera de C que describe la superficie exportada, y leerla es la forma más rápida de entender qué modelo de objetos atraviesa realmente la frontera. No hay clases: hay identificadores opacos, una tabla de símbolos y funciones libres con el nombre cualificado aplanado.
+
+```c
+/* Extracto tipico de la cabecera generada para una biblioteca dinamica */
+typedef struct { void* pinned; } motor_KNativePtr;
+
+typedef struct {
+  motor_KNativePtr pinned;
+} motor_kref_com_ejemplo_Motor;
+
+typedef struct {
+  struct {
+    struct {
+      motor_kref_com_ejemplo_Motor (*Motor)(const char* clave);
+      const char* (*procesar)(motor_kref_com_ejemplo_Motor thiz, const char* dato);
+    } Motor;
+  } com;
+  void (*DisposeStablePointer)(motor_KNativePtr ptr);
+} motor_ExportedSymbols;
+
+extern motor_ExportedSymbols* motor_symbols(void);
+```
+
+Obsérvese la función de liberación explícita al final: desde C, cada referencia obtenida es un ancla que impide al recolector liberar el objeto, y devolverla es responsabilidad del consumidor. Es el mismo principio que aparecerá en la lección de interoperabilidad, visto desde el otro lado de la frontera.
+
+Cada configuración se declina además en dos modos de construcción. El de depuración conserva información simbólica, desactiva la mayoría de las optimizaciones de LLVM y admite cachés; el de publicación activa la optimización completa y, en muchos proyectos, multiplica por cinco o por diez el tiempo de compilación respecto al primero. Confundir los dos al medir es el error más común: comparar un binario de depuración de Native contra una JVM con el JIT caliente no mide nada.
+
+## El tiempo de compilación como impuesto estructural
+
+La lentitud no es un defecto de implementación pendiente de arreglar, es la contrapartida de haber trasladado a la compilación un trabajo que la JVM hace en ejecución. El compilador nativo opera sobre el programa completo: para insertar una función de la biblioteca estándar necesita su IR, para decidir si una llamada virtual puede volverse directa necesita conocer todas las subclases existentes, y para eliminar código muerto necesita saber qué es alcanzable desde el punto de entrada. Ninguna de esas preguntas se puede responder mirando un solo fichero, y por eso el modelo incremental fino que damos por supuesto en la JVM no traslada bien.
+
+Las mitigaciones existen y son acumulativas. La caché de compilación guarda el resultado del backend para las dependencias que no han cambiado, de modo que el ciclo de desarrollo solo recompila el módulo tocado; funciona en configuraciones de depuración y es lo que convierte un ciclo de minutos en uno de decenas de segundos. La compilación incremental de `klib` evita regenerar el IR de módulos intactos. Y el demonio de Gradle con memoria suficiente evita pagar el arranque del compilador en cada invocación, que en Native no es despreciable.
+
+La topología del proyecto también importa, y más de lo que se suele suponer. Como el backend trabaja sobre el grafo alcanzable, tocar un módulo del que dependen todos los demás invalida prácticamente todo el trabajo cacheado, mientras que tocar un módulo hoja apenas cuesta nada. Un proyecto con un módulo *core* enorme del que cuelga el resto tiene, por construcción, el peor perfil de recompilación posible, y esa es una de las pocas situaciones donde dividir en módulos produce una mejora medible e inmediata en lugar de una discusión estética.
+
+Merece la pena señalar qué no ayuda, porque es donde se pierde el tiempo. Comprar una máquina con más núcleos ayuda menos de lo esperado, porque buena parte del backend y del enlazado son secuenciales. Reducir el número de targets construidos durante el desarrollo ayuda muchísimo: si trabajas sobre un simulador, no hay ninguna razón para compilar también para dispositivo en cada iteración. Y ejecutar las pruebas de la lógica común en la JVM durante el ciclo rápido, dejando la verificación en Native para la integración continua, es la decisión que más ciclo de desarrollo devuelve de todas.
+
+<Callout type="warn" title="La medida honesta es el ciclo, no la compilación limpia">
+Comparar una compilación desde cero de Native contra una de JVM es comparar dos cosas distintas: en la JVM la compilación limpia también es rápida porque no optimiza nada. La comparación que importa para el desarrollo diario es el ciclo editar, compilar, ejecutar con cachés calientes; y la que importa para publicar es la construcción de publicación completa, que en Native se mide en minutos y hay que presupuestar en la integración continua.
+</Callout>
+
+## Anticipado frente a especulativo
+
+La diferencia esencial no es el formato del artefacto sino el momento en que se decide. La JVM carga clases perezosamente, interpreta al principio, mide qué se ejecuta mucho, compila esos fragmentos con información de perfil real y aplica optimizaciones especulativas que solo son correctas mientras el perfil se sostenga; si deja de sostenerse, desoptimiza y vuelve al intérprete. Ese ciclo produce un rendimiento sostenido excelente a cambio de un calentamiento medible y de una huella de memoria considerable.
+
+Kotlin/Native no tiene ninguna de esas piezas. No hay intérprete, no hay JIT, no hay desoptimización y no hay carga de clases. El binario arranca ya en su forma definitiva: el primer microsegundo de ejecución es tan rápido como el último. A cambio, todas las decisiones se toman sin datos de ejecución: el compilador puede probar que una llamada es monomórfica, pero no puede apostar a que lo será porque no tendría cómo retractarse.
+
+Esa diferencia se propaga a sitios que no parecen relacionados. Como no hay carga dinámica, no puede haber `Class.forName` ni proxies fabricados en ejecución, y de ahí sale la ausencia de reflexión completa que se estudia en la última lección. Como todo el código posible está en el binario, la eliminación de lo inalcanzable pasa de ser una optimización agradable a ser un requisito de viabilidad, y de ahí sale la sensibilidad del tamaño al número de dependencias. Y como el runtime va enlazado dentro, el gestor de memoria es una decisión de compilación y no de despliegue: no existe el equivalente a elegir el recolector con un argumento al arrancar el proceso.
+
+<Callout type="tip" title="El binario es autocontenido, y eso también es una propiedad operativa">
+Sin máquina virtual instalada no hay versión de runtime que negociar con el equipo de sistemas, ni incompatibilidad entre la versión con la que se compiló y la que hay en el servidor, ni argumentos de arranque que ajustar por entorno. El artefacto es una unidad y se comporta igual en todas partes. Es una ventaja real y rara vez aparece en las comparativas, que suelen quedarse en milisegundos y megabytes.
+</Callout>
+
+<Cards>
+  <Card icon="⚙️" title="Arranque">
+    Native gana sin discusión: no hay carga de clases ni calentamiento. Es la razón por la que domina en herramientas de línea de comandos y funciones efímeras.
+  </Card>
+  <Card icon="📈" title="Rendimiento sostenido">
+    La JVM suele ganar en procesos largos con bucles calientes, porque optimiza con perfil real y puede especular donde el compilador anticipado no puede.
+  </Card>
+  <Card icon="🧠" title="Memoria">
+    Native parte de una huella mucho menor: no hay metadatos de clases ni código compilado en tiempo de ejecución compitiendo por la memoria del proceso.
+  </Card>
+  <Card icon="⏱️" title="Compilación">
+    Invertida respecto a todo lo anterior. Lo que la JVM difiere a la ejecución, Native lo paga en cada construcción, y ese coste no baja con el tiempo.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="No estás eligiendo un formato de salida, estás eligiendo en qué momento del ciclo de vida del software se toman las decisiones de optimización y quién paga por ellas">
+La forma más pobre de entender Kotlin/Native es como una alternativa de empaquetado, un modo de obtener un binario en lugar de un jar, porque esa lectura convierte una decisión arquitectónica en una preferencia de despliegue y produce equipos que adoptan Native por el arranque y luego se sorprenden con el tiempo de construcción, la ausencia de reflexión y los perfiles de rendimiento invertidos, como si fueran defectos y no consecuencias del mismo teorema. Lo que de verdad estás eligiendo es dónde vive el optimizador. En la JVM vive dentro del proceso del usuario, ejecutándose mientras el programa trabaja, alimentado por datos reales de ese despliegue concreto, capaz de descubrir que una interfaz con doce implementaciones en el código tiene una sola en producción y de compilar bajo esa suposición porque siempre puede deshacerla; el precio de esa inteligencia es que el usuario paga el calentamiento, la memoria del compilador y la impredecibilidad de las pausas, y a cambio recibe un rendimiento sostenido que ningún compilador anticipado alcanza en cargas de larga duración. En Native el optimizador vive en tu máquina de construcción, se ejecuta una vez, ve el programa entero pero no ve ni un solo dato de ejecución, y todo lo que decida queda congelado en el binario: la ganancia es que el usuario no paga absolutamente nada por optimizar, ni tiempo ni memoria ni varianza, y por eso el arranque es instantáneo y la huella minúscula. Reformulado así, el criterio de elección deja de ser una cuestión de gusto y se vuelve una pregunta sobre la forma de la carga de trabajo: si tu proceso vive milisegundos, invertir en un optimizador que necesita segundos para calentarse es absurdo y Native gana por construcción; si vive semanas ejecutando el mismo bucle sobre datos con una distribución estable, renunciar a la información de perfil es tirar rendimiento a la basura y la JVM gana por el mismo argumento. Todo lo demás de este nivel —la reflexión que no existe, el binario que abulta, el compilador que tarda— son corolarios de esa única elección, y quien la tiene clara no vuelve a sorprenderse con ninguno de ellos.
+</Callout>
+
+<Challenge title="Instrumentar la tubería completa">
+1. Compila el mismo módulo para JVM y para `linuxX64` o `macosArm64` y cronometra ambas construcciones limpias. Repite con el demonio caliente y anota la diferencia entre las dos mediciones.
+2. Inspecciona un `klib` de tu proyecto y comprueba, abriéndolo, que no contiene código máquina. Identifica qué sí contiene.
+3. Construye el mismo ejecutable en modo depuración y en modo publicación. Compara tiempo de construcción, tamaño del binario y tiempo de una ejecución corta.
+4. Activa las cachés de compilación, invalida un solo módulo hoja y mide cuánto se recompila. Repite tocando un módulo del que dependen todos los demás.
+5. Escribe un programa que solo imprima una línea y compáralo contra su equivalente en JVM midiendo el tiempo total del proceso, no el tiempo interno. Explica el resultado con lo aprendido en la última sección.
+</Challenge>

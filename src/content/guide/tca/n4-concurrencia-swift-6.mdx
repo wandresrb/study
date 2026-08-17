@@ -1,0 +1,149 @@
+---
+title: "Concurrencia de Swift 6: efectos, Sendable y MainActor"
+description: "Swift 6 comprueba en tiempo de compilación que no existan carreras de datos, y esa exigencia, que obliga a muchas bases de código a reescribirse, encuentra a TCA casi sin deuda. Esta lección examina Effect.run como el único punto donde entra async/await, explica qué exige Sendable y por qué el estado de valor lo satisface casi gratis, sitúa el aislamiento del Store en MainActor y su relación con la vista, detalla la cancelación cooperativa y el ciclo de vida de las tareas, y defiende que un reducer puro más efectos que solo se comunican mediante acciones es, literalmente, el modelo de actores aplicado a la arquitectura de una app."
+subject: tca
+level: 4
+order: 5
+position: "4.5"
+duration: "20 min"
+---
+
+<Lead>
+La migración a Swift 6 fue un acontecimiento incómodo para casi todo el ecosistema: el modo estricto convierte las carreras de datos en errores de compilación, y bases de código enteras descubrieron que llevaban años compartiendo estado mutable entre hilos sin saberlo. Para una app escrita en TCA, esa misma migración resulta sorprendentemente aburrida, y el motivo merece atención porque no es suerte. TCA ya exigía por diseño lo que Swift 6 comprueba por decreto: estado de valor que se copia en vez de compartirse, una función de transición síncrona y pura, y toda la asincronía confinada en efectos que no pueden tocar el estado y solo se comunican devolviendo acciones. Esta lección recorre las piezas del modelo de concurrencia moderno tal como aparecen en una feature real, y termina argumentando que el parecido con el modelo de actores no es una analogía cómoda: es la misma idea, escrita dos veces.
+</Lead>
+
+<Goals>
+
+- Escribir efectos con `Effect.run` y entender por qué el estado no puede cruzar hacia dentro de su closure.
+- Precisar qué exige `Sendable` y por qué el estado de valor y las acciones lo satisfacen casi sin esfuerzo.
+- Situar el aislamiento en `@MainActor` del `Store` y su relación con la vista y con los efectos.
+- Manejar la cancelación cooperativa y el ciclo de vida de las tareas asociadas a una feature.
+
+</Goals>
+
+## `Effect.run`: la única puerta hacia lo asíncrono
+
+El cuerpo del reducer es síncrono a propósito, así que no hay forma de escribir un `await` dentro del `switch`. La asincronía entra por un único sitio: el valor que devuelves. `Effect.run` recibe una closure asíncrona y un `send` con el que reinyectar acciones al sistema cuando el trabajo produce resultados.
+
+```swift
+case .aparecio:
+  state.cargando = true
+  return .run { [id = state.id] send in
+    let items = try await self.api.cargar(id)
+    await send(.datosRecibidos(items))
+  } catch: { error, send in
+    await send(.falloCarga(error.localizedDescription))
+  }
+  .cancellable(id: CancelID.carga, cancelInFlight: true)
+```
+
+Repara en la lista de captura `[id = state.id]`, que no es un tic de estilo sino una obligación. La closure de `.run` es escapada y `@Sendable`; el parámetro `state` es `inout`, un préstamo exclusivo que no puede sobrevivir a la llamada, de modo que capturarlo sería a la vez un error de compilación y una carrera de datos en potencia. Solo puedes llevarte copias de lo que necesites, y solo puedes devolver información al sistema como acciones. Esa doble restricción es la frontera entre la lógica y el mundo, y aquí el compilador la dibuja con un error en vez de con una recomendación.
+
+El `send` merece otra mirada. No es un callback que devuelva un valor al llamante: es un envío de mensaje al store, que volverá a entrar por el reducer como cualquier otra acción y se procesará en su turno. Un efecto no *modifica* nada; propone un suceso nuevo. Toda la comunicación de vuelta cabe en ese verbo.
+
+Como el efecto es un valor, combinar trabajo concurrente no exige orquestar tareas a mano: se componen los valores.
+
+```swift
+case .refrescarPulsado:
+  return .merge(
+    .run { send in await send(.perfilRecibido(try await self.api.perfil())) },
+    .run { send in await send(.avisosRecibidos(try await self.api.avisos())) }
+  )
+```
+
+`.merge` corre los efectos en paralelo y entrega las acciones según vayan llegando; `.concatenate` los encadena y espera a que cada uno termine antes de empezar el siguiente; `.none` declara que no hay trabajo; y `.send` reinyecta una acción de inmediato, sin salir a lo asíncrono. Cuatro combinadores que cubren la coreografía habitual sin que aparezca un solo `DispatchQueue` ni un `Task` suelto cuyo ciclo de vida haya que vigilar.
+
+## `Sendable`: la frontera que el compilador vigila
+
+`Sendable` es el protocolo con el que Swift marca los tipos cuyos valores se pueden cruzar con seguridad entre dominios de aislamiento. Un `struct` cuyos campos son todos `Sendable` lo conforma de forma implícita; un `enum` con valores asociados `Sendable`, también. Un tipo con una clase mutable dentro, no, y ahí es donde Swift 6 empieza a protestar.
+
+El diseño de TCA hace que esa comprobación resulte casi vacía: el `State` es una `struct` de valores, la `Action` es un `enum` de valores, y ambos cruzan la frontera hacia el efecto y de vuelta sin más ceremonia que existir. Los tipos que sí requieren cuidado son los que viven al otro lado: las dependencias, que a menudo envuelven objetos con estado, clientes de red o cachés.
+
+```swift
+struct ClienteAPI: Sendable {
+  var cargar: @Sendable (Item.ID) async throws -> [Item]
+  var guardar: @Sendable (Item) async throws -> Void
+}
+```
+
+Swift 6 afinó además la regla para que no resulte asfixiante: el aislamiento por regiones permite que un valor *no* `Sendable` cruce una frontera si el compilador demuestra que quien lo envía no conserva ninguna referencia a él, y el modificador `sending` sirve para declarar esa transferencia en una firma. Es la formalización de una intuición vieja —entregar algo y desentenderse es seguro; compartirlo, no— y explica por qué muchos avisos de la primera migración desaparecen sin tocar el diseño.
+
+Modelar la dependencia como una `struct` de closures `@Sendable` en vez de como un protocolo con una implementación de clase resuelve el problema de raíz: lo que cruza es un valor con funciones dentro, y cada implementación se responsabiliza de su propio aislamiento interno. Y cuando algo, por su naturaleza, mantiene estado mutable compartido —una caché en memoria, un contador de reintentos—, el lugar correcto es un `actor`, cuyo aislamiento serializa los accesos y que es `Sendable` por definición.
+
+<Callout type="warn" title="Los tres puntos donde suele aparecer la queja del compilador">
+En una migración a modo estricto, los avisos casi nunca vienen del reducer. Aparecen, por este orden: en dependencias que envuelven una clase heredada sin garantías de aislamiento; en tipos de terceros que aún no declaran `Sendable`; y en cierres que capturan `self` de un objeto no aislado. La reacción de urgencia es marcar todo con `@unchecked Sendable`, y es exactamente la que hay que evitar: esa anotación no arregla nada, promete al compilador que la seguridad la garantizas tú a mano. Úsala solo con un candado real detrás y un comentario que explique el invariante.
+</Callout>
+
+## `@MainActor`: el store vive donde vive la interfaz
+
+Un actor es un tipo que serializa el acceso a su estado mutable: solo una tarea lo toca a la vez, y llegar desde fuera exige `await`. El actor principal, `@MainActor`, es el que gobierna la interfaz de usuario. En TCA moderno el `Store` está aislado a él, y de ahí se derivan tres consecuencias prácticas.
+
+La primera es que enviar una acción desde la vista y leer el estado desde el cuerpo de una `View` no requieren salto alguno: ambos ocurren ya en el actor principal, así que la observación es directa y sin retardos de un ciclo. La segunda es que el reducer corre también en el actor principal, lo cual es correcto y barato precisamente porque su trabajo es puro y breve: mutar una `struct` y devolver un valor. La tercera es que el trabajo pesado no sucede ahí: la closure de `.run` se ejecuta en el pool concurrente, y cuando llama a `send`, la acción vuelve al actor principal para procesarse en orden.
+
+```swift
+struct VistaBusqueda: View {
+  @Bindable var store: StoreOf<Busqueda>
+
+  var body: some View {
+    List(store.items) { item in
+      Text(item.titulo)
+    }
+    .task { await store.send(.aparecio).finish() }
+  }
+}
+```
+
+El patrón del `.task` es el que ata el ciclo de vida de los efectos al de la vista: la tarea que SwiftUI crea se cancela cuando la vista desaparece, y `finish()` la mantiene viva mientras el efecto siga trabajando. Nada de esto exige razonar sobre colas: el aislamiento está declarado en los tipos y el compilador comprueba cada cruce.
+
+Queda una objeción legítima: si el reducer corre en el actor principal, ¿no acabará la interfaz bloqueada? Solo si le das trabajo que no le corresponde. Mutar unos campos de una `struct` cuesta microsegundos y no bloquea nada; lo que sí bloquearía es decodificar un JSON grande, filtrar diez mil elementos o comprimir una imagen dentro del `switch`. Ese trabajo no es una transición de estado, es cómputo, y su sitio es la closure de un `.run`, que corre fuera del actor principal y devuelve el resultado ya masticado como acción. La regla que se deriva vale como criterio de diseño: en el reducer, decisiones; en el efecto, trabajo.
+
+## Cancelación cooperativa y ciclo de vida
+
+En Swift la cancelación es cooperativa: cancelar una tarea no la interrumpe, activa una bandera que el código debe consultar. Los puntos de suspensión de la biblioteca estándar la comprueban por ti —`Task.sleep` lanza al cancelarse, `URLSession` aborta—, pero un bucle propio tiene que preguntar con `Task.checkCancellation` o `Task.isCancelled`.
+
+TCA envuelve todo esto en operadores sobre el efecto. `.cancellable(id:cancelInFlight:)` da nombre a un efecto y, con el segundo parámetro en verdadero, cancela automáticamente la ejecución anterior con ese mismo nombre, que es la forma canónica de evitar que una respuesta vieja de búsqueda pise a una nueva. `.cancel(id:)` cancela desde otra rama del `switch`.
+
+```swift
+private enum CancelID { case temporizador }
+
+case .iniciarPulsado:
+  return .run { send in
+    for await _ in self.clock.timer(interval: .seconds(1)) {
+      await send(.tick)
+    }
+  }
+  .cancellable(id: CancelID.temporizador)
+
+case .pararPulsado:
+  return .cancel(id: CancelID.temporizador)
+```
+
+El identificador es un valor cualquiera que sea `Hashable`, y usar un `enum` privado por feature evita que dos módulos distintos elijan sin querer el mismo nombre y se cancelen entre ellos. Repara además en que el bucle no comprueba la cancelación de forma explícita: el `for await` se suspende en cada iteración y ese punto de suspensión ya la detecta. En un bucle de cómputo sin suspensiones, en cambio, la tarea seguiría trabajando después de cancelada, y ahí sí hay que preguntar a mano con `Task.checkCancellation`.
+
+Los operadores de composición se encargan del resto sin que lo pidas: cuando un estado opcional gobernado por `ifLet` pasa a nulo, o una fila desaparece de una colección gobernada por `forEach`, los efectos en vuelo de ese hijo se cancelan solos. Es el mismo desmontaje que en un sistema imperativo tendrías que recordar escribir en cada punto de salida, y que aquí se deduce de un hecho declarado en el estado: si el hijo ya no existe, su trabajo tampoco.
+
+<Mermaid code={`sequenceDiagram
+  participant V as Vista en MainActor
+  participant S as Store en MainActor
+  participant R as Reducer puro
+  participant E as Efecto en tarea concurrente
+  V->>S: send accion
+  S->>R: reduce con estado inout
+  R-->>S: nuevo estado y Effect
+  S->>E: ejecuta la tarea del efecto
+  E->>E: await trabajo asincrono
+  E-->>S: send accion de resultado
+  S->>R: reduce de nuevo
+  R-->>V: estado observado y redibujado`} />
+
+<Callout type="dios" title="Un reducer puro con efectos que solo envían acciones es el modelo de actores, escrito otra vez">
+Vale la pena decir en voz alta lo que la lección ha ido rodeando. El modelo de actores, tal como lo formuló Hewitt en los años setenta y como lo implementan Erlang o el propio Swift, se sostiene sobre tres reglas: una entidad posee su estado y nadie más lo toca; procesa un mensaje cada vez, en orden; y lo único que puede hacerle a otra entidad es enviarle un mensaje. Vuelve ahora al ciclo de TCA con esas tres reglas en la mano. El `Store` posee el estado y ningún efecto puede tocarlo, porque `inout` no escapa. Procesa una acción cada vez, en el actor principal, de modo que dos acciones nunca se solapan a mitad de una mutación. Y la única forma de que un efecto influya en el sistema es enviar una acción. No es que TCA *se parezca* al modelo de actores ni que *encaje bien* con él: es una implementación del modelo de actores donde el buzón es la cola de acciones, el mensaje es la `Action` y el comportamiento del actor es el reducer. De ahí que la llegada de Swift 6 se sintiera, en una base de código en TCA, como una formalidad. La comprobación estricta de carreras busca exactamente lo que esta arquitectura ya prohibía por construcción: memoria mutable alcanzable desde dos dominios a la vez. Un `State` de valor no es alcanzable desde ningún sitio salvo el reducer; una `Action` de valor viaja copiada; un efecto no tiene puntero a nada del estado. Los avisos, cuando aparecen, se concentran sin excepción en la frontera con el mundo exterior —dependencias que envuelven objetos heredados, librerías de terceros aún sin anotar—, que es precisamente el lugar donde la seguridad de la concurrencia *debe* discutirse, porque es donde de verdad hay estado compartido. Ahí está la lección que trasciende a TCA y que conviene llevarse aunque mañana escribas en otra arquitectura: la concurrencia segura no se consigue añadiendo candados a un diseño que comparte memoria, sino eligiendo un diseño donde apenas haya memoria que compartir. La disciplina que pagaste niveles atrás —el estado como valor, la lógica como función pura, el efecto como dato devuelto— te la devuelve el compilador convertida en silencio.
+</Callout>
+
+<Challenge title="Somete tus efectos al modo estricto">
+1. Activa la comprobación estricta de concurrencia en un módulo de tu proyecto y anota dónde aparecen los avisos. Comprueba la hipótesis de la lección: cuenta cuántos caen en reducers y cuántos en dependencias.
+2. Escribe un efecto de búsqueda con `.run` que capture la consulta por valor y devuelva su resultado con `send`. Intenta a propósito capturar `state` entero y guarda el error del compilador junto a tu explicación de por qué `inout` no puede escapar.
+3. Añade `.cancellable(id:cancelInFlight: true)` y comprueba, escribiendo dos búsquedas seguidas, que la respuesta antigua ya no pisa a la nueva. Después quítalo y reproduce el bug a propósito.
+4. Convierte una dependencia basada en un protocolo con implementación de clase en una `struct` de closures `@Sendable`. Anota qué avisos desaparecen y por qué.
+5. Ata un efecto de larga duración al ciclo de vida de la vista con `.task` y `finish()`. Navega fuera de la pantalla y confirma con un registro que la tarea se canceló; luego escribe un test que falle si el efecto queda en vuelo al terminar.
+</Challenge>

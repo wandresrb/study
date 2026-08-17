@@ -1,0 +1,117 @@
+---
+title: "Organizar los bind groups por frecuencia de cambio"
+description: "El principio que decide si un renderer escala: agrupar los recursos por cada cuánto cambian, no por qué son, y la aritmética de llamadas que lo justifica."
+subject: webgpu
+level: 18
+order: 1
+position: "18.1"
+duration: "19 min"
+---
+
+<Lead>
+Con cuatro ranuras de bind group y un renderer de miles de objetos, la pregunta no es qué recursos existen sino **cada cuánto cambia cada uno**. Esa es la única variable que importa, porque el coste de un bucle de dibujado no lo fija el número de recursos sino el número de veces que hay que volver a atarlos. Agrupar por frecuencia de cambio es la decisión de arquitectura más importante que vas a tomar en un renderer de WebGPU, y se toma antes de escribir el primer shader.
+</Lead>
+
+<Goals>
+
+- Clasificar cualquier recurso de una escena por su frecuencia real de cambio.
+- Calcular el número de llamadas a `setBindGroup` de un bucle según cómo estén repartidos los grupos.
+- Explicar por qué un agrupamiento por tipo de recurso es siempre peor que uno por frecuencia.
+- Detectar el error de meter un dato de alta frecuencia en un grupo de baja frecuencia.
+
+</Goals>
+
+## La aritmética que lo decide todo
+
+Imagina una escena de 2000 objetos repartidos en 50 materiales, dibujada en 3 passes. Cada objeto necesita su matriz de modelo; cada material su textura y sus parámetros; cada pass su cámara y sus luces.
+
+Si repartes esos recursos por **frecuencia** —un grupo para lo que cambia por frame, otro para lo que cambia por material, otro para lo que cambia por objeto— y ordenas el bucle por material, las llamadas por pass son: 1 para el grupo de frame, 50 para los de material, 2000 para los de objeto. Total 2051.
+
+Si los repartes por **tipo** —un grupo con todos los buffers, otro con todas las texturas, otro con todos los samplers— cada uno de los tres grupos contiene al menos un dato que cambia por objeto, así que los tres hay que reatarlos en cada objeto: 6000 llamadas. Casi el triple, y con la agravante de que cada bind group contiene más entradas, así que cada atada es más cara.
+
+Peor todavía: en el reparto por tipo hay que crear un bind group **por objeto** para cada uno de los tres grupos, porque cada uno mezcla la textura del material con la matriz del objeto. Son 6000 bind groups en vez de 2051, y como un bind group se valida al crearse, ese coste se paga en el arranque o, si eres descuidado, en cada frame.
+
+La conclusión es incómoda pero clara: **la organización por tipo de recurso, que es la que sale sola cuando piensas en términos de la API, es la peor posible**. La organización correcta ignora por completo qué clase de objeto es cada recurso y solo mira su ritmo.
+
+<Mermaid code={`flowchart TB
+  subgraph G0[Grupo 0 una vez por frame]
+    A[Camara vista y proyeccion]
+    B[Luces de la escena]
+    C[Mapa de sombras y su sampler]
+  end
+  subgraph G1[Grupo 1 una vez por material]
+    D[Parametros del material]
+    E[Texturas albedo normal rugosidad]
+    F[Sampler del material]
+  end
+  subgraph G2[Grupo 2 una vez por objeto]
+    H[Matriz de modelo]
+    I[Matriz normal]
+  end
+  G0 --> G1
+  G1 --> G2
+  G2 --> DRAW[draw]
+  class G0 t-green
+  class G1 t-yellow
+  class G2 t-peach
+  class A t-teal
+  class B t-teal
+  class C t-teal
+  class D t-teal
+  class E t-teal
+  class F t-teal
+  class H t-teal
+  class I t-teal
+  class DRAW t-blue`} />
+
+El diagrama se lee como el bucle anidado que representa. El grupo 0 se ata fuera de todo; el grupo 1 en el bucle de materiales; el grupo 2 en el bucle de objetos. Cuanto más arriba vive un recurso, menos veces se toca.
+
+## Cómo se clasifica un recurso
+
+Para cada dato de tu escena, la pregunta es una sola: *entre dos draw calls consecutivos ordenados como quiero ordenarlos, ¿este dato cambia?* Las respuestas caen casi siempre en cuatro cubos.
+
+**Constante durante toda la aplicación.** Tablas de ruido, LUTs de tonemapping, la textura de un skybox que no se recarga, un sampler estándar. Estos ni siquiera necesitan su propio grupo: pueden vivir en el grupo de frame sin coste, porque el grupo de frame se ata una vez.
+
+**Por frame o por pass.** Matrices de cámara, tiempo, tamaño de la ventana, parámetros de iluminación global, el mapa de sombras ya renderizado. Cambian una vez por pass y afectan a todo lo que se dibuja en él.
+
+**Por material.** Texturas, factores de color, rugosidad base, el índice de refracción. Cambian cuando cambias de material, que si ordenas bien es unas decenas de veces por frame.
+
+**Por objeto o por draw.** La matriz de modelo, el índice de instancia base, un tinte por instancia. Cambian en cada draw call.
+
+La clasificación no es sobre la naturaleza del dato sino sobre **cómo lo vas a recorrer**. Si tu renderer ordena por profundidad y no por material, la textura de albedo pasa a ser un dato de alta frecuencia y el reparto cambia. Por eso la decisión de organización y la de ordenación del bucle son la misma decisión tomada dos veces.
+
+<Callout type="info" title="Los índices tienen dirección">
+La convención universal, heredada de Vulkan y D3D12, es que **el índice más bajo es el de menor frecuencia**. `@group(0)` para lo que cambia una vez, `@group(3)` para lo que cambia en cada draw. No es obligatorio, pero seguirla te alinea con toda la literatura y, más importante, con la regla de compatibilidad de layouts, que preserva los grupos atados en los índices bajos cuando cambias de pipeline.
+</Callout>
+
+## El error que arruina el reparto
+
+El fallo más caro es meter un dato de alta frecuencia en un grupo de baja frecuencia. Basta uno. Si el grupo 1, el de material, contiene además el índice del objeto, entonces el grupo 1 pasa a cambiar por objeto y toda la ventaja se evapora: hay que crear un bind group por objeto y atarlo 2000 veces.
+
+Este error es fácil de cometer porque el dato intruso suele ser pequeño y parecer inofensivo. Un `f32` con el tiempo transcurrido desde que apareció el objeto, un `u32` con su identificador para el picking. Cuatro bytes que convierten 50 bind groups en 2000.
+
+La detección es mecánica: para cada grupo, escribe en un comentario su frecuencia declarada y comprueba que **todos** sus miembros la respetan.
+
+```wgsl
+// @group(1) frecuencia: por material.
+struct Material {
+  colorBase : vec4<f32>,   // por material  -> ok
+  rugosidad : f32,         // por material  -> ok
+  metalico  : f32,         // por material  -> ok
+  idObjeto  : u32,         // POR OBJETO    -> intruso, sácalo al grupo 2
+};
+```
+
+Cuando encuentras un intruso hay dos salidas. La obvia es moverlo al grupo de su frecuencia. La otra, a menudo mejor, es sacarlo del sistema de bind groups: un dato de cuatro bytes que cambia por draw cabe en un vertex buffer con `stepMode: 'instance'`, o se resuelve con `@builtin(instance_index)` indexando un storage buffer. Ninguna de esas dos vías consume ranura de grupo ni exige una llamada por objeto.
+
+<Callout type="dios" title="La frecuencia se mide, no se supone">
+Todo el mundo asume que el orden de frecuencias es cámara, material, objeto, y en un renderer clásico lo es. Pero en cuanto añades transparencia con ordenación por profundidad, sombras con varias cascadas o un pass de partículas, esa jerarquía deja de describir tu bucle real. He visto renderers donde el recurso que más veces se ataba por frame era el buffer de luces, porque el clustered lighting lo reataba por tile. La forma de saberlo no es razonar: es instrumentar el bucle con un contador por índice de grupo y mirar los números al final del frame. Cinco líneas de código que reordenan la arquitectura entera. En la [lección sobre el coste de `setBindGroup`](/guia/webgpu/n18-el-coste-de-setbindgroup/) tienes el contador escrito.
+</Callout>
+
+## Cuando cuatro grupos no bastan
+
+A veces la clasificación honesta produce cinco o seis frecuencias distintas. Con `maxBindGroups` en 4, hay que fusionar, y la regla para hacerlo bien es: **fusiona siempre hacia arriba, nunca hacia abajo**. Meter un recurso de frecuencia media en el grupo de baja frecuencia lo convierte en alta frecuencia para todo el grupo; meterlo en el de alta frecuencia solo lo hace cambiar más veces de las necesarias, que es un coste acotado.
+
+En la práctica, las fusiones que salen bien son estas. Constantes de aplicación dentro del grupo de frame, porque el grupo de frame se ata una vez de todos modos. Datos de pass dentro del grupo de frame si solo hay un pass por frame que los use. Y, si te falta una ranura, los datos por objeto se sacan del sistema de grupos por completo con un storage buffer indexado por `@builtin(instance_index)`, que es el camino hacia el renderizado dirigido por GPU.
+
+El [reparto concreto en cuatro grupos](/guia/webgpu/n18-cuatro-grupos-que-escalan/) está en la lección siguiente, con el código de los cuatro layouts y el bucle que los recorre.

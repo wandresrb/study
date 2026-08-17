@@ -1,0 +1,152 @@
+---
+title: "Arena allocators"
+description: "Reservar un bloque grande y repartirlo con un incremento de puntero: la técnica que convierte liberar en una operación de coste constante, elimina la fuga individual por construcción y explica por qué compiladores y motores de juego la usan como asignador primario."
+subject: c23
+level: 14
+order: 2
+position: "14.2"
+duration: "18 min"
+---
+
+<Lead>
+Una arena invierte la pregunta. En lugar de decidir cuándo muere cada objeto, decides cuándo muere el grupo entero, y a cambio asignar cuesta una suma y liberar cuesta una asignación a cero. El resultado no es solo velocidad: es un modelo de propiedad tan pequeño que familias enteras de errores dejan de ser posibles, no porque las evites, sino porque la operación que las causaba ha desaparecido del programa.
+</Lead>
+
+<Goals>
+
+- Construir una arena correcta: alineación, crecimiento por cadena de bloques y reserva virtual.
+- Usar marcas de posición para obtener regiones temporales anidadas con coste cero.
+- Explicar por qué compiladores y motores de juego la adoptan como asignador primario.
+- Reconocer qué te quita una arena y qué errores nuevos introduce a cambio.
+
+</Goals>
+
+## La anatomía de un asignador de avance
+
+Una arena mantiene tres datos: la base del bloque, cuánto se ha usado y cuánto cabe. Asignar es alinear el cursor, comprobar que queda sitio y devolver la posición anterior. No hay búsqueda, no hay metadatos por objeto, no hay cabecera de ocho o dieciséis bytes precediendo a cada bloque como en un `malloc` clásico.
+
+```c
+typedef struct {
+    unsigned char *base;
+    size_t         usado;
+    size_t         capacidad;
+} Arena;
+
+static inline size_t alinear_arriba(size_t n, size_t a) {
+    return (n + a - 1) & ~(a - 1);          // a debe ser potencia de dos
+}
+
+void *arena_alloc(Arena *ar, size_t bytes, size_t alineacion) {
+    size_t inicio = alinear_arriba(ar->usado, alineacion);
+    if (inicio > ar->capacidad || bytes > ar->capacidad - inicio) return nullptr;
+    ar->usado = inicio + bytes;
+    return ar->base + inicio;
+}
+
+#define ARENA_NEW(ar, T, n) \
+    ((T *)arena_alloc((ar), sizeof(T) * (n), alignof(T)))
+```
+
+Dos detalles separan esta versión de la ingenua. El primero es la alineación explícita: si repartes bytes crudos sin redondear el cursor, tarde o temprano devolverás una dirección impar para un `double` o para un vector SIMD, y eso es comportamiento indefinido incluso en arquitecturas que lo toleran en silencio. El segundo es la forma de la comprobación de espacio. Escribir `inicio + bytes > capacidad` invita al desbordamiento aritmético cuando `bytes` procede de una entrada externa; restar antes de sumar, como arriba, no puede desbordar porque ambos operandos son magnitudes ya acotadas.
+
+La memoria devuelta no está inicializada. Una arena de propósito general suele ofrecer una variante que llama a `memset` y otra que no, porque poner a cero un megabyte que vas a sobrescribir inmediatamente es exactamente el tipo de coste invisible que las arenas existen para eliminar.
+
+## Marcas de posición y crecimiento
+
+De la disciplina de avance sale gratis un mecanismo poderoso: si el estado de la arena cabe en un `size_t`, guardarlo y restaurarlo te da regiones temporales anidadas.
+
+```c
+typedef struct { Arena *ar; size_t marca; } Temporal;
+
+Temporal temp_inicio(Arena *ar)  { return (Temporal){ ar, ar->usado }; }
+void     temp_fin(Temporal t)    { t.ar->usado = t.marca; }
+```
+
+Esto es un asignador de pila construido sobre un asignador de avance, y su coste es literalmente el de copiar y restaurar un entero. Es el patrón de la *scratch arena*: una función que necesita espacio auxiliar toma una marca al entrar, reparte todo lo que quiera y la restaura al salir, sin que el llamante sepa nada. La regla que lo sostiene es la única disciplina real que una arena impone: **ningún puntero obtenido después de la marca puede sobrevivir a su restauración**.
+
+Cuando la capacidad se agota hay dos respuestas. La primera es encadenar bloques: la arena guarda un puntero al bloque anterior y pide otro al sistema cuando el actual no da más de sí. Los punteros ya entregados siguen siendo válidos —nada se mueve, jamás—, pero la restauración de marcas se complica porque una marca pasa a ser un par de bloque y desplazamiento.
+
+```c
+typedef struct Bloque Bloque;
+struct Bloque { Bloque *anterior; size_t usado, capacidad; unsigned char datos[]; };
+```
+
+La segunda respuesta, más elegante en sistemas de 64 bits, consiste en separar reserva de compromiso. Con `mmap` puedes reservar un rango de direcciones enorme sin respaldarlo con memoria física, y dejar que el sistema asigne páginas solo cuando las tocas.
+
+```c
+// Reserva un espacio de direcciones amplio; las paginas se comprometen al usarse.
+void *base = mmap(nullptr, 1ull << 34, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+```
+
+Una arena así nunca crece ni se fragmenta: tiene dieciséis gibibytes de espacio virtual, consume solo las páginas que ha escrito y devuelve punteros permanentemente estables. El coste es un fallo de página menor la primera vez que se toca cada página, y la dependencia de que el sistema sobrecomprometa, que es lo habitual en Linux pero no una garantía universal.
+
+<Mermaid code={`flowchart LR
+  A[Reserva virtual grande] --> B[Cursor avanza]
+  B --> C[Marca guardada]
+  C --> D[Region temporal]
+  D --> E[Restaurar marca]
+  E --> B
+  B --> F[Reset total del cursor]
+  class F t-green`} />
+
+## Por qué la eligen compiladores y juegos
+
+La afinidad no es casual: ambos dominios tienen ciclos de vida con forma de fase, y la arena es la estructura de datos que representa exactamente esa forma.
+
+Un compilador construye un grafo enorme e intrincado —nodos de sintaxis, tipos, símbolos, representaciones intermedias— con muchísimas aristas cruzadas y ninguna noción clara de propiedad. Averiguar quién libera cada nodo sería un ejercicio de contabilidad inútil, porque todos mueren en el mismo instante: cuando la unidad de traducción termina. Con una arena por unidad, el compilador no escribe una sola llamada a `free` durante toda la fase de análisis, y el gráfico puede tener tantos ciclos como quiera sin que importe.
+
+Un motor de juego tiene un ciclo aún más nítido. Cada fotograma genera listas de objetos visibles, comandos de dibujo, resultados de colisión y contactos físicos, y absolutamente nada de eso sobrevive al fotograma siguiente. Dos arenas alternadas —una para el fotograma actual y otra para el anterior, intercambiadas al final de cada iteración— cubren incluso el caso de los datos que deben durar exactamente un fotograma más.
+
+<Cards>
+  <Card icon="🧠" title="Compilador">
+    Una arena por unidad de traducción. El grafo de sintaxis y tipos no necesita propiedad ni orden de destrucción.
+  </Card>
+  <Card icon="🎮" title="Fotograma">
+    Reset al final de cada iteración. Coste amortizado nulo y ausencia total de picos por liberación.
+  </Card>
+  <Card icon="🌐" title="Petición">
+    Una arena por petición en un servidor. La respuesta se envía y la memoria se recicla entera.
+  </Card>
+  <Card icon="⏱️" title="Determinismo">
+    Asignar y liberar tienen cota superior constante. Nada que buscar, nada que coalescer.
+  </Card>
+</Cards>
+
+Hay un beneficio menos citado y probablemente más importante: la **localidad**. Los objetos asignados consecutivamente quedan consecutivos en memoria, así que recorrer el grafo en el orden en que se construyó recorre la memoria linealmente y el prebúsqueda del procesador acierta. Un `malloc` de propósito general dispersa esos mismos nodos por todo el montón, y el coste no aparece en el asignador sino en cada recorrido posterior, donde es mucho más difícil de atribuir a su verdadera causa.
+
+## Lo que una arena te quita
+
+Ninguna técnica que compre tanto es gratis, y conviene enunciar el precio sin adornos.
+
+Pierdes la liberación individual. Si un objeto de vida corta se asigna en una arena de vida larga, su memoria queda retenida hasta el reset: eso no es una fuga en el sentido de la memoria inalcanzable, pero el consumo crece igual. Una arena mal dimensionada convierte un patrón de uso normal en un crecimiento monótono que solo se detiene cuando el proceso termina.
+
+Aparece un error nuevo, específico y muy desagradable: el **uso tras reset**. Un puntero a memoria de arena que sobrevive a la restauración de su marca no apunta a memoria liberada por el sistema, sino a memoria perfectamente válida que pronto contendrá otro objeto. No hay `SIGSEGV`, no hay corrupción del montón, no hay nada que un depurador convencional señale: solo dos objetos distintos compartiendo bytes.
+
+Peor aún, los detectores automáticos se quedan ciegos. Para AddressSanitizer y para Valgrind, la arena es un único bloque grande y correctísimo; un desbordamiento de un objeto a otro dentro de ella es, desde fuera, una escritura legítima. La contramedida existe y merece la pena en desarrollo: envenenar manualmente la memoria no repartida.
+
+```c
+#if defined(__SANITIZE_ADDRESS__) || \
+    (defined(__has_feature) && __has_feature(address_sanitizer))
+#  include <sanitizer/asan_interface.h>
+#  define ARENA_ENVENENAR(p, n)   ASAN_POISON_MEMORY_REGION((p), (n))
+#  define ARENA_DESENVENENAR(p, n) ASAN_UNPOISON_MEMORY_REGION((p), (n))
+#else
+#  define ARENA_ENVENENAR(p, n)    ((void)0)
+#  define ARENA_DESENVENENAR(p, n) ((void)0)
+#endif
+```
+
+Con eso, la arena vuelve a ser transparente para el sanitizador: cada objeto queda rodeado de bytes envenenados y los desbordamientos entre objetos vecinos reaparecen como errores. Es la práctica estándar en las bases de código serias que usan arenas, y la diferencia entre una técnica profesional y una trampa lenta.
+
+<Callout type="dios" title="La arena no acelera la asignación: elimina la pregunta que la hacía lenta">
+Es tentador leer la arena como una optimización —un `malloc` más rápido— y perderse lo que de verdad ocurre. Un asignador de propósito general es lento porque responde a una pregunta durísima: *dado un montón arbitrario con huecos de tamaños arbitrarios y una secuencia de liberaciones impredecible, encuéntrame un hueco*. Esa pregunta obliga a mantener estructuras de datos, a buscar, a coalescer huecos adyacentes, a defenderse de la fragmentación, y a hacerlo con seguridad frente a hilos concurrentes. La arena no responde mejor a esa pregunta: **la borra**. Al declarar por adelantado que un grupo de objetos comparte destino, el problema del emparejamiento entre reservas y liberaciones —que es donde viven las fugas, el uso tras liberar y la doble liberación— deja de existir, porque ya no hay emparejamiento que hacer. Y esto revela algo que trasciende a la gestión de memoria: la mayor parte de la complejidad del software no proviene del problema, sino de decisiones que dejamos abiertas cuando podríamos haberlas cerrado. Cada objeto con vida individual es un grado de libertad que alguien tendrá que razonar; cada grado de libertad eliminado es una clase entera de bugs que nadie tendrá que buscar. Por eso los programadores que adoptan arenas rara vez vuelven: no descubren un asignador rápido, descubren que llevaban años pagando un impuesto de contabilidad por una flexibilidad que su programa nunca usó. La lección se generaliza a los tiempos de vida, a la configuración, a los estados de una interfaz y a las opciones de una API. Antes de optimizar cómo respondes a una pregunta cara, comprueba si tu diseño te obligaba a hacerla.
+</Callout>
+
+<Challenge title="Construye una arena que aguante producción">
+1. Implementa `arena_alloc` con alineación explícita y la comprobación de espacio sin desbordamiento; verifica con `alignof(max_align_t)` que toda dirección devuelta está bien alineada.
+2. Añade marcas de posición y usa una región temporal dentro de una función recursiva; comprueba que el consumo máximo es el de la rama más profunda y no la suma de todas.
+3. Sustituye el `malloc` inicial por `mmap` con `MAP_NORESERVE` sobre un rango de varios gibibytes y mide, con `getrusage`, cuánta memoria física consume realmente tras repartir un mebibyte.
+4. Provoca deliberadamente un uso tras reset y observa que ni AddressSanitizer ni Valgrind lo detectan; añade después el envenenado manual y comprueba que el mismo programa ahora falla de forma ruidosa.
+5. Reescribe con arenas una estructura enlazada tuya que hoy libere nodo a nodo, y compara tiempo total, número de llamadas al asignador y fallos de caché con `perf stat`.
+</Challenge>

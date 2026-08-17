@@ -1,0 +1,160 @@
+---
+title: "Sincronizar con una API imperativa: el elemento real como actor invocado"
+description: "El elemento de vídeo del navegador es una máquina de estados ajena, escrita en C++, con su propia idea de la verdad y una API de órdenes y eventos que no pediste. Tu máquina no puede sustituirla ni ignorarla: tiene que convivir con ella. La forma correcta de esa convivencia es envolverla en un actor invocado que traduce órdenes hacia dentro y hechos hacia fuera, y esta lección desarrolla el patrón completo con fromCallback, incluyendo el problema del bucle de realimentación, la distinción entre orden y confirmación, y la liberación determinista de los oyentes cuando el estado que invoca al actor se abandona."
+subject: maquinas
+level: 19
+order: 2
+position: "19.2"
+duration: "19 min"
+---
+
+<Lead>
+Hay una asimetría incómoda en el fondo de todo reproductor: tu máquina de estados no es la única máquina de estados en juego. El elemento multimedia del navegador ya tiene la suya, implementada en el motor, con sus propias posiciones —`HAVE_NOTHING`, `HAVE_METADATA`, `HAVE_ENOUGH_DATA`— y sus propias transiciones que ocurren sin pedirte permiso porque dependen de la red, del decodificador y del sistema operativo. Esa máquina ajena no expone su estado como valor sino como una colección de propiedades mutables y un torrente de eventos del DOM, y su interfaz de control es imperativa: métodos que se invocan por efecto, no eventos que se envían. El error de principiante es tratarla como un almacén de datos que se lee y se escribe a voluntad. El patrón correcto la trata como lo que es —otro actor, con vida propia y latencia propia— y establece con ella un protocolo de dos canales: tú envías órdenes, ella responde con hechos, y ninguno de los dos lee directamente el interior del otro.
+</Lead>
+
+<Goals>
+
+- Envolver una API imperativa en una lógica de actor con `fromCallback` y su canal bidireccional.
+- Separar la orden que se emite de la confirmación que se recibe, sin confundirlas nunca.
+- Cortar el bucle de realimentación entre los efectos de la máquina y los eventos del recurso.
+- Garantizar la liberación de oyentes y recursos con la función de limpieza del actor.
+
+</Goals>
+
+## Dos canales: órdenes hacia dentro, hechos hacia fuera
+
+`fromCallback` es el único de los creadores de lógica que ofrece comunicación en ambos sentidos, y por eso es el envoltorio natural de cualquier recurso imperativo. Recibe `sendBack` para empujar hechos hacia la máquina padre y `receive` para escuchar órdenes que la máquina padre le manda. Cada dirección tiene un vocabulario distinto y mezclarlos es el primer error a evitar: las órdenes están en imperativo y en minúsculas, los hechos en pasado y en mayúsculas.
+
+```ts
+import { fromCallback } from 'xstate'
+
+type Orden =
+  | { type: 'cargar'; src: string }
+  | { type: 'play' }
+  | { type: 'pause' }
+  | { type: 'buscar'; segundo: number }
+
+export const medioReal = fromCallback<Orden, { el: HTMLVideoElement }>(
+  ({ input, sendBack, receive }) => {
+    const el = input.el
+
+    const listo = () => sendBack({ type: 'PUEDE_REPRODUCIR' })
+    const esperando = () => sendBack({ type: 'ESPERANDO_DATOS' })
+    const sonando = () => sendBack({ type: 'DATOS_SUFICIENTES' })
+    const detenido = () => sendBack({ type: 'PAUSA_CONFIRMADA' })
+    const final = () => sendBack({ type: 'FIN' })
+    const fallo = () =>
+      sendBack({ type: 'FALLO', motivo: el.error?.message ?? 'medio no disponible' })
+
+    el.addEventListener('canplay', listo)
+    el.addEventListener('waiting', esperando)
+    el.addEventListener('playing', sonando)
+    el.addEventListener('pause', detenido)
+    el.addEventListener('ended', final)
+    el.addEventListener('error', fallo)
+
+    receive((orden) => {
+      switch (orden.type) {
+        case 'cargar':
+          el.src = orden.src
+          el.load()
+          break
+        case 'play':
+          void el.play().catch(fallo)
+          break
+        case 'pause':
+          el.pause()
+          break
+        case 'buscar':
+          el.currentTime = orden.segundo
+          break
+      }
+    })
+
+    return () => {
+      el.removeEventListener('canplay', listo)
+      el.removeEventListener('waiting', esperando)
+      el.removeEventListener('playing', sonando)
+      el.removeEventListener('pause', detenido)
+      el.removeEventListener('ended', final)
+      el.removeEventListener('error', fallo)
+      el.pause()
+      el.removeAttribute('src')
+      el.load()
+    }
+  },
+)
+```
+
+La máquina lo invoca en la raíz, para que el actor viva mientras viva el reproductor entero, y le habla con `sendTo` desde las acciones de entrada de los estados que corresponden.
+
+```ts
+invoke: { id: 'medio', src: 'medioReal', input: ({ context }) => ({ el: context.el }) },
+states: {
+  reproduciendo: { entry: sendTo('medio', { type: 'play' }) },
+  pausado: { entry: sendTo('medio', { type: 'pause' }) },
+}
+```
+
+<Callout type="tip" title="El nombre delata la dirección">
+Adopta la convención de que los hechos que suben son sustantivos en pasado y las órdenes que bajan son verbos en infinitivo, y ganas una comprobación mental gratuita en cada línea. Si te descubres enviando `REPRODUCIR` hacia el actor o recibiendo `play` desde él, has cruzado los canales, y ese cruce es exactamente el que produce los bucles de la siguiente sección. La regla se sostiene sola: una máquina no ordena a otra que cambie de estado, le pide que haga algo y espera a saber qué pasó.
+</Callout>
+
+## El bucle de realimentación y cómo cortarlo
+
+El fallo más sutil de este patrón aparece cuando una orden provoca un evento que provoca la misma orden. Entrar en `reproduciendo` emite `play`; el elemento responde con `playing`; si tradujeras `playing` como un evento `REPRODUCIR` dirigido a la máquina, la máquina volvería a entrar en `reproduciendo` y volvería a emitir `play`. Con la reentrada eso es un ciclo infinito silencioso; sin ella, es simplemente ruido que enmascara los defectos reales.
+
+<Mermaid code={`flowchart LR
+  M[maquina de estados] -->|ordenes: play pause buscar| A[actor envoltorio]
+  A -->|metodos imperativos| E[elemento del navegador]
+  E -->|eventos del DOM| A
+  A -->|hechos: PUEDE_REPRODUCIR ESPERANDO_DATOS FIN FALLO| M
+  class M t-blue
+  class E t-yellow`} />
+
+La regla que corta el ciclo es que un hecho jamás debe traducirse al evento que lo causó. `playing` no significa reproduce, significa hay datos suficientes y el reloj avanza, y por eso se traduce como `DATOS_SUFICIENTES`, que solo tiene destino desde `buffering`. En `reproduciendo` ese hecho no declara transición y se descarta sin consecuencias, que es justo el comportamiento deseado: la confirmación de algo que ya sabías no debe cambiar nada.
+
+| Evento del recurso | Qué significa de verdad | Traducción correcta |
+| --- | --- | --- |
+| `canplay` | hay datos para empezar | `PUEDE_REPRODUCIR`, solo útil desde `cargando` |
+| `waiting` | el búfer se vació con el reloj en marcha | `ESPERANDO_DATOS` |
+| `playing` | el reloj vuelve a avanzar | `DATOS_SUFICIENTES`, solo útil desde `buffering` |
+| `pause` | alguien detuvo el medio, quizá el sistema | `PAUSA_CONFIRMADA`, nunca `PAUSAR` |
+| `ended` | se alcanzó el final del medio | `FIN` |
+| `error` | el recurso es inutilizable | `FALLO` con el motivo en la carga útil |
+
+<Callout type="warn" title="La reproducción puede ser denegada, y eso no es un fallo del medio">
+El método de reproducción devuelve una promesa que puede rechazarse porque la política de reproducción automática del navegador exige un gesto previo del usuario. Ese rechazo no es un error del recurso sino una negativa de la plataforma, y merece un estado distinto: la interfaz debe pedir una interacción explícita, no ofrecer un reintento que volverá a fallar igual. Tratar ambos casos como el mismo `FALLO` produce el bucle de reintentos más frustrante que existe, porque ninguna cantidad de intentos automáticos sustituye al clic que el navegador está exigiendo. Distingue `denegado_por_politica` de `error` y resuelve cada uno con la acción que de verdad lo desbloquea.
+</Callout>
+
+## Quién manda cuando ambos creen mandar
+
+Queda una pregunta de gobierno: si el usuario usa los controles nativos del elemento, el recurso cambia por su cuenta y tu máquina se entera después. La respuesta no es prohibir esa vía sino declarar cuál de las dos partes es la fuente de verdad y ser consecuente. Si tu máquina manda, ocultas los controles nativos y todo pasa por eventos tuyos. Si conviven, tratas cada cambio externo como un hecho que debe subir y ajustar tu estado, y aceptas que tus acciones de entrada deben ser idempotentes: emitir `pause` sobre algo ya pausado no debe producir nada observable, y por suerte la API imperativa cumple esa propiedad de forma natural.
+
+<Cards>
+  <Card icon="🎬" title="Invocar en la raíz">
+    El actor envoltorio vive tanto como el reproductor. Invocarlo dentro de un estado concreto lo destruiría y recrearía en cada transición.
+  </Card>
+  <Card icon="🧹" title="Limpieza determinista">
+    La función devuelta por `fromCallback` corre al detener el actor: quitar oyentes, pausar y soltar la fuente para liberar memoria y red.
+  </Card>
+  <Card icon="🪞" title="Idempotencia de órdenes">
+    Toda orden debe poder emitirse dos veces sin daño, porque el orden real de llegada depende del motor y no de tu grafo.
+  </Card>
+  <Card icon="🎚️" title="Una sola fuente de verdad">
+    Decide si mandan tus eventos o los controles nativos. Ambas opciones son válidas; la mezcla sin criterio no lo es.
+  </Card>
+</Cards>
+
+<Callout type="dios" title="Modelar es negociar con máquinas que no escribiste">
+Este patrón parece una técnica de integración y es en realidad una posición epistemológica sobre el software. Tu máquina no controla el elemento de vídeo: mantiene una creencia sobre él, alimentada por los hechos que ese elemento decide contarte y confirmada solo a posteriori. La orden que emites es una petición sin garantía —el navegador puede negarla, la red puede impedirla, el sistema puede apropiarse del audio— y tratarla como una asignación exitosa es el mismo error de categoría que confundir enviar un mensaje con haberlo hecho leer. De ahí se sigue la regla que gobierna todos los recursos externos, no solo el vídeo: nunca cambies de estado por haber emitido una orden, cambia de estado al recibir la confirmación de que ocurrió. Un modelo que se adelanta a los hechos es un modelo que miente cada vez que el mundo tarda, y el mundo siempre tarda. La consecuencia práctica es que casi todo estado ligado a un recurso externo necesita una posición intermedia entre pedir y saber, que es la que la versión ingenua se salta y la que aparece en la interfaz como el instante en que los botones mienten. La consecuencia teórica es más profunda: la frontera de tu sistema no está donde termina tu código, está donde termina tu certeza, y el trabajo de modelar consiste precisamente en dibujar esa frontera de forma explícita en lugar de fingir que no existe. Todo actor invocado es, en el fondo, la declaración de que ahí fuera hay algo que no obedece y con lo que hay que negociar.
+</Callout>
+
+<Challenge title="Envuelve el recurso y busca el bucle">
+1. Implementa la lógica de actor con los seis oyentes y comprueba con el inspector que cada evento del DOM llega como un hecho con nombre propio.
+2. Traduce deliberadamente el evento de reproducción del recurso como si fuera la orden del usuario y observa el ciclo que se forma al entrar en el estado correspondiente.
+3. Emite dos veces seguidas la orden de pausa y verifica que el segundo envío no produce ninguna transición ni ningún efecto observable.
+4. Provoca un rechazo de la promesa de reproducción bloqueando la reproducción automática y separa ese caso del fallo genuino del medio.
+5. Detén el actor a mitad de reproducción y comprueba con las herramientas del navegador que la descarga de red se interrumpe y los oyentes desaparecen.
+6. Habilita los controles nativos, cambia el estado desde ellos y decide de forma razonada si tu máquina debe adaptarse o si esos controles sobran.
+</Challenge>

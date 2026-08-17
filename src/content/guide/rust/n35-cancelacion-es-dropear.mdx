@@ -1,0 +1,161 @@
+---
+title: "Cancelacion: cancelar es dropear el future"
+description: "En Rust async no hay una senal de cancelacion en el lenguaje: cancelar una operacion es DROPEAR su future. Eso implica algo preciso y a veces peligroso: los destructores de lo que estaba vivo corren, pero el codigo que venia despues del ultimo await NO se ejecuta. De ahi el problema de cancelar en un punto malo, a mitad de un invariante."
+subject: rust
+level: 35
+order: 4
+position: "35.4"
+duration: "18 min"
+---
+
+<Lead>
+Ya has cancelado futures sin darte cuenta: cada rama perdedora de un `select!`, cada `timeout` que vence, cancela trabajo. Ahora toca nombrar el mecanismo, porque es a la vez de una simplicidad asombrosa y de una peligrosidad sutil. En Rust async **no existe** una señal de cancelación en el lenguaje, ni un método `cancel()`, ni una excepción que se lance para desmontar la pila. Cancelar una operación es, literalmente, **dropear su future**: dejar de sondearlo y destruir el valor. Esto tiene una consecuencia exacta que hay que grabarse a fuego: al dropear un future pausado en un `.await`, corren los **destructores** de todo lo que estaba vivo en ese punto —los `Drop`, los guardas RAII, la liberación de buffers—, pero el **código que venía después de ese `.await` nunca se ejecuta**. La operación se corta en seco en la costura donde estaba suspendida. Entender qué corre y qué no es entender por qué cancelar en el punto equivocado puede dejar tu programa a medias.
+</Lead>
+
+<Goals>
+
+- Comprender que cancelar en async es dropear el future, sin señal ni excepción de por medio.
+- Distinguir qué corre al cancelar —los destructores— de qué no corre —el código tras el `.await`—.
+- Reconocer el peligro de cancelar en un punto malo, a mitad de un invariante no atómico.
+- Elegir estrategias robustas: RAII compensatorio, `spawn` para trabajo que debe completarse, tokens.
+
+</Goals>
+
+## Cancelar es dropear
+
+En un lenguaje con hilos, cancelar es un problema espinoso: no puedes matar un hilo de forma segura a mitad de camino, porque no controlas dónde se interrumpe. Rust async lo resuelve dándole la vuelta: como un future es un **valor** —una máquina de estados perezosa—, para cancelarlo basta con lo que ya sabes hacer con cualquier valor: dejar de usarlo y dejarlo caer. No hay API especial; hay `Drop`.
+
+```rust
+async fn trabajo() -> u32 { /* varias etapas con .await */ 0 }
+
+async fn con_limite() {
+    // timeout conduce el future; si vence el plazo, DROPEA trabajo().
+    // Ese drop ES la cancelacion. No hay nada mas.
+    match tokio::time::timeout(Duration::from_secs(2), trabajo()).await {
+        Ok(v) => usar(v),
+        Err(_) => eprintln!("cancelado por timeout"),
+    }
+}
+```
+
+Todas las formas de cancelar se reducen a esto. Un `select!` dropea las ramas perdedoras. Un `timeout` dropea el future envuelto al vencer. Si guardas un future en una variable y no lo `.await`, y la variable sale de ámbito, se dropea sin haber corrido —cancelado antes de empezar—. Cancelar no es un evento que le mandas al future: es lo que le ocurre cuando dejas de conducirlo.
+
+## Qué corre y qué no: destructores sí, código tras await no
+
+Esta es la sección que hay que interiorizar, porque de ella se derivan todos los aciertos y todos los errores. Un future pausado en un `.await` es una máquina de estados que guarda, entre sus datos, las variables locales que siguen vivas en ese punto. Al dropearlo, esas variables se destruyen —sus `Drop` corren—, pero la ejecución **no se reanuda**: el código posterior al `.await` simplemente no llega a existir.
+
+```rust
+struct Guardia;
+impl Drop for Guardia {
+    fn drop(&mut self) { println!("limpieza"); } // ESTO corre al cancelar
+}
+
+async fn tarea() {
+    let _g = Guardia;          // vivo a traves del await
+    algo().await;              // si se cancela AQUI...
+    println!("terminado");     // ...esta linea NO corre
+} // ...pero _g se dropea: se imprime "limpieza"
+```
+
+Si `tarea` se cancela mientras espera en `algo().await`, verás `limpieza` pero nunca `terminado`. El destructor de `_g` es una promesa que Rust cumple pase lo que pase, porque `Drop` es parte de destruir el valor. Pero `println!("terminado")` es **código de continuación**, y la continuación de un future cancelado no se ejecuta. La lección: lo que pongas en un `Drop` está a salvo de la cancelación; lo que pongas como código normal tras un `.await`, no.
+
+Aquí conviene desmontar un reflejo heredado de otros lenguajes. En Java, Python o JavaScript, el bloque `finally` corre pase lo que pase —incluso si una excepción desmonta la pila—, así que se convierte en el hogar natural de la limpieza. En Rust async **no hay** un `finally` que la cancelación respete: el código que escribas después de un `.await`, aunque parezca de cierre, es continuación y por tanto es *lo primero* que se pierde al cancelar. El único mecanismo que la cancelación honra es `Drop`. Por eso la limpieza robusta en async no se escribe como pasos finales de la función, sino como el `Drop` de un guarda RAII: es la traducción de "esto debe correr pase lo que pase" al único idioma que la cancelación entiende.
+
+<Callout type="warn" title="Dropear un JoinHandle NO cancela la tarea spawneada">
+Cuidado con una asimetría crucial. Cancelar por drop vale para futures que *tú* conduces —los de `select!`, `timeout`, o los que tienes en una variable—. Pero una tarea lanzada con `tokio::spawn` es **independiente**: si dropeas su `JoinHandle`, la tarea **no** se cancela, sigue corriendo *desatada* hasta terminar. Para cancelar una tarea spawneada tienes que pedirlo explícitamente con `handle.abort()`. Regla: los futures locales se cancelan soltándolos; las tareas spawneadas hay que abortarlas a mano.
+</Callout>
+
+## El punto malo: cancelación e invariantes
+
+Ahora el peligro. Como el código tras el `.await` no corre al cancelar, si una operación consta de **varios pasos que deben ocurrir juntos** y hay un `.await` entre ellos, cancelar justo ahí deja el trabajo **a medias**. Los destructores corren, sí, pero un invariante lógico no es un destructor.
+
+```rust
+async fn transferir(a: &Cuenta, b: &Cuenta, monto: u64) {
+    a.restar(monto).await;   // paso 1: el dinero sale de a
+    // <-- si se cancela AQUI, el dinero se esfumo:
+    //     restado de a, jamas sumado a b. Ningun Drop lo arregla.
+    b.sumar(monto).await;    // paso 2: nunca corre si cancelaron antes
+}
+```
+
+Ningún `Drop` compensa esto por sí solo, porque "sumar a `b`" no es liberar un recurso, es lógica de negocio que vivía *después* del `.await` fatídico. El problema no es la cancelación en abstracto: es que **el punto de suspensión cayó en medio de una operación que debía ser atómica**. La misma disciplina que aplicabas a la cancel-safety de `select!` reaparece aquí en su forma más general: cada `.await` es un punto donde tu future *puede* morir, así que ningún `.await` debería quedar atrapado en mitad de una mutación que, interrumpida, rompa una invariante.
+
+<Callout type="tip" title="La mejor defensa: que no haya un await en medio">
+Antes de blindar la cancelación, intenta hacerla imposible. Si consigues que la mutación crítica ocurra **sin ningún `.await` entre sus mitades** —haz toda la espera *antes*, aplica el cambio de estado de un tirón *después*—, no queda punto malo donde caer. Auditar un future por su robustez es recorrer sus `.await` uno a uno preguntándote qué invariante se rompería si muriera justo ahí; los que atraviesan una mutación no atómica son los sospechosos, y muchos se curan reordenando para que el `.await` quede *fuera* de la sección delicada.
+</Callout>
+
+## Estrategias: RAII, spawn y tokens
+
+La primera defensa es mover la lógica crítica de limpieza a un `Drop`, para que corra aunque cancelen. Un *guarda de compensación* que revierte el paso 1 si no se llegó a confirmar:
+
+```rust
+struct Rollback<'a> { cuenta: &'a Cuenta, monto: u64, hecho: bool }
+
+impl Drop for Rollback<'_> {
+    fn drop(&mut self) {
+        if !self.hecho { self.cuenta.revertir_sincrono(self.monto); } // corre al cancelar
+    }
+}
+
+let mut guarda = Rollback { cuenta: a, monto, hecho: false };
+a.restar(monto).await;
+b.sumar(monto).await;
+guarda.hecho = true; // llegamos al final: no hay que revertir
+```
+
+Fíjate en un matiz importante: la reversión vive en `Drop`, que es **síncrono** —no puede tener `.await`—. Si tu compensación necesitara esperar (una escritura a la base de datos), `Drop` no basta y tendrías que recurrir a un token cooperativo o a `spawn` de una tarea de limpieza; es una de las razones por las que evitar el punto malo de entrada casi siempre gana a repararlo después.
+
+La segunda: si un trabajo **debe** completarse pase lo que pase, sácalo de la zona cancelable con `tokio::spawn`. Una tarea spawneada es desatada; ni un `select!` que la lanzó ni un `timeout` la matan al soltar sus futures. Pagas el precio de siempre —`Send + 'static`, sin préstamos del ámbito— a cambio de que corra hasta el final. La tercera, para cancelación *cooperativa* y ordenada, es un `CancellationToken` (de `tokio_util`): el future comprueba el token en puntos seguros y hace su limpieza a conciencia antes de salir, en vez de morir en un `.await` cualquiera.
+
+```rust
+loop {
+    tokio::select! {
+        _ = token.cancelled() => { limpieza_ordenada().await; break; }
+        trabajo = cola.recv() => procesar(trabajo).await,
+    }
+}
+```
+
+Las tres no compiten, se combinan según qué garantías necesites. Para **soltar recursos** limpiamente, RAII basta y actúa siempre. Para que un trabajo **no se interrumpa jamás**, `spawn` lo desata del ámbito cancelable. Para un apagado **ordenado y a tiempo**, el `CancellationToken` convierte la cancelación en un punto explícito y controlado, donde tú eliges dónde limpiar en vez de dejarlo al azar del `.await` en que te sorprenda el drop. La pregunta que las ordena es simple: ¿qué debe seguir siendo cierto si esta operación muere ahora mismo?
+
+<Cards>
+  <Card icon="🗑️" title="Cancelar = dropear">
+    Sin señal ni excepción. Soltar el future es cancelarlo. `select!`, `timeout` y salir de ámbito lo hacen.
+  </Card>
+  <Card icon="✅" title="Corre: los Drop">
+    Al cancelar, los destructores de lo vivo se ejecutan: guardas RAII, locks liberados, buffers soltados.
+  </Card>
+  <Card icon="🚫" title="No corre: tras el await">
+    El código de continuación posterior al `.await` no se ejecuta. Ahí anida el peligro del punto malo.
+  </Card>
+  <Card icon="🛡️" title="Robustez">
+    Limpieza en `Drop`, `spawn` para lo que debe completarse, `CancellationToken` para salir ordenado.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TB
+  A[Future pausado en un await] --> C[Se cancela se dropea]
+  C --> D1[Corren los destructores de lo vivo RAII locks buffers]
+  C --> D2[El codigo tras el await NO se ejecuta]
+  D2 --> R[Riesgo invariante a medias si el punto era malo]
+  R --> F1[Defensa limpieza en Drop compensatorio]
+  R --> F2[Defensa spawn si debe completarse]
+  class D1 t-green
+  class D2 t-red
+  class R t-peach`} />
+
+<Callout type="dios" title="La cancelacion por drop es el mismo ownership, ahora doblado sobre el tiempo">
+Que cancelar sea dropear no es una curiosidad de la API: es la culminación coherente de todo lo que Rust ha venido diciendo desde el nivel de *ownership*. Un future es un valor; los valores se destruyen soltándolos; destruir corre destructores. La cancelación no necesitó inventar nada porque el lenguaje ya tenía la pieza —`Drop`— desde el principio, y async se limita a aplicarla a un valor que resulta ser un cómputo suspendido. Esta economía conceptual es hermosa, pero esconde una asimetría que hay que mirar de frente. La liberación de **recursos** —memoria, ficheros, locks, conexiones— está resuelta por construcción: RAII garantiza que un future cancelado suelte todo lo que poseía, sin fugas, exactamente como cualquier valor que sale de ámbito. Lo que RAII *no* puede garantizar es la integridad de tus **invariantes lógicos**, porque una invariante como "el dinero que salió de A entró en B" no es un recurso que se libere, es una relación que tu código mantenía, y el código que la mantenía vivía después del `.await` donde te cancelaron. Aquí async te obliga a una honestidad que los modelos preventivos te ahorran a costa de mentirte: en un lenguaje que interrumpe hilos en cualquier instrucción, la atomicidad de tus operaciones es un rezo; en Rust, los únicos puntos donde un future puede morir son los `.await`, visibles y contables en el código, así que puedes razonar con precisión quirúrgica sobre qué operaciones quedan expuestas y protegerlas —cerrando la ventana entre pasos, poniendo la compensación en un `Drop`, o desatando con `spawn` lo que no admite interrupción—. La cancelación cooperativa no es una limitación de Rust, es su forma de decirte la verdad: cancelar significa no ejecutar el resto, y decidir qué pasa con lo que quedó a medias es responsabilidad tuya, no de una excepción mágica. El mismo sistema que te hizo pensar dónde vive cada dato ahora te hace pensar dónde puede morir cada cómputo. Es la disciplina del ownership, extendida del espacio al tiempo.
+</Callout>
+
+<Callout type="note" title="Lo esencial">
+Cancelar en async es dropear el future: no hay señal ni excepción, solo `Drop`. Al cancelar un future pausado, corren los **destructores** de lo vivo —RAII, locks, buffers— pero el **código tras el `.await` no se ejecuta**. De ahí el peligro de cancelar en un punto malo: una operación no atómica con un `.await` en medio queda a medias, y ningún `Drop` repara un invariante lógico. Ojo: dropear un `JoinHandle` no cancela la tarea spawneada (hay que `abort()`). Defensas: limpieza en `Drop` compensatorio, `spawn` para trabajo que debe completarse, `CancellationToken` para salir ordenado.
+</Callout>
+
+<Challenge title="Observa qué sobrevive a la cancelacion">
+1. Escribe un future con un tipo que imprima en su `Drop`, cancélalo con un `timeout` corto y comprueba que el `Drop` corre pero el código posterior al `.await` no.
+2. Reproduce el "punto malo": una función de dos pasos con un `.await` en medio; cancélala entre paso 1 y paso 2 y observa el estado inconsistente resultante.
+3. Añade un guarda de compensación (rollback en `Drop`) a la función anterior y verifica que ahora la cancelación deja el estado íntegro.
+4. Lanza una tarea con `tokio::spawn`, dropea su `JoinHandle` y comprueba que sigue corriendo; luego cancélala de verdad con `abort()` y nota la diferencia.
+5. Explica por qué la cancelación cooperativa de Rust —solo en los `.await`— permite razonar sobre atomicidad mejor que la interrupción de un hilo en un punto arbitrario.
+</Challenge>

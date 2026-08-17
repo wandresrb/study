@@ -1,0 +1,191 @@
+---
+title: "Patrones reales: webhooks, subidas, proxys y rate-limit"
+description: "Cuatro usos de producción que consolidan todo el nivel, cada uno bajo demanda. Recibir un webhook verificando su firma HMAC sobre el cuerpo crudo y acusar recibo rápido; aceptar la subida de un fichero con formData validando tamaño y tipo; hacer de proxy hacia una API de terceros para ocultar la clave secreta en el servidor; y frenar el abuso con un rate-limit básico por IP que responde 429 con Retry-After. Con las advertencias de seguridad que separan un endpoint de juguete de uno que aguanta el mundo real."
+subject: astro
+level: 22
+order: 5
+position: "22.5"
+duration: "18 min"
+---
+
+<Lead>
+Ya tienes las piezas: handlers por verbo, lectura del cuerpo, `params`, cabeceras, estados, streaming. Este cierre las ensambla en cuatro patrones que aparecen en casi cualquier proyecto serio. Recibir un **webhook** de un servicio externo y confiar en él sin ser engañado. Aceptar la **subida** de un fichero sin dejar que te desborde. Hacer de **proxy** hacia una API de pago para que su clave nunca salga del servidor. Y frenar el **abuso** con un límite de peticiones. Los cuatro comparten una moraleja: un endpoint bajo demanda es una puerta abierta a internet, y la diferencia entre uno de juguete y uno de producción está casi toda en cómo trata lo que entra por ella.
+</Lead>
+
+<Goals>
+
+- Recibir un webhook verificando su firma HMAC sobre el cuerpo crudo con `request.text`.
+- Aceptar la subida de un fichero con `formData`, validando tamaño y tipo.
+- Hacer de proxy a una API de terceros ocultando la clave secreta en el servidor.
+- Implementar un rate-limit básico por IP que responda `429` con `Retry-After`.
+
+</Goals>
+
+## Webhooks: confiar sin ser engañado
+
+Un webhook es un `POST` que un servicio externo —una pasarela de pago, un repositorio— lanza a tu endpoint cuando ocurre algo. El problema es la confianza: cualquiera puede enviarte un `POST` fingiendo ser ese servicio. La defensa es una **firma HMAC**: el emisor firma el cuerpo con un secreto compartido y adjunta la firma en una cabecera; tú recomputas la firma y compruebas que coincide. Clave: hay que firmar el **cuerpo crudo**, byte a byte, así que lo lees con `request.text` antes de parsear nada.
+
+```ts
+// src/pages/api/webhook.ts
+import type { APIRoute } from 'astro';
+
+export const prerender = false;
+const secret = import.meta.env.WEBHOOK_SECRET;
+
+export const POST: APIRoute = async ({ request }) => {
+  const firma = request.headers.get('x-signature') ?? '';
+  const crudo = await request.text();            // cuerpo sin parsear
+
+  if (!(await firmaValida(crudo, firma, secret))) {
+    return new Response('firma invalida', { status: 401 });
+  }
+
+  const evento = JSON.parse(crudo);
+  await encolarProceso(evento);                  // trabajo pesado, fuera del ciclo
+  return new Response(null, { status: 200 });    // acuse de recibo inmediato
+};
+
+// la firma se recomputa con la Web Crypto API, estandar en todo runtime
+async function firmaValida(cuerpo: string, firma: string, secret: string) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(cuerpo));
+  const esperada = [...new Uint8Array(mac)]
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return esperada === firma;
+}
+```
+
+Dos disciplinas más hacen a un receptor de webhooks robusto. Primera: **acusa recibo rápido** —un `200` en cuanto validas— y delega el trabajo pesado a una cola o a una tarea de fondo; si tardas, el emisor reintentará y procesarás el evento dos veces. Segunda: la **idempotencia**, tratar cada evento por su identificador único para que un reintento no duplique efectos. Un webhook mal hecho cobra dos veces la misma tarjeta.
+
+<Callout type="warn" title="Compara firmas en tiempo constante y guarda el secreto fuera del código">
+Comparar la firma con `===` es didáctico pero filtra información por el tiempo que tarda: un atacante mide cuánto rechazas para adivinar la firma byte a byte. En producción usa una comparación de tiempo constante. Y el `WEBHOOK_SECRET` jamás va en el repositorio: vive en una variable de entorno del servidor, leída con `import.meta.env`. Un secreto en el código fuente es un secreto ya filtrado.
+</Callout>
+
+## Subidas: aceptar un fichero sin desbordarte
+
+Un formulario `multipart` con un fichero se lee con `request.formData`, que devuelve un `FormData` donde cada campo de tipo archivo es un objeto `File`. Desde ahí tienes su nombre, su tamaño y sus bytes vía `arrayBuffer`. La regla de oro: **valida antes de guardar**, porque el cliente controla lo que manda.
+
+```ts
+export const prerender = false;
+
+export const POST: APIRoute = async ({ request }) => {
+  const form = await request.formData();
+  const fichero = form.get('archivo');
+
+  if (!(fichero instanceof File)) {
+    return Response.json({ error: 'falta el archivo' }, { status: 400 });
+  }
+  if (fichero.size > 2_000_000) {
+    return Response.json({ error: 'demasiado grande' }, { status: 413 });
+  }
+  if (!fichero.type.startsWith('image/')) {
+    return Response.json({ error: 'tipo no permitido' }, { status: 415 });
+  }
+
+  const bytes = await fichero.arrayBuffer();
+  const url = await guardarEnAlmacen(fichero.name, bytes);
+  return Response.json({ url }, { status: 201 });
+};
+```
+
+El tamaño se rechaza con `413`, el tipo no admitido con `415`. Nunca confíes solo en la extensión del nombre —se falsifica en un segundo—; comprueba el `type` y, para datos sensibles, inspecciona los primeros bytes. Y no guardes el fichero en tu servidor de aplicación: súbelo a un almacén de objetos —R2, S3— para no llenar el disco de la función.
+
+## Proxy: ocultar la clave en el servidor
+
+Muchas APIs de terceros exigen una clave secreta. Si tu JavaScript de cliente la usara directamente, esa clave viajaría al navegador y quedaría expuesta a la vista de cualquiera. El patrón proxy lo resuelve: tu endpoint recibe la petición del cliente, llama a la API de terceros **desde el servidor** con la clave, y devuelve el resultado. La clave nunca sale de tu backend.
+
+```ts
+export const prerender = false;
+const KEY = import.meta.env.CLIMA_API_KEY;
+
+export const GET: APIRoute = async ({ url }) => {
+  const ciudad = url.searchParams.get('ciudad') ?? 'madrid';
+  const arriba = await fetch(`https://api.clima.example/v1?q=${ciudad}&key=${KEY}`);
+
+  if (!arriba.ok) {
+    return Response.json({ error: 'servicio no disponible' }, { status: 502 });
+  }
+  const datos = await arriba.json();
+  return Response.json(datos, {
+    headers: { 'Cache-Control': 'public, max-age=600' },
+  });
+};
+```
+
+El proxy es además el sitio natural para **cachear** —un `Cache-Control` ahorra llamadas de pago a la API de arriba—, para **filtrar** qué campos expones y para **transformar** la respuesta. Un fallo del servicio de terceros se traduce a un `502 Bad Gateway`, que dice la verdad: no fallaste tú, falló aquel de quien dependes.
+
+## Rate-limit: frenar el abuso
+
+Un endpoint público sin freno es una invitación al abuso. Un rate-limit básico cuenta las peticiones por origen —`clientAddress` te da la IP, disponible solo bajo demanda— dentro de una ventana de tiempo, y responde `429 Too Many Requests` con `Retry-After` cuando se pasa.
+
+```ts
+export const prerender = false;
+const ventana = 60_000;      // 1 minuto
+const limite = 30;           // peticiones por ventana
+const cubos = new Map<string, { n: number; hasta: number }>();
+
+export const POST: APIRoute = async ({ clientAddress }) => {
+  const ahora = Date.now();
+  const cubo = cubos.get(clientAddress);
+
+  if (!cubo || ahora > cubo.hasta) {
+    cubos.set(clientAddress, { n: 1, hasta: ahora + ventana });
+  } else if (cubo.n >= limite) {
+    const espera = Math.ceil((cubo.hasta - ahora) / 1000);
+    return new Response('demasiadas peticiones', {
+      status: 429,
+      headers: { 'Retry-After': String(espera) },
+    });
+  } else {
+    cubo.n += 1;
+  }
+  return Response.json({ ok: true });
+};
+```
+
+<Callout type="warn" title="Un Map en memoria no es un rate-limit de verdad">
+Ese `Map` vive en la memoria de **una** instancia. En un despliegue serverless o en el borde hay muchas instancias efímeras: cada una tiene su propio contador, se reinician sin avisar y ninguna ve a las demás, así que el límite real es difuso y se evapora en cada redespliegue. Sirve para ilustrar el patrón y para un servidor único de larga vida, no para producción distribuida. Ahí necesitas un almacén compartido y atómico —Cloudflare KV o Durable Objects, Redis, Upstash— que cuente entre instancias. El algoritmo es el mismo; lo que cambia es dónde vive el contador.
+</Callout>
+
+<Cards>
+  <Card icon="🛰️" title="Webhook">
+    Verifica la firma HMAC sobre el cuerpo crudo, acusa recibo rapido y procesa idempotente.
+  </Card>
+  <Card icon="📤" title="Subida">
+    `formData` y `File`; valida tamano y tipo antes de guardar, y usa un almacen de objetos.
+  </Card>
+  <Card icon="🔀" title="Proxy">
+    Llama a la API de terceros desde el servidor; la clave secreta nunca llega al navegador.
+  </Card>
+  <Card icon="🚦" title="Rate-limit">
+    Cuenta por IP en una ventana y responde `429` con `Retry-After` al superar el limite.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart LR
+  EXT[servicio externo] -->|POST firmado| EP[endpoint webhook]
+  EP --> V{firma valida}
+  V -->|no| R401[401 rechazado]
+  V -->|si| ACK[200 acuse rapido]
+  ACK --> COLA[procesa en segundo plano]
+  class EXT t-blue
+  class ACK t-green
+  class R401 t-red`} />
+
+<Callout type="dios" title="Un endpoint público es una frontera, y toda frontera se defiende">
+El hilo que cose estos cuatro patrones no es técnico sino de postura: en el instante en que un endpoint pasa a bajo demanda y se expone a internet, deja de ser una función entre amigos y se vuelve una **frontera** por la que entra lo desconocido. Todo el que ha construido software de red aprende, antes o después, la misma ley: nada de lo que cruza esa frontera es confiable hasta que tú lo hagas confiable. El cuerpo del webhook podría ser una falsificación —por eso lo firmas y lo verificas—. El fichero subido podría ser un gigabyte de basura o un ejecutable disfrazado de imagen —por eso lo mides y lo inspeccionas—. La clave de tu API de pago es oro para un atacante —por eso jamás la dejas cruzar hacia el cliente—. Y el propio caudal de peticiones puede ser un ataque —por eso lo cuentas y lo frenas—. Cada patrón de este cierre es la misma idea aplicada a una amenaza distinta: validar la autenticidad, acotar el tamaño, guardar el secreto, limitar el ritmo. Fíjate en que ninguna de estas defensas es una función del framework que activas con una opción; son **decisiones de diseño** que solo tú puedes tomar, porque solo tú sabes qué es legítimo en tu dominio y qué no. Astro te da la puerta —el enrutado, el `Request`, el `Response`— pero la guardia la pones tú. Y esa es, al final, la madurez que separa a quien sabe escribir un handler de quien sabe operar un servicio: entender que la parte fácil es responder cuando todo va bien, y que el oficio de verdad está en lo que haces con lo que llega roto, mentiroso o malintencionado. Un endpoint que solo contempla el caso feliz no está terminado; está esperando a que alguien encuentre la frontera sin vigilar.
+</Callout>
+
+<Challenge title="Endurece un endpoint de producción">
+1. Escribe `src/pages/api/webhook.ts` que lea el cuerpo con `request.text`, verifique una firma HMAC con la Web Crypto API y responda `401` si no cuadra.
+2. Crea un endpoint de subida con `request.formData` que rechace ficheros mayores de un límite con `413` y tipos no permitidos con `415`.
+3. Monta un proxy con `GET` que llame a una API externa usando una clave de `import.meta.env`, cachee con `Cache-Control` y traduzca los fallos a `502`.
+4. Añade un rate-limit por `clientAddress` que responda `429` con `Retry-After`, y razona por qué un `Map` en memoria no basta en un despliegue distribuido.
+</Challenge>

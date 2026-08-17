@@ -1,0 +1,150 @@
+---
+title: "Cancelación cooperativa: pedir, comprobar y limpiar"
+description: "Cancelar una corrutina no la interrumpe: le pone una marca y confía en que el propio código la consulte. Esta lección explica por qué la interrupción forzosa es imposible de hacer segura, cómo funciona en realidad la cancelación de Kotlin —un Job que pasa a cancelando y una CancellationException que viaja por el árbol—, y qué obligaciones deja en manos de quien escribe el cuerpo. Detalla las tres herramientas de comprobación, la propiedad isActive para decidir sin lanzar, ensureActive para abortar de inmediato y yield para ceder el turno, muestra por qué todo punto de suspensión de la biblioteca ya coopera y por qué un bucle de cálculo puro no, y cierra con la liberación ordenada de recursos mediante finally y con el caso especial de la limpieza que necesita suspender dentro de NonCancellable."
+subject: mvi
+level: 4
+order: 4
+position: "4.4"
+duration: "19 min"
+---
+
+<Lead>
+La lección anterior dejó el árbol montado y el trabajo repartido entre hilos, pero con una promesa a medio cobrar: dijimos que un solo `cancel` en la raíz apaga todo el subárbol. Es cierto y es la razón de que Orbit no necesite gestionar suscripciones, aunque la palabra apagar oculta un matiz decisivo. Cancelar no detiene nada por la fuerza. Cancelar es dejar una nota, y el trabajo se detiene solo si el código que corre se molesta en leerla. Esa cooperación no es una carencia de la biblioteca ni una simplificación provisional: es la única forma conocida de cancelar código sin corromper el estado del programa, y entenderla es lo que separa a quien confía en que la cancelación funcione de quien sabe cuándo no lo hará.
+</Lead>
+
+<Goals>
+
+- Entender por qué la interrupción forzosa es insegura y por qué toda cancelación seria es cooperativa.
+- Seguir el mecanismo real: el `Job` pasa a estado cancelando y viaja una `CancellationException` por el árbol.
+- Usar `isActive`, `ensureActive` y `yield` sabiendo qué hace cada uno y cuándo procede.
+- Liberar recursos con `finally` y resolver el caso de la limpieza que necesita suspender con `NonCancellable`.
+
+</Goals>
+
+## Nadie puede detener código ajeno de forma segura
+
+La pregunta natural es por qué no existe un botón que mate una corrutina en el acto. La respuesta está en la historia de la plataforma: Java lo intentó con el método `stop` de `Thread`, que abortaba un hilo en cualquier instrucción, y quedó desaprobado hace más de veinte años por una razón demoledora. Un hilo detenido a mitad puede haber adquirido un candado y no haberlo soltado, haber escrito medio registro en un fichero, haber dejado una estructura de datos en un estado que ninguna parte del programa contempla. La interrupción forzosa no produce un programa detenido; produce un programa corrupto que aún no lo sabe.
+
+De ahí que toda cancelación seria sea cooperativa. Quien cancela **pide**, y quien ejecuta **comprueba** y decide dónde es seguro parar. Kotlin implementa esa petición con un cambio de estado en el `Job`, que pasa a cancelando, y con una excepción especial que se hace viajar por los puntos de suspensión: `CancellationException`. Todas las funciones suspendibles de la biblioteca estándar comprueban ese estado antes de reanudar y lanzan la excepción si la corrutina ya no está activa.
+
+```kotlin
+val trabajo = scope.launch {
+    repeat(1000) { i ->
+        delay(100)                 // punto de suspension: coopera solo
+        println("paso $i")
+    }
+}
+delay(350)
+trabajo.cancel()                   // pide la cancelacion
+trabajo.join()                     // espera a que de verdad termine
+// o, equivalente y mas comun:  trabajo.cancelAndJoin()
+```
+
+La distinción entre `cancel` y `join` es más importante de lo que parece. `cancel` retorna de inmediato: solo ha dejado la nota. El trabajo puede seguir vivo unos instantes más, hasta el siguiente punto donde coopere. Si necesitas la garantía de que ya no queda nada corriendo —al liberar un recurso compartido, por ejemplo— tienes que esperar con `join`. Esa misma espera es la que hace por ti un `coroutineScope` al cancelarse, y por eso la garantía estructural de la lección anterior se sostiene incluso siendo la cancelación cooperativa.
+
+<Callout type="info" title="CancellationException es una excepcion que el sistema ignora a proposito">
+La cancelación viaja como excepción para aprovechar el desenrollado de la pila y ejecutar los bloques `finally` por el camino, pero no se trata como un fallo. Cuando una corrutina termina con `CancellationException`, el padre no se cancela ni la considera un error: es una terminación normal y esperada. Esa asimetría explica algo que verás en la última lección del nivel: un `catch` genérico que capture todas las excepciones también atrapa la de cancelación y, si no la relanza, deja a la corrutina viva después de haber sido cancelada. La regla que evita el bug: si capturas todo, comprueba y relanza la de cancelación, o usa `ensureActive` justo después del `catch`.
+</Callout>
+
+## Las tres formas de cooperar
+
+Como la cooperación ocurre en los puntos de suspensión, el código que suspende con regularidad ya es cancelable sin que hagas nada: un `delay`, una llamada de red suspendida, una consulta a la base de datos, un `collect` sobre un `Flow`. El problema aparece en el código que **no** suspende: un bucle que calcula, que recorre un millón de elementos o que comprime una imagen. Ese bucle no tiene ningún punto donde mirar la nota, y seguirá trabajando hasta el final aunque su `Job` lleve rato cancelado.
+
+```kotlin
+// No coopera: sigue hasta el final aunque lo cancelen
+launch(Dispatchers.Default) {
+    var i = 0
+    while (i < 1_000_000) { procesar(i); i++ }
+}
+
+// Coopera de tres formas distintas
+launch(Dispatchers.Default) {
+    var i = 0
+    while (isActive && i < 1_000_000) {   // 1. decide sin lanzar
+        procesar(i); i++
+        if (i % 1000 == 0) ensureActive()  // 2. aborta lanzando si toca
+    }
+    yield()                                 // 3. cede el turno y comprueba
+}
+```
+
+`isActive` es una propiedad booleana del ámbito: consultarla no lanza nada y te deja decidir. Es la opción adecuada cuando quieres salir del bucle de forma ordenada y devolver un resultado parcial o registrar hasta dónde llegaste. `ensureActive` lanza `CancellationException` si el `Job` ya no está activo: es la opción cuando la salida correcta es abortar, y tiene la ventaja de que la excepción propaga la cancelación hacia arriba con la semántica esperada. `yield` hace las dos cosas y una tercera: comprueba, y si sigue activa cede el hilo para que otras corrutinas del mismo dispatcher puedan avanzar, lo cual evita que un bucle largo monopolice un hilo del pool.
+
+<Mermaid code={`flowchart TD
+  C[Alguien invoca cancel sobre el Job] --> E[El Job pasa a estado cancelando]
+  E --> D[Desciende a todos los hijos]
+  D --> P{El cuerpo coopera}
+  P -->|si hay punto de suspension| X[Lanza CancellationException]
+  P -->|bucle de calculo sin comprobar| S[Sigue trabajando hasta el final]
+  X --> F[Se ejecutan los bloques finally]
+  F --> T[El Job pasa a cancelado y join retorna]
+  class X t-yellow
+  class S t-red
+  class T t-green`} />
+
+Elegir entre las tres no es cuestión de gusto sino de qué significa parar en ese punto concreto. Y hay una cuarta vía que a menudo es la mejor: si el bucle procesa elementos que llegan de fuera, conviértelo en un `Flow` y colecciónalo, porque cada emisión pasa por un punto de suspensión y la cooperación vuelve a ser gratis. Cuando te descubras salpicando `ensureActive` cada mil iteraciones, pregúntate antes si el trabajo no querría estar expresado como un flujo.
+
+<Callout type="warn" title="Cancelado no significa terminado">
+Un error de razonamiento frecuente es tratar `cancel` como si fuera síncrono. Entre la petición y la terminación real hay una ventana, y en esa ventana el trabajo antiguo todavía puede emitir un resultado. Ese es el origen de un bug clásico en pantallas de búsqueda: cancelas la consulta anterior, lanzas la nueva, y la vieja alcanza a escribir su resultado después. Las defensas son dos y se complementan: esperar con `cancelAndJoin` cuando el orden importa de verdad, y comprobar la actividad antes de publicar cualquier resultado, de modo que una corrutina cancelada nunca llegue a tocar el estado.
+</Callout>
+
+## Cancelar por tiempo
+
+El caso más común de cancelación no lo inicia el usuario sino el reloj. `withTimeout` ejecuta un bloque y lo cancela si tarda más de lo permitido, lanzando `TimeoutCancellationException`; su hermana `withTimeoutOrNull` hace lo mismo pero devuelve nulo en vez de lanzar, lo que suele leerse mejor cuando agotar el plazo es un desenlace previsto y no un fallo.
+
+```kotlin
+fun buscar(texto: String) = intent {
+    val resultado = withTimeoutOrNull(3_000) {
+        repo.buscar(texto)                    // si tarda mas de 3 s, se cancela
+    }
+    reduce {
+        if (resultado == null) state.copy(error = "La busqueda tardo demasiado")
+        else state.copy(items = resultado, error = null)
+    }
+}
+```
+
+Dos matices que se olvidan a menudo. El primero es que el tiempo límite se apoya en el mismo mecanismo cooperativo de toda la lección: si el bloque contiene un tramo de cálculo puro sin puntos de suspensión, el plazo vencerá y nadie se enterará hasta que ese tramo termine. Un tiempo límite sobre código que no coopera es una decoración. El segundo es sutil y produce bugs desconcertantes: `TimeoutCancellationException` hereda de `CancellationException`, así que un `catch` amplio la absorbe silenciosamente y deja al programa creyendo que todo fue bien. Si quieres tratar el vencimiento como una situación de tu dominio, captúralo por su tipo concreto o, mejor, usa la variante que devuelve nulo y decide con un `if`.
+
+Repara también en la diferencia entre poner el plazo dentro o fuera de un reintento. Un `withTimeout` que envuelve el bucle entero limita el tiempo total de la operación; uno colocado dentro de cada intento limita cada intento por separado y permite que la suma se alargue. Las dos formas son legítimas y significan cosas distintas, así que conviene escribir en el código cuál elegiste en lugar de descubrirlo al depurar.
+
+## Limpiar sin dejar rastro
+
+Como la cancelación viaja como excepción, el desenrollado ejecuta los bloques `finally` que encuentre por el camino, y ese es el sitio idiomático para devolver lo que hayas tomado prestado: cerrar un fichero, soltar un candado, liberar un sensor, desregistrar un oyente. Para recursos que implementan cierre automático, la función `use` hace lo mismo de forma más compacta.
+
+```kotlin
+val trabajo = launch {
+    val fichero = abrirFichero()
+    try {
+        while (isActive) {
+            fichero.escribir(siguienteBloque())
+            delay(50)
+        }
+    } finally {
+        fichero.cerrar()                       // limpieza no suspendible: correcta
+        withContext(NonCancellable) {
+            repo.registrarInterrupcion()       // limpieza que suspende: necesita esto
+        }
+    }
+}
+```
+
+La segunda parte del `finally` señala una trampa real. Dentro de una corrutina ya cancelada, cualquier función suspendible que invoques lanza `CancellationException` de inmediato: la corrutina está muerta y la biblioteca se niega a suspender más. Si tu limpieza necesita suspender —enviar un último evento, cerrar una conexión con un adiós, escribir una traza en la base de datos— tienes que ejecutarla en un contexto que no atienda a la cancelación, y para eso existe `NonCancellable`.
+
+Úsalo con parsimonia y solo dentro de un `finally`. Un bloque `NonCancellable` es, por definición, código que ya no se puede detener, así que debe ser corto, acotado y sin bucles. Si algo largo se cuela dentro, habrás recreado a mano el problema que la cancelación cooperativa venía a resolver, y encima en el peor momento posible: cuando la pantalla ya se cerró y el usuario espera que todo haya parado.
+
+<Callout type="tip" title="En Orbit la cancelacion ya esta cableada, pero el cuerpo sigue siendo tuyo">
+Como el `container` cuelga de `viewModelScope`, salir de la pantalla cancela todos los `intent` en vuelo sin que escribas una línea: eso es la primera ley del árbol trabajando. Lo que la herencia no puede darte es la cooperación dentro del cuerpo. Un `intent` que colecciona un `Flow` o que espera al repositorio se detendrá solo porque suspende en cada paso; uno que ordena cien mil elementos en un bucle seguirá quemando procesador después de que el usuario se haya ido. La revisión útil es simple: recorre tus `intent` y localiza el tramo más largo sin ningún punto de suspensión. Ese tramo es exactamente lo que tu app sigue haciendo cuando ya nadie mira.
+</Callout>
+
+<Callout type="dios" title="Cancelar es un acuerdo, y el que ejecuta es el unico que sabe donde parar">
+Merece la pena entender por qué la cooperación no es una limitación técnica que algún día se superará, porque el argumento vale mucho más allá de Kotlin. La pregunta de fondo es quién posee la información necesaria para detener un cómputo sin dejar el mundo roto, y la respuesta es incómoda: solo el propio cómputo. Quien cancela ve un identificador de tarea; ignora si en este instante hay un candado tomado, si va por la mitad de una escritura que debe ser atómica, si acaba de reservar memoria que alguien tiene que liberar o si el registro que estaba componiendo quedaría inconsistente. El que ejecuta sí lo sabe, porque conoce sus propios invariantes, y por eso la única política segura es que el que ejecuta elija el punto donde parar. La interrupción forzosa fracasó exactamente ahí: no porque fuera difícil de implementar, sino porque colocaba la decisión en quien carecía de la información para tomarla. Ahora observa el diseño con esa clave y verás que cada pieza es una respuesta a ese problema de información. La `CancellationException` no es un mecanismo caprichoso: al viajar como excepción reutiliza el desenrollado de la pila, que es precisamente el protocolo que el lenguaje ya tenía para deshacer trabajo a medias de forma ordenada, con sus `finally` ejecutándose de dentro afuera. Que los puntos de suspensión sean también los puntos de cancelación no es una coincidencia feliz sino la elección central: un punto de suspensión es, por construcción, un lugar donde la corrutina ya estaba dispuesta a ceder el control, y por tanto un lugar donde sus invariantes están en orden. Suspender y poder ser cancelado resultan ser la misma propiedad mirada dos veces. Y que la excepción de cancelación no se trate como un fallo formaliza una distinción moral que muchos sistemas confunden: hay una diferencia real entre *esto se rompió* y *esto ya no hacía falta*, y mezclarlas llena los registros de errores falsos y hace que los verdaderos pasen desapercibidos. La consecuencia práctica que conviene llevarse es una inversión de la responsabilidad: la cancelación no la garantiza la biblioteca, la habilita. La biblioteca pone el aviso, propaga la petición por el árbol y ejecuta tus bloques de limpieza; poner los puntos donde ese aviso se lee sigue siendo trabajo tuyo, y ese trabajo es indelegable porque depende de un conocimiento que solo tú tienes. Por eso la pregunta que hay que hacerle a cualquier trozo de código asíncrono no es si es cancelable, sino dónde exactamente puede parar sin dejar nada a medias. Si no sabes responderla, la cancelación de ese código es una ilusión, por mucha estructura que tenga por encima.
+</Callout>
+
+<Challenge title="Haz cooperar a tu codigo mas terco">
+1. Escribe un bucle de cálculo puro de varios segundos dentro de un `launch`, cancélalo a mitad y demuestra con registros que sigue trabajando. Después hazlo cooperar de las tres formas y compara qué cambia en cada una.
+2. Explica cuándo elegirías `isActive` frente a `ensureActive` en un caso concreto tuyo, y qué diferencia hay en lo que ve el llamante.
+3. Reproduce el bug de la ventana entre cancelar y terminar: haz que una consulta cancelada escriba su resultado después de que la nueva ya lo hiciera. Arréglalo primero con `cancelAndJoin` y luego comprobando la actividad antes de publicar.
+4. Toma un recurso que haya que cerrar y protégelo con `finally`. Añade después una limpieza que necesite suspender y observa el error antes de envolverla en `NonCancellable`.
+5. Recorre los `intent` de una pantalla tuya y localiza el tramo más largo sin puntos de suspensión. Estima cuánto tiempo seguiría corriendo tras salir de la pantalla y corrígelo.
+</Challenge>

@@ -1,0 +1,149 @@
+---
+title: "select: esperar por lo primero que ocurra"
+description: "Todas las operaciones suspendidas que has visto hasta ahora esperan por una cosa concreta; select espera por la primera de varias y descarta el resto atómicamente, que es una capacidad de naturaleza distinta y no una comodidad sintáctica. Esta lección estudia las cláusulas de recepción y de envío, el sesgo determinista hacia la primera declarada y la inanición que provoca, la diferencia entre un timeout como cláusula y un timeout como envoltorio, y por qué esta parte de la librería lleva más de una década marcada como experimental sin que eso sea un accidente."
+subject: kotlin
+level: 25
+order: 4
+position: "25.4"
+duration: "23 min"
+---
+
+<Lead>
+Hasta aquí toda espera ha sido una espera por algo determinado: este canal, este resultado, este trabajo. Hay una clase de problemas que no se deja escribir así, la de esperar por lo primero que ocurra entre varias posibilidades sin comprometerse de antemano con ninguna. Consumir de dos fuentes y atender la que hable antes; enviar a la cola que tenga hueco; darle a una operación un plazo sin envolverla; competir dos peticiones y quedarse con la que gane. `select` es la construcción que resuelve esa familia entera, y su valor no está en la sintaxis sino en la garantía que la sostiene: de todas las alternativas declaradas, exactamente una se consuma y todas las demás quedan como si nunca se hubieran intentado.
+</Lead>
+
+<Goals>
+
+- Escribir esperas sobre varias fuentes con cláusulas de recepción, de envío y de resultado diferido.
+- Explicar la garantía de atomicidad de `select` y qué significa exactamente que las cláusulas perdedoras no tienen efecto.
+- Reconocer el sesgo hacia la primera cláusula declarada, la inanición que produce y cómo corregirla.
+- Situar el plazo como cláusula frente al plazo como envoltorio y valorar la marca de experimentalidad.
+
+</Goals>
+
+## La forma de la espera múltiple
+
+`select` es una función suspendida que recibe un bloque donde se declaran cláusulas. Cada cláusula asocia una operación potencialmente suspendida con el código que debe ejecutarse si esa es la que gana. La función se suspende hasta que alguna esté lista, ejecuta su bloque y devuelve su valor.
+
+```kotlin
+suspend fun atenderPrimero(a: ReceiveChannel<String>, b: ReceiveChannel<String>): String =
+    select {
+        a.onReceive { "de a: $it" }
+        b.onReceive { "de b: $it" }
+    }
+```
+
+Las cláusulas disponibles cubren casi todo lo que suspende en la librería. Del lado de los canales están `onReceive`, que falla si el canal está cerrado, y `onReceiveCatching`, que en ese caso entrega un `ChannelResult` en lugar de lanzar; del lado del envío está `onSend`, que espera a que haya hueco. Un `Deferred` ofrece `onAwait`, un `Job` ofrece `onJoin` y un `Mutex` ofrece `onLock`. Que la misma construcción sirva para esperar un dato, un hueco, un resultado y un cerrojo es lo que la convierte en un mecanismo general de espera y no en una utilidad de canales.
+
+El bloque de cada cláusula, conviene subrayarlo, se ejecuta *después* de que la operación se haya completado, con su resultado como receptor implícito, y puede a su vez suspender. Todas las cláusulas de un mismo `select` deben devolver el mismo tipo, que es el tipo de la expresión entera, y por eso a veces hay que anotarlo explícitamente cuando la inferencia no encuentra un supertipo útil.
+
+```kotlin
+// Enviar a la primera cola que acepte, sin bloquear en ninguna.
+select<Unit> {
+    rapida.onSend(evento) { }
+    lenta.onSend(evento) { }
+}
+```
+
+El caso completo, el que aparece en cualquier fusión real de dos fuentes, necesita además tratar el cierre, y para eso `onReceive` no basta: hay que usar la variante que devuelve un resultado y decidir qué significa que una de las ramas se haya agotado.
+
+```kotlin
+suspend fun fundirOrdenado(a: ReceiveChannel<Dato>, b: ReceiveChannel<Dato>) {
+    var vivos = 2
+    while (vivos > 0) select<Unit> {
+        a.onReceiveCatching { r -> r.getOrNull()?.let(::emitir) ?: vivos-- }
+        b.onReceiveCatching { r -> r.getOrNull()?.let(::emitir) ?: vivos-- }
+    }
+}
+```
+
+Ese bucle tiene un defecto instructivo: cuando una fuente se cierra, su cláusula sigue registrándose en cada vuelta y ganando de inmediato, porque un canal cerrado siempre está listo. Con el sesgo hacia la primera declarada, eso convierte el bucle en una rueda que gira sin consumir nada de la otra fuente. La corrección consiste en dejar de declarar la cláusula de una fuente agotada, y descubrir ese detalle a fuerza de leer el código es el rito de paso habitual de quien empieza con esta construcción.
+
+Ese ejemplo con `onSend` merece atención porque es donde se ve la garantía. Si ambas colas tuvieran hueco, el evento se envía a **una** sola: la cláusula perdedora no envía nada, no ocupa espacio y no deja rastro. Sin esa atomicidad, la construcción sería inútil, porque duplicar el evento en las dos colas es precisamente lo que nadie quiere.
+
+<Callout type="warn" title="Lo que no consume no siempre es inocuo">
+La atomicidad dice que solo una cláusula se completa. No dice que las cláusulas puedan reintentarse gratis en un bucle: cada evaluación de `select` registra y desregistra sus cláusulas en cada fuente, y hacerlo en un bucle cerrado sobre veinte canales es un coste real. Y si el bloque de la cláusula ganadora lanza una excepción después de haber recibido el elemento, ese elemento ya salió del canal y se pierde salvo que hayas puesto `onUndeliveredElement`.
+</Callout>
+
+## Sesgo, inanición y plazos
+
+`select` evalúa las cláusulas en el orden en que se declararon. Si en el momento de la llamada hay varias listas, gana siempre la primera declarada. Eso no es un detalle de implementación, es comportamiento documentado, y tiene una consecuencia desagradable: si la primera fuente está saturada, las siguientes no se atienden nunca.
+
+```kotlin
+// Inanición: si urgentes siempre tiene algo, normales no se lee jamás.
+while (true) select<Unit> {
+    urgentes.onReceive { atender(it) }
+    normales.onReceive { atender(it) }
+}
+```
+
+Ese código es correcto si el sesgo es lo que quieres, es decir, si estás implementando prioridades estrictas y aceptas que la cola de baja prioridad pueda no vaciarse nunca. Si lo que querías era equidad, existe `selectUnbiased`, que aleatoriza el orden de registro de las cláusulas y reparte a largo plazo. La elección entre ambas es una decisión de política de planificación, y escribir `select` sin haberla tomado es tomarla por omisión.
+
+<Mermaid code={`flowchart TD
+  A[select suspende] --> B[Registra todas las clausulas]
+  B --> C[Alguna esta lista ya]
+  C -->|Si| D[Gana la primera declarada]
+  C -->|No| E[Espera a la primera que se active]
+  D --> F[Se desregistran las demas]
+  E --> F
+  F --> G[Se ejecuta solo el bloque ganador]`} />
+
+Conviene además saber que el sesgo solo decide entre cláusulas que ya estaban listas en el momento del registro. Si ninguna lo está, `select` se suspende y gana sencillamente la primera que se active, con lo cual el orden del código deja de importar y el no determinismo del entorno toma el mando. Esto explica una observación que desconcierta a mucha gente al medir: bajo carga baja el reparto parece justo aunque uses la versión sesgada, y solo cuando la contención sube aparece la inanición. El sesgo no es un comportamiento constante, es un desempate.
+
+Los plazos entran en escena como una cláusula más. `onTimeout` compite con las otras alternativas y gana si nadie lo hace antes, lo cual es distinto de envolver la llamada en `withTimeout`. El envoltorio cancela la operación en curso y lanza una excepción; la cláusula simplemente ofrece un camino alternativo que no cancela nada y no lanza nada.
+
+```kotlin
+suspend fun leerConPlazo(c: ReceiveChannel<Dato>): Dato? = select {
+    c.onReceive { it }
+    onTimeout(500) { null }        // camino alternativo, no cancelación
+}
+```
+
+La distinción importa cuando la operación que espera tiene efectos. Con el envoltorio, vencido el plazo, la operación se cancela y todo lo que hubiera empezado se deshace por las rutas de limpieza habituales. Con la cláusula no se cancela nada: el canal sigue ahí, el elemento que estaba a punto de llegar llegará, y quien lo reciba será la siguiente llamada. Para leer de una fuente compartida eso suele ser lo deseable; para una petición de red que ya no interesa a nadie, es una fuga con otro nombre.
+
+La otra aplicación clásica de la construcción no involucra canales en absoluto: competir dos cálculos y quedarse con el que termine antes. Es el patrón de la petición cubierta, donde se lanza la misma consulta a dos réplicas para recortar la cola de latencia.
+
+```kotlin
+suspend fun elMasRapido(a: Deferred<Respuesta>, b: Deferred<Respuesta>): Respuesta =
+    select {
+        a.onAwait { it }
+        b.onAwait { it }
+    }   // el perdedor sigue vivo: cancélalo o lo estarás pagando
+```
+
+El comentario de la última línea señala el error más frecuente con `onAwait`. La cláusula perdedora no cancela nada: el otro trabajo continúa consumiendo recursos hasta terminar, y su excepción, si falla, seguirá propagándose por el ámbito. Envolver la competición en un `coroutineScope` propio y cancelar a los hermanos al salir es la única forma de que ganar signifique también que el resto se detiene.
+
+<Cards>
+  <Card icon="⚖️" title="Exactamente una gana">
+    La selección es atómica: una cláusula se completa y el resto se desregistran sin efecto. Es la propiedad que hace correcto el envío múltiple.
+  </Card>
+  <Card icon="📐" title="Sesgo declarativo">
+    El orden del código es el orden de prioridad. Útil deliberadamente, letal por descuido. `selectUnbiased` es el antídoto.
+  </Card>
+  <Card icon="⏱️" title="Plazo sin cancelar">
+    `onTimeout` es una rama más, no una interrupción. Cuando el plazo debe abortar el trabajo, el envoltorio sigue siendo la herramienta correcta.
+  </Card>
+  <Card icon="🧪" title="Marca experimental">
+    Varias cláusulas conservan la anotación de API experimental. La implementación se reescribió por completo hace pocas versiones y la superficie aún puede moverse.
+  </Card>
+</Cards>
+
+## La experimentalidad no es una formalidad
+
+Casi todo lo que rodea a `select` exige un `OptIn`, y esa marca lleva ahí desde el principio. Conviene saber por qué. El motor de selección tuvo que ser reescrito por completo cuando se rehizo la implementación de los canales, porque el algoritmo antiguo, basado en un descriptor atómico de operación múltiple, era correcto pero costoso y limitaba la escalabilidad de las primitivas que participaban en él. La versión actual reduce ese coste drásticamente a cambio de un protocolo de registro más sutil, y ese protocolo es el que cualquier tipo que quiera ofrecer una cláusula propia tiene que implementar. Ahí está la razón de la marca: la interfaz que permite escribir cláusulas nuevas todavía no se considera estable.
+
+Hay un segundo motivo, más mundano, para que la marca siga puesta: la superficie de cláusulas ha cambiado varias veces. La variante que devolvía nulo al cerrarse un canal fue sustituida por la que devuelve un resultado encapsulado, la cláusula de plazo ha ido y venido en su forma exacta, y las primitivas de sincronización han ido incorporando cláusulas propias con el tiempo. Nada de eso rompe código escrito hoy, pero explica por qué la librería prefiere no comprometerse todavía.
+
+Para el código de aplicación, la lectura práctica es tranquilizadora y precisa a la vez. Usar `select` con cláusulas de la propia librería es seguro y se hace en producción todos los días. Construir cláusulas propias implementando la interfaz interna es apostar contra la siguiente versión menor. Y hay un límite que sí conviene recordar siempre: no existe una cláusula para colectar un `Flow`, porque un flujo frío no es una fuente esperable sino una descripción de cómo producir; si necesitas seleccionar sobre flujos, el paso obligatorio es materializarlos antes en canales.
+
+<Callout type="dios" title="select no es una espera múltiple sino una transacción sobre eventos futuros, y su verdadera dificultad no está en escribirla sino en aceptar que introduce no determinismo deliberado en tu programa">
+Lo que hace `select` no tiene análogo entre las estructuras de control ordinarias, y esa es la razón por la que se aprende con facilidad y se usa mal con la misma facilidad. Un `if` decide sobre un valor que ya existe; un `when` selecciona entre ramas conocidas; incluso un `await` sobre varias tareas decide sobre resultados que ya se están calculando. `select` hace algo cualitativamente distinto: declara una intención condicional sobre eventos que todavía no han ocurrido, la registra simultáneamente en varias fuentes independientes, y luego debe garantizar que cuando dos de esas fuentes se activen a la vez —cosa que ocurrirá, porque están en hilos distintos— solo una de las intenciones se materialice y la otra se retire sin haber dejado consecuencia alguna. Eso es, técnicamente, una transacción: varias operaciones tentativas, una única confirmación, retirada limpia de las demás. Que la librería lo consiga sin cerrojos, con un protocolo de registro por fases sobre estructuras atómicas, es una pieza de ingeniería seria, y explica por qué el coste por selección no es despreciable y por qué la interfaz para extenderlo sigue sin ser pública. Pero el precio conceptual lo paga tu programa, no la librería. En el momento en que escribes un `select`, el resultado de tu función deja de ser una función de sus entradas y pasa a depender del orden temporal en que se activaron unas fuentes concurrentes: dos ejecuciones con exactamente los mismos datos pueden tomar ramas distintas, y ninguna de las dos es incorrecta. Ese no determinismo es exactamente lo que pediste —querías atender a quien hablase primero— pero se propaga a todo lo que dependa del resultado, y con él se van las pruebas reproducibles, la depuración por relectura y la capacidad de razonar sobre el estado siguiente sin pensar en el tiempo. Por eso el sesgo hacia la primera cláusula, que parece una rareza, es en realidad el rasgo más humano del diseño: es el único punto donde puedes reinyectar determinismo, decidiendo por escrito quién gana cuando todos están listos. Usar `select` bien consiste en tomar esa decisión conscientemente y en reducir su alcance al mínimo: el no determinismo debe entrar por un punto, resolverse allí mismo y salir convertido en un valor ordinario, nunca filtrarse hacia el resto del sistema.
+</Callout>
+
+<Challenge title="Somete select a presión">
+1. Escribe un consumidor de dos canales con `select` y satura el primero. Cuenta cuántos elementos del segundo se atienden y confirma la inanición.
+2. Cambia a `selectUnbiased` y repite la medida. Documenta el reparto obtenido y en qué caso preferirías cada versión.
+3. Implementa un envío a la primera de dos colas con `onSend` y verifica, contando en ambos destinos, que el total coincide exactamente con lo enviado.
+4. Compara `onTimeout` con `withTimeoutOrNull` sobre una operación lenta: comprueba en cuál de los dos la operación sigue viva después de vencer el plazo.
+5. Haz que el bloque de la cláusula ganadora lance una excepción justo después de recibir. Localiza el elemento perdido y recupéralo con `onUndeliveredElement`.
+</Challenge>

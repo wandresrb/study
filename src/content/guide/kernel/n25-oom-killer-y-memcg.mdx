@@ -1,0 +1,155 @@
+---
+title: "El OOM killer y memcg: matar para seguir vivo"
+description: "Cuándo se rinde el kernel y dispara el OOM killer, cómo puntúa a las víctimas con oom_badness, oom_score y oom_score_adj, por qué el oom_reaper recupera la memoria sin esperar a que el proceso muera, y cómo los cgroups v2 convierten una catástrofe global en una contenida por servicio."
+subject: kernel
+level: 25
+order: 5
+position: "25.5"
+duration: "18 min"
+---
+
+<Lead>
+Cuando el reclaim ya no libera lo suficiente, el reclaim directo se agota y cada reintento fracasa, al kernel le queda un solo recurso brutal: matar un proceso para que los demás vivan. El OOM killer elige a la víctima por su "maldad", el `oom_reaper` le arranca la memoria sin esperar a que agonice, y los cgroups convierten lo que sería una catástrofe para toda la máquina en un incidente acotado a un servicio. Es el kernel admitiendo la derrota, pero haciéndolo con un único principio inquebrantable: **progresar cueste lo que cueste**.
+</Lead>
+
+<Goals>
+
+- Entender cuándo se dispara el OOM killer y bajo qué restricciones.
+- Leer `oom_badness`, `oom_score`, `oom_score_adj` y la inmunidad -1000.
+- Comprender el `oom_reaper` y por qué el reaping es asíncrono.
+- Ver cómo memcg acota y aísla la presión con `memory.max` y `memory.oom.group`.
+
+</Goals>
+
+## Cuándo se rinde el kernel
+
+El OOM killer es el final del camino lento de asignación. Tras despertar a `kswapd`, hacer reclaim directo, compactar y reintentar varias veces sin conseguir memoria, `__alloc_pages_may_oom` llama a `out_of_memory`. Es un evento raro en máquinas con swap, porque antes suelen aparecer el thrashing o el reclaim directo; cuando llega, es que no queda nada que exprimir.
+
+```c
+/* mm/oom_kill.c */
+bool out_of_memory(struct oom_control *oc)
+{
+	if (oom_killer_disabled)
+		return false;
+
+	select_bad_process(oc);              /* rellena oc->chosen */
+	if (!oc->chosen) {
+		/* nadie a quien matar y sin memoria: pánico */
+		if (!is_sysrq_oom(oc) && !is_memcg_oom(oc))
+			panic("Out of memory and no killable processes\n");
+		return false;
+	}
+	oom_kill_process(oc, "Out of memory");
+	return true;
+}
+```
+
+El `oc->constraint` distingue el alcance del incidente. `CONSTRAINT_NONE` es el OOM global: falta memoria en toda la máquina. `CONSTRAINT_MEMCG` es un OOM de cgroup: un grupo topó con su límite aunque el sistema tenga RAM de sobra. Existen además `CONSTRAINT_CPUSET` y `CONSTRAINT_MEMORY_POLICY` para cuando la escasez es de un subconjunto de nodos NUMA. La restricción decide sobre **qué población** se elige a la víctima.
+
+## Elegir a la víctima: oom_badness
+
+El kernel no mata al azar ni al más viejo: puntúa a cada candidato con `oom_badness` y elimina al de mayor puntuación. La base del cálculo es sencilla y justa —cuánta memoria libera matarlo— y se corrige con un ajuste que el administrador controla:
+
+```c
+/* mm/oom_kill.c */
+long oom_badness(struct task_struct *p, unsigned long totalpages)
+{
+	long points;
+	long adj;
+
+	adj = (long)p->signal->oom_score_adj;
+	if (adj == OOM_SCORE_ADJ_MIN) {      /* -1000: intocable */
+		task_unlock(p);
+		return LONG_MIN;
+	}
+
+	/* base: rss + swap + tablas de páginas, en páginas */
+	points = get_mm_rss(p->mm) + get_mm_counter(p->mm, MM_SWAPENTS) +
+		 mm_pgtables_bytes(p->mm) / PAGE_SIZE;
+	task_unlock(p);
+
+	/* oom_score_adj desplaza en milésimas del total */
+	adj *= totalpages / 1000;
+	points += adj;
+
+	return points;
+}
+```
+
+La puntuación mide, en esencia, la **huella de memoria** del proceso: `rss` residente, más lo que tiene en swap, más sus tablas de páginas. Sobre esa base, `oom_score_adj` —un entero de -1000 a 1000 en `/proc/PID/oom_score_adj`— la desplaza en unidades de milésimas de la RAM total. Un valor positivo ofrece el proceso como carne de cañón; uno negativo lo protege. El extremo `-1000`, `OOM_SCORE_ADJ_MIN`, devuelve `LONG_MIN`: inmunidad total, el proceso jamás será elegido. La puntuación efectiva resultante se lee en `/proc/PID/oom_score`.
+
+```bash
+# ¿quién moriría primero? mayor oom_score = primero en la lista
+for p in /proc/[0-9]*; do
+	printf '%6s %5s %s\n' "$(cat $p/oom_score 2>/dev/null)" \
+		"$(basename $p)" "$(cat $p/comm 2>/dev/null)"
+done | sort -rn | head
+# proteger un proceso crítico de por vida:
+echo -1000 > /proc/$(pidof sshd)/oom_score_adj
+```
+
+## El oom_reaper: no esperes al cadáver
+
+Matar es enviar `SIGKILL`, pero un `SIGKILL` no libera memoria de inmediato: la víctima debe despertar, salir y que su `mm` se desmonte. ¿Y si la víctima está atascada esperando justamente un lock que retiene el hilo que provocó el OOM? Entonces no muere, no libera nada, y el sistema se congela en un abrazo mortal. Para romper esa posibilidad existe el `oom_reaper`, un kthread que **recupera la memoria de la víctima sin esperar a que muera**:
+
+```c
+/* mm/oom_kill.c — segar el mm de la víctima en paralelo a su muerte */
+static bool __oom_reap_task_mm(struct mm_struct *mm)
+{
+	struct vm_area_struct *vma;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	for_each_vma(vmi, vma) {
+		if (vma->vm_flags & (VM_HUGETLB | VM_PFNMAP))
+			continue;
+		/* desmapear solo anónimas privadas: liberables al instante */
+		if (vma_is_anonymous(vma) || !(vma->vm_flags & VM_SHARED))
+			unmap_page_range(&tlb, vma, range.start,
+					 range.end, NULL);
+	}
+	return true;
+}
+```
+
+El segador desmapea las regiones anónimas privadas de la víctima —las que se liberan sin escribir a ningún sitio— aun antes de que el proceso salga, y marca el `mm` con `MMF_OOM_SKIP` cuando termina. Así el kernel obtiene memoria en milisegundos y **garantiza el progreso** aunque la víctima tarde o se quede colgada. Es la encarnación de una desconfianza sana: nunca fíes en que el condenado morirá a tiempo; arráncale lo que puedas tú mismo.
+
+<Mermaid code={`flowchart TD
+  A[Asignacion falla tras reclaim y reintentos] --> B[Que restriccion aplica]
+  B -->|Global| C[Recorre todos los procesos]
+  B -->|memcg| D[Recorre solo el cgroup]
+  C --> E[oom_badness puntua cada tarea]
+  D --> E
+  E --> F[Elige la mayor puntuacion]
+  F --> G[SIGKILL a la victima]
+  G --> H[oom_reaper recupera su mm sin esperar]
+  H --> I[Memoria liberada y progreso garantizado]`} />
+
+## memcg: de catástrofe global a incidente local
+
+El controlador de memoria de cgroup v2 —memcg— transforma la naturaleza del OOM. En lugar de un evento que amenaza a toda la máquina, la presión se acota a un grupo. `memory.max` es el tope duro: al alcanzarlo, el grupo hace reclaim contra sí mismo y, si no cede, sufre un OOM **de su propia población**, sin tocar a los demás. `memory.high` frena antes, estrangulando al grupo con throttling en vez de matar. Y `memory.min` y `memory.low` protegen memoria por debajo de la cual el reclaim no expulsa.
+
+```bash
+# cgroup v2: acotar y aislar la presión de un servicio
+echo 512M > /sys/fs/cgroup/carga.slice/memory.max      # tope duro
+echo 400M > /sys/fs/cgroup/carga.slice/memory.high     # estrangula antes
+echo 1    > /sys/fs/cgroup/carga.slice/memory.oom.group # matar el grupo entero
+cat /sys/fs/cgroup/carga.slice/memory.events           # oom, oom_kill, max...
+```
+
+`memory.oom.group` añade un matiz decisivo: cuando se activa, el OOM no mata a un proceso suelto sino al **cgroup completo** como una unidad, útil para cargas donde matar la mitad de los hilos deja un servicio corrupto. Y `memory.events` expone contadores —`oom`, `oom_kill`, `max`, `high`— que permiten a un supervisor reaccionar. Sobre esta base, gestores como `systemd-oomd` vigilan la PSI (nivel 25.3) y matan carga en espacio de usuario **antes** de que el kernel llegue a su OOM, con más contexto sobre qué es prescindible.
+
+<Callout type="info" title="El OOM de memcg es el mismo mecanismo, con otro alcance">
+`select_bad_process` y `oom_badness` no cambian entre el OOM global y el de cgroup: lo único que cambia es la población sobre la que iteran y el `totalpages` que normaliza la puntuación. Esa reutilización es la elegancia del diseño: acotar la presión no exigió un subsistema nuevo, solo parametrizar el alcance del que ya existía. La misma maquinaria, restringida, se convierte en aislamiento.
+</Callout>
+
+<Callout type="dios" title="El OOM killer es cómo la casa cobra la apuesta del overcommit">
+Linux permite a los procesos reservar mucha más memoria virtual de la que existe físicamente: es el **overcommit**, y es una apuesta. La apuesta casi siempre se gana, porque casi ningún proceso toca de golpe toda la memoria que pidió; el kernel entrega páginas físicas solo cuando se escriben de verdad, y así una máquina de 32 GB sirve alegremente a procesos que "reservaron" 100. Pero una apuesta puede perderse, y el OOM killer es el mecanismo por el que **la casa cobra cuando la realidad reclama lo que se prometió y no existe**. Vista así, toda la gestión de memoria del kernel es un sistema de crédito: `malloc` es una promesa, la falta de página es el cobro diferido de esa promesa, el reclaim y el swap son refinanciación, y el OOM killer es la ejecución de la deuda cuando ya no hay refinanciación posible. Lo profundo es el principio que gobierna la ejecución: **entre congelarse para siempre y matar a alguien, el kernel elige siempre matar**, porque un sistema que no progresa está tan muerto como uno apagado, pero sin la dignidad de poder reiniciarse. El `oom_reaper` lleva ese principio al extremo —ni siquiera confía en que la víctima muera para recuperar su memoria— y memcg lo civiliza —convierte una ejecución que arruinaría a toda la máquina en una quiebra acotada a un solo deudor—. El overcommit es lo que hace a Linux eficiente; el OOM killer es lo que lo hace, pese a ello, capaz de sobrevivir a su propia ambición.
+</Callout>
+
+<Challenge title="Juega a ser el segador">
+1. Traza el camino de `__alloc_pages_may_oom` a `out_of_memory` y di qué reintentos lo preceden.
+2. Calcula a mano la `oom_badness` de dos procesos con `rss` distinto y `oom_score_adj` de 0 y 500.
+3. Protege un proceso con `oom_score_adj = -1000` y explica por qué `oom_badness` devuelve `LONG_MIN`.
+4. Razona qué desastre evita el `oom_reaper` desmapeando el `mm` antes de que la víctima salga.
+5. Crea un cgroup v2 con `memory.max` pequeño, provoca su OOM local y observa `memory.events`; luego activa `memory.oom.group` y compara.
+</Challenge>

@@ -1,0 +1,148 @@
+---
+title: "Service tokens y mTLS: identidad para máquinas"
+description: "Ninguna máquina sabe seguir una redirección hacia un proveedor de identidad, así que el tráfico automático necesita su propia forma de demostrar quién es. Recorremos los service token de Access con su acción Service Auth y su claim common_name, la rotación como impuesto operativo de todo secreto portador, el paso a mTLS donde la clave privada nunca viaja y el certificado de cliente se convierte en selector de política, el binding de certificado que permite a un Worker presentarse ante una API protegida, y el criterio para elegir entre service binding, token y certificado sin inventar autenticación donde no hace falta."
+subject: cloudflare
+level: 35
+order: 5
+position: "35.5"
+duration: "22 min"
+---
+
+<Lead>
+Todo lo anterior daba por supuesto un navegador y una persona detrás. Ahora quita las dos cosas. El cron que sincroniza el catálogo a las tres de la mañana no sabe leer una pantalla de inicio de sesión; el proveedor de pagos que te avisa por webhook no tiene cuenta en tu directorio; el servicio interno que llama a tu `API` de facturación no puede introducir un segundo factor. Y sin embargo todos ellos necesitan exactamente lo mismo que un usuario: llegar a tu Worker habiendo demostrado que son quienes dicen. Esta lección cierra el nivel con las dos formas de conseguirlo, un secreto compartido y un par de claves, y con la comparación entre ambas, que resulta ser una de las distinciones más consecuentes de toda la criptografía aplicada.
+</Lead>
+
+<Goals>
+
+- Emitir y consumir un `service token` con la acción `Service Auth` sin redirecciones.
+- Diseñar la rotación de un secreto portador con solapamiento y sin ventana de corte.
+- Configurar `mTLS` y usar el certificado de cliente como selector de política.
+- Elegir entre `service binding`, `service token` y certificado según dónde vive el llamante.
+
+</Goals>
+
+## El problema de la máquina que llama
+
+El flujo de la lección dos termina en una redirección hacia el proveedor de identidad. Para un navegador eso es transparente; para un cliente automático es un error. Recibe una respuesta de redirección hacia un dominio que no conoce, y en el mejor de los casos falla con claridad y en el peor la sigue, aterriza en una página `HTML` y guarda ese `HTML` como si fuera tu respuesta `JSON`. Por eso `Access` distingue una acción específica, `Service Auth`, que no redirige jamás: o la credencial viene en la petición, o la respuesta es un error inmediato.
+
+Esa acción se evalúa antes que las de identidad humana, lo cual no es un capricho sino una necesidad. Si se evaluase después, una política de `Allow` colocada arriba interceptaría al cliente automático y lo mandaría al proveedor de identidad antes de que nadie mirase su credencial de máquina. El orden garantiza que el tráfico sin persona detrás se resuelva sin persona detrás.
+
+Conviene separar desde el principio dos casos que se confunden y tienen soluciones opuestas. Cuando tú controlas al llamante, porque es tu cron, tu proceso por lotes o el servicio de un socio con quien hablas, puedes imponerle una credencial y todo lo de esta lección se aplica. Cuando no lo controlas, porque es la pasarela de pagos avisándote de un cobro o el proveedor de correo notificando un rebote, no hay ninguna credencial que puedas exigirle: solo puedes verificar la firma que ese tercero calcula sobre el cuerpo con un secreto compartido. Ese camino no pasa por `Access` en absoluto, y el error de intentar meterlo aquí produce sistemas donde el webhook simplemente deja de llegar sin que nadie se entere durante semanas.
+
+<Callout type="warn" title="Nunca en la cadena de consulta">
+Un secreto en un parámetro de la dirección acaba en el registro de accesos, en el historial del navegador, en la cabecera de referencia hacia terceros y en cualquier proxy del camino. Los secretos van en cabeceras, siempre, y las cabeceras de credencial se excluyen explícitamente de todo registro que escribas tú.
+</Callout>
+
+## El secreto portador y su impuesto
+
+Un `service token` de `Access` son dos valores: un identificador de cliente, que termina en `.access` y no es secreto, y un secreto de cliente que se muestra una única vez en el momento de crearlo. El cliente los envía en dos cabeceras y `Access` los valida en el borde.
+
+```bash
+curl https://api.ejemplo.com/sincronizar \
+  -H "CF-Access-Client-Id: $CF_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CF_CLIENT_SECRET"
+```
+
+Cuando la validación pasa, `Access` emite un `JWT` igual al de una persona salvo en dos campos, y esa diferencia es la que tu Worker debe usar: el sujeto viene vacío y aparece `common_name` con el identificador de cliente. Toda la verificación de la lección tres sigue aplicando sin cambios, y ese campo te permite distinguir sin ambigüedad una llamada de máquina de una llamada de persona, que es una distinción que tu lógica de autorización casi siempre quiere hacer.
+
+```ts
+const claims = await identidad(request);
+if (!claims) return new Response("no autorizado", { status: 403 });
+
+const esMaquina = Boolean(claims.common_name) && !claims.sub;
+if (esMaquina && request.method !== "POST") {
+  return new Response("operacion no permitida a un cliente automatico", { status: 403 });
+}
+```
+
+Ese fragmento hace algo que conviene convertir en costumbre: acotar por tipo de llamante y no solo por identidad. Una máquina suele necesitar dos o tres operaciones concretas y ninguna más, mientras que una persona necesita explorar. Reflejar esa diferencia en el código cuesta tres líneas y reduce el alcance de un secreto filtrado a lo que ese secreto tenía que poder hacer.
+
+Desde tu lado, el secreto se guarda como cualquier otro: nunca en el manifiesto, nunca en una variable de texto plano, sino como secreto cifrado o en el almacén de secretos, y se lee desde `env` en el momento de la llamada saliente.
+
+<Callout type="warn" title="Un secreto portador se degrada con cada uso">
+El secreto viaja en cada petición. Eso significa que puede acabar en el registro de un proxy intermedio, en la traza de un error, en un informe de fallo, en la captura de un depurador o en el ejemplo de `curl` que alguien pegó en una página interna hace dos años. Ninguna de esas fugas produce una alerta. Por eso la vida de un `service token` no es una preferencia: es la cota superior del daño de una fuga que todavía no has descubierto.
+</Callout>
+
+La duración del token es configurable y el valor por defecto es generoso, del orden de un año, lo que en la práctica significa que muchos despliegues acaban con credenciales que llevan más tiempo vivas que la mitad del equipo que las usa. Elegir una vida corta obliga a automatizar la renovación desde el primer día, y esa obligación es precisamente el beneficio: un mecanismo de rotación que se ejercita cada mes funciona el día que hace falta, y uno que no se ha ejecutado nunca es una hipótesis.
+
+La rotación es la contrapartida obligatoria, y hacerla sin corte exige solapamiento. El patrón correcto tiene cuatro pasos y ninguno se puede saltar: emites el token nuevo, lo despliegas en todos los llamantes, verificas en los registros de acceso que el identificador antiguo ya no aparece, y solo entonces revocas. Invertir el tercero y el cuarto es la causa más habitual de una avería nocturna en un proceso por lotes que nadie recordaba que existía. Una política que admita cualquier `service token` válido de la organización simplifica la rotación y a cambio renuncia a distinguir quién llama, lo cual solo es aceptable si de verdad da igual.
+
+## mTLS: la clave que no viaja
+
+La alternativa cambia la naturaleza de la prueba. Con `TLS` mutuo el cliente presenta un certificado durante el saludo, y demuestra que posee la clave privada correspondiente sin enviarla nunca. Cloudflare permite subir la autoridad certificadora que emite esos certificados, asociarla a los nombres de anfitrión que la exigen, y a partir de ahí el resultado de la validación queda disponible como campos evaluables tanto en reglas del `WAF` como en selectores de política de `Access`, entre ellos si el certificado se verificó, si está revocado, su nombre distinguido de sujeto y su huella.
+
+<Cards>
+  <Card icon="🔑" title="Posesión, no revelación">
+    La clave privada no aparece en ninguna petición. Ningún registro, traza ni captura puede contenerla, porque nunca sale del cliente.
+  </Card>
+  <Card icon="🏷️" title="Identidad en el sujeto">
+    El nombre común del certificado identifica al llamante y sirve de selector, sin necesidad de un segundo secreto.
+  </Card>
+  <Card icon="🧾" title="El coste es la PKI">
+    Emitir, distribuir, renovar y revocar certificados es trabajo real. Es el precio de que la credencial no viaje.
+  </Card>
+  <Card icon="🧱" title="Se combina, no se sustituye">
+    Exigir certificado válido en `require` y `service token` en `include` da dos factores independientes para una máquina.
+  </Card>
+</Cards>
+
+La contrapartida de `mTLS` está toda concentrada en una palabra: revocación. Mientras el certificado sea válido y la clave siga en manos de quien la tenga, la puerta está abierta, y retirar esa validez antes de tiempo exige que el verificador consulte una lista de revocados, que la lista esté disponible y que esté fresca. La respuesta moderna a ese problema no consiste en mejorar las listas sino en evitarlas: emitir certificados de vida muy corta, de horas en lugar de años, y renovarlos automáticamente mientras la máquina siga mereciendo el acceso. La caducidad hace por ti lo que la revocación nunca terminó de hacer bien, y de paso convierte una operación manual de emergencia en un proceso rutinario que se ejercita cada día.
+
+Del lado saliente, un Worker que deba presentarse ante una `API` protegida con `mTLS` no puede hacerlo con un `fetch` normal, porque no hay dónde poner la clave. Wrangler resuelve esto subiendo el par y exponiéndolo como binding, y a partir de ahí el propio binding tiene un método `fetch` que realiza la petición presentando el certificado.
+
+```bash
+npx wrangler mtls-certificate upload \
+  --cert cliente.pem --key cliente.key --name cert-interno
+```
+
+```toml
+[[mtls_certificates]]
+binding = "CERT_INTERNO"
+certificate_id = "d3ad...beef"
+```
+
+```ts
+const respuesta = await env.CERT_INTERNO.fetch("https://interno.ejemplo.com/facturas");
+```
+
+Hay un detalle de esa configuración que conviene no pasar por alto: el manifiesto guarda el identificador del certificado, no el certificado. La clave privada se subió una vez a la plataforma y ya no vuelve a existir como texto en ningún sitio que tú controles, ni en el repositorio, ni en la tubería de despliegue, ni en la memoria de tu proceso. Ese es exactamente el mismo patrón que los secretos cifrados del nivel ocho, llevado ahora a material criptográfico asimétrico.
+
+Fíjate en la simetría con todo el nivel: la clave privada nunca aparece en tu código, no se puede imprimir, no se puede filtrar por un registro y no existe como cadena que alguien pueda copiar. El binding entrega una capacidad, no un valor, que es exactamente el modelo de capacidades que viste en el nivel dos aplicado ahora a la identidad de tu propio servicio.
+
+## Elegir sin inventar autenticación
+
+Antes de configurar nada conviene hacerse una pregunta que ahorra la mitad del trabajo: dónde vive el llamante. Si es otro Worker de tu propia cuenta, no necesitas ninguna de las dos cosas de esta lección. Un `service binding` entrega la petición al Worker destino sin salir a la red, sin resolver `DNS`, sin coste de `TLS` y sin exponer un extremo público que haya que proteger. Poner un `service token` entre dos Workers de la misma cuenta es fabricar un secreto, un canal y un problema de rotación para resolver algo que la plataforma ya resuelve por construcción.
+
+| Escenario | Mecanismo | Por qué |
+| --- | --- | --- |
+| Worker a Worker, misma cuenta | `service binding` | No hay red \| no hay credencial que rotar |
+| Cliente externo o tercero | `service token` | Solo exige dos cabeceras y una política |
+| Socio con exigencias fuertes | `mTLS` | La credencial no viaja \| identidad en el certificado |
+| Salida hacia una `API` protegida | Binding de certificado | La clave privada nunca es un valor en tu código |
+
+<Mermaid code={`flowchart TD
+  Q[quien llama] --> A[otro Worker de tu cuenta]
+  A --> B[service binding sin credencial]
+  Q --> C[sistema externo]
+  C --> D[puedes gestionar una autoridad certificadora]
+  D --> E[mTLS con nombre comun como selector]
+  C --> F[no puedes gestionar PKI]
+  F --> G[service token con Service Auth y rotacion]
+  E --> H[verifica el JWT en el Worker]
+  G --> H`} />
+
+Hay una tentación intermedia que conviene desactivar antes de que aparezca: usar un `service token` entre dos Workers de la misma cuenta porque así el código del llamado es idéntico venga de donde venga. La uniformidad es real y el precio también, porque acabas de crear un extremo público que antes no existía, un secreto que rotar, una latencia de red y una superficie que proteger, todo para no escribir una rama. Si de verdad quieres una sola forma de autorizar, la manera correcta es que el `service binding` entregue el sujeto como argumento de una llamada de tipo `RPC` y que la lógica de autorización sea la misma función en ambos casos.
+
+Repara en que las dos ramas terminan en el mismo sitio. Da igual cómo se haya demostrado la identidad en el borde: el Worker sigue recibiendo un `JWT` de `Access` y sigue teniendo que verificarlo con las mismas cuatro comprobaciones de la lección tres. Esa uniformidad es el mayor beneficio práctico del diseño, porque tu código de autorización no necesita saber si al otro lado había una persona con segundo factor o un proceso por lotes con un certificado: recibe un sujeto probado y decide.
+
+<Callout type="dios" title="Un secreto se usa revelándolo y una clave se usa sin revelarla: de esa asimetría sale toda la operación moderna de credenciales, y la caducidad acaba sustituyendo a la revocación">
+Cierra el nivel deteniéndote en la diferencia que separa las dos mitades de esta lección, porque no es una preferencia de implementación sino una de las distinciones más productivas de la criptografía aplicada, y explica por decreto casi todo lo que la industria ha hecho en los últimos quince años. Un secreto compartido tiene una propiedad incómoda que su nombre disimula: para probar que lo tienes, hay que enseñarlo. La credencial y la prueba de la credencial son el mismo objeto, de modo que cada uso es una revelación, y cada revelación deja una copia en algún sitio que no controlas del todo. La seguridad de un secreto portador decrece de forma monótona con el número de veces que se usa y con el número de sistemas que lo observan al pasar, y no hay ninguna manera de detener esa erosión: solo se puede reiniciar el contador rotando, que es precisamente por qué la rotación es un impuesto y no una buena práctica opcional. Un par de claves rompe esa identidad. La prueba deja de ser el secreto y pasa a ser una operación hecha con el secreto, con lo que usar y revelar se separan por primera vez, y la clave privada puede pasarse la vida entera sin salir del dispositivo, o incluso sin salir de un módulo de hardware donde ni siquiera el sistema operativo puede leerla. Esa separación es la que hace que un certificado de cliente pueda usarse un millón de veces sin degradarse ni un ápice, y es la razón profunda por la que `mTLS` es cualitativamente distinto y no solo más incómodo. Ahora la parte que casi nadie termina de razonar, y que devuelve la lección al primer día del nivel. Al ganar la asimetría, el coste operativo no desaparece: se desplaza de la rotación a la revocación, es decir, del problema de cambiar un valor al problema de convencer a todo el mundo de que un valor que sigue siendo criptográficamente válido ya no debe aceptarse. Y ese segundo problema es mucho peor, porque es un problema de consenso distribuido con adversario: exige que cada verificador consulte una lista, que la lista esté disponible, que esté fresca, y que la indisponibilidad de la lista no se convierta en una denegación de servicio ni en una autorización por omisión. La historia entera de las listas de revocación es la historia de ese fracaso. La salida que la industria terminó encontrando es de una elegancia brutal: dejar de revocar y empezar a caducar. Si el certificado dura minutos u horas en lugar de años, la revocación se vuelve innecesaria porque el tiempo la hace por ti, y un problema de consenso distribuido se ha convertido en un problema de reloj, que es la clase de problema que sí sabemos resolver a escala planetaria. Ahí se cierra el círculo que abrió la primera lección: la confianza es una función del tiempo transcurrido desde la última prueba, y todo el arte consiste en hacer que el intervalo entre dejar de merecer un acceso y perderlo sea tan corto que ya no haga falta ningún mecanismo para acortarlo.
+</Callout>
+
+<Challenge title="Autentica una máquina de las dos maneras">
+1. Emite un `service token`, escribe una política de `Service Auth` y comprueba que sin las cabeceras la respuesta es un error inmediato y no una redirección.
+2. Verifica en tu Worker que el `JWT` recibido trae el sujeto vacío y `common_name` con el identificador de cliente, y ramifica tu autorización a partir de ese hecho.
+3. Ejecuta una rotación completa con solapamiento y demuestra con los registros de acceso que el identificador antiguo dejó de usarse antes de revocarlo.
+4. Configura `mTLS` sobre el mismo camino y añade el certificado válido como `require`, dejando el `service token` en `include`. Comprueba que ahora hacen falta los dos.
+5. Sustituye una llamada saliente autenticada por secreto por una con binding de certificado y razona qué clase de fuga acabas de volver imposible.
+</Challenge>

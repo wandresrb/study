@@ -1,0 +1,158 @@
+---
+title: "errno y el manejo de errores"
+description: "Por qué errno no es una variable, cómo se volvió local a cada hilo, las tres reglas que casi todo el mundo incumple y las convenciones de error de POSIX que conviven sin ponerse de acuerdo."
+subject: c23
+level: 22
+order: 4
+position: "22.4"
+duration: "17 min"
+---
+
+<Lead>
+`errno` parece la parte más humilde de la libc: un entero global donde se deja un número cuando algo sale mal. Casi todo en esa frase es falso. No es una variable, no es global, no se pone a cero solo, y consultarlo cuando no toca produce diagnósticos inventados. Detrás de ese nombre de siete letras hay una lección completa sobre estado implícito, hilos y el coste de una decisión de diseño tomada en 1978.
+</Lead>
+
+<Goals>
+
+- Explicar qué expande realmente el identificador `errno` y por qué dejó de ser una variable.
+- Aplicar las tres reglas que gobiernan cuándo se puede consultar su valor.
+- Distinguir las convenciones de error que POSIX mantiene en paralelo y cuándo aplica cada una.
+- Diseñar el manejo de errores de una API propia sin heredar los defectos del modelo clásico.
+
+</Goals>
+
+## `errno` no es una variable
+
+En los primeros Unix sí lo era: un `int` global declarado en la libc. Ese diseño murió con los hilos. Si dos hilos fallan a la vez en llamadas distintas, uno pisa el diagnóstico del otro y ambos leen basura. La solución fue conservar la sintaxis y cambiar la semántica: hoy `errno` es una **macro**, y lo que expande es la desreferencia de una función que devuelve un puntero al entero propio del hilo en curso.
+
+En `glibc` la macro expande, en esencia, a `(*__errno_location())`. En `musl` a `(*__errno_location())` con otra implementación detrás. Y desde C11 el estándar exige que cada hilo tenga su propio `errno`, así que en implementaciones modernas el almacenamiento vive en la zona de datos locales por hilo y el acceso es tan barato como un desplazamiento sobre un registro de segmento.
+
+```c
+#include <errno.h>
+#include <stdio.h>
+
+int main(void) {
+    printf("%p\n", (void *)&errno);   // legal: la macro produce un lvalue
+}
+```
+
+De aquí salen tres consecuencias que se deducen sin memorizar. **No puedes declararlo tú**: escribir `extern int errno;` compilaba en 1990 y hoy es un error, porque el objeto real tiene otro nombre. **No puedes guardarlo entre hilos**: el valor que ves pertenece a quien lo lee. Y **debes preservarlo en los manejadores de señales**: una señal puede interrumpirte entre una llamada fallida y tu comprobación, y si el manejador ejecuta cualquier función que toque `errno`, tu diagnóstico se evapora. Un manejador correcto lo guarda al entrar y lo restaura al salir.
+
+## Las tres reglas
+
+Casi todo el código roto que verás incumple una de estas tres, y las tres derivan de una sola idea: `errno` **solo dice algo cuando una función te indicó primero que falló**.
+
+<Cards>
+  <Card icon="1️⃣" title="Solo tras un fallo">
+    Consultarlo después de una llamada que tuvo éxito no significa nada: puede conservar el valor de un fallo anterior, incluso interno a la libc.
+  </Card>
+  <Card icon="2️⃣" title="El éxito no lo limpia">
+    Ninguna función lo pone a cero al triunfar. El estándar solo prohíbe que una llamada exitosa lo cambie a cero, no que lo deje sucio.
+  </Card>
+  <Card icon="3️⃣" title="Ponlo a cero tú antes">
+    Cuando el valor de retorno es ambiguo, la única forma de distinguir error de dato válido es asignarle cero antes de llamar.
+  </Card>
+</Cards>
+
+El caso canónico de la tercera regla es `strtol`, que puede devolver legítimamente el mismo valor que devuelve al desbordar. Lo mismo ocurre con `readdir`, que devuelve un puntero nulo tanto al terminar el directorio como al fallar.
+
+```c
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+
+int convertir(const char *texto, long *salida) {
+    char *fin;
+    errno = 0;                                  // regla 3: obligatorio aqui
+    long v = strtol(texto, &fin, 10);
+    if (fin == texto) return -1;                // no habia digitos
+    if (errno == ERANGE) return -1;             // desbordamiento real
+    if (*fin != '\0') return -1;                // basura al final
+    *salida = v;
+    return 0;
+}
+```
+
+<Mermaid code={`flowchart TD
+  A[Llamada a la funcion] --> B{Devolvio indicador de fallo}
+  B -- No --> C[errno carece de significado, ignoralo]
+  B -- Si --> D{Documenta que asigna errno}
+  D -- No --> E[Usa el mecanismo propio de la funcion]
+  D -- Si --> F[Lee errno una sola vez y guardalo]
+  class C t-yellow
+  class F t-green`} />
+
+Guardarlo de inmediato no es paranoia. En cuanto llamas a `printf`, a `close` o a cualquier rutina de limpieza, el valor puede haber cambiado. El patrón robusto copia el número a una local en la misma línea siguiente al fallo.
+
+## Las convenciones de POSIX no son una
+
+Es tentador creer que en POSIX todo devuelve `-1` y asigna `errno`. Conviven al menos cuatro convenciones, y confundirlas produce mensajes de error absurdos.
+
+La **clásica** es la de las syscalls: `-1` para enteros, puntero nulo para punteros, y el diagnóstico en `errno`. La usan `open`, `read`, `write`, `stat`, `malloc`, `fopen`.
+
+La de **`pthreads` y funciones modernas** invierte el modelo: devuelven el código de error **directamente** y no tocan `errno`. `pthread_mutex_lock` devuelve `EDEADLK`, no `-1`. Comprobar `errno` tras ellas es un error puro, y sin embargo se ve en producción constantemente.
+
+```c
+int rc = pthread_mutex_lock(&m);
+if (rc != 0) {                       // rc ES el codigo, errno no interviene
+    fprintf(stderr, "lock: %s\n", strerror(rc));
+}
+```
+
+La de **resolución de nombres** tiene un espacio de códigos propio: `getaddrinfo` devuelve valores como `EAI_AGAIN` que no pertenecen al conjunto de `errno` y se traducen con `gai_strerror`. Mezclarlos con `strerror` produce mensajes que no corresponden a nada.
+
+Y está el caso de las funciones que devuelven **un valor imposible** como señal, del que `strtol` es el arquetipo.
+
+Para imprimir hay más trampas de las que parece. `perror` es cómoda pero escribe siempre a `stderr` y no permite formato. `strerror` devuelve un puntero a un buffer que la implementación puede reutilizar, así que no es segura entre hilos. Su versión reentrante, `strerror_r`, tiene **dos firmas incompatibles**: la de XSI devuelve un `int` y llena tu buffer, y la de GNU devuelve un `char *` que puede no ser tu buffer. Cuál obtienes depende de las macros de test de características que hayas definido, lo cual convierte un detalle de portabilidad en un fallo de compilación silencioso. C23 añadió `strerror_l` al repertorio disponible y `glibc` ofrece además el especificador `%m` de `printf`, que inserta el mensaje de `errno` sin argumento.
+
+## Diseñar el error en tu propia API
+
+Conocer el modelo clásico sirve sobre todo para no repetirlo. Cuando la biblioteca la escribes tú, hay cuatro decisiones que separan una API que se puede usar bien de una que invita al descuido.
+
+La primera: **devuelve el código en el valor de retorno**, como hacen `pthreads` y las funciones POSIX modernas, y entrega el resultado por un parámetro de salida. Así el diagnóstico viaja en la firma, sobrevive a cualquier llamada intermedia y no necesita almacenamiento por hilo.
+
+La segunda: **no inventes un `errno` propio**. Una variable global de estado en tu biblioteca reproduce todos los defectos originales y añade uno nuevo, porque tus usuarios tendrán que recordar que existe.
+
+La tercera: **preserva `errno` en la limpieza**. La ruta de salida por error suele cerrar descriptores y liberar memoria, y `close` puede fallar y machacar el diagnóstico que ibas a devolver. El patrón correcto lo guarda y lo restaura.
+
+```c
+int cargar(const char *ruta, char **fuera) {
+    int guardado;
+    FILE *f = fopen(ruta, "rb");
+    if (!f) return -1;                    // errno viene de fopen
+
+    char *buf = malloc(4096);
+    if (!buf) { guardado = errno; goto salir; }
+
+    if (fread(buf, 1, 4096, f) == 0 && ferror(f)) { guardado = EIO; goto liberar; }
+
+    fclose(f);
+    *fuera = buf;
+    return 0;
+
+liberar:
+    free(buf);
+salir:
+    fclose(f);                            // puede fallar y tocar errno
+    errno = guardado;                     // por eso lo restauramos
+    return -1;
+}
+```
+
+La cuarta: **trata `EINTR` de forma explícita**. Una llamada bloqueante interrumpida por una señal devuelve `-1` con ese código sin haber fallado realmente, y un reintento en bucle es lo único correcto. Registrar el manejador con reinicio automático cubre muchos casos, pero no todos.
+
+```c
+ssize_t n;
+do { n = read(fd, buf, len); } while (n < 0 && errno == EINTR);
+```
+
+<Callout type="dios" title="El problema no es errno: es el estado implícito">
+Levanta la vista de la macro y mira el patrón. `errno` es un **canal lateral**: la función devuelve el dato por un camino y el diagnóstico por otro, invisible en la firma. Todos los defectos que has visto son consecuencias mecánicas de esa separación. Nadie puede saber por el prototipo si una función asigna `errno` o no, y por eso hace falta leer la documentación de cada una. Como el canal es único y sobrevive a la llamada, hay que fijarlo a cero antes y copiarlo después, y basta una función intermedia para destruirlo. Como es estado y no valor, los hilos lo rompieron y hubo que reinventarlo como almacenamiento por hilo, y las señales lo siguen rompiendo si no lo salvas a mano. El compilador no puede ayudarte: ignorar el retorno de `read` es legal, y leer `errno` cuando no procede también. Esa es la razón profunda de que los lenguajes posteriores metieran el error **dentro** del tipo de retorno, sea un tipo suma o una excepción: no porque los códigos de error sean malos, sino porque un diagnóstico que viaja fuera del valor de retorno no se puede verificar. Y esa es también la lección aplicable hoy en C: cuando diseñes tu propia API, devuelve el error en el valor de retorno, deja el resultado en un parámetro de salida, y no inventes un `errno` particular para tu biblioteca. Los estándares no cometieron un error de programación en 1978; tomaron una decisión razonable en un mundo sin hilos, y tú estás en condiciones de no repetirla.
+</Callout>
+
+<Challenge title="Audita el diagnóstico">
+1. Imprime la dirección de `errno` desde dos hilos y comprueba que difieren; luego provoca un fallo en uno y verifica que el otro no lo ve.
+2. Escribe una conversión con `strtol` que distinga correctamente los tres fallos posibles y pruébala con una cadena vacía, con basura al final y con un número mayor que `LONG_MAX`.
+3. Provoca un `EDEADLK` con `pthread_mutex_lock` sobre un mutex recursivo mal configurado y demuestra que `errno` no cambió.
+4. Compila un uso de `strerror_r` con `_GNU_SOURCE` y sin él, y explica por qué una de las dos versiones no compila o devuelve otra cosa.
+</Challenge>

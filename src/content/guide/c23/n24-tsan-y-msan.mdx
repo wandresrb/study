@@ -1,0 +1,148 @@
+---
+title: "ThreadSanitizer y MemorySanitizer"
+description: "Relojes vectoriales para demostrar carreras de datos que ni siquiera se han manifestado, y sombra bit a bit para seguir el rastro de lo no inicializado. Los dos sanitizers más potentes y los más exigentes."
+subject: c23
+level: 24
+order: 4
+position: "24.4"
+duration: "18 min"
+---
+
+<Lead>
+`ASan` y `UBSan` cazan errores que ocurren. Los dos sanitizers de esta lección cazan algo más difícil: errores que **podrían** ocurrir. `TSan` denuncia una carrera de datos aunque en esa ejecución el resultado haya sido correcto por pura suerte de planificación; `MSan` denuncia el uso de un bit no inicializado aunque ese bit valiera casualmente cero. Ese salto de lo observado a lo demostrable es lo que los convierte en los instrumentos más potentes del arsenal, y también en los más caros y quisquillosos.
+</Lead>
+
+<Goals>
+
+- Entender los relojes vectoriales y la relación happens-before que usa `TSan`.
+- Definir con precisión qué es una carrera de datos y por qué basta con ejecutarla una vez.
+- Comprender la propagación de sombra bit a bit de `MSan` y el rastreo de orígenes.
+- Conocer las limitaciones reales de ambos y cuándo no vas a poder usarlos.
+
+</Goals>
+
+## ThreadSanitizer: demostrar, no observar
+
+Una **carrera de datos** tiene una definición formal, no intuitiva: dos accesos a la misma posición de memoria, desde hilos distintos, al menos uno de escritura, sin que exista entre ellos una relación de orden establecida por sincronización. Si esa relación falta, la norma declara el programa entero indefinido, con independencia de lo que imprima esta vez.
+
+`TSan` implementa esa definición literalmente. Mantiene un **reloj vectorial** por hilo —un contador por cada hilo del sistema— que se actualiza en cada evento de sincronización: crear o unir un hilo, tomar o soltar un `mutex`, una operación atómica con un orden de memoria que lo justifique. Comparar dos relojes vectoriales responde exactamente a la pregunta correcta: ¿está este acceso ordenado respecto de aquel?
+
+Junto a eso, cada ocho bytes de tu programa llevan cuatro **celdas de sombra**, y en cada una TSan registra el último acceso: qué hilo, en qué instante lógico, de qué tamaño y si fue lectura o escritura. Ante un acceso nuevo, compara con las celdas guardadas; si encuentra un par no ordenado con al menos una escritura y de hilos distintos, informa.
+
+<Mermaid code={`flowchart TD
+  A[Dos accesos a la misma direccion] --> B[Son del mismo hilo]
+  B -->|si| N[No hay carrera]
+  B -->|no| C[Al menos uno es escritura]
+  C -->|no| N
+  C -->|si| D[Los relojes vectoriales los ordenan]
+  D -->|si| N
+  D -->|no| R[Carrera de datos, informa las dos pilas]
+  class N t-green
+  class R t-red`} />
+
+La consecuencia práctica es enorme y merece decirse despacio: **TSan no necesita que la carrera salga mal**. Basta con que los dos accesos ocurran en la misma ejecución, en cualquier orden y con cualquier separación temporal. Ese es el abismo que separa esta herramienta del método tradicional —lanzar mil hilos, estresar y rezar—, que solo encuentra la carrera si el planificador tiene la amabilidad de reproducirla justo mientras miras.
+
+```bash
+# TSan exige codigo independiente de posicion y no se combina con ASan
+clang -std=c23 -O2 -g -fsanitize=thread -fPIE -pie carreras.c -o carreras
+TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 ./carreras
+```
+
+El caso canónico deja clarísima la diferencia:
+
+```c
+static int contador;                    /* compartido y sin proteger */
+
+static void *sumar(void *arg) {
+    for (int i = 0; i < 100; i++)
+        contador++;                     /* una lectura mas una escritura */
+    return NULL;
+}
+```
+
+Con solo cien iteraciones por hilo, este programa imprime el total correcto casi siempre: la ventana en la que dos incrementos se pisan es diminuta. Un test que compruebe el valor final se quedará en verde durante años. TSan informa en la primera ejecución, porque el resultado le da igual: lo que registra es que dos hilos tocaron `contador` sin una arista de orden entre ellos. Y la corrección en C23 consiste en declarar esa intención en el tipo, no en cruzar los dedos:
+
+```c
+static _Atomic int contador;            /* incremento indivisible y, ademas,
+                                           establece orden entre los hilos */
+```
+
+Además de las carreras, detecta inversiones de orden de bloqueo —futuros interbloqueos que aún no se han producido—, destrucción de un `mutex` todavía tomado, hilos que se filtran sin unirse y llamadas no seguras dentro de manejadores de señal.
+
+## MemorySanitizer: el rastro de lo no inicializado
+
+`MSan` resuelve un problema distinto con la misma estrategia de sombra, pero a una resolución mucho más fina: **un bit de sombra por cada bit** de la aplicación, donde uno significa "no inicializado". Y hace algo que ninguno de los otros hace: propaga esa sombra a través de la aritmética. Si sumas una variable limpia con una sucia, el resultado hereda la suciedad, bit a bit, según las reglas de la operación.
+
+Lo decisivo es cuándo decide informar. No al leer un valor sucio —copiar basura de un sitio a otro es perfectamente legal—, sino cuando ese valor **influye en el comportamiento observable**: decide una rama, indexa un array, se dereferencia como puntero o cruza la frontera hacia una llamada al sistema.
+
+```c
+int x;                       /* sin inicializar */
+int y = x + 1;               /* silencio: y queda sucio, nada mas */
+int *p = malloc(sizeof *p);  /* el contenido tambien nace sucio */
+
+if (y > 0)                   /* AQUI: use-of-uninitialized-value */
+    hacer_algo();
+```
+
+Ese aplazamiento es potente pero desorienta: el informe aparece lejos del punto donde nació la suciedad. Para eso existe el rastreo de orígenes, que encadena la historia hasta la reserva o la variable local culpable:
+
+```bash
+clang -std=c23 -O1 -g -fsanitize=memory -fsanitize-memory-track-origins=2 \
+      -fno-omit-frame-pointer prog.c -o prog
+```
+
+Con los orígenes activos, el informe deja de decir solo dónde se usó el valor y añade su genealogía:
+
+```bash
+==2891==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x4a1b2c in decidir prog.c:41:9
+    #1 0x4a1e40 in main prog.c:58:5
+  Uninitialized value was created by a heap allocation
+    #0 0x49c0f1 in malloc
+    #1 0x4a1a03 in cargar_config prog.c:22:18
+```
+
+Esa segunda pila es lo que hace usable a MSan: sin ella, un valor sucio que ha atravesado tres funciones y dos estructuras es prácticamente irrastreable a mano. El nivel `2` guarda la cadena completa de propagación; el `1`, solo el origen inmediato, a cambio de bastante menos memoria.
+
+Hay además un detalle que sorprende a todo el mundo la primera vez: MSan vigila también la frontera con el núcleo. Sus interceptores inspeccionan los búferes que pasas a `write`, a `send` o a cualquier llamada al sistema, de modo que volcar a un fichero una estructura con relleno sin inicializar produce informe. No es pedantería: es exactamente la clase de fuga que ha filtrado bytes de memoria de procesos privilegiados en incidentes reales.
+
+## Los límites que tienes que conocer
+
+<Cards>
+  <Card icon="🧵" title="TSan: el precio">
+    Entre cinco y quince veces más lento, y de cinco a diez veces más memoria. Necesita un mapeo de direcciones gigantesco y fijo. No se combina con `ASan` ni con `MSan`.
+  </Card>
+  <Card icon="🌫️" title="MSan: la exigencia">
+    Solo en Clang, y con una condición dura: **todo** el código debe estar instrumentado. Una sola biblioteca compilada sin `-fsanitize=memory` produce falsos positivos en cascada.
+  </Card>
+</Cards>
+
+Esa exigencia de MSan es la razón de que se use muchísimo menos que ASan: para aplicarlo de verdad hay que reconstruir con MSan cada dependencia del proyecto, y a menudo la propia biblioteca estándar. Cuando eso no es viable, la alternativa para lecturas no inicializadas es `Valgrind`, que veremos en la lección siguiente, o mitigar en lugar de detectar con `-ftrivial-auto-var-init=pattern`, que rellena las locales con un patrón reconocible; recuerda que eso oculta el bug en vez de encontrarlo, y que en C23 el inicializador vacío te deja poner a cero cualquier agregado sin ceremonia.
+
+El límite de TSan es otro y más sutil. La herramienta entiende `pthread`, entiende los atómicos de C23 y entiende las primitivas de la biblioteca estándar porque las intercepta. Lo que **no** entiende es la sincronización que tú inventes: una espera activa sobre un `volatile`, una barrera escrita en ensamblador en línea, un protocolo lock-free construido sobre operaciones que no declaraste atómicas. En esos casos TSan ve dos accesos sin orden y denuncia una carrera que, a tu juicio, no existe. La respuesta correcta casi nunca es silenciarlo, sino declarar el orden explícitamente:
+
+```c
+#include <sanitizer/tsan_interface.h>
+
+/* le enseñas a TSan que aqui hay una relacion happens-before real */
+__tsan_release(&mi_bandera);          /* en el hilo que publica */
+__tsan_acquire(&mi_bandera);          /* en el hilo que consume */
+```
+
+Y un límite compartido por ambos, el más importante de todos: **solo ven el código que se ejecuta**. Un sanitizer no demuestra la ausencia de errores en tu programa, sino en los caminos que tus pruebas recorrieron. De ahí que la pareja natural de esta lección sea la cobertura y el fuzzing del nivel 25: los sanitizers son el oráculo que dice si algo fue mal, y el fuzzer es el motor que explora los caminos donde mirar.
+
+<Callout type="warn" title="Un binario por sanitizer, y en paralelo">
+`TSan` y `MSan` reclaman el mismo espacio de direcciones que `ASan` para su sombra, así que son mutuamente excluyentes. La disciplina profesional es tener directorios de compilación paralelos —uno con `address,undefined`, otro con `thread`, otro con `memory`— y ejecutar la misma suite de pruebas en cada uno. Es más lento en total, pero cada uno responde una pregunta distinta y ninguna de las tres es opcional en un proyecto concurrente.
+</Callout>
+
+<Callout type="dios" title="La carrera de datos es el bug que la disciplina no puede evitar">
+De todas las clases de error que comete un programador de C, la carrera de datos es la única que resiste por completo al método clásico de la revisión cuidadosa. Un desbordamiento se ve leyendo el código. Una fuga se ve siguiendo los caminos de salida. Pero una carrera es una propiedad de **todos los entrelazados posibles** de todos los hilos, un espacio combinatorio que crece de forma explosiva y que ninguna mente humana recorre; y su manifestación depende del planificador, del número de núcleos, de la carga de la máquina y del modelo de memoria del procesador, de modo que reproducirla es cuestión de azar y depurarla con `printf` la hace desaparecer. Es el bug que funciona en tu portátil durante seis meses y corrompe datos en producción el día de mayor tráfico. Contra eso, la instrumentación con relojes vectoriales no es una ayuda incremental: es un cambio de categoría epistemológica. TSan no te dice que algo salió mal; te dice que tu programa **carece de la relación de orden que la norma exige**, un hecho estructural sobre tu código que sigue siendo cierto en todas las ejecuciones, en todas las máquinas y bajo todos los planificadores. Pasas de esperar a que el fallo aparezca a demostrar que no puede haberlo en los caminos probados. Si escribes código concurrente en C y no lo pruebas bajo TSan, no estás escribiendo código concurrente: estás apostando.
+</Callout>
+
+<Challenge title="Demuestra la carrera que no se manifiesta">
+1. Escribe dos hilos que incrementen un `int` compartido sin sincronizar, con solo cien iteraciones cada uno. Comprueba que el resultado es correcto casi siempre, y que TSan informa igualmente.
+2. Corrige con `_Atomic` y verifica que TSan calla. Corrige después con un `mutex` y compruébalo también.
+3. Sustituye el atómico por una espera activa sobre un `volatile` y observa el falso positivo. Anótalo con `__tsan_release` y `__tsan_acquire` y razona si tu sincronización es realmente correcta.
+4. Construye un interbloqueo por inversión de orden de dos `mutex` y comprueba que TSan lo denuncia incluso cuando no llega a bloquearse.
+5. Compila con Clang y `-fsanitize=memory` un programa que ramifique sobre una variable no inicializada. Añade `-fsanitize-memory-track-origins=2` y compara ambos informes.
+</Challenge>

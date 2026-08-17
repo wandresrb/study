@@ -1,0 +1,134 @@
+---
+title: "epoll a fondo: level-triggered contra edge-triggered"
+description: "La bandera EPOLLET que separa el bucle ingenuo del bucle correcto de alto rendimiento: level-triggered avisa mientras queden datos y perdona la pereza; edge-triggered avisa solo en el flanco y exige drenar el descriptor hasta EAGAIN con fds no bloqueantes. Las trampas clásicas, el patrón de drenaje, y EPOLLONESHOT y EPOLLEXCLUSIVE para el rearmado y el thundering herd en servidores multihilo."
+subject: kernel
+level: 39
+order: 4
+position: "39.4"
+duration: "16 min"
+---
+
+<Lead>
+Una sola bandera, `EPOLLET`, separa el bucle de `epoll` que cualquiera escribe del bucle que hace funcionar a nginx bajo carga. Es la elección entre dos disciplinas de notificación heredadas de la electrónica digital: por nivel, que te avisa mientras la condición siga cierta, y por flanco, que te avisa una sola vez en el instante del cambio. La primera perdona los errores; la segunda es más rápida pero traslada a tu código la obligación de recordar el trabajo pendiente. Elegir mal, o mezclar las reglas de una con las de la otra, produce los bugs más sutiles de toda la programación de red.
+</Lead>
+
+<Goals>
+
+- Distinguir el modo level-triggered (por defecto) del edge-triggered (`EPOLLET`).
+- Implementar el patrón correcto de ET: drenar el descriptor hasta `EAGAIN`.
+- Evitar las trampas: fds bloqueantes con ET, lecturas parciales y hambre entre conexiones.
+- Usar `EPOLLONESHOT` y `EPOLLEXCLUSIVE` para el rearmado y el thundering herd multihilo.
+
+</Goals>
+
+## Level-triggered: el modo por defecto que perdona
+
+En el modo por nivel, que es el que obtienes si no pides nada, `epoll_wait` te reporta un descriptor **siempre que** esté listo. Si llegan cuatro kilobytes, lees mil bytes y regresas al bucle, la próxima llamada a `epoll_wait` volverá a avisarte de ese mismo fd porque aún quedan datos. Es el comportamiento de `poll`, seguro y tolerante: puedes leer a tu ritmo, en fragmentos pequeños, y la corrección sobrevive.
+
+```c
+/* level-triggered: basta una lectura por aviso; el resto se reporta luego */
+if (eventos[i].events & EPOLLIN) {
+	ssize_t n = read(fd, buf, sizeof(buf));   /* lee un trozo y vuelve al bucle */
+	if (n > 0)
+		procesar(buf, n);                     /* si queda mas, epoll_wait lo dira otra vez */
+}
+```
+
+El precio del nivel aparece con la escritura. Si registras `EPOLLOUT` en modo por nivel, un socket con hueco en su búfer de envío está *siempre* listo para escribir, así que `epoll_wait` disparará sin cesar consumiendo la CPU. El patrón correcto es no vigilar `EPOLLOUT` de continuo: se activa con `EPOLL_CTL_MOD` solo cuando una escritura devuelve `EAGAIN` y se retira en cuanto el búfer de salida se vacía.
+
+## Edge-triggered: EPOLLET, el aviso único
+
+Con `EPOLLET` el kernel te avisa solo en el **flanco**: en el instante exacto en que el descriptor pasa de no tener datos a tenerlos. Recibes una única notificación por ese flanco, y si no consumes todo lo disponible, no te avisará de nuevo hasta que lleguen datos **nuevos**. Esto exige dos cosas inseparables: el fd debe ser no bloqueante, y en cada aviso hay que drenarlo por completo hasta que `read` devuelva `EAGAIN`.
+
+```c
+/* patron correcto de EPOLLET: drenar hasta EAGAIN en cada aviso */
+for (;;) {
+	ssize_t n = read(fd, buf, sizeof(buf));
+	if (n > 0) {
+		procesar(buf, n);
+		continue;                 /* sigue leyendo: puede quedar mas del mismo flanco */
+	}
+	if (n < 0 && errno == EAGAIN)
+		break;                    /* buffer vaciado: ahora si, espera el proximo flanco */
+	if (n == 0) {                 /* EOF: el par cerro */
+		cerrar(fd);
+		break;
+	}
+	if (n < 0 && errno != EINTR) {
+		cerrar(fd);               /* error real */
+		break;
+	}
+}
+```
+
+El `EAGAIN` no es un caso marginal: es el único punto donde tu programa y el kernel vuelven a sincronizarse sobre el hecho de que el búfer está de verdad vacío. Omitir el bucle de drenaje deja bytes atascados que nadie volverá a anunciar, y la conexión se cuelga en silencio. A cambio, ET realiza muchas menos llamadas a `epoll_wait` y no reincide sobre datos ya conocidos, que es justo lo que se busca a alta concurrencia.
+
+## EPOLLOUT: la disponibilidad de escritura
+
+Casi todo el foco recae en la lectura, pero la escritura tiene su propia coreografía. Un `write` sobre un socket no bloqueante puede transferir solo una parte y devolver `EAGAIN` cuando el búfer de envío del kernel se llena: el par remoto lee despacio y aplica contrapresión. En ese instante te quedan bytes pendientes y necesitas saber cuándo el socket vuelve a admitir escritura, que es justo lo que anuncia `EPOLLOUT`.
+
+El error clásico es vigilar `EPOLLOUT` de forma permanente: como vimos, en modo por nivel dispara sin cesar porque el búfer casi siempre tiene hueco, y en cualquier modo despierta el bucle sin trabajo real. El patrón correcto es de doble filo: activar `EPOLLOUT` **solo** mientras haya datos atascados y retirarlo en cuanto se drenan.
+
+```c
+/* escribir hasta EAGAIN; activar EPOLLOUT solo si queda pendiente */
+static void intentar_escribir(struct conn *c)
+{
+	while (c->pend_len > 0) {
+		ssize_t n = write(c->fd, c->pend + c->pend_off, c->pend_len);
+		if (n > 0) { c->pend_off += n; c->pend_len -= n; continue; }
+		if (n < 0 && errno == EAGAIN) {              /* buffer lleno: pedir aviso */
+			modificar_interes(c, EPOLLIN | EPOLLOUT | EPOLLET);
+			return;
+		}
+		if (n < 0 && errno != EINTR) { cerrar(c); return; }
+	}
+	modificar_interes(c, EPOLLIN | EPOLLET);         /* drenado: dejar de vigilar OUT */
+}
+```
+
+Este vaivén —pedir `EPOLLOUT` bajo contrapresión y retirarlo al vaciar el búfer de salida— es el corazón de cualquier proxy o servidor que reenvíe más de lo que el cliente consume, y la razón por la que un bucle de eventos serio mantiene un búfer de escritura por conexión.
+
+## Trampas y patrones correctos
+
+La trampa más frecuente combina ET con un fd **bloqueante**: el bucle de drenaje lee hasta que ya no hay datos y entonces `read` no devuelve `EAGAIN` sino que **duerme al hilo**, congelando el bucle de eventos entero. Con ET, el fd no bloqueante no es opcional. La segunda trampa es el hambre: un descriptor muy activo puede acaparar el bucle drenándose sin fin mientras los demás esperan; la defensa es acotar los bytes por turno y reencolar el fd si quedó trabajo.
+
+Conviene además registrar `EPOLLRDHUP`: avisa cuando el par cierra su mitad de escritura, lo que permite detectar la desconexión en el propio evento sin esperar a que un `read` devuelva cero. Sin esa bandera descubres el cierre solo al intentar leer, un viaje de ida y vuelta de más por cada conexión que se va.
+
+En servidores multihilo entran dos banderas más. `EPOLLONESHOT` desarma el descriptor tras un único evento: garantiza que, en un grupo de hilos que comparten el mismo `epoll`, solo uno atienda una conexión dada a la vez. Al terminar, el hilo rearma el fd con `EPOLL_CTL_MOD`.
+
+```c
+/* EPOLLONESHOT: un solo hilo toca la conexion; hay que rearmar tras atenderla */
+struct epoll_event ev = { .events = EPOLLIN | EPOLLET | EPOLLONESHOT, .data.ptr = c };
+epoll_ctl(epfd, EPOLL_CTL_ADD, c->fd, &ev);
+
+/* ...tras drenar por completo en el hilo trabajador... */
+ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);   /* devolver el fd al conjunto activo */
+```
+
+Y `EPOLLEXCLUSIVE`, sobre un socket de escucha compartido por varios hilos que hacen `epoll_wait` en el mismo conjunto, despierta a **uno solo** por cada evento en lugar de a todos: elimina la estampida —el *thundering herd*— en la que decenas de hilos se despiertan por un único `accept` y todos menos uno vuelven a dormirse en balde.
+
+<Mermaid code={`flowchart TB
+  subgraph Level-triggered
+    D1[quedan datos sin leer] -->|en cada epoll_wait| N1[vuelve a avisar]
+  end
+  subgraph Edge-triggered
+    E1[llega dato nuevo] -->|solo en el flanco| N2[avisa una vez]
+    N2 --> DR[debes drenar hasta EAGAIN]
+  end`} />
+
+<Callout type="danger" title="ET sobre un fd bloqueante es un cuelgue garantizado">
+Es el error más común de `epoll`. Con `EPOLLET`, tu bucle de drenaje llama a `read` una y otra vez hasta agotar los datos; si el descriptor es bloqueante, esa última lectura sin datos **no** devuelve `EAGAIN`, sino que duerme al hilo dentro del bucle de eventos. Todo el servidor se congela esperando bytes que no llegarán. Regla inquebrantable: `EPOLLET` implica `SOCK_NONBLOCK` o un `fcntl` con `O_NONBLOCK`, sin excepción.
+</Callout>
+
+<Callout type="dios" title="Nivel contra flanco es la pregunta de quién guarda el trabajo pendiente">
+Detente en la distinción, porque bajo su apariencia de detalle técnico late una decisión sobre dónde reside el estado del trabajo inacabado. En el modo por nivel, ese estado lo custodia el kernel: mientras existan bytes sin leer, la condición permanece asertada, y `epoll` la vuelve a derivar de los búferes en cada llamada. Puedes olvidar, holgazanear, leer a cuentagotas, y la corrección aguanta, porque la verdad vive en la memoria del kernel y él te la recuerda tantas veces como haga falta. En el modo por flanco, el kernel custodia únicamente la transición: te avisa una sola vez, en el instante en que el búfer pasó de vacío a lleno, y a partir de ahí se lava las manos. La obligación de recordar que "puede quedar más" se transfiere íntegra a tu programa, y por eso debes drenar hasta `EAGAIN`, porque `EAGAIN` es el único lugar donde tú y el kernel volvéis a acordar que el búfer está realmente vacío. ET es más rápido precisamente porque dice menos, y es más peligroso precisamente porque dice menos: cambias la contabilidad paciente del kernel por una única señal afilada y asumes la deuda de vaciar. Interioriza esto y habrás entendido de antemano todos los bugs de ET que escribirás en tu vida, porque cada uno será el mismo: un momento en que diste por hecho que el kernel aún recordaba algo que ya había, correctamente, olvidado. Nivel y flanco no son dos ajustes de una API, son dos repartos distintos de la responsabilidad sobre la memoria de lo pendiente.
+</Callout>
+
+<Challenge title="Domina el flanco sin cortarte">
+1. Escribe un lector `EPOLLET` con su bucle de drenaje hasta `EAGAIN` y explica qué bytes se pierden si eliminas el bucle y lees una sola vez.
+2. Registra el mismo fd como bloqueante con `EPOLLET`, provoca la última lectura sin datos y describe con precisión dónde y por qué se congela el servidor.
+3. Razona por qué vigilar `EPOLLOUT` de forma permanente en modo por nivel dispara la CPU, y cuál es el patrón de activarlo y retirarlo.
+4. Monta un grupo de hilos con `EPOLLONESHOT` y explica qué condición de carrera evita y en qué punto exacto hay que rearmar con `EPOLL_CTL_MOD`.
+5. Describe el thundering herd sobre un socket de escucha compartido y cómo `EPOLLEXCLUSIVE` lo desactiva.
+</Challenge>

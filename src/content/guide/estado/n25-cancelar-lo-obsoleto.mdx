@@ -1,0 +1,150 @@
+---
+title: "Cancelar lo obsoleto: AbortController, tokens y respuestas ignoradas"
+description: "Una vez aceptado que la red no puede decidir cuál es la verdad de la interfaz, queda por resolver el problema práctico de retirarle esa autoridad, y hay dos remedios que se confunden con demasiada frecuencia porque en el caso feliz producen el mismo resultado. Ignorar una respuesta obsoleta es una decisión local que protege el estado y no ahorra nada; abortar la petición con AbortController es una decisión de transporte que libera conexiones, ancho de banda y trabajo de servidor, pero no protege por sí sola de nada si el flujo de errores no está bien tratado. Esta lección separa ambos mecanismos, construye el patrón del token de petición como forma canónica del descarte, muestra cómo propagar la señal hasta el fondo de la pila de datos y termina delimitando con precisión qué clase de fallos la cancelación no arregla y por qué aplicarla a una mutación puede ser peor que no hacer nada."
+subject: estado
+level: 25
+order: 2
+position: "25.2"
+duration: "19 min"
+---
+
+<Lead>
+La primera reacción de casi todo el mundo ante el bug del buscador es cancelar la petición anterior, y es una reacción sana pero incompleta, porque mezcla dos operaciones que viven en planos distintos y tienen garantías distintas. Cancelar actúa sobre el transporte: cierra una conexión, deja de leer un cuerpo, avisa a quien esté escuchando. Descartar actúa sobre el estado: decide que un resultado que ya tienes en la mano no tiene derecho a escribir. La confusión importa porque la cancelación es un intento y el descarte es una garantía. Una petición abortada puede haber llegado igualmente al servidor, haber creado un pedido y haber devuelto un cuerpo que tu cliente ya estaba leyendo; una respuesta descartada, en cambio, no toca el estado bajo ninguna circunstancia, porque el descarte se decide dentro de tu propio proceso y no depende de nadie. La regla de diseño que se deduce de ahí es que el descarte es obligatorio siempre y la cancelación es una optimización que además hay que saber cuándo no aplicar.
+</Lead>
+
+<Goals>
+
+- Separar el descarte de una respuesta, que es una garantía local, de la cancelación, que es un intento sobre el transporte.
+- Implementar el patrón del token de petición y razonar por qué basta con una comparación de identidad.
+- Propagar una señal de aborto por toda la pila de datos y tratar correctamente el error de cancelación.
+- Delimitar los casos en los que cancelar es inútil, insuficiente o directamente peligroso.
+
+</Goals>
+
+## Ignorar y abortar no son lo mismo
+
+El descarte se apoya en una idea mínima: cada vez que arranca una operación se registra cuál es la operación vigente, y cuando una respuesta quiere escribir se comprueba primero si sigue siéndolo. La comprobación es una igualdad, cuesta nada y no puede fallar, porque tanto el registro como la comprobación ocurren en el mismo hilo y en turnos completos. La forma más simple de ese registro es una bandera capturada por el cierre del efecto; la más general es un contador monótono, el token de petición, que sobrevive a los remontajes y sirve además para diagnosticar.
+
+```ts
+// Forma minima: la bandera vive en el cierre y la limpieza la apaga.
+useEffect(() => {
+  let vigente = true
+  buscar(consulta).then(r => { if (vigente) setResultados(r) })
+  return () => { vigente = false }
+}, [consulta])
+
+// Forma general: token monotono. Sobrevive a remontajes y es observable.
+const token = useRef(0)
+async function lanzar(consulta: string) {
+  const mio = ++token.current
+  const r = await buscar(consulta)
+  if (mio !== token.current) return   // llego tarde: no tiene derecho a escribir
+  setResultados(r)
+}
+```
+
+Las dos formas no son equivalentes y la diferencia importa más de lo que sugiere su tamaño. La bandera del cierre protege una instancia concreta de un efecto: si el componente se desmonta y se vuelve a montar, la bandera nueva no sabe nada de la petición que lanzó la anterior, y aunque en ese caso la limpieza ya habrá apagado la vieja, el razonamiento deja de ser local en cuanto hay dos efectos escribiendo en la misma región de estado. El token vive por encima de las instancias, es un único árbitro para toda una unidad de coherencia, y por eso escala a situaciones donde varias rutas de código compiten por la misma casilla: un efecto que carga al montar, un manejador que recarga al pulsar y una suscripción que refresca al recibir un aviso del servidor pueden compartir árbitro sin coordinarse entre sí.
+
+Merece la pena detenerse en por qué el token es suficiente sin necesidad de estructuras más ricas. No hay que llevar una lista de peticiones en vuelo, ni cronometrarlas, ni ordenarlas: basta con saber cuál es la última que se lanzó, porque el criterio de pertinencia no es la antigüedad de la respuesta sino la vigencia de la intención que la originó. Cualquier respuesta cuyo token no coincida con el actual pertenece a una intención superada, con independencia de cuándo salió o de si llegó antes o después que otra. Ese es el punto elegante del patrón: reduce un problema de ordenación temporal, que sería costoso, a una comparación de identidad, que es gratuita.
+
+<Callout type="tip" title="La limpieza del efecto es el mejor sitio para el descarte">
+Toda la maquinaria de vigencia puede colgarse de la función de limpieza, y hacerlo tiene una ventaja que no es estética. La limpieza se ejecuta también cuando el componente se desmonta o cuando la pantalla cambia, no solo cuando cambia la dependencia, de modo que el mismo mecanismo que resuelve la lectura obsoleta resuelve gratis el efecto zombi de la lección anterior. Si el descarte vive en cambio dentro de un manejador de eventos, tendrás que acordarte de invalidarlo al desmontar, y eso es exactamente la clase de cosa que se olvida.
+</Callout>
+
+## AbortController y la propagación de la señal
+
+La cancelación tiene otro objetivo: dejar de gastar. Una petición en vuelo consume una de las conexiones simultáneas que el navegador concede por origen, ocupa ancho de banda, mantiene viva una consulta en el servidor y a veces una transacción en la base de datos. Con siete peticiones en vuelo por palabra tecleada, seis de ellas ya irrelevantes, el ahorro no es marginal. El mecanismo estándar es un controlador que expone una señal, la señal se pasa a la operación y abortarla hace que la promesa rechace con un error específico que hay que distinguir de un fallo real.
+
+```ts
+const controlador = useRef<AbortController | null>(null)
+
+async function lanzar(consulta: string) {
+  controlador.current?.abort()                 // retira lo anterior
+  const c = new AbortController()
+  controlador.current = c
+  try {
+    const r = await buscar(consulta, c.signal)
+    if (c.signal.aborted) return                // cinturon y tirantes
+    setResultados(r)
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") return
+    setError(e)                                 // esto si es un fallo de verdad
+  }
+}
+```
+
+El detalle que más defectos genera en la práctica no es crear el controlador sino tratar su error. Un aborto llega por el mismo canal que un fallo de red, y si el bloque de captura no lo filtra, cada pulsación de tecla pintará un mensaje de error en la pantalla, encenderá una alerta en el sistema de observabilidad y contaminará las métricas de fiabilidad con incidencias que no existen. Peor todavía: si el manejador de error apaga un indicador de carga, la interfaz parpadeará entre cargando y error a cada letra. Filtrar el aborto no es una cortesía, es parte del contrato.
+
+<Mermaid code={`flowchart TD
+  I[nueva intencion del usuario] --> A[abortar controlador anterior]
+  A --> B[crear controlador nuevo y token nuevo]
+  B --> C[lanzar peticion con la senal]
+  C --> D[como termina la operacion]
+  D -->|error de aborto| E[ignorar en silencio]
+  D -->|error real| F[registrar y mostrar fallo]
+  D -->|respuesta recibida| G[comprobar token vigente]
+  G -->|no vigente| H[descartar sin tocar el estado]
+  G -->|vigente| J[escribir el estado]
+  class J t-green
+  class H t-yellow`} />
+
+Hay dos capacidades del mecanismo que se usan poco y que resuelven casos frecuentes sin código propio. La primera es la señal con temporizador, que aborta sola pasado un plazo y evita mantener a mano un cronómetro que además habría que cancelar. La segunda es la composición de señales: una operación puede estar sujeta a varias causas de aborto independientes, la navegación a otra pantalla, el vencimiento del plazo y la llegada de una intención nueva, y combinarlas produce una única señal que se dispara con la primera de las tres.
+
+```ts
+// Varias causas de aborto, una sola senal.
+const porIntencion = new AbortController()
+const senal = AbortSignal.any([
+  porIntencion.signal,        // el usuario cambio de idea
+  AbortSignal.timeout(8000),  // plazo maximo aceptable
+  senalDeNavegacion,          // se abandono la pantalla
+])
+
+// Un flujo abierto tambien se cierra desde la misma senal.
+senal.addEventListener("abort", () => flujo.close(), { once: true })
+
+const r = await fetch(url, { signal: senal })
+```
+
+La señal solo sirve si llega hasta el fondo. Una arquitectura por capas suele tener un componente que llama a un caso de uso, que llama a un repositorio, que llama a un cliente de red, y basta con que una de esas firmas olvide el parámetro para que la cancelación se convierta en decorativa: el controlador aborta algo que nadie escucha y la petición sigue viva. Por eso conviene tratar la señal como se trata el contexto en otros ecosistemas, como un parámetro que atraviesa todas las funciones asíncronas del camino, y por eso las librerías serias de datos la exponen en el argumento de la función de consulta en lugar de dejarla a criterio de quien implemente.
+
+## Cuándo cancelar no basta o hace daño
+
+La regla general que subyace a esta sección puede enunciarse antes de los casos concretos, porque una vez enunciada los casos se vuelven predecibles. La cancelación solo tiene sentido cuando la operación no ha dejado huella fuera de tu proceso, y su valor decrece a medida que crece la probabilidad de que sí la haya dejado. Una lectura no deja huella y por tanto se puede abandonar sin consecuencias. Una escritura la deja casi siempre. Una operación compartida entre varios consumidores deja huella en la expectativa de los otros consumidores, que es una forma de huella igual de real aunque no salga de la máquina. Ordenados por ese criterio, los tres casos que siguen dejan de parecer excepciones arbitrarias y se leen como puntos de una misma escala.
+
+Hay tres situaciones en las que la cancelación no es la respuesta, y confundirlas con el caso del buscador produce fallos peores que el original. La primera es la mutación: abortar la petición no deshace el trabajo que el servidor ya inició, de modo que un pedido puede quedar creado, un cargo emitido y un correo enviado mientras el cliente cree haber cancelado. La segunda es la deduplicación entre consumidores: si dos componentes comparten una misma consulta, el que se desmonte primero no debe abortar la petición del otro, y por eso las caches de datos cuentan suscriptores antes de cancelar nada. La tercera es la petición ya resuelta: cancelar después de recibir el cuerpo no revierte nada, solo el descarte protege.
+
+<Cards>
+  <Card icon="🧾" title="Mutaciones">
+    Cancelar una escritura no la deshace. Lo que hace falta es idempotencia por clave de operación y, si de verdad hay que revertir, una operación compensatoria explícita en el servidor.
+  </Card>
+  <Card icon="👥" title="Consultas compartidas">
+    Con varios suscriptores, la cancelación debe depender del recuento de referencias. Abortar al desmontar el primero rompe la pantalla del segundo y es un fallo clásico al escribir una cache propia.
+  </Card>
+  <Card icon="🐢" title="Reintentos y respaldo">
+    Una capa de reintentos que no observe la señal resucitará la petición abortada. La señal tiene que consultarse antes de cada intento, no solo antes del primero.
+  </Card>
+  <Card icon="📡" title="Flujos y suscripciones">
+    Un canal abierto no termina solo. Su cierre es parte del ciclo de vida, y el mismo controlador que aborta una petición puede cerrar el flujo si se conecta a su evento de aborto.
+  </Card>
+</Cards>
+
+<Callout type="warn" title="Abortar una mutación deja al cliente y al servidor contando historias distintas">
+El escenario que conviene tener presente es este. El cliente envía una orden de compra, el servidor la recibe, empieza a procesarla y en ese instante el usuario navega a otra pantalla, con lo que la limpieza aborta la petición. El cliente no recibe respuesta, no registra nada y no muestra confirmación. El servidor termina el trabajo, cobra y envía el correo. A partir de ahí las dos mitades del sistema tienen creencias incompatibles sobre lo que ocurrió, y ninguna herramienta del lado del cliente puede reconciliarlas porque el efecto ya salió al mundo. La lección práctica es que la cancelación pertenece al vocabulario de las lecturas. En las escrituras, lo que se necesita no es poder abortar sino poder repetir sin daño, y eso se construye con identidad de operación en el servidor, tema de la quinta lección de este nivel.
+</Callout>
+
+Queda un matiz de rendimiento que casi nunca se menciona y que decide si la cancelación conviene. Abortar y relanzar destruye el trabajo parcial, y si las peticiones son caras y muy frecuentes puedes acabar cancelando siempre justo antes de recibir, de modo que el sistema gasta el máximo y no completa nunca. La combinación correcta es amortiguar primero y cancelar después: un retardo antirrebote de unos doscientos milisegundos reduce el número de peticiones en un orden de magnitud, y la cancelación se encarga solo de las que sobreviven a ese filtro. Antirrebote sin descarte sigue teniendo el bug, porque dos peticiones espaciadas también se invierten; descarte sin antirrebote es correcto pero derrochador. Los tres mecanismos son complementarios y ninguno sustituye a otro.
+
+Conviene además decidir de forma consciente en qué capa vive todo esto, porque la respuesta cambia el coste de mantenerlo. Implementado a mano en cada componente, el patrón se repite decenas de veces y basta con que una de ellas olvide la comprobación de vigencia para que el defecto vuelva. Implementado dentro de una cache de consultas, se obtiene gratis y de manera uniforme: la clave de consulta actúa como token, la librería descarta las respuestas cuya clave ya no está montada, deduplica peticiones idénticas de varios consumidores y expone la señal en el argumento de la función de consulta para que la cancelación sea el camino natural en lugar del camino diligente. Esa es, con diferencia, la razón técnica más fuerte para adoptar una de esas librerías, muy por encima del ahorro de líneas: no escribes el mecanismo, y por tanto no puedes olvidarlo.
+
+<Callout type="dios" title="Cancelar es una petición cortés al mundo exterior; descartar es una decisión soberana sobre tu propio estado">
+La jerarquía entre estos dos mecanismos es lo que hay que llevarse de la lección, y se entiende bien preguntando qué ocurre si cada uno falla. Si la cancelación falla, y falla más a menudo de lo que se cree porque la petición ya salió, el servidor ya la aceptó o la capa intermedia ignoró la señal, lo único que se pierde es el ahorro: has gastado ancho de banda y ciclos de servidor que no querías gastar. Si el descarte falla, se corrompe el estado y la persona que usa el producto ve una mentira en la pantalla. Uno es un problema de eficiencia y el otro es un problema de corrección, y confundir su orden de importancia es lo que lleva a implementaciones que abortan con diligencia y siguen mostrando resultados equivocados, porque el desarrollador dio por hecho que abortar implica no recibir. No lo implica: entre la llamada a abortar y la llegada del rechazo puede haberse resuelto ya la promesa original, y en ese caso el manejador escribirá tan tranquilo. De ahí la disciplina que conviene interiorizar y que no admite excepciones: escribe siempre la comprobación de vigencia, aunque hayas cancelado, aunque estés seguro, aunque parezca redundante. La comprobación cuesta una comparación de enteros y te da una garantía que ninguna llamada al exterior puede darte. La cancelación es una petición cortés a un sistema que no controlas y que puede ignorarte; el descarte es una decisión tomada dentro de tus propios muros, y en un sistema distribuido eso es la diferencia entre esperar que algo salga bien y saber que saldrá bien.
+</Callout>
+
+<Challenge title="Separa los dos mecanismos y mide lo que cada uno te da">
+1. Implementa el buscador con descarte por token pero sin cancelación, y comprueba con el test determinista del capítulo anterior que el estado ya es correcto. Anota cuántas peticiones siguen viajando por la red.
+2. Añade `AbortController` y vuelve a medir el número de peticiones completadas. Cuantifica el ahorro en peticiones y en bytes recibidos.
+3. Quita el filtro del error de aborto y observa el efecto en la interfaz y en el registro de errores. Vuelve a ponerlo y explica por escrito qué métrica habrías corrompido en producción.
+4. Rompe la propagación a propósito eliminando el parámetro de señal en la capa de repositorio y demuestra con el panel de red que la cancelación se ha vuelto decorativa.
+5. Aplica el mismo patrón a una mutación y describe qué pasa en el servidor cuando abortas a mitad. Diseña la clave de idempotencia que haría segura esa operación.
+6. Combina antirrebote de doscientos milisegundos, cancelación y descarte, y construye una tabla con las tres métricas que cambia cada mecanismo: corrección, número de peticiones y trabajo desperdiciado.
+</Challenge>

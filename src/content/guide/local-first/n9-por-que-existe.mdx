@@ -1,0 +1,144 @@
+---
+title: "Por qué existe: el problema de IndexedDB"
+description: "Qué le falta a IndexedDB para sostener un motor de datos serio, por qué emular páginas sobre un almacén de objetos duplica trabajo, y qué gana el navegador al recibir una primitiva de ficheros."
+subject: local-first
+level: 9
+order: 4
+position: "9.4"
+duration: "16 min"
+---
+
+<Lead>
+IndexedDB no es una mala API: es una API que resuelve un problema distinto del que creemos tener. Lleva quince años siendo el único almacén serio del navegador y en ese tiempo la comunidad la ha usado para todo, incluido aquello para lo que no sirve —sostener por debajo otro motor de datos—, con resultados que van de lo mediocre a lo grotesco. OPFS aparece precisamente para deshacer ese apilamiento, y entender por qué exige mirar de cerca lo que un almacén de objetos no puede hacer por mucho que se le pida bien.
+</Lead>
+
+<Goals>
+
+- Identificar las tres carencias estructurales de IndexedDB como sustrato: escritura parcial, durabilidad y sincronía.
+- Entender el desajuste de impedancias de construir un motor de datos sobre otro.
+- Argumentar por qué un sistema de ficheros es la primitiva que los motores de datos esperan.
+- Situar SQLite sobre OPFS como consecuencia directa, no como truco.
+
+</Goals>
+
+## Lo que un almacén de objetos no puede darte
+
+IndexedDB guarda valores completos bajo claves. Ese contrato tiene tres consecuencias que ninguna cantidad de ingenio en la capa de arriba puede esquivar.
+
+La primera es que **no existe la escritura parcial**. No hay ninguna operación que diga escribe estos cuatro kilobytes en el offset 20.480.000 del valor asociado a esta clave. Solo puedes reemplazar el valor entero, y tampoco puedes leer un fragmento: recuperar un valor lo trae completo, aunque solo quieras mirar su cabecera. Si tu base de datos vive en un único valor de dos gigabytes, cambiar un registro reescribe dos gigabytes y consultarlo los materializa todos.
+
+La salida obvia es trocear: una clave por página, y así el valor que reescribes es pequeño. Funciona, y es exactamente lo que se hizo durante años, pero acabas de convertir un fichero en un índice de decenas de miles de entradas donde antes había un offset aritmético, y cada acceso pasa a costar una búsqueda en un árbol ajeno en lugar de una suma.
+
+La segunda es que **cada valor cruza el algoritmo de clonado estructurado** al entrar y al salir. Para un `ArrayBuffer` el coste tiende a ser una copia de memoria, pero sigue siendo una copia, y sobre estructuras ricas es serialización de verdad. Los bytes nunca son solo bytes, y en un motor que ya tiene su propio formato en disco esa traducción es puro trabajo perdido.
+
+La tercera es que **todo es asíncrono y transaccional**, con un modelo de vida de la transacción tan sutil como hostil: la transacción se confirma sola cuando la cola de microtareas se vacía sin operaciones pendientes de ella, así que ceder el turno a cualquier promesa ajena la mata bajo tus pies. No hay forma de escribir una función que reciba una transacción y haga trabajo arbitrario dentro, que es justamente lo que un motor necesita para componer sus capas.
+
+```js
+const tx = db.transaction('paginas', 'readwrite');
+tx.objectStore('paginas').put(bloqueA, 5000);
+
+await fetch('/telemetria');            // cede el turno al bucle de eventos
+
+tx.objectStore('paginas').put(bloqueB, 5001);   // TransactionInactiveError
+```
+
+<Callout type="warn" title="La durabilidad tampoco es lo que parece">
+Que una transacción de IndexedDB se confirme no significa que los bytes estén en el disco: significa que el navegador se ha comprometido a ponerlos. El parámetro de durabilidad estricta pide un vaciado real, pero es una petición cara, y su comportamiento exacto depende del motor y del sistema de ficheros. Un protocolo de recuperación tras fallo necesita saber con precisión qué escrituras sobrevivieron y en qué orden, y ese nivel de control no está en el contrato de IndexedDB.
+</Callout>
+
+## El desajuste de impedancias
+
+Antes de OPFS, ejecutar SQLite en el navegador obligaba a un apilamiento absurdo. SQLite quiere leer y escribir páginas de cuatro kilobytes en offsets de un fichero, así que había que emular ese fichero troceándolo en registros de IndexedDB, una clave por página. El resultado es un árbol B —el de SQLite— sentado sobre otro árbol B —el del motor que implementa IndexedDB por dentro— que a su vez descansa sobre el sistema de ficheros real que se quería usar desde el principio.
+
+<Mermaid code={`flowchart TD
+  subgraph Emulando
+    A1[Motor SQLite] --> A2[Capa que finge ser un fichero]
+    A2 --> A3[IndexedDB con una clave por pagina]
+    A3 --> A4[Motor interno del navegador]
+    A4 --> A5[Sistema de ficheros real]
+  end
+  subgraph Directo
+    B1[Motor SQLite] --> B2[OPFS con offsets reales]
+    B2 --> B3[Sistema de ficheros real]
+  end`} />
+
+Cada nivel de esa torre paga su peaje: transacción, búsqueda en el índice, clonado, y una barrera que merece párrafo propio. Un motor escrito en C llama a leer una página y **espera el resultado en la misma línea**: su árbol B, su caché de páginas y su recuperación están escritos alrededor de esa suposición. IndexedDB solo sabe responder más tarde. Salvar esa distancia obliga a reescribir el binario para que pueda suspenderse y reanudarse en cada llamada, y eso multiplica su tamaño y hunde el rendimiento, o bien a apoyarse en la integración de promesas de WebAssembly, que es más limpia pero sigue siendo un puente sobre un abismo que no debería existir. La comparación desnuda es esta:
+
+```js
+// Emulando un fichero sobre IndexedDB: leer la página 5000.
+const tx = db.transaction('paginas', 'readonly');
+const pagina = await comoPromesa(tx.objectStore('paginas').get(5000));
+// coste: transacción + índice + clonado, para 4 KiB
+```
+
+```js
+// OPFS: los mismos 4 KiB, sin capas intermedias.
+const archivo = await manejador.getFile();
+const pagina = await archivo.slice(5000 * 4096, 5001 * 4096).arrayBuffer();
+```
+
+Y hay una segunda razón, menos obvia, para que el apilamiento sea malo incluso cuando el rendimiento aguanta: **la atomicidad se duplica y no se compone**. El motor de arriba tiene su propio protocolo para sobrevivir a un corte —escribir la intención en un registro, aplicar después, marcar el punto de consistencia— y ese protocolo depende del orden real en que las escrituras llegaron al disco. Al meterlo dentro de transacciones de IndexedDB, el orden que observa el motor deja de ser el orden que ocurre, porque hay una capa entre medias reordenando y agrupando según criterios propios. Puedes acabar con dos sistemas de recuperación que funcionan perfectamente por separado y que, juntos, no garantizan nada.
+
+<Callout type="info" title="Ya no es un experimento">
+La distribución oficial de SQLite compilada a WebAssembly incluye desde hace tiempo su propia capa de ficheros sobre OPFS, y es la vía recomendada para persistir en el navegador. Bases de varios gigabytes, con transacciones e índices reales, funcionando a velocidad casi nativa dentro de una pestaña. Casi todos los motores local-first que verás en los niveles siguientes están construidos sobre esa combinación o sobre alguna variante suya.
+</Callout>
+
+<Callout type="dios" title="Es un error de categoría: una base de datos no es sustrato de otra base de datos">
+Lo que ocurrió durante quince años tiene un nombre preciso en diseño de sistemas, y es un error de nivel de abstracción. IndexedDB es una base de datos: tiene claves, índices, transacciones, un orden de recorrido y decisiones tomadas sobre cómo se serializan los valores. Un motor de datos que se construye encima no puede aprovechar nada de eso, porque él mismo trae sus propios índices, sus propias transacciones y su propio formato binario, y todo lo que la capa inferior le ofrece se convierte en trabajo duplicado que hay que atravesar en lugar de usar. La página que SQLite quiere leer ya está localizada por su offset, y aun así hay que buscarla en un índice ajeno; los bytes ya están en el formato final, y aun así hay que pasarlos por un serializador; la unidad de atomicidad ya la define el registro de escritura anticipada, y aun así hay que envolverla en una transacción que no aporta nada y que se confirma según reglas que no controlas. Un sistema de ficheros, en cambio, es exactamente lo contrario: no es una base de datos, es la primitiva mínima sobre la que se construyen las bases de datos, y su pobreza es su virtud. Un fichero no tiene opinión sobre tus datos, no tiene índice que consultar, no serializa, no transacciona; ofrece cuatro cosas —leer en un offset, escribir en un offset, cambiar el tamaño, forzar el vaciado a disco— y resulta que esas cuatro cosas son con precisión el conjunto contra el que están escritos todos los motores de almacenamiento de los últimos cuarenta años, desde el registro de escritura anticipada de Postgres hasta los árboles de fusión de RocksDB. Darle esa primitiva al navegador no añade una funcionalidad más al catálogo: elimina de golpe la traducción entera, y con ella la razón por la que persistir en el cliente era un compromiso en lugar de una decisión. La lección general vale mucho más allá de esta API concreta: cuando dos capas de tu sistema implementan la misma idea, el trabajo no se suma, se multiplica, y la solución nunca es optimizar la traducción sino eliminar una de las dos capas.
+</Callout>
+
+## Lo que se construyó encima
+
+Con un fichero real y un camino de acceso sin barrera asíncrona, la portabilidad de un motor de datos al navegador deja de ser un proyecto de investigación y pasa a ser un ejercicio de fontanería: se escribe una capa de ficheros virtual que traduce las operaciones del motor a las de OPFS, y el resto del código se compila sin tocar una línea. La forma de esa capa es sorprendentemente pequeña, y es la misma en Postgres, en SQLite y en cualquier árbol de fusión que quieras portar:
+
+```js
+// La superficie mínima que un motor de almacenamiento espera del mundo.
+const capaDeFicheros = {
+  abrir(nombre)                 { /* devuelve un descriptor */ },
+  leer(fd, destino, offset)     { /* llena destino desde offset */ },
+  escribir(fd, origen, offset)  { /* escribe origen en offset */ },
+  truncar(fd, tamano)           { /* fija el tamano */ },
+  tamano(fd)                    { /* consulta el tamano */ },
+  vaciar(fd)                    { /* fuerza la bajada a disco */ },
+  cerrar(fd)                    { /* libera */ },
+};
+```
+
+Siete funciones, y ninguna de ellas es expresable con fidelidad sobre un almacén de objetos: las tres primeras porque hablan de offsets que allí no existen, `vaciar` porque la durabilidad no está bajo tu control, y todas a la vez porque el motor las llama esperando una respuesta inmediata. Sobre OPFS, en cambio, se corresponden casi uno a uno con lo que la API ofrece —del todo cuando entras por el camino síncrono del nivel 10—.
+
+<Cards>
+  <Card icon="🗃️" title="SQLite en la pestaña">
+    La distribución oficial de SQLite compilada a WebAssembly incluye una capa de ficheros sobre OPFS. Bases de varios gigabytes, con índices y consultas reales, a velocidad casi nativa dentro del navegador.
+  </Card>
+  <Card icon="📜" title="Registro de escritura anticipada">
+    Escribir primero la intención en un fichero de registro y aplicar después es el patrón que hace recuperable cualquier almacén. Necesita añadir al final y vaciar en orden, y eso es justo lo que un almacén de objetos no expresa.
+  </Card>
+  <Card icon="🧱" title="Árboles de fusión">
+    Segmentos inmutables que se escriben una vez y se compactan después encajan de forma natural en un sistema de ficheros, y de forma pésima en un almacén de valores completos.
+  </Card>
+  <Card icon="🤝" title="Motores de sincronización">
+    Un motor local-first necesita el documento, su historia y sus índices en un formato que controle byte a byte para poder podar, compactar y diferenciar. OPFS es lo que se lo permite.
+  </Card>
+</Cards>
+
+El efecto de segundo orden es tal vez más importante que el rendimiento: al desaparecer la traducción, **el mismo código de almacenamiento corre en el servidor y en el cliente**. Un motor que habla con una capa de ficheros de siete funciones puede tener una implementación sobre el sistema de ficheros nativo y otra sobre OPFS, y el resto —el formato en disco, el protocolo de recuperación, las consultas— es idéntico y se prueba una sola vez. Esa unificación es la que hace realista mover la autoridad al cliente sin escribir dos productos.
+
+## Cuándo IndexedDB sigue siendo la respuesta
+
+Nada de lo anterior condena a IndexedDB: lo devuelve a su sitio. Sigue siendo la elección correcta —y muchas veces la única sensata— cuando lo que necesitas es de verdad un almacén de objetos y no tienes ninguna intención de escribir un motor.
+
+Encaja bien con metadatos y preferencias, con colas de trabajo pendientes de envío, con cachés de entidades que llegan de una API y se consultan por identificador, con manejadores de ficheros persistidos entre sesiones, y con cualquier caso donde quieras consultar por un campo que no es la clave, porque los índices secundarios te los da hechos y en OPFS tendrías que construirlos tú desde cero.
+
+La regla de decisión cabe en una línea: **si tu unidad natural de trabajo es un valor entero, quédate donde estás; si es un rango de bytes dentro de algo grande, has llegado a OPFS**. Y la combinación de ambos es un patrón perfectamente respetable: el motor en OPFS para el volumen, e IndexedDB al lado para el puñado de registros de control que quieres poder consultar sin abrir nada.
+
+<Callout type="tip" title="Migrar no es copiar de una API a otra">
+Si ya tienes datos en IndexedDB, mover el volumen a OPFS no consiste en volcar los valores tal cual: consiste en decidir primero cuál es tu formato en disco —qué es una página, qué es un registro, dónde está el registro de escritura anticipada— y después escribirlo. Saltarse ese paso reproduce dentro de un fichero exactamente el mismo almacén clave-valor del que venías, con la única diferencia de que ahora lo mantienes tú.
+</Callout>
+
+<Challenge title="Mide la torre">
+1. Guarda un megabyte en un valor de IndexedDB, modifica un byte y vuelve a guardarlo. Cronométralo y compáralo con la misma modificación en un fichero de OPFS.
+2. Trocea ese megabyte en páginas de cuatro kilobytes, guarda una clave por página y mide lectura aleatoria de cien páginas contra el mismo acceso con `slice`.
+3. Reproduce a propósito el error de transacción inactiva cediendo el turno dentro de una transacción, y explica en una frase por qué existe esa regla.
+4. Enumera qué partes de tu aplicación actual encajan de verdad con un almacén de objetos y cuáles estabas forzando.
+5. Diseña sobre papel la capa de ficheros mínima que necesitaría un motor externo: qué cuatro operaciones expone y con qué llamadas de OPFS las implementarías.
+</Challenge>

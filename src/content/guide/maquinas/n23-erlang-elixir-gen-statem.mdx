@@ -1,0 +1,152 @@
+---
+title: "Erlang y Elixir: gen_statem, la máquina como ciudadano de primera"
+description: "En la BEAM la máquina de estados no es un patrón que alguien añade encima del lenguaje: es un comportamiento de la biblioteca estándar con veinticinco años de historia, y trae de serie cosas que ninguna librería de interfaz ofrece. Esta lección desmonta gen_statem pieza a pieza —los dos modos de retrollamada, la separación entre nombre del estado y datos del estado, las acciones de entrada, los tres tipos de temporizador, el aplazamiento de eventos y la respuesta síncrona desde dentro de la transición— y termina en la propiedad que lo cambia todo: cada máquina es un proceso aislado que puede morir sin llevarse a nadie por delante."
+subject: maquinas
+level: 23
+order: 4
+position: "23.4"
+duration: "20 min"
+---
+
+<Lead>
+Las tres lecciones anteriores mostraban lenguajes donde el sistema de tipos regala la mitad estructural del statechart y el resto lo escribes tú. Erlang invierte el reparto entero. Aquí no hay tipos que comprueben nada al compilar, pero sí existe, desde hace un cuarto de siglo, un comportamiento de la biblioteca estándar cuyo único propósito es ejecutar máquinas de estados, con una lista de primitivas que a cualquiera que venga de XState le resultará familiar hasta la incomodidad y que en varios puntos la supera. La razón de esa madurez es histórica y vale la pena entenderla: Erlang nació para centralitas telefónicas, y una centralita es literalmente un enjambre de protocolos con estados, temporizadores y eventos que llegan a destiempo. Lo que en la web se descubrió hacia 2018 como una buena forma de organizar una interfaz, allí fue desde el primer día la única forma concebible de escribir el sistema.
+</Lead>
+
+<Goals>
+
+- Separar el nombre del estado de los datos del estado y elegir con criterio entre los dos modos de retrollamada.
+- Usar acciones de transición: respuesta síncrona, evento propio inmediato, aplazamiento y los tres tipos de temporizador.
+- Reconocer el aplazamiento de eventos como solución de primera clase al evento que llega demasiado pronto.
+- Situar la máquina dentro del modelo de procesos: aislamiento, buzón, muerte y lo que sobrevive a un reinicio.
+
+</Goals>
+
+## El nombre del estado y los datos del estado
+
+El comportamiento `gen_statem` apareció en OTP 19 y jubiló a `gen_fsm`, que quedó obsoleto en OTP 20. La sustitución no fue cosmética: corrigió tres limitaciones que en su antecesor obligaban a componendas constantes, a saber, la imposibilidad de aplazar un evento, la falta de temporizadores asociados al estado y la obligación de que el estado fuera siempre un átomo. La abstracción que resultó descompone el estado en dos mitades que el resto de este track lleva veintitantos niveles distinguiendo: el nombre del estado, que determina qué eventos son legales, y los datos del estado, que son el estado extendido y viajan con la máquina sin cambiar qué es legal.
+
+Esa descomposición da lugar a los dos modos de retrollamada, y elegir entre ellos es la primera decisión de diseño. Con `state_functions`, el nombre del estado debe ser un átomo y cada estado tiene su propia función, de modo que el código queda agrupado por estado y leer un estado completo es leer una función. Con `handle_event_function`, hay una sola retrollamada de cuatro argumentos, el nombre del estado puede ser cualquier término —una tupla, un mapa, algo compuesto— y el código puede agruparse por evento, que es lo que conviene cuando muchos estados reaccionan igual a lo mismo. Añadir `state_enter` a la lista del modo activa además las llamadas de entrada, que son las acciones de entrada de Harel con otro nombre.
+
+```elixir
+defmodule Torniquete do
+  @behaviour :gen_statem
+  require Logger
+
+  def start_link, do: :gen_statem.start_link({:local, __MODULE__}, __MODULE__, :ok, [])
+  def moneda, do: :gen_statem.call(__MODULE__, :moneda)
+  def empujar, do: :gen_statem.cast(__MODULE__, :empujar)
+
+  @impl true
+  def callback_mode, do: [:state_functions, :state_enter]
+
+  @impl true
+  def init(:ok), do: {:ok, :bloqueado, %{monedas: 0, giros: 0}}
+
+  def bloqueado(:enter, _anterior, _datos) do
+    Logger.info("torniquete bloqueado")
+    :keep_state_and_data
+  end
+
+  def bloqueado({:call, quien}, :moneda, datos) do
+    {:next_state, :abierto, %{datos | monedas: datos.monedas + 1},
+     [{:reply, quien, :ok}, {:state_timeout, 5_000, :caduco}]}
+  end
+
+  def bloqueado(:cast, :empujar, _datos) do
+    {:keep_state_and_data, [:postpone]}
+  end
+
+  def abierto(:enter, _anterior, _datos), do: :keep_state_and_data
+
+  def abierto(:cast, :empujar, datos) do
+    {:next_state, :bloqueado, %{datos | giros: datos.giros + 1}}
+  end
+
+  def abierto(:state_timeout, :caduco, datos) do
+    {:next_state, :bloqueado, datos}
+  end
+
+  def abierto({:call, quien}, :moneda, _datos) do
+    {:keep_state_and_data, [{:reply, quien, {:error, :ya_abierto}}]}
+  end
+end
+```
+
+La versión equivalente en el otro modo revela para qué sirve de verdad: cuando el nombre del estado puede ser un término compuesto, la jerarquía y las regiones dejan de ser algo que hay que aplanar a mano. Un estado escrito como una tupla de modo y submodo permite escribir manejadores que atienden a todos los submodos de un modo con una sola cláusula, que es exactamente el comportamiento de un estado compuesto de Harel expresado con coincidencia de patrones.
+
+```elixir
+def callback_mode, do: :handle_event_function
+
+# atiende cualquier submodo del modo conectado
+def handle_event(:cast, :desconectar, {:conectado, _submodo}, datos) do
+  {:next_state, :desconectado, %{datos | sesion: nil}}
+end
+
+# solo el submodo de espera
+def handle_event(:state_timeout, :sin_respuesta, {:conectado, :esperando}, datos) do
+  {:next_state, {:conectado, :inactivo}, datos}
+end
+```
+
+Esa capacidad tiene contrapartida y conviene enunciarla antes de abusar de ella: al agrupar por evento se pierde la lectura por estado, que es la gran virtud del primer modo, y con nombres compuestos el conjunto de estados deja de estar enumerado en ningún sitio, de modo que nada impide inventar una tupla que no corresponde a ningún estado real. La regla práctica que aplica la mayoría del ecosistema es empezar con funciones por estado, que se leen como el diagrama, y cambiar de modo solo cuando la jerarquía o la repetición entre estados lo justifiquen.
+
+<Callout type="info" title="El evento trae su tipo y eso resuelve una ambigüedad clásica">
+Cada retrollamada recibe el tipo del evento además de su contenido, y los tipos son cerrados: llamada síncrona con remitente, envío asíncrono, mensaje ordinario del buzón, vencimiento de temporizador de evento o de estado, y evento interno generado por la propia máquina. Esa distinción resuelve de raíz un problema que en otros entornos se arrastra a mano, que es no poder diferenciar un evento del dominio de un mensaje de infraestructura que se coló por el mismo canal. Aquí la firma te lo dice, y puedes decidir por estado si un mensaje inesperado se ignora, se aplaza o mata al proceso.
+</Callout>
+
+## Las acciones que casi ninguna otra herramienta trae
+
+La lista de retorno de una retrollamada no se limita al estado siguiente: incluye una lista de acciones que el motor ejecuta en orden, y ahí está la parte que conviene mirar despacio porque es donde `gen_statem` aventaja a la mayoría de las librerías modernas.
+
+| Concepto | En `gen_statem` | Equivalente habitual en XState |
+| --- | --- | --- |
+| nombre del estado | átomo o término compuesto | valor de estado |
+| estado extendido | los datos que acompañan al estado | el contexto |
+| acción de entrada | llamada de entrada con `state_enter` | acción de entrada declarativa |
+| temporizador del estado | temporizador de estado, muere al cambiar | transición retardada |
+| temporizador reiniciable | temporizador de evento, muere con cualquier evento | no existe de serie |
+| varios relojes a la vez | temporizadores con nombre | actores temporizadores a mano |
+| evento propio inmediato | evento siguiente insertado en cabeza | evento elevado |
+| respuesta síncrona al llamante | acción de respuesta desde la transición | no existe de serie |
+| evento que llega pronto | aplazamiento | no existe de serie |
+
+Las tres últimas filas merecen comentario porque no son comodidades. La respuesta síncrona permite que un cliente llame a la máquina y espere el resultado, pero la máquina decide desde dentro de la transición cuándo y qué contestar, e incluso puede no contestar todavía y guardar el remitente en sus datos para responderle cuatro estados después: eso es una petición que espera a que un protocolo avance, y es endiabladamente difícil de escribir sin un motor que lo contemple.
+
+El aplazamiento es la joya. Cuando un evento llega en un estado donde aún no tiene sentido, el manejador puede pedir que se guarde en lugar de descartarlo, y el motor lo vuelve a entregar automáticamente en cuanto el nombre del estado cambia, respetando el orden de llegada. Piensa en un cliente que envía peticiones mientras la conexión aún se está estableciendo: sin aplazamiento hay que inventar una cola en el estado extendido, drenarla a mano al entrar en el estado bueno y no equivocarse con el orden. Con aplazamiento son cinco caracteres. El precio, que hay que decir, es que un evento aplazado que nunca encuentra un cambio de estado se acumula en memoria para siempre, de modo que aplazar sin un temporizador de estado que garantice la salida es una fuga esperando su turno. En el torniquete de arriba, además, aplazar el empujón es discutible como decisión de producto —lo razonable en una puerta real es descartarlo— y aparece ahí para que veas el mecanismo, no para que lo copies.
+
+<Callout type="warn" title="Los tres temporizadores no son intercambiables">
+El temporizador de estado se cancela solo en cuanto el nombre del estado cambia, y es el que quieres para cosas como el tiempo máximo que una sesión aguanta abierta. El temporizador de evento se cancela con la llegada de cualquier evento, y es exactamente el reloj de inactividad que en otros entornos se reimplementa mal a mano cada vez. Los temporizadores con nombre son independientes entre sí, sobreviven al cambio de estado y se cancelan a voluntad, y son los que permiten tener varios plazos a la vez sin inventar identificadores. Confundir los dos primeros produce el fallo más difícil de reproducir de todos: un plazo que unas veces salta y otras no, según lo que ocurriera antes.
+</Callout>
+
+## El proceso es el actor y el estado no sobrevive por defecto
+
+Todo lo anterior sería una biblioteca elegante si no fuera porque cada máquina es además un proceso de la BEAM: tiene su propio montículo, su propio buzón, su planificación expropiativa y su identificador. Eso significa que instanciar diez mil máquinas es una operación normal y barata, que ninguna puede corromper la memoria de otra, que un fallo en una no arrastra a las demás y que la comunicación entre máquinas es un envío de mensaje al buzón del vecino, con la máquina receptora decidiendo en qué estado ese mensaje significa algo.
+
+<Mermaid code={`flowchart TD
+  S[supervisor] -->|arranca y vigila| A[proceso gen statem sesion A]
+  S -->|arranca y vigila| B[proceso gen statem sesion B]
+  A -->|mensaje sincrono con respuesta diferida| B
+  B -.->|falla y muere| S
+  S -.->|reinicia en el estado inicial| B
+  B -->|escribe lo que debe durar| T[almacen fuera del proceso]
+  class A t-green
+  class T t-sky`} />
+
+De ahí se sigue la consecuencia que más sorprende a quien llega desde una interfaz de usuario y la que hay que enunciar sin adornos: el estado de un `gen_statem` no es duradero. Vive en el montículo del proceso y desaparece cuando el proceso muere, de modo que el supervisor que lo reinicia arranca una máquina nueva en el estado inicial, no la misma máquina donde la dejó. Esto no es un defecto que OTP no llegó a resolver, es una decisión: la máquina modela el protocolo en curso, que por naturaleza es efímero, y lo que debe sobrevivir a una caída se escribe explícitamente fuera del proceso, en una tabla en memoria compartida, en una base de datos o en un registro de eventos. La distinción entre lo que la máquina está haciendo ahora y lo que el sistema debe recordar pase lo que pase queda así separada por construcción, y esa separación es justamente la que los motores de flujos de trabajo duraderos reintroducen a base de persistir cada transición.
+
+<Callout type="tip" title="Cómo se prueba y cómo se mira por dentro">
+Una máquina de este tipo se prueba en tres capas distintas y conviene no mezclarlas. La transición pura se prueba llamando directamente a la función del estado con un tipo de evento, un contenido y unos datos, y comprobando la tupla que devuelve: no hace falta arrancar ningún proceso. El comportamiento del proceso vivo se prueba arrancándolo, enviándole llamadas y comprobando respuestas, con el reloj acelerado si hay temporizadores. Y para mirar por dentro sin instrumentar nada, el módulo `sys` de OTP entrega el estado actual de un proceso en marcha, permite activar trazas de todos los eventos que recibe y hasta instalar un depurador estadístico: es el inspector en vivo que en otros ecosistemas hay que enchufar a mano, disponible para cualquier proceso en producción.
+</Callout>
+
+<Callout type="dios" title="La BEAM no adoptó el modelo de actores: es el modelo de actores">
+Merece la pena decir con toda claridad cuál es la relación histórica, porque el orden importa. XState no inventó el modelo de actores ni la máquina como unidad de ejecución: reconstruyó sobre un solo hilo de JavaScript, y con notable fidelidad, lo que Erlang tenía funcionando en centralitas desde principios de los noventa. La diferencia entre la reconstrucción y el original no está en la sintaxis, está en qué garantiza el sustrato. En un intérprete de statecharts sobre JavaScript, dos máquinas del mismo programa comparten montículo, comparten hilo y comparten destino: si una entra en un bucle infinito, las demás dejan de responder; si una lanza una excepción no capturada en el momento equivocado, puede llevarse el proceso entero; y el aislamiento entre actores es una convención que el lenguaje no impone. En la BEAM, cada máquina tiene su propia memoria, su propio turno de planificación y su propia muerte, y esas tres propiedades convierten una idea de diseño en una propiedad operativa: puedes razonar sobre el fallo de una máquina sin razonar sobre las demás. Ahí está el aprendizaje transferible, que no es aprender Erlang sino saber qué le estás pidiendo a tu entorno. Cuando dices que tu aplicación es un sistema de actores, en la BEAM esa frase es una descripción del tiempo de ejecución, y en cualquier otro sitio es una descripción de tu disciplina. Ambas cosas son legítimas y sirven para pensar; confundirlas lleva a esperar del intérprete un aislamiento que solo el planificador puede dar, y a diseñar sistemas cuya tolerancia a fallos existe únicamente en el diagrama.
+</Callout>
+
+<Challenge title="Escribe una máquina que aplace y responda">
+1. Modela un cliente de protocolo con tres estados —desconectado, conectando y listo— usando el modo de funciones por estado y las llamadas de entrada activadas.
+2. Haz que las peticiones que lleguen mientras conecta se aplacen en lugar de fallar, y comprueba el orden en que se atienden al llegar al estado listo.
+3. Añade un temporizador de estado que abandone el intento de conexión y compara su comportamiento con el de un temporizador de evento en el mismo sitio.
+4. Guarda el remitente de una llamada en los datos del estado y respóndele dos transiciones más tarde, cuando el protocolo lo permita.
+5. Reescribe la misma máquina en el modo de una sola retrollamada y decide cuál de las dos versiones lees mejor y por qué.
+6. Mata el proceso a propósito, deja que el supervisor lo reinicie y enumera qué información se perdió y cuál tendrías que haber escrito fuera.
+</Challenge>

@@ -1,0 +1,142 @@
+---
+title: "Un contenedor a mano: namespaces mas cgroups"
+description: "Docker no es magia: es kernel. Construir un contenedor con las manos usando unshare para aislar la vista, pivot_root para cambiar la raiz del sistema de ficheros y cgroups v2 para limitar cuanta CPU y memoria consume, entendiendo que un runtime de contenedores no hace nada que tu no puedas hacer con las llamadas al sistema del propio Linux."
+subject: kernel
+level: 52
+order: 2
+position: "52.2"
+duration: "17 min"
+---
+
+<Lead>
+Un contenedor parece un objeto: algo que Docker fabrica, arranca y destruye. No lo es. Un contenedor no existe como entidad dentro del kernel; no hay ninguna estructura `struct container` en las fuentes de Linux. Lo que llamamos contenedor es un proceso corriente al que se le ha recortado la vista con namespaces, se le ha cambiado la raíz del árbol de ficheros y se le ha puesto una correa a su consumo de recursos con cgroups. Docker, Podman y `runc` orquestan esas tres operaciones con esmero, pero cada una es una llamada al sistema que tú puedes invocar a mano. En esta lección construimos un contenedor con un puñado de comandos, para que la palabra deje de sonar a magia y empiece a sonar a lo que es: kernel.
+</Lead>
+
+<Goals>
+
+- Separar las dos mitades del problema: aislar la vista frente a limitar el consumo.
+- Levantar el aislamiento con `unshare` y una raíz propia con `pivot_root`.
+- Acotar CPU, memoria y número de procesos con la jerarquía unificada de `cgroups` v2.
+- Ver que un runtime de contenedores solo compone estas piezas del kernel.
+
+</Goals>
+
+## Dos problemas ortogonales
+
+Un contenedor resuelve dos cosas que conviene no confundir. La primera es *qué ve* el proceso: qué procesos, qué red, qué sistema de ficheros, qué hostname. Eso lo dan los namespaces de la lección anterior. La segunda es *cuánto consume*: cuánta CPU, cuánta RAM, cuántos PIDs, cuánto ancho de banda de disco. Eso lo dan los cgroups. Son ejes independientes: puedes aislar la vista sin limitar recursos, o limitar recursos sin aislar nada. Un contenedor es sencillamente la intersección de ambos, más una imagen de sistema de ficheros que hace de raíz.
+
+<Cards>
+  <Card icon="👁️" title="Namespaces: la vista">
+    Particionan recursos globales para que el proceso vea su propia tabla de PIDs, su pila de red, su árbol de montajes. Responden a la pregunta qué existe para este proceso.
+  </Card>
+  <Card icon="⛓️" title="Cgroups: el consumo">
+    Contabilizan y limitan CPU, memoria, E/S y número de tareas de un grupo de procesos. Responden a la pregunta cuánto puede gastar este proceso.
+  </Card>
+</Cards>
+
+## El aislamiento con las manos
+
+Empezamos por la vista. Un solo `unshare` puede desprender todos los namespaces de golpe. La clave es `--user --map-root-user`, que crea primero un `user` namespace y nos hace `root` dentro de él, habilitando la creación de los demás sin privilegios reales sobre el host:
+
+```bash
+# aislar todo y arrancar un shell como PID 1 de su propio mundo
+unshare --user --map-root-user \
+        --mount --uts --ipc --net --pid --cgroup --fork \
+        /bin/bash
+```
+
+Dentro de ese shell aún vemos el sistema de ficheros del host, porque compartimos su raíz. El paso decisivo es `pivot_root`, que intercambia la raíz del `mnt` namespace por un directorio que preparamos como imagen. A diferencia de `chroot` —trivial de escapar—, `pivot_root` reemplaza de verdad la raíz y luego desmontamos la antigua para que sea inalcanzable:
+
+```bash
+# dentro del shell aislado, con /srv/rootfs conteniendo una mini distro
+mount --bind /srv/rootfs /srv/rootfs      # pivot_root exige que sea un mount
+cd /srv/rootfs
+mkdir -p vieja_raiz
+pivot_root . vieja_raiz                    # . pasa a ser /, la antigua a vieja_raiz
+umount -l /vieja_raiz                       # cortar el cordon con el host
+mount -t proc proc /proc                    # un /proc que refleje el pid namespace
+hostname contenedor
+exec ps aux                                 # solo TUS procesos; PID 1 es tu shell
+```
+
+## El mapeo de identidades
+
+Falta explicar la magia de `--map-root-user`. Cuando creas un `user` namespace sin más, no hay ninguna correspondencia entre las identidades de dentro y las de fuera, así que todo aparece como el UID de desbordamiento —`nobody`, el 65534—. Para que el `root` interno signifique algo, escribes la correspondencia en `/proc/PID/uid_map` y `/proc/PID/gid_map`, con el formato `id-dentro id-fuera longitud`:
+
+```bash
+# sin mapeos: el proceso se ve a si mismo como nadie
+unshare --user /bin/bash -c 'id'
+# uid=65534(nobody) gid=65534(nogroup)
+
+# mapear a mano desde el padre: el 0 de dentro es tu UID 1000 de fuera
+echo 'deny'      > /proc/$PID/setgroups   # requisito de seguridad desde 3.19
+echo '0 1000 1'  > /proc/$PID/uid_map     # root interno -> usuario 1000
+echo '0 1000 1'  > /proc/$PID/gid_map
+```
+
+Ese `deny` en `setgroups` antes del `gid_map` no es opcional: tapa una vulnerabilidad de 2014 en la que un usuario, al soltar sus grupos suplementarios dentro de un namespace nuevo, podía burlar un permiso *negativo* —un fichero vedado precisamente a un grupo al que pertenecía—. Y aquí reside la seguridad del modelo rootless: el `root` de dentro es, para el kernel del host, el humilde UID 1000. Aunque un atacante escape del contenedor, aterriza como un usuario sin privilegios, no como el administrador de la máquina.
+
+En este punto ya tienes un contenedor funcional en cuanto a aislamiento: procesos, red, montajes, IPC y hostname son privados, la raíz del sistema de ficheros es tu imagen y las identidades están acotadas. Lo único que falta es impedir que este proceso devore la máquina.
+
+## La correa: cgroups v2
+
+Los cgroups viven en un sistema de ficheros montado en `/sys/fs/cgroup`. En la jerarquía *unificada* de la versión 2 —la única que se usa hoy— cada directorio es un grupo, y escribir en sus ficheros de control fija los límites. Crear un grupo y acotarlo es escribir texto:
+
+```bash
+# crear un grupo y limitar memoria, CPU y numero de procesos
+mkdir /sys/fs/cgroup/miapp
+echo '128M'          > /sys/fs/cgroup/miapp/memory.max   # tope de RAM
+echo '50000 100000'  > /sys/fs/cgroup/miapp/cpu.max      # 50 ms de cada 100: medio nucleo
+echo '64'            > /sys/fs/cgroup/miapp/pids.max      # anti fork bomb
+```
+
+Meter un proceso en el grupo es escribir su PID en `cgroup.procs`; a partir de ese instante él y sus futuros hijos quedan contabilizados y limitados:
+
+```bash
+echo $$ > /sys/fs/cgroup/miapp/cgroup.procs   # este shell y su descendencia
+```
+
+Hay un detalle que atrapa a todo el mundo la primera vez: para que un hijo pueda usar un controlador, el padre debe *delegárselo* explícitamente escribiendo en `cgroup.subtree_control`. Sin ese paso, `memory.max` ni siquiera existe como fichero en el subgrupo:
+
+```bash
+# habilitar los controladores para los hijos ANTES de crearlos
+echo '+memory +cpu +pids' > /sys/fs/cgroup/cgroup.subtree_control
+cat /sys/fs/cgroup/miapp/cgroup.controllers   # ahora aparecen disponibles
+```
+
+Esta *jerarquía unificada* es la gran ruptura de la versión 2 frente a la 1: un único árbol donde todos los controladores coexisten, en lugar de una maraña de jerarquías paralelas e inconsistentes. Si el grupo excede `memory.max`, el kernel primero intenta reclamar páginas y, si no puede, dispara el OOM killer *dentro* de ese cgroup, sin tocar al resto del sistema. Este es exactamente el mecanismo con el que Kubernetes hace cumplir los *limits* de un pod.
+
+<Mermaid code={`flowchart LR
+  P[proceso normal] --> A[unshare user mount pid net]
+  A --> B[pivot_root a la imagen]
+  B --> C[escribir PID en cgroup.procs]
+  C --> D[contenedor con vista aislada y consumo acotado]`} />
+
+## Lo que hace un runtime, sin el runtime
+
+Cuando `docker run` arranca un contenedor, `runc` hace en C, con precisión y manejo de errores, exactamente lo que acabamos de teclear: llama a `clone3` con la máscara de flags `CLONE_NEW*`, escribe los mapeos en `/proc/PID/uid_map`, monta la imagen y ejecuta `pivot_root`, coloca el proceso en un cgroup que fija los límites del `docker run --memory`, y solo entonces aplica dos capas más que veremos a continuación: recorta las capabilities al mínimo (lección 52.4) y carga un filtro seccomp que bloquea las syscalls peligrosas (lección 52.3). El formato OCI que Docker consume no es más que un JSON que describe qué namespaces crear, qué montar y qué límites poner. No hay una sola línea de ese proceso que no sea kernel de Linux invocado desde el espacio de usuario.
+
+Y como no hay nada especial, puedes auditar un contenedor de Docker con las mismas herramientas de la lección anterior. `lsns` lista los namespaces del sistema y quién los habita; `nsenter` usa `setns` por debajo para meterte en los de un contenedor sin pasar por Docker:
+
+```bash
+lsns -t pid -t net          # los namespaces vivos y su proceso lider
+nsenter -t $(pidof nginx) -n -p -m ip addr   # entrar en la red y PIDs del contenedor
+```
+
+Que esto funcione sobre un contenedor de Docker sin que Docker intervenga es la prueba definitiva de la tesis: no hay contenedor, hay namespaces que cualquiera con permiso puede inspeccionar y compartir.
+
+<Callout type="info" title="El daemon no es el contenedor">
+Es tentador creer que el contenedor vive dentro del proceso de Docker. No: `dockerd` y `containerd` solo preparan el terreno y lanzan a `runc`, que a su vez hace las llamadas al sistema y *se retira*. El proceso del contenedor cuelga entonces de un pequeño supervisor, no del daemon. Por eso puedes reiniciar Docker sin matar los contenedores en marcha: el aislamiento lo sostiene el kernel, no el programa que lo pidió.
+</Callout>
+
+<Callout type="dios" title="El contenedor es un adjetivo disfrazado de sustantivo">
+Piensa en lo que de verdad ha ocurrido en esta lección, porque desmonta una de las abstracciones más exitosas y más engañosas de la última década. Hablamos de contenedores como si fueran cosas: los creamos, los movemos, los borramos, los contamos, dibujamos cajas alrededor de ellos en los diagramas. El lenguaje nos empuja a reificarlos, a imaginar un objeto discreto con paredes propias flotando sobre el sistema operativo. Pero cuando bajas al kernel y buscas ese objeto, no está. No hay `struct container`, no hay una tabla de contenedores, no hay un subsistema de contenedores. Lo que hay es un proceso normal —idéntico en su naturaleza a cualquier otro— sobre el que se han aplicado tres adjetivos: está *aislado* en su vista por namespaces, está *arraigado* en una imagen por pivot_root, está *acotado* en su consumo por cgroups. El contenedor no es un sustantivo; es un proceso adjetivado, una configuración de propiedades que se le cuelgan encima. Y esta revelación tiene una consecuencia práctica enorme: si el contenedor no es una entidad sino un conjunto de atributos, entonces su seguridad no es la solidez de unas paredes que no existen, sino la exhaustividad de esos atributos. Un contenedor está tan aislado como completos sean sus namespaces, tan confinado como estrictas sus capabilities, tan sandboxeado como cerrado su filtro seccomp. Olvida uno de esos adjetivos —comparte el `pid` namespace del host, deja `CAP_SYS_ADMIN`, no pongas seccomp— y el objeto que creías sólido se revela como lo que siempre fue: un proceso corriente con la misma línea directa al kernel que cualquier otro. Docker no construyó una fortaleza; describió con rigor un proceso. Y toda la ingeniería de seguridad de contenedores consiste en no olvidar ningún adjetivo.
+</Callout>
+
+<Challenge title="Fabrica tu contenedor sin Docker">
+1. Prepara un `rootfs` mínimo con `debootstrap` o extrayendo la imagen de `alpine`, y arranca un shell aislado dentro de él con `unshare` y `pivot_root` siguiendo los pasos de arriba.
+2. Comprueba desde dentro que `ps aux` solo muestra tu descendencia y que `ip addr` no ve las interfaces del host.
+3. Crea un cgroup con `memory.max` de 64 MB, mete tu shell y ejecuta un programa que reserve 128 MB: observa cómo el OOM killer actúa dentro del grupo sin afectar al host.
+4. Explica por qué `pivot_root` es seguro frente a `chroot` y qué papel juega desmontar la raíz antigua.
+5. Argumenta, con las tres piezas de esta lección, qué le falta a tu contenedor a mano para igualar la seguridad de un `docker run` por defecto.
+</Challenge>

@@ -1,0 +1,128 @@
+---
+title: "Zero-copy en red: MSG_ZEROCOPY e io_uring"
+description: "Las interfaces modernas eliminan la última copia del envío de red fijando las páginas de usuario y dejando que el DMA de la NIC las lea directamente. MSG_ZEROCOPY añade una notificación asíncrona de finalización sobre send; io_uring integra el envío zero-copy con buffers registrados y elimina hasta la propia syscall. El coste oculto —fijar páginas, rastrear completado, coherencia— y por qué solo compensa por encima de un umbral de tamaño."
+subject: kernel
+level: 42
+order: 5
+position: "42.5"
+duration: "17 min"
+---
+
+<Lead>
+En el envío de red queda una copia que ni `sendfile` ni `splice` eliminan cuando el dato nace en userspace: la del buffer del proceso al `sk_buff` del kernel. `MSG_ZEROCOPY` la borra fijando las páginas del usuario y dejando que la NIC lea de ellas por DMA. Pero esa copia cero no es gratis: introduce un modelo asíncrono de finalización que complica el código y solo gana por encima de cierto tamaño. Este último nivel une las dos piezas —`MSG_ZEROCOPY` e io_uring— y cierra el círculo entendiendo que el zero-copy no elimina el coste, lo desplaza.
+</Lead>
+
+<Goals>
+
+- Enviar sin copiar el payload con `SO_ZEROCOPY` y `MSG_ZEROCOPY`.
+- Consumir las notificaciones de finalización por la cola de errores del socket.
+- Integrar el envío zero-copy en io_uring con buffers registrados.
+- Razonar el equilibrio entre complejidad y rendimiento, y el umbral de tamaño donde compensa.
+
+</Goals>
+
+## MSG_ZEROCOPY: send sin copiar el payload
+
+Se activa por socket y se pide por envío. El kernel fija las páginas del buffer, apunta a ellas desde el `sk_buff` y la NIC las lee por DMA directamente.
+
+```c
+/* Una vez por socket: habilitar zero-copy */
+int one = 1;
+setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof one);
+
+/* Por envio: el kernel NO copia; fija las paginas de 'buf' */
+ssize_t n = send(fd, buf, len, MSG_ZEROCOPY);
+```
+
+Aquí aparece la sutileza que lo cambia todo. `send` regresa **antes** de que la NIC haya terminado de transmitir. Como el kernel no copió el dato, las páginas de `buf` siguen siendo la fuente de la transmisión: el proceso **no debe** reescribirlas hasta que el hardware las haya leído y la red haya confirmado el envío. ¿Cómo sabe el proceso que ya puede reutilizar el buffer? Con una notificación asíncrona que el kernel deposita en la **cola de errores** del socket.
+
+## La notificación de finalización: MSG_ERRQUEUE
+
+Cada `send` con `MSG_ZEROCOPY` lleva un número de secuencia. Cuando el kernel termina con esas páginas, encola un aviso que lees con `recvmsg` sobre `MSG_ERRQUEUE`.
+
+```c
+#include <linux/errqueue.h>
+
+/* El kernel avisa cuando ya no necesita las paginas fijadas */
+char control[128];
+struct msghdr msg = { .msg_control = control, .msg_controllen = sizeof control };
+
+recvmsg(fd, &msg, MSG_ERRQUEUE);
+
+struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+struct sock_extended_err *serr = (void *)CMSG_DATA(cm);
+
+if (serr->ee_origin == SO_EE_ORIGIN_ZEROCOPY) {
+	/* ee_data..ee_info: rango de numeros de envio ya completados */
+	uint32_t lo = serr->ee_info, hi = serr->ee_data;
+	liberar_buffers_en_rango(lo, hi);   /* ya puedo reusar esas paginas */
+}
+```
+
+El kernel agrupa completados por rangos para amortizar el coste. Y hay un detalle honesto: si en el último tramo la copia habría sido más barata que fijar las páginas, el kernel **puede decidir copiar de todos modos** y marcarlo con el bit `SO_EE_CODE_ZEROCOPY_COPIED`. El zero-copy es una petición, no una garantía.
+
+<Callout type="warn" title="Fijar páginas no es gratis">
+`MSG_ZEROCOPY` cambia una copia por dos costes nuevos: fijar y soltar las páginas de usuario (tocar sus `struct page`, incrementar referencias, bloquearlas frente al reclaim del nivel 25) y la contabilidad de la notificación de finalización. Para buffers pequeños ese sobrecoste supera al de un simple `memcpy`, por eso la documentación del kernel sitúa el punto de rentabilidad **alrededor de 10 KiB** por envío. Por debajo, el `send` normal es más rápido. Medir es obligatorio.
+</Callout>
+
+## io_uring: elimina también la syscall
+
+io_uring (niveles 40 y 41) lleva el zero-copy un paso más allá: no solo evita la copia del payload, sino que elimina la propia llamada al sistema por operación mediante sus anillos de submission y completion. La operación de envío zero-copy es `IORING_OP_SEND_ZC`.
+
+```c
+/* Fijar los buffers UNA vez: el kernel los mapea de forma persistente */
+struct iovec iov = { .iov_base = buf, .iov_len = len };
+io_uring_register_buffers(&ring, &iov, 1);
+
+/* Envio zero-copy encolado en el anillo, sin syscall por operacion */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_send_zc(sqe, fd, buf, len, 0, 0);
+io_uring_submit(&ring);
+```
+
+Con `io_uring_register_buffers`, las páginas se fijan una sola vez al arrancar en lugar de en cada envío: el coste de *pinning* que penalizaba a `MSG_ZEROCOPY` se paga una vez y se amortiza sobre millones de operaciones. Y la finalización, que en sockets exigía leer la cola de errores, aquí llega como un evento de completado ordinario: por cada `send_zc` recibes **dos** CQE, una con `IORING_CQE_F_MORE` (el envío se aceptó) y otra con `IORING_CQE_F_NOTIF` (el kernel ya soltó las páginas y puedes reusarlas).
+
+```c
+struct io_uring_cqe *cqe;
+io_uring_wait_cqe(&ring, &cqe);
+
+if (cqe->flags & IORING_CQE_F_NOTIF) {
+	/* el kernel ya no necesita el buffer: reutilizable */
+	reciclar_buffer();
+}
+io_uring_cqe_seen(&ring, cqe);
+```
+
+## El equilibrio: complejidad contra rendimiento
+
+<Cards>
+  <Card icon="🐢" title="send normal">
+    Una copia por CPU, pero síncrono y trivial. El buffer es reutilizable en cuanto `send` regresa. Gana para mensajes pequeños y código sencillo.
+  </Card>
+  <Card icon="⚡" title="MSG_ZEROCOPY">
+    Sin copia del payload, pero fija páginas y obliga a rastrear la finalización por `MSG_ERRQUEUE`. Gana por encima de ~10 KiB por envío.
+  </Card>
+  <Card icon="🚀" title="io_uring send_zc">
+    Sin copia y sin syscall por operación, con buffers registrados que amortizan el pinning. Máximo rendimiento, máxima complejidad de programación.
+  </Card>
+</Cards>
+
+<Mermaid code={`flowchart TD
+  Q[Cuanto mide el envio y cuanta complejidad toleras] -->|Pequeno o simple| A[send normal con una copia]
+  Q -->|Grande y toleras async| B[MSG_ZEROCOPY con errqueue]
+  Q -->|Grande y maximo rendimiento| C[io_uring send_zc con buffers registrados]
+  class A t-blue
+  class B t-yellow
+  class C t-green`} />
+
+<Callout type="dios" title="El zero-copy no elimina el coste: lo desplaza, y esa es la lección del nivel">
+Has llegado al final del nivel, así que reúne todas las técnicas —`mmap`, `sendfile`, `splice`, `dma_buf`, `MSG_ZEROCOPY`, io_uring— y verás que ninguna borró el coste de mover datos: lo movieron de sitio. La copia por CPU desapareció, sí, pero a cambio apareció otra cosa: fijar páginas para que la memoria no se mueva bajo el DMA, mantener la coherencia de caché entre motores que ven el mismo buffer, rastrear de forma asíncrona cuándo el hardware terminó para saber cuándo puedes reescribir, gestionar fences y notificaciones y colas de completado. El trabajo no se evaporó; se transformó de trasiego de bytes en contabilidad de propiedad y sincronización. Y esa transformación tiene un precio en complejidad que solo se paga solo por encima de cierto volumen: regalar la copia de un mensaje de doscientos bytes cuesta más que hacerla, porque la maquinaria de fijar y notificar pesa más que el propio `memcpy`. Aquí está la madurez que separa al ingeniero de sistemas del que colecciona trucos: entender que zero-copy no es un objetivo moral, es una **compensación**, y que la respuesta correcta a cuántas copias eliminar depende del tamaño del dato, de la frecuencia, del ancho de banda disponible y de cuánta complejidad puede sostener tu código sin volverse frágil. El novato oye "zero-copy" y quiere ponerlo en todas partes; el experto mide, encuentra el umbral, y usa el `send` de una copia para lo pequeño y la maquinaria completa solo donde el volumen la justifica. La lección última del nivel no es una API, es un principio que gobierna toda la ingeniería de rendimiento: no existe el coste eliminado, solo el coste reubicado, y dominar un sistema es saber exactamente adónde lo has movido y si el sitio nuevo te sale más barato que el viejo. Cuando esa pregunta —¿dónde acaba de verdad el coste que creo haber quitado?— se te vuelva automática, habrás terminado no solo este nivel, sino tu formación como pensador de sistemas.
+</Callout>
+
+<Challenge title="Encuentra tu umbral de rentabilidad">
+1. Escribe un emisor con `SO_ZEROCOPY` y `MSG_ZEROCOPY` que lea las notificaciones de `MSG_ERRQUEUE` y no reutilice un buffer hasta que su envío se confirme.
+2. Compara throughput y uso de CPU frente a un `send` normal para tamaños de 512 B, 4 KiB, 64 KiB y 1 MiB; localiza el punto donde el zero-copy empieza a ganar.
+3. Detecta cuándo el kernel cayó a copia leyendo `SO_EE_CODE_ZEROCOPY_COPIED` y explica en qué condiciones ocurre.
+4. Reimplementa el emisor con io_uring y `io_uring_prep_send_zc` con buffers registrados; verifica que recibes las dos CQE (`F_MORE` y `F_NOTIF`) por envío.
+5. Vuelve a la predicción que hiciste en el nivel 42.1 y contrástala: para tu escenario real, ¿qué técnica del nivel gana, y adónde se ha desplazado el coste que creías haber eliminado?
+</Challenge>

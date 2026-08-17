@@ -1,0 +1,153 @@
+---
+title: "El listener actual: cómo un signal sabe quién lo lee"
+description: "El mecanismo mas simple y mas ingenioso del nucleo: una unica variable global mutable, Listener, que apunta a la computacion en curso. El getter la consulta para tejer la dependencia; el baile de guardar y restaurar la mantiene coherente entre computaciones anidadas; untrack la apaga; y el codigo asincrono, al correr cuando ya es null, explica por que no trackea."
+subject: solid
+level: 10
+order: 4
+position: "10.4"
+duration: "15 min"
+---
+
+<Lead>
+El rastreo automático de dependencias parece brujería: escribes `count()` dentro de un efecto y, sin declarar nada, quedas suscrito. Pero cuando abres el capó, la brujería se disuelve en algo casi decepcionante por lo simple: **una sola variable global mutable**. Se llama `Listener` y apunta, en cada instante, a la computación que está corriendo ahora mismo. Toda la magia del tracking cabe en la pregunta que el getter le hace a esa variable: ¿hay alguien escuchando? Si lo hay, anoto la arista. Esta lección disecciona ese único puntero y el baile que lo mantiene honesto.
+</Lead>
+
+<Goals>
+
+- Entender que el tracking se apoya en una variable global: `Listener`.
+- Ver cómo el getter la consulta para decidir si teje o no la dependencia.
+- Comprender el baile de guardar y restaurar que sostiene las computaciones anidadas.
+- Explicar, desde `Listener`, por qué `untrack` y el código asíncrono no suscriben.
+
+</Goals>
+
+## Una variable global, y basta
+
+El núcleo mantiene un puñado de variables a nivel de módulo. Las dos que importan hoy son el dueño actual y el oyente actual:
+
+```ts
+let Owner: Owner | null = null;         // el ambito para cleanup y contexto
+let Listener: Computation<any> | null = null;  // la computacion que corre AHORA
+```
+
+`Listener` es el corazón del tracking. Cuando vale `null`, nadie está escuchando: leer un signal solo devuelve su valor. Cuando apunta a una computación, leer un signal la suscribe. Vuelve al `readSignal` de la lección 1 y fíjate en la guarda que lo gobierna todo:
+
+```ts
+function readSignal(this: SignalState<any>) {
+  if (Listener) {                    // <- la unica pregunta que importa
+    // ... teje la arista bidireccional entre this y Listener ...
+  }
+  return this.value;
+}
+```
+
+No hay análisis estático, no hay proxies, no hay compilador inspeccionando nombres. Hay una condición: `if (Listener)`. La misma llamada `count()` se comporta como suscripción o como lectura inerte según el valor que tenga esa variable en el momento exacto de invocarla. El *dónde* y el *cuándo* de la lectura lo deciden todo, y ambos se reducen al contenido de un puntero.
+
+Conviene separar bien los dos punteros, porque hacen cosas distintas y a menudo se confunden. `Listener` gobierna el **tracking**: quién se suscribe al leer. `Owner` gobierna la **propiedad**: bajo qué ámbito se registran los efectos hijos, los `onCleanup` y el contexto, para poder destruirlos en bloque cuando el ámbito muere. Casi siempre valen lo mismo —una computación es, a la vez, oyente y dueño—, pero no siempre: dentro de `untrack` se apaga `Listener` y se conserva `Owner`, de modo que sigues creando efectos que se limpiarán correctamente aunque tus lecturas no suscriban. Son dos ejes independientes —suscripción y ciclo de vida— y por eso son dos variables independientes.
+
+## El baile de guardar y restaurar
+
+¿Quién pone `Listener`? Lo pone la propia maquinaria justo antes de ejecutar el cuerpo de una computación, y lo quita justo después. El patrón es siempre el mismo: guardar el valor anterior, poner el nuevo, ejecutar, restaurar. Simplificado:
+
+```ts
+function runComputation(node: Computation<any>) {
+  const listenerAnterior = Listener;   // 1) guarda quien escuchaba antes
+  const ownerAnterior = Owner;
+  Listener = Owner = node;             // 2) YO soy ahora el que escucha
+  try {
+    node.value = node.fn(node.value);  // 3) corre el cuerpo: aqui se leen signals
+  } finally {
+    Listener = listenerAnterior;       // 4) restaura, pase lo que pase
+    Owner = ownerAnterior;
+  }
+}
+```
+
+El `try/finally` no es decorativo: garantiza que, incluso si el cuerpo lanza, `Listener` vuelve a su valor previo y no queda contaminado. Y como cada llamada guarda el valor anterior en una **variable local de su propio marco de pila**, las computaciones anidadas se apilan solas: un efecto que crea otro efecto dentro guarda al padre, se pone a sí mismo, y al terminar devuelve el trono al padre. No hace falta una pila explícita; la pila de llamadas de JavaScript **es** la pila de listeners.
+
+<Mermaid code={`sequenceDiagram
+  participant P as effect padre
+  participant L as Listener global
+  participant S as signal
+  P->>L: guarda null, pone padre
+  P->>S: lee count
+  S->>L: hay Listener, suscribe al padre
+  P->>L: al salir restaura null`} />
+
+Míralo con dos computaciones anidadas. Un efecto crea dentro un memo; cuando el cuerpo del memo corre, no debe robarle las dependencias al efecto:
+
+```tsx
+createEffect(() => {          // Listener: null -> efecto
+  a();                        // se suscribe el EFECTO a la senal a
+  const m = createMemo(() => {
+    // al correr este cuerpo, Listener: efecto -> memo (con el efecto guardado)
+    return b();               // se suscribe el MEMO a b, no el efecto
+  });                         // al salir del memo, Listener vuelve a ser el efecto
+  m();                        // el efecto se suscribe a m
+});                           // al salir del efecto, Listener vuelve a null
+```
+
+Cada nivel guardó a su padre en una variable local y se lo devolvió al terminar. Por eso `a` y `m` quedan como dependencias del efecto, y `b` como dependencia del memo, sin mezclarse: el reparto lo hace, sin ninguna lógica extra, el mero juego de guardar y restaurar sobre la pila de llamadas.
+
+## untrack: apagar el oyente a voluntad
+
+Si el tracking es "hay un `Listener`, suscribo", entonces desactivarlo es trivial: pon `Listener` a `null` un momento. Eso es exactamente `untrack`:
+
+```ts
+function untrack<T>(fn: () => T): T {
+  const anterior = Listener;
+  Listener = null;         // apaga el oyente
+  try {
+    return fn();           // las lecturas de aqui dentro NO suscriben
+  } finally {
+    Listener = anterior;   // vuelve a encenderlo
+  }
+}
+```
+
+Dentro de `fn`, `Listener` es `null`, así que cualquier `signal()` que leas devuelve su valor pero no teje arista. Es el mismo baile de guardar y restaurar, usado a la inversa: en lugar de instalar un oyente, lo silencias. `on`, con su opción de dependencias explícitas, se construye sobre esta misma idea de controlar qué se trackea y qué no.
+
+El uso canónico es leer un valor sin depender de él: quieres el dato de ahora, no reaccionar a sus cambios futuros.
+
+```tsx
+createEffect(() => {
+  const q = consulta();                    // dependencia real: reactiva a q
+  const t = untrack(() => tema());         // se lee, pero NO suscribe a tema
+  registrar(q, t);                         // corre al cambiar q, jamas al cambiar tema
+});
+```
+
+Aquí el efecto se re-ejecuta cuando cambia `consulta`, pero permanece sordo a `tema` aunque use su último valor. `Listener` estaba puesto al leer `consulta` y apagado al leer `tema`: toda la diferencia de comportamiento cabe en el estado de un puntero durante dos líneas contiguas.
+
+Y no es solo `Listener` y `untrack`: todo el núcleo es un puñado de variables de módulo manipuladas con este mismo baile. `batch` levanta una bandera global que hace que las escrituras se acumulen en vez de propagarse, y la baja al terminar para soltar una sola onda. `createRoot` instala un `Owner` de raíz para un subárbol cuyo ciclo de vida quieres controlar a mano. Las colas `Updates` y `Effects`, y el `ExecCount` de la lección 3, son también globales del módulo. El núcleo reactivo de Solid es, visto sin romanticismo, una máquina de estados diminuta gobernada por media docena de variables compartidas y unas pocas funciones que las guardan, las cambian y las restauran alrededor de tu código.
+
+## Por qué lo asíncrono no trackea
+
+Ahora tienes la explicación exacta del error clásico. El `Listener` solo apunta a tu computación **durante la ejecución síncrona** de su cuerpo, entre el paso 2 y el paso 4 del baile. En cuanto `node.fn` retorna, el `finally` restaura `Listener` a lo que hubiera antes —casi siempre `null`—. Un callback que corre más tarde ya no está en esa ventana:
+
+```tsx
+createEffect(() => {
+  const id = usuarioId();          // SI: Listener = este efecto, suscribe
+  setTimeout(() => {
+    console.log(pagina());         // NO: el timeout corre despues,
+  }, 1000);                        //     cuando Listener ya volvio a null
+});
+```
+
+Cuando el `setTimeout` dispara su callback, la pila que había instalado el efecto se desmontó hace tiempo y `Listener` es `null`. La lectura de `pagina()` devuelve el valor pero no suscribe a nadie. No es un bug de Solid ni una excepción caprichosa: es la consecuencia directa y necesaria de que el tracking viva en una variable que solo está puesta durante el cuerpo síncrono. Lee tus dependencias **arriba y de forma síncrona**, captura sus valores en constantes, y pásalos al código asíncrono.
+
+<Callout type="note" title="Este diseño asume un solo hilo">
+Que el tracking descanse sobre una variable global mutable solo funciona porque JavaScript es de un solo hilo y el cuerpo rastreado es síncrono: mientras corre, nada más puede tocar `Listener`. No hay dos computaciones ejecutándose *a la vez* que se pisen el puntero; se turnan sobre la pila. Esa es también la razón profunda de que lo asíncrono rompa el tracking: un `await` cede el hilo, otras computaciones corren y restauran el puntero, y cuando tu callback reanuda, el `Listener` que había ya no es el tuyo. La reactividad síncrona de grano fino y la ejecución monohilo de JavaScript encajan como dos piezas hechas la una para la otra.
+</Callout>
+
+<Callout type="dios" title="Todo el tracking cabe en un puntero">
+Da un paso atrás y admira la economía del diseño. La característica más distintiva de Solid frente a React —cero listas de dependencias, cero declaraciones, un grafo siempre exacto— no descansa sobre un compilador sofisticado ni sobre proxies que interceptan cada acceso, sino sobre **una variable global mutable y un getter que la consulta**. Leer es llamar a una función; esa función mira `Listener`; si hay alguien, se anota como arista. Eso es todo. La aparente sofisticación del rastreo automático se descompone en tres piezas triviales por separado que, combinadas, resultan poderosas: un puntero global que dice quién escucha, un baile de guardar-poner-restaurar que lo mantiene coherente a través de la pila de llamadas, y una guarda `if (Listener)` en el punto de lectura. Interioriza esto y varias cosas encajan a la vez. Entiendes por qué los signals se leen con paréntesis: hace falta un getter donde colgar la consulta. Entiendes por qué `untrack` es tan barato: solo pone el puntero a `null`. Entiendes por qué lo asíncrono se escapa: el puntero ya se restauró. Y entiendes por qué el modelo compone tan bien: como el estado del tracking vive en una variable del sistema y no en tus objetos, puedes pasar signals, derivarlos y anidarlos sin que nada se rompa. La reactividad de grano fino, vista desde aquí, no es más que la disciplina de mantener honesto un solo puntero.
+</Callout>
+
+<Challenge title="Sigue el puntero">
+1. Escribe un efecto que lea dos signals y, mentalmente, marca en qué instante `Listener` apunta a ese efecto y en cuál vuelve a `null`.
+2. Anida un `createMemo` dentro de un `createEffect`. Explica cómo el baile de guardar/restaurar hace que el memo no le robe las dependencias al efecto.
+3. Envuelve una de las dos lecturas en `untrack` y comprueba que el efecto ya no reacciona a ese signal. Relaciónalo con `Listener = null`.
+4. Reproduce el bug asíncrono: lee un signal dentro de un `setTimeout` disparado por un efecto y verifica que cambiarlo luego no re-ejecuta el efecto. Explica por qué en términos del puntero.
+5. Razona por qué un `try/finally` (y no un simple `Listener = anterior` al final) es imprescindible para que una excepción no deje el puntero contaminado.
+</Challenge>

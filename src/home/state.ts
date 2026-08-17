@@ -5,10 +5,10 @@ export interface Layer {
   name: string;
 }
 
-// Values travel as data-fase on <html>; theme.css variants match them. Do not translate.
-export type Phase = 'inicio' | 'corriendo' | 'saliendo';
+// Values travel as data-phase on <html>; theme.css variants match them. Do not translate.
+export type Phase = 'start' | 'running' | 'leaving';
 
-const [phase, setPhase] = createSignal<Phase>('inicio');
+const [phase, setPhase] = createSignal<Phase>('start');
 const [stack, setStack] = createSignal<Layer[]>([]);
 const [collapsed, setCollapsed] = createSignal(false);
 const [output, setOutput] = createSignal<{ text: string; cls: string }[]>([]);
