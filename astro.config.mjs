@@ -11,8 +11,6 @@ import solidJs from '@astrojs/solid-js';
 
 import tailwindcss from '@tailwindcss/vite';
 
-import pagefind from 'astro-pagefind';
-
 import { SHIKI_THEMES } from './src/lib/themes.ts';
 
 import { fileTitleTransformer } from './src/lib/shiki-file-title.ts';
@@ -75,8 +73,11 @@ export default defineConfig({
     },
   },
 
-  // forceExit debe ir de último: su build:done corre tras sitemap y pagefind.
-  integrations: [catalog(), mdx(), sitemap(), solidJs(), pagefind(), forceExit()],
+  // La indexación de pagefind vive en el script `build` (CLI one-shot), no como
+  // integración: su API de Node (writeFiles vía servicio en background) se colgaba
+  // sin resolver en el builder de Cloudflare y bloqueaba la cola de hooks.
+  // forceExit va de último: su build:done corre tras sitemap.
+  integrations: [catalog(), mdx(), sitemap(), solidJs(), forceExit()],
 
   vite: {
     plugins: [tailwindcss()],
