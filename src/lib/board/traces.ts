@@ -64,13 +64,7 @@ function bundle(p: Request): Bundle {
   return { traces, axis: traces[center | 0], width: p.width };
 }
 
-function edge(
-  id: string,
-  side: 'n' | 's' | 'e' | 'w',
-  t = 0,
-  inset = 0,
-  fallback?: Point,
-): Point {
+function edge(id: string, side: 'n' | 's' | 'e' | 'w', t = 0, inset = 0, fallback?: Point): Point {
   const z = ZONES.find((s) => s.id === id);
   if (!z) {
     if (fallback) return fallback;
@@ -92,20 +86,76 @@ const CPU_INSET = 2;
 
 export function buses(): Bundle[] {
   return [
-    bundle({ from: edge('cpu', 'e', -12, CPU_INSET), to: edge('dimm-a', 'w', -24), n: 16, pitch: 0.85, width: 0.3, horizontal: true }),
-    bundle({ from: edge('cpu', 'e', 12, CPU_INSET), to: edge('dimm-a', 'w', 26), n: 16, pitch: 0.85, width: 0.3, horizontal: true }),
+    bundle({
+      from: edge('cpu', 'e', -12, CPU_INSET),
+      to: edge('dimm-a', 'w', -24),
+      n: 16,
+      pitch: 0.85,
+      width: 0.3,
+      horizontal: true,
+    }),
+    bundle({
+      from: edge('cpu', 'e', 12, CPU_INSET),
+      to: edge('dimm-a', 'w', 26),
+      n: 16,
+      pitch: 0.85,
+      width: 0.3,
+      horizontal: true,
+    }),
 
-    bundle({ from: edge('cpu', 's', -6, CPU_INSET), to: edge('pcie16', 'n', 32), n: 14, pitch: 0.85, width: 0.3, horizontal: false }),
+    bundle({
+      from: edge('cpu', 's', -6, CPU_INSET),
+      to: edge('pcie16', 'n', 32),
+      n: 14,
+      pitch: 0.85,
+      width: 0.3,
+      horizontal: false,
+    }),
 
-    bundle({ from: edge('cpu', 'w', -14, CPU_INSET), to: edge('io', 'e', 6), n: 10, pitch: 0.9, width: 0.3, horizontal: true }),
+    bundle({
+      from: edge('cpu', 'w', -14, CPU_INSET),
+      to: edge('io', 'e', 6),
+      n: 10,
+      pitch: 0.9,
+      width: 0.3,
+      horizontal: true,
+    }),
 
-    bundle({ from: edge('chipset', 'w', -4), to: edge('m2-bot', 'e', 0), n: 10, pitch: 0.85, width: 0.3, horizontal: true }),
-    bundle({ from: edge('chipset', 'w', 8), to: edge('pcie1', 'e', 0), n: 8, pitch: 0.85, width: 0.3, horizontal: true }),
+    bundle({
+      from: edge('chipset', 'w', -4),
+      to: edge('m2-bot', 'e', 0),
+      n: 10,
+      pitch: 0.85,
+      width: 0.3,
+      horizontal: true,
+    }),
+    bundle({
+      from: edge('chipset', 'w', 8),
+      to: edge('pcie1', 'e', 0),
+      n: 8,
+      pitch: 0.85,
+      width: 0.3,
+      horizontal: true,
+    }),
     bundle({ from: edge('chipset', 's', -8), to: [40, 108], n: 12, pitch: 0.8, width: 0.28, horizontal: false }),
-    bundle({ from: edge('chipset', 'n', 0), to: edge('m2-top', 'e', 4), n: 8, pitch: 0.9, width: 0.3, horizontal: true }),
+    bundle({
+      from: edge('chipset', 'n', 0),
+      to: edge('m2-top', 'e', 4),
+      n: 8,
+      pitch: 0.9,
+      width: 0.3,
+      horizontal: true,
+    }),
 
     bundle({ from: edge('atx', 'n', -9), to: edge('vrm-n', 'e', 2), n: 3, pitch: 2.2, width: 1.4, horizontal: false }),
-    bundle({ from: edge('vrm-n', 's', -8), to: edge('cpu', 'n', 4, CPU_INSET), n: 4, pitch: 2.4, width: 1.4, horizontal: false }),
+    bundle({
+      from: edge('vrm-n', 's', -8),
+      to: edge('cpu', 'n', 4, CPU_INSET),
+      n: 4,
+      pitch: 2.4,
+      width: 1.4,
+      horizontal: false,
+    }),
   ];
 }
 
@@ -140,12 +190,8 @@ export function cpuFanout(): Fanout {
       const t = center + (i - n / 2) * PITCH;
       const reach = 2.2 + (i % 3) * 1.3 + rnd() * 0.5;
 
-      const a: Point =
-        side.axis === 'x'
-          ? [t, side.fixed - side.n * INSET]
-          : [side.fixed - side.n * INSET, t];
-      const b: Point =
-        side.axis === 'x' ? [t, side.fixed + side.n * reach] : [side.fixed + side.n * reach, t];
+      const a: Point = side.axis === 'x' ? [t, side.fixed - side.n * INSET] : [side.fixed - side.n * INSET, t];
+      const b: Point = side.axis === 'x' ? [t, side.fixed + side.n * reach] : [side.fixed + side.n * reach, t];
 
       if (solid(b[0], b[1], 0.6)) continue;
       traces.push([a, b]);

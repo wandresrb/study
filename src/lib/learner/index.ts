@@ -22,7 +22,7 @@ const listeners = new Set<Listener>();
 let channel: BroadcastChannel | undefined;
 let dbPromise: Promise<IDBDatabase> | undefined;
 
-const request = <T,>(req: IDBRequest<T>) =>
+const request = <T>(req: IDBRequest<T>) =>
   new Promise<T>((resolve, reject) => {
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -200,9 +200,7 @@ export async function miss(id: string): Promise<void> {
 
 /** Due reviews, the most overdue first. Lessons are read, not reviewed. */
 export async function due(): Promise<Item[]> {
-  return (await all())
-    .filter((i) => i.kind !== 'lesson' && i.dueOn <= today())
-    .sort((a, b) => a.dueOn - b.dueOn);
+  return (await all()).filter((i) => i.kind !== 'lesson' && i.dueOn <= today()).sort((a, b) => a.dueOn - b.dueOn);
 }
 
 /** done/mastered per lesson, for the sidebar ticks. */

@@ -24,9 +24,7 @@ export function footprint(s: Zone): { x: number; z: number; w: number; d: number
   if (s.kind !== 'slot') return { x: s.x, z: s.z, w: s.w, d: s.d };
   const lengthwise = s.d > s.w;
   const grow = 7;
-  return lengthwise
-    ? { x: s.x, z: s.z, w: s.w, d: s.d + grow * 2 }
-    : { x: s.x, z: s.z, w: s.w + grow * 2, d: s.d };
+  return lengthwise ? { x: s.x, z: s.z, w: s.w, d: s.d + grow * 2 } : { x: s.x, z: s.z, w: s.w + grow * 2, d: s.d };
 }
 
 export const ZONES: readonly Zone[] = [
@@ -73,10 +71,10 @@ export const IDEAL_HOLES: readonly { x: number; z: number }[] = [
 
 export const HOLE_RADIUS = 6;
 
-export const COILS: readonly { x: number; z: number }[] = Array.from(
-  { length: 8 },
-  (_, i) => ({ x: -12 + i * 10, z: -92 }),
-);
+export const COILS: readonly { x: number; z: number }[] = Array.from({ length: 8 }, (_, i) => ({
+  x: -12 + i * 10,
+  z: -92,
+}));
 
 export const CAPACITORS: readonly { x: number; z: number }[] = [
   { x: -46, z: -78 },
@@ -138,15 +136,23 @@ export const HEADERS: readonly { x: number; z: number; pins: number }[] = [
 export const HEADER_PIN_PITCH = 2.54;
 
 export const INDUCTORS: readonly { x: number; z: number }[] = [
-  { x: 100, z: 74 }, { x: 100, z: 88 }, { x: 30, z: 58 },
-  { x: -70, z: 84 }, { x: 30, z: 34 }, { x: -74, z: -20 },
-  { x: -80, z: -70 }, { x: -80, z: -48 },
+  { x: 100, z: 74 },
+  { x: 100, z: 88 },
+  { x: 30, z: 58 },
+  { x: -70, z: 84 },
+  { x: 30, z: 34 },
+  { x: -74, z: -20 },
+  { x: -80, z: -70 },
+  { x: -80, z: -48 },
 ];
 
 export const DIODES: readonly { x: number; z: number; rot: 0 | 1 }[] = [
-  { x: 100, z: 58, rot: 1 }, { x: 22, z: 76, rot: 0 },
-  { x: -62, z: 8, rot: 0 }, { x: 44, z: -6, rot: 1 },
-  { x: -104, z: 46, rot: 1 }, { x: 66, z: 100, rot: 0 },
+  { x: 100, z: 58, rot: 1 },
+  { x: 22, z: 76, rot: 0 },
+  { x: -62, z: 8, rot: 0 },
+  { x: 44, z: -6, rot: 1 },
+  { x: -104, z: 46, rot: 1 },
+  { x: 66, z: 100, rot: 0 },
 ];
 
 export const BATTERY = { x: -101, z: 90, r: 10 } as const;

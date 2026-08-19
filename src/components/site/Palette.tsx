@@ -66,9 +66,7 @@ export default function Palette(props: Props) {
   const [extras, setExtras] = createSignal<Entry[]>([]);
   const [sheetHits, setSheetHits] = createSignal<LessonHit[]>([]);
 
-  const trackNames = new Map(
-    props.entries.filter((e) => e[1] === 'tema').map((e) => [e[2].split('/')[1], e[0]]),
-  );
+  const trackNames = new Map(props.entries.filter((e) => e[1] === 'tema').map((e) => [e[2].split('/')[1], e[0]]));
 
   let input: HTMLInputElement | undefined;
   let list: HTMLUListElement | undefined;
@@ -165,9 +163,7 @@ export default function Palette(props: Props) {
 
   const trapTab = (e: KeyboardEvent) => {
     if (!box) return;
-    const focusables = box.querySelectorAll<HTMLElement>(
-      'input, button, [href], [tabindex]:not([tabindex="-1"])',
-    );
+    const focusables = box.querySelectorAll<HTMLElement>('input, button, [href], [tabindex]:not([tabindex="-1"])');
     if (!focusables.length) return;
     const first = focusables[0];
     const last = focusables[focusables.length - 1];
@@ -182,8 +178,7 @@ export default function Palette(props: Props) {
 
   const onKeyDown = (e: KeyboardEvent) => {
     const target = e.target as HTMLElement | null;
-    const typing =
-      target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target?.tagName ?? '');
+    const typing = target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target?.tagName ?? '');
 
     if ((e.key === 'k' || e.key === 'K') && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
@@ -264,71 +259,69 @@ export default function Palette(props: Props) {
             containing block for fixed descendants, which pinned the modal to
             the header strip instead of the viewport. */}
         <Portal>
-        <div
-          class="d-modal d-modal-open items-start pt-[12vh] backdrop-blur-[3px]"
-          onClick={(e) => e.target === e.currentTarget && close()}
-        >
           <div
-            ref={box}
-            role="dialog"
-            aria-modal="true"
-            aria-label="Buscar"
-            class="d-modal-box flex max-h-[70vh] w-full max-w-measure flex-col overflow-hidden border border-overlay0 bg-mantle p-0 shadow-modal"
+            class="d-modal d-modal-open items-start pt-[12vh] backdrop-blur-[3px]"
+            onClick={(e) => e.target === e.currentTarget && close()}
           >
-            <input
-              ref={input}
-              value={query()}
-              onInput={(e) => setQuery(e.currentTarget.value)}
-              placeholder="Busca un tema o una lección…"
-              role="combobox"
-              aria-expanded="true"
-              aria-controls="palette-list"
-              aria-autocomplete="list"
-              aria-activedescendant={results().length ? optionId(cursor()) : undefined}
-              class="w-full border-0 border-b border-surface1 bg-transparent px-4 py-3.5 text-base text-text outline-none placeholder:text-subtext0"
-            />
-
-            <Show
-              when={results().length > 0}
-              fallback={
-                <p class="m-0 px-4 py-6 text-sm text-subtext0">Nada para «{query()}».</p>
-              }
+            <div
+              ref={box}
+              role="dialog"
+              aria-modal="true"
+              aria-label="Buscar"
+              class="d-modal-box flex max-h-[70vh] w-full max-w-measure flex-col overflow-hidden border border-overlay0 bg-mantle p-0 shadow-modal"
             >
-              <ul
-                ref={list}
-                id="palette-list"
-                role="listbox"
-                aria-label="Resultados"
-                class="m-0 flex-1 list-none overflow-y-auto p-1.5"
-              >
-                <For each={results()}>
-                  {(hit, i) => (
-                    <li
-                      id={optionId(i())}
-                      role="option"
-                      aria-selected={i() === cursor()}
-                      onClick={() => go(hit[2])}
-                      onMouseMove={() => setCursor(i())}
-                      class="flex cursor-pointer items-baseline gap-3 rounded px-3 py-2 text-left aria-selected:bg-surface0/70"
-                    >
-                      <span class="w-24 shrink-0 truncate font-mono text-2xs text-subtext0">
-                        {hit[1]}
-                      </span>
-                      <span class="truncate text-md text-subtext1">{hit[0]}</span>
-                    </li>
-                  )}
-                </For>
-              </ul>
-            </Show>
+              <input
+                ref={input}
+                value={query()}
+                onInput={(e) => setQuery(e.currentTarget.value)}
+                placeholder="Busca un tema o una lección…"
+                role="combobox"
+                aria-expanded="true"
+                aria-controls="palette-list"
+                aria-autocomplete="list"
+                aria-activedescendant={results().length ? optionId(cursor()) : undefined}
+                class="w-full border-0 border-b border-surface1 bg-transparent px-4 py-3.5 text-base text-text outline-none placeholder:text-subtext0"
+              />
 
-            <p class="m-0 flex items-center gap-4 border-t border-surface1 bg-crust px-4 py-2 font-mono text-2xs text-subtext0">
-              <span>↑↓ moverse</span>
-              <span>⏎ abrir</span>
-              <span>esc cerrar</span>
-              <span class="ml-auto">{props.entries.length + extras().length + lessons().length + sheetHits().length} destinos</span>
-            </p>
+              <Show
+                when={results().length > 0}
+                fallback={<p class="m-0 px-4 py-6 text-sm text-subtext0">Nada para «{query()}».</p>}
+              >
+                <ul
+                  ref={list}
+                  id="palette-list"
+                  role="listbox"
+                  aria-label="Resultados"
+                  class="m-0 flex-1 list-none overflow-y-auto p-1.5"
+                >
+                  <For each={results()}>
+                    {(hit, i) => (
+                      <li
+                        id={optionId(i())}
+                        role="option"
+                        aria-selected={i() === cursor()}
+                        onClick={() => go(hit[2])}
+                        onMouseMove={() => setCursor(i())}
+                        class="flex cursor-pointer items-baseline gap-3 rounded px-3 py-2 text-left aria-selected:bg-surface0/70"
+                      >
+                        <span class="w-24 shrink-0 truncate font-mono text-2xs text-subtext0">{hit[1]}</span>
+                        <span class="truncate text-md text-subtext1">{hit[0]}</span>
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </Show>
+
+              <p class="m-0 flex items-center gap-4 border-t border-surface1 bg-crust px-4 py-2 font-mono text-2xs text-subtext0">
+                <span>↑↓ moverse</span>
+                <span>⏎ abrir</span>
+                <span>esc cerrar</span>
+                <span class="ml-auto">
+                  {props.entries.length + extras().length + lessons().length + sheetHits().length} destinos
+                </span>
+              </p>
+            </div>
           </div>
-        </div>
         </Portal>
       </Show>
     </>

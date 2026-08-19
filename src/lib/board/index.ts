@@ -1,19 +1,17 @@
 import gsap from 'gsap';
 
-import { END, type Scene } from '../scene';
+import { type Scene } from '../scene';
 import { build } from './board';
 import { engine } from './render';
 import { rig } from './rig';
 
-const SINK = [END, 0.94] as const;
-
-const smooth = (t: number) => t * t * (3 - 2 * t);
-const band = (p: number, a: number, b: number) =>
-  smooth(Math.min(1, Math.max(0, (p - a) / (b - a))));
-
 export interface BoardScene extends Scene {
   start(): void;
   reset(): void;
+  explode(v: number): void;
+  probe(t: number, lit: number): void;
+  open(v: number): void;
+  gate(t: number, on: number, conducting: number, lit: number): void;
 }
 
 export async function mount(host: HTMLElement): Promise<BoardScene> {
@@ -26,8 +24,7 @@ export async function mount(host: HTMLElement): Promise<BoardScene> {
 
   host.dataset.backend = m.backend;
 
-  // END is also the resting pose: camera fully arrived, sinking not yet started.
-  const state = { p: reduced ? END : 0, intro: reduced ? 1 : 0 };
+  const state = { p: reduced ? 1 : 0, intro: reduced ? 1 : 0, explode: reduced ? 0 : 1 };
   const startTime = performance.now();
 
   let frames = 0;
@@ -36,13 +33,9 @@ export async function mount(host: HTMLElement): Promise<BoardScene> {
 
   const compose = (t: number) => {
     try {
-      const camera = Math.min(1, state.p / END);
-      const sunk = band(state.p, SINK[0], SINK[1]);
-
-      const showMachine = started && sunk < 0.999;
-      if (showMachine) {
-        r.apply(camera, state.intro);
-        board.compose(camera, sunk);
+      if (started) {
+        r.apply(state.p, state.intro);
+        board.compose(state.p, state.explode);
         board.animate(t, state.intro);
         m.renderer.render(board.scene, r.camera);
       } else {
@@ -81,6 +74,7 @@ export async function mount(host: HTMLElement): Promise<BoardScene> {
       gsap.killTweensOf(state);
       state.p = 0;
       state.intro = 0;
+      state.explode = 1;
     },
 
     start() {
@@ -92,6 +86,30 @@ export async function mount(host: HTMLElement): Promise<BoardScene> {
     advance(p) {
       if (reduced || !alive) return;
       gsap.to(state, { p, duration: 0.7, ease: 'power2.out', overwrite: 'auto' });
+    },
+
+    explode(v) {
+      if (!alive) return;
+      if (reduced) {
+        state.explode = v;
+        return;
+      }
+      gsap.to(state, { explode: v, duration: 0.9, ease: 'power2.out', overwrite: 'auto' });
+    },
+
+    probe(t, lit) {
+      if (!alive) return;
+      board.probe(t, lit);
+    },
+
+    open(v) {
+      if (!alive) return;
+      board.open(v);
+    },
+
+    gate(t, on, conducting, lit) {
+      if (!alive) return;
+      board.gate(t, on, conducting, lit);
     },
 
     destroy() {

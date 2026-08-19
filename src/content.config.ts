@@ -13,9 +13,7 @@ const guide = defineCollection({
     subject: z.string().min(1),
     level: z.number().int().nonnegative(),
     order: z.number().int().positive(),
-    position: z
-      .string()
-      .regex(/^\d+(?:\.\d+)?$/, 'Es la posición de la lección: «17» o «17.5»'),
+    position: z.string().regex(/^\d+(?:\.\d+)?$/, 'Es la posición de la lección: «17» o «17.5»'),
     duration: z.string().optional(),
   }),
 });

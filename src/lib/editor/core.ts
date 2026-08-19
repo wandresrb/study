@@ -58,15 +58,19 @@ export function tokenize(keys: string): string[] {
 
 /** A keydown as vim would write it. Modifier-only presses do not count. */
 function keyName(ev: KeyboardEvent): string | null {
-  if (ev.key === 'Shift' || ev.key === 'Control' || ev.key === 'Alt' || ev.key === 'Meta')
-    return null;
+  if (ev.key === 'Shift' || ev.key === 'Control' || ev.key === 'Alt' || ev.key === 'Meta') return null;
   const base =
-    ev.key === 'Escape' ? 'Esc'
-    : ev.key === 'Enter' ? 'CR'
-    : ev.key === 'Backspace' ? 'BS'
-    : ev.key === 'Tab' ? 'Tab'
-    : ev.key === ' ' ? 'Space'
-    : ev.key;
+    ev.key === 'Escape'
+      ? 'Esc'
+      : ev.key === 'Enter'
+        ? 'CR'
+        : ev.key === 'Backspace'
+          ? 'BS'
+          : ev.key === 'Tab'
+            ? 'Tab'
+            : ev.key === ' '
+              ? 'Space'
+              : ev.key;
   if (ev.ctrlKey) return `<C-${base}>`;
   if (base.length > 1) return `<${base}>`;
   return base;
@@ -143,9 +147,7 @@ export async function create(host: HTMLElement, opts: EditorOptions): Promise<Ed
 
   const stateOf = (doc: string) => {
     const state = EditorState.create({ doc, extensions });
-    return opts.cursor
-      ? state.update({ selection: { anchor: toOffset(state, opts.cursor) } }).state
-      : state;
+    return opts.cursor ? state.update({ selection: { anchor: toOffset(state, opts.cursor) } }).state : state;
   };
 
   const view = new EditorView({ state: stateOf(opts.doc), parent: host });

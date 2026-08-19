@@ -43,11 +43,7 @@ export interface VimExercise {
 
 const normalize = (s: string) => s.replace(/\n$/, '');
 
-export async function mount(
-  host: HTMLElement,
-  def: ExerciseDef,
-  hooks: Hooks,
-): Promise<VimExercise> {
+export async function mount(host: HTMLElement, def: ExerciseDef, hooks: Hooks): Promise<VimExercise> {
   let keys = 0;
   let solved = false;
   let replaying = false;

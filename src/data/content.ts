@@ -65,8 +65,32 @@ export interface Lesson {
   minutes: number;
 }
 
-const PALETTE = ['var(--green)', 'var(--blue)', 'var(--mauve)', 'var(--sky)', 'var(--peach)', 'var(--teal)', 'var(--yellow)', 'var(--pink)', 'var(--lavender)', 'var(--sapphire)', 'var(--maroon)'];
-const PALETTE_HEX = ['#a6e3a1', '#89b4fa', '#cba6f7', '#89dceb', '#fab387', '#94e2d5', '#f9e2af', '#f5c2e7', '#b4befe', '#74c7ec', '#eba0ac'];
+const PALETTE = [
+  'var(--green)',
+  'var(--blue)',
+  'var(--mauve)',
+  'var(--sky)',
+  'var(--peach)',
+  'var(--teal)',
+  'var(--yellow)',
+  'var(--pink)',
+  'var(--lavender)',
+  'var(--sapphire)',
+  'var(--maroon)',
+];
+const PALETTE_HEX = [
+  '#a6e3a1',
+  '#89b4fa',
+  '#cba6f7',
+  '#89dceb',
+  '#fab387',
+  '#94e2d5',
+  '#f9e2af',
+  '#f5c2e7',
+  '#b4befe',
+  '#74c7ec',
+  '#eba0ac',
+];
 
 const qLevels = db.prepare(
   'SELECT idx, name, subtitle, description, color, color_hex, digit FROM level WHERE track = ? ORDER BY idx',
@@ -328,7 +352,10 @@ export function conceptsTaughtBy(trackId: string, level: number): { id: string; 
 
 export function getTeaches(): [string, string, number, number][] {
   return (qAllTeaches.all() as Row[]).map((r) => [
-    String(r.concept), String(r.track), Number(r.level), Number(r.weight),
+    String(r.concept),
+    String(r.track),
+    Number(r.level),
+    Number(r.weight),
   ]);
 }
 

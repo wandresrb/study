@@ -73,12 +73,7 @@ export function pulses(): Pulses {
       const bx = x1 + ex;
       const bz = z1 + ez;
 
-      pos.push(
-        ax - nx, LIFT, az - nz,
-        ax + nx, LIFT, az + nz,
-        bx + nx, LIFT, bz + nz,
-        bx - nx, LIFT, bz - nz,
-      );
+      pos.push(ax - nx, LIFT, az - nz, ax + nx, LIFT, az + nz, bx + nx, LIFT, bz + nz, bx - nx, LIFT, bz - nz);
       const u = (id + 0.5) / traces.length;
       ids.push(u, 0.5, u, 0.5, u, 0.5, u, 0.5);
       idx.push(v, v + 1, v + 2, v, v + 2, v + 3);

@@ -1,15 +1,6 @@
 import { CanvasTexture, LinearMipmapLinearFilter, SRGBColorSpace } from 'three/webgpu';
 
-import {
-  rng,
-  HEADERS,
-  solid,
-  SIDE,
-  HALF,
-  HEADER_PIN_PITCH,
-  BATTERY,
-  ZONES,
-} from './layout';
+import { rng, HEADERS, solid, SIDE, HALF, HEADER_PIN_PITCH, BATTERY, ZONES } from './layout';
 import { inHole, holes } from './holes';
 import { FOOTPRINTS, type Part } from './seeding';
 import { cpuFanout, buses, type Point } from './traces';
@@ -208,12 +199,7 @@ export function mask(anisotropy: number, parts: readonly Part[]): Mask {
     for (const hdr of HEADERS) {
       for (let row = 0; row < 2; row++) {
         for (let i = 0; i < hdr.pins; i++) {
-          ring(
-            hdr.x + i * HEADER_PIN_PITCH,
-            hdr.z + (row - 0.5) * HEADER_PIN_PITCH,
-            0.85,
-            i === 0 && row === 0,
-          );
+          ring(hdr.x + i * HEADER_PIN_PITCH, hdr.z + (row - 0.5) * HEADER_PIN_PITCH, 0.85, i === 0 && row === 0);
         }
       }
     }
@@ -222,7 +208,7 @@ export function mask(anisotropy: number, parts: readonly Part[]): Mask {
       const lengthwise = z.d > z.w;
       const len = lengthwise ? z.d : z.w;
       for (const side of [-1, 1]) {
-        const t = (side * (len / 2 - 3));
+        const t = side * (len / 2 - 3);
         ring(z.x + (lengthwise ? 0 : t), z.z + (lengthwise ? t : 0), 1.1, false);
       }
     }
@@ -232,13 +218,7 @@ export function mask(anisotropy: number, parts: readonly Part[]): Mask {
       for (let row = 0; row < 2; row++) {
         for (let i = 0; i < hdr.pins; i++) {
           c.beginPath();
-          c.arc(
-            ax(hdr.x + i * HEADER_PIN_PITCH),
-            az(hdr.z + (row - 0.5) * HEADER_PIN_PITCH),
-            0.4 * PX,
-            0,
-            Math.PI * 2,
-          );
+          c.arc(ax(hdr.x + i * HEADER_PIN_PITCH), az(hdr.z + (row - 0.5) * HEADER_PIN_PITCH), 0.4 * PX, 0, Math.PI * 2);
           c.fill();
         }
       }

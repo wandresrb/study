@@ -13,12 +13,12 @@ import { SIDE } from './layout';
 const EDGE_H = 5;
 
 const smooth = (t: number) => t * t * (3 - 2 * t);
-const band = (p: number, a: number, b: number) =>
-  smooth(Math.min(1, Math.max(0, (p - a) / (b - a))));
+const band = (p: number, a: number, b: number) => smooth(Math.min(1, Math.max(0, (p - a) / (b - a))));
 
 export interface Edge {
   group: Group;
-  apply(p: number): void;
+  /** `assembled` is 0 while the machine is apart: the board has no body yet. */
+  apply(p: number, assembled: number): void;
   dispose(): void;
 }
 
@@ -48,8 +48,8 @@ export function edge(): Edge {
   return {
     group,
 
-    apply(p) {
-      const rise = band(p, 0.28, 0.48);
+    apply(p, assembled) {
+      const rise = band(p, 0.28, 0.48) * assembled;
       box.scale.y = Math.max(0.001, rise * EDGE_H);
       wireMat.opacity = rise * 0.9;
     },

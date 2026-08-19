@@ -20,6 +20,7 @@ import Bell from '@lucide/astro/icons/bell';
 import BellOff from '@lucide/astro/icons/bell-off';
 import Bolt from '@lucide/astro/icons/bolt';
 import Bomb from '@lucide/astro/icons/bomb';
+import Bone from '@lucide/astro/icons/bone';
 import BookOpen from '@lucide/astro/icons/book-open';
 import Bookmark from '@lucide/astro/icons/bookmark';
 import Bot from '@lucide/astro/icons/bot';
@@ -88,6 +89,7 @@ import Folders from '@lucide/astro/icons/folders';
 import Footprints from '@lucide/astro/icons/footprints';
 import Gamepad2 from '@lucide/astro/icons/gamepad-2';
 import Gauge from '@lucide/astro/icons/gauge';
+import Gem from '@lucide/astro/icons/gem';
 import Ghost from '@lucide/astro/icons/ghost';
 import Gift from '@lucide/astro/icons/gift';
 import GitFork from '@lucide/astro/icons/git-fork';
@@ -105,6 +107,7 @@ import House from '@lucide/astro/icons/house';
 import IdCard from '@lucide/astro/icons/id-card';
 import Image from '@lucide/astro/icons/image';
 import Infinity from '@lucide/astro/icons/infinity';
+import IterationCw from '@lucide/astro/icons/iteration-cw';
 import Key from '@lucide/astro/icons/key';
 import KeyRound from '@lucide/astro/icons/key-round';
 import Keyboard from '@lucide/astro/icons/keyboard';
@@ -113,6 +116,7 @@ import Layers from '@lucide/astro/icons/layers';
 import Leaf from '@lucide/astro/icons/leaf';
 import Library from '@lucide/astro/icons/library';
 import LifeBuoy from '@lucide/astro/icons/life-buoy';
+import Lightbulb from '@lucide/astro/icons/lightbulb';
 import Link from '@lucide/astro/icons/link';
 import Link2 from '@lucide/astro/icons/link-2';
 import ListOrdered from '@lucide/astro/icons/list-ordered';
@@ -139,8 +143,10 @@ import Network from '@lucide/astro/icons/network';
 import Newspaper from '@lucide/astro/icons/newspaper';
 import NotebookPen from '@lucide/astro/icons/notebook-pen';
 import OctagonAlert from '@lucide/astro/icons/octagon-alert';
+import Origami from '@lucide/astro/icons/origami';
 import Package from '@lucide/astro/icons/package';
 import PaintBucket from '@lucide/astro/icons/paint-bucket';
+import Paintbrush from '@lucide/astro/icons/paintbrush';
 import Palette from '@lucide/astro/icons/palette';
 import Paperclip from '@lucide/astro/icons/paperclip';
 import Pause from '@lucide/astro/icons/pause';
@@ -154,6 +160,8 @@ import Plug from '@lucide/astro/icons/plug';
 import Plus from '@lucide/astro/icons/plus';
 import Printer from '@lucide/astro/icons/printer';
 import Puzzle from '@lucide/astro/icons/puzzle';
+import RadioReceiver from '@lucide/astro/icons/radio-receiver';
+import Rainbow from '@lucide/astro/icons/rainbow';
 import Receipt from '@lucide/astro/icons/receipt';
 import Recycle from '@lucide/astro/icons/recycle';
 import RefreshCw from '@lucide/astro/icons/refresh-cw';
@@ -170,6 +178,8 @@ import Scissors from '@lucide/astro/icons/scissors';
 import ScrollText from '@lucide/astro/icons/scroll-text';
 import Search from '@lucide/astro/icons/search';
 import Shield from '@lucide/astro/icons/shield';
+import Ship from '@lucide/astro/icons/ship';
+import ShoppingBasket from '@lucide/astro/icons/shopping-basket';
 import Shuffle from '@lucide/astro/icons/shuffle';
 import Signal from '@lucide/astro/icons/signal';
 import Siren from '@lucide/astro/icons/siren';
@@ -188,6 +198,7 @@ import Square from '@lucide/astro/icons/square';
 import SquareFunction from '@lucide/astro/icons/square-function';
 import Star from '@lucide/astro/icons/star';
 import Stethoscope from '@lucide/astro/icons/stethoscope';
+import Sunrise from '@lucide/astro/icons/sunrise';
 import Swords from '@lucide/astro/icons/swords';
 import Syringe from '@lucide/astro/icons/syringe';
 import Tag from '@lucide/astro/icons/tag';
@@ -211,6 +222,7 @@ import Undo2 from '@lucide/astro/icons/undo-2';
 import Upload from '@lucide/astro/icons/upload';
 import User from '@lucide/astro/icons/user';
 import Users from '@lucide/astro/icons/users';
+import Video from '@lucide/astro/icons/video';
 import VolumeX from '@lucide/astro/icons/volume-x';
 import WandSparkles from '@lucide/astro/icons/wand-sparkles';
 import WavesHorizontal from '@lucide/astro/icons/waves-horizontal';
@@ -232,9 +244,10 @@ import PythonMark from 'simple-icons/icons/python.svg';
 import RustMark from 'simple-icons/icons/rust.svg';
 
 /**
- * The lessons decorate <Card> with an emoji. Resolving it to an icon keeps the
- * site on one visual language without touching a single .mdx: these 274 entries
- * cover ~96% of the calls, and anything unmapped still shows its glyph.
+ * Lessons and seeds decorate cards, track features and cheatsheet categories
+ * with an emoji. Resolving it here keeps the site on one visual language
+ * without touching a single .mdx; callers fall back to a neutral icon for
+ * anything unmapped, so no emoji ever renders.
  *
  * To add one: import the icon and add its line. `lint:content` will not catch a
  * name that does not exist, but `astro check` will.
@@ -504,6 +517,24 @@ const EMOJI_ICON: Record<string, AstroComponent> = {
   '🔼': ChevronUp,
   '🛣️': Route,
   '🧳': Briefcase,
+  '➰': IterationCw,
+  '〰️': Spline,
+  '🌅': Sunrise,
+  '🌈': Rainbow,
+  '🎥': Video,
+  '💅': Paintbrush,
+  '💎': Gem,
+  '💡': Lightbulb,
+  '📟': RadioReceiver,
+  '🔲': Square,
+  '🔺': Triangle,
+  '🕐': Clock,
+  '🖌️': Paintbrush,
+  '🚢': Ship,
+  '🦋': Origami,
+  '🦴': Bone,
+  '🧶': Spool,
+  '🧺': ShoppingBasket,
   '🦀': RustMark,
   '🐧': LinuxMark,
   '🐘': PostgresqlMark,

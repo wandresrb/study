@@ -52,11 +52,7 @@ function heatsink(s: Zone, m: Materials): Group {
   fins.frustumCulled = false;
   for (let i = 0; i < n; i++) {
     const t = (i / (n - 1) - 0.5) * (width - 2.4);
-    mold.position.set(
-      s.x + (lengthwise ? t : 0),
-      s.h * 0.34 + (s.h * 0.66) / 2,
-      s.z + (lengthwise ? 0 : t),
-    );
+    mold.position.set(s.x + (lengthwise ? t : 0), s.h * 0.34 + (s.h * 0.66) / 2, s.z + (lengthwise ? 0 : t));
     mold.rotation.set(0, 0, 0);
     mold.scale.set(lengthwise ? 1.7 : length - 2, s.h * 0.66, lengthwise ? length - 2 : 1.7);
     mold.updateMatrix();
@@ -202,11 +198,7 @@ export function relief(m: Materials, sites: readonly Part[]): Group {
     const cap = length * 0.26;
     for (const side of [-1, 1]) {
       const d = side * (length / 2 - cap / 2);
-      mold.position.set(
-        s.x + (s.rot === 1 ? 0 : d),
-        f.h * 0.52,
-        s.z + (s.rot === 1 ? d : 0),
-      );
+      mold.position.set(s.x + (s.rot === 1 ? 0 : d), f.h * 0.52, s.z + (s.rot === 1 ? d : 0));
       mold.rotation.set(0, s.rot === 1 ? Math.PI / 2 : 0, 0);
       mold.scale.set(cap, f.h * 1.04, width * 1.06);
       mold.updateMatrix();
@@ -287,11 +279,7 @@ export function relief(m: Materials, sites: readonly Part[]): Group {
       const t = (i / (n - 1) - 0.5) * (length - 3);
       for (const side of [-1, 1]) {
         const off = side * width * 0.16;
-        mold.position.set(
-          z.x + (lengthwise ? off : t),
-          z.h * 0.6,
-          z.z + (lengthwise ? t : off),
-        );
+        mold.position.set(z.x + (lengthwise ? off : t), z.h * 0.6, z.z + (lengthwise ? t : off));
         mold.rotation.set(0, 0, 0);
         mold.scale.set(lengthwise ? 0.36 : 0.44, z.h * 0.36, lengthwise ? 0.44 : 0.36);
         mold.updateMatrix();
@@ -325,11 +313,7 @@ export function relief(m: Materials, sites: readonly Part[]): Group {
   for (const c of HEADERS) {
     for (let row = 0; row < 2; row++) {
       for (let i = 0; i < c.pins; i++) {
-        mold.position.set(
-          c.x + i * HEADER_PIN_PITCH,
-          3.2,
-          c.z + (row - 0.5) * HEADER_PIN_PITCH,
-        );
+        mold.position.set(c.x + i * HEADER_PIN_PITCH, 3.2, c.z + (row - 0.5) * HEADER_PIN_PITCH);
         mold.rotation.set(0, 0, 0);
         mold.scale.set(0.64, 4, 0.64);
         mold.updateMatrix();

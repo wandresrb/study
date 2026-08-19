@@ -22,15 +22,7 @@ export interface Part {
   t: number;
 }
 
-function row(
-  x0: number,
-  z0: number,
-  dx: number,
-  dz: number,
-  n: number,
-  footprint: Footprint,
-  rot: 0 | 1,
-): Part[] {
+function row(x0: number, z0: number, dx: number, dz: number, n: number, footprint: Footprint, rot: 0 | 1): Part[] {
   const out: Part[] = [];
   for (let i = 0; i < n; i++) out.push({ x: x0 + dx * i, z: z0 + dz * i, footprint, rot, t: 0 });
   return out;
@@ -95,10 +87,21 @@ function motifs(): Part[] {
   p.push(...row(42, 44, 0, 2.6, 14, 'p0603', 0));
 
   const ISLANDS: [number, number][] = [
-    [-70, -74], [-70, -58], [-70, -42],
-    [30, 6], [46, 6], [30, 24],
-    [-100, -2], [-100, 18], [-100, 38], [-100, 58],
-    [-62, 96], [-38, 96], [-14, 96], [10, 96], [34, 96],
+    [-70, -74],
+    [-70, -58],
+    [-70, -42],
+    [30, 6],
+    [46, 6],
+    [30, 24],
+    [-100, -2],
+    [-100, 18],
+    [-100, 38],
+    [-100, 58],
+    [-62, 96],
+    [-38, 96],
+    [-14, 96],
+    [10, 96],
+    [34, 96],
   ];
   for (const [x, z] of ISLANDS) p.push(...island(x, z));
 

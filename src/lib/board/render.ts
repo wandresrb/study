@@ -33,9 +33,7 @@ export async function engine(
 
   await renderer.init();
 
-  const backend = (renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend
-    ? 'webgpu'
-    : 'webgl';
+  const backend = (renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend ? 'webgpu' : 'webgl';
 
   let width = 0;
   let height = 0;

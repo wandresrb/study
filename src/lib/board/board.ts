@@ -1,8 +1,10 @@
 import {
   DirectionalLight,
   Group,
+  InstancedMesh,
   Mesh,
   MeshStandardNodeMaterial,
+  Object3D,
   PlaneGeometry,
   Scene,
   type WebGPURenderer,
@@ -10,11 +12,13 @@ import {
 import { color, length, mix, smoothstep, texture, uniform, uv } from 'three/tsl';
 
 import { environment } from './environment';
-import { SIDE } from './layout';
+import { SIDE, SOCKET_X, SOCKET_Z } from './layout';
 import { mask } from './mask';
 import { relief, type Materials } from './parts';
+import { DIE_TOP, LID_NAME } from './processor';
 import { edge } from './edge';
-import { devices } from './devices';
+import { mosfet } from './mosfet';
+import { probe } from './probe';
 import { seed } from './seeding';
 import { pulses } from './pulses';
 
@@ -37,9 +41,16 @@ export interface Board {
   scene: Scene;
   uPulses: { value: number };
   animate(t: number, intensity: number): void;
-  compose(p: number, sunk: number): void;
+  compose(p: number, explode: number): void;
+  probe(t: number, lit: number): void;
+  /** Lifts the lid off the package, 0 shut to 1 open. */
+  open(v: number): void;
+  gate(t: number, on: number, conducting: number, lit: number): void;
   dispose(): void;
 }
+
+/** How far each layer drifts when the machine comes apart, in board units. */
+const LIFT = { tiny: 74, big: 196 } as const;
 
 export function build(renderer: WebGPURenderer): Board {
   const scene = new Scene();
@@ -140,8 +151,17 @@ export function build(renderer: WebGPURenderer): Board {
   const boardEdge = edge();
   machine.add(boardEdge.group);
 
-  const peripherals = devices(materials);
-  machine.add(peripherals.group);
+  const bus = probe(materials);
+  machine.add(bus.group);
+
+  // The speck of silicon the magnified transistor is taken from: one core.
+  const speck: [number, number, number] = [SOCKET_X - 4.6, DIE_TOP, SOCKET_Z - 4.4];
+  const switchDetail = mosfet(materials, speck, [-22, 44, 16]);
+  machine.add(switchDetail.group);
+
+  const lid = raised.getObjectByName(LID_NAME);
+  const lidY = lid?.position.y ?? 0;
+  const lidZ = lid?.position.z ?? 0;
 
   scene.add(group);
 
@@ -166,6 +186,18 @@ export function build(renderer: WebGPURenderer): Board {
   bounce.position.set(240, 90, -230);
   scene.add(bounce);
 
+  // The exploded view separates what the assembled board hides: the substrate,
+  // the components sown on it, and the parts that stand up.
+  const tiny = raised.children.filter((c) => (c as InstancedMesh).isInstancedMesh);
+  const big = raised.children.filter((c) => !(c as InstancedMesh).isInstancedMesh);
+  const base = new WeakMap<Object3D, number>();
+  for (const child of [...tiny, ...big, sparks.mesh]) {
+    base.set(child, child.position.y);
+  }
+  const lift = (child: Object3D, by: number) => {
+    child.position.y = (base.get(child) ?? 0) + by;
+  };
+
   return {
     scene,
     uPulses,
@@ -174,11 +206,28 @@ export function build(renderer: WebGPURenderer): Board {
       sparks.update(t, intensity);
     },
 
-    compose(p, sunk) {
-      boardEdge.apply(p);
-      peripherals.apply(p);
-      machine.position.y = -sunk * 820;
-      machine.scale.setScalar(1 - sunk * 0.34);
+    compose(p, explode) {
+      boardEdge.apply(p, 1 - explode);
+      bus.group.visible = explode < 0.02;
+
+      for (const c of tiny) lift(c, explode * LIFT.tiny);
+      for (const c of big) lift(c, explode * LIFT.big);
+      lift(sparks.mesh, explode * LIFT.tiny);
+    },
+
+    probe(t, lit) {
+      bus.set(t, lit);
+    },
+
+    open(v) {
+      if (!lid) return;
+      lid.position.y = lidY + v * 27;
+      lid.position.z = lidZ - v * 16;
+      lid.rotation.x = -v * 0.16;
+    },
+
+    gate(t, on, conducting, lit) {
+      switchDetail.set(t, on, conducting, lit);
     },
 
     dispose() {
@@ -186,12 +235,23 @@ export function build(renderer: WebGPURenderer): Board {
         const m = n as Mesh;
         if (m.geometry) m.geometry.dispose();
       });
-      for (const m of [substrateMat, aluminumMat, plasticMat, contactMat, bodyMat, accentMat, steelMat, fineContactMat, channelMat]) {
+      for (const m of [
+        substrateMat,
+        aluminumMat,
+        plasticMat,
+        contactMat,
+        bodyMat,
+        accentMat,
+        steelMat,
+        fineContactMat,
+        channelMat,
+      ]) {
         m.dispose();
       }
       sparks.dispose();
       boardEdge.dispose();
-      peripherals.dispose();
+      bus.dispose();
+      switchDetail.dispose();
       maps.dispose();
       env.dispose();
       scene.environment = null;

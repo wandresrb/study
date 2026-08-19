@@ -76,12 +76,7 @@ function ribbon(c: Ribbon, path: Point[], u0: number, u1: number, width: number)
     const bx = x1 + ex;
     const bz = z1 + ez;
 
-    c.pos.push(
-      ax - nx, NEON_Y, az - nz,
-      ax + nx, NEON_Y, az + nz,
-      bx + nx, NEON_Y, bz + nz,
-      bx - nx, NEON_Y, bz - nz,
-    );
+    c.pos.push(ax - nx, NEON_Y, az - nz, ax + nx, NEON_Y, az + nz, bx + nx, NEON_Y, bz + nz, bx - nx, NEON_Y, bz - nz);
     c.uvs.push(ua, 0, ua, 1, ub, 1, ub, 0);
     c.idx.push(c.v, c.v + 1, c.v + 2, c.v, c.v + 2, c.v + 3);
     c.v += 4;
@@ -142,16 +137,7 @@ export function devices(m: Materials): Devices {
 
   const gMonitor = nest(0, MONITOR.z);
   box(gMonitor, MONITOR.base.w, MONITOR.base.h, MONITOR.base.d, 0, 0, MONITOR.base.z, m.body);
-  box(
-    gMonitor,
-    MONITOR.neck.w,
-    MONITOR.neck.h,
-    MONITOR.neck.d,
-    0,
-    MONITOR.base.h,
-    MONITOR.neck.z,
-    m.body,
-  );
+  box(gMonitor, MONITOR.neck.w, MONITOR.neck.h, MONITOR.neck.d, 0, MONITOR.base.h, MONITOR.neck.z, m.body);
 
   const panel = box(gMonitor, MONITOR.panel.w, MONITOR.panel.h, MONITOR.panel.d, 0, PANEL_Y, 0, m.body);
   panel.rotation.x = MONITOR.panel.tilt;
@@ -184,11 +170,7 @@ export function devices(m: Materials): Devices {
   let n = 0;
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
-      mat4.makeTranslation(
-        (c - (COLS - 1) / 2) * STEP_X,
-        KEYBOARD.h + 2.5,
-        (r - (ROWS - 1) / 2) * STEP_Z,
-      );
+      mat4.makeTranslation((c - (COLS - 1) / 2) * STEP_X, KEYBOARD.h + 2.5, (r - (ROWS - 1) / 2) * STEP_Z);
       keys.setMatrixAt(n++, mat4);
     }
   }
@@ -239,8 +221,7 @@ export function devices(m: Materials): Devices {
   group.add(neonMesh);
 
   const smooth = (t: number) => t * t * (3 - 2 * t);
-  const band = (p: number, a: number, b: number) =>
-    smooth(Math.min(1, Math.max(0, (p - a) / (b - a))));
+  const band = (p: number, a: number, b: number) => smooth(Math.min(1, Math.max(0, (p - a) / (b - a))));
 
   const nests: { g: Group; delay: number }[] = [
     { g: gMonitor, delay: 0 },

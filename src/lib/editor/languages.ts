@@ -34,8 +34,7 @@ const LOADERS: Record<Exclude<Language, 'text'>, () => Promise<Extension>> = {
   js: () => import('@codemirror/lang-javascript').then((m) => m.javascript()),
   ts: () => import('@codemirror/lang-javascript').then((m) => m.javascript({ typescript: true })),
   jsx: () => import('@codemirror/lang-javascript').then((m) => m.javascript({ jsx: true })),
-  tsx: () =>
-    import('@codemirror/lang-javascript').then((m) => m.javascript({ jsx: true, typescript: true })),
+  tsx: () => import('@codemirror/lang-javascript').then((m) => m.javascript({ jsx: true, typescript: true })),
   rust: () => import('@codemirror/lang-rust').then((m) => m.rust()),
   c: () => import('@codemirror/lang-cpp').then((m) => m.cpp()),
   cpp: () => import('@codemirror/lang-cpp').then((m) => m.cpp()),

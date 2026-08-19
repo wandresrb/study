@@ -42,7 +42,7 @@ async function record(root: HTMLElement, attempt: number, solution: string, test
 }
 const originals = new WeakMap<HTMLElement, string>();
 
-const jsonIn = <T,>(root: ParentNode, sel: string): T | null => {
+const jsonIn = <T>(root: ParentNode, sel: string): T | null => {
   const raw = root.querySelector(`${sel} script[type="application/json"]`)?.textContent;
   return raw ? (JSON.parse(raw) as T) : null;
 };
@@ -57,9 +57,7 @@ function paintTests(root: HTMLElement, results: TestResult[]) {
     const li = document.createElement('li');
     li.className = r.pass ? 'text-green' : 'text-red';
     const name = r.label ?? r.call;
-    li.textContent = r.pass
-      ? `✓ ${name}`
-      : `✗ ${name} — ${r.error ? r.error : `dio ${r.got}, se esperaba ${r.want}`}`;
+    li.textContent = r.pass ? `✓ ${name}` : `✗ ${name} — ${r.error ? r.error : `dio ${r.got}, se esperaba ${r.want}`}`;
     list.append(li);
   }
 }
@@ -151,7 +149,6 @@ document.addEventListener('click', (e) => {
   if (button.dataset.action === 'run') void run(root);
   else if (button.dataset.action === 'reset') reset(root);
 });
-
 
 document.addEventListener('astro:before-swap', () => {
   for (const root of document.querySelectorAll<HTMLElement>('[data-run]')) {

@@ -12,9 +12,7 @@ const loadEngine = () => (engine ??= import('./engine'));
 
 async function setup(root: HTMLElement): Promise<VimExercise> {
   const api = await loadEngine();
-  const def = JSON.parse(
-    root.querySelector('script[type="application/json"]')!.textContent!,
-  ) as ExerciseDef;
+  const def = JSON.parse(root.querySelector('script[type="application/json"]')!.textContent!) as ExerciseDef;
 
   const id = root.dataset.id!;
   const challenge = root.dataset.challenge ?? '';
@@ -36,8 +34,7 @@ async function setup(root: HTMLElement): Promise<VimExercise> {
   const paintState = (mastery: number | undefined) => {
     stateEl.textContent = mastery === 2 ? '★' : mastery !== undefined ? '✓' : '○';
     stateEl.className =
-      'font-mono text-sm ' +
-      (mastery === 2 ? 'text-yellow' : mastery !== undefined ? 'text-green' : 'text-overlay0');
+      'font-mono text-sm ' + (mastery === 2 ? 'text-yellow' : mastery !== undefined ? 'text-green' : 'text-overlay0');
   };
   void get(itemId).then((r) => paintState(r?.mastery));
 
@@ -52,8 +49,7 @@ async function setup(root: HTMLElement): Promise<VimExercise> {
         return;
       }
       const chip = document.createElement('kbd');
-      chip.className =
-        'rounded-xs border border-line bg-mantle px-1 font-mono text-2xs text-subtext1';
+      chip.className = 'rounded-xs border border-line bg-mantle px-1 font-mono text-2xs text-subtext1';
       chip.textContent = key;
       hudEl.append(chip);
       while (hudEl.childElementCount > 14) hudEl.firstElementChild!.remove();
@@ -119,11 +115,7 @@ async function celebrate(root: HTMLElement, star: boolean) {
     { boxShadow: `0 0 0 2px var(${star ? '--yellow' : '--green'})` },
     { boxShadow: '0 0 0 0px transparent', duration: 0.6, ease: 'power2.out' },
   );
-  gsap.fromTo(
-    root.querySelector('[data-state]'),
-    { scale: 1.6 },
-    { scale: 1, duration: 0.35, ease: 'back.out(3)' },
-  );
+  gsap.fromTo(root.querySelector('[data-state]'), { scale: 1.6 }, { scale: 1, duration: 0.35, ease: 'back.out(3)' });
 }
 
 /** Mounts what is still pending. Exported: the review page injects exercises. */

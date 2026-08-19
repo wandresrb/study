@@ -7,13 +7,15 @@ interface Shot {
 }
 
 const SHOTS: readonly Shot[] = [
-  { p: 0, pos: [0, 372, 96], look: [0, 0, -4] },
-  { p: 0.18, pos: [-52, 288, 232], look: [0, 4, -12] },
-  { p: 0.34, pos: [14, 148, 288], look: [0, 12, -54] },
-  { p: 0.48, pos: [0, 76, 322], look: [0, 40, -180] },
-  { p: 0.62, pos: [0, 560, 1560], look: [0, 210, -20] },
-  { p: 0.82, pos: [0, 380, 1440], look: [0, 170, -20] },
-  { p: 1, pos: [0, 350, 1400], look: [0, 160, -20] },
+  { p: 0, pos: [-300, 470, 560], look: [0, 110, -20] },
+  { p: 0.18, pos: [-240, 420, 478], look: [0, 74, -18] },
+  { p: 0.3, pos: [-186, 374, 414], look: [0, 44, -14] },
+  { p: 0.52, pos: [-30, 196, 128], look: [26, 12, -52] },
+  // down on the copper that leaves the processor for the memory slots
+  { p: 0.68, pos: [64, 42, -34], look: [62, 0, -70] },
+  { p: 0.84, pos: [10, 84, 40], look: [16, 22, -46] },
+  // the package with its lid off, and the transistor blown up above it
+  { p: 1, pos: [-16, 104, 128], look: [10, 30, -34] },
 ];
 
 const smooth = (t: number) => t * t * (3 - 2 * t);

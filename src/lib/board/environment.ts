@@ -28,8 +28,7 @@ export function environment(renderer: WebGPURenderer): Environment {
 
   for (let y = 0; y < H; y++) {
     const v = y / (H - 1);
-    const base =
-      v < 0.5 ? mix(zenith, horizon, Math.pow(v / 0.5, 0.7)) : mix(horizon, ground, (v - 0.5) / 0.5);
+    const base = v < 0.5 ? mix(zenith, horizon, Math.pow(v / 0.5, 0.7)) : mix(horizon, ground, (v - 0.5) / 0.5);
 
     for (let x = 0; x < W; x++) {
       const u = x / (W - 1);
