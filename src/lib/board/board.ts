@@ -45,7 +45,7 @@ export interface Board {
   probe(t: number, lit: number): void;
   /** Lifts the lid off the package, 0 shut to 1 open. */
   open(v: number): void;
-  gate(t: number, on: number, conducting: number, lit: number): void;
+  gate(t: number, a: number, b: number, lit: number): void;
   dispose(): void;
 }
 
@@ -156,7 +156,7 @@ export function build(renderer: WebGPURenderer): Board {
 
   // The speck of silicon the magnified transistor is taken from: one core.
   const speck: [number, number, number] = [SOCKET_X - 4.6, DIE_TOP, SOCKET_Z - 4.4];
-  const switchDetail = mosfet(materials, speck, [-22, 44, 16]);
+  const switchDetail = mosfet(materials, speck, [-20, 48, 10]);
   machine.add(switchDetail.group);
 
   const lid = raised.getObjectByName(LID_NAME);
@@ -226,8 +226,8 @@ export function build(renderer: WebGPURenderer): Board {
       lid.rotation.x = -v * 0.16;
     },
 
-    gate(t, on, conducting, lit) {
-      switchDetail.set(t, on, conducting, lit);
+    gate(t, a, b, lit) {
+      switchDetail.set(t, a, b, lit);
     },
 
     dispose() {

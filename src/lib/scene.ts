@@ -9,8 +9,8 @@ export interface Scene {
   probe?(t: number, lit: number): void;
   /** Lifts the lid off the package, 0 shut to 1 open. */
   open?(v: number): void;
-  /** The magnified transistor: its gate, whether current crosses, and how lit. */
-  gate?(t: number, on: number, conducting: number, lit: number): void;
+  /** The magnified pair: each gate's input, and how lit the detail is. */
+  gate?(t: number, a: number, b: number, lit: number): void;
   destroy(): void;
 }
 

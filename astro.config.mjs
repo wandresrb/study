@@ -17,12 +17,16 @@ import { SHIKI_THEMES } from './src/lib/themes.ts';
 
 import { fileTitleTransformer } from './src/lib/shiki-file-title.ts';
 import catalog from './src/integrations/catalog.ts';
+import forceExit from './src/integrations/force-exit.ts';
 
 export default defineConfig({
   site: 'https://wandres.dev',
 
   experimental: {
-    incrementalBuild: false,
+    // Las lecciones ya devuelven cacheKey en getStaticPaths: con el manifest de
+    // node_modules/.astro persistido entre builds (actions/cache en CI), solo se
+    // regeneran las páginas cuyo contenido o dependencias cambiaron.
+    incrementalBuild: true,
     collectionStorage: 'chunked',
   },
 
@@ -71,7 +75,8 @@ export default defineConfig({
     },
   },
 
-  integrations: [catalog(), mdx(), sitemap(), solidJs(), pagefind()],
+  // forceExit debe ir de último: su build:done corre tras sitemap y pagefind.
+  integrations: [catalog(), mdx(), sitemap(), solidJs(), pagefind(), forceExit()],
 
   vite: {
     plugins: [tailwindcss()],

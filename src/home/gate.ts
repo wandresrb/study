@@ -13,7 +13,10 @@ const HIGH = 'text-green';
  * and hands the same state to the magnified transistor in the scene, so the
  * schematic and the silicon can never disagree.
  */
-export function runGate(panel: HTMLElement, onFrame: (t: number, on: number, conducting: number, lit: number) => void): GateRun {
+export function runGate(
+  panel: HTMLElement,
+  onFrame: (t: number, a: number, b: number) => void,
+): GateRun {
   const inputs = { a: 1, b: 1 };
 
   const mos = (id: string) => panel.querySelector<SVGUseElement>(`[data-mos="${id}"]`);
@@ -70,7 +73,7 @@ export function runGate(panel: HTMLElement, onFrame: (t: number, on: number, con
     if (!alive) return;
     raf = requestAnimationFrame(frame);
     const t = (now - t0) / 1000;
-    onFrame(t, inputs.a, inputs.a && inputs.b, Math.min(1, t / 0.7));
+    onFrame(t, inputs.a, inputs.b);
   };
 
   const onClick = (e: Event) => {
@@ -91,7 +94,6 @@ export function runGate(panel: HTMLElement, onFrame: (t: number, on: number, con
       alive = false;
       cancelAnimationFrame(raf);
       panel.removeEventListener('click', onClick);
-      onFrame(0, 0, 0, 0);
     },
 
     toggle(input) {

@@ -15,7 +15,7 @@ const SHOTS: readonly Shot[] = [
   { p: 0.68, pos: [64, 42, -34], look: [62, 0, -70] },
   { p: 0.84, pos: [10, 84, 40], look: [16, 22, -46] },
   // the package with its lid off, and the transistor blown up above it
-  { p: 1, pos: [-16, 104, 128], look: [10, 30, -34] },
+  { p: 1, pos: [-30, 100, 130], look: [-6, 28, -24] },
 ];
 
 const smooth = (t: number) => t * t * (3 - 2 * t);

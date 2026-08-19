@@ -11,7 +11,7 @@ export interface BoardScene extends Scene {
   explode(v: number): void;
   probe(t: number, lit: number): void;
   open(v: number): void;
-  gate(t: number, on: number, conducting: number, lit: number): void;
+  gate(t: number, a: number, b: number, lit: number): void;
 }
 
 export async function mount(host: HTMLElement): Promise<BoardScene> {
@@ -107,9 +107,9 @@ export async function mount(host: HTMLElement): Promise<BoardScene> {
       board.open(v);
     },
 
-    gate(t, on, conducting, lit) {
+    gate(t, a, b, lit) {
       if (!alive) return;
-      board.gate(t, on, conducting, lit);
+      board.gate(t, a, b, lit);
     },
 
     destroy() {

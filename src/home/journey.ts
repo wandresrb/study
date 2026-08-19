@@ -104,6 +104,8 @@ function paintChrome(i: number) {
 
 let panelRun: { stop(): void; toggle?(input: string): void } | null = null;
 let panelEl: HTMLElement | null = null;
+/** How far the scroll has brought the magnified detail in, 0 to 1. */
+let gateLit = 0;
 
 function paintPanels(id: string) {
   let live: HTMLElement | null = null;
@@ -117,10 +119,11 @@ function paintPanels(id: string) {
   panelRun?.stop();
   panelRun = null;
   panelEl = live;
+  scene?.gate?.(0, 0, 0, 0);
 
   if (!live || reduced()) return;
   panelRun = live.querySelector('[data-gate-panel]')
-    ? runGate(live, (t, on, conducting, lit) => scene?.gate?.(t, on, conducting, lit))
+    ? runGate(live, (t, a, b) => scene?.gate?.(t, a, b, gateLit))
     : runProbe(live, (t, lit) => scene?.probe?.(t, lit));
 }
 
@@ -191,7 +194,10 @@ const measure = () => {
 
   scene.advance(cameraAt(q));
   scene.explode?.(1 - band(q, 0.04, 0.22));
-  scene.open?.(band(q, 0.74, 0.88));
+  scene.open?.(band(q, 0.7, 0.85));
+  // The magnified pair belongs to the scroll, not to the panel's clock: it
+  // must not be hanging there while the camera is still on its way.
+  gateLit = band(q, 0.85, 0.94);
 };
 
 const onScroll = () => {
